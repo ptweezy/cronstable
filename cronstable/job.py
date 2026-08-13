@@ -1810,8 +1810,12 @@ async def close_event_log_writers() -> None:
         writer.stop()
 
     def _join() -> None:
+        # one deadline shared by every writer: all stop sentinels are
+        # already queued, so the drains overlap and N wedged threads still
+        # cost EVENTLOG_FLUSH_TIMEOUT total, not N times it
+        deadline = time.monotonic() + EVENTLOG_FLUSH_TIMEOUT
         for writer in writers:
-            writer.join(EVENTLOG_FLUSH_TIMEOUT)
+            writer.join(max(0.0, deadline - time.monotonic()))
 
     await asyncio.get_running_loop().run_in_executor(None, _join)
 
@@ -1826,10 +1830,12 @@ def _close_event_log_writers_atexit() -> None:
     documentation states outright rather than implying a durability this
     design does not have.
     """
-    for source in list(_EVENTLOG_WRITERS):
-        writer = _EVENTLOG_WRITERS.pop(source)
-        writer.stop()
-        writer.join(EVENTLOG_FLUSH_TIMEOUT)
+    writers = [_EVENTLOG_WRITERS.pop(s) for s in list(_EVENTLOG_WRITERS)]
+    for writer in writers:
+        writer.stop()  # all sentinels first, so the drains overlap
+    deadline = time.monotonic() + EVENTLOG_FLUSH_TIMEOUT
+    for writer in writers:
+        writer.join(max(0.0, deadline - time.monotonic()))
 
 
 class EventLogReporter(Reporter):

@@ -287,9 +287,10 @@ def _run_init(args: Any) -> int:
             print(
                 "cronstable init: {} can write {}, so any local account "
                 "can add a job, and a service runs it as SYSTEM. "
-                'Restrict it with: icacls "{}" /inheritance:r /grant '
-                "*S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F".format(
-                    grantee, target, target
+                "Restrict it with: {}".format(
+                    grantee,
+                    target,
+                    platform.config_dir_icacls_recipe(target),
                 ),
                 file=sys.stderr,
             )
@@ -606,11 +607,10 @@ def _warn_if_config_is_writable(config_arg: str | None) -> None:
     logging.getLogger("cronstable").warning(
         "%s can be written by %s, so any local account can add or change "
         "a job this daemon runs, and a service runs them as SYSTEM. "
-        'Restrict it with: icacls "%s" /inheritance:r /grant '
-        "*S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F",
+        "Restrict it with: %s",
         config_arg,
         grantee,
-        config_arg,
+        platform.config_dir_icacls_recipe(config_arg),
     )
 
 

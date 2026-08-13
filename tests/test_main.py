@@ -607,6 +607,9 @@ def test_a_writable_config_is_warned_about_once_at_startup(
     assert "icacls" in text
     assert "*S-1-5-18:(OI)(CI)F" in text
     assert "*S-1-5-32-544:(OI)(CI)F" in text
+    # the AU read grant _CONFIG_DIR_SDDL keeps: dropping it would break
+    # unelevated config resolution (see platform.config_dir_icacls_recipe)
+    assert "*S-1-5-11:(OI)(CI)RX" in text
 
 
 def test_nothing_is_said_when_the_config_is_not_writable(monkeypatch, caplog):

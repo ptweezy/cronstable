@@ -1040,6 +1040,20 @@ def fsync_directory(path: str) -> None:
 #: generic bits, which Windows' own tools cannot render as a permission.
 _CONFIG_DIR_SDDL = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;AU)"
 
+
+def config_dir_icacls_recipe(path: str) -> str:
+    """The paste-able icacls line for :data:`_CONFIG_DIR_SDDL`.
+
+    Kept beside the SDDL so the printed advice cannot drift from what
+    :func:`harden_config_dir` applies.  ``RX`` is the icacls spelling of
+    ``FRFX``; the AU grant stays for the reason given above.
+    """
+    return (
+        'icacls "{}" /inheritance:r /grant *S-1-5-18:(OI)(CI)F '
+        "/grant *S-1-5-32-544:(OI)(CI)F "
+        "/grant *S-1-5-11:(OI)(CI)RX".format(path)
+    )
+
 #: SDDL aliases for "any account on this machine", the only principals a
 #: write grant to is reported as a finding.  CREATOR OWNER (``CO``) is
 #: deliberately absent: it appears on ``%ProgramData%`` itself and resolves

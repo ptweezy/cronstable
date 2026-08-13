@@ -933,6 +933,9 @@ def lower_exec(
     a workaround: it keeps expansion at RUN time on the target host, where
     baking in this machine's values at import time would be wrong for
     every other machine in the estate.
+
+    A ``%VAR%`` working directory has no such lowering (CreateProcess
+    applies the cwd itself, before any shell), so it gets a blocking note.
     """
     command = _text(action, "Command")
     if not command:
@@ -943,6 +946,20 @@ def lower_exec(
         )
     arguments = _text(action, "Arguments") or ""
     workdir = _text(action, "WorkingDirectory")
+    notes = []
+    if workdir and _PERCENT_VAR.search(workdir):
+        # The cmd.exe fallback cannot help a cwd: CreateProcess applies it
+        # before any shell runs.  Blocking, so the job is not emitted live.
+        notes.append(
+            Note(
+                task,
+                "Exec/WorkingDirectory",
+                "it uses %VAR% in the working directory, which nothing in "
+                "cronstable expands and no shell can expand for it",
+                "replace it with the expanded path for the target host",
+                True,
+            )
+        )
     if _PERCENT_VAR.search(command) or _PERCENT_VAR.search(arguments):
         # Quote the program unless it already is.  Task Scheduler decides
         # quoting on the LITERAL text it stored, and it calls CreateProcess
@@ -958,7 +975,8 @@ def lower_exec(
         return (
             line,
             workdir,
-            [
+            notes
+            + [
                 Note(
                     task,
                     "Exec/Command",
@@ -981,7 +999,6 @@ def lower_exec(
     if len(command) >= 2 and command[0] == command[-1] == '"':
         command = command[1:-1]
     argv = [command] + windows_argv_split(arguments)
-    notes = []
     if arguments:
         # The split gets a self check for free: list2cmdline implements the
         # same C runtime rules in reverse, so a round trip that does not
@@ -1250,6 +1267,7 @@ def convert_task(
         for action_index, action in enumerate(execs):
             argv, workdir, action_notes = lower_exec(action, label)
             notes += action_notes
+            commented = commented or any(n.blocking for n in action_notes)
             if argv is None:
                 continue
             suffix = ""

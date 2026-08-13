@@ -553,6 +553,27 @@ def test_exec_becomes_an_argv_list_and_a_working_directory():
     assert job["workingDirectory"] == "C:\\s"
 
 
+def test_a_percent_var_working_directory_blocks_the_task():
+    # cmd.exe can expand %VAR% in a command line, but a cwd is applied by
+    # CreateProcess before any shell runs, so nothing can expand it and
+    # the emitted job would fail every spawn.
+    converted = _convert(
+        _task(
+            triggers=_DAILY,
+            actions="<Exec><Command>C:\\s\\b.exe</Command>"
+            "<WorkingDirectory>%USERPROFILE%\\scripts</WorkingDirectory>"
+            "</Exec>",
+        )
+    )
+    assert converted.commented is True
+    note = next(
+        n for n in converted.notes if n.element == "Exec/WorkingDirectory"
+    )
+    assert note.blocking is True
+    # the scaffold is still emitted (commented) with the literal to edit
+    assert converted.jobs[0]["workingDirectory"] == "%USERPROFILE%\\scripts"
+
+
 def test_a_quoted_command_loses_its_quotes():
     # Task Scheduler stores a spaced path quoted because Command and
     # Arguments are concatenated; in an argv a quote is part of the name.

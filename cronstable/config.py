@@ -3852,16 +3852,25 @@ def _validate_eventlog_config(config: "CronstableConfig") -> None:
     users = _eventlog_report_users(config)
 
     def _blocks() -> Any:
-        for job in config.jobs:
+        holders = [(job.name, job) for job in config.jobs]
+        for dag_config in config.dags:
+            for taskkey, template in dag_config.task_templates.items():
+                holders.append(
+                    (
+                        "dag {} task {}".format(dag_config.name, taskkey),
+                        template,
+                    )
+                )
+        for where, holder in holders:
             for action in (
                 "onFailure",
                 "onPermanentFailure",
                 "onSuccess",
                 "onLate",
             ):
-                block = getattr(job, action, None)
+                block = getattr(holder, action, None)
                 if isinstance(block, dict):
-                    yield job.name, (block.get("report") or {})
+                    yield where, (block.get("report") or {})
         notify = config.notify_config
         if notify is not None:
             yield "notify", (notify.get("report") or {})
