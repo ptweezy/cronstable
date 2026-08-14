@@ -251,12 +251,13 @@ on ARM64) and run it directly; no `chmod` is needed:
 .\cronstable-windows-amd64.exe --version
 ```
 
-The Windows binaries carry a version resource but are not
-Authenticode-signed, so the first run of a browser-downloaded copy trips
-SmartScreen: choose "More info", then "Run anyway", and verify the download
-against the release's `SHA256SUMS` if your policy calls for it. `winget
-install ptweezy.cronstable` installs the same binary through the Windows
-Package Manager. See [Running on Windows](Running-on-Windows) for the full
+The Windows binaries carry a version resource and are Authenticode-signed
+with Azure Artifact Signing. The first run of a browser-downloaded copy can
+still trip SmartScreen while the signing identity's reputation accrues:
+choose "More info", then "Run anyway", and verify the download against the
+release's `SHA256SUMS` if your policy calls for it. `winget install
+ptweezy.cronstable` installs the same binary through the Windows Package
+Manager. See [Running on Windows](Running-on-Windows) for the full
 Windows install and deployment story.
 
 Windows releases also attach `cronstable-windows-amd64.zip` and
@@ -264,7 +265,8 @@ Windows releases also attach `cronstable-windows-amd64.zip` and
 Each extracts to a single `cronstable\` folder and is the download that can
 host the [Windows service](Windows-Service), which the one-file `.exe`
 cannot. Clear the Mark of the Web from the zip before extracting, so the
-extracted files do not each carry it:
+extracted files do not each carry it; use an elevated PowerShell, since
+writing into `C:\Program Files` needs one:
 
 ```powershell
 Unblock-File .\cronstable-windows-amd64.zip
