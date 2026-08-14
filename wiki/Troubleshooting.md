@@ -676,9 +676,13 @@ It cannot, and this is not a cronstable limitation to work around. The
 published one-file `.exe` (which is what winget installs) unpacks itself and
 runs the program in a **child** process, so the process the Service Control
 Manager starts and watches never registers with the service dispatcher, and
-the start fails on the SCM's timeout. Install with pip or pipx to run as a
-service, or use the `schtasks` recipe on
-[Running on Windows](Running-on-Windows#running-unattended).
+the start fails on the SCM's timeout. Download
+`cronstable-windows-<arch>.zip` (a one-directory build) and run `service
+install` from its extracted `cronstable.exe`, install the
+[MSI](Windows-MSI), which registers the service itself, or install with pip
+or pipx; the `schtasks` recipe on
+[Running on Windows](Running-on-Windows#running-unattended) remains the
+fallback for the one-file executable.
 
 ### A reinstall fails with "the service is pending deletion"
 
