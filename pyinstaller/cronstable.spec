@@ -1,11 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
 import re
 import sys
 
 from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
+
+# CRONSTABLE_BUNDLE selects the output layout: "onefile" (the default),
+# "onedir", or "both". The default must stay one-file because six knob-less
+# consumers read the single dist/cronstable(.exe): four release.yml lanes
+# plus pyinstaller/Dockerfile and pyinstaller/Makefile. The one-dir layout
+# exists because a one-file build cannot host a Windows service: its
+# bootloader unpacks itself and runs the program in a child process the
+# Service Control Manager never sees (see cronstable/winservice.py). "both" emits the two
+# layouts from one Analysis (the Windows release lane; a second invocation
+# would repeat the dependency scan). `or "onefile"` rather than a get()
+# default, so an empty-string export cannot flip the layout.
+BUNDLE = os.environ.get("CRONSTABLE_BUNDLE") or "onefile"
+if BUNDLE not in ("onefile", "onedir", "both"):
+    raise SystemExit(
+        "CRONSTABLE_BUNDLE must be 'onefile', 'onedir' or 'both', "
+        "got {!r}".format(BUNDLE)
+    )
 
 # strip is a Unix concept (ELF/Mach-O). On Windows the GNU `strip` that ships
 # with git bash WILL corrupt the bundled PE DLLs (notably pythonXY.dll) if
@@ -202,20 +220,51 @@ a = Analysis(
     optimize=2,
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    [],
+
+# ONE kwargs dict for both EXE calls, so the two shipped layouts cannot
+# drift in metadata or stripping (the onedir exe is the one inside the
+# zip AND the MSI). The real differences stay at the call sites: what
+# the exe embeds, and runtime_tmpdir, a one-file-only option.
+exe_kwargs = dict(
     name="cronstable",
     debug=False,
     bootloader_ignore_signals=False,
     strip=STRIP,
     upx=False,
     upx_exclude=[],
-    runtime_tmpdir=None,
     console=True,
     version=version_resource,
 )
+if BUNDLE in ("onedir", "both"):
+    # dist/cronstable/cronstable.exe plus _internal/. The exe keeps the
+    # version resource so Properties > Details works on the shipped file.
+    # Under "both" this EXE lands in the workpath (COLLECT assembles
+    # dist/cronstable/), so it coexists with dist/cronstable.exe below.
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        **exe_kwargs,
+    )
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=STRIP,
+        upx=False,
+        upx_exclude=[],
+        name="cronstable",
+    )
+if BUNDLE in ("onefile", "both"):
+    exe_onefile = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        [],
+        runtime_tmpdir=None,
+        **exe_kwargs,
+    )
