@@ -318,7 +318,7 @@ reporter that writes to the Windows Event Log.
 
 ### Packaging
 
-- **A one-directory Windows build ships beside the .exe.** Every release
+- A one-directory Windows build ships beside the .exe. Every release
   now attaches `cronstable-windows-amd64.zip` and
   `cronstable-windows-arm64.zip`, each holding a single `cronstable`
   directory (`cronstable.exe` beside `_internal`), so extracting into
@@ -330,11 +330,12 @@ reporter that writes to the Windows Event Log.
   service reached pip and pipx installs only. The one-directory build has
   no child process and hosts a service normally; the refusal message now
   points at the zip and the MSI alongside pip and pipx. The build comes
-  from the same spec behind a new `CRONSTABLE_BUNDLE=onedir` switch, and
-  the Windows release lane proves each zip against the real SCM (`service
-  install`, `status`, `remove` under a CI-scoped name) before attaching
-  it. winget continues to install the portable one-file executable.
-- **An MSI for managed machine-wide deployment.** Every release also
+  from the same spec behind a new `CRONSTABLE_BUNDLE` switch (the
+  release lane's `both` mode emits the one-file and one-directory
+  layouts from a single analysis), and the Windows release lane proves
+  each zip against the real SCM (`service install`, `status`, `remove`
+  under a CI-scoped name) before attaching it. winget continues to install the portable one-file executable.
+- An MSI for managed machine-wide deployment. Every release also
   attaches `cronstable-windows-amd64.msi` and
   `cronstable-windows-arm64.msi`, WiX-built per-machine installers for
   GPO, Intune and SCCM. The MSI installs the one-directory build to
@@ -344,15 +345,27 @@ reporter that writes to the Windows Event Log.
   actions and the flag that applies them to orderly failure exits; a
   parity test holds the two spellings equal. A first install registers
   the service without starting it, because there is no configuration yet
-  and a start would burn the recovery retries; an upgrade that finds the
-  machine-wide configuration directory stops the running service for the
-  file switch and starts it again, and `STARTSERVICE=1` starts it on a
-  first install whose configuration was deployed ahead of the package.
-  Uninstalling removes the service, the files and the `PATH` entry and
-  leaves `C:\ProgramData\cronstable` alone. The release lane installs and
+  and a start would burn the recovery retries; an upgrade stops the
+  running service for the file switch and starts it again when the
+  existing install's configuration directory is present, and
+  `STARTSERVICE=1` starts it on a first install whose configuration was
+  deployed ahead of the package. `CONFIGDIR` and `ADDPATH` are
+  remembered across upgrades, so a fleet push never has to repeat them;
+  passing one on an upgrade command line changes it. Uninstalling
+  removes the service, the files and the `PATH` entry and leaves
+  `C:\ProgramData\cronstable` alone. The release lane installs and
   uninstalls each MSI for real on the runner, asserting the registered
-  ImagePath and recovery actions in between. Like the other Windows
-  assets, the MSI ships unsigned.
+  ImagePath and recovery actions in between, and drives a real major
+  upgrade that proves a custom configuration directory survives and the
+  service comes back up.
+- Windows binaries, zips and MSIs are Authenticode-signed. On a
+  release, a dedicated job signs the one-file executables, each zip's
+  inner `cronstable.exe` and both MSIs with Azure Artifact Signing,
+  rebuilding the zips and MSIs from the signed payload, so the
+  published `SHA256SUMS` and release assets describe signed bytes.
+  Every signature gets an RFC 3161 timestamp and outlives the
+  short-lived signing certificates. Without the signing secrets the
+  release ships unsigned with a warning, as before.
 
 ## 1.2.39
 

@@ -35,9 +35,13 @@ From an elevated prompt:
 
 ```shell
 msiexec /i cronstable-windows-amd64.msi /qn
-cronstable init C:\ProgramData\cronstable
-cronstable service start
+"C:\Program Files\cronstable\cronstable.exe" init C:\ProgramData\cronstable
+"C:\Program Files\cronstable\cronstable.exe" service start
 ```
+
+The full paths matter: the shell that ran `msiexec` predates the `PATH`
+change the installer made, so a bare `cronstable` only works in shells
+opened later.
 
 The service is registered for automatic start but the MSI does not start
 it on a first install: there is no configuration yet, and a service with
@@ -60,6 +64,10 @@ Pass public properties on the `msiexec` command line
 | `STARTSERVICE` | unset | `1` starts the service at the end of the install, including a first install. Pass it when the configuration is deployed ahead of the package. |
 | `INSTALLFOLDER` | `C:\Program Files\cronstable` | The install directory. |
 
+`CONFIGDIR` and `ADDPATH` are remembered: an upgrade installed without
+them keeps the existing install's values, so a fleet push never has to
+repeat them. Passing one on an upgrade command line changes it.
+
 For a managed rollout that ships configuration with the package, deploy
 the configuration files first (or in the same policy) and install with
 `STARTSERVICE=1`:
@@ -75,10 +83,12 @@ log names the exact action that failed.
 
 Installing a newer MSI over an older one upgrades in place: the old
 version is removed first, and a running service is stopped for the
-switch. The service is started again at the end of the upgrade when the
-machine-wide configuration directory exists, which is the working
-deployment's normal case; a machine that never got configuration stays
-stopped. Windows Installer waits for the service's stop, and the stop
+switch. Install-time properties are remembered (see above), so the
+upgraded service keeps its configuration directory. The service is
+started again at the end of the upgrade when that directory exists,
+which is the working deployment's normal case; a machine that never got
+configuration stays stopped. Windows Installer waits for the service's
+stop, and the stop
 drains running jobs first, so an upgrade during a very long job can time
 out and roll back; for maintenance windows, stop the service yourself
 (`cronstable service stop`) before pushing the upgrade.
@@ -88,9 +98,12 @@ newer install.
 
 ## Signing
 
-Like the other Windows assets, the MSI is not Authenticode-signed. GPO,
-Intune and SCCM deployments do not involve SmartScreen, but a
-browser-downloaded MSI's first run trips it (choose "More info", then
-"Run anyway"), and AppLocker/WDAC publisher rules cannot admit an
-unsigned package; use a hash rule there. Verify a download against the
-release's `SHA256SUMS` when your policy calls for it.
+The MSI, like every Windows release asset, is Authenticode-signed with
+Azure Artifact Signing, and each signature carries an RFC 3161
+timestamp so it outlives the short-lived signing certificates. UAC
+elevation shows the verified publisher, and AppLocker/WDAC deployments
+can admit the package with a publisher rule. GPO, Intune and SCCM
+deployments do not involve SmartScreen; a browser-downloaded MSI's
+first run can still trip it while the signing identity's reputation
+accrues (choose "More info", then "Run anyway"). Verify a download
+against the release's `SHA256SUMS` when your policy calls for it.

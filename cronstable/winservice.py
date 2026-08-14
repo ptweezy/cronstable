@@ -133,6 +133,14 @@ SERVICE_DESCRIPTION = (
     "not a user is logged on."
 )
 
+#: The one-directory release assets the one-file refusal in ``install``
+#: points at.  Owned by release.yml's attach list;
+#: tests/test_ci_fences.py holds the two spellings equal.
+ONEDIR_RELEASE_ASSETS = (
+    "cronstable-windows-amd64.zip",
+    "cronstable-windows-arm64.zip",
+)
+
 #: How often the pending-state pumper reports progress, and the wait hint it
 #: reports.  The SCM's rule is not "start within 30 seconds": it is that
 #: while a state is pending, dwCheckPoint must advance before dwWaitHint
@@ -1353,12 +1361,13 @@ def install(args: Any, api: WinApi) -> int:
             "program in a child process, so the process the Service "
             "Control Manager starts never registers, and the start fails "
             "on the SCM's timeout. Download the one-directory build "
-            "(cronstable-windows-amd64.zip or cronstable-windows-arm64.zip "
-            "on the releases page), extract it, and run `cronstable "
+            "({} on the releases page), extract it, and run `cronstable "
             "service install` from its cronstable.exe; or install the "
             ".msi, which registers the service itself; or install "
             "cronstable with pip or pipx; or keep using the schtasks "
-            "recipe in the Windows documentation."
+            "recipe in the Windows documentation.".format(
+                " or ".join(ONEDIR_RELEASE_ASSETS)
+            )
         )
     config = getattr(args, "config", None)
     if not config:

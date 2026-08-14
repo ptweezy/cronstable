@@ -7,19 +7,13 @@ service. CI builds it in the `binaries-windows` job of
 ```shell
 # 1. A one-directory payload at dist/cronstable (see the spec's knob).
 uv venv && uv pip install pyinstaller==6.21.0 .
-CRONSTABLE_BUNDLE=onedir uv run pyinstaller --workpath build-onedir --noconfirm pyinstaller/cronstable.spec
+CRONSTABLE_BUNDLE=onedir uv run pyinstaller --noconfirm pyinstaller/cronstable.spec
 
-# 2. WiX v6 as a .NET tool, plus the Util extension at the same version.
-dotnet tool install --global wix --version 6.0.1
-wix extension add --global WixToolset.Util.wixext/6.0.1
-
-# 3. Build and validate. Payload must be an absolute path (it is a
-#    compile-time preprocessor variable; a bind path resolves too late for
-#    the Files harvest). -sw1149 is explained at the ServiceConfig element.
-wix build packaging/msi/cronstable.wxs -arch x64 -d Version=0.0.1 \
-  -d Payload="$(cygpath -w "$PWD/dist/cronstable")" \
-  -ext WixToolset.Util.wixext -sw1149 -o dist/cronstable-test.msi
-wix msi validate dist/cronstable-test.msi
+# 2. Build and validate with the same script CI uses (pinned WiX v6
+#    tool + Util extension, version normalization, wix build + wix msi
+#    validate). The recipe lives only there: the gate build and the
+#    signed rebuild must be the same code path.
+sh .github/scripts/build_msi.sh amd64 0.0.1 dist/cronstable dist/cronstable-test.msi
 ```
 
 The service values in `cronstable.wxs` mirror `cronstable service install`

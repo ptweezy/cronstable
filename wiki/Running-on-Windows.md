@@ -95,12 +95,14 @@ detail (which matters only under unusual locked-down filesystems) see
 [Installation](Installation).
 
 The Windows executables carry a version resource (Properties > Details shows
-the product and version) but are **not Authenticode-signed**, so the first
-run of a browser-downloaded .exe trips SmartScreen ("Windows protected your
-PC"): choose "More info", then "Run anyway", and verify the download against
-the release's `SHA256SUMS` if your policy requires it. Environments that
-allowlist by publisher (AppLocker/WDAC publisher rules) cannot admit an
-unsigned binary; use a hash or path rule there, or install through pip.
+the product and version) and are Authenticode-signed with Azure Artifact
+Signing, each signature timestamped so it outlives the short-lived signing
+certificates. The first run of a browser-downloaded .exe can still trip
+SmartScreen ("Windows protected your PC") while the signing identity's
+reputation accrues: choose "More info", then "Run anyway", and verify the
+download against the release's `SHA256SUMS` if your policy requires it.
+Environments that allowlist by publisher (AppLocker/WDAC) can use a
+publisher rule instead of per-release hash rules.
 
 ### One-directory zip (hosts the service)
 
@@ -114,7 +116,8 @@ the [Windows service](Windows-Service); the one-file `.exe` cannot, and
 A browser download carries the Mark of the Web, and extracting with
 Explorer stamps it onto every extracted file, so the first run of the
 extracted `cronstable.exe` would trip SmartScreen file by file. Clearing it
-from the zip before extraction clears it for everything at once:
+from the zip before extraction clears it for everything at once. From an
+elevated PowerShell (writing into `C:\Program Files` needs one):
 
 ```powershell
 Unblock-File .\cronstable-windows-amd64.zip

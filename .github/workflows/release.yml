@@ -961,6 +961,10 @@ jobs:
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+          # The spec's "both" mode emits dist/cronstable.exe and the
+          # service-hosting dist/cronstable/ from one Analysis, instead
+          # of paying the dependency scan twice per arch on every push.
+          CRONSTABLE_BUNDLE: both
         run: |
           set -euo pipefail
           # Runner-native (uv ships a win_arm64 build too); install into a
@@ -998,16 +1002,12 @@ jobs:
           path: dist/cronstable-windows-${{ matrix.arch }}.exe
           if-no-files-found: error
           retention-days: 7
-      - name: Build one-directory bundle
-        env:
-          CRONSTABLE_BUNDLE: onedir
+      - name: Smoke-test and zip the one-directory bundle
         run: |
           set -euo pipefail
-          # Second invocation of the same spec with the onedir knob; its own
-          # workpath so the one-file build's guts cache cannot bleed into a
-          # different layout. dist/cronstable.exe was renamed away above, so
-          # dist/cronstable/ is free.
-          uv run pyinstaller --workpath build-onedir --noconfirm pyinstaller/cronstable.spec
+          # dist/cronstable/ came out of the same spec run as the
+          # one-file exe (CRONSTABLE_BUNDLE=both), so the two layouts
+          # share one Analysis and cannot drift.
           ./dist/cronstable/cronstable.exe --version
           ./dist/cronstable/cronstable.exe --validate-config -c pyinstaller/smoke-push.yaml
           # A real SCM round trip, because hosting a service is this
@@ -1033,55 +1033,29 @@ jobs:
           path: dist/cronstable-windows-${{ matrix.arch }}.zip
           if-no-files-found: error
           retention-days: 7
-      # WiX is not preinstalled on windows-latest (removed from the WS2025
-      # image) or on windows-11-arm; the .NET tool install is the one path
-      # that is identical on both runners. Pinned like pyinstaller, and the
-      # Util extension major must match the tool major. (WiX v6 is under
-      # FireGiant's Open Source Maintenance Fee; open-source CI use is
-      # unaffected.) MSI assembly is not compilation, so -arch is metadata
-      # and the same steps serve both runners.
+      # The recipe lives in the shared script because sign-windows
+      # rebuilds the MSIs with the SAME script: one recipe is what makes
+      # "the gate already proved this MSI" true. test_ci_fences pins
+      # both call sites.
       - name: Build MSI
         env:
           VERSION: ${{ needs.version.outputs.new }}
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          dotnet tool install --global wix --version 6.0.1
-          export PATH="$PATH:$(cygpath -u "$USERPROFILE")/.dotnet/tools"
-          wix extension add --global WixToolset.Util.wixext/6.0.1
-          # ProductVersion must be numeric X.Y.Z (MSI caps 255.255.65535);
-          # strip the setuptools_scm dev suffix on non-release builds, whose
-          # MSIs are 7-day CI artifacts and never published.
-          msiver="$(printf '%s' "$VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
-          case "$ARCH" in
-            amd64) wixarch=x64 ;;
-            arm64) wixarch=arm64 ;;
-          esac
-          # -sw1149: WiX warns on every native ServiceConfig element; the
-          # rationale for keeping it lives at the element in the .wxs.
-          wix build packaging/msi/cronstable.wxs \
-            -arch "$wixarch" \
-            -d Version="$msiver" \
-            -d Payload="$(cygpath -w "$PWD/dist/cronstable")" \
-            -ext WixToolset.Util.wixext \
-            -sw1149 \
-            -o "dist/cronstable-windows-${ARCH}.msi"
-          # ICE validation is a separate command in WiX v4+ (build does not
-          # run it). Errors fail the job.
-          wix msi validate "dist/cronstable-windows-${ARCH}.msi"
+          sh .github/scripts/build_msi.sh "$ARCH" "$VERSION" \
+            dist/cronstable "dist/cronstable-windows-${ARCH}.msi"
       # A real machine-wide install/uninstall on the elevated runner. The
       # service must exist afterwards but never be started: the runner has
       # no configuration, and the .wxs only starts a service on an upgrade
       # that finds one, or on an explicit STARTSERVICE=1.
-      # MSYS2_ARG_CONV_EXCL stops git bash from turning /i /qn into paths.
       - name: Smoke-test MSI (install, verify, uninstall)
         env:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          msi="$(cygpath -w "$PWD/dist/cronstable-windows-${ARCH}.msi")"
-          MSYS2_ARG_CONV_EXCL='*' msiexec /i "$msi" /qn /norestart /l*v msi-install.log \
-            || { tail -n 100 msi-install.log; exit 1; }
+          . .github/scripts/msi_smoke.sh
+          msi_install "dist/cronstable-windows-${ARCH}.msi" msi-install.log
           # Registered, stopped, and the ImagePath is the exact quoted
           # command line winservice.host_argv/image_path would write.
           sc query cronstable | grep -q 'STOPPED'
@@ -1090,14 +1064,60 @@ jobs:
           sc qfailure cronstable | grep -qi 'RESTART'
           # The installed exe runs from Program Files.
           "/c/Program Files/cronstable/cronstable.exe" --version
-          MSYS2_ARG_CONV_EXCL='*' msiexec /x "$msi" /qn /norestart /l*v msi-uninstall.log \
-            || { tail -n 100 msi-uninstall.log; exit 1; }
+          msi_uninstall "dist/cronstable-windows-${ARCH}.msi" msi-uninstall.log
           # Service and files are gone.
           if sc query cronstable >/dev/null 2>&1; then
             echo "service still registered after uninstall" >&2
             exit 1
           fi
           test ! -e "/c/Program Files/cronstable/cronstable.exe"
+      # A real major-upgrade round trip; the fresh-install smoke above
+      # exercises none of the upgrade choreography. Install with a
+      # CUSTOM config directory, upgrade to a patch-bumped twin without
+      # re-passing any property, then require the service still points
+      # at the custom directory and was started by the upgrade. Either
+      # assert missing re-opens the fleet failure: upgrades silently
+      # resetting the config dir and leaving the service stopped.
+      - name: Smoke-test MSI upgrade (remembered properties, restart)
+        env:
+          VERSION: ${{ needs.version.outputs.new }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/msi_smoke.sh
+          sh .github/scripts/build_msi.sh "$ARCH" "$VERSION" \
+            dist/cronstable upgrade-twin.msi bump-patch
+          cfg="/c/cronstable-ci-upgrade-cfg"
+          cfgwin='C:\cronstable-ci-upgrade-cfg'
+          mkdir -p "$cfg"
+          cp pyinstaller/smoke-push.yaml "$cfg/"
+          # Leave neither the install nor the service behind on failure.
+          trap '. .github/scripts/msi_smoke.sh; \
+            msi_uninstall upgrade-twin.msi cleanup-twin.log >/dev/null 2>&1 || true; \
+            msi_uninstall "dist/cronstable-windows-${ARCH}.msi" cleanup-v1.log >/dev/null 2>&1 || true; \
+            rm -rf "$cfg"' EXIT
+          msi_install "dist/cronstable-windows-${ARCH}.msi" upgrade-v1.log \
+            CONFIGDIR="$cfgwin"
+          sc qc cronstable | grep -F "$cfgwin"
+          # The upgrade: no properties on the command line, the managed
+          # rollout's normal shape.
+          msi_install upgrade-twin.msi upgrade-v2.log
+          # The custom directory survived the re-registration.
+          sc qc cronstable | grep -F "$cfgwin"
+          # The probe found the remembered directory: the start
+          # component's marker exists and the service reaches RUNNING
+          # (the config in $cfg already passed --validate-config).
+          MSYS2_ARG_CONV_EXCL='*' reg query 'HKLM\SOFTWARE\cronstable' /v ServiceStartedByMsi
+          for _ in $(seq 1 15); do
+            sc query cronstable | grep -q 'RUNNING' && break
+            sleep 2
+          done
+          sc query cronstable | grep -q 'RUNNING'
+          msi_uninstall upgrade-twin.msi upgrade-uninstall.log
+          if sc query cronstable >/dev/null 2>&1; then
+            echo "service still registered after upgrade uninstall" >&2
+            exit 1
+          fi
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-windows-${{ matrix.arch }}-msi
@@ -1493,10 +1513,17 @@ jobs:
           set -euo pipefail
           # All six or none, docker-push's registry-gate rule: a partial
           # set would fail azure/login mid-release instead of degrading
-          # to the unsigned ship.
+          # to the unsigned ship. The name list IS the env block above
+          # (an unset secret still materializes as an empty env var);
+          # test_ci_fences keeps the env block covering every secret the
+          # job references.
+          names="$(compgen -A export AZURE_ | sort || true)"  # no-match exits 1; the guard below owns that case
+          if [ -z "$names" ]; then
+            echo "no AZURE_* env vars found; the decide step lost its env block" >&2
+            exit 1
+          fi
           missing=""
-          for name in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_SUBSCRIPTION_ID \
-                      AZURE_SIGNING_ENDPOINT AZURE_SIGNING_ACCOUNT AZURE_SIGNING_PROFILE; do
+          for name in $names; do
             [ -n "${!name:-}" ] || missing="$missing $name"
           done
           if [ -n "$missing" ]; then
@@ -1595,27 +1622,14 @@ jobs:
           VERSION: ${{ needs.version.outputs.new }}
         run: |
           set -euo pipefail
-          # Same pinned WiX as binaries-windows' Build MSI step, on the
-          # same .wxs; test_ci_fences keeps the two pin sets equal.
+          # The SAME recipe as binaries-windows' Build MSI step, by
+          # construction: one shared script, so the signed rebuild
+          # cannot drift from the MSI the gate's msiexec smoke proved.
           # -arch is metadata, so this x64 runner builds the arm64
           # package too.
-          dotnet tool install --global wix --version 6.0.1
-          export PATH="$PATH:$(cygpath -u "$USERPROFILE")/.dotnet/tools"
-          wix extension add --global WixToolset.Util.wixext/6.0.1
-          msiver="$(printf '%s' "$VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
           for arch in amd64 arm64; do
-            case "$arch" in
-              amd64) wixarch=x64 ;;
-              arm64) wixarch=arm64 ;;
-            esac
-            wix build packaging/msi/cronstable.wxs \
-              -arch "$wixarch" \
-              -d Version="$msiver" \
-              -d Payload="$(cygpath -w "$PWD/work/${arch}/cronstable")" \
-              -ext WixToolset.Util.wixext \
-              -sw1149 \
-              -o "out/cronstable-windows-${arch}.msi"
-            wix msi validate "out/cronstable-windows-${arch}.msi"
+            sh .github/scripts/build_msi.sh "$arch" "$VERSION" \
+              "work/${arch}/cronstable" "out/cronstable-windows-${arch}.msi"
           done
       - name: Sign the MSIs
         if: steps.decide.outputs.signed == 'true'
@@ -1630,25 +1644,28 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
-      # The action can exit 0 having signed nothing (a filter typo, for
-      # instance), so check the exact bytes being uploaded. work/ is the
-      # tree the zips were built from, so checking it covers the exe
-      # inside each zip.
+      # The action can exit 0 having signed nothing (a filter typo), so
+      # check the exact bytes being uploaded. The set is DERIVED, not
+      # enumerated: everything in out/ except the zips, plus each
+      # payload root's exes (work/ is the tree the zips were built
+      # from, so that covers the exe inside each zip). A new asset in
+      # out/ is verified without being listed here; the count floor
+      # catches the set shrinking.
       - name: Verify every signature
         if: steps.decide.outputs.signed == 'true'
         shell: pwsh
         run: |
-          $files = @(
-            'out\cronstable-windows-amd64.exe', 'out\cronstable-windows-arm64.exe',
-            'out\cronstable-windows-amd64.msi', 'out\cronstable-windows-arm64.msi',
-            'work\amd64\cronstable\cronstable.exe', 'work\arm64\cronstable\cronstable.exe'
-          )
+          $files = @(Get-ChildItem out -File | Where-Object Extension -ne '.zip') +
+                   @(Get-ChildItem work\*\cronstable -File -Filter *.exe)
+          if ($files.Count -lt 6) {
+            throw "expected at least 6 signed files (2 exes, 2 MSIs, 2 payload exes), found $($files.Count)"
+          }
           foreach ($f in $files) {
-            $sig = Get-AuthenticodeSignature $f
+            $sig = Get-AuthenticodeSignature $f.FullName
             if ($sig.Status -ne 'Valid') {
-              throw "unsigned or invalid signature on ${f}: $($sig.Status) $($sig.StatusMessage)"
+              throw "unsigned or invalid signature on $($f.FullName): $($sig.Status) $($sig.StatusMessage)"
             }
-            Write-Host "OK $f -> $($sig.SignerCertificate.Subject)"
+            Write-Host "OK $($f.FullName) -> $($sig.SignerCertificate.Subject)"
           }
       # A real msiexec round trip on the signed amd64 package (this
       # runner is x64 and elevated). The ImagePath/recovery greps stay
@@ -1659,14 +1676,13 @@ jobs:
         if: steps.decide.outputs.signed == 'true'
         run: |
           set -euo pipefail
-          msi="$(cygpath -w "$PWD/out/cronstable-windows-amd64.msi")"
-          trap 'MSYS2_ARG_CONV_EXCL="*" msiexec /x "$msi" /qn /norestart >/dev/null 2>&1 || true' EXIT
-          MSYS2_ARG_CONV_EXCL='*' msiexec /i "$msi" /qn /norestart /l*v signed-install.log \
-            || { tail -n 100 signed-install.log; exit 1; }
+          . .github/scripts/msi_smoke.sh
+          msi="out/cronstable-windows-amd64.msi"
+          trap 'msi_uninstall "$msi" signed-cleanup.log >/dev/null 2>&1 || true' EXIT
+          msi_install "$msi" signed-install.log
           sc query cronstable | grep -q 'STOPPED'
           "/c/Program Files/cronstable/cronstable.exe" --version
-          MSYS2_ARG_CONV_EXCL='*' msiexec /x "$msi" /qn /norestart /l*v signed-uninstall.log \
-            || { tail -n 100 signed-uninstall.log; exit 1; }
+          msi_uninstall "$msi" signed-uninstall.log
       - name: Upload the signed set
         if: steps.decide.outputs.signed == 'true'
         uses: actions/upload-artifact@v7.0.1

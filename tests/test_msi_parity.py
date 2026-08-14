@@ -160,6 +160,96 @@ def test_upgrade_scheduling_stays_early():
     assert package.get("UpgradeCode") == UPGRADE_CODE
 
 
+def test_configdir_and_addpath_are_remembered_across_upgrades():
+    # Windows Installer forgets command-line properties between
+    # transactions: without the remember-property pattern, an upgrade
+    # run without CONFIGDIR=... re-registers the service against the
+    # default directory, and an ADDPATH=0 install grows its PATH entry
+    # back. Fence every leg: the registry write, the AppSearch
+    # read-back, and the save/restore pair that keeps an explicit
+    # command-line value winning.
+    root = _root()
+    values = {
+        v.get("Name"): v for v in root.findall(".//wxs:RegistryValue", NS)
+    }
+    properties = {
+        p.get("Id"): p for p in root.findall(".//wxs:Property", NS)
+    }
+    setprops = root.findall(".//wxs:SetProperty", NS)
+    for prop, reg_name in [("CONFIGDIR", "ConfigDir"), ("ADDPATH", "AddPath")]:
+        # Written with the resolved value from an unconditional
+        # component (PathEntry vanishes under ADDPATH=0, exactly when
+        # AddPath most needs remembering).
+        value = values[reg_name]
+        assert value.get("Root") == "HKLM"
+        assert value.get("Key") == "SOFTWARE\\cronstable"
+        assert value.get("Value") == "[{}]".format(prop)
+        holder = [
+            c
+            for c in root.findall(".//wxs:Component", NS)
+            if value in list(c)
+        ]
+        assert len(holder) == 1
+        assert holder[0].get("Condition") is None
+        # Read back by AppSearch on the next transaction.
+        search = properties[prop].find("wxs:RegistrySearch", NS)
+        assert search is not None, "{} lost its read-back".format(prop)
+        assert search.get("Root") == "HKLM"
+        assert search.get("Key") == "SOFTWARE\\cronstable"
+        assert search.get("Name") == reg_name
+        # Command-line precedence: saved before AppSearch can clobber it,
+        # restored after.
+        save = [
+            s
+            for s in setprops
+            if s.get("Id") == "CMDLINE_" + prop
+            and s.get("Before") == "AppSearch"
+        ]
+        restore = [
+            s
+            for s in setprops
+            if s.get("Id") == prop
+            and s.get("After") == "AppSearch"
+            and s.get("Value") == "[CMDLINE_{}]".format(prop)
+        ]
+        assert len(save) == 1, "{} lost its command-line save".format(prop)
+        assert save[0].get("Condition") == prop
+        assert len(restore) == 1, "{} lost its restore".format(prop)
+    # ADDPATH's default must NOT be a declared Value="1":
+    # indistinguishable from an explicit ADDPATH=1, whose save would
+    # clobber a remembered 0.
+    assert properties["ADDPATH"].get("Value") is None
+    defaults = [
+        s
+        for s in setprops
+        if s.get("Id") == "ADDPATH" and s.get("Condition") == "NOT ADDPATH"
+    ]
+    assert len(defaults) == 1 and defaults[0].get("Value") == "1"
+
+
+def test_config_probe_follows_the_remembered_configdir():
+    # The start-on-upgrade condition asks "does the PREVIOUS install's
+    # config directory exist", not "does the default location exist",
+    # so an upgrade with a custom CONFIGDIR gets its restart too. The
+    # probe goes through the same remembered registry value as the
+    # CONFIGDIR read-back.
+    root = _root()
+    found = next(
+        p
+        for p in root.findall(".//wxs:Property", NS)
+        if p.get("Id") == "CRONSTABLE_CONFIG_FOUND"
+    )
+    search = found.find("wxs:RegistrySearch", NS)
+    assert search is not None, "the config probe lost its registry hop"
+    assert search.get("Root") == "HKLM"
+    assert search.get("Key") == "SOFTWARE\\cronstable"
+    assert search.get("Name") == "ConfigDir"
+    assert search.get("Type") == "directory"
+    # The nested DirectorySearch turns "the value exists" into "the
+    # directory it names exists".
+    assert search.find("wxs:DirectorySearch", NS) is not None
+
+
 def test_install_sets_nothing_the_msi_does_not():
     with open(WINSERVICE, encoding="utf-8") as fobj:
         tree = ast.parse(fobj.read())

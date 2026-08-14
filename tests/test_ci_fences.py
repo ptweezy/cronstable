@@ -179,32 +179,58 @@ def test_release_hashes_exactly_what_it_attaches():
     )
 
 
-def test_wix_tool_and_extension_pins_match():
-    # The Util extension's major must match the wix tool's major, and
-    # the MSI is built in TWO jobs (binaries-windows' gate build,
-    # sign-windows' signed rebuild), so all four pins must move together
-    # or a release ships an MSI built by a WiX the gate never proved. A
-    # docs-only PR never runs the Windows lane, so pin it here.
-    pins = {}
+def test_msi_build_recipe_is_shared_and_pinned():
+    # The MSI is built in TWO jobs (the gate build, whose msiexec smoke
+    # proves the .wxs semantics, and the signed rebuild). The recipe
+    # must be one code path or a release ships a signed MSI built
+    # differently from the one the gate proved: both jobs must invoke
+    # the shared script without regrowing a private wix invocation, and
+    # the script's tool and extension pins must match. A docs-only PR
+    # never runs the Windows lane, so pin it here.
+    script_path = os.path.join(ROOT, ".github", "scripts", "build_msi.sh")
+    with open(script_path, encoding="utf-8") as fobj:
+        script = fobj.read()
+    tool = re.search(r"^WIX_TOOL_VERSION=(\S+)$", script, re.M)
+    ext = re.search(r"^WIX_UTIL_VERSION=(\S+)$", script, re.M)
+    assert tool is not None, "build_msi.sh lost its wix tool pin"
+    assert ext is not None, "build_msi.sh lost its Util extension pin"
+    assert tool.group(1) == ext.group(1), (
+        "wix pins moved apart: tool {}, extension {}".format(
+            tool.group(1), ext.group(1)
+        )
+    )
     for job_name, step_name in [
         ("binaries-windows", "Build MSI"),
         ("sign-windows", "Rebuild the MSIs from the signed payload"),
     ]:
         run = _named_steps(_workflow()["jobs"][job_name])[step_name]["run"]
-        tool = re.search(
-            r"dotnet tool install --global wix --version (\S+)", run
+        assert ".github/scripts/build_msi.sh" in run, (
+            "{}: no longer builds through the shared script".format(job_name)
         )
-        ext = re.search(r"WixToolset\.Util\.wixext/(\S+)", run)
-        assert tool is not None, (
-            "{}: the wix tool install lost its pin".format(job_name)
+        assert "wix build" not in run, (
+            "{}: grew a private wix invocation beside the shared "
+            "script".format(job_name)
         )
-        assert ext is not None, "{}: the Util extension lost its pin".format(
-            job_name
-        )
-        pins[job_name] = (tool.group(1), ext.group(1))
-    assert len({pin for pair in pins.values() for pin in pair}) == 1, (
-        "wix pins moved apart: {}".format(pins)
-    )
+
+
+def test_msi_smoke_steps_share_the_msiexec_helpers():
+    # The msiexec incantation (MSYS2_ARG_CONV_EXCL, exit 3010 counted
+    # as the reboot-required success it is, the log tail on failure)
+    # lives once in msi_smoke.sh. A step spelling msiexec by hand
+    # regrows the duplicate and its 3010 flake, which in sign-windows
+    # fails the release.
+    for job_name, step_name in [
+        ("binaries-windows", "Smoke-test MSI (install, verify, uninstall)"),
+        (
+            "binaries-windows",
+            "Smoke-test MSI upgrade (remembered properties, restart)",
+        ),
+        ("sign-windows", "Smoke-test the signed amd64 MSI (install, uninstall)"),
+    ]:
+        run = _named_steps(_workflow()["jobs"][job_name])[step_name]["run"]
+        assert ".github/scripts/msi_smoke.sh" in run, step_name
+        assert "msiexec /i" not in run, step_name
+        assert "msiexec /x" not in run, step_name
 
 
 # --------------------------------------------------------------------------
@@ -271,6 +297,46 @@ def test_signed_set_covers_every_windows_release_asset():
     assert signed == attached, "signed-only: {}, attached-only: {}".format(
         sorted(signed - attached), sorted(attached - signed)
     )
+
+
+def test_decide_step_env_covers_every_signing_secret():
+    # The decide step's env block is the single enumeration of the
+    # signing secrets (its shell derives the all-or-none check from the
+    # AZURE_* env vars). A secret referenced by a later step but absent
+    # from the env block is not gated: the job claims signed=true and
+    # then fails mid-release.
+    job = _workflow()["jobs"][SIGN_JOB]
+    decide = _named_steps(job)["Decide whether to sign"]
+    env_keys = set(decide.get("env") or {})
+    referenced = set()
+    for step in job["steps"]:
+        referenced |= set(re.findall(r"secrets\.(AZURE_\w+)", str(step)))
+    assert referenced, "no AZURE_ secret references: the detector went stale"
+    missing = sorted(referenced - env_keys)
+    assert not missing, (
+        "signing secrets referenced by sign-windows steps but not gated "
+        "by the decide step's env block: {}".format(missing)
+    )
+
+
+def test_refusal_message_assets_are_release_assets():
+    # The one-file refusal names the zips, and the names are owned by
+    # the release attach list: a rename there must move the message too,
+    # or it sends users hunting for a filename no release carries.
+    from cronstable import winservice
+
+    release_steps = _named_steps(_workflow()["jobs"]["release"])
+    attached = set(
+        re.findall(
+            r"binaries/(cronstable-windows-\S+)",
+            release_steps["Create GitHub Release"]["with"]["files"],
+        )
+    )
+    for asset in winservice.ONEDIR_RELEASE_ASSETS:
+        assert asset in attached, (
+            "the refusal message names {}, which the release does not "
+            "attach".format(asset)
+        )
 
 
 def test_every_signing_step_carries_a_timestamp():
