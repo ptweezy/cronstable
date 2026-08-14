@@ -1894,17 +1894,18 @@ def report_config_enabled(report_config: dict[str, Any]) -> bool:
     # persisted shapes, hand-built test configs) keep working.
     if (report_config.get("push") or {}).get("enabled"):
         return True
-    # eventlog last, and the platform probe behind the dict probe: this
-    # function is the whole cost of a completion in the common
-    # no-reporter deployment, so the default path must short-circuit
-    # before it reads a module global. The platform test belongs to the
-    # mirror rather than being a nicety, because the reporter's own second
-    # early return IS the platform: without it, an eventlog-only config
-    # would schedule a fan-out on every completion on Linux for six
+    # eventlog last, with the platform tested before the dict: on POSIX
+    # the reporter is a no-op and the attribute read is cheaper than the
+    # dict probes (dict first measured +15.6% on job.report_noop_100k at
+    # the 1.2.40 perf gate). platform.IS_WINDOWS is read at call time
+    # because tests monkeypatch it. The platform test is part of the
+    # mirror: the reporter's own second early return IS the platform, so
+    # an eventlog-only config on Linux reads as disabled here too.
+    # Otherwise every completion would schedule a fan-out for six
     # reporters that all drop it on arrival.
-    return bool((report_config.get("eventlog") or {}).get("enabled")) and bool(
-        platform.IS_WINDOWS
-    )
+    if not platform.IS_WINDOWS:
+        return False
+    return bool((report_config.get("eventlog") or {}).get("enabled"))
 
 
 #: The key set every reporting context's ``template_vars`` exposes.
