@@ -10,6 +10,7 @@ matrix they select from, and pins the enforcement to junitxml counts
 instead of a stdout grep.
 """
 
+import fnmatch
 import os
 import re
 
@@ -179,20 +180,111 @@ def test_release_hashes_exactly_what_it_attaches():
 
 
 def test_wix_tool_and_extension_pins_match():
-    # The Util extension's major must match the wix tool's major, and the
-    # two are pinned in the same step; a bump that moves one without the
-    # other fails at build time in CI, but only on a Windows lane run,
-    # which a docs-only PR never triggers. Pin them to each other here.
-    job = _workflow()["jobs"]["binaries-windows"]
-    run = _named_steps(job)["Build MSI"]["run"]
-    tool = re.search(
-        r"dotnet tool install --global wix --version (\S+)", run
+    # The Util extension's major must match the wix tool's major, and
+    # the MSI is built in TWO jobs (binaries-windows' gate build,
+    # sign-windows' signed rebuild), so all four pins must move together
+    # or a release ships an MSI built by a WiX the gate never proved. A
+    # docs-only PR never runs the Windows lane, so pin it here.
+    pins = {}
+    for job_name, step_name in [
+        ("binaries-windows", "Build MSI"),
+        ("sign-windows", "Rebuild the MSIs from the signed payload"),
+    ]:
+        run = _named_steps(_workflow()["jobs"][job_name])[step_name]["run"]
+        tool = re.search(
+            r"dotnet tool install --global wix --version (\S+)", run
+        )
+        ext = re.search(r"WixToolset\.Util\.wixext/(\S+)", run)
+        assert tool is not None, (
+            "{}: the wix tool install lost its pin".format(job_name)
+        )
+        assert ext is not None, "{}: the Util extension lost its pin".format(
+            job_name
+        )
+        pins[job_name] = (tool.group(1), ext.group(1))
+    assert len({pin for pair in pins.values() for pin in pair}) == 1, (
+        "wix pins moved apart: {}".format(pins)
     )
-    ext = re.search(r"WixToolset\.Util\.wixext/(\S+)", run)
-    assert tool is not None, "the wix tool install lost its pin"
-    assert ext is not None, "the Util extension lost its pin"
-    assert tool.group(1) == ext.group(1), (
-        "wix tool pin {} and Util extension pin {} moved apart".format(
-            tool.group(1), ext.group(1)
+
+
+# --------------------------------------------------------------------------
+# Windows signing: the signed set must be what actually ships
+# --------------------------------------------------------------------------
+
+SIGN_JOB = "sign-windows"
+UPLOAD_STEP = "Upload the signed set"
+OVERLAY_STEP = "Overlay the signed Windows artifacts"
+
+
+def test_signed_upload_name_dodges_the_broad_release_download():
+    # The release job merges every cronstable-* artifact into one
+    # directory, so a signed artifact matching that pattern would leave
+    # signed and unsigned copies of the same filenames to fight over
+    # download order. The overlay step must also name exactly the
+    # artifact the sign job uploads.
+    upload = _named_steps(_workflow()["jobs"][SIGN_JOB])[UPLOAD_STEP]
+    name = str(upload["with"]["name"])
+    release_steps = _named_steps(_workflow()["jobs"]["release"])
+    broad = str(release_steps["Download release binaries"]["with"]["pattern"])
+    assert not fnmatch.fnmatch(name, broad), (
+        "signed artifact name {!r} matches the broad download pattern "
+        "{!r}".format(name, broad)
+    )
+    assert str(release_steps[OVERLAY_STEP]["with"]["name"]) == name
+
+
+def test_release_overlays_the_signed_set_before_hashing():
+    # The overlay must sit after the broad download (or the unsigned
+    # set wins) and before SHA256SUMS (or the sums describe bytes that
+    # are not attached). Its gate reads the sign job's output, which
+    # requires sign-windows in needs; without that the expression is
+    # silently empty and a signed release ships unsigned.
+    job = _workflow()["jobs"]["release"]
+    assert SIGN_JOB in job["needs"]
+    names = [step.get("name") for step in job["steps"]]
+    assert (
+        names.index("Download release binaries")
+        < names.index(OVERLAY_STEP)
+        < names.index("Generate SHA256SUMS")
+    )
+    overlay = _named_steps(job)[OVERLAY_STEP]
+    assert "needs.sign-windows.outputs.signed" in str(overlay["if"])
+
+
+def test_signed_set_covers_every_windows_release_asset():
+    # A Windows asset added to the release lists must go through the
+    # sign job too, and one that stops shipping must leave it, or a new
+    # asset ships unsigned beside its signed siblings.
+    upload = _named_steps(_workflow()["jobs"][SIGN_JOB])[UPLOAD_STEP]
+    signed = {
+        os.path.basename(line.strip())
+        for line in str(upload["with"]["path"]).splitlines()
+        if line.strip()
+    }
+    release_steps = _named_steps(_workflow()["jobs"]["release"])
+    attached = set(
+        re.findall(
+            r"binaries/(cronstable-windows-\S+)",
+            release_steps["Create GitHub Release"]["with"]["files"],
         )
     )
+    assert signed == attached, "signed-only: {}, attached-only: {}".format(
+        sorted(signed - attached), sorted(attached - signed)
+    )
+
+
+def test_every_signing_step_carries_a_timestamp():
+    # Artifact Signing rotates its leaf certificates within days and
+    # the signing action does not timestamp by default, so an
+    # untimestamped signature dies with its certificate. Every signing
+    # step must pin both timestamp inputs.
+    steps = [
+        step
+        for step in _workflow()["jobs"][SIGN_JOB]["steps"]
+        if "artifact-signing-action" in str(step.get("uses", ""))
+    ]
+    assert steps, "no signing steps found: the detector went stale"
+    for step in steps:
+        with_block = step.get("with") or {}
+        assert with_block.get("timestamp-rfc3161"), step.get("name")
+        assert with_block.get("timestamp-digest"), step.get("name")
