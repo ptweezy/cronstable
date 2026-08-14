@@ -261,6 +261,11 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# A wedged await (the intermittent 3.12 test_dag_tools_full_flow hang) must
+# dump every thread's stack and fail the run, not burn the 30 min CI job
+# timeout and report "cancelled". Armed per test; no test comes near 300s.
+faulthandler_timeout = 300
+faulthandler_exit_on_timeout = true
 
 [tool.coverage.run]
 source = ["cronstable"]
