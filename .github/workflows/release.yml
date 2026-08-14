@@ -1656,7 +1656,7 @@ jobs:
         shell: pwsh
         run: |
           $files = @(Get-ChildItem out -File | Where-Object Extension -ne '.zip') +
-                   @(Get-ChildItem work\*\cronstable -File -Filter *.exe)
+                   @(Get-ChildItem work\*\cronstable\*.exe -File)
           if ($files.Count -lt 6) {
             throw "expected at least 6 signed files (2 exes, 2 MSIs, 2 payload exes), found $($files.Count)"
           }
