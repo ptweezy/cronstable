@@ -52,11 +52,11 @@ mirrors into the past (floor 1970); ``occurrences`` iterates real
 instants, never yielding one twice.
 """
 
-import bisect
 import datetime
 import hashlib
 import itertools
 import re
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Iterator, Mapping
 from typing import (
     Optional,
@@ -769,6 +769,8 @@ class CronTab:
         "_months_sorted",
         "_years_sorted",
         "_dom_sorted",
+        "_first_hms",
+        "_last_hms",
         "_dow_free",
         "_days_plain",
         "_resolved_differs",
@@ -777,12 +779,13 @@ class CronTab:
     def __init__(self, crontab: str, hash_key: Optional[str] = None) -> None:
         self._source = " ".join(crontab.split())
         self._resolved = self._source
-        fields = crontab.lower().split()
+        lowered = crontab.lower()
+        fields = lowered.split()
         # Skip the (not cheap) H expansion when no 'h' appears at all;
         # ``display is None`` already means "nothing to resolve".
         # Deliberately conservative: any 'h' (``thu``, ``@hourly``) still
         # takes the expansion path, so no spelling of H can slip past.
-        has_hash = "h" in crontab or "H" in crontab
+        has_hash = "h" in lowered
         display: Optional[list[str]] = (
             self._source.split() if has_hash else None
         )
@@ -872,6 +875,10 @@ class CronTab:
         self._years_sorted = (
             _sorted_tuple(self._years) if self._years is not None else ()
         )
+        # _first_time/_last_time's answers for tod=None, built on first
+        # use so a parse-and-discard CronTab never pays for them.
+        self._first_hms: Optional[_HMS] = None
+        self._last_hms: Optional[_HMS] = None
         # Whether the day-of-week column constrains anything.  All seven
         # values makes the second half of the plain-day test a tautology,
         # letting _next_civil bisect straight through the day-of-month
@@ -1044,10 +1051,8 @@ class CronTab:
     ) -> bool:
         """The AND of the day-of-month and day-of-week constraints.
 
-        ``month_end`` is passed in rather than recomputed: every caller
-        already holds it and this runs per candidate day.  The civil walks
-        do not call this at all when :attr:`_days_plain` holds; see
-        :meth:`_next_civil`.
+        Only :meth:`test` calls this; the civil walks inline the same
+        dom/dow pair with the weekday carried forward day to day.
         """
         if not self._dom_matches(year, month, day, month_end):
             return False
@@ -1203,8 +1208,11 @@ class CronTab:
         tod: Optional[datetime.time] = base.time()
         years = self._years
         years_sorted = self._years_sorted
+        months = self._months
         months_sorted = self._months_sorted
-        while year <= _YEAR_HORIZON:
+        days_plain = self._days_plain
+        horizon = _YEAR_HORIZON
+        while year <= horizon:
             # membership against the frozenset, not a scan of the tuple
             if years is not None and year not in years:
                 next_year = self._next_in(years_sorted, year)
@@ -1212,7 +1220,7 @@ class CronTab:
                     return None
                 year, month, day, tod = next_year, 1, 1, None
                 continue
-            if month not in self._months:
+            if month not in months:
                 nxt = self._next_in(months_sorted, month)
                 if nxt is None:
                     year, month = year + 1, months_sorted[0]
@@ -1222,19 +1230,24 @@ class CronTab:
                 continue
             month_end = _month_end(year, month)
             # ``day`` is always a real day of this month here (base's own
-            # day on the first pass, 1 after), so the weekday seed below
+            # day on the first pass, 1 after), so the weekday seeds below
             # cannot be asked for a date that does not exist.
-            if self._days_plain:
+            if days_plain:
                 found = self._next_plain_day(year, month, day, month_end, tod)
                 if found is not None:
                     return found
             else:
+                # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
+                dow = (datetime.date(year, month, day).weekday() + 1) % 7
                 while day <= month_end:
-                    if self._day_matches(year, month, day, month_end):
+                    if self._dom_matches(
+                        year, month, day, month_end
+                    ) and self._dow_matches(dow, day, month_end):
                         found = self._at_first_time(year, month, day, tod)
                         if found is not None:
                             return found
                     day += 1
+                    dow = dow + 1 if dow < 6 else 0
                     tod = None
             month += 1
             day, tod = 1, None
@@ -1263,7 +1276,7 @@ class CronTab:
             # constrains the day: bisect to each listed day instead of
             # testing every calendar day in between.
             dom_sorted = self._dom_sorted
-            index = bisect.bisect_left(dom_sorted, day)
+            index = bisect_left(dom_sorted, day)
             seed_day = day
             while index < len(dom_sorted):
                 day = dom_sorted[index]
@@ -1277,8 +1290,8 @@ class CronTab:
                 index += 1
             return None
         # Two set lookups per candidate day, the weekday carried forward
-        # instead of rebuilt per day.  Exactly the _day_matches test of
-        # _next_civil's general branch (see _days_plain).
+        # instead of rebuilt per day.  Exactly the dom/dow test of
+        # _next_civil's L/W/# branch with the plain sets (see _days_plain).
         dom = self._dom
         dow_set = self._dow
         # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
@@ -1329,10 +1342,8 @@ class CronTab:
     @staticmethod
     def _next_in(ordered: tuple[int, ...], current: int) -> Optional[int]:
         """First element of ``ordered`` greater than ``current``."""
-        for value in ordered:
-            if value > current:
-                return value
-        return None
+        index = bisect_right(ordered, current)
+        return ordered[index] if index < len(ordered) else None
 
     def _first_time(
         self, at_or_after: Optional[datetime.time]
@@ -1345,23 +1356,30 @@ class CronTab:
         moves to the next hour.  Returns a plain ``(hour, minute, second)``
         because the only consumer feeds a datetime constructor.
         """
+        if at_or_after is None:
+            hms = self._first_hms
+            if hms is None:
+                hms = self._first_hms = (
+                    self._hours_sorted[0],
+                    self._minutes_sorted[0],
+                    self._seconds_sorted[0],
+                )
+            return hms
         hours = self._hours_sorted
         minutes = self._minutes_sorted
         seconds = self._seconds_sorted
-        if at_or_after is None:
-            return (hours[0], minutes[0], seconds[0])
         hour = at_or_after.hour
-        index = bisect.bisect_left(hours, hour)
+        index = bisect_left(hours, hour)
         if index == len(hours):
             return None
         if hours[index] > hour:
             return (hours[index], minutes[0], seconds[0])
         minute = at_or_after.minute
-        m_index = bisect.bisect_left(minutes, minute)
+        m_index = bisect_left(minutes, minute)
         if m_index < len(minutes):
             if minutes[m_index] > minute:
                 return (hour, minutes[m_index], seconds[0])
-            s_index = bisect.bisect_left(seconds, at_or_after.second)
+            s_index = bisect_left(seconds, at_or_after.second)
             if s_index < len(seconds):
                 return (hour, minute, seconds[s_index])
             if m_index + 1 < len(minutes):
@@ -1443,15 +1461,18 @@ class CronTab:
         tod: Optional[datetime.time] = base.time()
         years = self._years
         years_sorted = self._years_sorted
+        months = self._months
         months_sorted = self._months_sorted
-        while year >= _YEAR_FLOOR:
+        days_plain = self._days_plain
+        floor = _YEAR_FLOOR
+        while year >= floor:
             if years is not None and year not in years:
                 prev_year = self._prev_in(years_sorted, year)
                 if prev_year is None:
                     return None
                 year, month, day, tod = prev_year, 12, 31, None
                 continue
-            if month not in self._months:
+            if month not in months:
                 prv = self._prev_in(months_sorted, month)
                 if prv is None:
                     year, month = year - 1, months_sorted[-1]
@@ -1463,18 +1484,24 @@ class CronTab:
             if day > month_end:
                 day = month_end  # clamp the rollback sentinel into the month
             # the clamp above leaves ``day`` a real day of this month, so the
-            # weekday seed cannot be asked for a date that does not exist.
-            if self._days_plain:
+            # weekday seeds below cannot be asked for a date that does not
+            # exist.
+            if days_plain:
                 found = self._prev_plain_day(year, month, day, tod)
                 if found is not None:
                     return found
             else:
+                # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
+                dow = (datetime.date(year, month, day).weekday() + 1) % 7
                 while day >= 1:
-                    if self._day_matches(year, month, day, month_end):
+                    if self._dom_matches(
+                        year, month, day, month_end
+                    ) and self._dow_matches(dow, day, month_end):
                         found = self._at_last_time(year, month, day, tod)
                         if found is not None:
                             return found
                     day -= 1
+                    dow = dow - 1 if dow > 0 else 6
                     tod = None
             month -= 1
             day, tod = 31, None
@@ -1496,7 +1523,7 @@ class CronTab:
         """
         if self._dow_free:
             dom_sorted = self._dom_sorted
-            index = bisect.bisect_right(dom_sorted, day) - 1
+            index = bisect_right(dom_sorted, day) - 1
             seed_day = day
             while index >= 0:
                 day = dom_sorted[index]
@@ -1523,10 +1550,8 @@ class CronTab:
     @staticmethod
     def _prev_in(ordered: tuple[int, ...], current: int) -> Optional[int]:
         """Last element of ``ordered`` less than ``current``."""
-        for value in reversed(ordered):
-            if value < current:
-                return value
-        return None
+        index = bisect_left(ordered, current) - 1
+        return ordered[index] if index >= 0 else None
 
     def _last_time(
         self, at_or_before: Optional[datetime.time]
@@ -1536,23 +1561,30 @@ class CronTab:
         The backward mirror of :meth:`_first_time`, with the order of
         preference reversed and the same ``(hour, minute, second)`` return.
         """
+        if at_or_before is None:
+            hms = self._last_hms
+            if hms is None:
+                hms = self._last_hms = (
+                    self._hours_sorted[-1],
+                    self._minutes_sorted[-1],
+                    self._seconds_sorted[-1],
+                )
+            return hms
         hours = self._hours_sorted
         minutes = self._minutes_sorted
         seconds = self._seconds_sorted
-        if at_or_before is None:
-            return (hours[-1], minutes[-1], seconds[-1])
         hour = at_or_before.hour
-        index = bisect.bisect_right(hours, hour) - 1
+        index = bisect_right(hours, hour) - 1
         if index < 0:
             return None
         if hours[index] < hour:
             return (hours[index], minutes[-1], seconds[-1])
         minute = at_or_before.minute
-        m_index = bisect.bisect_right(minutes, minute) - 1
+        m_index = bisect_right(minutes, minute) - 1
         if m_index >= 0:
             if minutes[m_index] < minute:
                 return (hour, minutes[m_index], seconds[-1])
-            s_index = bisect.bisect_right(seconds, at_or_before.second) - 1
+            s_index = bisect_right(seconds, at_or_before.second) - 1
             if s_index >= 0:
                 return (hour, minute, seconds[s_index])
             if m_index >= 1:
