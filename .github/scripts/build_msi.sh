@@ -59,12 +59,16 @@ esac
 
 # -sw1149: WiX warns on every native ServiceConfig element; the rationale
 # for keeping it lives at the element in the .wxs.
+# -pdbtype none: no .wixpdb beside the .msi. sign-windows verifies a
+# signature on everything in its output folder, and a debug pdb is not
+# a signable file type.
 wix build packaging/msi/cronstable.wxs \
   -arch "$wixarch" \
   -d Version="$msiver" \
   -d Payload="$(cygpath -w "$(realpath "$payload")")" \
   -ext WixToolset.Util.wixext \
   -sw1149 \
+  -pdbtype none \
   -o "$out"
 # ICE validation is a separate command in WiX v4+ (build does not run
 # it). Errors fail the job.

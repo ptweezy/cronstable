@@ -5,6 +5,9 @@
 More Windows work: a service host, a Task Scheduler importer, and a
 reporter that writes to the Windows Event Log.
 
+- Windows release assets are now Authenticode signed for both
+  architectures: the one-file exe, the exe inside the zip, and the MSI.
+  Signing runs through Azure Artifact Signing.
 - The readers that answer "which run is the newest" judge by finish time
   instead of by position in the stream. Chaining orders the appends one
   node makes. It cannot order what a peer node sharing the mount appends
