@@ -20,10 +20,10 @@ cronstable supports Windows on two CPU architectures: `amd64` (x64) and `arm64`
 (ARM64). You can install it either as a normal Python package or as a
 self-contained executable.
 
-| Architecture | pip / pipx | Standalone binary |
-| --- | --- | --- |
-| `amd64` (x64) | `pip install cronstable` | `cronstable-windows-amd64.exe` |
-| `arm64` (ARM64) | `pip install cronstable` | `cronstable-windows-arm64.exe` |
+| Architecture | pip / pipx | Standalone binary | Zip (one-directory) | MSI |
+| --- | --- | --- | --- | --- |
+| `amd64` (x64) | `pip install cronstable` | `cronstable-windows-amd64.exe` | `cronstable-windows-amd64.zip` | `cronstable-windows-amd64.msi` |
+| `arm64` (ARM64) | `pip install cronstable` | `cronstable-windows-arm64.exe` | `cronstable-windows-arm64.zip` | `cronstable-windows-arm64.msi` |
 
 The test suite runs on Windows (both x64 and ARM64) in CI on every commit,
 with a small set of POSIX-only tests (per-job user/group switching, privilege
@@ -34,7 +34,22 @@ release workflow.
 
 ## Installation
 
-There are three ways to install cronstable on Windows.
+There are five ways to install cronstable on Windows.
+
+### MSI (machine-wide, hosts the service)
+
+Every release attaches an MSI per architecture. It installs to
+`C:\Program Files\cronstable`, registers the [Windows
+service](Windows-Service) and puts the install directory on the system
+`PATH`, and it is the path for managed deployment through GPO, Intune or
+SCCM:
+
+```shell
+msiexec /i cronstable-windows-amd64.msi /qn
+```
+
+See [Windows MSI](Windows-MSI) for the silent-install properties, upgrade
+behavior and first-start steps.
 
 ### winget
 
@@ -47,7 +62,7 @@ winget install ptweezy.cronstable
 
 Upgrade later with `winget upgrade ptweezy.cronstable`. The winget package is
 a per-user install of the portable executable; for a machine-wide deployment
-use the standalone binary below and place it yourself.
+use the MSI above or the zip below.
 
 ### pip / pipx
 
@@ -80,12 +95,40 @@ detail (which matters only under unusual locked-down filesystems) see
 [Installation](Installation).
 
 The Windows executables carry a version resource (Properties > Details shows
-the product and version) but are **not Authenticode-signed**, so the first
-run of a browser-downloaded .exe trips SmartScreen ("Windows protected your
-PC"): choose "More info", then "Run anyway", and verify the download against
-the release's `SHA256SUMS` if your policy requires it. Environments that
-allowlist by publisher (AppLocker/WDAC publisher rules) cannot admit an
-unsigned binary; use a hash or path rule there, or install through pip.
+the product and version) and are Authenticode-signed with Azure Artifact
+Signing, each signature timestamped so it outlives the short-lived signing
+certificates. The first run of a browser-downloaded .exe can still trip
+SmartScreen ("Windows protected your PC") while the signing identity's
+reputation accrues: choose "More info", then "Run anyway", and verify the
+download against the release's `SHA256SUMS` if your policy requires it.
+Environments that allowlist by publisher (AppLocker/WDAC) can use a
+publisher rule instead of per-release hash rules.
+
+### One-directory zip (hosts the service)
+
+`cronstable-windows-amd64.zip` and `cronstable-windows-arm64.zip` hold the
+same program as the standalone binary in a one-directory layout: a single
+`cronstable\` folder with `cronstable.exe` beside an `_internal\` directory,
+running in place with no self-extraction. This is the download that can host
+the [Windows service](Windows-Service); the one-file `.exe` cannot, and
+`cronstable service install` refuses it by name.
+
+A browser download carries the Mark of the Web, and extracting with
+Explorer stamps it onto every extracted file, so the first run of the
+extracted `cronstable.exe` would trip SmartScreen file by file. Clearing it
+from the zip before extraction clears it for everything at once. From an
+elevated PowerShell (writing into `C:\Program Files` needs one):
+
+```powershell
+Unblock-File .\cronstable-windows-amd64.zip
+Expand-Archive .\cronstable-windows-amd64.zip -DestinationPath 'C:\Program Files'
+& 'C:\Program Files\cronstable\cronstable.exe' --version
+```
+
+Extracting into `C:\Program Files` yields
+`C:\Program Files\cronstable\cronstable.exe`, the path the recipes on this
+page use. The SmartScreen and AppLocker/WDAC notes above apply to the zip's
+executable the same way they apply to the one-file `.exe`.
 
 There is no Windows container image; the published Docker image is Linux-only.
 See [Installation](Installation) for the Linux image and its supported
@@ -372,12 +415,15 @@ cronstable service start
 That registers cronstable with the Service Control Manager, so it starts at
 boot, keeps running after you log off, appears in `services.msc`, and gets
 Windows' own recovery actions. Stopping it drains running jobs first, and
-the SCM is told the stop is in progress for as long as that takes. See
-[Windows Service](Windows-Service) for the full command set, the logging
-story, and the one install shape that cannot host a service: the published
-one-file `.exe` (also what winget installs), whose bootloader runs the
-program in a child process the SCM never sees. Install with pip or pipx to
-run as a service.
+the SCM is told the stop is in progress for as long as that takes. The
+commands work from a pip or pipx install, from the extracted
+[one-directory zip](#one-directory-zip-hosts-the-service), or not at all
+from the one-file `.exe`; the [MSI](Windows-MSI) registers the service by
+itself, so none of them are needed there. A service host therefore needs no
+Python installed. See [Windows Service](Windows-Service) for the full
+command set, the logging story, and the one install shape that cannot host
+a service: the published one-file `.exe` (also what winget installs), whose
+bootloader runs the program in a child process the SCM never sees.
 
 ### Task Scheduler, for the one-file executable
 
@@ -388,7 +434,8 @@ machine-wide config directory either way, so the daemon reads the same
 configuration no matter which account runs it.
 
 Register a boot-time task running as `SYSTEM` (adjust the .exe path to
-where you installed it):
+where you installed it; extracting the one-directory zip into
+`C:\Program Files` produces exactly the path this recipe uses):
 
 ```shell
 schtasks /Create /TN cronstable /SC ONSTART /RU SYSTEM /RL HIGHEST /TR "\"C:\Program Files\cronstable\cronstable.exe\" -c C:\ProgramData\cronstable"

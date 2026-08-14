@@ -33,7 +33,11 @@ What this module deliberately does not do is described in
 identity is its own piece of work), and it refuses to install from a
 one-file frozen binary, which cannot host a service at all because the
 PyInstaller bootloader runs the application in a child process the SCM
-never sees.
+never sees.  The published ``cronstable-windows-<arch>.zip`` and ``.msi``
+are one-directory builds and host a service normally; the one-file ``.exe``
+(also what winget installs) is the shape ``install`` refuses.  The MSI
+registers the service itself with the same settings ``install`` writes,
+fenced by ``tests/test_msi_parity.py``.
 """
 
 from __future__ import annotations
@@ -127,6 +131,14 @@ CTRL_SHUTDOWN_EVENT = 6
 SERVICE_DESCRIPTION = (
     "Runs the cronstable job scheduler, so scheduled jobs run whether or "
     "not a user is logged on."
+)
+
+#: The one-directory release assets the one-file refusal in ``install``
+#: points at.  Owned by release.yml's attach list;
+#: tests/test_ci_fences.py holds the two spellings equal.
+ONEDIR_RELEASE_ASSETS = (
+    "cronstable-windows-amd64.zip",
+    "cronstable-windows-arm64.zip",
 )
 
 #: How often the pending-state pumper reports progress, and the wait hint it
@@ -760,14 +772,19 @@ class WinApi:
             advapi32.CloseServiceHandle(manager)
 
     def _config2(  # pragma: no cover (windows)
-        self, name: str, level: int, payload: Any, action: str
+        self,
+        name: str,
+        level: int,
+        payload: Any,
+        action: str,
+        access: int = SERVICE_CHANGE_CONFIG,
     ) -> None:
         import ctypes
 
         advapi32, manager, service = self._open_service(
             name,
             SC_MANAGER_CONNECT,
-            SERVICE_CHANGE_CONFIG,
+            access,
             action,
         )
         try:
@@ -839,11 +856,16 @@ class WinApi:
         payload = SERVICE_FAILURE_ACTIONSW(
             reset_s, None, None, len(actions), array
         )
+        # SERVICE_START on top of SERVICE_CHANGE_CONFIG: ChangeServiceConfig2W
+        # refuses a failure-actions payload containing SC_ACTION_RESTART with
+        # ERROR_ACCESS_DENIED unless the handle carries the start right, even
+        # from an elevated caller.
         self._config2(
             name,
             SERVICE_CONFIG_FAILURE_ACTIONS,
             payload,
             "set the recovery actions",
+            access=SERVICE_CHANGE_CONFIG | SERVICE_START,
         )
 
     def set_failure_actions_flag(  # pragma: no cover (windows)
@@ -1338,9 +1360,14 @@ def install(args: Any, api: WinApi) -> int:
             "Windows service. Its bootloader unpacks itself and runs the "
             "program in a child process, so the process the Service "
             "Control Manager starts never registers, and the start fails "
-            "on the SCM's timeout. Install cronstable with pip or pipx and "
-            "run `cronstable service install` from there, or keep using "
-            "the schtasks recipe in the Windows documentation."
+            "on the SCM's timeout. Download the one-directory build "
+            "({} on the releases page), extract it, and run `cronstable "
+            "service install` from its cronstable.exe; or install the "
+            ".msi, which registers the service itself; or install "
+            "cronstable with pip or pipx; or keep using the schtasks "
+            "recipe in the Windows documentation.".format(
+                " or ".join(ONEDIR_RELEASE_ASSETS)
+            )
         )
     config = getattr(args, "config", None)
     if not config:

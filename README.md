@@ -290,13 +290,23 @@ tmpfs/`emptyDir` recipe are in the
 [Installation](https://github.com/ptweezy/cronstable/wiki/Installation) wiki
 page.
 
+Windows releases additionally attach `cronstable-windows-<arch>.zip`, a
+one-directory build that extracts to a single `cronstable` folder and can
+host the [Windows
+service](https://github.com/ptweezy/cronstable/wiki/Windows-Service), and
+`cronstable-windows-<arch>.msi`, a machine-wide installer that registers
+the service for GPO/Intune/SCCM deployment (see the [Windows
+MSI](https://github.com/ptweezy/cronstable/wiki/Windows-MSI) wiki page).
+
 ## Running on Windows
 
 cronstable runs natively on Windows (x64 and ARM64), in addition to Linux and
 macOS. Install it with `pip install cronstable`, or download the self-contained
-`cronstable-windows-amd64.exe` / `cronstable-windows-arm64.exe` from the
-[releases page](https://github.com/ptweezy/cronstable/releases) (no Python
-required). Everything else, like the YAML crontab, scheduling, reporting, retries,
+`cronstable-windows-amd64.exe` / `cronstable-windows-arm64.exe`, the
+one-directory `cronstable-windows-<arch>.zip` (the shape that can host the
+Windows service), or the machine-wide `cronstable-windows-<arch>.msi` from
+the [releases page](https://github.com/ptweezy/cronstable/releases) (no
+Python required for any of them). Everything else, like the YAML crontab, scheduling, reporting, retries,
 the HTTP API and the [web dashboard](#web-dashboard), works the same as on
 POSIX. A few platform details differ:
 
