@@ -41,11 +41,17 @@ from tests._helpers import (
 # that budget) and prints every asyncio.Task with its await stack and
 # _fut_waiter, which names what the unfinished task is stuck on.  It only
 # observes: a gc walk from a side thread that touches no loop and schedules
-# no callback, so it cannot perturb the hang it reports on.  It writes to a
-# dup of the real stderr fd taken at import: pytest's fd-level capture would
-# otherwise hold the dump in a tempfile that faulthandler's exit discards.
-# Not a fixture, so the no-autouse rule above stands: no test's behavior can
-# change.
+# no callback, so it cannot perturb the hang it reports on.  Not a fixture,
+# so the no-autouse rule above stands: no test's behavior can change.
+#
+# The dump must reach the REAL stderr.  pytest's fd-level capture is
+# already active when this file imports, so a dup taken here lands in the
+# capture tempfile and dies unread with faulthandler's os._exit.  The one
+# fd in the process that provably escapes capture is the one pytest's
+# faulthandler plugin stashed for its own timeout dumps (it is why those
+# dumps appear in CI logs), so pytest_configure re-points _DUMP_FD at a
+# dup of it; the import-time dup stays only as the fallback for a run
+# with the faulthandler plugin disabled.
 
 _DUMP_TASKS_AFTER = 240.0
 try:
@@ -54,11 +60,27 @@ except (AttributeError, OSError, ValueError):  # pragma: no cover - pythonw
     _DUMP_FD = None
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_configure(config):
-    global _DUMP_TASKS_AFTER
+    # trylast: the faulthandler plugin's own pytest_configure stashes the
+    # fd this reads, and conftest hooks run before builtin plugins' by
+    # default
+    global _DUMP_TASKS_AFTER, _DUMP_FD
     timeout = float(config.getini("faulthandler_timeout") or 0)
     if timeout:
         _DUMP_TASKS_AFTER = timeout * 0.8
+    try:
+        from _pytest.faulthandler import fault_handler_stderr_fd_key
+
+        real_fd = config.stash.get(fault_handler_stderr_fd_key, None)
+    except ImportError:  # pragma: no cover - plugin layout changed
+        real_fd = None
+    if real_fd is not None:
+        # a private dup, so the plugin's unconfigure-time close of its own
+        # fd cannot invalidate the watchdog's
+        if _DUMP_FD is not None:
+            os.close(_DUMP_FD)
+        _DUMP_FD = os.dup(real_fd)
 
 
 def _dump_asyncio_tasks(nodeid: str) -> None:
