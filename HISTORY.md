@@ -1,5 +1,10 @@
 # History
 
+## 1.2.42
+
+- Dependency floors raised to clear published security advisories
+- Build and CI toolchain version bumps
+
 ## 1.2.41
 
 Hot paths in the scheduler, the cluster gossip,
