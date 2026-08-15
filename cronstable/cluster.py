@@ -1245,6 +1245,10 @@ class ClusterManager(LeadershipBackend):
             # projection and the dashboard sorts its rows).
             names = sorted(names)[:MAX_ADVERTISED_JOB_SUMMARIES]
             truncated = True
+        if not truncated:
+            # the provider builds a fresh dict per call and consumers only
+            # read it, so the untruncated snapshot is returned whole
+            return summaries, False
         return {name: summaries[name] for name in names}, truncated
 
     # --- the mTLS /peer server -------------------------------------------

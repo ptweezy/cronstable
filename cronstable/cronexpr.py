@@ -875,10 +875,17 @@ class CronTab:
         self._years_sorted = (
             _sorted_tuple(self._years) if self._years is not None else ()
         )
-        # _first_time/_last_time's answers for tod=None, built on first
-        # use so a parse-and-discard CronTab never pays for them.
-        self._first_hms: Optional[_HMS] = None
-        self._last_hms: Optional[_HMS] = None
+        # _first_time/_last_time's answers for tod=None.
+        self._first_hms: _HMS = (
+            self._hours_sorted[0],
+            self._minutes_sorted[0],
+            self._seconds_sorted[0],
+        )
+        self._last_hms: _HMS = (
+            self._hours_sorted[-1],
+            self._minutes_sorted[-1],
+            self._seconds_sorted[-1],
+        )
         # Whether the day-of-week column constrains anything.  All seven
         # values makes the second half of the plain-day test a tautology,
         # letting _next_civil bisect straight through the day-of-month
@@ -1290,8 +1297,8 @@ class CronTab:
                 index += 1
             return None
         # Two set lookups per candidate day, the weekday carried forward
-        # instead of rebuilt per day.  Exactly the dom/dow test of
-        # _next_civil's L/W/# branch with the plain sets (see _days_plain).
+        # day to day.  Exactly the dom/dow test of _next_civil's L/W/#
+        # branch with the plain sets (see _days_plain).
         dom = self._dom
         dow_set = self._dow
         # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
@@ -1357,14 +1364,7 @@ class CronTab:
         because the only consumer feeds a datetime constructor.
         """
         if at_or_after is None:
-            hms = self._first_hms
-            if hms is None:
-                hms = self._first_hms = (
-                    self._hours_sorted[0],
-                    self._minutes_sorted[0],
-                    self._seconds_sorted[0],
-                )
-            return hms
+            return self._first_hms
         hours = self._hours_sorted
         minutes = self._minutes_sorted
         seconds = self._seconds_sorted
@@ -1562,14 +1562,7 @@ class CronTab:
         preference reversed and the same ``(hour, minute, second)`` return.
         """
         if at_or_before is None:
-            hms = self._last_hms
-            if hms is None:
-                hms = self._last_hms = (
-                    self._hours_sorted[-1],
-                    self._minutes_sorted[-1],
-                    self._seconds_sorted[-1],
-                )
-            return hms
+            return self._last_hms
         hours = self._hours_sorted
         minutes = self._minutes_sorted
         seconds = self._seconds_sorted
