@@ -20,6 +20,8 @@ teardowns they replace keep working side by side until then.
 
 import asyncio
 import sys
+import threading
+import time
 
 import pytest
 
@@ -30,6 +32,80 @@ from tests._helpers import (
     _exit,
     _state_cfg,
 )
+
+
+# --- hung-test asyncio task dump (the chronic 3.12 teardown hang) ----------
+#
+# faulthandler_timeout (pyproject) dumps OS threads and exits at 300s, but
+# the hang sits in a suspended coroutine faulthandler cannot see: the
+# 2026-08-15 dump showed the main thread in Runner.close -> _cancel_all_tasks
+# -> select() with every other thread a parked daemon.  This dump fires
+# first (~240s) and prints every asyncio.Task with its await stack and
+# _fut_waiter, which names what the unfinished task is stuck on.  It only
+# observes (a gc walk from a side thread; no loop is touched, no callback
+# scheduled), so it cannot perturb the hang it reports on.  Not a fixture,
+# so the no-autouse rule above stands: no test's behavior can change.
+
+_DUMP_TASKS_AFTER = 240.0
+_current_test: "tuple[str, float] | None" = None
+_watchdog_started = False
+
+
+def _dump_asyncio_tasks(nodeid: str) -> None:
+    import gc
+    import traceback
+
+    err = sys.__stderr__
+    if err is None:  # pragma: no cover - pythonw
+        return
+    print(
+        "\n=== asyncio task dump: %r still running after %.0fs ==="
+        % (nodeid, _DUMP_TASKS_AFTER),
+        file=err,
+    )
+    for obj in gc.get_objects():
+        if not isinstance(obj, asyncio.Task):
+            continue
+        print("--- %r" % obj, file=err)
+        waiter = getattr(obj, "_fut_waiter", None)
+        if waiter is not None:
+            print("    waiting on: %r" % waiter, file=err)
+        try:
+            obj.print_stack(file=err)
+        except Exception:  # pragma: no cover - a task mid-teardown
+            traceback.print_exc(file=err)
+    print("=== end asyncio task dump ===", file=err, flush=True)
+
+
+def _watch_for_hung_test() -> None:
+    dumped_for = None
+    while True:
+        time.sleep(15)
+        current = _current_test
+        if current is None:
+            continue
+        nodeid, started = current
+        if (
+            nodeid != dumped_for
+            and time.monotonic() - started > _DUMP_TASKS_AFTER
+        ):
+            dumped_for = nodeid
+            _dump_asyncio_tasks(nodeid)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item):
+    global _current_test, _watchdog_started
+    if not _watchdog_started:
+        _watchdog_started = True
+        threading.Thread(
+            target=_watch_for_hung_test,
+            daemon=True,
+            name="cronstable-test-watchdog",
+        ).start()
+    _current_test = (item.nodeid, time.monotonic())
+    yield
+    _current_test = None
 
 
 class Req:
