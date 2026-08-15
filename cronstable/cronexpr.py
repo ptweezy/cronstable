@@ -877,17 +877,11 @@ class CronTab:
         self._years_sorted = (
             _sorted_tuple(self._years) if self._years is not None else ()
         )
-        # _first_time/_last_time's answers for tod=None.
-        self._first_hms: _HMS = (
-            self._hours_sorted[0],
-            self._minutes_sorted[0],
-            self._seconds_sorted[0],
-        )
-        self._last_hms: _HMS = (
-            self._hours_sorted[-1],
-            self._minutes_sorted[-1],
-            self._seconds_sorted[-1],
-        )
+        # _first_time/_last_time's answers for tod=None, built on first
+        # use: eager tuples here cost ~140 bytes per parsed CronTab,
+        # enough to trip mem.crontab_10k's gate.
+        self._first_hms: Optional[_HMS] = None
+        self._last_hms: Optional[_HMS] = None
         # Whether the day-of-week column constrains anything.  All seven
         # values makes the second half of the plain-day test a tautology,
         # letting _next_civil bisect straight through the day-of-month
@@ -1378,7 +1372,14 @@ class CronTab:
         because the only consumer feeds a datetime constructor.
         """
         if at_or_after is None:
-            return self._first_hms
+            hms = self._first_hms
+            if hms is None:
+                hms = self._first_hms = (
+                    self._hours_sorted[0],
+                    self._minutes_sorted[0],
+                    self._seconds_sorted[0],
+                )
+            return hms
         hours = self._hours_sorted
         minutes = self._minutes_sorted
         seconds = self._seconds_sorted
@@ -1579,7 +1580,14 @@ class CronTab:
         preference reversed and the same ``(hour, minute, second)`` return.
         """
         if at_or_before is None:
-            return self._last_hms
+            hms = self._last_hms
+            if hms is None:
+                hms = self._last_hms = (
+                    self._hours_sorted[-1],
+                    self._minutes_sorted[-1],
+                    self._seconds_sorted[-1],
+                )
+            return hms
         hours = self._hours_sorted
         minutes = self._minutes_sorted
         seconds = self._seconds_sorted
