@@ -485,6 +485,7 @@ def next_fires(
     tz: Optional[datetime.tzinfo] = None,
     start: Optional[datetime.datetime] = None,
     hash_key: Optional[str] = None,
+    tab: Optional[CronTab] = None,
 ) -> list[datetime.datetime]:
     """The next ``count`` fire times of a schedule, straight from the
     daemon's own engine (:meth:`CronTab.occurrences`), so the preview
@@ -499,10 +500,11 @@ def next_fires(
     text = (schedule or "").strip()
     if text.lower() == "@reboot":
         return []
-    try:
-        tab = CronTab(text, hash_key=hash_key)
-    except (ValueError, KeyError):
-        return []
+    if tab is None:
+        try:
+            tab = CronTab(text, hash_key=hash_key)
+        except (ValueError, KeyError):
+            return []
     zone = tz or datetime.timezone.utc
     current = start if start is not None else datetime.datetime.now(zone)
     return list(itertools.islice(tab.occurrences(current), count))
