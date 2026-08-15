@@ -1,5 +1,31 @@
 # History
 
+## 1.2.41
+
+Hot paths in the scheduler, the cluster gossip,
+the HTTP payload builders and the TUI do less work.
+
+- Cron expressions whose day columns are plain lists match and advance
+  through a fast path: set membership instead of the L/W/# machinery,
+  with the weekday carried forward day to day rather than rebuilt from
+  the date.
+- A scheduler pass reads the clock once and judges every pause window,
+  SLA observation and sleep interval against that instant.
+- Cluster gossip precomputes what cannot change while the daemon runs
+  (peer URLs, the peer count, the `electLeader` flag), fetches the
+  job-set id once per payload instead of once per field, and latches a
+  settled view instead of re-deriving it every poll.
+- Payload builders copy less: log listings slice the ring in place,
+  `GET /jobs` swaps its computed fields into the body it already owns,
+  Prometheus label dictionaries are reused across scrapes, and
+  fingerprint templates render from the job's variable mapping instead
+  of a copy of it.
+- The filesystem state backend precomputes its per-job paths and caches
+  the filesystem-safe name encoding instead of re-encoding it on every
+  keys listing.
+- The TUI folds its per-poll aggregates in a single pass over the jobs
+  and skips re-rendering panels whose inputs did not change.
+
 ## 1.2.40
 
 More Windows work: a service host, a Task Scheduler importer, and a
