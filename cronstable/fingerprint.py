@@ -175,7 +175,7 @@ def _command_repr(command: str | list[str]) -> dict[str, Any]:
     ``["echo", "a b"]`` and ``["echo", "a", "b"]`` must not collide.
     """
     if isinstance(command, list):
-        return {"argv": list(command)}
+        return {"argv": command}
     return {"shell_command": command}
 
 
@@ -294,10 +294,9 @@ def _redact_action(
         if hit is not None:
             return hit[1]
     out = dict(action)
-    if "report" in out and isinstance(out["report"], dict):
-        out["report"] = _omit_default_report_fields(
-            _redact_report(out["report"])
-        )
+    report = out.get("report")
+    if isinstance(report, dict):
+        out["report"] = _omit_default_report_fields(_redact_report(report))
     if memo is not None:
         memo.redacted[id(action)] = (action, out)
         memo.normalized[id(out)] = (out, _normalize_numbers(out))
@@ -434,14 +433,14 @@ def _normalize_numbers(
             hit = memo.get(id(obj))
             if hit is not None:
                 return hit[1]
-        out = {}
-        for k, v in obj.items():
-            out[k] = (
+        return {
+            k: (
                 _normalize_numbers(v, memo)
                 if isinstance(v, _NORMALIZABLE)
                 else v
             )
-        return out
+            for k, v in obj.items()
+        }
     if isinstance(obj, list):
         return [
             _normalize_numbers(v, memo) if isinstance(v, _NORMALIZABLE) else v
