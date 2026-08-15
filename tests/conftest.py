@@ -19,7 +19,9 @@ teardowns they replace keep working side by side until then.
 """
 
 import asyncio
+import os
 import sys
+import threading
 
 import pytest
 
@@ -30,6 +32,102 @@ from tests._helpers import (
     _exit,
     _state_cfg,
 )
+
+
+# --- hung-test asyncio task dump (the chronic 3.12 teardown hang) ----------
+#
+# faulthandler_timeout (pyproject) dumps OS threads and exits, but a hang in
+# a suspended coroutine is invisible to it.  This dump fires first (80% of
+# that budget) and prints every asyncio.Task with its await stack and
+# _fut_waiter, which names what the unfinished task is stuck on.  It only
+# observes: a gc walk from a side thread that touches no loop and schedules
+# no callback, so it cannot perturb the hang it reports on.  Not a fixture,
+# so the no-autouse rule above stands: no test's behavior can change.
+#
+# The dump must reach the REAL stderr.  pytest's fd-level capture is
+# already active when this file imports, so a dup taken here lands in the
+# capture tempfile and dies unread with faulthandler's os._exit.  The one
+# fd in the process that provably escapes capture is the one pytest's
+# faulthandler plugin stashed for its own timeout dumps (it is why those
+# dumps appear in CI logs), so pytest_configure re-points _DUMP_FD at a
+# dup of it; the import-time dup stays only as the fallback for a run
+# with the faulthandler plugin disabled.
+
+_DUMP_TASKS_AFTER = 240.0
+try:
+    _DUMP_FD: "int | None" = os.dup(sys.__stderr__.fileno())
+except (AttributeError, OSError, ValueError):  # pragma: no cover - pythonw
+    _DUMP_FD = None
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_configure(config):
+    # trylast: the faulthandler plugin's own pytest_configure stashes the
+    # fd this reads, and conftest hooks run before builtin plugins' by
+    # default
+    global _DUMP_TASKS_AFTER, _DUMP_FD
+    timeout = float(config.getini("faulthandler_timeout") or 0)
+    if timeout:
+        _DUMP_TASKS_AFTER = timeout * 0.8
+    try:
+        from _pytest.faulthandler import fault_handler_stderr_fd_key
+
+        real_fd = config.stash.get(fault_handler_stderr_fd_key, None)
+    except ImportError:  # pragma: no cover - plugin layout changed
+        real_fd = None
+    if real_fd is not None:
+        # a private dup, so the plugin's unconfigure-time close of its own
+        # fd cannot invalidate the watchdog's
+        if _DUMP_FD is not None:
+            os.close(_DUMP_FD)
+        _DUMP_FD = os.dup(real_fd)
+
+
+def _dump_asyncio_tasks(nodeid: str) -> None:
+    import gc
+    import io
+    import traceback
+
+    if _DUMP_FD is None:  # pragma: no cover - pythonw
+        return
+    out = io.StringIO()
+    try:
+        out.write(
+            "\n=== asyncio task dump: %r still running after %.0fs ===\n"
+            % (nodeid, _DUMP_TASKS_AFTER)
+        )
+        for obj in gc.get_objects():
+            if not isinstance(obj, asyncio.Task):
+                continue
+            try:
+                out.write("--- %r\n" % obj)
+                waiter = getattr(obj, "_fut_waiter", None)
+                if waiter is not None:
+                    out.write("    waiting on: %r\n" % waiter)
+                obj.print_stack(file=out)
+            except Exception:  # pragma: no cover - a task mid-teardown
+                traceback.print_exc(file=out)
+        out.write("=== end asyncio task dump ===\n")
+    except Exception:  # pragma: no cover - keep a partial dump
+        traceback.print_exc(file=out)
+    try:
+        os.write(_DUMP_FD, out.getvalue().encode("utf-8", "backslashreplace"))
+    except OSError:  # pragma: no cover - stderr gone
+        pass
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item):
+    timer = threading.Timer(
+        _DUMP_TASKS_AFTER, _dump_asyncio_tasks, [item.nodeid]
+    )
+    timer.daemon = True
+    timer.name = "cronstable-test-watchdog"
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
 
 
 class Req:

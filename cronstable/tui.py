@@ -384,6 +384,20 @@ HEALTH_COLOR = {
     "unknown": "pending",
 }
 
+#: Column id -> table title, for the jobs table's header row.
+_COL_TITLES = {
+    "status": "status",
+    "name": "name",
+    "schedule": "schedule",
+    "last": "last",
+    "next": "next",
+    "dur": "dur",
+    "spark": "runs",
+    "res": "cpu/mem",
+    "owner": "owner",
+    "cmd": "command",
+}
+
 #: Heatmap bucket precedence. "skipped" seeds the bucket and ranks below
 #: "ok": an hour that only ever held slots back for a pause must not shade
 #: green, but one real success in it outranks any number of holds.  An
@@ -1078,6 +1092,14 @@ def pad_to(text: str, width: int) -> str:
     return text + " " * (width - w)
 
 
+#: Flattened-string memo for :func:`oneline`.  The schedule and command
+#: cells flatten the same poll-stable strings on every frame, so the memo
+#: is warm from the first paint; capped and reset wholesale like _CHAR_W
+#: because commands are operator- and job-controlled.
+_ONELINE: dict[str, str] = {}
+_ONELINE_MAX = 4096
+
+
 def oneline(text: Any) -> str:
     """Collapse whitespace runs (incl. newlines) to single spaces.
 
@@ -1087,7 +1109,14 @@ def oneline(text: Any) -> str:
     Escapes and C0/C1 controls are dropped outright: these strings come
     from the API and carry no legitimate styling of their own.
     """
-    return " ".join(_CTRL_RE.sub("", strip_ansi(str(text))).split())
+    key = str(text)
+    flat = _ONELINE.get(key)
+    if flat is None:
+        flat = " ".join(_CTRL_RE.sub("", strip_ansi(key)).split())
+        if len(_ONELINE) >= _ONELINE_MAX:
+            _ONELINE.clear()
+        _ONELINE[key] = flat
+    return flat
 
 
 #: C0 controls, plus the 8-bit C1 range, that must never reach a painted
@@ -2393,6 +2422,15 @@ class App:
         # ---- data mirrors of the daemon ----
         self.jobs: list[dict[str, Any]] = []
         self.by_name: dict[str, dict[str, Any]] = {}
+        # Per-poll aggregates over self.jobs (see _refresh_job_aggregates):
+        # pure functions of the payload, folded once per poll and read by
+        # the per-frame renderers.
+        self.health_counts: dict[str, int] = {}
+        self._health_keyed: list[tuple[str, dict[str, Any]]] = []
+        self._col_flags = (False, False, False, False)
+        self._wb_shown: Optional[
+            tuple[int, list[tuple[str, dict[str, Any]]]]
+        ] = None
         self.fetched_mono = 0.0  # monotonic stamp of the last good /jobs
         self.version = ""
         self.job_set_id = ""
@@ -2510,6 +2548,15 @@ class App:
         # plain).  rewrite_sgr inks with the current theme, so the memo
         # is valid for one theme only; _retheme() clears it.
         self._ansi_cache: dict[str, tuple[str, str]] = {}
+        # constant chrome rows (table header, footer hints), keyed by
+        # their build inputs; inked with the current theme, so
+        # _retheme() clears this too
+        self._chrome_cache: dict[tuple[Any, ...], str] = {}
+        # single-slot rendered-body caches for the pressure and week
+        # panels (see render_press / render_week); also theme-inked,
+        # also cleared by _retheme()
+        self._press_body: Optional[tuple[Any, ...]] = None
+        self._week_body: Optional[tuple[Any, ...]] = None
         # wrapped-row counts per line, valid for one content width (a
         # resize or a timestamp toggle changes it and clears the memo)
         self._wrap_rows_cache: dict[str, int] = {}
@@ -2617,6 +2664,9 @@ class App:
         return float(sched) - (time.monotonic() - self.fetched_mono)
 
     def recompute_view(self) -> None:
+        # the aggregates fold rides along: every path that swaps or
+        # reshapes the job data ends in a recompute_view
+        self._refresh_job_aggregates()
         keep = None
         current = self.selected_job()
         if current is not None:
@@ -2749,6 +2799,41 @@ class App:
 
     def refresh_now(self) -> None:
         self._poll_wakeup.set()
+
+    def _refresh_job_aggregates(self) -> None:
+        """Fold the whole-list aggregates the frame renderers read.
+
+        One walk per poll: the toolbar's health counts, the wallboard's
+        (health key, job) pairs and the column-layout flags are all pure
+        functions of the /jobs payload, whose row dicts are never mutated
+        between polls (``self.jobs`` has a single writer, ``_poll_once``).
+        Frames render at up to ~30 Hz during log floods, so the renderers
+        read these folds instead of re-walking every job per frame.
+
+        The column flags are ``(spread, monitored, overdue, paused)``.
+        The OVERDUE badge and the "⏸ til HH:MM" cell want a wider column,
+        but only as a bonus paid out of leftover slack: neither is allowed
+        to price a whole droppable column off the board.
+        """
+        counts: dict[str, int] = {}
+        keyed: list[tuple[str, dict[str, Any]]] = []
+        spread = monitored = overdue = paused = False
+        for job in self.jobs:
+            key = health(job)[0]
+            counts[key] = counts.get(key, 0) + 1
+            keyed.append((key, job))
+            if not spread and "clusterOwner" in job:
+                spread = True
+            if not monitored and job.get("running_resources") is not None:
+                monitored = True
+            if not overdue and sla_overdue(job):
+                overdue = True
+            if not paused and job.get("paused"):
+                paused = True
+        self.health_counts = counts
+        self._health_keyed = keyed
+        self._col_flags = (spread, monitored, overdue, paused)
+        self._wb_shown = None
 
     async def _poll_once(self) -> None:
         try:
@@ -3399,8 +3484,12 @@ class AppActions(App):
             bool(self.prefs["light"]),
             str(self.prefs["cvd"]),
         )
-        # memoised log lines carry the old theme's SGR ink
+        # memoised log lines, chrome rows and panel bodies carry the old
+        # theme's SGR ink
         self._ansi_cache.clear()
+        self._chrome_cache.clear()
+        self._press_body = None
+        self._week_body = None
         self.term.invalidate()
         self.mark()
 
@@ -4847,12 +4936,10 @@ class AppRender(AppKeys):
                 "dim",
             )
         )
-        counts: dict[str, int] = {}
-        for job in self.jobs:
-            # health() is a multi-branch walk of the payload; calling it
-            # twice to produce one count doubled the toolbar's whole cost
-            key = health(job)[0]
-            counts[key] = counts.get(key, 0) + 1
+        # per-poll fold: health() is a multi-branch walk of the payload,
+        # so the counts come from _refresh_job_aggregates, not a per-frame
+        # walk of every job
+        counts = self.health_counts
         spans.append(paint.style("   %d jobs " % len(self.jobs), "fg"))
         for key, color in (("run", "run"), ("fail", "fail"), ("ok", "ok")):
             if counts.get(key):
@@ -4888,27 +4975,9 @@ class AppRender(AppKeys):
 
     # ---- the jobs table ---------------------------------------------
     def _column_flags(self) -> tuple[bool, bool, bool, bool]:
-        """``(spread, monitored, overdue, paused)`` for the layout.
-
-        One walk, not four: every frame asks the job list the same four
-        questions, and the walk stops as soon as they are all yes.  The
-        OVERDUE badge and the "⏸ til HH:MM" cell want a wider column, but
-        only as a bonus paid out of leftover slack: neither is allowed to
-        price a whole droppable column off the board.
-        """
-        spread = monitored = overdue = paused = False
-        for job in self.jobs:
-            if not spread and "clusterOwner" in job:
-                spread = True
-            if not monitored and job.get("running_resources") is not None:
-                monitored = True
-            if not overdue and sla_overdue(job):
-                overdue = True
-            if not paused and job.get("paused"):
-                paused = True
-            if spread and monitored and overdue and paused:
-                break
-        return (spread, monitored, overdue, paused)
+        """``(spread, monitored, overdue, paused)`` for the layout, as
+        folded by :meth:`_refresh_job_aggregates`."""
+        return self._col_flags
 
     def _columns(self, cols: int) -> list[tuple[str, int]]:
         """(column, width) picks that fit ``cols``, widest board first."""
@@ -4974,21 +5043,16 @@ class AppRender(AppKeys):
         cut: Optional[int] = None,
     ) -> list[str]:
         layout = self._columns(cols)
-        titles = {
-            "status": "status",
-            "name": "name",
-            "schedule": "schedule",
-            "last": "last",
-            "next": "next",
-            "dur": "dur",
-            "spark": "runs",
-            "res": "cpu/mem",
-            "owner": "owner",
-            "cmd": "command",
-        }
-        header = " ".join(pad_to(titles[c], w) for c, w in layout)
-        head = paint.style(pad_to(" " + header, cols), "dim", bold=True)
-        rows = [head if cut is None else cut_to_width(head, cut)]
+        # the title row is a pure function of the layout and widths, so
+        # it is kept in the chrome cache between frames
+        head_key = ("head", tuple(layout), cols, cut)
+        head_row = self._chrome_cache.get(head_key)
+        if head_row is None:
+            header = " ".join(pad_to(_COL_TITLES[c], w) for c, w in layout)
+            head = paint.style(pad_to(" " + header, cols), "dim", bold=True)
+            head_row = head if cut is None else cut_to_width(head, cut)
+            self._chrome_cache[head_key] = head_row
+        rows = [head_row]
         view = self.view
         self.table_offset = scroll_window(
             len(view), body_rows, self.sel, self.table_offset
@@ -5161,15 +5225,22 @@ class AppRender(AppKeys):
     def render_footer(
         self, paint: Painter, cols: int, cut: Optional[int] = None
     ) -> str:
-        hints = (
-            "j/k move · enter open · r run · x cancel · p pause · c copy · "
-            "/ filter · g refresh · t theme · i incident · w wallboard · "
-            "ctrl+k palette · ? help · q quit"
-        )
-        return cut_to_width(
-            paint.style(" " + pad_to(hints, cols - 1), "dim"),
-            cols if cut is None else cut,
-        )
+        # the hints never change, so the padded, styled, cut row is a pure
+        # function of the geometry and lives in the chrome cache
+        key = ("footer", cols, cut)
+        row = self._chrome_cache.get(key)
+        if row is None:
+            hints = (
+                "j/k move · enter open · r run · x cancel · p pause · "
+                "c copy · / filter · g refresh · t theme · i incident · "
+                "w wallboard · ctrl+k palette · ? help · q quit"
+            )
+            row = cut_to_width(
+                paint.style(" " + pad_to(hints, cols - 1), "dim"),
+                cols if cut is None else cut,
+            )
+            self._chrome_cache[key] = row
+        return row
 
     # ---- toasts ------------------------------------------------------
     def _compose_toasts(
@@ -5197,13 +5268,11 @@ class AppRender(AppKeys):
     ) -> list[str]:
         ascii_mode = bool(self.prefs["ascii"])
         # health() drives the tile order, the tile ink AND the footer
-        # counts, so it is walked once per job per frame: the sort key,
-        # the per-tile lookup and the doubled footer count together used
-        # to call it three times per job plus once per painted tile.
-        keyed = [(health(job)[0], job) for job in self.jobs]
-        counts: dict[str, int] = {}
-        for key, _job in keyed:
-            counts[key] = counts.get(key, 0) + 1
+        # counts; the (key, job) pairs and the counts are pure functions
+        # of the poll payload, folded once per poll by
+        # _refresh_job_aggregates and read here per frame.
+        keyed = self._health_keyed
+        counts = self.health_counts
         stale = self.stale()
         rows: list[str] = []
         if self.verdict is not None:
@@ -5226,11 +5295,21 @@ class AppRender(AppKeys):
         max_tiles = max(per_row, per_row * max(1, avail // (tile_rows + 1)))
         # only max_tiles tiles are ever painted, so the tail of a big fleet
         # never needs ordering; nsmallest is sorted()[:n], ties included.
-        shown = heapq.nsmallest(
-            max_tiles,
-            keyed,
-            key=lambda kj: (WB_ORDER.get(kj[0], 9), kj[1].get("name", "")),
-        )
+        # The selection is a pure function of the poll fold and max_tiles
+        # (which moves only with the terminal size and banner rows), so it
+        # is kept until either changes.
+        if self._wb_shown is not None and self._wb_shown[0] == max_tiles:
+            shown = self._wb_shown[1]
+        else:
+            shown = heapq.nsmallest(
+                max_tiles,
+                keyed,
+                key=lambda kj: (
+                    WB_ORDER.get(kj[0], 9),
+                    kj[1].get("name", ""),
+                ),
+            )
+            self._wb_shown = (max_tiles, shown)
         for chunk_start in range(0, len(shown), per_row):
             chunk = shown[chunk_start : chunk_start + per_row]
             lines3: list[list[str]] = [[], [], []]
@@ -6285,6 +6364,49 @@ class AppOverlays(AppRender):
                 width,
                 "r refresh · esc close",
             )
+        # The rows are a pure function of the three payload objects and
+        # the width: the payloads are swapped wholesale by
+        # _recompute_pressure (on its 60 s gate), so identity comparison
+        # is exact and one build serves every frame in between.  The
+        # cache holds the compared references, so a recycled object id
+        # can never validate a stale entry; retheme clears it (the rows
+        # carry theme ink).
+        sug = self.press_suggest
+        dups = self.press_dups
+        cached = self._press_body
+        if (
+            cached is not None
+            and cached[0] is data
+            and cached[1] is sug
+            and cached[2] is dups
+            and cached[3] == width
+        ):
+            body = cached[4]
+        else:
+            body = self._press_rows(paint, data, sug, dups, width)
+            self._press_body = (data, sug, dups, width, body)
+        visible = max(6, lines - 6)
+        self.panel_scroll = max(
+            0, min(self.panel_scroll, max(0, len(body) - visible))
+        )
+        body = body[self.panel_scroll : self.panel_scroll + visible]
+        return panel_frame(
+            paint,
+            "schedule pressure",
+            body,
+            width,
+            "j/k scroll · r refresh · esc close",
+        )
+
+    def _press_rows(
+        self,
+        paint: Painter,
+        data: dict[str, Any],
+        sug: Optional[dict[str, Any]],
+        dups: list[dict[str, Any]],
+        width: int,
+    ) -> list[str]:
+        """Every row of the pressure panel body, unscrolled."""
         body: list[str] = []
         busiest = data["busiest_minute"]
         body.append(
@@ -6326,7 +6448,6 @@ class AppOverlays(AppRender):
             for offset, char in enumerate(":%02d" % minute):
                 axis[minute + offset] = char
         body.append(paint.style(" " * 8 + "".join(axis), "dim"))
-        sug = self.press_suggest
         if sug:
             body.append(
                 paint.style(" suggest ", "dim")
@@ -6337,20 +6458,16 @@ class AppOverlays(AppRender):
                 + paint.style("H * * * *", "accent", bold=True)
                 + paint.style(" per-job hashed slots", "dim")
             )
-        if self.press_dups:
+        if dups:
             body.append(paint.style("", "fg"))
             body.append(
                 paint.style(
                     " duplicate schedules (%d group%s, firing on identical "
-                    "instants)"
-                    % (
-                        len(self.press_dups),
-                        "" if len(self.press_dups) == 1 else "s",
-                    ),
+                    "instants)" % (len(dups), "" if len(dups) == 1 else "s"),
                     "dim",
                 )
             )
-            for group in self.press_dups[:4]:
+            for group in dups[:4]:
                 names = ", ".join(group["jobs"][:5])
                 if len(group["jobs"]) > 5:
                     names += ", +%d more" % (len(group["jobs"]) - 5)
@@ -6382,18 +6499,7 @@ class AppOverlays(AppRender):
                 hot = count >= max(5, grid_max * 0.7)
                 spans.append(paint.style(shade, "fail" if hot else "run"))
             body.append("".join(spans))
-        visible = max(6, lines - 6)
-        self.panel_scroll = max(
-            0, min(self.panel_scroll, max(0, len(body) - visible))
-        )
-        body = body[self.panel_scroll : self.panel_scroll + visible]
-        return panel_frame(
-            paint,
-            "schedule pressure",
-            body,
-            width,
-            "j/k scroll · r refresh · esc close",
-        )
+        return body
 
     # ---- week calendar ----------------------------------------------
     def render_week(self, paint: Painter, cols: int, lines: int) -> list[str]:
@@ -6411,6 +6517,47 @@ class AppOverlays(AppRender):
                 width,
                 "r refresh · esc close",
             )
+        # The rows depend on the payload (swapped wholesale by
+        # _recompute_week, so identity comparison is exact), the width and
+        # the clock, which enters only through the today label and the
+        # past-dimming of agenda rows; both are minute-granular in
+        # display, so one build serves every frame of a minute.  The cache
+        # holds the compared payload reference (a recycled object id can
+        # never validate a stale entry) and retheme clears it.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        minute = now.replace(second=0, microsecond=0)
+        cached = self._week_body
+        if (
+            cached is not None
+            and cached[0] is data
+            and cached[1] == width
+            and cached[2] == minute
+        ):
+            body = cached[3]
+        else:
+            body = self._week_rows(paint, data, width, now)
+            self._week_body = (data, width, minute, body)
+        visible = max(6, lines - 6)
+        self.panel_scroll = max(
+            0, min(self.panel_scroll, max(0, len(body) - visible))
+        )
+        body = body[self.panel_scroll : self.panel_scroll + visible]
+        return panel_frame(
+            paint,
+            "week calendar (UTC)",
+            body,
+            width,
+            "j/k scroll · r refresh · esc close",
+        )
+
+    def _week_rows(
+        self,
+        paint: Painter,
+        data: dict[str, Any],
+        width: int,
+        now: datetime.datetime,
+    ) -> list[str]:
+        """Every row of the week-calendar body, unscrolled."""
         body: list[str] = []
         items = data["items"]
         frequent = data["frequent"]
@@ -6435,7 +6582,7 @@ class AppOverlays(AppRender):
         for hour in range(0, 24, 3):
             axis.append(paint.style("%02d " % hour, "dim"))
         body.append("".join(axis))
-        today = datetime.datetime.now(datetime.timezone.utc).date()
+        today = now.date()
         for day in range(7):
             date = (start + datetime.timedelta(days=day)).date()
             label = "today" if date == today else date.strftime("%a")
@@ -6456,7 +6603,6 @@ class AppOverlays(AppRender):
         if items:
             body.append("")
             body.append(paint.style(" upcoming fires (UTC)", "dim"))
-            now = datetime.datetime.now(datetime.timezone.utc)
             for when, name in items:
                 past = when < now
                 body.append(
@@ -6486,18 +6632,7 @@ class AppOverlays(AppRender):
                         "  x%d%s" % (count, "+" if capped else ""), "dim"
                     )
                 )
-        visible = max(6, lines - 6)
-        self.panel_scroll = max(
-            0, min(self.panel_scroll, max(0, len(body) - visible))
-        )
-        body = body[self.panel_scroll : self.panel_scroll + visible]
-        return panel_frame(
-            paint,
-            "week calendar (UTC)",
-            body,
-            width,
-            "j/k scroll · r refresh · esc close",
-        )
+        return body
 
     # ---- next-fire radar --------------------------------------------
     def render_radar(self, paint: Painter, cols: int, lines: int) -> list[str]:
