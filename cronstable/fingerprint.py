@@ -173,6 +173,7 @@ def _command_repr(command: str | list[str]) -> dict[str, Any]:
     Keeps the shell-string vs argv-list distinction (they behave differently),
     rather than joining a list into a string, which would be lossy:
     ``["echo", "a b"]`` and ``["echo", "a", "b"]`` must not collide.
+    ``argv`` aliases the live config list, so consumers must not mutate it.
     """
     if isinstance(command, list):
         return {"argv": command}

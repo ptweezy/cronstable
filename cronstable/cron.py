@@ -1497,7 +1497,9 @@ def _jobs_response_product(
     The tag hashes a CANONICAL variant with the volatile relative
     ``scheduled_in`` swapped for its stable absolute next-fire instant, so
     it changes exactly when the displayed data changes, not per countdown
-    tick. Pure and free of scheduler state, so it can run on an executor.
+    tick. Free of scheduler state, so it can run on an executor; the swap
+    mutates ``payload`` in place, which each build owns exclusively
+    (single-flight, or one executor hop).
 
     ``trusted=True`` and SHA-256 deliberately differ from durable-record
     rules: two builds disagreeing degrades a 304 into a 200, never a wrong
@@ -1505,29 +1507,23 @@ def _jobs_response_product(
     nothing to leak; the If-None-Match check stays in the handler because
     one product is shared across every concurrent poller.
     """
-    # the swap happens in place: this build owns the payload exclusively
-    # (single-flight, or one executor hop), so it is free to mutate rows
-    saved = [job["scheduled_in"] for job in payload]
-    try:
-        for job in payload:
-            job["scheduled_in"] = next_fire.get(job["name"])
-        try:
-            raw = _json.dumps_bytes(payload, trusted=True)
-        except (_json.UnsupportedValue, ValueError, TypeError):
-            # the stdlib flavour cannot render a datetime, so a no-orjson
-            # install always lands here; determinism is all the tag needs.
-            raw = json.dumps(
-                payload, separators=(",", ":"), default=str
-            ).encode("utf-8")
-    finally:
-        # the body serialize below needs the original relative values
-        for job, prior in zip(payload, saved, strict=True):
-            job["scheduled_in"] = prior
-    etag = '"' + hashlib.sha256(raw).hexdigest()[:32] + '"'
+    # the body serializes before the swap below, while the rows still hold
+    # the relative values it shows
     try:
         body = _json.dumps_bytes(payload, trusted=True)
     except (_json.UnsupportedValue, ValueError, TypeError):
         body = json.dumps(payload, default=str).encode("utf-8")
+    for job in payload:
+        job["scheduled_in"] = next_fire.get(job["name"])
+    try:
+        raw = _json.dumps_bytes(payload, trusted=True)
+    except (_json.UnsupportedValue, ValueError, TypeError):
+        # the stdlib flavour cannot render a datetime, so a no-orjson
+        # install always lands here; determinism is all the tag needs.
+        raw = json.dumps(payload, separators=(",", ":"), default=str).encode(
+            "utf-8"
+        )
+    etag = '"' + hashlib.sha256(raw).hexdigest()[:32] + '"'
     if len(body) >= _GZIP_MIN_BYTES:
         return etag, body, _gzip_body(body)
     return etag, body, None
@@ -3692,8 +3688,8 @@ class Cron:
         except (ValueError, KeyError) as err:
             payload.update({"valid": False, "error": str(err)})
             return payload
-        # the preview walk and the describer both reuse `tab`, the parse
-        # of this text under `seed` above
+        # the preview walk and the describer share `tab`, the parse of
+        # this text under `seed` above
         fires = next_fires(text, count, tz=zone, hash_key=seed, tab=tab)
         payload.update(
             {
@@ -4440,11 +4436,11 @@ class Cron:
     ) -> Optional[PauseInfo]:
         """The job's live pause window, or ``None``; expiry enforced HERE.
 
-        The one pause read every consumer goes through: an expired window
-        reads as absent everywhere at once. The stale entry is swept by
-        housekeeping; only memory is consulted, never store I/O on a
-        scheduling path.  ``now`` is a looping caller's pass instant and
-        defaults to a fresh clock read.
+        The one pause read every consumer goes through: expiry is judged
+        against ``now`` (a looping caller's pass instant, defaulting to a
+        fresh clock read), so within one pass an expired window reads as
+        absent everywhere at once. The stale entry is swept by housekeeping;
+        only memory is consulted, never store I/O on a scheduling path.
         """
         info = self._paused.get(name)
         if info is None:
@@ -5244,11 +5240,14 @@ class Cron:
         job: JobConfig,
         now: Optional[datetime.datetime] = None,
     ) -> dict[str, Any]:
+        # one instant for the whole payload (a looping caller's pass instant,
+        # or a fresh read): scheduled_in, pause expiry and SLA observations
+        # agree about the time.
+        if now is None:
+            now = get_now(datetime.timezone.utc)
         running = self.running_jobs.get(name) or []
         # next scheduled run, in seconds; None when not applicable (disabled,
-        # currently running, or a one-off @reboot schedule).  ``now`` is the
-        # caller's pass instant when it is looping the job set; see
-        # _scheduled_in.
+        # currently running, or a one-off @reboot schedule).
         scheduled_in = self._scheduled_in(name, job, bool(running), now)
         # a dead schedule's None means NEVER, distinct from the running/
         # disabled Nones. For a non-running job _scheduled_in already
@@ -5372,11 +5371,7 @@ class Cron:
         # has_sla is precomputed, keeping the allocation off no-SLA jobs.
         if job.has_sla:
             thresholds = job.sla_thresholds
-            observations = self._sla_observations(
-                name,
-                job,
-                now if now is not None else get_now(datetime.timezone.utc),
-            )
+            observations = self._sla_observations(name, job, now)
             breaches = []
             for check, (
                 threshold,
@@ -6364,8 +6359,8 @@ class Cron:
         buffer, so after the buffer rotates it can only ever skip forward,
         never resurrect dropped lines.
         """
-        # `lines` aliases the live ring; the len and the islice run
-        # synchronously back to back, so both see the same contents
+        # `lines` aliases the live ring: safe only on the event loop, where
+        # the len and the islice run with nothing rotating between them
         lines = output.lines if output is not None else ()
         total = len(lines)
         if cursor is None:

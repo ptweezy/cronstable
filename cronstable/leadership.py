@@ -388,7 +388,7 @@ class LeaseBackend(LeadershipBackend):
         :meth:`cronstable.cluster.ClusterManager._reconcile_job_set_id`;
         the store-read set is reconciled by :meth:`_observe_reboot_ran`.
 
-        ``current``: the live job-set id, fetched once by the caller.
+        ``current``: the live job-set id.
         """
         if self._reboot_ran_local_job_set_id != current:
             self._reboot_ran_local = set()
@@ -414,7 +414,7 @@ class LeaseBackend(LeadershipBackend):
         ``advertised_ran_jobs`` read-path guard); the next observe
         re-populates under the new id.
 
-        ``current``: the live job-set id, fetched once by the caller.
+        ``current``: the live job-set id.
         """
         if self._reboot_ran_job_set_id != current:
             self._reboot_ran = set()
