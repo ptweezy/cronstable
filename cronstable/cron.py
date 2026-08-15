@@ -1704,15 +1704,22 @@ async def _noop_state_write() -> None:
     return None
 
 
-def next_sleep_interval(subminute: bool = False) -> float:
+def next_sleep_interval(
+    subminute: bool = False,
+    now: Optional[datetime.datetime] = None,
+) -> float:
     """Seconds to sleep until the next scheduling tick.
 
     Minute mode (``subminute`` False, the default) snaps to the top of the
     next minute.  When any enabled job pins specific
     seconds the scheduler switches to ``subminute`` mode and snaps to the next
     whole-second boundary instead, so a second-level schedule can fire on time.
+
+    ``now`` is the caller's already-read clock instant (aware UTC); when
+    omitted the function reads the clock itself.
     """
-    now = get_now(datetime.timezone.utc)
+    if now is None:
+        now = get_now(datetime.timezone.utc)
     if subminute:
         target = now.replace(microsecond=0) + datetime.timedelta(seconds=1)
     else:
@@ -8310,7 +8317,10 @@ class Cron:
         boundary. Never negative. The cap goes through
         next_sleep_interval so tests can patch that one function.
         """
-        housekeeping = next_sleep_interval(False)
+        # one clock read serves the housekeeping snap and the soonest-fire
+        # delta below
+        now = get_now(datetime.timezone.utc)
+        housekeeping = next_sleep_interval(False, now)
         # Wake sooner when a DAG poke/retry/run is due, floored at
         # MIN_TICK_SLEEP (an already-due hint stays due until its pass
         # rewrites the entry; unfloored it would spin the loop). Whether
@@ -8326,7 +8336,6 @@ class Cron:
         soonest = self._peek_soonest_fire()
         if soonest is None:
             return housekeeping
-        now = get_now(datetime.timezone.utc)
         delta = (soonest - now).total_seconds()
         return max(0.0, min(housekeeping, delta))
 
