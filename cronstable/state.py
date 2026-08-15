@@ -40,6 +40,7 @@ standard library.
 import abc
 import asyncio
 import contextlib
+import functools
 import hashlib
 import logging
 import math
@@ -125,6 +126,10 @@ DOCS_DIR = "docs"
 #: never guess wider: every other ``docs/`` namespace is durable state.
 _IDEM_DOC_NS_PREFIX = "idem/"
 BLOBS_DIR = "blobs"
+
+#: The character set of a lowercase sha256 hex digest; blob paths admit
+#: exactly these, so a crafted digest can never escape the blob directory.
+_HEX_DIGITS = frozenset("0123456789abcdef")
 
 # Worker-thread concurrency caps (see :meth:`FilesystemStateBackend._call`).
 # BULK bounds the record/document ops so a wedged mount cannot strand an
@@ -250,8 +255,13 @@ def _now() -> float:
     return time.time()
 
 
+@functools.lru_cache(maxsize=4096)
 def _fs_safe(name: str) -> str:
     """Return ``name`` as an injective, filename-safe token.
+
+    A pure function of ``name``, memoized with a bounded cache: the same
+    stream and namespace tokens recur on every store op and every
+    directory-listing decode re-encodes each candidate name.
 
     Bytes outside :data:`_FS_SAFE` are percent-encoded from UTF-8, so
     arbitrary job names map to distinct, portable filenames.  Injectivity
@@ -994,12 +1004,26 @@ class FilesystemStateBackend(StateBackend):
         # colliding; job-set scoping (like the lease backends' @reboot set) is
         # layered on top by callers via the stream name.
         self.namespace = config.get("deploymentId") or "default"
+        # The namespaced root all this backend's files live under, plus the
+        # per-lane subroots; every path helper hangs off these, and root and
+        # namespace hold for the backend's lifetime.
+        self.base = os.path.join(self.root, _fs_safe(self.namespace))
+        self._records_root = os.path.join(self.base, RECORDS_DIR)
+        self._leases_root = os.path.join(self.base, LEASES_DIR)
+        self._docs_root = os.path.join(self.base, DOCS_DIR)
+        self._blobs_root = os.path.join(self.base, BLOBS_DIR)
+        self._tmp_root = os.path.join(self.base, TMP_DIR)
+        self._quarantine_root = os.path.join(self.base, QUARANTINE_DIR)
         self._configured_topology: str = config.get("topology", "auto")
         self._topology = "unknown"
         # a per-process id mixed into every written filename, so records and
         # temp files from different nodes/processes onto one shared mount never
         # collide on a name.  os.urandom is fine (uniqueness, not secrecy).
         self._instance = os.urandom(6).hex()
+        # every temp file's fixed path head; only the sequence number varies
+        self._tmp_prefix = os.path.join(
+            self._tmp_root, "w-{}-".format(self._instance)
+        )
         # Worker threads may run several sync halves at once; an unlocked
         # `self._seq += 1` can interleave, and a duplicated seq (plus the
         # coarse Windows clock) means one record silently clobbering
@@ -1078,24 +1102,19 @@ class FilesystemStateBackend(StateBackend):
 
     # --- paths -----------------------------------------------------------
 
-    @property
-    def base(self) -> str:
-        """The namespaced root all this backend's files live under."""
-        return os.path.join(self.root, _fs_safe(self.namespace))
-
     def _stream_dir(self, stream: str) -> str:
-        return os.path.join(self.base, RECORDS_DIR, _fs_safe(stream))
+        return os.path.join(self._records_root, _fs_safe(stream))
 
     def _lease_paths(self, name: str) -> tuple[str, str]:
         safe = _fs_safe(name)
-        leases = os.path.join(self.base, LEASES_DIR)
+        leases = self._leases_root
         return (
             os.path.join(leases, safe + ".lock"),
             os.path.join(leases, safe + ".lease"),
         )
 
     def _doc_dir(self, namespace: str) -> str:
-        return os.path.join(self.base, DOCS_DIR, _fs_safe(namespace))
+        return os.path.join(self._docs_root, _fs_safe(namespace))
 
     def _doc_paths(self, namespace: str, key: str) -> tuple[str, str]:
         """The ``(lock file, doc file)`` for one document.
@@ -1122,11 +1141,9 @@ class FilesystemStateBackend(StateBackend):
         # reaches the filesystem, so a crafted digest (e.g. from a
         # malicious restore archive) cannot escape the blob directory via
         # ".." or a path separator.
-        if len(digest) != 64 or any(
-            c not in "0123456789abcdef" for c in digest
-        ):
+        if len(digest) != 64 or not _HEX_DIGITS.issuperset(digest):
             raise ValueError("invalid blob digest: {!r}".format(digest))
-        return os.path.join(self.base, BLOBS_DIR, digest[:2], digest + ".blob")
+        return os.path.join(self._blobs_root, digest[:2], digest + ".blob")
 
     def _next_seq(self) -> int:
         with self._seq_lock:
@@ -1134,11 +1151,7 @@ class FilesystemStateBackend(StateBackend):
             return self._seq
 
     def _tmp_path(self) -> str:
-        return os.path.join(
-            self.base,
-            TMP_DIR,
-            "w-{}-{:012d}.tmp".format(self._instance, self._next_seq()),
-        )
+        return self._tmp_prefix + "{:012d}.tmp".format(self._next_seq())
 
     # --- worker threads ----------------------------------------------------
 
@@ -1218,7 +1231,9 @@ class FilesystemStateBackend(StateBackend):
             # finally returns, which is exactly the latency worth seeing.
             elapsed = time.perf_counter() - began
             with self._stats_lock:
-                entry = self._op_stats.setdefault(op, [0, 0, 0.0])
+                entry = self._op_stats.get(op)
+                if entry is None:
+                    entry = self._op_stats[op] = [0, 0, 0.0]
                 entry[0] += 1
                 if exc is not None:
                     entry[1] += 1
@@ -1909,7 +1924,7 @@ class FilesystemStateBackend(StateBackend):
     def _list_stream_names_audit_sync(
         self, prefix: str
     ) -> tuple[list[str], bool]:
-        records_root = os.path.join(self.base, RECORDS_DIR)
+        records_root = self._records_root
         token_prefix = _fs_safe_fragment(prefix)
         try:
             tokens = os.listdir(records_root)
@@ -2543,11 +2558,10 @@ class FilesystemStateBackend(StateBackend):
         transform: Callable[[Optional[dict[str, Any]]], tuple[Any, _T]],
     ) -> tuple[Optional[dict[str, Any]], _T]:
         lock_path, doc_path = self._doc_paths(namespace, key)
-        # the lock file's directory is the namespace dir, created here so the
-        # very first write to a fresh namespace has somewhere to land.
-        self._makedirs_durable(os.path.dirname(lock_path))
-        # ``touch``: every mutate refreshes the lock file's mtime, the idle
-        # clock the GC orphan-lock sweep judges a doc ``.lock`` by.
+        # _locked creates the namespace dir before opening the lock file,
+        # so the very first write to a fresh namespace has somewhere to
+        # land.  ``touch``: every mutate refreshes the lock file's mtime,
+        # the idle clock the GC orphan-lock sweep judges a doc ``.lock`` by.
         with self._locked(lock_path, touch=True):
             current = self._read_doc_file(doc_path, strict=True)
             new_body, result = transform(current)
@@ -2634,7 +2648,7 @@ class FilesystemStateBackend(StateBackend):
     def _list_document_namespaces_sync(
         self, prefix: str
     ) -> tuple[list[str], bool]:
-        docs_root = os.path.join(self.base, DOCS_DIR)
+        docs_root = self._docs_root
         token_prefix = _fs_safe_fragment(prefix)
         try:
             tokens = os.listdir(docs_root)
@@ -2836,15 +2850,17 @@ class FilesystemStateBackend(StateBackend):
         now = _now()
         cutoff = now - max(0.0, grace)
         keep_tokens = {_fs_safe(stream) for stream in PROTECTED_STREAMS}
-        prefix_tokens: list[str] = []
+        prefix_list: list[str] = []
         for prefix, suffixes in keep.items():
-            prefix_tokens.append(_fs_safe_fragment(prefix))
+            prefix_list.append(_fs_safe_fragment(prefix))
             for suffix in suffixes:
                 keep_tokens.add(_fs_safe(prefix + suffix))
+        # str.startswith takes the whole tuple in one call per entry
+        prefix_tokens = tuple(prefix_list)
         removed_streams: list[str] = []
         removed_records = 0
         kept_streams = 0
-        records_root = os.path.join(self.base, RECORDS_DIR)
+        records_root = self._records_root
         try:
             entries = sorted(os.listdir(records_root))
         except OSError:
@@ -2853,9 +2869,7 @@ class FilesystemStateBackend(StateBackend):
             stream_dir = os.path.join(records_root, token)
             if not os.path.isdir(stream_dir):
                 continue
-            if token in keep_tokens or not any(
-                token.startswith(p) for p in prefix_tokens
-            ):
+            if token in keep_tokens or not token.startswith(prefix_tokens):
                 # referenced, protected, or unrecognised: never delete what
                 # is still wanted or cannot be classified.
                 kept_streams += 1
@@ -2919,10 +2933,10 @@ class FilesystemStateBackend(StateBackend):
         )
         locks_removed = self._gc_orphan_locks_sync(cutoff, dry_run)
         tmp_removed = self._sweep_dir_sync(
-            os.path.join(self.base, TMP_DIR), now - TMP_MAX_AGE, dry_run
+            self._tmp_root, now - TMP_MAX_AGE, dry_run
         )
         quarantine_removed = self._sweep_dir_sync(
-            os.path.join(self.base, QUARANTINE_DIR), cutoff, dry_run
+            self._quarantine_root, cutoff, dry_run
         )
         return {
             "dry_run": dry_run,
@@ -2957,7 +2971,7 @@ class FilesystemStateBackend(StateBackend):
         to the orphan-lock sweep.
         """
         removed = 0
-        docs_root = os.path.join(self.base, DOCS_DIR)
+        docs_root = self._docs_root
         idem_token_prefix = _fs_safe_fragment(_IDEM_DOC_NS_PREFIX)
         try:
             ns_tokens = os.listdir(docs_root)
@@ -3090,7 +3104,7 @@ class FilesystemStateBackend(StateBackend):
         if not prefix_tokens:
             return 0
         removed = 0
-        lease_root = os.path.join(self.base, LEASES_DIR)
+        lease_root = self._leases_root
         try:
             names = os.listdir(lease_root)
         except OSError:
@@ -3099,7 +3113,7 @@ class FilesystemStateBackend(StateBackend):
             if not name.endswith(".lease"):
                 continue
             token = name[: -len(".lease")]
-            if not any(token.startswith(p) for p in prefix_tokens):
+            if not token.startswith(prefix_tokens):
                 continue  # non-ephemeral: never touched
             lease_path = os.path.join(lease_root, name)
             lock_path = os.path.join(lease_root, token + ".lock")
@@ -3161,7 +3175,7 @@ class FilesystemStateBackend(StateBackend):
         vanishing window.
         """
         removed = 0
-        docs_root = os.path.join(self.base, DOCS_DIR)
+        docs_root = self._docs_root
         try:
             ns_tokens = os.listdir(docs_root)
         except OSError:
@@ -3183,7 +3197,7 @@ class FilesystemStateBackend(StateBackend):
                     lock_path, doc_path, cutoff, dry_run
                 ):
                     removed += 1
-        lease_root = os.path.join(self.base, LEASES_DIR)
+        lease_root = self._leases_root
         try:
             names = os.listdir(lease_root)
         except OSError:
@@ -3287,7 +3301,7 @@ class FilesystemStateBackend(StateBackend):
 
     def _migrate_sync(self, dry_run: bool) -> dict[str, Any]:
         current = converted = unknown = unreadable = failed = 0
-        records_root = os.path.join(self.base, RECORDS_DIR)
+        records_root = self._records_root
         try:
             streams = sorted(os.listdir(records_root))
         except OSError:
@@ -3378,7 +3392,7 @@ class FilesystemStateBackend(StateBackend):
     ) -> int:
         cutoff = _now() - max(0.0, grace)
         removed = 0
-        blobs_root = os.path.join(self.base, BLOBS_DIR)
+        blobs_root = self._blobs_root
         try:
             shards = os.listdir(blobs_root)
         except OSError:
@@ -3508,11 +3522,11 @@ class FilesystemStateBackend(StateBackend):
                     bucket["scopes"].append({"scope": scope, "count": count})
             return groups
 
-        records = walk(os.path.join(self.base, RECORDS_DIR), ".json")
-        documents = walk(os.path.join(self.base, DOCS_DIR), ".doc")
+        records = walk(self._records_root, ".json")
+        documents = walk(self._docs_root, ".doc")
 
         leases: list[dict[str, Any]] = []
-        lease_root = os.path.join(self.base, LEASES_DIR)
+        lease_root = self._leases_root
         now = _now()
         try:
             lease_files = sorted(os.listdir(lease_root))
@@ -3538,9 +3552,7 @@ class FilesystemStateBackend(StateBackend):
             )
 
         try:
-            quarantine = len(
-                os.listdir(os.path.join(self.base, QUARANTINE_DIR))
-            )
+            quarantine = len(os.listdir(self._quarantine_root))
         except OSError:
             quarantine = 0
 

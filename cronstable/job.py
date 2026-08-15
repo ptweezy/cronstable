@@ -2,6 +2,7 @@ import asyncio
 import asyncio.subprocess
 import atexit
 import html
+import itertools
 import logging
 import ntpath
 import os
@@ -753,7 +754,10 @@ class StreamReader:
                 if self.discarded_lines
                 else []
             )
-            output = "".join(self.save_top + middle + list(self.save_bottom))
+            # chain feeds join without concatenating the three parts first
+            output = "".join(
+                itertools.chain(self.save_top, middle, self.save_bottom)
+            )
         else:
             output = "".join(self.save_top)
         return output, self.discarded_lines
@@ -813,14 +817,15 @@ class SentryReporter(Reporter):
         import sentry_sdk
         import sentry_sdk.utils
 
+        # template_vars is rebuilt on every property access, so one read
+        # serves the body render and every fingerprint line
+        tvars = job.template_vars
         template = _compiled_template(config["body"])
-        body = template.render(job.template_vars)
+        body = template.render(tvars)
 
         fingerprint = []
         for line in config["fingerprint"]:
-            fingerprint.append(
-                _compiled_template(line).render(job.template_vars)
-            )
+            fingerprint.append(_compiled_template(line).render(tvars))
 
         kwargs = {}
         if config.get("maxStringLength"):
@@ -1568,7 +1573,9 @@ def eventlog_event_strings(
     builder, and the notify context's job shim carries ``__slots__``, so
     attribute probing is the brittle way to ask the same question.
     """
-    tvars = dict(ctx.template_vars)
+    # every template_vars implementation builds a fresh dict per access,
+    # and this function only reads it, so the dict is used as handed over
+    tvars = ctx.template_vars
     output = ""
     if include_output:
         output = _eventlog_safe(
@@ -2213,6 +2220,7 @@ class RunningJob:
     async def start(self) -> None:
         if self.proc is not None:
             raise RuntimeError("process already running")
+        config = self.config
         self.started_at = datetime.now(timezone.utc)
         # Isolate the job in its own process group, so cancel() can take its
         # whole descendant tree down as a unit rather than only the process we
@@ -2221,24 +2229,24 @@ class RunningJob:
         # creation flags are the only race-free place to set one; POSIX is
         # served by the renice below, once there is a group to renice.
         kwargs: dict[str, Any] = platform.new_process_group_kwargs(
-            self.config.priority
+            config.priority
         )
-        if isinstance(self.config.command, list):
+        if isinstance(config.command, list):
             create: Any = asyncio.create_subprocess_exec
-            cmd = self.config.command
+            cmd = config.command
         else:
-            if self.config.shell:
+            if config.shell:
                 create, cmd, shell_kwargs = shell_spawn(
-                    self.config.shell, self.config.command
+                    config.shell, config.command
                 )
                 kwargs.update(shell_kwargs)
             else:
                 create = asyncio.create_subprocess_shell
-                cmd = [self.config.command]
-        if self.config.environment or self.extra_env:
+                cmd = [config.command]
+        if config.environment or self.extra_env:
             env = dict(os.environ)
             fixup_pyinstaller_env(env)
-            for envvar in self.config.environment:
+            for envvar in config.environment:
                 env[envvar["key"]] = envvar["value"]
             # The daemon-injected control-channel vars go last, so a job's own
             # environment cannot shadow the loopback URL/token it needs to
@@ -2247,7 +2255,7 @@ class RunningJob:
             env.update(self.extra_env)
             self.env = env
             kwargs["env"] = env
-        if self.config.workingDirectory is not None:
+        if config.workingDirectory is not None:
             # The directory the child starts in.  Omitted rather than passed
             # as None when unset, so a job that does not ask for one keeps
             # inheriting the daemon's CWD byte for byte as it always has.
@@ -2257,22 +2265,24 @@ class RunningJob:
             # preexec_fn runs, so on a job that also demotes, the chdir uses
             # the daemon's privileges and the demoted child can land in a
             # directory it cannot itself read.
-            kwargs["cwd"] = self.config.workingDirectory
-        if self.config.uid is not None or self.config.gid is not None:
+            kwargs["cwd"] = config.workingDirectory
+        if config.uid is not None or config.gid is not None:
             # POSIX only: uid/gid are always None on Windows (the config layer
             # rejects user/group there), so preexec_fn is never wired up on a
             # platform that doesn't support it.
             kwargs["preexec_fn"] = self._demote
-        logger.debug("%s: will execute argv %r", self.config.name, cmd)
-        if self.config.captureStderr:
+        logger.debug("%s: will execute argv %r", config.name, cmd)
+        capture_stderr = config.captureStderr
+        capture_stdout = config.captureStdout
+        if capture_stderr:
             kwargs["stderr"] = asyncio.subprocess.PIPE
-        if self.config.captureStdout:
+        if capture_stdout:
             kwargs["stdout"] = asyncio.subprocess.PIPE
-        if self.config.executionTimeout:
+        if config.executionTimeout:
             self.execution_deadline = (
-                time.perf_counter() + self.config.executionTimeout
+                time.perf_counter() + config.executionTimeout
             )
-        if self.config.captureStderr or self.config.captureStdout:
+        if capture_stderr or capture_stdout:
             # The pipe's flow-control watermark, NOT the line cap (the
             # reader enforces maxLineLength by hand, see
             # StreamReader._read). This only decides how much unread
@@ -2285,11 +2295,15 @@ class RunningJob:
             # POSIX wants UTF-8 bytes argv (locale-independent); Windows wants
             # str (CreateProcessW rejects bytes). See platform.encode_argv.
             args = platform.encode_argv(cmd)
-            logger.debug(
-                "subprocess: args=%r, kwargs=%r",
-                args,
-                loggable_spawn_kwargs(kwargs),
-            )
+            # loggable_spawn_kwargs copies and summarises the whole kwargs
+            # dict, so the guard keeps the launch path free of it whenever
+            # DEBUG is off.
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "subprocess: args=%r, kwargs=%r",
+                    args,
+                    loggable_spawn_kwargs(kwargs),
+                )
             self.proc = await create(*args, **kwargs)
         except (
             subprocess.SubprocessError,
@@ -2308,7 +2322,7 @@ class RunningJob:
             logger.exception(
                 "Error launching subprocess of job %s, cmd=%r, kwargs=%s "
                 "(system encoding: %s)",
-                self.config.name,
+                config.name,
                 cmd,
                 loggable_spawn_kwargs(kwargs),
                 sys.getdefaultencoding(),
@@ -2324,7 +2338,7 @@ class RunningJob:
             # its effect alone: a refusal is best-effort by design and
             # apply_priority logs it, so there is nothing to decide here and
             # nothing to say twice.
-            platform.apply_priority(self.proc.pid, self.config.priority)
+            platform.apply_priority(self.proc.pid, config.priority)
 
         # Spawned, not awaited: every launch path holds the daemon-wide
         # spawn gate around start(), and a stalled statsd send would hold
@@ -2333,37 +2347,37 @@ class RunningJob:
         if self.statsd_writer:
             self._start_telemetry = asyncio.create_task(self._on_start())
 
-        if self.config.monitorResources and self.proc.pid is not None:
+        if config.monitorResources and self.proc.pid is not None:
             # Best-effort: if psutil cannot attach the monitor stays inert
             # and resource_usage ends up None. Started right after launch.
             self._resource_monitor = ResourceMonitor(
                 self.proc.pid,
-                interval=self.config.monitorResourcesInterval,
-                history=self.config.monitorResourcesHistory,
+                interval=config.monitorResourcesInterval,
+                history=config.monitorResourcesHistory,
             )
             self._resource_monitor.start()
 
-        if self.config.captureStderr:
+        if capture_stderr:
             assert self.proc.stderr is not None
             self._stderr_reader = StreamReader(
-                self.config.name,
+                config.name,
                 "stderr",
                 self.proc.stderr,
-                self.config.streamPrefix,
-                self.config.saveLimit,
+                config.streamPrefix,
+                config.saveLimit,
                 on_line=self.output.publish,
-                max_line_length=self.config.maxLineLength,
+                max_line_length=config.maxLineLength,
             )
-        if self.config.captureStdout:
+        if capture_stdout:
             assert self.proc.stdout is not None
             self._stdout_reader = StreamReader(
-                self.config.name,
+                config.name,
                 "stdout",
                 self.proc.stdout,
-                self.config.streamPrefix,
-                self.config.saveLimit,
+                config.streamPrefix,
+                config.saveLimit,
                 on_line=self.output.publish,
-                max_line_length=self.config.maxLineLength,
+                max_line_length=config.maxLineLength,
             )
 
     def live_resources(self) -> Optional[dict[str, Any]]:

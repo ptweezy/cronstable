@@ -117,6 +117,10 @@ _GAP_PROBE = datetime.timedelta(hours=26)
 #: once-per-call path of next(), prev() and every occurrences() yield.
 _ONE_SECOND = datetime.timedelta(seconds=1)
 
+#: The UTC singleton; the aware loops in next(), prev() and occurrences()
+#: convert through it once per candidate.
+_UTC = datetime.timezone.utc
+
 
 #: Days per month, indexed 1-12 (February's non-leap length); index 0 unused.
 _MDAYS = (0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
@@ -731,9 +735,7 @@ def _default_now(default_utc: bool) -> datetime.datetime:
     on this path.
     """
     if default_utc:
-        return datetime.datetime.now(datetime.timezone.utc).replace(
-            tzinfo=None
-        )
+        return datetime.datetime.now(_UTC).replace(tzinfo=None)
     return datetime.datetime.now()
 
 
@@ -1049,6 +1051,13 @@ class CronTab:
             and (self._years is None or entry.year in self._years)
         ):
             return False
+        if self._days_plain:
+            # Plain day columns reduce the day test to set membership
+            # (the _days_plain contract); the month length feeds only
+            # the L / W / # rules, so it stays uncomputed here.
+            if entry.day not in self._dom:
+                return False
+            return self._dow_free or (entry.weekday() + 1) % 7 in self._dow
         # month length computed only once the cheaper column checks pass
         month_end = _month_end(entry.year, entry.month)
         return self._day_matches(entry.year, entry.month, entry.day, month_end)
@@ -1190,15 +1199,13 @@ class CronTab:
         # offered again on the second.  The seed may sit BEFORE now's
         # label (see _gap_rewound_seed); the resolved-UTC guard below
         # keeps the earlier seed from ever RETURNING a past instant.
-        now_utc = now.astimezone(datetime.timezone.utc)
+        now_utc = now.astimezone(_UTC)
         civil = self._gap_rewound_seed(now, now_utc)
         while True:
             target = self._next_civil(civil)
             if target is None:
                 return None
-            resolved_utc = target.replace(tzinfo=now.tzinfo).astimezone(
-                datetime.timezone.utc
-            )
+            resolved_utc = target.replace(tzinfo=now.tzinfo).astimezone(_UTC)
             if resolved_utc > now_utc:
                 return (resolved_utc - now_utc).total_seconds()
             resolved_civil = resolved_utc.astimezone(now.tzinfo).replace(
@@ -1210,7 +1217,10 @@ class CronTab:
         self, civil: datetime.datetime
     ) -> Optional[datetime.datetime]:
         """Smallest whole-second civil instant strictly after ``civil``."""
-        base = civil.replace(microsecond=0) + _ONE_SECOND
+        # a whole-second seed (every occurrences() cursor) skips the copy
+        base = (
+            civil.replace(microsecond=0) if civil.microsecond else civil
+        ) + _ONE_SECOND
         year, month, day = base.year, base.month, base.day
         tod: Optional[datetime.time] = base.time()
         years = self._years
@@ -1218,6 +1228,9 @@ class CronTab:
         months = self._months
         months_sorted = self._months_sorted
         days_plain = self._days_plain
+        dom_matches = self._dom_matches
+        dow_matches = self._dow_matches
+        at_first_time = self._at_first_time
         horizon = _YEAR_HORIZON
         while year <= horizon:
             # membership against the frozenset, not a scan of the tuple
@@ -1247,10 +1260,10 @@ class CronTab:
                 # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
                 dow = (datetime.date(year, month, day).weekday() + 1) % 7
                 while day <= month_end:
-                    if self._dom_matches(
+                    if dom_matches(
                         year, month, day, month_end
-                    ) and self._dow_matches(dow, day, month_end):
-                        found = self._at_first_time(year, month, day, tod)
+                    ) and dow_matches(dow, day, month_end):
+                        found = at_first_time(year, month, day, tod)
                         if found is not None:
                             return found
                     day += 1
@@ -1283,9 +1296,10 @@ class CronTab:
             # constrains the day: bisect to each listed day instead of
             # testing every calendar day in between.
             dom_sorted = self._dom_sorted
+            dom_count = len(dom_sorted)
             index = bisect_left(dom_sorted, day)
             seed_day = day
-            while index < len(dom_sorted):
+            while index < dom_count:
                 day = dom_sorted[index]
                 if day > month_end:
                     return None
@@ -1420,7 +1434,7 @@ class CronTab:
         # label the zone leaves in place, then replay the forward iterator
         # (the fire policy itself) and keep the last instant before now.
         tz = now.tzinfo
-        utc = datetime.timezone.utc
+        utc = _UTC
         now_utc = now.astimezone(utc)
         # No occurrence lives past _YEAR_HORIZON, so clamp a far-future
         # ``now`` (a schema-valid MCP/web ``at`` argument) to the horizon's
@@ -1464,6 +1478,9 @@ class CronTab:
         months = self._months
         months_sorted = self._months_sorted
         days_plain = self._days_plain
+        dom_matches = self._dom_matches
+        dow_matches = self._dow_matches
+        at_last_time = self._at_last_time
         floor = _YEAR_FLOOR
         while year >= floor:
             if years is not None and year not in years:
@@ -1494,10 +1511,10 @@ class CronTab:
                 # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
                 dow = (datetime.date(year, month, day).weekday() + 1) % 7
                 while day >= 1:
-                    if self._dom_matches(
+                    if dom_matches(
                         year, month, day, month_end
-                    ) and self._dow_matches(dow, day, month_end):
-                        found = self._at_last_time(year, month, day, tod)
+                    ) and dow_matches(dow, day, month_end):
+                        found = at_last_time(year, month, day, tod)
                         if found is not None:
                             return found
                     day -= 1
@@ -1631,7 +1648,7 @@ class CronTab:
             # right after a spring-forward (see _gap_rewound_seed).  The
             # guard in the loop then admits exactly the candidates whose
             # resolved instant is strictly after start.
-            start_utc = start.astimezone(datetime.timezone.utc)
+            start_utc = start.astimezone(_UTC)
             civil = self._gap_rewound_seed(start, start_utc)
         while True:
             target = self._next_civil(civil)
@@ -1646,9 +1663,7 @@ class CronTab:
             # as the label the wall clock actually shows at that instant,
             # and continuing the civil search from the rendered label steps
             # past both the skipped hour and a fall-back repeat.
-            resolved_utc = target.replace(tzinfo=tz).astimezone(
-                datetime.timezone.utc
-            )
+            resolved_utc = target.replace(tzinfo=tz).astimezone(_UTC)
             resolved = resolved_utc.astimezone(tz)
             if resolved_utc <= start_utc:
                 # already past in REAL time (a fold=1 start, or a rewound
