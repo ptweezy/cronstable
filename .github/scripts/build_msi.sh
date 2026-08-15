@@ -25,8 +25,8 @@ set -euo pipefail
 # Maintenance Fee does not affect open-source CI use.) MSI assembly is
 # not compilation, so -arch is metadata and one runner shape serves
 # both.
-WIX_TOOL_VERSION=6.0.1
-WIX_UTIL_VERSION=6.0.1
+WIX_TOOL_VERSION=6.0.2
+WIX_UTIL_VERSION=6.0.2
 
 arch="$1"
 version="$2"
