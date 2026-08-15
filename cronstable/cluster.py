@@ -37,7 +37,6 @@ from typing import (
     Optional,
     TypeGuard,
     TypeVar,
-    cast,
 )
 
 import aiohttp
@@ -49,6 +48,8 @@ from cronstable.fingerprint import SCHEME_VERSION
 from cronstable.leadership import LeadershipBackend
 
 logger = logging.getLogger("cronstable.cluster")
+
+_UTC = datetime.timezone.utc
 
 # Per-peer status, as reported in the /cluster view.
 STATUS_UNKNOWN = "unknown"  # not yet contacted
@@ -1028,13 +1029,13 @@ def _memoized_derived(
             self._derived_cache_key = key
             self._derived_cache.clear()
         try:
-            # the cache is heterogeneous (keyed by method name); the cast
-            # restores the method's static result type.
-            return cast("_DerivedT", self._derived_cache[name])
+            # the cache is heterogeneous (keyed by method name); the
+            # annotation restores the method's static result type.
+            value: _DerivedT = self._derived_cache[name]
         except KeyError:
             value = method(self)
             self._derived_cache[name] = value
-            return value
+        return value
 
     return wrapper
 
@@ -1065,10 +1066,19 @@ class ClusterManager(LeadershipBackend):
         # "single-leader" (one leader runs all Leader jobs) or "spread"
         # (per-job ownership via rendezvous hashing); see _cluster_allows.
         self.distribution: str = config.get("distribution", "single-leader")
-        self.view = ClusterView(
-            [peer["host"] for peer in config["peers"]],
-            config["driftAfter"],
-        )
+        # config is immutable for a manager's lifetime (a cluster config
+        # change rebuilds the manager), so init-time snapshots cannot go
+        # stale.
+        self._peer_count: int = len(config["peers"])
+        self._elect_leader: bool = bool(config.get("electLeader"))
+        hosts = [peer["host"] for peer in config["peers"]]
+        self.view = ClusterView(hosts, config["driftAfter"])
+        self._peer_urls = {
+            host: "https://{}/peer".format(host) for host in hosts
+        }
+        self._reboot_ran_urls = {
+            host: "https://{}/reboot-ran".format(host) for host in hosts
+        }
         self._client_ssl = build_client_ssl_context(config["tls"])
         self._server_ssl = build_server_ssl_context(config["tls"])
         # snapshot the TLS material as loaded, so an in-place cert rotation can
@@ -1100,6 +1110,10 @@ class ClusterManager(LeadershipBackend):
         # emit-once latch for the degenerate 2-of-2 self-listing warning
         # (see _maybe_warn_degenerate_self_listing).
         self._warned_degenerate_self = False
+        # permanent-True latch for view_settled(): set once settling can no
+        # longer revert (no UNKNOWN peer and >= _SETTLE_ROUNDS completed
+        # rounds).
+        self._view_settled_latched = False
         # host -> (etag, record_success keyword set) of the last full /peer
         # body absorbed, driving conditional re-polls (see _observe_peer).
         # Content-addressed, so safe to keep across failed rounds: a later
@@ -1162,8 +1176,8 @@ class ClusterManager(LeadershipBackend):
         """
         return (
             PeerState._mutation_generation,
-            len(self.config["peers"]),
-            bool(self.config.get("electLeader")),
+            self._peer_count,
+            self._elect_leader,
             self.distribution,
             self.node_name,
             self.instance_id,
@@ -1221,25 +1235,27 @@ class ClusterManager(LeadershipBackend):
         if provider is None:
             return {}, False
         summaries = provider()
-        names = sorted(
+        names = [
             name for name in summaries if len(name) <= MAX_JOB_SUMMARY_NAME_LEN
-        )
-        truncated = len(names) > MAX_ADVERTISED_JOB_SUMMARIES or len(
-            names
-        ) < len(summaries)
-        return {
-            name: summaries[name]
-            for name in names[:MAX_ADVERTISED_JOB_SUMMARIES]
-        }, truncated
+        ]
+        truncated = len(names) < len(summaries)
+        if len(names) > MAX_ADVERTISED_JOB_SUMMARIES:
+            # sorted so the surviving subset is stable across rounds; entry
+            # order is otherwise meaningless (the ETag hashes a sort_keys
+            # projection and the dashboard sorts its rows).
+            names = sorted(names)[:MAX_ADVERTISED_JOB_SUMMARIES]
+            truncated = True
+        return {name: summaries[name] for name in names}, truncated
 
     # --- the mTLS /peer server -------------------------------------------
 
     def _peer_payload(self) -> dict[str, Any]:
         """The full /peer response body (see :meth:`_handle_peer`)."""
         job_summaries, summaries_truncated = self._advertised_job_summaries()
+        my_id = self.get_job_set_id()
         payload: dict[str, Any] = {
             "node_name": self.node_name,
-            "job_set_id": self.get_job_set_id(),
+            "job_set_id": my_id,
             "scheme_version": SCHEME_VERSION,
             "instance_id": self.instance_id,
             # our declared cluster size (len(peers)+1): a peer declaring a
@@ -1249,7 +1265,7 @@ class ClusterManager(LeadershipBackend):
             # our coordination policy: not in the fingerprint, so a
             # divergence is a conflict (see conflicting_policies).
             "distribution": self.distribution,
-            "elect_leader": bool(self.config.get("electLeader")),
+            "elect_leader": self._elect_leader,
             # our current observations: mutual agreement plus transitive
             # duplicate detection; see ClusterView.local_members.
             "members": self.view.local_members(
@@ -1259,7 +1275,7 @@ class ClusterManager(LeadershipBackend):
             # retire its matching deferred job without re-running it. Capped
             # so an inflated upstream set cannot push this response past the
             # byte cap (reboot_ran() still uses the full union).
-            "ran_reboot_jobs": sorted(self.advertised_ran_jobs())[
+            "ran_reboot_jobs": sorted(self.advertised_ran_jobs(my_id))[
                 :MAX_ADVERTISED_REBOOT_JOBS
             ],
             # the peers we *mutually* agree with: a poller's only sound
@@ -1429,9 +1445,7 @@ class ClusterManager(LeadershipBackend):
                         MAX_PEER_RESPONSE_BYTES,
                         len(body_bytes),
                     )
-            now_epoch = datetime.datetime.now(
-                datetime.timezone.utc
-            ).timestamp()
+            now_epoch = time.time()
             # etag computed on the payload actually sent: a degraded body
             # must never carry the full body's tag (which would 304 a poller
             # into replaying a body it never received).
@@ -1465,8 +1479,7 @@ class ClusterManager(LeadershipBackend):
         # enable_compression() lets aiohttp negotiate deflate first,
         # contradicting the documented gzip exchange. The size floor skips
         # bodies where the CPU spend outweighs the saved bytes.
-        body = resp.body
-        if isinstance(body, bytes) and len(body) >= MIN_COMPRESS_BYTES:
+        if len(body_bytes) >= MIN_COMPRESS_BYTES:
             if "gzip" in request.headers.get("Accept-Encoding", "").lower():
                 resp.enable_compression(web.ContentCoding.gzip)
             else:
@@ -1500,15 +1513,13 @@ class ClusterManager(LeadershipBackend):
             # malformed push from a buggy/hostile peer: reject cleanly
             # rather than 500 on an escaped exception.
             return web.Response(status=400)
-        if (
-            isinstance(data, dict)
-            and data.get("job_set_id") == self.get_job_set_id()
-        ):
+        my_id = self.get_job_set_id()
+        if isinstance(data, dict) and data.get("job_set_id") == my_id:
             # Reconcile our recorded runs to the current job set *before*
             # absorbing, mirroring _poll_all: otherwise names arriving just
             # after a reload would be seeded under the stale id and wiped by
             # the next poll.
-            self._reconcile_job_set_id(self.get_job_set_id())
+            self._reconcile_job_set_id(my_id)
             self._ran_reboot_jobs |= _parse_str_list(
                 data.get("names"),
                 max_len=MAX_REBOOT_JOB_NAME_LEN,
@@ -1783,7 +1794,7 @@ class ClusterManager(LeadershipBackend):
         """
         if self._warned_degenerate_self:
             return False
-        if not bool(self.config.get("electLeader")):
+        if not self._elect_leader:
             return False
         self_hosts = [
             host
@@ -1810,7 +1821,7 @@ class ClusterManager(LeadershipBackend):
     async def _observe_peer(
         self, session: aiohttp.ClientSession, host: str, my_id: str
     ) -> None:
-        url = "https://{}/peer".format(host)
+        url = self._peer_urls[host]
         # Conditional re-poll: echo the ETag of the last full body this host
         # served us, so an unchanged peer can answer with a bodyless 304
         # instead of the full O(members + jobs) JSON (see _handle_peer).
@@ -1860,7 +1871,7 @@ class ClusterManager(LeadershipBackend):
         # its countdowns while serving, so the pre-request instant would
         # overstate the snapshot's age by the round-trip latency, and a 304
         # replay would carry that skew for as long as the tag holds.
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(_UTC)
         # parse the sidecar once for both paths; missing or malformed
         # degrades to None and must never fail the poll.
         peer_node_stats = _parse_node_stats_header(raw_stats_header)
@@ -2066,7 +2077,7 @@ class ClusterManager(LeadershipBackend):
 
     # --- deferred @reboot "already ran" gossip ---------------------------
 
-    def advertised_ran_jobs(self) -> set[str]:
+    def advertised_ran_jobs(self, my_id: Optional[str] = None) -> set[str]:
         """@reboot one-shots known to have run under our *current* job set.
 
         Our own runs plus those reported by agreeing peers; re-advertising
@@ -2076,17 +2087,20 @@ class ClusterManager(LeadershipBackend):
         ``STATUS_AGREED``: after a local reload a peer's stale AGREED
         ran-set could otherwise retire a redefined @reboot one-shot without
         running the new definition. Mirrors :meth:`_handle_reboot_ran`'s
-        gate on pushes.
+        gate on pushes. ``my_id`` is the live job-set id, fetched when not
+        supplied.
         """
-        my_id = self.get_job_set_id()
+        if my_id is None:
+            my_id = self.get_job_set_id()
         # Gate our OWN recorded runs on the live id too: they were recorded
         # under _ran_jobs_job_set_id, which the poll reconciles only lazily;
         # between a reload and the next poll /peer would otherwise advertise
         # the old set under the NEW id, retiring an agreed peer's redefined
         # @reboot one-shot without running it. (None = no runs recorded yet.)
+        ran_id = self._ran_jobs_job_set_id
         jobs = (
             set(self._ran_reboot_jobs)
-            if self._ran_jobs_job_set_id in (None, my_id)
+            if ran_id is None or ran_id == my_id
             else set()
         )
         for peer in self.view.peers.values():
@@ -2106,10 +2120,10 @@ class ClusterManager(LeadershipBackend):
         instead of materialising the whole union.
         """
         my_id = self.get_job_set_id()
+        ran_id = self._ran_jobs_job_set_id
         if (
-            self._ran_jobs_job_set_id in (None, my_id)
-            and job_name in self._ran_reboot_jobs
-        ):
+            ran_id is None or ran_id == my_id
+        ) and job_name in self._ran_reboot_jobs:
             return True
         for peer in self.view.peers.values():
             if (
@@ -2138,13 +2152,16 @@ class ClusterManager(LeadershipBackend):
 
     async def _push_reboot_ran(self) -> None:
         peers = self.config["peers"]
+        my_id = self.get_job_set_id()
         # capped like the /peer serialization so a push body cannot exceed the
         # receiver's MAX_PEER_RESPONSE_BYTES (else rejected as oversized).
-        names = sorted(self.advertised_ran_jobs())[:MAX_ADVERTISED_REBOOT_JOBS]
+        names = sorted(self.advertised_ran_jobs(my_id))[
+            :MAX_ADVERTISED_REBOOT_JOBS
+        ]
         session = self._session
         if not peers or not names or session is None:
             return
-        payload = {"job_set_id": self.get_job_set_id(), "names": names}
+        payload = {"job_set_id": my_id, "names": names}
         await asyncio.gather(
             *(
                 self._push_reboot_ran_one(session, peer["host"], payload)
@@ -2159,7 +2176,7 @@ class ClusterManager(LeadershipBackend):
         host: str,
         payload: dict[str, Any],
     ) -> None:
-        url = "https://{}/reboot-ran".format(host)
+        url = self._reboot_ran_urls[host]
         try:
             # allow_redirects=False (see _observe_peer): a redirect would
             # replay this payload to an attacker-chosen target over a
@@ -2216,9 +2233,7 @@ class ClusterManager(LeadershipBackend):
                 duplicate_instances += 1
             else:
                 seen_instances.add(peer.instance_id)
-        return (
-            len(self.config["peers"]) + 1 - self_listed - duplicate_instances
-        )
+        return self._peer_count + 1 - self_listed - duplicate_instances
 
     def quorum(self) -> int:
         return quorum_size(self.cluster_size())
@@ -2238,7 +2253,7 @@ class ClusterManager(LeadershipBackend):
         return {
             "declared_size": self.cluster_size(),
             "declared_distribution": self.distribution,
-            "declared_elect_leader": bool(self.config.get("electLeader")),
+            "declared_elect_leader": self._elect_leader,
         }
 
     @_memoized_derived
@@ -2726,10 +2741,15 @@ class ClusterManager(LeadershipBackend):
         positively owning the job (which would abandon a rightful owner's
         pending retry; fatal for an @reboot keep-alive).
         """
+        if self._view_settled_latched:
+            return True
         for peer in self.view.peers.values():
             if peer.status == STATUS_UNKNOWN:
                 return False
         if self._poll_rounds >= _SETTLE_ROUNDS:
+            # no peer is UNKNOWN (a status never returns there) and the
+            # round count only grows, so True is now permanent: latch it.
+            self._view_settled_latched = True
             return True
         for peer in self.view.peers.values():
             if (
@@ -2759,6 +2779,23 @@ class ClusterManager(LeadershipBackend):
             [*self._agreeing_peer_names(), *self._available_contenders()],
         )
 
+    @_memoized_derived
+    def _lower_instance_twins(self) -> "list[set[str]]":
+        """Gossiped views of the strictly-lower-instance twins announcing our
+        nodeName, the candidates :meth:`_cedes_to_lower_instance` may defer
+        to. Normally empty (a duplicate nodeName is a misconfiguration).
+        """
+        twins: "list[set[str]]" = []
+        for peer in self.view.peers.values():
+            if peer.status in _STALE_STATUSES:
+                continue
+            if peer.node_name != self.node_name or not peer.instance_id:
+                continue
+            if peer.instance_id >= self.instance_id:
+                continue  # not a strictly-lower-instance twin
+            twins.append(peer.mutual_agreeing or set())
+        return twins
+
     def _cedes_to_lower_instance(
         self, owns_for: "Callable[[str, set[str]], bool]"
     ) -> bool:
@@ -2780,14 +2817,8 @@ class ClusterManager(LeadershipBackend):
         folded contender we cannot see is mis-read as a self-owner, biasing
         to the accepted double-run.
         """
-        for peer in self.view.peers.values():
-            if peer.status in _STALE_STATUSES:
-                continue
-            if peer.node_name != self.node_name or not peer.instance_id:
-                continue
-            if peer.instance_id >= self.instance_id:
-                continue  # not a strictly-lower-instance twin
-            if owns_for(peer.node_name, peer.mutual_agreeing or set()):
+        for view in self._lower_instance_twins():
+            if owns_for(self.node_name, view):
                 return True
         return False
 
@@ -2978,7 +3009,7 @@ class ClusterManager(LeadershipBackend):
         data", not "no jobs".
         """
         job_summaries, summaries_truncated = self._advertised_job_summaries()
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(_UTC)
         stats_max_age = self._node_stats_max_age()
         nodes: list[dict[str, Any]] = [
             {
@@ -3028,7 +3059,7 @@ class ClusterManager(LeadershipBackend):
             "backend": "gossip",
             "node_name": self.node_name,
             "distribution": self.distribution,
-            "elect_leader": bool(self.config.get("electLeader")),
+            "elect_leader": self._elect_leader,
             # the peer-poll cadence, so the dashboard can set expectations
             # for how stale a healthy peer's as_of may legitimately be
             "interval": self.config["interval"],
@@ -3047,7 +3078,7 @@ class ClusterManager(LeadershipBackend):
             "job_set_id": self.get_job_set_id(),
             "cluster_size": self.cluster_size(),
             "quorum": self.quorum(),
-            "elect_leader": bool(self.config.get("electLeader")),
+            "elect_leader": self._elect_leader,
             "distribution": self.distribution,
             # a conflict was detected: Leader jobs fail closed until it clears
             # (see has_conflict / cron._cluster_allows). "conflict" is the
@@ -3086,7 +3117,7 @@ class ClusterManager(LeadershipBackend):
             # now + the staleness window so each peer's absorbed node_stats
             # expires from the /cluster panel too (see fresh_node_stats).
             "peers": self.view.to_list(
-                datetime.datetime.now(datetime.timezone.utc),
+                datetime.datetime.now(_UTC),
                 self._node_stats_max_age(),
             ),
         }
