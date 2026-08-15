@@ -378,7 +378,7 @@ class LeaseBackend(LeadershipBackend):
         # (see _reconcile_local_reboot_ran).  None until the first use.
         self._reboot_ran_local_job_set_id: Optional[str] = None
 
-    def _reconcile_local_reboot_ran(self) -> None:
+    def _reconcile_local_reboot_ran(self, current: str) -> None:
         """Drop our own @reboot-ran marks when the job set changed.
 
         A reload that redefines an @reboot job changes the job-set id, and
@@ -387,20 +387,22 @@ class LeaseBackend(LeadershipBackend):
         would suppress the new one-shot cluster-wide).  Mirrors gossip's
         :meth:`cronstable.cluster.ClusterManager._reconcile_job_set_id`;
         the store-read set is reconciled by :meth:`_observe_reboot_ran`.
+
+        ``current``: the live job-set id.
         """
-        current = self.get_job_set_id()
         if self._reboot_ran_local_job_set_id != current:
             self._reboot_ran_local = set()
             self._reboot_ran_local_job_set_id = current
 
     def reboot_ran(self, job_name: str) -> bool:
-        self._reconcile_local_reboot_ran()
-        self._reconcile_observed_reboot_ran()
+        current = self.get_job_set_id()
+        self._reconcile_local_reboot_ran(current)
+        self._reconcile_observed_reboot_ran(current)
         return (
             job_name in self._reboot_ran or job_name in self._reboot_ran_local
         )
 
-    def _reconcile_observed_reboot_ran(self) -> None:
+    def _reconcile_observed_reboot_ran(self, current: str) -> None:
         """Drop the store-read @reboot-ran set when the live job set changed.
 
         A reload that redefines an @reboot job changes the job-set id but
@@ -411,13 +413,15 @@ class LeaseBackend(LeadershipBackend):
         the redefined one-shot.  Gate on the live id here (mirrors gossip's
         ``advertised_ran_jobs`` read-path guard); the next observe
         re-populates under the new id.
+
+        ``current``: the live job-set id.
         """
-        if self._reboot_ran_job_set_id != self.get_job_set_id():
+        if self._reboot_ran_job_set_id != current:
             self._reboot_ran = set()
             self._reboot_ran_job_set_id = None
 
     async def mark_reboot_ran(self, job_name: str) -> None:
-        self._reconcile_local_reboot_ran()
+        self._reconcile_local_reboot_ran(self.get_job_set_id())
         self._reboot_ran_local.add(job_name)
         await self._persist_reboot_ran()
 
@@ -442,11 +446,12 @@ class LeaseBackend(LeadershipBackend):
         :meth:`_reconcile_observed_reboot_ran` can drop it if the live job
         set changes before the next observe.
         """
-        if stored_job_set_id == self.get_job_set_id():
+        current = self.get_job_set_id()
+        if stored_job_set_id == current:
             self._reboot_ran = set(stored)
         else:
             self._reboot_ran = set()
-        self._reboot_ran_job_set_id = self.get_job_set_id()
+        self._reboot_ran_job_set_id = current
 
     def reboot_ran_annotation(
         self, existing: Optional[dict[str, str]] = None
@@ -457,12 +462,12 @@ class LeaseBackend(LeadershipBackend):
         preserve, so a backend can skip an empty annotations block.  Used
         by the kubernetes backend's Lease write.
         """
-        self._reconcile_local_reboot_ran()
-        combined = self._reboot_ran | self._reboot_ran_local
-        annotations = dict(existing or {})
-        if combined:
+        current = self.get_job_set_id()
+        self._reconcile_local_reboot_ran(current)
+        annotations = dict(existing) if existing else {}
+        if self._reboot_ran or self._reboot_ran_local:
             annotations[REBOOT_RAN_KEY] = encode_reboot_ran(
-                self.get_job_set_id(), combined
+                current, self._reboot_ran | self._reboot_ran_local
             )
         return annotations or None
 

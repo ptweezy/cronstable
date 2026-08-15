@@ -17,7 +17,7 @@
 # cronstable™
 / kraahn-stuh-bl /
 
-A stability-focused, container-friendly, optionally-distributed, fault-tolerant, highly-available, leader-electing, configurable, precompiled, multi-architecture, portable, batteries-included, security-hardened, production-ready cron replacement.
+A stability-focused, container-friendly, optionally-distributed, fault-tolerant, leader-electing, resumable, configurable, precompiled, multi-architecture, portable, batteries-included, security-hardened, production-ready cron replacement.
 
 ## Why cronstable?
 
