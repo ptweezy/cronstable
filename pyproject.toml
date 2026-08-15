@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77", "setuptools_scm>=8"]
+requires = ["setuptools>=83", "setuptools_scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -41,10 +41,10 @@ keywords = [
 dynamic = ["version"]
 dependencies = [
     "strictyaml>=1.7,<2",
-    "aiohttp>=3.10,<4",
-    "sentry-sdk>=2,<3",
-    "aiosmtplib>=3,<6",
-    "jinja2>=3,<4",
+    "aiohttp>=3.14.3,<4",
+    "sentry-sdk>=2.8,<3",
+    "aiosmtplib>=5.1.1,<6",
+    "jinja2>=3.1.6,<4",
     # zoneinfo's tz database, so timezones resolve on minimal/slim images
     # that don't ship the system tzdata.
     "tzdata>=2024.1",
@@ -113,7 +113,7 @@ speedups = [
     # so it stays optional and the zero-new-dep, architecture-portable core
     # install runs on stock json without it. It does have Windows wheels, so
     # (unlike uvloop) it needs no platform marker.
-    "orjson>=3.9",
+    "orjson>=3.11.6",
 ]
 # End-to-end encrypted push alerts (the `push` reporter; see cronstable.push).
 # PyNaCl bundles libsodium (pure C, no Rust), ships abi3 wheels for every
@@ -123,11 +123,11 @@ speedups = [
 # is no silent runtime fallback: a config with a `push:` section refuses to
 # start when this is absent (an alerting channel must fail closed, not
 # self-disable). See config._validate_push_config.
-push = ["pynacl>=1.5"]
+push = ["pynacl>=1.6.2"]
 # Zero-config LAN discovery (the opt-in `web.bonjour` mDNS advert; see
 # cronstable.discovery). Same fail-closed contract: web.bonjour without this
 # installed is a ConfigError, never a silent no-advert.
-discovery = ["zeroconf>=0.132"]
+discovery = ["zeroconf>=0.149.16"]
 dev = [
     # only the cluster mTLS tests use it, and it has no win-arm64 wheel; see
     # requirements_dev.txt for why it's gated to other platforms.
@@ -138,9 +138,9 @@ dev = [
     # the importorskip blind spot that file warns about: the accelerated
     # JSON, push-sealing, and mDNS test arms all self-skip.  This list and
     # requirements_dev.txt are pinned equal by tests/test_dev_deps_parity.py.
-    "orjson>=3.9; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
-    "pynacl>=1.5",
-    "zeroconf>=0.132",
+    "orjson>=3.11.6; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+    "pynacl>=1.6.2",
+    "zeroconf>=0.149.16",
     # drives a real Chromium for the client/daemon cron-engine differential;
     # requirements_dev.txt explains the marker and the separate browser step.
     "playwright; platform_machine != 'ARM64' or sys_platform != 'win32'",

@@ -106,7 +106,7 @@ COPY docker/install_orjson.sh /tmp/deps/install_orjson.sh
 RUN set -eux; \
     RUST_SETUP="zypper --non-interactive refresh \
         && zypper --non-interactive install rust cargo" \
-    sh /tmp/deps/install_orjson.sh "orjson>=3.9"; \
+    sh /tmp/deps/install_orjson.sh "orjson>=3.11.6"; \
     zypper clean --all
 
 # ---- project install: the only per-commit layers ------------------------

@@ -13,14 +13,14 @@ cryptography; platform_machine != "ARM64" or sys_platform != "win32"
 # cells still self-skip via importorskip, and
 # test_orjson_is_installed_where_a_wheel_exists fails if this line ever stops
 # covering the cells that DO have wheels.
-orjson>=3.9; python_version < "3.15" and (platform_machine != "ARM64" or sys_platform != "win32")
+orjson>=3.11.6; python_version < "3.15" and (platform_machine != "ARM64" or sys_platform != "win32")
 # pynacl backs the optional `push` extra (E2E-encrypted push alerts). Installed
 # in dev unconditionally so the sealing/round-trip tests in tests/test_push.py
 # really run in every CI cell: its cp38-abi3 wheels cover every runner we use
 # (including win-arm64, unlike cryptography above), so no marker is needed;
 # the tests still importorskip so a bare `pip install -e .` checkout can run
 # the rest of the suite.
-pynacl>=1.5
+pynacl>=1.6.2
 # zeroconf backs the optional `discovery` extra (the web.bonjour mDNS advert).
 # Installed in dev for the same reason as pynacl above: without it every
 # discovery test runs against hand-rolled fakes and a real-library signature
@@ -28,7 +28,7 @@ pynacl>=1.5
 # the exact optional-dep blind spot the orjson note above describes. It is
 # pure Python with optional prebuilt speedups, so no platform marker is
 # needed; the tests still importorskip so a bare checkout runs the rest.
-zeroconf>=0.132
+zeroconf>=0.149.16
 # playwright drives a real Chromium for the client/daemon cron-engine
 # differential (tests/test_web_engine_parity.py), which replays the whole
 # golden corpus through both the dashboard's own JavaScript schedule engine

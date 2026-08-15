@@ -6,7 +6,7 @@ service. CI builds it in the `binaries-windows` job of
 
 ```shell
 # 1. A one-directory payload at dist/cronstable (see the spec's knob).
-uv venv && uv pip install pyinstaller==6.21.0 .
+uv venv && uv pip install pyinstaller==6.22.1 .
 CRONSTABLE_BUNDLE=onedir uv run pyinstaller --noconfirm pyinstaller/cronstable.spec
 
 # 2. Build and validate with the same script CI uses (pinned WiX v6
