@@ -1,4 +1,4 @@
-# ![The cronstable wordmark; its l is a live self-balancing double pendulum: it sways through the theme glitches, collapses when the signal drops, and swings itself back upright](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/logo-balance.webp)
+# ![The cronstable wordmark; its l is a live self-balancing double pendulum: it sways through the theme glitches, collapses when the signal drops, and swings itself back upright](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/logo-balance.webp)
 
 [![PyPI version](https://img.shields.io/pypi/v/cronstable.svg?logo=pypi&logoColor=white&color=0073b7)](https://pypi.org/project/cronstable/)
 [![GitHub release](https://img.shields.io/github/v/release/ptweezy/cronstable?logo=github&color=8a2be2)](https://github.com/ptweezy/cronstable/releases/latest)
@@ -158,7 +158,7 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   everything and a **[terminal twin](#terminal-dashboard)**
   (`cronstable tui`) with the same keys
 
-[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.webp)](#web-dashboard)
+[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](#web-dashboard)
 
 > Web UI tour.
 
@@ -423,7 +423,7 @@ Point a browser at the HTTP listener and you have a keyboard-driven control
 room for every job, and, when you use them, for the cluster, the DAGs, and the
 durable state store too.
 
-[![cronstable web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-overview.png)
+[![cronstable web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)
 
 The overview shows every job with its **live status**, a **countdown to its
 next run**, the last run's duration and exit-code badge, and a **sparkline of
@@ -436,7 +436,7 @@ headline ("4 share exit=69, likely one cause"). Click any job (or press
 
 | Live log tail | Run history | Schedule, explained |
 | :---: | :---: | :---: |
-| [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-logs.png) | [![Run history with success rate, duration chart, and per-run CPU and peak-memory columns](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-schedule.png) |
+| [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png) | [![Run history with success rate, duration chart, and per-run CPU and peak-memory columns](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-schedule.png) |
 | Follow a running job's output **live** over Server-Sent Events, with ANSI color, in-log **grep** (plain text or regex), per-line timestamps, line-wrap, and one-click download. | **Success rate** plus average / min / max duration over the retained history, with a color-coded per-run chart; with [resource monitoring](#resource-monitoring) on, **CPU time and peak memory** per run and in the stats. | A **plain-English** reading of the cron expression and a **timezone-aware preview of the next run times**, computed live in the browser. |
 
 Every action has a key. A fuzzy command palette (`Ctrl-K` / `⌘K`) runs any
@@ -446,7 +446,7 @@ single job on demand, or every failing job at once.
 
 | Fuzzy command palette | Keyboard-first, with a shortcut for everything |
 | :---: | :---: |
-| [![A fuzzy command palette listing run and log actions for each job](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-palette.png) | [![The keyboard shortcut reference overlay](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-shortcuts.png) |
+| [![A fuzzy command palette listing run and log actions for each job](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-palette.png) | [![The keyboard shortcut reference overlay](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-shortcuts.png) |
 
 ### Orchestration, live
 
@@ -457,7 +457,7 @@ decide **approval gates** with a click, from any node in the fleet.
 
 | The task graph | A human approval gate |
 | :---: | :---: |
-| [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-dag-graph.png) | [![The DAG drawer's task list with an approval gate awaiting a decision, Approve and Reject buttons armed](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-dag-approval.png) |
+| [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png) | [![The DAG drawer's task list with an approval gate awaiting a decision, Approve and Reject buttons armed](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-approval.png) |
 | A `data-quality-gate` diamond: fan-out checks that reconverge on a `certify` task, colored by state as the run advances. | A release train **parked on a human**: the build succeeded, the approval gate is `awaiting`, and the sensor and publish tasks queue behind your decision. |
 
 ### The whole fleet on one page
@@ -471,7 +471,7 @@ so any node can serve the single pane of glass.
 
 | Cluster panel | Fleet view |
 | :---: | :---: |
-| [![The cluster panel: nine peers, all agreed, quorum met, with per-node load and per-node job ownership](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-cluster.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-fleet.png) |
+| [![The cluster panel: nine peers, all agreed, quorum met, with per-node load and per-node job ownership](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-cluster.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png) |
 | Nine nodes, `8/8 agreed`, quorum met, per-node **load meters** and per-node **owns** counts under `distribution: spread`. | Every node's state for every job, one glance: ok / failing / running cells with ages, per-column node health, and a **failing only** filter. |
 
 ### When things break
@@ -485,7 +485,7 @@ pane, like tailing a set of pods.
 
 | Incident timeline | Merged multi-tail |
 | :---: | :---: |
-| [![The incident timeline overlay: every job's most recent run, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity colors and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-multitail.png) |
+| [![The incident timeline overlay: every job's most recent run, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity colors and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png) |
 | "What happened, in what order": relative times, outcome glyphs, failure reasons, exit codes, durations, and a **failing only** filter. | Four streams, one pane: identity-colored prefixes, `end of run output` markers, auto re-attach on each job's next run. |
 
 ### Wallboards, heatmaps, and the state store
@@ -501,7 +501,7 @@ counters, artifacts, and quarantine.
 
 | Wallboard / TV mode | Activity heatmap | Durable-state inspector |
 | :---: | :---: | :---: |
-| [![The wallboard: worst-first job tiles with an INCIDENT stamp and next-fire countdowns](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-wallboard.png) | [![The activity heatmap punchcard: one row per job, cells colored by worst outcome and shaded by run volume](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-heatmap.png) | [![The durable-state inspector: record counts per kind, op latencies, and per-primitive tabs](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-state.png) |
+| [![The wallboard: worst-first job tiles with an INCIDENT stamp and next-fire countdowns](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-wallboard.png) | [![The activity heatmap punchcard: one row per job, cells colored by worst outcome and shaded by run volume](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-heatmap.png) | [![The durable-state inspector: record counts per kind, op latencies, and per-primitive tabs](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-state.png) |
 
 ### Themes, Readability, and Accessibility
 
@@ -510,17 +510,17 @@ amber and green phosphor, and flat **modern** and **standard** looks, each in
 a dark (phosphor) and a light (paper) variant. Cycle hues with `t`, flip
 light/dark with `T`:
 
-[![The same cronstable board cycling through all ten themes (carolina, amber, green, modern and standard, each in a dark phosphor and a light paper variant) and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp)
+[![The same cronstable board cycling through all ten themes (carolina, amber, green, modern and standard, each in a dark phosphor and a light paper variant) and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)
 
-*(One board, ten themes, two interface fonts, animated: [WebP](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp), [GIF](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.gif). The four stills below are pulled from it.)*
+*(One board, ten themes, two interface fonts, animated: [WebP](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp), [GIF](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.gif). The four stills below are pulled from it.)*
 
 | Amber phosphor CRT | Green phosphor CRT |
 | :---: | :---: |
-| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-green.png) |
+| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) |
 
 | Flat modern theme | Carolina, on paper (light) |
 | :---: | :---: |
-| [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-carolina-light.png) |
+| [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina-light.png) |
 
 Beyond the themes: an optional proportional-sans interface font (shown per
 theme in the animation above), UI scaling, deuteranopia- and tritanopia-safe
@@ -532,7 +532,7 @@ and schedules for real while it types:
 
 | Settings | Startup self-test |
 | :---: | :---: |
-| [![The settings panel: theme picker with carolina selected, CRT toggles, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-boot.png) |
+| [![The settings panel: theme picker with carolina selected, CRT toggles, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png) |
 
 The `l` in the header's "cronstable" is a live cart-and-double-pendulum
 simulation. I like to call him double-P, Peter Parker, or PP.
@@ -557,44 +557,44 @@ web page's: `j`/`k` move, `Enter` opens a job's drawer, `r` runs, `x`
 cancels, `/` filters, `Ctrl-K` opens the fuzzy command palette, and `?`
 lists everything.
 
-[![The cronstable TUI: a live 59-job board with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, cluster owner column, and the verdict bar correlating a staged failure](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-overview.png)
+[![The cronstable TUI: a live 59-job board with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, cluster owner column, and the verdict bar correlating a staged failure](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)
 
 Press `Enter` on any job for its drawer, the same three tabs as the
 web page, plus resources for monitored jobs:
 
 | Live log tail | Run history | Schedule, explained |
 | :---: | :---: | :---: |
-| [![The Logs tab: a live SSE tail with per-line timestamps, in-log search with match highlighting, and end-of-run markers between runs](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-logs.png) | [![The History tab: success rate, duration stats, and per-run rows with duration bars and CPU seconds](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-history.png) | [![The Schedule tab: the cron expression in plain English with the exact next fire instants from the daemon's own engine](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-schedule.png) |
+| [![The Logs tab: a live SSE tail with per-line timestamps, in-log search with match highlighting, and end-of-run markers between runs](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-logs.png) | [![The History tab: success rate, duration stats, and per-run rows with duration bars and CPU seconds](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-history.png) | [![The Schedule tab: the cron expression in plain English with the exact next fire instants from the daemon's own engine](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-schedule.png) |
 
 | Fuzzy command palette | Keyboard-first, with the web page's keys |
 | :---: | :---: |
-| [![The command palette fuzzy-matching "run": global actions plus per-job and per-DAG commands](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-palette.png) | [![The shortcut overlay: the web dashboard's shortcut table verbatim, with terminal extras grouped below](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-shortcuts.png) |
+| [![The command palette fuzzy-matching "run": global actions plus per-job and per-DAG commands](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-palette.png) | [![The shortcut overlay: the web dashboard's shortcut table verbatim, with terminal extras grouped below](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-shortcuts.png) |
 
 DAGs get the same drawer as the browser, and approval gates are decided
 with a keypress:
 
 | The task graph, mid-flight | A human approval gate |
 | :---: | :---: |
-| [![The DAG drawer's graph tab: the data-quality-gate diamond as topological layers, states coloring as the run advances](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-dag-graph.png) | [![The DAG drawer's tasks tab: release-train parked on its approval gate, with a approve / R reject armed](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-dag-approval.png) |
+| [![The DAG drawer's graph tab: the data-quality-gate diamond as topological layers, states coloring as the run advances](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-graph.png) | [![The DAG drawer's tasks tab: release-train parked on its approval gate, with a approve / R reject armed](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-approval.png) |
 
 With clustering on, the cluster panel and the full fleet matrix render
 in the terminal too:
 
 | Cluster panel | Fleet view |
 | :---: | :---: |
-| [![The cluster panel: nine gossiping peers, all agreed, with per-node load and the lease detail](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-cluster.png) | [![The fleet view: a 59-job by 9-node matrix of live cells: ok, failing, and running with ages](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-fleet.png) |
+| [![The cluster panel: nine gossiping peers, all agreed, with per-node load and the lease detail](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-cluster.png) | [![The fleet view: a 59-job by 9-node matrix of live cells: ok, failing, and running with ages](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-fleet.png) |
 
 The same incident tools are here, from the timeline to the multi-tail:
 
 | Incident timeline | Merged multi-tail |
 | :---: | :---: |
-| [![The incident timeline: every job's most recent finish, newest first, with failure reasons, exit codes, and the blast-radius set flagged](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-multitail.png) |
+| [![The incident timeline: every job's most recent finish, newest first, with failure reasons, exit codes, and the blast-radius set flagged](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png) |
 
 So are the wallboard, the heatmap, and the state inspector:
 
 | Wallboard / TV mode | Activity heatmap | Durable-state inspector |
 | :---: | :---: | :---: |
-| [![The wallboard: worst-first tiles with failure ages and exit codes, run sparklines, and the tally foot](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-wallboard.png) | [![The activity heatmap: one row per job, one cell per hour, worst outcome colored and shaded by volume](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-heatmap.png) | [![The state inspector: store inventory, record streams, and document namespaces from the durable state store](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-state.png) |
+| [![The wallboard: worst-first tiles with failure ages and exit codes, run sparklines, and the tally foot](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-wallboard.png) | [![The activity heatmap: one row per job, one cell per hour, worst outcome colored and shaded by volume](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-heatmap.png) | [![The state inspector: store inventory, record streams, and document namespaces from the durable state store](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-state.png) |
 
 The same ten themes as the browser (`t` cycles the hue, `T` flips
 phosphor ↔ paper), with the same colour-vision-safe remaps and an
@@ -602,18 +602,18 @@ phosphor ↔ paper), with the same colour-vision-safe remaps and an
 
 | Amber phosphor | Green phosphor |
 | :---: | :---: |
-| [![The TUI in the amber phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-amber.png) | [![The TUI in the green phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-green.png) |
+| [![The TUI in the amber phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png) | [![The TUI in the green phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png) |
 
 | Flat modern | Carolina, on paper (light) |
 | :---: | :---: |
-| [![The TUI in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-modern.png) | [![The TUI in the carolina light paper theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-carolina-light.png) |
+| [![The TUI in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-modern.png) | [![The TUI in the carolina light paper theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-carolina-light.png) |
 
 The TUI runs the same BIOS-style boot self-test, next to the settings
 sheet:
 
 | Startup self-test | Settings |
 | :---: | :---: |
-| [![The TUI boot self-test: link latency, firmware, job set, schedules, and cluster probed live, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-boot.png) | [![The TUI settings panel: theme, color vision, refresh interval, log toggles, zen, and the boot self-test](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-settings.png) |
+| [![The TUI boot self-test: link latency, firmware, job set, schedules, and cluster probed live, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-boot.png) | [![The TUI settings panel: theme, color vision, refresh interval, log toggles, zen, and the boot self-test](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-settings.png) |
 
 Run `cronstable tui` against the local daemon, or point it elsewhere with
 `--url` and `--token-env`; `--tv` starts on the wallboard and `--job`
@@ -1116,7 +1116,7 @@ ride the durable store and are visible to every node sharing it.)
 Pair a device from the dashboard ("Pair a device" in the command palette or
 settings, a QR scan) or with one call:
 
-[![The dashboard's Pair a device panel: a QR code of the connection payload, the same JSON as a copyable string, and a warning that the embedded token holds every scope](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)
+[![The dashboard's Pair a device panel: a QR code of the connection payload, the same JSON as a copyable string, and a warning that the embedded token holds every scope](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
 
 ```shell
 curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
