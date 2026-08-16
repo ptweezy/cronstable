@@ -72,9 +72,13 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 ## Branching
 
 cronstable develops on a single branch, `main`. Open your pull request against
-it, and iterate on a feature branch first: superseded runs there are cancelled,
-while consecutive pushes to `main` each run the whole matrix, so that a release
-is never cancelled mid-publish.
+it.
+
+CI collapses superseded runs: pushing again cancels the earlier run, whether it
+had already started or was still waiting in the queue, so an intermediate
+commit can land with its run cut short. Push a commit you want fully tested on
+its own. Releases are the exception. They sit in their own concurrency group,
+where they start at once and always run to completion.
 
 ## Running the checks
 

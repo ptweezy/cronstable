@@ -64,23 +64,33 @@ on:
         type: string
         default: ""
 
-# One in-flight run per (head repo, branch). A same-repo branch push and its
-# PR still share a group, so the duplicate is cancelled rather than run twice.
-# The group is qualified by the HEAD repository because cancel-in-progress
-# evaluates on the INCOMING run: an unqualified group let a fork PR whose head
-# branch was named `main` land in the push-to-main group and cancel an
-# in-flight release mid-publish (its own ref is refs/pull/N/merge, so the
-# expression below was true for it). main is never cancelled by main pushes
-# (cancel-in-progress false there): consecutive main pushes QUEUE so releases
-# serialize instead of racing, and a workflow_dispatch release is likewise
-# protected from a later push cancelling it.
+# One in-flight run per (head repo, branch, kind). A same-repo branch push and
+# its PR still share a group, so the duplicate is cancelled rather than run
+# twice. The group is qualified by the HEAD repository because
+# cancel-in-progress evaluates on the INCOMING run: an unqualified group let a
+# fork PR whose head branch was named `main` land in the push-to-main group and
+# cancel an in-flight release mid-publish (its own ref is refs/pull/N/merge).
 #
-# With main the ONLY long-lived branch, that costs real minutes: no trunk push
-# supersedes the one before it, so each runs the whole matrix. Iterate on a
-# feature branch, where cancel-in-progress still collapses superseded runs.
+# It is also qualified by kind, and that is what protects a release now that
+# main is the only branch. `cancel-in-progress: false` protects a run that has
+# already started, and only that one; a run still waiting in the queue loses
+# its slot to the next push. So gating on the ref alone cost coverage rather
+# than minutes, and 555845a is the proof: it landed on main and its run died
+# in the queue before a single job started. Splitting the groups lets ordinary
+# pushes collapse freely while a release sits alone in its own group, starting
+# at once and running to completion; consecutive releases still share one
+# group and serialize.
+#
+# The release test errs on the side of caution and, unlike `decide`, is
+# allowed to be fuzzy: a false positive costs one extra run that survives to
+# the end, while a false negative could cancel a publish. It says yes to a
+# manual dispatch, to any pushed commit whose full message contains `[release`
+# (a superset of decide's stricter scan, which reads subject lines only), and
+# to any push of 20+ commits, the point at which the event payload truncates
+# and hides the rest.
 concurrency:
-  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'workflow_dispatch' }}
+  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}-${{ (github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null) && 'release' || 'ci' }}
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null) }}
 
 # Least-privilege default for all jobs; the publish jobs opt up to the narrower
 # write scopes they actually need (see each one's own permissions:).
@@ -160,8 +170,9 @@ jobs:
             bump="${INPUT_BUMP:-minor}"
           elif [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/main" ]; then
             # Trigger if ANY commit introduced by this push has a [release]
-            # marker -- not just the tip commit, since a push can carry several
-            # commits and the marker need not sit on the last one.
+            # marker, scanning the whole push rather than the tip alone: a
+            # push can carry several commits and the marker can sit on any of
+            # them.
             # The range is the commits new in this push (BEFORE..AFTER); on a
             # brand-new branch BEFORE is all-zeros, so fall back to the tip.
             zero="0000000000000000000000000000000000000000"
@@ -2191,7 +2202,7 @@ jobs:
   # Publishes from `main`, the repository's only long-lived branch: it is where
   # wiki/ is edited, and the pages hardcode /blob/main/ links and
   # raw.githubusercontent.com/.../main/ screenshots, so the wiki documents the
-  # trunk by construction. A feature branch never publishes.
+  # trunk by construction. Only a push to main publishes.
   #
   # GITHUB_TOKEN with `contents: write` can push a repo's OWN wiki -- no PAT.
   # The widespread "wikis need a PAT" advice traces to one archived action's
@@ -2200,7 +2211,7 @@ jobs:
   # is only needed for a wiki in a DIFFERENT repo -- which is why the Homebrew
   # tap push above needs HOMEBREW_TAP_TOKEN and this job needs no secret at all.
   wiki:
-    # The repository guard is not redundant: a fork has its OWN main, and a
+    # The repository guard earns its place: a fork has its OWN main, and a
     # fork's wiki is uninitialized (a wiki repo does not exist until someone
     # creates a page), so `<fork>/cronstable.wiki` 404s and the checkout fails.
     # Every other job in this pipeline is fork-clean, so without this the wiki
@@ -2236,10 +2247,11 @@ jobs:
           git -C .wiki config user.name  "github-actions[bot]"
           git -C .wiki config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # The wiki accepts web-UI edits, so a push can still lose a race even
-          # though runs on main queue rather than overlap. The commit is a pure
-          # snapshot of wiki/, so there is nothing to rebase: re-mirror onto the
-          # new tip and retry instead of reddening a docs run.
+          # The wiki accepts web-UI edits, and a release run sits in its own
+          # concurrency group alongside an ordinary one, so two publishes can
+          # overlap and a push can lose a race. The commit is a pure snapshot
+          # of wiki/, so there is nothing to rebase: re-mirror onto the new tip
+          # and retry instead of reddening a docs run.
           for attempt in 1 2 3; do
             git -C .wiki fetch -q origin master
             git -C .wiki reset -q --hard origin/master
