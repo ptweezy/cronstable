@@ -30,7 +30,13 @@ import pytest
 from cronstable import dag, dagrun, jobstate
 from cronstable.cron import Cron
 from cronstable.state import Lease
-from tests._helpers import _instant_sleep, _state_cfg
+from tests._helpers import (
+    _drain_pending,
+    _instant_sleep,
+    _reap_running,
+    _settle_dag_cron,
+    _state_cfg,
+)
 from tests.test_state_job_primitives import _break_record_reads
 
 _PY = sys.executable
@@ -39,31 +45,6 @@ _UTC = datetime.timezone.utc
 
 def _utcnow():
     return datetime.datetime.now(_UTC)
-
-
-async def _drain_pending(cron):
-    # run every spawned state-write (advances launch the next tasks); advances
-    # spawn further advances, so loop until the set is quiet.
-    for _ in range(50):
-        pend = [t for t in list(cron._pending_state_writes) if not t.done()]
-        if not pend:
-            return
-        await asyncio.gather(*pend, return_exceptions=True)
-
-
-async def _reap_running(cron):
-    """Await every currently-running task and route its completion."""
-    rjs = [
-        rj for jobs in list(cron.running_jobs.values()) for rj in list(jobs)
-    ]
-    for rj in rjs:
-        await rj.wait()
-        await cron._handle_finished_job(rj)
-    # The reaper batches DAG-task completions and records them once per run
-    # after draining a batch of finished jobs; mirror that flush here (the
-    # completions are only buffered until it runs).
-    await cron._dag.flush_completions()
-    return bool(rjs)
 
 
 async def _drive(cron, dag_name, run_key, *, max_rounds=60):
@@ -100,6 +81,9 @@ async def _make_cron(tmp_path, yaml):
 
 
 async def _teardown(cron):
+    # settle first: a still-running advance cancelled by the loop close
+    # wedges the whole run (see _settle_dag_cron).
+    await _settle_dag_cron(cron)
     await cron._dag.shutdown()
     await cron._stop_job_api()
     if cron.state_backend is not None:
