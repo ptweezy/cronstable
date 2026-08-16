@@ -55,6 +55,14 @@ servers:
 # an unauthenticated daemon ignores it. The `.ics` calendar routes also
 # accept the same token as a `?token=` query parameter (declared per-operation),
 # because calendar clients cannot send a bearer header.
+#
+# `web.anonymousScopes` is a third shape: a daemon that configures tokens and
+# lists scopes there grants those scopes to requests presenting no credential,
+# so a public read-only board answers a tokenless GET. Only `view` may be
+# granted that way (the config schema refuses the rest), so every mutating
+# route stays token-gated, and `GET /push/devices` is excluded besides.
+# A request that presents a credential is evaluated exactly as it is without
+# the setting, so a wrong token still gets 401 rather than the anonymous grant.
 security:
   - bearerAuth: []
   - {} # an unauthenticated daemon (no web.authToken) accepts calls with no token
@@ -1038,11 +1046,14 @@ paths:
       summary: Describe the presented bearer token
       operationId: getWhoami
       description: >-
-        The label and scopes of the token that authenticated this request,
-        so a client can tell what it may do (and the dashboard can warn
-        when its pairing QR would hand a phone the all-scopes token). With
-        no token configured there is no auth middleware: `authenticated`
-        is false and every scope is effectively granted.
+        What the caller may do, so a client can draw the right controls
+        (and the dashboard can warn when its pairing QR would hand a phone
+        the all-scopes token). Branch on `allScopes` rather than on
+        `authenticated`: an unauthenticated caller is unrestricted on a
+        daemon with no token configured (no auth middleware, `allScopes`
+        true) and restricted under a `web.anonymousScopes` grant
+        (`label: "anonymous"`, `allScopes` false). See the `WhoAmI` schema
+        for all three shapes.
       responses:
         "200":
           description: The matched token's identity.
@@ -1060,6 +1071,10 @@ paths:
         Every device paired for end-to-end encrypted push alerts. Push
         tokens are redacted to their trailing characters; public keys are
         returned whole. 404 until a `push:` section is configured.
+        Requires a bearer token even where `web.anonymousScopes` grants
+        `view`: the registry names paired devices, so it is the one
+        view-scoped route excluded from anonymous access, and answers 403
+        to a credential-less caller.
       responses:
         "200":
           description: "`{devices}`, sorted by pairing time."
@@ -1072,6 +1087,7 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/PushDevice" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404":
           description: No `push:` section is configured.
           content:
@@ -1368,14 +1384,17 @@ components:
         that lacks the scope an operation requires is 403, not 401. The
         required scope defaults to `view` for GET/HEAD and `control` for other
         methods; operations that need more carry an `x-required-scope`
-        extension.
+        extension. A daemon may also grant scopes to callers presenting no
+        credential at all (`web.anonymousScopes`, `view` only), in which case
+        the same scope table decides the request and an uncovered operation
+        answers 403; presenting a wrong token is still 401.
     icsToken:
       type: apiKey
       in: query
       name: token
       description: >-
         Any configured token (`web.authToken` or a `web.authTokens` entry
-        holding `view`) as a `?token=` query parameter. Accepted ONLY on the
+        holding `view`) as a `?token=` query parameter. Accepted only on the
         `.ics` calendar routes (calendar clients cannot send a bearer header);
         every other route refuses query tokens.
 
@@ -1437,14 +1456,19 @@ components:
         is the generic `401: Unauthorized`, byte-identical for a missing
         header, a wrong scheme and an unknown token: a reason that told
         those apart would answer, for an unauthenticated caller, which half
-        of a guess was right.
+        of a guess was right. On a daemon configuring `web.anonymousScopes`
+        this narrows to "credentials were presented and are invalid": a
+        request carrying nothing at all is served, or refused with a
+        reasoned 403 naming the scope it lacked.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     Forbidden:
       description: >-
         The bearer token is valid but lacks the scope this operation requires
-        (see `x-required-scope`), or a cross-site `Origin` was refused.
+        (see `x-required-scope`), or a cross-site `Origin` was refused, or no
+        credential was presented to a daemon whose `web.anonymousScopes`
+        grant does not cover this operation.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -1480,7 +1504,19 @@ components:
 
     WhoAmI:
       type: object
-      description: The bearer token that authenticated the request.
+      description: >-
+        What the caller is allowed to do, in three shapes. A matched token
+        reports `authenticated: true` with its own label and scopes. A
+        daemon with no auth configured reports
+        `authenticated: false, label: null, allScopes: true`, and grants
+        every scope. A credential-less request served through
+        `web.anonymousScopes` reports
+        `authenticated: false, label: "anonymous", allScopes: false` with
+        the granted scopes, which is a restricted caller even though it is
+        unauthenticated. Because those last two disagree while sharing
+        `authenticated: false`, `allScopes` is the field a client should
+        branch on. `anonymous` is reserved: do not label a real token
+        with it.
       properties:
         authenticated: { type: boolean }
         label: { type: string, nullable: true }
