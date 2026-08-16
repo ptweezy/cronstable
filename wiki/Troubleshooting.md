@@ -283,8 +283,12 @@ such as `failsWhen=nonzeroReturn and retcode=<n>` or
 | `nonzeroReturn` | Bool | `true`  | A nonzero exit code marks the job failed            |
 | `always`        | Bool | `false` | The job is always considered failed when it exits   |
 
-A job whose command cannot be launched at all (for example, the executable does not
-exist) is reported as an ordinary failure with exit code `127`, not an internal error.
+A job whose command cannot be launched at all is reported as an ordinary failure with
+exit code `127`, not an internal error. Either the executable does not exist, or the
+job's `workingDirectory` does not. The missing directory is the harder one to read off
+a log: it reaches the message only through the `kwargs=` repr of the spawn line, and on
+Windows the OS error there (`WinError 267`) names no path of its own. See
+[workingDirectory](Commands-and-Environment#workingdirectory).
 Note `producesStderr`/`producesStdout` only apply when the corresponding stream is
 captured, and they also fire when output was *discarded* (`saveLimit: 0` still counts
 discarded lines as output).
@@ -293,6 +297,48 @@ discarded lines as output).
 `producesStderr: false`. Note `producesStdout` is the only required key in the
 `failsWhen` map (strictyaml-required); the other three are optional and take the
 defaults above. See [Failure Detection and Retries](Failure-Detection-and-Retries).
+
+### A job's `priority` does not take effect on POSIX
+
+**Symptom.** The config says `priority: high` (or `above-normal`), but `top` or
+`ps -o ni` shows the job at the same nice value as everything else. Nothing is
+logged, and cronstable reports the run as a success.
+
+**Cause.** Lowering a nice value is a raise in priority, and raising a priority
+needs `CAP_SYS_NICE` or `RLIMIT_NICE` headroom. A kernel that refuses does not
+fail the job: the run goes on at the priority it inherited. That is deliberate,
+so an unprivileged host does not turn a minutely job into some 1,440 warnings a day
+about a condition that will not change until the deployment does. Note
+"raise" is relative to cronstable's own nice, so on a daemon started at nice 15
+even `below-normal` (nice 10) is a raise.
+
+**Fix.** Look for the one-shot config-load `WARNING` naming the job, which is
+where cronstable flags a priority it may not be able to apply. To see the
+refusal itself, run at `DEBUG`: `platform.apply_priority` logs one line per
+refused renice naming the level, the pid and the errno. To grant the headroom,
+give the daemon `CAP_SYS_NICE` (`AmbientCapabilities=CAP_SYS_NICE` in a systemd
+unit) or raise its `RLIMIT_NICE`. On Windows an unprivileged account can set
+every class in the vocabulary, so nothing is refused there. See
+[priority](Commands-and-Environment#priority).
+
+### A Windows job's `high` priority does not reach the programs it launches
+
+**Symptom.** A `.cmd` file or a `shell: cmd` job at `priority: high` shows
+cmd.exe at High in Task Manager, but the program it actually runs sits at
+Normal.
+
+**Cause.** When a child carries no priority-class flag of its own,
+`CreateProcess` gives it the creator's class only if the creator is idle or
+below-normal, and NORMAL otherwise. cronstable sets the class on the job's own
+process, and cmd.exe launches its programs with no class flag, so a raised
+class stops at cmd.exe. By that same rule, lowered classes (`idle`,
+`below-normal`) do carry down the whole tree.
+
+**Fix.** Name the program that needs the priority as the job's `command`
+instead of wrapping it in a `.cmd`, so cronstable creates it directly. POSIX
+has no equivalent split: `setpriority(PRIO_PGRP)` covers the group and a later
+fork inherits the nice value. See
+[Process priority](Running-on-Windows#process-priority).
 
 ### stderr capture vs. routing
 
@@ -602,12 +648,69 @@ use that grace). See
 [Cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout)
 on [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
+### The Windows service will not start
+
+Read the bootstrap log first: by default
+`<config directory>\logs\cronstable-service.log`. A service has no stderr,
+so that file is where a startup failure is recorded.
+
+`cronstable service status` decodes the last failure without opening
+anything:
+
+| It says | Fix |
+| --- | --- |
+| `the configuration did not parse` | Run `cronstable -v -c <path>` interactively against the same path. |
+| `the service log could not be opened` | The log directory is not writable by LocalSystem. Pass `--log-file` somewhere it is, or `--no-log-file` with a `logging:` section. |
+| `the scheduler stopped with an error` | The scheduler raised; the bootstrap log has the traceback. |
+
+If it starts and schedules nothing, check which configuration it read. A
+service runs as LocalSystem, whose `%APPDATA%` is
+`C:\Windows\System32\config\systemprofile\AppData\Roaming`, not yours, so a
+per-user path is not the path you tested. `cronstable service install`
+refuses to install the per-user default for that reason; use a machine-wide
+directory and name it with `-c`.
+
+### `install` says a one-file build cannot host a service
+
+It cannot, and this is not a cronstable limitation to work around. The
+published one-file `.exe` (which is what winget installs) unpacks itself and
+runs the program in a **child** process, so the process the Service Control
+Manager starts and watches never registers with the service dispatcher, and
+the start fails on the SCM's timeout. Download
+`cronstable-windows-<arch>.zip` (a one-directory build) and run `service
+install` from its extracted `cronstable.exe`, install the
+[MSI](Windows-MSI), which registers the service itself, or install with pip
+or pipx; the `schtasks` recipe on
+[Running on Windows](Running-on-Windows#running-unattended) remains the
+fallback for the one-file executable.
+
+### A reinstall fails with "the service is pending deletion"
+
+Something still holds a handle to the removed service, so Windows marked it
+for deletion rather than deleting it. The usual culprits are the Services
+console (`services.msc`) and Task Manager's Services tab. Close them and run
+`cronstable service install` again.
+
+### `killTimeout` does nothing under the service
+
+Expected, unless the service was installed with `--console`. The graceful
+step of stopping a job is a console control event, and a service has no
+console, so the kill goes straight to the forced tree kill and there is
+nothing for `killTimeout` to bound. `cronstable service install --console`
+allocates one; it is off by default because an allocated console changes
+what a job inherits. See
+[Windows Service](Windows-Service#--console-and-job-termination).
+
 ## Reference: exit codes used internally
 
-| Code   | Meaning                                                              |
-| ------ | ------------------------------------------------------------------- |
-| `127`  | Command could not be launched (e.g. executable not found)           |
-| `-100` | Job cancelled because it exceeded `executionTimeout`                |
+| Code   | Meaning                                                                    |
+| ------ | -------------------------------------------------------------------------- |
+| `127`  | Command could not be launched (executable or `workingDirectory` not found) |
+| `-100` | Job cancelled because it exceeded `executionTimeout`                       |
+
+A missing `workingDirectory` gets the same `127` as a missing executable, and
+the path it tried shows up only inside the `kwargs=` repr of the spawn log
+line. See [workingDirectory](Commands-and-Environment#workingdirectory).
 
 Two Windows codes worth recognizing in run history: `1` is what
 `taskkill /F` leaves behind (a run reaped by the forced tree kill reports it,

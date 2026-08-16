@@ -1,9 +1,13 @@
-"""Pure-helper and local-state tests for the etcd leadership backend.
+"""Unit tests for the etcd leadership backend.
 
-No etcd server and no crypto: the HTTP glue is ``# pragma: no cover`` and
-exercised only by the Docker integration tests.
+No etcd server: the pure decision helpers and the local leader/quorum state
+run directly, and the lifecycle around them (start, the renew loop, the round,
+the campaign, the @reboot-ran CAS, the teardown) runs with ``_post`` replaced
+by a fake.  ``_post`` itself, the HTTP request/failover glue, is
+``# pragma: no cover`` and the Docker integration tests exercise it.
 """
 
+import asyncio
 import base64
 import datetime
 import time
@@ -13,6 +17,7 @@ import pytest
 
 from cronstable.backends.etcd import (
     _MIN_USABLE_TTL,
+    _REBOOT_RAN_CAS_ATTEMPTS,
     EtcdBackend,
     _b64,
     _b64decode,
@@ -26,7 +31,7 @@ from cronstable.backends.etcd import (
     lease_ttl_from_keepalive,
 )
 from cronstable.config import parse_config_string
-from tests._helpers import _utc_now_plus
+from tests._helpers import _utc_now_plus, _write_tls
 
 NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
 
@@ -1162,3 +1167,417 @@ async def test_known_lease_loss_closes_reboot_gate(monkeypatch):
     assert b._reboot_ran_synced is False
     with pytest.raises(RebootRanUnknownError):
         b.reboot_ran("boot-job")
+
+
+# --- the lifecycle around the round: start / renew loop / stop -------------
+#
+# _renew_once is driven above through a fake _post. What follows covers the
+# code around it: session setup and the best-effort initial round, the retry
+# loop's failure arms, the teardown that revokes the lease, and the auxiliary
+# paths (auth, TLS material, the @reboot-ran CAS). All of it runs against the
+# fake rather than an etcd server.
+
+
+class _FakePost:
+    """A scriptable stand-in for ``EtcdBackend._post``.
+
+    Routes by path and records every call, so a test can assert which POSTs a
+    round issued, including the txn the read-only campaign fast path skips.
+    """
+
+    def __init__(self, *, lease_id="777", ttl="15", holder=None, fail=()):
+        self.lease_id = lease_id
+        self.ttl = ttl
+        self.holder = holder  # None -> we win the campaign
+        self.fail = list(fail)  # per-call: an exception to raise, or None
+        self.calls = []
+        self.on_call = None
+
+    @property
+    def paths(self):
+        return [path for path, _ in self.calls]
+
+    async def __call__(self, path, body, *, allow_reauth=True):
+        self.calls.append((path, body))
+        if self.on_call is not None:
+            self.on_call(path)
+        if self.fail:
+            failure = self.fail.pop(0)
+            if failure is not None:
+                raise failure
+        if path == "/v3/lease/grant":
+            return {"ID": self.lease_id, "TTL": self.ttl}
+        if path == "/v3/lease/keepalive":
+            return {"result": {"TTL": self.ttl}}
+        if path == "/v3/kv/txn":
+            if self.holder is None:
+                return {"succeeded": True}
+            return {
+                "succeeded": False,
+                "responses": [
+                    {
+                        "response_range": {
+                            "kvs": [
+                                {
+                                    "value": _b64(self.holder),
+                                    "lease": "other-lease",
+                                }
+                            ]
+                        }
+                    }
+                ],
+            }
+        if path == "/v3/kv/range":
+            return {"kvs": []}
+        if path == "/v3/auth/authenticate":
+            return {"token": "tok-1"}
+        return {}
+
+
+async def test_start_runs_a_round_before_returning(monkeypatch):
+    # The initial round exists so is_quorate()/is_leader() reflect a real read
+    # of the store BEFORE the first spawn_jobs; without it every PreferLeader
+    # job runs on every node at boot (and on every reload that rebuilds the
+    # manager).
+    b = _backend()
+    post = _FakePost()
+    monkeypatch.setattr(b, "_post", post)
+    await b.start()
+    try:
+        assert b.is_leader() is True  # the round really ran
+        assert b.is_quorate() is True
+        assert b._lease_id == "777"
+        assert b._task is not None and not b._task.done()
+        assert b._session is not None
+    finally:
+        await b.stop()
+
+
+async def test_start_survives_a_failing_initial_round(monkeypatch):
+    # Best-effort by contract: an etcd that is down at boot must not fail
+    # manager start (which would wedge leader gating off until the next
+    # reload). The backend comes up not-quorate, the honest state.
+    b = _backend()
+    post = _FakePost(fail=[aiohttp.ClientError("no route")])
+    monkeypatch.setattr(b, "_post", post)
+    await b.start()
+    try:
+        assert b.is_quorate() is False
+        assert b.is_leader() is False
+        assert b._task is not None  # the retry loop still started
+    finally:
+        await b.stop()
+
+
+async def test_stop_revokes_the_lease_and_closes_the_session(monkeypatch):
+    # revoking deletes the election key at once: a peer takes over without
+    # waiting out the TTL. The session must be closed too, or one connector
+    # leaks per reload.
+    b = _backend()
+    post = _FakePost()
+    monkeypatch.setattr(b, "_post", post)
+    await b.start()
+    await b.stop()
+    assert "/v3/lease/revoke" in post.paths
+    assert b._lease_id is None
+    assert b._session is None
+    assert b._task is None
+    assert b.is_leader() is False
+
+
+async def test_stop_swallows_a_failed_revoke(monkeypatch):
+    # a failed revoke is harmless (the lease still expires by its TTL) and
+    # must never escape into the inline start_stop_cluster reload.
+    b = _backend()
+    post = _FakePost()
+    monkeypatch.setattr(b, "_post", post)
+    await b.start()
+    post.fail = [OSError("connection reset")]
+    await b.stop()  # must not raise
+    assert b._lease_id is None
+    assert b._session is None
+
+
+async def test_stop_before_start_is_a_noop():
+    # start_stop_cluster can stop a backend that never started (a config error
+    # aborted the build); it must not raise or touch a session it never had.
+    b = _backend()
+    await b.stop()
+    assert b._session is None
+    assert b._task is None
+    assert b.is_leader() is False
+
+
+async def test_renew_loop_retries_after_a_failed_round(monkeypatch):
+    # A round that cannot reach etcd must NOT advance the monotonic contact
+    # deadline (is_quorate goes stale, so Leader fails closed and the
+    # never-skip PreferLeader default runs), and the loop must survive it.
+    b = _backend()
+    post = _FakePost()
+    monkeypatch.setattr(b, "_post", post)
+    # renew_period is a derived property; replace it on the class so the
+    # loop's inter-round wait does not cost this test a real second.
+    monkeypatch.setattr(EtcdBackend, "renew_period", 0.01)
+    await b.start()
+    try:
+        # the loop's next round cannot reach etcd; the one after it recovers.
+        post.calls.clear()
+        post.fail = [aiohttp.ClientError("no route")]
+        post.on_call = lambda path: (
+            b._stop.set() if len(post.calls) > 1 else None
+        )
+        await asyncio.wait_for(b._task, 5)
+        assert len(post.calls) > 1  # it retried
+        assert b.is_quorate() is True  # and recovered
+    finally:
+        await b.stop()
+
+
+async def test_renew_loop_logs_an_unexpected_error_and_continues(monkeypatch):
+    # the non-network arm: a bug (or a wrong-shape gateway body) must be
+    # logged with a traceback and retried. A dead loop means a holder that
+    # stops renewing and silently loses the election.
+    b = _backend()
+    post = _FakePost()
+    monkeypatch.setattr(b, "_post", post)
+    monkeypatch.setattr(EtcdBackend, "renew_period", 0.01)
+    await b.start()  # the initial round lands normally
+    try:
+        # the loop's next round hits the bug; the one after it must still run.
+        post.calls.clear()
+        post.fail = [RuntimeError("bug")]
+        post.on_call = lambda path: (
+            b._stop.set() if len(post.calls) > 1 else None
+        )
+        await asyncio.wait_for(b._task, 5)
+        assert len(post.calls) > 1  # it kept going after the traceback
+        assert b.is_quorate() is True
+    finally:
+        await b.stop()
+
+
+async def test_renew_loop_propagates_cancellation_from_inside_a_round(
+    monkeypatch,
+):
+    # a cancel landing mid-round must end the loop, not be caught as "a failed
+    # round" and retried forever (which would ignore stop()).
+    b = _backend()
+    in_round = asyncio.Event()
+
+    async def hanging_post(path, body, *, allow_reauth=True):
+        in_round.set()
+        await asyncio.Event().wait()
+
+    post = _FakePost()
+    monkeypatch.setattr(b, "_post", post)
+    monkeypatch.setattr(EtcdBackend, "renew_period", 0.01)
+    await b.start()  # round 1 lands through the normal fake
+    monkeypatch.setattr(b, "_post", hanging_post)
+    await asyncio.wait_for(in_round.wait(), 5)
+    b._task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await b._task
+    b._task = None
+    monkeypatch.setattr(b, "_post", post)
+    await b.stop()
+
+
+async def test_campaign_reads_without_proposing_in_the_steady_state(
+    monkeypatch,
+):
+    # The steady state must NOT submit the create-if-absent transaction: etcd
+    # only treats a txn as read-only when every op in BOTH branches is a
+    # Range, so proposing each round would put a raft round (WAL-fsynced on
+    # every member) through for a read that applies nothing.
+    b = _backend()
+    post = _FakePost()
+    monkeypatch.setattr(b, "_post", post)
+    await b._renew_once()  # first round: grants and proposes
+    assert "/v3/kv/txn" in post.paths
+    assert b._campaign_must_create is False  # a key exists now
+
+    post.calls.clear()
+
+    async def range_hit(path, body, *, allow_reauth=True):
+        post.calls.append((path, body))
+        if path == "/v3/kv/range":
+            return {
+                "kvs": [{"value": _b64("node-a"), "lease": post.lease_id}]
+            }
+        return await _FakePost.__call__(post, path, body)
+
+    monkeypatch.setattr(b, "_post", range_hit)
+    await b._renew_once()
+    assert "/v3/kv/range" in post.paths
+    assert "/v3/kv/txn" not in post.paths  # read-only: no raft proposal
+    assert b.is_leader() is True  # and the fence still holds
+
+
+async def test_renew_once_raises_when_the_grant_returns_no_id(monkeypatch):
+    # a gateway that answers a grant without an ID leaves us leaseless; the
+    # round must fail loudly (the loop logs and retries) rather than campaign
+    # with None and mis-read the fence.
+    b = _backend()
+
+    async def no_id(path, body, *, allow_reauth=True):
+        if path == "/v3/lease/grant":
+            return {}
+        return {}
+
+    monkeypatch.setattr(b, "_post", no_id)
+    with pytest.raises(aiohttp.ClientError):
+        await b._renew_once()
+
+
+async def test_authenticate_returns_the_token(monkeypatch):
+    b = _backend(
+        "    username: admin\n    password:\n      value: secret\n",
+        endpoint="https://127.0.0.1:2379",
+    )
+    post = _FakePost()
+    monkeypatch.setattr(b, "_post", post)
+    assert await b._authenticate() == "tok-1"
+    path, body = post.calls[0]
+    assert path == "/v3/auth/authenticate"
+    assert body == {"name": "admin", "password": "secret"}
+
+
+def test_build_ssl_is_none_for_plain_http():
+    # no https endpoint: no client TLS context, and nothing on disk to
+    # dry-run-load.
+    b = _backend()
+    assert b._build_ssl() is None
+    assert b.tls_files_loadable() is True
+
+
+def test_build_ssl_loads_the_client_material(tmp_path):
+    material = _write_tls(tmp_path, cn="etcd-ca", suffix="client")
+    extra = (
+        "    tls:\n"
+        "      ca: " + material["ca"].replace("\\", "/") + "\n"
+        "      cert: " + material["cert"].replace("\\", "/") + "\n"
+        "      key: " + material["key"].replace("\\", "/") + "\n"
+    )
+    b = _backend(extra=extra, endpoint="https://127.0.0.1:2379")
+    ctx = b._build_ssl()
+    assert ctx is not None
+    assert b.tls_files_loadable() is True
+
+
+def test_tls_files_not_loadable_mid_rotation(tmp_path):
+    # cert-manager / Vault refreshes write ca/cert/key separately, so a
+    # reload can observe a half-written file. start_stop_cluster consults this
+    # before tearing the running backend down: an unloadable set must report
+    # False so the healthy backend is KEPT (make-before-break) instead of
+    # rebuilt into a failure that leaves no manager and wedges Leader closed.
+    material = _write_tls(tmp_path, cn="etcd-ca", suffix="client")
+    extra = (
+        "    tls:\n"
+        "      ca: " + material["ca"].replace("\\", "/") + "\n"
+        "      cert: " + material["cert"].replace("\\", "/") + "\n"
+        "      key: " + material["key"].replace("\\", "/") + "\n"
+    )
+    b = _backend(extra=extra, endpoint="https://127.0.0.1:2379")
+    assert b.tls_files_loadable() is True
+    # a truncated cert, as seen mid-write
+    open(material["cert"], "w").close()
+    assert b.tls_files_loadable() is False
+
+
+# --- @reboot-ran persistence: the failure arms ----------------------------
+
+
+async def test_cas_write_contends_out_without_raising(monkeypatch):
+    # Under persistent contention the CAS gives up after a bounded number of
+    # attempts rather than spinning: the local set still stops THIS node
+    # re-running its own one-shot, and the next round retries.
+    b = _backend()
+    posts = []
+
+    async def always_contended(path, body, *, allow_reauth=True):
+        posts.append(path)
+        if path == "/v3/kv/range":
+            return {"kvs": []}
+        return {"succeeded": False}  # someone else moved the key, every time
+
+    monkeypatch.setattr(b, "_post", always_contended)
+    b._reboot_ran_local = {"migrate"}
+    await b._cas_write_reboot_ran()  # must not raise
+    assert posts.count("/v3/kv/txn") == _REBOOT_RAN_CAS_ATTEMPTS
+
+
+async def test_persist_reboot_ran_swallows_a_failed_write(monkeypatch):
+    # cron calls mark_reboot_ran from _process_pending_reboots, OUTSIDE the
+    # run loop's guard, so a failed eager persist must never escape;
+    # _sync_reboot_ran retries it on the next round.
+    b = _backend()
+
+    async def boom():
+        raise aiohttp.ClientError("no route")
+
+    monkeypatch.setattr(b, "_cas_write_reboot_ran", boom)
+    await b._persist_reboot_ran()  # must not raise
+
+
+async def test_sync_reboot_ran_warns_once_while_a_leader_is_blind(
+    monkeypatch, caplog
+):
+    # A holder that cannot read the ran-set back IS deferring its pending
+    # @reboot one-shots (reboot_ran raises RebootRanUnknownError), so the
+    # outage must be surfaced once per outage rather than once per round, or a
+    # sick etcd floods the log at the renew cadence.
+    b = _backend()
+
+    async def boom():
+        raise aiohttp.ClientError("no route")
+
+    monkeypatch.setattr(b, "_cas_write_reboot_ran", boom)
+    b._is_leader = True
+    b._reboot_ran_synced = False
+    def warnings():
+        return sum("deferring pending" in r.message for r in caplog.records)
+
+    with caplog.at_level("WARNING", logger="cronstable"):
+        await b._sync_reboot_ran()
+        assert b._reboot_ran_warned is True
+        assert warnings() == 1
+        await b._sync_reboot_ran()  # a second failed round
+        assert warnings() == 1  # stays quiet
+
+
+async def test_sync_reboot_ran_backs_off_for_an_unsynced_follower(monkeypatch):
+    # The raise gate is leader-gated and a takeover forces its own re-read, so
+    # a failed read on a follower must space the retry to the refresh period
+    # instead of hammering a sick etcd every round.
+    b = _backend()
+
+    async def boom():
+        raise aiohttp.ClientError("no route")
+
+    monkeypatch.setattr(b, "_cas_write_reboot_ran", boom)
+    b._is_leader = False
+    b._reboot_ran_synced = False
+    b._reboot_refresh_next = 0.0
+    await b._sync_reboot_ran()
+    assert b._reboot_refresh_next > 0.0  # backed off
+    assert b._reboot_ran_warned is False  # and stayed quiet
+
+
+async def test_sync_reboot_ran_keeps_retrying_a_synced_followers_mark(
+    monkeypatch,
+):
+    # a follower that HAS read the key back but still holds an unpersisted mark
+    # retries every round (the mark is what the store may not carry yet), and
+    # does not push its refresh deadline out.
+    b = _backend()
+
+    async def boom():
+        raise aiohttp.ClientError("no route")
+
+    monkeypatch.setattr(b, "_cas_write_reboot_ran", boom)
+    b._is_leader = False
+    b._reboot_ran_synced = True
+    b._reboot_ran_local = {"migrate"}
+    b._reboot_refresh_next = 0.0
+    await b._sync_reboot_ran()
+    assert b._reboot_refresh_next == 0.0  # untouched: retry next round

@@ -1238,10 +1238,14 @@ class MCPHandler:
         except ValueError as err:
             return _tool_error(str(err))
         if payload is None:
+            # the same lookup GET /schedule/why performs
+            # (Cron._job_or_dag_schedule), so a DAG's synthetic dag:<name>
+            # schedule job answers here too and the reason must not claim a
+            # job was the only thing searched, nor point at a tool that
+            # cannot list one. The HTTP twin says the same sentence.
             return _tool_error(
-                "job not found: {!r}. Use cron_list_jobs to enumerate.".format(
-                    name
-                )
+                "no job or DAG schedule named {!r}. Use cron_list_jobs or "
+                "cron_list_dags to enumerate.".format(name)
             )
         return _result(payload, _why_summary(payload))
 

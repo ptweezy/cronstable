@@ -514,6 +514,19 @@ class PrometheusMetrics:
         # and capped at LABEL_BLOCK_CACHE_MAX so it cannot grow into
         # permanent RSS on a six-figure fleet.
         self._label_blocks: _LabelBlockCache = {}
+        # Per-job label dicts for phase 1 (see _label_sets): one shared set
+        # per job instead of fresh dicts per sample per scrape.  Cleared
+        # wherever _label_blocks is cleared, for the same reasons.
+        self._job_label_dicts: dict[
+            str,
+            tuple[
+                dict[str, str],
+                tuple[dict[str, str], ...],
+                tuple[dict[str, str], ...],
+                dict[str, str],
+                tuple[dict[str, str], ...],
+            ],
+        ] = {}
         # A persisted histogram baseline whose bucket bounds did not match at
         # seed time, parked as (bounds, {job: histogram fields}) instead of
         # dropped: the daemon seeds counters during state startup, BEFORE the
@@ -541,8 +554,10 @@ class PrometheusMetrics:
             return
         self._buckets = new
         self._bucket_bound_strs = tuple(_bucket_bound(b) for b in new)
-        # the "le" blocks memoized against the old bounds are dead weight now
+        # the "le" blocks and label dicts memoized against the old bounds
+        # are dead weight now
         self._label_blocks.clear()
+        self._job_label_dicts.clear()
         # Bucket bounds changed: past observations cannot be re-binned, so
         # every job's histogram restarts from zero -- an ordinary counter
         # reset to Prometheus. The run/outcome counters are unaffected.
@@ -576,6 +591,7 @@ class PrometheusMetrics:
         # delete selectively, and a reload is the one moment the label
         # universe can shrink. The next scrape rebuilds what it still needs.
         self._label_blocks.clear()
+        self._job_label_dicts.clear()
 
     def _job(self, name: str) -> _JobMetrics:
         job = self._jobs.get(name)
@@ -583,6 +599,45 @@ class PrometheusMetrics:
             job = _JobMetrics(len(self._buckets))
             self._jobs[name] = job
         return job
+
+    def _label_sets(
+        self, name: str
+    ) -> tuple[
+        dict[str, str],
+        tuple[dict[str, str], ...],
+        tuple[dict[str, str], ...],
+        dict[str, str],
+        tuple[dict[str, str], ...],
+    ]:
+        """One job's sample label dicts: the bare ``job_name`` dict, the
+        per-outcome dicts (RUN_OUTCOMES order), the histogram ``le`` dicts
+        (bucket order), the ``+Inf`` dict, and the CPU ``mode`` dicts
+        (user, system).
+
+        Sample label dicts are read-only downstream (``block_for`` tuples
+        the items; nothing mutates a sample's labels), so every scrape
+        shares one set per job.  The memo is invalidated alongside
+        _label_blocks: on prune and on a bucket change.
+        """
+        entry = self._job_label_dicts.get(name)
+        if entry is None:
+            entry = self._job_label_dicts[name] = (
+                {"job_name": name},
+                tuple(
+                    {"job_name": name, "status": outcome}
+                    for outcome in RUN_OUTCOMES
+                ),
+                tuple(
+                    {"job_name": name, "le": le}
+                    for le in self._bucket_bound_strs
+                ),
+                {"job_name": name, "le": "+Inf"},
+                (
+                    {"job_name": name, "mode": "user"},
+                    {"job_name": name, "mode": "system"},
+                ),
+            )
+        return entry
 
     # -- event hooks (called from cronstable.cron) ----------------------------
 
@@ -1144,12 +1199,13 @@ class PrometheusMetrics:
         )
         for name in sorted(self._jobs):
             job = self._jobs[name]
-            labels = {"job_name": name}
-            for outcome in RUN_OUTCOMES:
-                runs.add(
-                    {"job_name": name, "status": outcome},
-                    job.runs.get(outcome, 0),
-                )
+            labels, outcome_labels, le_labels, inf_labels, mode_labels = (
+                self._label_sets(name)
+            )
+            for outcome, status_labels in zip(
+                RUN_OUTCOMES, outcome_labels, strict=True
+            ):
+                runs.add(status_labels, job.runs.get(outcome, 0))
             retries.add(labels, job.retries)
             permanent.add(labels, job.permanent_failures)
             start_failures.add(labels, job.start_failures)
@@ -1157,30 +1213,19 @@ class PrometheusMetrics:
             # unmonitored job does not export permanently-frozen zeros; peak
             # RSS likewise appears only after a real observation.
             if job.cpu_count:
-                cpu_seconds.add(
-                    {"job_name": name, "mode": "user"}, job.cpu_user_sum
-                )
-                cpu_seconds.add(
-                    {"job_name": name, "mode": "system"}, job.cpu_system_sum
-                )
+                cpu_seconds.add(mode_labels[0], job.cpu_user_sum)
+                cpu_seconds.add(mode_labels[1], job.cpu_system_sum)
             if job.max_rss_observed:
                 peak_rss.add(labels, job.max_rss_observed)
             # bucket_counts is stored cumulatively (every bound >= the
-            # observation is incremented), so the counts render as-is. The "le"
-            # label strings are precomputed (self._bucket_bound_strs).
-            for le, count in zip(
-                self._bucket_bound_strs, job.bucket_counts, strict=True
+            # observation is incremented), so the counts render as-is. The
+            # "le" label dicts carry the precomputed bound strings in bucket
+            # order (see _label_sets).
+            for bucket_labels, count in zip(
+                le_labels, job.bucket_counts, strict=True
             ):
-                duration.add(
-                    {"job_name": name, "le": le},
-                    count,
-                    suffix="_bucket",
-                )
-            duration.add(
-                {"job_name": name, "le": "+Inf"},
-                job.duration_count,
-                suffix="_bucket",
-            )
+                duration.add(bucket_labels, count, suffix="_bucket")
+            duration.add(inf_labels, job.duration_count, suffix="_bucket")
             duration.add(labels, job.duration_sum, suffix="_sum")
             duration.add(labels, job.duration_count, suffix="_count")
             if job.last_success_time is not None:
@@ -1255,7 +1300,13 @@ class PrometheusMetrics:
             "(absent unless that run had monitorResources on).",
         )
         for name, job_config in cron.cron_jobs.items():
-            labels = {"job_name": name}
+            labels = self._label_sets(name)[0]
+            # A job's `priority` is deliberately absent from these labels,
+            # unlike on the /jobs payload, which carries it when it is set.
+            # An info metric spells the same label set for every job, so the
+            # only way to add it is to emit priority="normal" for all of
+            # them, which repoints every existing series of this metric to
+            # say something that was already true.
             info.add(
                 {
                     "job_name": name,

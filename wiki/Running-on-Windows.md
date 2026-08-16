@@ -20,10 +20,10 @@ cronstable supports Windows on two CPU architectures: `amd64` (x64) and `arm64`
 (ARM64). You can install it either as a normal Python package or as a
 self-contained executable.
 
-| Architecture | pip / pipx | Standalone binary |
-| --- | --- | --- |
-| `amd64` (x64) | `pip install cronstable` | `cronstable-windows-amd64.exe` |
-| `arm64` (ARM64) | `pip install cronstable` | `cronstable-windows-arm64.exe` |
+| Architecture | pip / pipx | Standalone binary | Zip (one-directory) | MSI |
+| --- | --- | --- | --- | --- |
+| `amd64` (x64) | `pip install cronstable` | `cronstable-windows-amd64.exe` | `cronstable-windows-amd64.zip` | `cronstable-windows-amd64.msi` |
+| `arm64` (ARM64) | `pip install cronstable` | `cronstable-windows-arm64.exe` | `cronstable-windows-arm64.zip` | `cronstable-windows-arm64.msi` |
 
 The test suite runs on Windows (both x64 and ARM64) in CI on every commit,
 with a small set of POSIX-only tests (per-job user/group switching, privilege
@@ -34,7 +34,22 @@ release workflow.
 
 ## Installation
 
-There are three ways to install cronstable on Windows.
+There are five ways to install cronstable on Windows.
+
+### MSI (machine-wide, hosts the service)
+
+Every release attaches an MSI per architecture. It installs to
+`C:\Program Files\cronstable`, registers the [Windows
+service](Windows-Service) and puts the install directory on the system
+`PATH`, and it is the path for managed deployment through GPO, Intune or
+SCCM:
+
+```shell
+msiexec /i cronstable-windows-amd64.msi /qn
+```
+
+See [Windows MSI](Windows-MSI) for the silent-install properties, upgrade
+behavior and first-start steps.
 
 ### winget
 
@@ -47,7 +62,7 @@ winget install ptweezy.cronstable
 
 Upgrade later with `winget upgrade ptweezy.cronstable`. The winget package is
 a per-user install of the portable executable; for a machine-wide deployment
-use the standalone binary below and place it yourself.
+use the MSI above or the zip below.
 
 ### pip / pipx
 
@@ -80,12 +95,40 @@ detail (which matters only under unusual locked-down filesystems) see
 [Installation](Installation).
 
 The Windows executables carry a version resource (Properties > Details shows
-the product and version) but are **not Authenticode-signed**, so the first
-run of a browser-downloaded .exe trips SmartScreen ("Windows protected your
-PC"): choose "More info", then "Run anyway", and verify the download against
-the release's `SHA256SUMS` if your policy requires it. Environments that
-allowlist by publisher (AppLocker/WDAC publisher rules) cannot admit an
-unsigned binary; use a hash or path rule there, or install through pip.
+the product and version) and are Authenticode-signed with Azure Artifact
+Signing, each signature timestamped so it outlives the short-lived signing
+certificates. The first run of a browser-downloaded .exe can still trip
+SmartScreen ("Windows protected your PC") while the signing identity's
+reputation accrues: choose "More info", then "Run anyway", and verify the
+download against the release's `SHA256SUMS` if your policy requires it.
+Environments that allowlist by publisher (AppLocker/WDAC) can use a
+publisher rule instead of per-release hash rules.
+
+### One-directory zip (hosts the service)
+
+`cronstable-windows-amd64.zip` and `cronstable-windows-arm64.zip` hold the
+same program as the standalone binary in a one-directory layout: a single
+`cronstable\` folder with `cronstable.exe` beside an `_internal\` directory,
+running in place with no self-extraction. This is the download that can host
+the [Windows service](Windows-Service); the one-file `.exe` cannot, and
+`cronstable service install` refuses it by name.
+
+A browser download carries the Mark of the Web, and extracting with
+Explorer stamps it onto every extracted file, so the first run of the
+extracted `cronstable.exe` would trip SmartScreen file by file. Clearing it
+from the zip before extraction clears it for everything at once. From an
+elevated PowerShell (writing into `C:\Program Files` needs one):
+
+```powershell
+Unblock-File .\cronstable-windows-amd64.zip
+Expand-Archive .\cronstable-windows-amd64.zip -DestinationPath 'C:\Program Files'
+& 'C:\Program Files\cronstable\cronstable.exe' --version
+```
+
+Extracting into `C:\Program Files` yields
+`C:\Program Files\cronstable\cronstable.exe`, the path the recipes on this
+page use. The SmartScreen and AppLocker/WDAC notes above apply to the zip's
+executable the same way they apply to the one-file `.exe`.
 
 There is no Windows container image; the published Docker image is Linux-only.
 See [Installation](Installation) for the Linux image and its supported
@@ -138,6 +181,43 @@ configuration:
 ```shell
 cronstable init
 ```
+
+### Who may write the config directory
+
+Whoever can write the config directory decides what the scheduler runs, and a
+service runs it as SYSTEM. On Windows that is easy to get wrong without
+touching anything: `%ProgramData%` grants `BUILTIN\Users` the right to create
+files, and a directory made under it inherits that, so every local account can
+drop a `.yaml` there. A directory created at the root of a drive is worse
+again, since `C:\` hands new subdirectories `Modify` for Authenticated Users.
+
+`cronstable init` therefore checks the directory it created and, when any
+local account could write to it, restricts it: full control for LocalSystem
+and the local Administrators group, read and execute for everyone else, with
+inheritance from the parent severed. It says so when it does. A per-user
+`%APPDATA%\cronstable` carries no such permission to begin with and is left
+alone.
+
+Read is deliberately left in place. The boundary this defends is who may
+*write* a job, and removing read would stop an unelevated account from listing
+the directory at all, which in turn makes the machine-wide path stop resolving
+for that account. If your config holds secrets inline rather than in
+[`fromFile`](Reporting#secrets) sources, tighten it further.
+
+For a directory that already exists, the daemon says so once at startup and
+prints the same fix:
+
+```text
+C:\ProgramData\cronstable can be written by BUILTIN\Users, so any local
+account can add or change a job this daemon runs, and a service runs them
+as SYSTEM. Restrict it with: icacls "C:\ProgramData\cronstable"
+/inheritance:r /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F
+```
+
+The recipe names SIDs rather than group names so it pastes unchanged on a
+localized install, where `BUILTIN\Administrators` is spelled in the local
+language. Add `/grant *S-1-5-11:(OI)(CI)(RX)` to keep read for everyone, which
+is what `init` does.
 
 ### "Configuration file not found" applies to this path
 
@@ -202,6 +282,31 @@ jobs:
     schedule: "*/5 * * * *"
     captureStdout: true
 ```
+
+### Working directory
+
+A job inherits cronstable's own working directory unless it says otherwise,
+and on Windows that is rarely where you want to be: a daemon started from an
+elevated console starts in the system directory, and one started by Task
+Scheduler starts wherever that action was configured to. Either way, every
+relative path inside a `.bat` or `.ps1` resolves somewhere the author did not
+mean. `workingDirectory` names the directory the job's process starts in, the
+equivalent of the "Start in (optional)" box on a Task Scheduler action:
+
+```yaml
+jobs:
+  - name: importer
+    command: import.bat
+    schedule: "0 * * * *"
+    workingDirectory: C:\jobs\importer
+```
+
+At config load cronstable expands `~` and `${VAR}` and makes the result
+absolute. A directory that does not exist is not a load error: the OS reports
+it at spawn, and cronstable records the run as a launch failure with exit
+`127`. See [Commands and Environment](Commands-and-Environment#workingdirectory)
+for the full semantics, and the note below on program lookup, which is the one
+place Windows and POSIX disagree about what `workingDirectory` covers.
 
 ### Using PowerShell or another interpreter
 
@@ -298,20 +403,39 @@ See [Running unattended](#running-unattended) below and the
 
 ## Running unattended
 
-cronstable is a single foreground process and does not install itself as a
-Windows service. To run it unattended (starting at boot, surviving logoff),
-register it with the in-box Task Scheduler or wrap it in a service manager.
-Use the machine-wide config directory for either, so the daemon reads the
-same configuration no matter which account runs it.
-
-One-time setup, from an elevated prompt:
+The supported way to run cronstable unattended is as a Windows service.
+From an elevated prompt:
 
 ```shell
 cronstable init C:\ProgramData\cronstable
+cronstable service install -c C:\ProgramData\cronstable
+cronstable service start
 ```
 
-Then register a boot-time task running as `SYSTEM` (adjust the .exe path to
-where you installed it):
+That registers cronstable with the Service Control Manager, so it starts at
+boot, keeps running after you log off, appears in `services.msc`, and gets
+Windows' own recovery actions. Stopping it drains running jobs first, and
+the SCM is told the stop is in progress for as long as that takes. The
+commands work from a pip or pipx install, from the extracted
+[one-directory zip](#one-directory-zip-hosts-the-service), or not at all
+from the one-file `.exe`; the [MSI](Windows-MSI) registers the service by
+itself, so none of them are needed there. A service host therefore needs no
+Python installed. See [Windows Service](Windows-Service) for the full
+command set, the logging story, and the one install shape that cannot host
+a service: the published one-file `.exe` (also what winget installs), whose
+bootloader runs the program in a child process the SCM never sees.
+
+### Task Scheduler, for the one-file executable
+
+Where the service is not available, the in-box Task Scheduler starts
+cronstable at boot and survives logoff too. It gives you neither the
+Services console nor a real stop control, but it does the job. Use the
+machine-wide config directory either way, so the daemon reads the same
+configuration no matter which account runs it.
+
+Register a boot-time task running as `SYSTEM` (adjust the .exe path to
+where you installed it; extracting the one-directory zip into
+`C:\Program Files` produces exactly the path this recipe uses):
 
 ```shell
 schtasks /Create /TN cronstable /SC ONSTART /RU SYSTEM /RL HIGHEST /TR "\"C:\Program Files\cronstable\cronstable.exe\" -c C:\ProgramData\cronstable"
@@ -324,7 +448,8 @@ restart-on-failure. A service wrapper such as
 [NSSM](https://nssm.cc) works the same way and additionally supervises
 crashes; point it at the same command line.
 
-Three things every unattended deployment should add:
+Three things a Task Scheduler or wrapper deployment should add. A service
+installed with `cronstable service install` already has the first two.
 
 **A stop path.** With no console there is no Ctrl-C. Configure a loopback
 listener with an auth token, and stop the daemon gracefully over HTTP; this
@@ -345,10 +470,10 @@ curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:8080/shutdown
 Killing the process instead (`taskkill /F`, Task Manager) skips the drain and
 leaves any spawned job trees running.
 
-**A log file.** An unattended daemon's stderr goes nowhere. cronstable writes no
-Windows Event Log entries; give the root logger a rotating file via the
-`logging:` section (a plain `logging.config.dictConfig` passthrough, stdlib
-only, works in the frozen .exe):
+**A log file.** An unattended daemon's stderr goes nowhere. Give the root
+logger a rotating file via the `logging:` section (a plain
+`logging.config.dictConfig` passthrough, stdlib only, works in the frozen
+.exe):
 
 ```yaml
 logging:
@@ -372,6 +497,11 @@ logging:
 See [Logging Configuration](Logging-Configuration) for the section's
 semantics (including that `--validate-config` does not exercise it).
 
+That log file and the Event Log reporter below cover different things and
+an unattended box usually wants both: the `logging:` section captures the
+daemon's own log, while `report.eventlog` publishes per-run outcomes where
+monitoring can pick them up.
+
 **A firewall rule, only if you bind beyond loopback.** Loopback-only
 listeners (`127.0.0.1`) need no rule. A routable `web.listen` or
 `cluster.listen` needs an inbound allow rule, created ahead of time for an
@@ -388,6 +518,40 @@ enabled, the client default) resumes the same kernel session at the next
 power-on, and cronstable treats it as the same OS boot, so `@reboot` does not
 re-fire after it; a Restart always begins a new boot. See
 [Durable State](Durable-State) for the boot-identity mechanics.
+
+## Windows Event Log
+
+Job outcomes can be written to the Windows Event Log, which is where a
+Windows shop's monitoring already looks: Event Viewer, a Windows Event
+Forwarding subscription, SCOM, and every SIEM connector. It is a sixth
+reporter in the same `report` block as the other five, so it fires from the
+same hooks:
+
+```yaml
+defaults:
+  onFailure:
+    report:
+      eventlog:
+        enabled: true
+```
+
+Records carry a stable event ID (1000 succeeded, 1001 failed, 1002 failed
+permanently, 1003 overdue, 1010 and 1011 for daemon events) and a fixed set
+of insertion strings, so a rule written against them keeps working:
+
+```powershell
+Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'cronstable'; ID = 1001, 1002 }
+```
+
+cronstable does not register its event source, because that needs an HKLM
+write and buys nothing without a message DLL, so Event Viewer prefixes the
+rendered text with its generic "description cannot be found" note. That
+costs the rendered prose only: the provider, the ID, the level and every
+insertion string are all present, so the XML view, `wevtutil`, forwarding
+and SIEM connectors read the record normally.
+
+See [Windows Event Log](Windows-Event-Log) for the full tables, the optional
+source registration, and why `includeOutput` is off by default.
 
 ## Job termination semantics
 
@@ -415,7 +579,11 @@ it.
 The break needs a console shared between the daemon and the job. Where there
 is none (a daemon started by a service wrapper with no console), the graceful
 step cannot be delivered and becomes the tree kill immediately; the job gets
-no notice there, and `killTimeout` has nothing left to bound.
+no notice there, and `killTimeout` has nothing left to bound. A service
+installed with `cronstable service install --console` allocates one so the
+two-step keeps working; it is off by default because an allocated console
+changes what a job inherits. See
+[Windows Service](Windows-Service#--console-and-job-termination).
 
 Honest bounds on the sequence: a descendant that moved itself into a new
 process group (`start /b` does) never receives the break, though the forced
@@ -432,12 +600,87 @@ and how `concurrencyPolicy: Replace` cancels the outgoing instance, see
 [Cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout)
 on [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
+## Process priority
+
+A job can say how it should be scheduled against everything else on the box:
+
+```yaml
+jobs:
+  - name: reindex
+    command: reindex.cmd
+    schedule: "0 3 * * *"
+    priority: idle
+```
+
+The level becomes the process's Windows priority class, set on the creation
+flags at `CreateProcess` time, which is the one race-free place to set it:
+
+| Level | Windows priority class | Task Scheduler `-Priority` |
+| --- | --- | --- |
+| `idle` | `IDLE_PRIORITY_CLASS` | 9 to 10 |
+| `below-normal` | `BELOW_NORMAL_PRIORITY_CLASS` | 7 to 8 (7 is its default) |
+| `normal` (default) | no class flag; see below | 4 to 6 |
+| `above-normal` | `ABOVE_NORMAL_PRIORITY_CLASS` | 2 to 3 |
+| `high` | `HIGH_PRIORITY_CLASS` | 1 |
+
+Windows hands every one of these classes to an unprivileged account, so
+nothing here needs an elevated daemon. POSIX differs: raising a priority
+there needs `CAP_SYS_NICE` or `RLIMIT_NICE` headroom, and a refusal leaves
+the job at the priority it inherited.
+
+`realtime` is not reachable, at any level of the config. REALTIME outranks the
+threads that service disk, keyboard and mouse; one runaway job at that class
+can put the machine out of reach of the operator who has to stop it, and
+nothing a scheduled job does is worth that. `priority: realtime` is a load
+error naming the five levels that are accepted.
+
+### A lowered class covers the tree, a raised one does not
+
+A child created with no class flag of its own gets the creator's class only
+when the creator is idle or below-normal; otherwise Windows gives it NORMAL.
+That one rule decides how far a job's level reaches:
+
+- `idle` and `below-normal` cover the whole helper tree. A `.cmd` file at
+  `priority: idle` runs cmd.exe at IDLE and every program cmd.exe launches at
+  IDLE too.
+- `above-normal` and `high` apply to the spawned process only. A `.cmd` file
+  or a `shell: cmd` job at `priority: high` runs cmd.exe at HIGH, and every
+  program cmd.exe actually launches runs at NORMAL.
+
+Measured on Windows 11: an unflagged grandchild of a HIGH parent comes back
+NORMAL, and an unflagged grandchild of an IDLE parent comes back IDLE.
+
+`high` is still worth asking for: it gets the job's own process scheduled
+ahead of the rest of the box, and for a job whose command is the work (a
+`.exe`, a `python` script) the tree is one process deep anyway. A `.cmd`
+wrapper, though, does not hand its level down, so a job that needs a raised
+program should name that program as the `command` rather than wrap it. POSIX
+has no such asymmetry: cronstable renices the whole process group, and
+anything forked afterwards inherits the nice value.
+
+### The default level
+
+Task Scheduler numbers run the other way (0 highest, 10 lowest), and its
+per-task default is 7, which is BELOW_NORMAL. cronstable's default is
+deliberately neither a number nor a class: `normal` emits no class flag at
+all. Windows defaults a child to NORMAL only when its creator is not itself
+idle or below-normal, so emitting `NORMAL_PRIORITY_CLASS` would silently
+*promote* every job of a daemon that Task Scheduler had started at its own
+default 7. Emitting nothing instead means a daemon at idle or below normal
+hands that class to its jobs, and a daemon at normal or above hands them
+NORMAL. Either way cronstable never promotes a job the operator did not ask
+to promote.
+
+See [priority](Commands-and-Environment#priority) for the POSIX half and the
+full semantics.
+
 ## Features not supported on Windows
 
 Three POSIX-specific features cannot work on Windows. None is silently
-dropped: each is reported clearly. A fourth platform difference (POSIX file
-modes) is silent by nature and called out at the end of this section so it is
-on the record.
+dropped: each is reported clearly. Two further platform differences (program
+lookup under `workingDirectory`, and POSIX file modes) are not reported at
+config load, and are called out at the end of this section so they are on the
+record.
 
 ### Per-job `user` / `group` switching
 
@@ -494,6 +737,42 @@ through `%ComSpec%` (cmd.exe), or assign a shell that exists on the machine
 assignment with a POSIX value is kept but warned about, since it replaces the
 Windows `PATH` for the entries below it. See
 [Classic Crontabs](Classic-Crontabs) for the format's full semantics.
+
+### `workingDirectory` does not change program lookup
+
+Setting a job's
+[`workingDirectory`](Commands-and-Environment#workingdirectory) changes where
+the process starts, on Windows exactly as on POSIX. On Windows it does not
+change where the *program* is looked up: `CreateProcessW` searches the
+calling process's directory (cronstable's) rather than the child's working
+directory. A list-form `command` naming its program by a relative path, one
+carrying a separator such as `.\import.bat`, therefore resolves against the
+working directory on POSIX and fails on Windows with a `start_failed` run and
+a `FileNotFoundError`, from the same config. A bare name with no separator is
+looked up on `PATH` on both platforms and never comes from the working
+directory at all, since CPython assembles the `PATH` candidates in the parent,
+before the child changes directory.
+
+Name the program by full path, or leave `command` as a string so the command
+processor resolves it, since `cmd.exe` starts in the working directory and
+searches there:
+
+```yaml
+jobs:
+  # cmd.exe starts in workingDirectory and finds import.bat there
+  - name: importer
+    command: import.bat
+    schedule: "0 * * * *"
+    workingDirectory: C:\jobs\importer
+
+  # the list form bypasses the command processor, and CreateProcessW searches
+  # cronstable's own directory rather than the child's, so this fails to launch
+  - name: importer-argv
+    command:
+      - import.bat
+    schedule: "0 * * * *"
+    workingDirectory: C:\jobs\importer
+```
 
 ### POSIX file modes are advisory only
 
@@ -566,12 +845,14 @@ Apart from the differences above, cronstable behaves the same on Windows as on
 POSIX. The YAML crontab, classic crontabs (with the `SHELL=` guard above),
 schedules and timezones, environment variables and env files, output
 capturing, concurrency, failure detection and retries, reporting
-(mail / Sentry / shell / webhook), statsd metrics, the Prometheus `/metrics` endpoint,
+(mail / Sentry / shell / webhook / push, plus the Windows-only
+[Event Log reporter](Windows-Event-Log)), statsd metrics, the Prometheus `/metrics` endpoint,
 the HTTP control API, the web dashboard, and the `cronstable tui` terminal
 dashboard (which enables VT mode on the Windows console and reads keys via
 `msvcrt`) all work as documented elsewhere in this wiki:
 
 - [Classic Crontabs](Classic-Crontabs)
+- [Importing from Task Scheduler](Importing-Task-Scheduler)
 - [Schedules and Timezones](Schedules-and-Timezones)
 - [Commands and Environment](Commands-and-Environment)
 - [Output Capturing](Output-Capturing)

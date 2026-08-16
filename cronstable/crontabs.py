@@ -374,6 +374,10 @@ def _unescape_percent(command: str, where: str) -> str:
     overwhelmingly the common case, e.g. ``date +\%F`` -- becomes a
     literal ``%`` exactly as cron would make it.
     """
+    if "%" not in command:
+        # a command without a percent is already its own literal form;
+        # the character walk below applies only to commands that carry one
+        return command
     out: list[str] = []
     index = 0
     while index < len(command):

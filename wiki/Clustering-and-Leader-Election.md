@@ -167,8 +167,8 @@ The per-backend config keys (`cluster.kubernetes.*`, `cluster.etcd.*`,
 auth/TLS, failure modes, and monitoring are in
 [Operating the lease backends](#operating-the-lease-backends-kubernetes-and-etcd).
 Runnable samples are in
-[`example/kubernetes/`](https://github.com/ptweezy/cronstable/tree/develop/example/kubernetes)
-and [`example/etcd/`](https://github.com/ptweezy/cronstable/tree/develop/example/etcd).
+[`example/kubernetes/`](https://github.com/ptweezy/cronstable/tree/main/example/kubernetes)
+and [`example/etcd/`](https://github.com/ptweezy/cronstable/tree/main/example/etcd).
 
 The rest of this page documents the **`gossip`** backend (the default) in
 depth; its trust model and quorum math are specific to it. The `clusterPolicy`
@@ -1170,7 +1170,7 @@ before deploying; see the [Command-Line Reference](CLI-Reference).
 
   A ready-to-apply `ServiceAccount` + `Role` + `RoleBinding` + 3-replica
   `Deployment` is in
-  [`example/kubernetes/deployment.yaml`](https://github.com/ptweezy/cronstable/blob/develop/example/kubernetes/deployment.yaml).
+  [`example/kubernetes/deployment.yaml`](https://github.com/ptweezy/cronstable/blob/main/example/kubernetes/deployment.yaml).
   Run `cronstable --validate-config` on the config before applying the manifests;
   see the [Command-Line Reference](CLI-Reference).
 * **Credentials.** In-cluster, the pod's service-account token, CA, and
@@ -1407,7 +1407,7 @@ For running multiple replicas on Kubernetes (both `backend: kubernetes` and
 ## Trying it locally
 
 The repository ships a ready-to-run three-node cluster in
-[`example/cluster/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/develop/example/cluster/docker-compose.yml).
+[`example/cluster/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/main/example/cluster/docker-compose.yml).
 It generates a throwaway cluster CA and per-node certificates, brings up three
 mutually-attesting nodes with `electLeader: true` and one job of each
 `clusterPolicy`, and publishes each node's dashboard on a separate port
@@ -1424,15 +1424,15 @@ The compose file's header comments document the full set of things to try
 
 **A full showcase.** For the fullest end-to-end demo (`distribution: spread`,
 all three `clusterPolicy` values, and mTLS together), the repository ships
-[`example/grand-tour/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/develop/example/grand-tour/docker-compose.yml);
+[`example/grand-tour/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/main/example/grand-tour/docker-compose.yml);
 its walkthrough is in
-[`example/grand-tour/README.md`](https://github.com/ptweezy/cronstable/blob/develop/example/grand-tour/README.md).
+[`example/grand-tour/README.md`](https://github.com/ptweezy/cronstable/blob/main/example/grand-tour/README.md).
 
 ### A larger, CPU-heavy cluster
 
 To watch [`distribution: spread`](#distribution-one-leader-or-spread-the-load)
 fan real load across the cluster, the repository also ships
-[`example/cluster-large/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/develop/example/cluster-large/docker-compose.yml):
+[`example/cluster-large/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/main/example/cluster-large/docker-compose.yml):
 **ten** nodes (dashboards on ports 8080–8089) running a larger job set with
 several CPU-heavy jobs, defaulting to `spread`. Each node's config is generated
 from environment variables by a small entrypoint, so there are no per-node files
@@ -1453,7 +1453,7 @@ header comments list how to inspect per-job owners and fail nodes.
 ### A fenced backend locally
 
 To try a **lease backend** instead of gossip,
-[`example/etcd/`](https://github.com/ptweezy/cronstable/tree/develop/example/etcd)
+[`example/etcd/`](https://github.com/ptweezy/cronstable/tree/main/example/etcd)
 ships a `docker-compose.yml` with a single etcd plus two cronstable instances
 (`backend: etcd`) and one job of each `clusterPolicy`:
 
@@ -1465,7 +1465,7 @@ docker compose -f example/etcd/docker-compose.yml exec etcd etcdctl get cronstab
 ```
 
 For the Kubernetes `Lease` backend,
-[`example/kubernetes/`](https://github.com/ptweezy/cronstable/tree/develop/example/kubernetes)
+[`example/kubernetes/`](https://github.com/ptweezy/cronstable/tree/main/example/kubernetes)
 has the RBAC + `Deployment` to apply against any cluster (k3d/kind for local).
 
 ## See also

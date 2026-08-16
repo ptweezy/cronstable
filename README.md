@@ -1,4 +1,4 @@
-# ![The cronstable wordmark; its l is a live self-balancing double pendulum: it sways through the theme glitches, collapses when the signal drops, and swings itself back upright](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/logo-balance.webp)
+# ![The cronstable wordmark; its l is a live self-balancing double pendulum: it sways through the theme glitches, collapses when the signal drops, and swings itself back upright](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/logo-balance.webp)
 
 [![PyPI version](https://img.shields.io/pypi/v/cronstable.svg?logo=pypi&logoColor=white&color=0073b7)](https://pypi.org/project/cronstable/)
 [![GitHub release](https://img.shields.io/github/v/release/ptweezy/cronstable?logo=github&color=8a2be2)](https://github.com/ptweezy/cronstable/releases/latest)
@@ -14,10 +14,10 @@
 [![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-# cronstable™
+# Cronstable
 / kraahn-stuh-bl /
 
-A stability-focused, container-friendly, optionally-distributed, fault-tolerant, highly-available, leader-electing, configurable, precompiled, multi-architecture, portable, batteries-included, security-hardened, production-ready cron replacement.
+A stability-focused, container-friendly, optionally-distributed, fault-tolerant, leader-electing, resumable, configurable, precompiled, multi-architecture, portable, batteries-included, security-hardened, production-ready cron replacement.
 
 ## Why cronstable?
 
@@ -53,7 +53,7 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   (see [Schedule introspection](#schedule-introspection))
 * Builtin sending of Sentry, Mail, and webhook (Slack-compatible)
   notifications when cron jobs fail
-* **End-to-end encrypted push notifications**: a fifth reporter seals each
+* **End-to-end encrypted push notifications**: a dedicated reporter seals each
   alert to a paired device's own key (libsodium sealed box), so the relay
   that forwards it to the platform push service never sees job names,
   hostnames, or log lines; pairing is a dashboard QR scan or one API call,
@@ -158,9 +158,9 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   everything and a **[terminal twin](#terminal-dashboard)**
   (`cronstable tui`) with the same keys
 
-[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.webp)](#web-dashboard)
+[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](#web-dashboard)
 
-> The (optional) Web UI tour.
+> Web UI tour.
 
 ## Quick start
 
@@ -242,22 +242,34 @@ hardened Kubernetes/Docker setup.
 ### Install using pip
 
 cronstable requires Python >= 3.10 (for systems with an older Python, use the
-binary instead). Install it in a virtual environment, or let
-[pipx](https://github.com/pipxproject/pipx) create one for you:
+binary instead). Install it in a virtual environment:
 
 ```shell
-pip install cronstable   # inside a venv
-pipx install cronstable  # or isolated, via pipx
+pip install cronstable
+```
+
+or let [pipx](https://github.com/pipxproject/pipx) create an isolated one
+for you:
+
+```shell
+pipx install cronstable
 ```
 
 ### Install using Homebrew or winget
 
 Both package managers install the self-contained release binary for your
-platform, so no Python is required:
+platform, so no Python is required.
+
+macOS or Linux:
 
 ```shell
-brew install ptweezy/tap/cronstable  # macOS or Linux, from the cronstable tap
-winget install ptweezy.cronstable    # Windows
+brew install ptweezy/tap/cronstable
+```
+
+Windows:
+
+```shell
+winget install ptweezy.cronstable
 ```
 
 Upgrade later with `brew upgrade cronstable` or
@@ -290,13 +302,23 @@ tmpfs/`emptyDir` recipe are in the
 [Installation](https://github.com/ptweezy/cronstable/wiki/Installation) wiki
 page.
 
+Windows releases additionally attach `cronstable-windows-<arch>.zip`, a
+one-directory build that extracts to a single `cronstable` folder and can
+host the [Windows
+service](https://github.com/ptweezy/cronstable/wiki/Windows-Service), and
+`cronstable-windows-<arch>.msi`, a machine-wide installer that registers
+the service for GPO/Intune/SCCM deployment (see the [Windows
+MSI](https://github.com/ptweezy/cronstable/wiki/Windows-MSI) wiki page).
+
 ## Running on Windows
 
 cronstable runs natively on Windows (x64 and ARM64), in addition to Linux and
 macOS. Install it with `pip install cronstable`, or download the self-contained
-`cronstable-windows-amd64.exe` / `cronstable-windows-arm64.exe` from the
-[releases page](https://github.com/ptweezy/cronstable/releases) (no Python
-required). Everything else, like the YAML crontab, scheduling, reporting, retries,
+`cronstable-windows-amd64.exe` / `cronstable-windows-arm64.exe`, the
+one-directory `cronstable-windows-<arch>.zip` (the shape that can host the
+Windows service), or the machine-wide `cronstable-windows-<arch>.msi` from
+the [releases page](https://github.com/ptweezy/cronstable/releases) (no
+Python required for any of them). Everything else, like the YAML crontab, scheduling, reporting, retries,
 the HTTP API and the [web dashboard](#web-dashboard), works the same as on
 POSIX. A few platform details differ:
 
@@ -336,14 +358,35 @@ POSIX. A few platform details differ:
   job runs in its own console process group, so the keystroke never reaches
   the jobs themselves). Closing the console window and OS shutdown trigger the
   same drain on the OS's few seconds of grace, and the authenticated
-  `POST /shutdown` route stops a console-less daemon. Logging off does not stop
-  it: an unattended daemon sees that event for every user on the machine.
+  `POST /shutdown` route stops a console-less daemon (and stops the Windows
+  service cleanly, without tripping its recovery actions). Logging off does
+  not stop it: an unattended daemon sees that event for every user on the
+  machine.
 
-* **Running unattended.** Register cronstable as a boot-time Task Scheduler task
-  (or under a service wrapper) with the machine-wide config; the wiki's
-  [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows)
-  page carries the copy-paste `schtasks` recipe, a rotating-log config, and
-  the stop path.
+* **Running unattended, as a real Windows service.** `cronstable service
+  install -c C:\ProgramData\cronstable` registers the scheduler with the
+  Service Control Manager, so it starts at boot, runs whether or not anyone
+  is logged on, appears in `services.msc`, and gets Windows' own recovery
+  actions; stopping it drains running jobs first, and the SCM is told the
+  stop is still in progress for as long as that takes. It is a ctypes shim
+  over advapi32, so it adds no dependency. The published one-file `.exe`
+  cannot host a service (its bootloader runs the program in a child process
+  the SCM never sees) and `install` says so; install with pip or pipx for
+  that, or use the `schtasks` recipe. See
+  [Windows Service](https://github.com/ptweezy/cronstable/wiki/Windows-Service)
+  and
+  [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows).
+
+* **Migrating from Task Scheduler.** `cronstable import-taskscheduler
+  tasks.xml -o jobs.yaml` converts an estate's exports into cronstable jobs,
+  mapping time, calendar and boot triggers, `Exec` actions, working
+  directories, execution time limits, instance policy and priority. It is a
+  one-shot converter, not a loader, because exporting a task does not
+  unregister it. Everything it cannot carry across is listed with a reason
+  rather than dropped, and on a whole-machine export that list is long: most
+  registered tasks on a stock Windows install are COM-handler or
+  event-driven internals rather than schedules. See
+  [Importing from Task Scheduler](https://github.com/ptweezy/cronstable/wiki/Importing-Task-Scheduler).
 
 * **Not supported on Windows.** Per-job `user`/`group` switching (there is no
   `setuid`/`setgid` equivalent) is rejected with a clear configuration error,
@@ -381,7 +424,7 @@ Point a browser at the HTTP listener and you have a keyboard-driven control
 room for every job, and, when you use them, for the cluster, the DAGs, and the
 durable state store too.
 
-[![cronstable web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-overview.png)
+[![cronstable web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)
 
 The overview shows every job with its **live status**, a **countdown to its
 next run**, the last run's duration and exit-code badge, and a **sparkline of
@@ -394,7 +437,7 @@ headline ("4 share exit=69, likely one cause"). Click any job (or press
 
 | Live log tail | Run history | Schedule, explained |
 | :---: | :---: | :---: |
-| [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-logs.png) | [![Run history with success rate, duration chart, and per-run CPU and peak-memory columns](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-schedule.png) |
+| [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png) | [![Run history with success rate, duration chart, and per-run CPU and peak-memory columns](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-schedule.png) |
 | Follow a running job's output **live** over Server-Sent Events, with ANSI color, in-log **grep** (plain text or regex), per-line timestamps, line-wrap, and one-click download. | **Success rate** plus average / min / max duration over the retained history, with a color-coded per-run chart; with [resource monitoring](#resource-monitoring) on, **CPU time and peak memory** per run and in the stats. | A **plain-English** reading of the cron expression and a **timezone-aware preview of the next run times**, computed live in the browser. |
 
 Every action has a key. A fuzzy command palette (`Ctrl-K` / `⌘K`) runs any
@@ -404,7 +447,7 @@ single job on demand, or every failing job at once.
 
 | Fuzzy command palette | Keyboard-first, with a shortcut for everything |
 | :---: | :---: |
-| [![A fuzzy command palette listing run and log actions for each job](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-palette.png) | [![The keyboard shortcut reference overlay](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-shortcuts.png) |
+| [![A fuzzy command palette listing run and log actions for each job](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-palette.png) | [![The keyboard shortcut reference overlay](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-shortcuts.png) |
 
 ### Orchestration, live
 
@@ -415,7 +458,7 @@ decide **approval gates** with a click, from any node in the fleet.
 
 | The task graph | A human approval gate |
 | :---: | :---: |
-| [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-dag-graph.png) | [![The DAG drawer's task list with an approval gate awaiting a decision, Approve and Reject buttons armed](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-dag-approval.png) |
+| [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png) | [![The DAG drawer's task list with an approval gate awaiting a decision, Approve and Reject buttons armed](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-approval.png) |
 | A `data-quality-gate` diamond: fan-out checks that reconverge on a `certify` task, colored by state as the run advances. | A release train **parked on a human**: the build succeeded, the approval gate is `awaiting`, and the sensor and publish tasks queue behind your decision. |
 
 ### The whole fleet on one page
@@ -429,7 +472,7 @@ so any node can serve the single pane of glass.
 
 | Cluster panel | Fleet view |
 | :---: | :---: |
-| [![The cluster panel: nine peers, all agreed, quorum met, with per-node load and per-node job ownership](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-cluster.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-fleet.png) |
+| [![The cluster panel: nine peers, all agreed, quorum met, with per-node load and per-node job ownership](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-cluster.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png) |
 | Nine nodes, `8/8 agreed`, quorum met, per-node **load meters** and per-node **owns** counts under `distribution: spread`. | Every node's state for every job, one glance: ok / failing / running cells with ages, per-column node health, and a **failing only** filter. |
 
 ### When things break
@@ -443,7 +486,7 @@ pane, like tailing a set of pods.
 
 | Incident timeline | Merged multi-tail |
 | :---: | :---: |
-| [![The incident timeline overlay: every job's most recent run, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity colors and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-multitail.png) |
+| [![The incident timeline overlay: every job's most recent run, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity colors and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png) |
 | "What happened, in what order": relative times, outcome glyphs, failure reasons, exit codes, durations, and a **failing only** filter. | Four streams, one pane: identity-colored prefixes, `end of run output` markers, auto re-attach on each job's next run. |
 
 ### Wallboards, heatmaps, and the state store
@@ -459,7 +502,7 @@ counters, artifacts, and quarantine.
 
 | Wallboard / TV mode | Activity heatmap | Durable-state inspector |
 | :---: | :---: | :---: |
-| [![The wallboard: worst-first job tiles with an INCIDENT stamp and next-fire countdowns](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-wallboard.png) | [![The activity heatmap punchcard: one row per job, cells colored by worst outcome and shaded by run volume](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-heatmap.png) | [![The durable-state inspector: record counts per kind, op latencies, and per-primitive tabs](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-state.png) |
+| [![The wallboard: worst-first job tiles with an INCIDENT stamp and next-fire countdowns](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-wallboard.png) | [![The activity heatmap punchcard: one row per job, cells colored by worst outcome and shaded by run volume](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-heatmap.png) | [![The durable-state inspector: record counts per kind, op latencies, and per-primitive tabs](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-state.png) |
 
 ### Themes, Readability, and Accessibility
 
@@ -468,17 +511,17 @@ amber and green phosphor, and flat **modern** and **standard** looks, each in
 a dark (phosphor) and a light (paper) variant. Cycle hues with `t`, flip
 light/dark with `T`:
 
-[![The same cronstable board cycling through all ten themes (carolina, amber, green, modern and standard, each in a dark phosphor and a light paper variant) and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp)
+[![The same cronstable board cycling through all ten themes (carolina, amber, green, modern and standard, each in a dark phosphor and a light paper variant) and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)
 
-*(One board, ten themes, two interface fonts, animated: [WebP](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp), [GIF](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.gif). The four stills below are pulled from it.)*
+*(One board, ten themes, two interface fonts, animated: [WebP](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp), [GIF](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.gif). The four stills below are pulled from it.)*
 
 | Amber phosphor CRT | Green phosphor CRT |
 | :---: | :---: |
-| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-green.png) |
+| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) |
 
 | Flat modern theme | Carolina, on paper (light) |
 | :---: | :---: |
-| [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-carolina-light.png) |
+| [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina-light.png) |
 
 Beyond the themes: an optional proportional-sans interface font (shown per
 theme in the animation above), UI scaling, deuteranopia- and tritanopia-safe
@@ -490,7 +533,7 @@ and schedules for real while it types:
 
 | Settings | Startup self-test |
 | :---: | :---: |
-| [![The settings panel: theme picker with carolina selected, CRT toggles, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-boot.png) |
+| [![The settings panel: theme picker with carolina selected, CRT toggles, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png) |
 
 The `l` in the header's "cronstable" is a live cart-and-double-pendulum
 simulation. I like to call him double-P, Peter Parker, or PP.
@@ -503,7 +546,7 @@ in the wiki is the full walkthrough, and
 [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to
 enable it.
 
-**Try it:** `docker compose -f example/zen-demo/docker-compose.yml up` boots a single node with a demo job set, and `docker compose -f example/cluster/docker-compose.yml up` boots a 3-node cluster (`cronstable-a`/`cronstable-b`/`cronstable-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** (a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all five failure reporters wired to live sinks), run `docker compose -f example/grand-tour/docker-compose.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
+**Try it:** `docker compose -f example/zen-demo/docker-compose.yml up` boots a single node with a demo job set, and `docker compose -f example/cluster/docker-compose.yml up` boots a 3-node cluster (`cronstable-a`/`cronstable-b`/`cronstable-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** (a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all five cross-platform failure reporters wired to live sinks), run `docker compose -f example/grand-tour/docker-compose.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
 
 ## Terminal dashboard
 
@@ -515,44 +558,44 @@ web page's: `j`/`k` move, `Enter` opens a job's drawer, `r` runs, `x`
 cancels, `/` filters, `Ctrl-K` opens the fuzzy command palette, and `?`
 lists everything.
 
-[![The cronstable TUI: a live 59-job board with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, cluster owner column, and the verdict bar correlating a staged failure](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-overview.png)
+[![The cronstable TUI: a live 59-job board with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, cluster owner column, and the verdict bar correlating a staged failure](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)
 
 Press `Enter` on any job for its drawer, the same three tabs as the
 web page, plus resources for monitored jobs:
 
 | Live log tail | Run history | Schedule, explained |
 | :---: | :---: | :---: |
-| [![The Logs tab: a live SSE tail with per-line timestamps, in-log search with match highlighting, and end-of-run markers between runs](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-logs.png) | [![The History tab: success rate, duration stats, and per-run rows with duration bars and CPU seconds](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-history.png) | [![The Schedule tab: the cron expression in plain English with the exact next fire instants from the daemon's own engine](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-schedule.png) |
+| [![The Logs tab: a live SSE tail with per-line timestamps, in-log search with match highlighting, and end-of-run markers between runs](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-logs.png) | [![The History tab: success rate, duration stats, and per-run rows with duration bars and CPU seconds](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-history.png) | [![The Schedule tab: the cron expression in plain English with the exact next fire instants from the daemon's own engine](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-schedule.png) |
 
 | Fuzzy command palette | Keyboard-first, with the web page's keys |
 | :---: | :---: |
-| [![The command palette fuzzy-matching "run": global actions plus per-job and per-DAG commands](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-palette.png) | [![The shortcut overlay: the web dashboard's shortcut table verbatim, with terminal extras grouped below](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-shortcuts.png) |
+| [![The command palette fuzzy-matching "run": global actions plus per-job and per-DAG commands](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-palette.png) | [![The shortcut overlay: the web dashboard's shortcut table verbatim, with terminal extras grouped below](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-shortcuts.png) |
 
 DAGs get the same drawer as the browser, and approval gates are decided
 with a keypress:
 
 | The task graph, mid-flight | A human approval gate |
 | :---: | :---: |
-| [![The DAG drawer's graph tab: the data-quality-gate diamond as topological layers, states coloring as the run advances](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-dag-graph.png) | [![The DAG drawer's tasks tab: release-train parked on its approval gate, with a approve / R reject armed](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-dag-approval.png) |
+| [![The DAG drawer's graph tab: the data-quality-gate diamond as topological layers, states coloring as the run advances](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-graph.png) | [![The DAG drawer's tasks tab: release-train parked on its approval gate, with a approve / R reject armed](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-approval.png) |
 
 With clustering on, the cluster panel and the full fleet matrix render
 in the terminal too:
 
 | Cluster panel | Fleet view |
 | :---: | :---: |
-| [![The cluster panel: nine gossiping peers, all agreed, with per-node load and the lease detail](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-cluster.png) | [![The fleet view: a 59-job by 9-node matrix of live cells: ok, failing, and running with ages](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-fleet.png) |
+| [![The cluster panel: nine gossiping peers, all agreed, with per-node load and the lease detail](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-cluster.png) | [![The fleet view: a 59-job by 9-node matrix of live cells: ok, failing, and running with ages](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-fleet.png) |
 
 The same incident tools are here, from the timeline to the multi-tail:
 
 | Incident timeline | Merged multi-tail |
 | :---: | :---: |
-| [![The incident timeline: every job's most recent finish, newest first, with failure reasons, exit codes, and the blast-radius set flagged](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-multitail.png) |
+| [![The incident timeline: every job's most recent finish, newest first, with failure reasons, exit codes, and the blast-radius set flagged](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png) |
 
 So are the wallboard, the heatmap, and the state inspector:
 
 | Wallboard / TV mode | Activity heatmap | Durable-state inspector |
 | :---: | :---: | :---: |
-| [![The wallboard: worst-first tiles with failure ages and exit codes, run sparklines, and the tally foot](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-wallboard.png) | [![The activity heatmap: one row per job, one cell per hour, worst outcome colored and shaded by volume](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-heatmap.png) | [![The state inspector: store inventory, record streams, and document namespaces from the durable state store](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-state.png) |
+| [![The wallboard: worst-first tiles with failure ages and exit codes, run sparklines, and the tally foot](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-wallboard.png) | [![The activity heatmap: one row per job, one cell per hour, worst outcome colored and shaded by volume](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-heatmap.png) | [![The state inspector: store inventory, record streams, and document namespaces from the durable state store](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-state.png) |
 
 The same ten themes as the browser (`t` cycles the hue, `T` flips
 phosphor ↔ paper), with the same colour-vision-safe remaps and an
@@ -560,18 +603,18 @@ phosphor ↔ paper), with the same colour-vision-safe remaps and an
 
 | Amber phosphor | Green phosphor |
 | :---: | :---: |
-| [![The TUI in the amber phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-amber.png) | [![The TUI in the green phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-green.png) |
+| [![The TUI in the amber phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png) | [![The TUI in the green phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png) |
 
 | Flat modern | Carolina, on paper (light) |
 | :---: | :---: |
-| [![The TUI in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-modern.png) | [![The TUI in the carolina light paper theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-carolina-light.png) |
+| [![The TUI in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-modern.png) | [![The TUI in the carolina light paper theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-carolina-light.png) |
 
 The TUI runs the same BIOS-style boot self-test, next to the settings
 sheet:
 
 | Startup self-test | Settings |
 | :---: | :---: |
-| [![The TUI boot self-test: link latency, firmware, job set, schedules, and cluster probed live, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-boot.png) | [![The TUI settings panel: theme, color vision, refresh interval, log toggles, zen, and the boot self-test](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-settings.png) |
+| [![The TUI boot self-test: link latency, firmware, job set, schedules, and cluster probed live, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-boot.png) | [![The TUI settings panel: theme, color vision, refresh interval, log toggles, zen, and the boot self-test](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-settings.png) |
 
 Run `cronstable tui` against the local daemon, or point it elsewhere with
 `--url` and `--token-env`; `--tv` starts on the wallboard and `--job`
@@ -736,7 +779,7 @@ quickstart uses the root `docker-compose.yml`). Highlights:
 | Example | One command | Shows off |
 | --- | --- | --- |
 | [`demo`](example/demo) | `docker compose up` | The dashboard playground: varied jobs, live logs, retries, a long-runner, an on-demand job. |
-| [`grand-tour`](example/grand-tour) | `docker compose -f example/grand-tour/docker-compose.yml up --build` | **Everything at once**: a 9-node mTLS cluster, shared durable state, five DAG patterns, second-level probes, all five reporters wired to live sinks. |
+| [`grand-tour`](example/grand-tour) | `docker compose -f example/grand-tour/docker-compose.yml up --build` | **Everything at once**: a 9-node mTLS cluster, shared durable state, five DAG patterns, second-level probes, all five cross-platform reporters wired to live sinks. |
 | [`cluster`](example/cluster) | `docker compose -f example/cluster/docker-compose.yml up` | A 3-node gossip cluster: peer attestation, quorum, leader election, live failover. |
 | [`cluster-large`](example/cluster-large) | `docker compose -f example/cluster-large/docker-compose.yml up` | A 10-node, CPU-heavy fleet for watching `distribution: spread` and the load meters. |
 | [`dag`](example/dag) | `cronstable -c example/dag` | Orchestration alone, single node: dependencies, XCom, fan-out, a sensor, an approval gate. |
@@ -998,7 +1041,7 @@ Note: if the configuration option is a directory and there are multiple configur
 
 ### Reporting
 
-cronstable has five built-in reporters: `sentry`, `mail`, `shell`, `webhook`
+cronstable has six built-in reporters: `sentry`, `mail`, `shell`, `webhook`
 (Slack-compatible out of the box), and `push`
 ([end-to-end encrypted push notifications](#push-notifications), below). Each
 can fire on the `onFailure`, `onPermanentFailure`, `onSuccess`, and `onLate`
@@ -1046,7 +1089,7 @@ the shell reporter's `CRONSTABLE_*` environment.
 
 ### Push notifications
 
-A fifth reporter, `push`, delivers end-to-end encrypted alerts to paired
+The `push` reporter delivers end-to-end encrypted alerts to paired
 devices. Each alert is sealed to the device's X25519 public key (a libsodium
 sealed box) before it leaves the daemon; the hosted relay that forwards it to
 the platform push service (APNs) sees only ciphertext and routing metadata,
@@ -1074,10 +1117,10 @@ ride the durable store and are visible to every node sharing it.)
 Pair a device from the dashboard ("Pair a device" in the command palette or
 settings, a QR scan) or with one call:
 
-[![The dashboard's Pair a device panel: a QR code of the connection payload, the same JSON as a copyable string, and a warning that the embedded token holds every scope](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)
+[![The dashboard's Pair a device panel: a QR code of the connection payload, the same JSON as a copyable string, and a warning that the embedded token holds every scope](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
 
 ```shell
-$ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -d '{"name": "my-iphone", "platform": "ios", "publicKey": "<base64 X25519 key>", "pushToken": "<device push token>"}' \
     http://127.0.0.1:8080/push/devices
 ```
@@ -1093,6 +1136,40 @@ See
 [Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
 in the wiki for the report options, pairing and revocation, storage, size
 limits, and the relay trust model.
+
+### Windows Event Log
+
+On Windows, the `eventlog` reporter writes each outcome to the Event Log,
+where a Windows shop's monitoring already looks: Event Viewer, a Windows
+Event Forwarding subscription, SCOM, and every SIEM connector. It needs no
+extra and no dependency, and each record carries a stable event ID plus a
+fixed set of insertion strings, so a rule written against it keeps working:
+
+```yaml
+defaults:
+  onFailure:
+    report:
+      eventlog:
+        enabled: true
+```
+
+```powershell
+Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'cronstable'; ID = 1001, 1002 }
+```
+
+Jobs use event IDs 1000 (succeeded), 1001 (failed), 1002 (failed
+permanently) and 1003 (overdue); daemon and orchestration events use 1010
+and 1011. cronstable does not register its event source, so Event Viewer
+prefixes the rendered text with its generic "description cannot be found"
+note; the provider, ID, level and every insertion string are unaffected, so
+the XML view, `wevtutil`, forwarding and SIEM connectors read the record
+normally. On any other platform the reporter does nothing and the config
+load says so once.
+
+See
+[Windows Event Log](https://github.com/ptweezy/cronstable/wiki/Windows-Event-Log)
+in the wiki for the full ID and field tables, the optional source
+registration, and the reasons behind both defaults.
 
 ### Metrics
 
@@ -1348,6 +1425,55 @@ This feature is POSIX-only (it relies on `setuid`/`setgid`). On Windows, a job
 with `user` or `group` set is rejected with a configuration error; see
 [Running on Windows](#running-on-windows).
 
+### Working directory
+
+By default a job starts in whatever directory cronstable itself is running in.
+`workingDirectory` names the directory instead. It matters most on Windows,
+where an elevated console starts the daemon in the system directory, so every
+relative path in a script resolves somewhere unintended. It is the equivalent
+of the "Start in" box on a Task Scheduler action.
+
+```yaml
+- name: nightly-import
+  command: import.bat
+  schedule:
+    minute: "0"
+    hour: "2"
+  workingDirectory: C:\jobs\importer
+```
+
+cronstable expands `~` and `${VAR}` and makes the result absolute at config
+load. The OS checks that the directory exists at spawn, not at load, so a
+missing one fails that one run at launch instead of rejecting the whole
+config. You can also set the key in a `defaults:` block and on a DAG task. See
+[Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment#workingdirectory).
+
+### Process priority
+
+`priority` says how a job should be scheduled against everything else on the
+box, in five levels: `idle`, `below-normal`, `normal`, `above-normal`,
+`high`.
+
+```yaml
+- name: nightly-reindex
+  command: reindex.sh
+  schedule:
+    minute: "0"
+    hour: "3"
+  priority: idle
+```
+
+On Windows the level becomes the process's priority class at creation; on
+POSIX cronstable renices the job's process group right after the spawn
+(`idle` is nice 19, `high` is nice -10). Descendants inherit a lowered level
+on both platforms. A raised one reaches only the job's own process on
+Windows, which starts an unflagged child of an above-normal or high parent at
+NORMAL; POSIX renices the whole group, so it has no such split. `normal` is
+the default, and the one level cronstable never applies. Raising a priority
+needs privilege on POSIX, and a kernel that refuses leaves the run going at
+the priority it inherited rather than failing it. See
+[Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment#priority).
+
 ### Remote web/HTTP interface
 
 If you wish to remotely control cronstable, you can optionally enable an HTTP REST
@@ -1435,7 +1561,9 @@ which gives it some useful properties:
 * it covers **every behavior-affecting field** (command, schedule, shell, the
   *names* of `environment` variables, capture flags, `failsWhen`,
   retry/reporting policy, timezone, `enabled`, and so on), so any meaningful
-  change to a job changes the id;
+  change to a job changes the id; it deliberately leaves out per-host values,
+  `workingDirectory` among them, so a Windows replica and a Linux one running
+  the same jobs from paths they spell differently still agree;
 * `user`/`group` are fingerprinted **as configured** (e.g. `www-data`), not as
   the resolved numeric uid/gid, which can differ host to host;
 * **secret/value material is never embedded**: inline reporting secrets

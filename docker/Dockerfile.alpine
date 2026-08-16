@@ -86,7 +86,7 @@ COPY docker/install_orjson.sh /tmp/deps/install_orjson.sh
 RUN set -eux; \
     RUST_SETUP="apk add --no-cache curl \
         && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" \
-    sh /tmp/deps/install_orjson.sh "orjson>=3.9"
+    sh /tmp/deps/install_orjson.sh "orjson>=3.11.6"
 
 # ---- project install: the only per-commit layers ------------------------
 
