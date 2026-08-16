@@ -30,7 +30,7 @@ CI (the `dco` job) checks that every commit in a pull request carries this
 trailer. Forgot it? Sign off the whole branch and force-push:
 
 ```sh
-git rebase --signoff origin/develop
+git rebase --signoff origin/main
 git push --force-with-lease
 ```
 
@@ -68,6 +68,17 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 > branches, and it only does so when they are tagged: write
 > `# pragma: no cover (windows)`, not a bare
 > `# pragma: no cover`. See [the pragma vocabulary](#coverage-pragmas).
+
+## Branching
+
+cronstable develops on a single branch, `main`. Open your pull request against
+it.
+
+CI collapses superseded runs: pushing again cancels the earlier run, whether it
+had already started or was still waiting in the queue, so an intermediate
+commit can land with its run cut short. Push a commit you want fully tested on
+its own. Releases are the exception. They sit in their own concurrency group,
+where they start at once and always run to completion.
 
 ## Running the checks
 
@@ -204,7 +215,7 @@ workflow**, then pick the bump level from the dropdown.
 
 The same pipeline runs on every commit and PR; only the publish steps are
 gated behind the release check (the lone exception is the `wiki` job, which
-publishes documentation on every push to `develop` — see [Editing the
+publishes documentation on every push to `main` — see [Editing the
 wiki](#editing-the-wiki)). On a release it, in order:
 
 1. **decides** whether to release and at what level (the strict marker check,
@@ -232,7 +243,7 @@ wiki](#editing-the-wiki)). On a release it, in order:
 
 Because no file is committed back to *this* repo, a release never re-triggers
 the workflow. (Two jobs do push elsewhere — the Homebrew tap on a release, and
-the wiki on a `develop` commit — but both targets are separate repositories and
+the wiki on a `main` commit — but both targets are separate repositories and
 a push to either raises no event here.) Because the tag is
 created *after* publishing, a failed publish leaves no orphan tag and a re-run
 cleanly retries the same version.
@@ -266,12 +277,12 @@ docker run --rm -v "$PWD/example/docker/cronstable.yaml:/etc/cronstable.d/cronst
 
 Edit [`wiki/`](wiki) in this repo — not the wiki in the browser. The
 [GitHub wiki](https://github.com/ptweezy/cronstable/wiki) is a published copy:
-every push to `develop` runs the pipeline's `wiki` job, which mirrors
+every push to `main` runs the pipeline's `wiki` job, which mirrors
 `wiki/*.md` onto it (one file per page, named as the page's URL:
 `Web-Dashboard.md` → `/wiki/Web-Dashboard`).
 
 The mirror is authoritative, so it **deletes**: a page created or edited from
-the wiki's web UI is reverted on the next push to `develop`. The job prints
+the wiki's web UI is reverted on the next push to `main`. The job prints
 every add/modify/delete to the run log.
 
 Pages link to each other with bare wiki links — `[Installation](Installation)` —

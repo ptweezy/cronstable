@@ -113,19 +113,48 @@ def test_every_actions_cache_write_is_branch_gated():
     # PR evicts the docker layer cache the build depends on, which is how
     # 1.2.31 broke: the release build hit a `not_found` on an evicted
     # blob. Restores stay ungated on purpose; every branch reads through
-    # to what develop and main stored.
+    # to what main stored.
     writers = _cache_writers()
     assert writers, "no cache writers found: the detector went stale"
     ungated = [
         (job, label)
         for job, label, gate in writers
-        if not ("refs/heads/develop" in gate and "refs/heads/main" in gate)
+        if "refs/heads/main" not in gate
     ]
     assert not ungated, (
-        "these Actions cache writers are not gated to develop/main, so "
-        "they write from every branch and fork PR against a shared 10 GB "
-        "quota: {}".format(ungated)
+        "these Actions cache writers are not gated to main, so they write "
+        "from every branch and fork PR against a shared 10 GB quota: "
+        "{}".format(ungated)
     )
+
+
+def test_workflow_names_no_retired_branch():
+    # The repository develops on a single trunk. A leftover
+    # `refs/heads/develop` condition is dead but silent: it evaluates false
+    # forever, so the cache write or wiki publish it guards simply stops
+    # happening.
+    with open(WORKFLOW, encoding="utf-8") as fobj:
+        body = fobj.read()
+    assert "refs/heads/develop" not in body, (
+        "release.yml still gates on the retired `develop` branch; those "
+        "conditions are now permanently false"
+    )
+
+
+def test_release_runs_are_never_cancelled():
+    # The release test is spelled twice, in `group` and again in
+    # `cancel-in-progress`. Let them drift and a release lands in the
+    # cancellable group, where the next push kills it mid-publish. A queued
+    # run loses its slot too (cancel-in-progress false protects only a run
+    # already in flight), so the split group is the whole protection.
+    con = _workflow()["concurrency"]
+    group = str(con["group"])
+    cancel = str(con["cancel-in-progress"])
+    for probe in ("workflow_dispatch", "'[release'", "commits[19]"):
+        assert probe in group, "concurrency.group lost {}".format(probe)
+        assert probe in cancel, "cancel-in-progress lost {}".format(probe)
+    # and it must split the group on that test, so check for both arms
+    assert "'release'" in group and "'ci'" in group, group
 
 
 def test_every_browser_backed_test_module_is_fenced():

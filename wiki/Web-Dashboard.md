@@ -7,7 +7,7 @@ into a live, keyboard-driven control room. Watch every job's status, tail its
 output as it runs, review run history, and preview upcoming schedules, all from a
 browser.
 
-[![The cronstable web dashboard, a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-overview.png)
+[![The cronstable web dashboard, a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)
 
 ## Enabling and opening it
 
@@ -132,7 +132,7 @@ direct link to it.
 
 ### Logs: live output, in your browser
 
-[![Live log tailing in the drawer, with ANSI color, line numbers, and an in-log search highlighting every match](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-logs.png)
+[![Live log tailing in the drawer, with ANSI color, line numbers, and an in-log search highlighting every match](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png)
 
 The Logs tab streams a job's captured output over
 [Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events):
@@ -154,7 +154,7 @@ the tab without limit.
 
 ### History: outcomes and durations over time
 
-[![The history tab: a stats grid (runs, success rate, ok/fail, avg/min/max duration), a per-run duration bar chart, and a detailed run table](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-history.png)
+[![The history tab: a stats grid (runs, success rate, ok/fail, avg/min/max duration), a per-run duration bar chart, and a detailed run table](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-history.png)
 
 The History tab summarizes the job's retained run history:
 
@@ -199,7 +199,7 @@ cell, and the drawer header repeats the live readings while the job runs.
 
 ### Schedule: in plain English, in the right timezone
 
-[![The schedule tab: a plain-English reading of the cron expression and a timezone-aware list of the next run times](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-schedule.png)
+[![The schedule tab: a plain-English reading of the cron expression and a timezone-aware list of the next run times](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-schedule.png)
 
 The Schedule tab turns the cron expression into something you can read at a glance:
 
@@ -284,15 +284,15 @@ section is configured, the dashboard shows a **cluster panel** below the job
 table (it stays hidden otherwise). The panel polls `GET /cluster` alongside the
 job list and renders:
 
-[![The cluster panel: nine peers all agreed, quorum met, per-node load meters, per-node job ownership, and the DAG card above it](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-cluster.png)
+[![The cluster panel: nine peers all agreed, quorum met, per-node load meters, per-node job ownership, and the DAG card above it](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-cluster.png)
 
 > **Try it:** the bundled Compose demos bring the dashboard up with one command.
-> [`example/cluster/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/develop/example/cluster/docker-compose.yml)
+> [`example/cluster/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/main/example/cluster/docker-compose.yml)
 > starts the three-node gossip cluster (`cronstable-a` / `cronstable-b` / `cronstable-c`) so
 > you can watch the peer table, roles, and leadership move live; stop a node to
 > see the summary and dots react. For the ambient wallboard view (including the
 > "zen" all-clear screensaver),
-> [`example/zen-demo/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/develop/example/zen-demo/docker-compose.yml)
+> [`example/zen-demo/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/main/example/zen-demo/docker-compose.yml)
 > runs a single deliberately calm node.
 
 - a **summary line** with this node's name (e.g. `cronstable-a`) and the agreement
@@ -337,7 +337,7 @@ peer set only, so it is hidden entirely for the lease backends.
 
 ### Fleet view: every node's runs in one pane
 
-[![The fleet view: a jobs-by-nodes matrix, each cell a node's last outcome for the job, with per-node health and load in the column headers](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-fleet.png)
+[![The fleet view: a jobs-by-nodes matrix, each cell a node's last outcome for the job, with per-node health and load in the column headers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png)
 
 The dashboard normally shows one node's truth: `/jobs` reports the runs *this*
 node made, so under
@@ -396,7 +396,7 @@ for the full `GET /cluster` field semantics.
 
 ## Merged multi-tail
 
-[![The multi-tail console: four jobs' live logs merged into one pane with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-multitail.png)
+[![The multi-tail console: four jobs' live logs merged into one pane with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png)
 
 The **`≋ tail`** toolbar button opens the **multi-tail console**: several jobs'
 log streams merged into one live pane, each line prefixed with its job name in
@@ -440,7 +440,7 @@ the bar to the red **CLUSTER ALERT** severity described
 [above](#cluster-panel). The bar carries `▤ timeline`, `▸ mitigate`, and
 `≋ tail` buttons scoped to the incident set.
 
-[![The incident timeline overlay: every job's most recent finished run, newest first, with failure reasons, exit codes, and durations](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-incident-timeline.png)
+[![The incident timeline overlay: every job's most recent finished run, newest first, with failure reasons, exit codes, and durations](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)
 
 The **incident timeline** (press `i`, or *Incident timeline* in the command
 palette) lists every job's most recent finished run, newest first, each with
@@ -461,7 +461,7 @@ table) for your incident channel or ticket.
 
 ## Wallboard / TV mode
 
-[![The wallboard: worst-first job tiles with an INCIDENT stamp, next-fire countdowns, sparklines, and a footer tally](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-wallboard.png)
+[![The wallboard: worst-first job tiles with an INCIDENT stamp, next-fire countdowns, sparklines, and a footer tally](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-wallboard.png)
 
 Press `w` (or *Wallboard / TV mode* in the palette, or open the page with a
 `#tv` hash) for a full-screen kiosk view built for a wall monitor: every job as
@@ -532,7 +532,7 @@ calendar app; see [Calendar Export](Calendar-Export).
 
 ## Activity heatmap
 
-[![The activity heatmap punchcard: one row per job, cells colored by worst outcome in the bucket and shaded by run volume](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-heatmap.png)
+[![The activity heatmap punchcard: one row per job, cells colored by worst outcome in the bucket and shaded by run volume](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-heatmap.png)
 
 The **`▦ heat`** header button (or *Toggle activity heatmap* in the palette)
 adds a punchcard card: one row per job, 24 time buckets across a **6h / 24h /
@@ -587,7 +587,7 @@ anything back to the daemon.
 
 ## Command palette
 
-[![The command palette open, fuzzy-matching the query "run" to per-job run and log actions](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-palette.png)
+[![The command palette open, fuzzy-matching the query "run" to per-job run and log actions](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-palette.png)
 
 Press `Ctrl-K` (or `⌘K`, or `Ctrl-P`) to open a **fuzzy command palette**. It
 searches both global actions (refresh, run all failing jobs, cycle theme, toggle
@@ -597,7 +597,7 @@ filter, arrow keys to move, `Enter` to run.
 
 ## Keyboard shortcuts
 
-[![The keyboard shortcut reference overlay listing every shortcut](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-shortcuts.png)
+[![The keyboard shortcut reference overlay listing every shortcut](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-shortcuts.png)
 
 The dashboard is keyboard-first. Press `?` at any time for this overlay.
 
@@ -623,7 +623,7 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 
 ## Settings, themes, and notifications
 
-[![The settings panel: theme, CRT effects, scanlines, compact density, desktop notifications, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-settings.png)
+[![The settings panel: theme, CRT effects, scanlines, compact density, desktop notifications, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)
 
 The settings panel (and the command palette) expose:
 
@@ -647,7 +647,7 @@ comes back the way you left it.
 
 ### Pair a device
 
-[![The Pair a device panel: a QR code of the connection payload, the payload as a copyable JSON string, and the all-scopes token warning](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)
+[![The Pair a device panel: a QR code of the connection payload, the payload as a copyable JSON string, and the all-scopes token warning](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
 
 The settings sheet (and the command palette) also open the **Pair a device**
 panel: a QR code of `{v: 1, name, url, token}` plus the same JSON as a
@@ -659,11 +659,11 @@ give a phone a scoped `web.authTokens` entry instead. See
 
 | Amber phosphor CRT | Green phosphor CRT |
 | :---: | :---: |
-| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-green.png) |
+| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) |
 
 | Flat modern theme | Carolina, on paper (light) |
 | :---: | :---: |
-| [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-carolina-light.png) |
+| [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina-light.png) |
 
 ## The pendulum wordmark
 
