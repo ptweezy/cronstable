@@ -113,18 +113,30 @@ def test_every_actions_cache_write_is_branch_gated():
     # PR evicts the docker layer cache the build depends on, which is how
     # 1.2.31 broke: the release build hit a `not_found` on an evicted
     # blob. Restores stay ungated on purpose; every branch reads through
-    # to what develop and main stored.
+    # to what main stored.
     writers = _cache_writers()
     assert writers, "no cache writers found: the detector went stale"
     ungated = [
         (job, label)
         for job, label, gate in writers
-        if not ("refs/heads/develop" in gate and "refs/heads/main" in gate)
+        if "refs/heads/main" not in gate
     ]
     assert not ungated, (
-        "these Actions cache writers are not gated to develop/main, so "
-        "they write from every branch and fork PR against a shared 10 GB "
-        "quota: {}".format(ungated)
+        "these Actions cache writers are not gated to main, so they write "
+        "from every branch and fork PR against a shared 10 GB quota: "
+        "{}".format(ungated)
+    )
+
+
+def test_workflow_names_no_retired_branch():
+    # The repository develops on ONE trunk. A leftover `refs/heads/develop`
+    # condition is never true again and nothing reds to say so, so the cache
+    # write or wiki publish it guards would just stop happening.
+    with open(WORKFLOW, encoding="utf-8") as fobj:
+        body = fobj.read()
+    assert "refs/heads/develop" not in body, (
+        "release.yml still gates on the retired `develop` branch; those "
+        "conditions are now permanently false"
     )
 
 

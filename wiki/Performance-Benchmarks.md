@@ -9,7 +9,7 @@ publish a release that regressed past a metric's declared limit.
 
 ## What is measured
 
-The suite lives in [`benchmarks/`](https://github.com/ptweezy/cronstable/blob/develop/benchmarks)
+The suite lives in [`benchmarks/`](https://github.com/ptweezy/cronstable/blob/main/benchmarks)
 and currently covers about 37 metrics across these groups:
 
 | Group | Examples |
@@ -84,7 +84,7 @@ python benchmarks/compare.py --baseline before.json --current after.json --md di
 `--only <substring>` runs one group (for example `--only cronexpr`). Compare
 only runs made on the same machine. The full harness reference, including how
 to add a benchmark, is in
-[`benchmarks/README.md`](https://github.com/ptweezy/cronstable/blob/develop/benchmarks/README.md).
+[`benchmarks/README.md`](https://github.com/ptweezy/cronstable/blob/main/benchmarks/README.md).
 
 ## Related pages
 
