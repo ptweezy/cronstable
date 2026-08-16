@@ -992,7 +992,7 @@ values). Declaring
 rejected.
 
 A full worked config is in
-[`example/job-state/cronstable.yaml`](https://github.com/ptweezy/cronstable/tree/develop/example/job-state).
+[`example/job-state/cronstable.yaml`](https://github.com/ptweezy/cronstable/tree/main/example/job-state).
 The wire protocol (the `/v1/` endpoints) is in the
 [HTTP Control API](HTTP-API) reference, and every command's flags and exit
 codes are in the [Command-Line Reference](CLI-Reference).
