@@ -101,14 +101,20 @@ and under `notify.report`:
 
 Pairing registers a device's public key and platform push token with the
 daemon. The dashboard has a "Pair a device" panel (in the command palette
-and in settings) that renders a QR code of `{v: 1, name, url, token}` plus
-the same JSON as a copyable string; the companion app scans it and
-completes the pairing by calling `POST /push/devices` with the scanned
-token. The panel warns when the token it would embed is the all-scopes one;
+and in settings) whose QR encodes a pairing link: the
+`{v: 1, name, url, token}` payload, base64url-encoded into the fragment of
+the relay origin's `/pair` route, so a phone-camera scan deep-links into
+the companion app (or lands on install pointers when the app is missing).
+The panel shows the same payload as a copyable JSON string, the app's
+in-app scanner accepts both forms, and either way the app completes the
+pairing by calling `POST /push/devices` with the scanned token. The link
+format is specified in the relay protocol's
+["Pairing links" section](https://github.com/ptweezy/cronstable/blob/main/docs/relay-protocol.md#pairing-links).
+The panel warns when the token it would embed is the all-scopes one;
 give a phone a scoped
 [`web.authTokens`](HTTP-API#scoped-tokens-webauthtokens) entry instead.
 
-[![The Pair a device panel: a QR code of the connection payload, the payload as a copyable JSON string, and the all-scopes token warning](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
+[![The Pair a device panel: a QR code deep-linking the connection payload into the companion app, the payload as a copyable JSON string, and the all-scopes token warning](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
 
 Pairing is also one API call (`control` scope):
 
@@ -179,10 +185,12 @@ are on the [HTTP API page](HTTP-API#get-pushdevices).
 Pairing endpoints sit behind the web API's bearer token whenever one is
 configured, and the daemon refuses to start a `push:` section on a routable
 listener that has none (see [Failure behavior](#failure-behavior)), so an
-ungated pairing endpoint can only exist on loopback or a unix socket. Two
+ungated pairing endpoint can only exist on loopback or a unix socket. Three
 things still travel during pairing that are worth protecting: the QR
-payload embeds a bearer token, and the pairing POST carries the device
-public key
+payload embeds a bearer token; an app-absent camera scan loads the relay
+host's landing page with that payload in the URL fragment, readable by the
+page's script (the in-app scanner and the copyable JSON involve no third
+party); and the pairing POST carries the device public key
 that every future alert is sealed to. On a transport an attacker can read
 or rewrite (plaintext HTTP across a shared network), the token can be
 stolen and, worse, the key can be substituted: alerts would then seal to

@@ -1115,8 +1115,9 @@ defaults:
 ride the durable store and are visible to every node sharing it.)
 
 Pair a device from the dashboard ("Pair a device" in the command palette or
-settings; the QR is a deep link, so scanning it with the phone's camera
-opens the app directly) or with one call:
+settings; the QR is a deep link, so a phone-camera scan opens the companion
+app, or a landing page with install pointers when the app is missing) or
+with one call:
 
 [![The dashboard's Pair a device panel: a QR code deep-linking the connection payload into the app being paired, the same payload as a copyable JSON string, and a warning that the embedded token holds every scope](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
 
@@ -1128,7 +1129,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 
 Setting `web.bonjour: true` (with the `discovery` extra installed)
 additionally advertises the web API as a `_cronstable._tcp` mDNS service on
-the local network, so client apps find the daemon without a typed URL;
+the local network, so a companion app finds the daemon without a typed URL;
 see the
 [LAN Discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)
 wiki page.
@@ -1491,7 +1492,13 @@ With the web interface enabled, cronstable also serves the
 [web dashboard](#web-dashboard) at the root path (`/`) of any `http://`
 listener; set `ui: false` to expose only the REST API. With `web.authToken`
 set, the dashboard page loads without a token, then prompts for one and
-stores it only in that browser tab. See the
+stores it only in that browser tab. Adding `web.anonymousScopes: [view]`
+alongside the tokens turns the same page into a public read-only board:
+credential-less requests hold the `view` scope, the dashboard skips the
+prompt and draws view-only chrome, and every mutating route still requires
+a token. See
+[Public read-only access](https://github.com/ptweezy/cronstable/wiki/HTTP-API#public-read-only-access-webanonymousscopes)
+and the
 [full dashboard tour](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard)
 in the wiki.
 

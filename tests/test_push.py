@@ -2117,6 +2117,7 @@ async def test_whoami_with_and_without_token():
         "label": "wallboard",
         "scopes": ["view"],
         "allScopes": False,
+        "pairLinkBase": "https://relay.cronstable.com/pair",
     }
     body = json.loads((await cron._web_whoami(_Req())).body)
     assert body["authenticated"] is False
@@ -2137,7 +2138,22 @@ async def test_whoami_reports_an_anonymous_grant():
         "label": "anonymous",
         "scopes": ["view"],
         "allScopes": False,
+        "pairLinkBase": "https://relay.cronstable.com/pair",
     }
+
+
+async def test_whoami_pair_link_base_follows_the_relay_origin():
+    # the pairing QR's deep link tracks the configured relay's origin
+    # (credentials and path dropped), so a self-hosted relay keeps camera
+    # pairing on its own domain; the hosted landing is only the fallback.
+    cron = _cron()
+    body = json.loads((await cron._web_whoami(_Req())).body)
+    assert body["pairLinkBase"] == "https://relay.cronstable.com/pair"
+    cron._applied_push_config = {
+        "relay": {"url": "https://user:pw@relay.internal:8443/report"}
+    }
+    body = json.loads((await cron._web_whoami(_Req())).body)
+    assert body["pairLinkBase"] == "https://relay.internal:8443/pair"
 
 
 async def test_all_scopes_token_reports_all_scopes():

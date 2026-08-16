@@ -937,15 +937,25 @@ empty `stream` parameter is a `400`; a stateless install is a `404`
 ### `GET /whoami`
 
 Describes the bearer token that authenticated this request, as
-`{authenticated, label, scopes, allScopes}`: its `label`, the scopes it
-grants (with the implied `view` expanded), and whether it is an all-scopes
-token. A companion app uses it to show what it may do; the dashboard uses it
-to warn when its pairing QR would hand a phone the all-scopes token (see
+`{authenticated, label, scopes, allScopes, pairLinkBase}`: its `label`, the
+scopes it grants (with the implied `view` expanded), whether it is an
+all-scopes token, and the base URL of the pairing QR's deep link (the
+origin of `push.relay.url` plus `/pair`, the hosted landing while no
+`push:` section is applied). A companion app uses it to show what it may
+do; the dashboard uses it to warn when its pairing QR would hand a phone
+the all-scopes token (see
 [Push Notifications](Push-Notifications)). Requires the `view` scope.
 
 When no token is configured there is no auth middleware and no token to
 describe: `authenticated` is `false`, `label` is `null`, `scopes` lists every
 scope, and `allScopes` is `true` (every scope is effectively granted).
+
+A credential-less request served through
+[`web.anonymousScopes`](#public-read-only-access-webanonymousscopes) is the
+third shape: `authenticated` is `false`, `label` is `"anonymous"` (a
+reserved label config load refuses for real tokens), `scopes` lists the
+granted set, and `allScopes` is `false`. Branch on `allScopes`, since the
+open daemon above shares `authenticated: false`.
 
 ### `GET /push/devices`
 
@@ -953,7 +963,10 @@ Lists every device paired for [end-to-end encrypted push
 alerts](Push-Notifications), sorted by pairing time. Push tokens are redacted
 to their trailing six characters (the token is what lets a third party
 address the device through the platform push service); public keys are
-returned whole. Requires the `view` scope.
+returned whole. Requires the `view` scope. It is the one view route a
+[`web.anonymousScopes`](#public-read-only-access-webanonymousscopes) grant
+deliberately excludes: a credential-less request answers `403` naming the
+scope the method needs, since the registry lists every paired phone.
 
 Like all `/push/...` routes, it answers `404` until a `push:` section is
 configured (the routes are always registered, so a reload that adds the

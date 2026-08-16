@@ -1053,7 +1053,8 @@ paths:
         daemon with no token configured (no auth middleware, `allScopes`
         true) and restricted under a `web.anonymousScopes` grant
         (`label: "anonymous"`, `allScopes` false). See the `WhoAmI` schema
-        for all three shapes.
+        for all three shapes. Every shape carries `pairLinkBase`, the base
+        URL of the pairing QR's deep link.
       responses:
         "200":
           description: The matched token's identity.
@@ -1359,7 +1360,8 @@ paths:
       description: >-
         The single-page Web Dashboard, registered unless `web.ui: false`.
         Served without authentication (the page holds no data; the browser
-        then sends the bearer token on every data request it makes).
+        sends the stored bearer token on the data requests it makes, and
+        none on an anonymous-view board).
       security: []
       responses:
         "200":
@@ -1515,8 +1517,8 @@ components:
         the granted scopes, which is a restricted caller even though it is
         unauthenticated. Because those last two disagree while sharing
         `authenticated: false`, `allScopes` is the field a client should
-        branch on. `anonymous` is reserved: do not label a real token
-        with it.
+        branch on. `anonymous` is reserved: config load refuses a real
+        token labeled with it.
       properties:
         authenticated: { type: boolean }
         label: { type: string, nullable: true }
@@ -1538,7 +1540,14 @@ components:
                 enum: [view, control, approve]
               - type: string
         allScopes: { type: boolean }
-      required: [authenticated, scopes, allScopes]
+        pairLinkBase:
+          type: string
+          description: >-
+            Base URL of the pairing deep link the dashboard's QR encodes:
+            the origin of `push.relay.url` plus `/pair` (embedded
+            credentials dropped), or the hosted relay's landing while no
+            `push:` section is applied.
+      required: [authenticated, scopes, allScopes, pairLinkBase]
 
     PushDevice:
       type: object

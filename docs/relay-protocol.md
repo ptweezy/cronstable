@@ -32,15 +32,28 @@ https://relay.cronstable.com/pair#<base64url({"v":1,"name":…,"url":…,"token"
 
 The payload (the same `{v, name, url, token}` JSON the panel shows as a
 copyable string) rides in the URL fragment, base64url-encoded with padding
-stripped. Fragments are never sent with an HTTP request, so the landing
-host serves a static page and never sees the daemon address or the token.
+stripped. The link's base is the origin of the daemon's `push.relay.url`
+plus `/pair`, embedded credentials dropped; the dashboard reads it from
+`GET /whoami` as `pairLinkBase`, and the hosted relay's landing is the
+fallback while no `push:` section is applied. Fragments are never sent
+with an HTTP request, so the payload never reaches the landing host's
+server or its logs. The page that host serves is another matter: when it
+loads at all (a scan with the app installed opens the app directly), its
+script reads the fragment to build the fallback link below, so the
+app-absent camera flow trusts the landing host's content. The in-app
+scanner and the copyable raw JSON involve no third party.
+
 The hosted relay serves that landing page at `GET /pair` (install pointers
 plus a `cronstable://pair#<fragment>` fallback link carrying the identical
 fragment) and the app-association file at
 `GET /.well-known/apple-app-site-association`; a client app accepts the
-payload as raw JSON or inside either link form. A self-hosted relay is free
-to skip both routes: they are a convenience for camera scans, not part of
-the daemon wire contract.
+payload as raw JSON or inside either link form. A self-hosted relay that
+serves `GET /pair` receives its deployments' camera scans on its own
+domain; instant app-open through the association file works only for the
+domains baked into the app's entitlements, so a self-hosted landing leans
+on the `cronstable://` fallback. A relay that skips both routes still
+satisfies the daemon wire contract; its deployments pair through the
+in-app scanner or the copyable JSON.
 
 ## Inbound request
 

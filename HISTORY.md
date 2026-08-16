@@ -2,6 +2,16 @@
 
 ## 1.2.42
 
+- The dashboard's "Pair a device" QR encodes a deep link: a phone-camera
+  scan opens the companion app, or a landing page with install pointers
+  when the app is missing, with the pairing payload riding in the URL
+  fragment. The link's base follows `push.relay.url`; the copyable string
+  stays the raw pairing JSON.
+- `web.anonymousScopes: [view]` grants credential-less requests read-only
+  view scope for public boards: the dashboard draws view-only chrome,
+  mutating routes answer 403, and `GET /push/devices` stays token-gated.
+  `/whoami` reports the grant under the reserved `anonymous` label and
+  carries the pairing QR's `pairLinkBase`.
 - Dependency floors raised to clear published security advisories
 - Build and CI toolchain version bumps
 - Development consolidated onto a single `main` branch; the wiki publishes

@@ -1928,6 +1928,22 @@ def test_web_anonymous_scopes_rejects_an_empty_list():
         parse_config_string(_ANON_TOKEN_YAML + "  anonymousScopes: []\n", "")
 
 
+def test_web_auth_token_label_anonymous_is_refused():
+    # /whoami and the pairing audit log use 'anonymous' for the
+    # credential-less grant; a real token wearing the label would
+    # masquerade as it there.
+    yaml = (
+        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+        "  authTokens:\n"
+        "    - label: anonymous\n"
+        "      scopes:\n        - view\n"
+        "      value: secret-tok\n"
+    )
+    with pytest.raises(ConfigError) as exc:
+        parse_config_string(yaml, "")
+    assert "reserved" in str(exc.value)
+
+
 # ---------------------------------------------------------------------------
 # pure helpers
 # ---------------------------------------------------------------------------

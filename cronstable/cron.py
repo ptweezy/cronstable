@@ -348,6 +348,11 @@ _WEB_SCOPE_OVERRIDES = {
 # token-holding viewer may see it, an anonymous stranger may not.
 _WEB_ANONYMOUS_EXCLUDED = frozenset({"/push/devices"})
 
+# Fallback base for the dashboard's pairing deep link while no push section
+# is applied. With one, /whoami derives the base from push.relay.url's
+# origin, so a self-hosted relay keeps camera pairing on its own domain.
+WEB_PAIR_LINK_FALLBACK = "https://relay.cronstable.com/pair"
+
 # The web API's complete route table: (method, path, handler, gate).
 # `handler` names a Cron method except "mcp"-gated rows (MCPHandler);
 # `gate` marks conditionally registered groups (None, "mcp", "metrics",
@@ -3378,7 +3383,8 @@ class Cron:
         every scope is effectively granted. A request served through
         web.anonymousScopes is also unauthenticated, but reports the
         granted scope set under the reserved label ``anonymous`` with
-        ``allScopes`` false, the discriminator clients key on.
+        ``allScopes`` false, the discriminator clients key on. Every
+        shape carries ``pairLinkBase``, the pairing QR's deep-link base.
         """
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         anon = request.get(WEB_ANON_REQUEST_KEY)
@@ -3403,7 +3409,21 @@ class Cron:
                 "scopes": sorted(matched.scopes),
                 "allScopes": matched.scopes == _WEB_ALL_SCOPES,
             }
+        payload["pairLinkBase"] = self._web_pair_link_base()
         return _json_response(payload, headers=self._web_headers())
+
+    def _web_pair_link_base(self) -> str:
+        """Origin of push.relay.url plus /pair; the hosted fallback while
+        no push section is applied. Credentials embedded in the relay URL
+        are dropped: the base goes into a user-visible QR link."""
+        applied = self._applied_push_config
+        url = applied["relay"]["url"] if applied else ""
+        parts = urlparse(url)
+        if not parts.scheme or not parts.netloc:
+            return WEB_PAIR_LINK_FALLBACK
+        return "{}://{}/pair".format(
+            parts.scheme, parts.netloc.rsplit("@", 1)[-1]
+        )
 
     def _push_service_required(self) -> "push.PushService":
         """The running push service, or the 404 the route contract says.
@@ -8068,7 +8088,8 @@ class Cron:
                     raise _api_error(
                         web.HTTPForbidden,
                         "the device registry is not served anonymously; "
-                        "present a bearer token with the 'view' scope",
+                        "present a bearer token with the {!r} "
+                        "scope".format(required),
                     )
                 raise _api_error(
                     web.HTTPForbidden,
@@ -8157,7 +8178,8 @@ class Cron:
         an Origin matching this daemon's authority or web.allowedOrigins
         passes; anything else is 403. Residual: a rebinding page served on
         the daemon's OWN port passes the equality test; web.authToken
-        closes that completely.
+        closes that, except for the read-only routes a web.anonymousScopes
+        grant deliberately serves credential-less.
         """
 
         @web.middleware

@@ -105,10 +105,11 @@ jobs:
   # =====================================================================
 
   # [shows: @reboot] A first run the moment the daemon starts, so a fresh
-  # deploy is never an empty board. With the durable store above, @reboot means
-  # once per OS boot: a daemon restart alone does not re-fire it. Its log
-  # doubles as the board's welcome mat and names the scripted operator
-  # honestly.
+  # deploy is never an empty board. With the durable store above, @reboot
+  # fires once per OS boot where the platform exposes a boot identity
+  # (Linux); macOS has none, so on the launchd host every daemon start
+  # counts as a fresh boot and re-fires it. Its log doubles as the board's
+  # welcome mat and names the scripted operator honestly.
   - name: welcome
     command: |
       echo "cronstable public demo up on $HOSTNAME at $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
@@ -117,7 +118,7 @@ jobs:
       echo "visitors are read-only; the demo-operator job performs the approvals and pauses you will see"
     schedule: "@reboot"
 
-  # [shows: durable KV counter] The steady green pulse, now with a proof of
+  # [shows: durable KV counter] The steady green pulse, with a proof of
   # durability: the beat number lives in the state store, so it keeps counting
   # across daemon restarts and redeploys instead of resetting.
   - name: heartbeat

@@ -1028,9 +1028,7 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                     )
                 ),
                 # scopes granted to requests that present no credential at
-                # all. Only `view` may be granted: mutating scopes always
-                # require a bearer token, enforced by the schema itself.
-                # Requires at least one authToken/authTokens entry (see
+                # all. Requires at least one authToken/authTokens entry (see
                 # _validate_web_config); a wrong or unknown presented token
                 # still 401s rather than degrading to anonymous.
                 Opt("anonymousScopes"): Seq(Enum(["view"])),
@@ -3583,6 +3581,13 @@ def _validate_web_config(webconf: WebConfig) -> None:
             "holds every scope, so an anonymous grant would only mislead. "
             "Configure at least one token, or remove anonymousScopes."
         )
+    for entry in webconf.get("authTokens") or ():
+        if entry.get("label") == "anonymous":
+            raise ConfigError(
+                "web.authTokens label 'anonymous' is reserved: /whoami and "
+                "the pairing audit log use it for the credential-less "
+                "grant (web.anonymousScopes). Pick another label."
+            )
     if resolve_bonjour_config(webconf) is not None:
         # Imported here so a config without the advert never pays for
         # the probe; discovery.py itself imports zeroconf guardedly.

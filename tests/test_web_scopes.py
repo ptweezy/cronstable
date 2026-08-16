@@ -698,6 +698,7 @@ async def test_anonymous_view_end_to_end(caplog):
                     "label": "anonymous",
                     "scopes": ["view"],
                     "allScopes": False,
+                    "pairLinkBase": "https://relay.cronstable.com/pair",
                 }
             # ...but cannot act, on any of the three mutating gates
             async with session.post(base + "/jobs/test/start") as resp:
@@ -709,9 +710,14 @@ async def test_anonymous_view_end_to_end(caplog):
                 assert resp.status == 403
             async with session.get(base + "/mcp") as resp:
                 assert resp.status == 403
-            # ...nor read the device registry
+            # ...nor read the device registry; the exclusion 403 names the
+            # scope the method actually needs
             async with session.get(base + "/push/devices") as resp:
                 assert resp.status == 403
+                assert "'view'" in (await resp.json())["error"]
+            async with session.post(base + "/push/devices", json={}) as resp:
+                assert resp.status == 403
+                assert "'control'" in (await resp.json())["error"]
             # ...nor stop the daemon (control-gated first, and the handler
             # refuses an unauthenticated caller besides)
             async with session.post(base + "/shutdown") as resp:
