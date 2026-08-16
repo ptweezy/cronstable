@@ -60,6 +60,68 @@ async def _drain_state_writes(cron):
     await asyncio.gather(*list(cron._pending_state_writes))
 
 
+# --- quiescing a DAG cron ---------------------------------------------------
+# the one home: tests/test_state_dag_run.py's drive pump and both DAG
+# teardowns (its _teardown and conftest's dag_cron) import them from here.
+
+
+async def _drain_pending(cron):
+    # run every spawned state-write (advances launch the next tasks); advances
+    # spawn further advances, so loop until the set is quiet.
+    for _ in range(50):
+        pend = [t for t in list(cron._pending_state_writes) if not t.done()]
+        if not pend:
+            return
+        await asyncio.gather(*pend, return_exceptions=True)
+
+
+async def _reap_running(cron):
+    """Await every currently-running task and route its completion."""
+    rjs = [
+        rj for jobs in list(cron.running_jobs.values()) for rj in list(jobs)
+    ]
+    for rj in rjs:
+        await rj.wait()
+        await cron._handle_finished_job(rj)
+    # The reaper batches DAG-task completions and records them once per run
+    # after draining a batch of finished jobs; mirror that flush here (the
+    # completions are only buffered until it runs).
+    await cron._dag.flush_completions()
+    return bool(rjs)
+
+
+async def _settle_dag_cron(cron):
+    """Quiesce a DAG cron's in-flight work, BEFORE tearing it down.
+
+    A teardown that skips this leaves whatever the test's last DAG action
+    spawned -- `DagScheduler._spawn_advance` tracks an `advance_one` through
+    `Cron._track_state_write`, and that advance launches the next task's
+    subprocess -- running past the end of the test.  `_dag.shutdown()` does
+    not cancel tracked writes (the daemon's own shutdown bound-waits them
+    instead, see `Cron._stop_state`), so the leftover task survives into
+    pytest-asyncio's loop close, where `asyncio.runners._cancel_all_tasks`
+    cancels EVERY live task at once.
+
+    That is unsurvivable when the advance happens to be inside
+    `create_subprocess_exec`: cancelling it sends asyncio's
+    `_make_subprocess_transport` into `transp.close(); await transp._wait()`,
+    an unbounded await in a cancellation cleanup path, and `_wait()` is only
+    resolved via `_try_finish()`, which needs every pipe connected -- but
+    asyncio's own `_connect_pipes` helper task was cancelled in the same
+    sweep, so one pipe stays None and the wait never resolves.  The task
+    wedges in "cancelling" forever, the loop close never returns, and the
+    run dies at pytest's `faulthandler_timeout` (CI runs 605/613/626, on
+    ubuntu 3.11/3.12 and windows 3.12 alike).
+
+    Draining alone stops the hang but still orphans the launched child, so
+    reap the running tasks too, then drain the completions that reaping
+    records.
+    """
+    await _drain_pending(cron)
+    await _reap_running(cron)
+    await _drain_pending(cron)
+
+
 # --- polling ----------------------------------------------------------------
 
 

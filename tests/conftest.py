@@ -30,6 +30,7 @@ from tests._helpers import (
     _backend,
     _drain_state_writes,
     _exit,
+    _settle_dag_cron,
     _state_cfg,
 )
 
@@ -212,8 +213,10 @@ async def dag_cron(tmp_path):
     ``"  jobApi:\\n    enabled: true\\n"`` for test_ui_endpoints.py's
     variant), starts the state layer, and returns the cron.  ``web=True``
     additionally sets ``cron.web_config = {}`` for direct handler calls.
-    Teardown per cron, in reverse creation order: dag shutdown, job-api
-    stop, backend stop.
+    Teardown per cron, in reverse creation order: settle the in-flight
+    advances and their launched tasks (``_settle_dag_cron``, whose docstring
+    explains why skipping it wedges the run), dag shutdown, job-api stop,
+    backend stop.
     """
     crons = []
 
@@ -230,6 +233,7 @@ async def dag_cron(tmp_path):
 
     yield make
     for cron in reversed(crons):
+        await _settle_dag_cron(cron)
         await cron._dag.shutdown()
         await cron._stop_job_api()
         if cron.state_backend is not None:
