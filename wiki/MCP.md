@@ -214,7 +214,7 @@ The MCP surface fits cronstable's hardened posture and is safe by default:
 
 ## Trying it
 
-The [`example/mcp`](https://github.com/ptweezy/cronstable/tree/develop/example/mcp)
+The [`example/mcp`](https://github.com/ptweezy/cronstable/tree/main/example/mcp)
 project boots a node with the MCP server enabled:
 
 ```shell

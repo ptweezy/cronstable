@@ -13,7 +13,7 @@ name: CI
 # fails the gate, while the resulting chart + summary are attached to the
 # GitHub Release and appended to its notes.
 # No SOFTWARE is published on an ordinary commit; the
-# one thing that is, is documentation -- a push to `develop` publishes wiki/ to
+# one thing that is, is documentation -- a push to `main` publishes wiki/ to
 # the GitHub wiki (the `wiki` job, ungated, since a doc is not an artifact).
 #
 # A release happens ONLY when either:
@@ -74,6 +74,10 @@ on:
 # (cancel-in-progress false there): consecutive main pushes QUEUE so releases
 # serialize instead of racing, and a workflow_dispatch release is likewise
 # protected from a later push cancelling it.
+#
+# With main the ONLY long-lived branch, that costs real minutes: no trunk push
+# supersedes the one before it, so each runs the whole matrix. Iterate on a
+# feature branch, where cancel-in-progress still collapses superseded runs.
 concurrency:
   group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'workflow_dispatch' }}
@@ -156,8 +160,8 @@ jobs:
             bump="${INPUT_BUMP:-minor}"
           elif [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/main" ]; then
             # Trigger if ANY commit introduced by this push has a [release]
-            # marker -- not just the tip commit (the marker usually sits on a
-            # develop commit one behind the merge commit that lands on main).
+            # marker -- not just the tip commit, since a push can carry several
+            # commits and the marker need not sit on the last one.
             # The range is the commits new in this push (BEFORE..AFTER); on a
             # brand-new branch BEFORE is all-zeros, so fall back to the tip.
             zero="0000000000000000000000000000000000000000"
@@ -756,10 +760,10 @@ jobs:
       # with that exporter's multi-GB layer blobs, and this job alone is 13
       # matrix rows. Writing from every branch and every fork PR would evict
       # the layer cache the docker build depends on. Every other branch
-      # still RESTORES through to what develop and main stored, which is
+      # still RESTORES through to what main stored, which is
       # where the QEMU compile savings actually come from.
-      - name: Save pip cache (long-lived branches only)
-        if: ${{ steps.pip-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') }}
+      - name: Save pip cache (trunk only)
+        if: ${{ steps.pip-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v6.1.0
         with:
           path: .pip-cache
@@ -1193,7 +1197,7 @@ jobs:
           #
           # ignore-error is the second line of defence. A cache export is an
           # optimization; it must never be able to red a build that succeeded.
-          cache-to: ${{ (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') && format('type=gha,mode=max,scope={0},ignore-error=true', matrix.distro) || '' }}
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope={0},ignore-error=true', matrix.distro) || '' }}
 
   # Paired performance benchmark. The suite in benchmarks/ runs against BOTH
   # this commit and the latest published release tag, interleaved on one
@@ -2184,12 +2188,10 @@ jobs:
   # written). wiki/ is the source of truth; the wiki is the render target (the
   # pages use ~460 bare `[Page](Page)` wiki links, which ONLY resolve there).
   #
-  # Publishes from `develop`, not `main`: develop is the default branch and
-  # where wiki/ is edited, and the pages hardcode /blob/develop/ links and
-  # raw.githubusercontent.com/.../develop/ screenshots -- the wiki documents
-  # develop by construction. Syncing from both would also race: `concurrency` is
-  # keyed per branch, so a develop push and a main merge are NOT serialized
-  # against each other and their wiki pushes would collide.
+  # Publishes from `main`, the repository's only long-lived branch: it is where
+  # wiki/ is edited, and the pages hardcode /blob/main/ links and
+  # raw.githubusercontent.com/.../main/ screenshots, so the wiki documents the
+  # trunk by construction. A feature branch never publishes.
   #
   # GITHUB_TOKEN with `contents: write` can push a repo's OWN wiki -- no PAT.
   # The widespread "wikis need a PAT" advice traces to one archived action's
@@ -2198,12 +2200,12 @@ jobs:
   # is only needed for a wiki in a DIFFERENT repo -- which is why the Homebrew
   # tap push above needs HOMEBREW_TAP_TOKEN and this job needs no secret at all.
   wiki:
-    # The repository guard is not redundant: a fork has its OWN develop, and a
+    # The repository guard is not redundant: a fork has its OWN main, and a
     # fork's wiki is uninitialized (a wiki repo does not exist until someone
     # creates a page), so `<fork>/cronstable.wiki` 404s and the checkout fails.
     # Every other job in this pipeline is fork-clean, so without this the wiki
-    # job would be a permanent red X on every fork's develop push.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.repository == 'ptweezy/cronstable'
+    # job would be a permanent red X on every fork's main push.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'ptweezy/cronstable'
     runs-on: ubuntu-latest
     permissions:
       # The one grant that allows pushing the wiki. GitHub's docs never mention
@@ -2234,10 +2236,10 @@ jobs:
           git -C .wiki config user.name  "github-actions[bot]"
           git -C .wiki config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # The wiki accepts web-UI edits and two develop pushes can overlap
-          # before cancel-in-progress lands, so a push CAN lose a race. The
-          # commit is a pure snapshot of wiki/, so there is nothing to rebase --
-          # re-mirror onto the new tip and retry instead of reddening a docs run.
+          # The wiki accepts web-UI edits, so a push CAN still lose a race even
+          # though runs on main queue rather than overlap. The commit is a pure
+          # snapshot of wiki/, so there is nothing to rebase: re-mirror onto the
+          # new tip and retry instead of reddening a docs run.
           for attempt in 1 2 3; do
             git -C .wiki fetch -q origin master
             git -C .wiki reset -q --hard origin/master
