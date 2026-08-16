@@ -14,7 +14,7 @@
 [![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-# Cronstable™
+# Cronstable
 / kraahn-stuh-bl /
 
 A stability-focused, container-friendly, optionally-distributed, fault-tolerant, leader-electing, resumable, configurable, precompiled, multi-architecture, portable, batteries-included, security-hardened, production-ready cron replacement.
