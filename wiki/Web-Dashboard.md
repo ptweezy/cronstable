@@ -647,12 +647,14 @@ comes back the way you left it.
 
 ### Pair a device
 
-[![The Pair a device panel: a QR code of the connection payload, the payload as a copyable JSON string, and the all-scopes token warning](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
+[![The Pair a device panel: a QR code deep-linking the connection payload into the companion app, the payload as a copyable JSON string, and the all-scopes token warning](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
 
 The settings sheet (and the command palette) also open the **Pair a device**
-panel: a QR code of `{v: 1, name, url, token}` plus the same JSON as a
-copyable string, which is how the companion app learns the daemon's address
-and bearer token in one scan. The panel checks the stored token against
+panel: a QR encoding a pairing deep link (the `{v: 1, name, url, token}`
+payload rides in the link's fragment, so a phone-camera scan opens the
+companion app), plus the same JSON as a copyable string the in-app scanner
+also accepts. Either form hands the app the daemon's address and bearer
+token in one scan. The panel checks the stored token against
 [`GET /whoami`](HTTP-API#get-whoami) and warns when it holds every scope;
 give a phone a scoped `web.authTokens` entry instead. See
 [Push Notifications](Push-Notifications) for the pairing flow this feeds.
@@ -696,8 +698,8 @@ token button at any time.
 
 On load the dashboard asks [`GET /whoami`](HTTP-API#get-whoami) what it is
 allowed to do, and draws only the controls that scope covers. Holding
-`control`, or talking to a daemon with no authentication configured, shows
-the full interface.
+every scope, or talking to a daemon with no authentication configured,
+shows the full interface.
 
 Without `control`, the dashboard omits the Run, Stop, Pause and Resume
 buttons, the DAG Trigger and Backfill buttons, "run failing" and the mitigate

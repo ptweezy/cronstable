@@ -45,7 +45,7 @@ Two tokens still exist:
 
 | Token | Scopes | Public? | Why it exists |
 | --- | --- | --- | --- |
-| `public-demo-viewer` | `view` | Yes, by design | The companion app authenticates with it. It grants exactly what anonymous visitors already hold, so publishing it costs nothing. |
+| `public-demo-viewer` | `view` | Yes, by design | The companion app authenticates with it. It grants anonymous view plus `GET /push/devices` (empty here: no `push:` block), so publishing it costs nothing on this instance. |
 | `demo-operator` | `control`, `approve` | **No** | The `demo-operator` job's own credential. Visitors cannot act, so this scripted operator performs the mutating actions the board shows off: it decides the `firmware-rollout` approval gate, opens maintenance-window pauses on `feed-sync`, and clears `meter-export`'s depends-on-past gate with a manual start. |
 
 The operator token is generated per host, never printed by any job, and
@@ -54,24 +54,25 @@ token file (`$(brew --prefix)/etc/cronstable-demo/operator-token`) and
 the LaunchAgent plist that hands it to the daemon; on the container path
 it lives in `.env`, which is gitignored. It reaches the job as a
 run-scoped secret over loopback, so it never appears in a command line
-or in any view-scoped API response. Rotating either one:
+or in any view-scoped API response.
 
 Either token can be rotated on either deployment path by setting its
 variable and re-running the bring-up command:
 
 ```sh
-CRONSTABLE_DEMO_VIEW_TOKEN=new-value docker compose up -d    # containers
+# containers: persist the value in .env, which compose reads on every up
+echo 'CRONSTABLE_DEMO_VIEW_TOKEN=new-value' >> .env && docker compose up -d
 CRONSTABLE_DEMO_VIEW_TOKEN=new-value ./launchd/install.sh    # native
 ```
 
 Rotating the *view* token additionally means updating the app config.
 Rotating the operator token affects only this host.
 
-> **Daemon version.** No released cronstable carries
-> `web.anonymousScopes` yet; 1.2.41 is the latest tag. An older daemon
-> rejects this config outright and names the key as unexpected, so this
-> board needs a daemon built from `develop`, or the first release that
-> carries the feature. Deploy the config and the daemon together.
+> **Daemon version.** This board needs a daemon that understands
+> `web.anonymousScopes`; an older daemon rejects the config outright and
+> names the key as unexpected. Build cronstable from `main`, or install a
+> release that carries the key, and deploy the config and the daemon
+> together.
 
 ## Standing it up
 
@@ -137,6 +138,10 @@ cloudflared tunnel route dns cronstable-demo demo.cronstable.com
 ./launchd/install.sh                         # safe to re-run
 ```
 
+The daemon-version note above applies here: a brew-installed release
+without `web.anonymousScopes` stops `install.sh` at its config-validation
+step, and a failed validation leaves any previous install untouched.
+
 No dashboard steps and no tunnel token: `cloudflared tunnel login`
 writes a certificate that authorizes creating the tunnel and its DNS
 record from the CLI, so `.env` stays a container-path concern.
@@ -160,7 +165,9 @@ publishing a board that acts on strangers' requests.
 
 It then loads two agents, both `RunAtLoad` + `KeepAlive`:
 `com.cronstable.demo` (the daemon) and `com.cronstable.tunnel`
-(`cloudflared`, ingress in `~/.cloudflared/config.yml`), logging to
+(`cloudflared`, ingress in `~/.cloudflared/config.yml`; the script backs
+up a pre-existing hand-written file beside it before overwriting),
+logging to
 `$(brew --prefix)/var/log/cronstable-{demo,tunnel}.*.log`.
 
 Two things this path gives up, both fine for shell-noise demo jobs but
@@ -198,12 +205,12 @@ self-hosted way to find out before Apple does.
 
 - Base URL: `https://demo.cronstable.com`
 - Token: the view token above (baked into the "Try the demo" action).
-  Keeping it is the simpler path; the app could also drop it entirely
-  now that the instance serves anonymous view.
+  Keeping it is the simpler path; the app could also drop it entirely,
+  because the instance serves anonymous view.
 - `GET /whoami` with that token answers
-  `{authenticated: true, label: "public-demo-viewer", scopes: ["view"], allScopes: false}`,
+  `{authenticated: true, label: "public-demo-viewer", scopes: ["view"], allScopes: false, pairLinkBase: "https://relay.cronstable.com/pair"}`,
   exactly the shape the app uses to hide mutating affordances in demo
   mode. With **no** token the same endpoint answers
-  `{authenticated: false, label: "anonymous", scopes: ["view"], allScopes: false}`,
+  `{authenticated: false, label: "anonymous", scopes: ["view"], allScopes: false, pairLinkBase: "https://relay.cronstable.com/pair"}`,
   so a client that keys on `allScopes` (not on `authenticated`) degrades
   identically either way.
