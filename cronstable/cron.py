@@ -12,6 +12,7 @@ import hashlib
 import heapq
 import hmac
 import importlib.resources
+import itertools
 import json
 import logging
 import logging.config
@@ -1496,7 +1497,9 @@ def _jobs_response_product(
     The tag hashes a CANONICAL variant with the volatile relative
     ``scheduled_in`` swapped for its stable absolute next-fire instant, so
     it changes exactly when the displayed data changes, not per countdown
-    tick. Pure and free of scheduler state, so it can run on an executor.
+    tick. Free of scheduler state, so it can run on an executor; the swap
+    mutates ``payload`` in place, which each build owns exclusively
+    (single-flight, or one executor hop).
 
     ``trusted=True`` and SHA-256 deliberately differ from durable-record
     rules: two builds disagreeing degrades a 304 into a 200, never a wrong
@@ -1504,22 +1507,23 @@ def _jobs_response_product(
     nothing to leak; the If-None-Match check stays in the handler because
     one product is shared across every concurrent poller.
     """
-    canonical = [
-        {**job, "scheduled_in": next_fire.get(job["name"])} for job in payload
-    ]
-    try:
-        raw = _json.dumps_bytes(canonical, trusted=True)
-    except (_json.UnsupportedValue, ValueError, TypeError):
-        # the stdlib flavour cannot render a datetime, so a no-orjson
-        # install always lands here; determinism is all the tag needs.
-        raw = json.dumps(canonical, separators=(",", ":"), default=str).encode(
-            "utf-8"
-        )
-    etag = '"' + hashlib.sha256(raw).hexdigest()[:32] + '"'
+    # the body serializes before the swap below, while the rows still hold
+    # the relative values it shows
     try:
         body = _json.dumps_bytes(payload, trusted=True)
     except (_json.UnsupportedValue, ValueError, TypeError):
         body = json.dumps(payload, default=str).encode("utf-8")
+    for job in payload:
+        job["scheduled_in"] = next_fire.get(job["name"])
+    try:
+        raw = _json.dumps_bytes(payload, trusted=True)
+    except (_json.UnsupportedValue, ValueError, TypeError):
+        # the stdlib flavour cannot render a datetime, so a no-orjson
+        # install always lands here; determinism is all the tag needs.
+        raw = json.dumps(payload, separators=(",", ":"), default=str).encode(
+            "utf-8"
+        )
+    etag = '"' + hashlib.sha256(raw).hexdigest()[:32] + '"'
     if len(body) >= _GZIP_MIN_BYTES:
         return etag, body, _gzip_body(body)
     return etag, body, None
@@ -1700,15 +1704,22 @@ async def _noop_state_write() -> None:
     return None
 
 
-def next_sleep_interval(subminute: bool = False) -> float:
+def next_sleep_interval(
+    subminute: bool = False,
+    now: Optional[datetime.datetime] = None,
+) -> float:
     """Seconds to sleep until the next scheduling tick.
 
     Minute mode (``subminute`` False, the default) snaps to the top of the
     next minute.  When any enabled job pins specific
     seconds the scheduler switches to ``subminute`` mode and snaps to the next
     whole-second boundary instead, so a second-level schedule can fire on time.
+
+    ``now`` is the caller's already-read clock instant (aware UTC); when
+    omitted the function reads the clock itself.
     """
-    now = get_now(datetime.timezone.utc)
+    if now is None:
+        now = get_now(datetime.timezone.utc)
     if subminute:
         target = now.replace(microsecond=0) + datetime.timedelta(seconds=1)
     else:
@@ -3267,7 +3278,7 @@ class Cron:
                 running += 1
             if job.enabled:
                 enabled += 1
-            pause = self._pause_active(name)
+            pause = self._pause_active(name, now)
             if pause is not None:
                 paused += 1
             last = self.last_run.get(name)
@@ -3684,19 +3695,20 @@ class Cron:
         except (ValueError, KeyError) as err:
             payload.update({"valid": False, "error": str(err)})
             return payload
-        fires = next_fires(text, count, tz=zone, hash_key=seed)
+        # the preview walk and the describer share `tab`, the parse of
+        # this text under `seed` above
+        fires = next_fires(text, count, tz=zone, hash_key=seed, tab=tab)
         payload.update(
             {
                 "valid": True,
                 "reboot": False,
                 "normalized": str(tab),
-                # `tab` is this very text parsed under `seed` a few
-                # lines up: the describer reuses it instead of parsing
-                # the same expression a second time per request
                 "description": describe_cron(text, hash_key=seed, tab=tab),
                 "fires": [when.isoformat() for when in fires],
                 "never_fires": not fires,
                 "lint": [
+                    # the linter reparses deliberately: its tab branch
+                    # lints the canonical spelling instead of the raw text
                     finding._asdict()
                     for finding in lint_schedule(
                         text, timezone=zone, hash_key=seed
@@ -4424,18 +4436,25 @@ class Cron:
             self._sla_bank_pause(name, was, get_now(datetime.timezone.utc))
             logger.info("Job %s resumed by %s (%s)", name, by, channel)
 
-    def _pause_active(self, name: str) -> Optional[PauseInfo]:
+    def _pause_active(
+        self,
+        name: str,
+        now: Optional[datetime.datetime] = None,
+    ) -> Optional[PauseInfo]:
         """The job's live pause window, or ``None``; expiry enforced HERE.
 
-        The one pause read every consumer goes through: an expired window
-        reads as absent everywhere at once. The stale entry is swept by
-        housekeeping; only memory is consulted, never store I/O on a
-        scheduling path.
+        The one pause read every consumer goes through: expiry is judged
+        against ``now`` (a looping caller's pass instant, defaulting to a
+        fresh clock read), so within one pass an expired window reads as
+        absent everywhere at once. The stale entry is swept by housekeeping;
+        only memory is consulted, never store I/O on a scheduling path.
         """
         info = self._paused.get(name)
         if info is None:
             return None
-        if info.until <= get_now(datetime.timezone.utc):
+        if now is None:
+            now = get_now(datetime.timezone.utc)
+        if info.until <= now:
             return None
         return info
 
@@ -4643,7 +4662,7 @@ class Cron:
                 # no-SLA deployment pays O(1) per job per pass.
                 self._sla_clear_latches(name)
                 continue
-            if not job.enabled or self._pause_active(name) is not None:
+            if not job.enabled or self._pause_active(name, now) is not None:
                 # excused: a pre-pause/disable breach would otherwise pin
                 # the gauge, sla block and OVERDUE chip for the window.
                 self._sla_clear_latches(name)
@@ -5228,11 +5247,14 @@ class Cron:
         job: JobConfig,
         now: Optional[datetime.datetime] = None,
     ) -> dict[str, Any]:
+        # one instant for the whole payload (a looping caller's pass instant,
+        # or a fresh read): scheduled_in, pause expiry and SLA observations
+        # agree about the time.
+        if now is None:
+            now = get_now(datetime.timezone.utc)
         running = self.running_jobs.get(name) or []
         # next scheduled run, in seconds; None when not applicable (disabled,
-        # currently running, or a one-off @reboot schedule).  ``now`` is the
-        # caller's pass instant when it is looping the job set; see
-        # _scheduled_in.
+        # currently running, or a one-off @reboot schedule).
         scheduled_in = self._scheduled_in(name, job, bool(running), now)
         # a dead schedule's None means NEVER, distinct from the running/
         # disabled Nones. For a non-running job _scheduled_in already
@@ -5299,7 +5321,7 @@ class Cron:
             # optional feature's extra.
             "paused": (
                 pause.to_dict()
-                if (pause := self._pause_active(name)) is not None
+                if (pause := self._pause_active(name, now)) is not None
                 else None
             ),
         }
@@ -5356,9 +5378,7 @@ class Cron:
         # has_sla is precomputed, keeping the allocation off no-SLA jobs.
         if job.has_sla:
             thresholds = job.sla_thresholds
-            observations = self._sla_observations(
-                name, job, get_now(datetime.timezone.utc)
-            )
+            observations = self._sla_observations(name, job, now)
             breaches = []
             for check, (
                 threshold,
@@ -6346,21 +6366,27 @@ class Cron:
         buffer, so after the buffer rotates it can only ever skip forward,
         never resurrect dropped lines.
         """
-        lines = list(output.lines) if output is not None else []
+        # `lines` aliases the live ring: safe only on the event loop, where
+        # the len and the islice run with nothing rotating between them
+        lines = output.lines if output is not None else ()
         total = len(lines)
         if cursor is None:
             start = max(0, total - tail)
         else:
             start = min(max(cursor, 0), total)
-        selected = lines[start : start + tail]
+        stop = min(start + max(tail, 0), total)
+        # older retained lines exist above what we returned (only
+        # meaningful on a cursor-less "give me the tail" call).
+        truncated = cursor is None and start > 0
+        if stop <= start:
+            return {"lines": [], "cursor": start, "truncated": truncated}
         return {
             "lines": [
-                {"stream": stream, "line": line} for stream, line in selected
+                {"stream": stream, "line": line}
+                for stream, line in itertools.islice(lines, start, stop)
             ],
-            "cursor": start + len(selected),
-            # older retained lines exist above what we returned (only
-            # meaningful on a cursor-less "give me the tail" call).
-            "truncated": cursor is None and start > 0,
+            "cursor": stop,
+            "truncated": truncated,
         }
 
     def job_logs_tail_payload(
@@ -8291,7 +8317,10 @@ class Cron:
         boundary. Never negative. The cap goes through
         next_sleep_interval so tests can patch that one function.
         """
-        housekeeping = next_sleep_interval(False)
+        # one clock read serves the housekeeping snap and the soonest-fire
+        # delta below
+        now = get_now(datetime.timezone.utc)
+        housekeeping = next_sleep_interval(False, now)
         # Wake sooner when a DAG poke/retry/run is due, floored at
         # MIN_TICK_SLEEP (an already-due hint stays due until its pass
         # rewrites the entry; unfloored it would spin the loop). Whether
@@ -8307,7 +8336,6 @@ class Cron:
         soonest = self._peek_soonest_fire()
         if soonest is None:
             return housekeeping
-        now = get_now(datetime.timezone.utc)
         delta = (soonest - now).total_seconds()
         return max(0.0, min(housekeeping, delta))
 

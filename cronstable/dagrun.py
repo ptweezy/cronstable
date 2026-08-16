@@ -1066,7 +1066,8 @@ class DagScheduler:
         if lease is None:
             return False
         self._owned[ref] = lease
-        self._locks.setdefault(ref, asyncio.Lock())
+        if ref not in self._locks:
+            self._locks[ref] = asyncio.Lock()
         self._renewers[ref] = asyncio.ensure_future(self._renew_loop(ref))
         self._wake[ref] = _now()  # advance promptly
         self._hold_advancing(ref)  # ...but the loop must not spin meanwhile
@@ -1260,7 +1261,12 @@ class DagScheduler:
         most the pass already running plus one fresh pass that observes
         everything the burst recorded.
         """
-        lock = self._locks.setdefault(ref, asyncio.Lock())
+        # get-then-insert: the single event loop runs this without an await
+        # in between, and the miss path (a run's first advance) is the rare
+        # one, so the held lock is reused without constructing a fresh one.
+        lock = self._locks.get(ref)
+        if lock is None:
+            lock = self._locks[ref] = asyncio.Lock()
         if lock.locked():
             # No await between this check and the holder's own re-check
             # under the lock, so the flag cannot be missed.
@@ -1913,7 +1919,10 @@ class DagScheduler:
         # a time, and flush_completions (invoked once it has drained the whole
         # batch) folds a run's completions into a single RMW. Recording here
         # would be one full-document write+fsync per task again.
-        self._completion_buffer.setdefault(ref, []).append(
+        buffer = self._completion_buffer.get(ref)
+        if buffer is None:
+            buffer = self._completion_buffer[ref] = []
+        buffer.append(
             {
                 "taskkey": dref.taskkey,
                 "taskId": dref.task_id,

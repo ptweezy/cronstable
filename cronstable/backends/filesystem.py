@@ -781,8 +781,8 @@ class FilesystemBackend(ElectionReadsBase):
         is harmless; the per-id ``_reboot_persisted`` set just keeps the
         stream from growing one record per renew round.
         """
-        self._reconcile_local_reboot_ran()
         live_id = self.get_job_set_id()
+        self._reconcile_local_reboot_ran(live_id)
         if self._reboot_persisted_job_set_id != live_id:
             self._reboot_persisted = set()
             self._reboot_persisted_job_set_id = live_id
@@ -831,7 +831,7 @@ class FilesystemBackend(ElectionReadsBase):
         return False
 
     async def mark_reboot_ran(self, job_name: str) -> None:
-        self._reconcile_local_reboot_ran()
+        self._reconcile_local_reboot_ran(self.get_job_set_id())
         self._reboot_ran_local.add(job_name)
         # eager, bounded, best-effort: the caller launches right after, so
         # a store that cannot answer must not stall the launch -- the

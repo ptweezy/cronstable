@@ -136,9 +136,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Decide release
         id: d
         env:
@@ -304,9 +304,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Install runtime + distributable extras
         run: |
           set -euo pipefail
@@ -439,9 +439,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Build distributions
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -507,9 +507,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -518,7 +518,7 @@ jobs:
           # Runner-native, all-wheels arch: install into a throwaway uv venv and
           # freeze from it with `uv run` (uv discovers the setup-python 3.14).
           uv venv --python 3.14
-          uv pip install pyinstaller==6.21.0  # pin matches pyinstaller/Dockerfile
+          uv pip install pyinstaller==6.22.1  # pin matches pyinstaller/Dockerfile
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) so the binary runs the faster
           # event loop. Install a wheel where one exists, else build it from
@@ -542,7 +542,7 @@ jobs:
           # push channel disabled. verify_extra.py round-trips a real
           # sealed box so a miscompiled libsodium also fails the job.
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" hard
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
           # Bundle zeroconf (the `discovery` extra) for web.bonjour. Pure
           # Python with optional speedups, so the install works on every
           # arch and is a HARD failure too. It is LGPL-2.1: the notice
@@ -550,7 +550,7 @@ jobs:
           # archive is attached to the Release, and the public build
           # recipe is the relink path. See LICENSING.md.
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too: a
@@ -695,7 +695,7 @@ jobs:
               # leave the toolchain unused.
               ${{ matrix.toolchain }}
               pip install --upgrade pip
-              pip install pyinstaller==6.21.0   # pin matches the other binary jobs
+              pip install pyinstaller==6.22.1   # pin matches the other binary jobs
               pip install .                     # bakes the pinned version into cronstable/version.py
               # Bundle uvloop (the `speedups` extra): a wheel where one exists
               # (amd64/arm64), else a source build. The shared script has
@@ -723,13 +723,13 @@ jobs:
               # uninstalled, so the binary never ships a miscompiled
               # libsodium (push fails closed).
               ${{ matrix.nacl_tools }}
-              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
               # Bundle zeroconf (the `discovery` extra): pure Python with
               # optional speedups, so a HARD install even under QEMU. It
               # is LGPL-2.1; the in-binary notice, Release source
               # archive, and public build recipe are the compliance kit
               # (see LICENSING.md).
-              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version            # smoke test, native or emulated on its own libc
               # Whenever the build env kept pynacl, the frozen binary
@@ -810,9 +810,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -821,7 +821,7 @@ jobs:
           # Runner-native, all-wheels arch: install into a throwaway uv venv and
           # freeze from it with `uv run` (uv discovers the setup-python 3.14).
           uv venv --python 3.14
-          uv pip install pyinstaller==6.21.0  # pin matches the Linux jobs
+          uv pip install pyinstaller==6.22.1  # pin matches the Linux jobs
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) for the faster event loop; macOS
           # ships wheels for both arches. The shared script has verify_extra.py
@@ -839,12 +839,12 @@ jobs:
           # are HARD failures on this lane (a soft-fail would silently
           # ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" hard
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on both arches, HARD failure. LGPL-2.1; in-binary notice +
           # Release source archive + public build recipe (LICENSING.md).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
@@ -955,9 +955,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -970,7 +970,7 @@ jobs:
           # Runner-native (uv ships a win_arm64 build too); install into a
           # throwaway uv venv and freeze from it with `uv run`.
           uv venv --python 3.14
-          uv pip install pyinstaller==6.21.0  # pin matches the Linux/macOS jobs
+          uv pip install pyinstaller==6.22.1  # pin matches the Linux/macOS jobs
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle orjson (the `speedups` extra) for the durable-state / cluster
           # JSON paths; Windows amd64 ships a wheel (arm64 falls back if none).
@@ -983,13 +983,13 @@ jobs:
           # and verify are HARD failures on this lane (a soft-fail would
           # silently ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" hard
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on win32/amd64/arm64, HARD failure. LGPL-2.1; in-binary
           # notice + Release source archive + public build recipe
           # (LICENSING.md).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           ./dist/cronstable.exe --version      # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
@@ -1227,9 +1227,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Install current and baseline environments
         id: envs
         env:
@@ -1446,9 +1446,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Build core + pro, prove the boundary, run pro's tests
         run: |
           set -euo pipefail
@@ -1878,7 +1878,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p third-party
-          python3 -m pip download "zeroconf>=0.132" --no-deps --no-binary :all: -d third-party
+          python3 -m pip download "zeroconf>=0.149.16" --no-deps --no-binary :all: -d third-party
           cp cronstable/licenses/THIRD-PARTY-NOTICES.txt third-party/
           ls -l third-party
 

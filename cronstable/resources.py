@@ -34,7 +34,7 @@ import os
 import threading
 import time
 import weakref
-from collections import deque
+from collections import defaultdict, deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -328,10 +328,12 @@ def _ppid_index() -> Optional[dict[int, list[int]]]:
     ppid_map = getattr(psutil, "_ppid_map", None)
     if ppid_map is None:  # pragma: no cover - shipped by every psutil 3.x+
         return None
-    index: dict[int, list[int]] = {}
+    # a defaultdict allocates the child list only for parents that have
+    # one; consumers read through .get, which never inserts
+    index: defaultdict[int, list[int]] = defaultdict(list)
     try:
         for pid, ppid in ppid_map().items():
-            index.setdefault(ppid, []).append(pid)
+            index[ppid].append(pid)
     except Exception:  # noqa: BLE001 - sampling must never raise
         return None
     return index
@@ -673,10 +675,14 @@ class ResourceMonitor:
         # tree but failed this round's read (a transient AccessDenied, say)
         # has NOT departed: carry its last reading forward instead, or its
         # next successful read would double-count on top of the banked value.
-        live_pids = {k[0] for k in live}
+        live_pids: Optional[set[int]] = None
         for key, (user, system) in self._members.items():
             if key in live:
                 continue
+            # the pid set exists only for reconciling members missing from
+            # this sample; a churn-free tree never builds it
+            if live_pids is None:
+                live_pids = {k[0] for k in live}
             if key[0] in tree_pids and key[0] not in live_pids:
                 live[key] = (user, system)
                 continue
@@ -687,8 +693,13 @@ class ResourceMonitor:
         # accumulate instead of plateauing at the largest instantaneous tree
         # sum.  The max() only guards against per-sample jitter in the
         # readings ever nudging a total backwards.
-        cpu_user = self._departed_user + sum(u for u, _ in live.values())
-        cpu_system = self._departed_system + sum(s for _, s in live.values())
+        live_user = 0.0
+        live_system = 0.0
+        for user, system in live.values():
+            live_user += user
+            live_system += system
+        cpu_user = self._departed_user + live_user
+        cpu_system = self._departed_system + live_system
         self._cpu_user = max(self._cpu_user, cpu_user)
         self._cpu_system = max(self._cpu_system, cpu_system)
         self._max_rss = max(self._max_rss, rss)
