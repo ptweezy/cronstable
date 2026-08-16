@@ -10,6 +10,7 @@ diverging variants of the same helper, the version here is a superset and
 the parameter differences are documented on the helper itself.
 """
 
+import ast
 import asyncio
 import datetime
 import json
@@ -57,6 +58,68 @@ def _backend(tmp_path, **over):
 async def _drain_state_writes(cron):
     # canonical: tests/test_state.py
     await asyncio.gather(*list(cron._pending_state_writes))
+
+
+# --- quiescing a DAG cron ---------------------------------------------------
+# the one home: tests/test_state_dag_run.py's drive pump and both DAG
+# teardowns (its _teardown and conftest's dag_cron) import them from here.
+
+
+async def _drain_pending(cron):
+    # run every spawned state-write (advances launch the next tasks); advances
+    # spawn further advances, so loop until the set is quiet.
+    for _ in range(50):
+        pend = [t for t in list(cron._pending_state_writes) if not t.done()]
+        if not pend:
+            return
+        await asyncio.gather(*pend, return_exceptions=True)
+
+
+async def _reap_running(cron):
+    """Await every currently-running task and route its completion."""
+    rjs = [
+        rj for jobs in list(cron.running_jobs.values()) for rj in list(jobs)
+    ]
+    for rj in rjs:
+        await rj.wait()
+        await cron._handle_finished_job(rj)
+    # The reaper batches DAG-task completions and records them once per run
+    # after draining a batch of finished jobs; mirror that flush here (the
+    # completions are only buffered until it runs).
+    await cron._dag.flush_completions()
+    return bool(rjs)
+
+
+async def _settle_dag_cron(cron):
+    """Quiesce a DAG cron's in-flight work, BEFORE tearing it down.
+
+    A teardown that skips this leaves whatever the test's last DAG action
+    spawned -- `DagScheduler._spawn_advance` tracks an `advance_one` through
+    `Cron._track_state_write`, and that advance launches the next task's
+    subprocess -- running past the end of the test.  `_dag.shutdown()` does
+    not cancel tracked writes (the daemon's own shutdown bound-waits them
+    instead, see `Cron._stop_state`), so the leftover task survives into
+    pytest-asyncio's loop close, where `asyncio.runners._cancel_all_tasks`
+    cancels EVERY live task at once.
+
+    That is unsurvivable when the advance happens to be inside
+    `create_subprocess_exec`: cancelling it sends asyncio's
+    `_make_subprocess_transport` into `transp.close(); await transp._wait()`,
+    an unbounded await in a cancellation cleanup path, and `_wait()` is only
+    resolved via `_try_finish()`, which needs every pipe connected -- but
+    asyncio's own `_connect_pipes` helper task was cancelled in the same
+    sweep, so one pipe stays None and the wait never resolves.  The task
+    wedges in "cancelling" forever, the loop close never returns, and the
+    run dies at pytest's `faulthandler_timeout` (CI runs 605/613/626, on
+    ubuntu 3.11/3.12 and windows 3.12 alike).
+
+    Draining alone stops the hang but still orphans the launched child, so
+    reap the running tasks too, then drain the completions that reaping
+    records.
+    """
+    await _drain_pending(cron)
+    await _reap_running(cron)
+    await _drain_pending(cron)
 
 
 # --- polling ----------------------------------------------------------------
@@ -339,3 +402,131 @@ def _write_tls(dirpath, cn="web-ca", *, suffix="leaf", ip_sans=True):
         "cert": str(cert_path),
         "key": str(key_path),
     }
+
+
+# --- source invariant: no bare `web.HTTP*` error responses ------------------
+#
+# The published contract is that every 4xx/5xx body the daemon's application
+# serves is one `{"error": "<reason>"}` envelope with a reason the caller can
+# act on.  A bare `raise web.HTTPNotFound()` breaks it twice: aiohttp's own
+# body is `text/plain`, and its text is the useless `"404: Not Found"`, which
+# survives even where an outermost middleware rewraps the body as JSON.  A
+# bare `return web.HTTPNotFound()` is worse still, because the error
+# middlewares rescue a RAISED `web.HTTPException` only: a returned one is a
+# `Response` the chain hands straight to the wire, so it reaches the caller as
+# `404 text/plain`.  Both shapes are the defect; a handler builds its error
+# response through one of the named helpers below.
+#
+# There is deliberately no `content_type="application/json"` escape hatch:
+# exempting a raise that passes it would admit
+# `raise web.HTTPNotFound(text="nope", content_type="application/json")`,
+# which is application/json carrying a body that is not the envelope.
+#
+# Two files own this rule and each pins it in its own test home:
+# cronstable/cron.py (tests/test_cron_web.py) and cronstable/jobapi.py
+# (tests/test_state_job_api.py).
+
+# The ONE class an ARGUMENTLESS raise may name.  An auth failure deliberately
+# carries no reason, and the rationale is written at all seven raise sites
+# (four in cron.auth_middleware, three in JobStateAPI._run): a 401 that
+# distinguished a missing header from a wrong scheme from an unknown token
+# would confirm to an unauthenticated caller which half of a guess was right.
+# The exemption is for a no-argument raise BECAUSE that is what makes the body
+# reasonless: `raise web.HTTPUnauthorized(text="unknown token")` puts the
+# oracle back and is flagged like any other bare error.  Both modules'
+# outermost error middleware still gives the reasonless body the JSON
+# envelope, so only the reason is withheld.  The allowlist covers raises only:
+# a RETURNED 401 is rescued by nothing and is always a defect.
+BARE_HTTP_RAISE_ALLOWED = frozenset({"HTTPUnauthorized"})
+
+# How an error response is built instead, per scanned module.  Load-bearing:
+# `bare_http_raises` reports a module that no longer binds one of its helpers,
+# so a rename lands as a test failure instead of quietly leaving the comment
+# above describing a rule nothing implements.
+ERROR_ENVELOPE_HELPERS = {
+    "cron.py": (
+        "_api_error",
+        "_action_http_error",
+        "_http_for_action_error",
+        "_push_store_unavailable",
+    ),
+    "jobapi.py": ("JobStateError",),
+}
+
+
+def bare_http_raises(path):
+    """Every bare ``web.HTTP*`` error response in ``path``.
+
+    Returns a list of ``(filename, lineno, enclosing function)`` triples,
+    which is empty on a conforming file.  Three shapes are reported: a
+    ``raise`` naming a ``web.HTTP*`` class with any argument, an argumentless
+    ``raise`` of a class outside ``BARE_HTTP_RAISE_ALLOWED``, and a ``return``
+    of a ``web.HTTP*`` instance (never allowlisted, since no middleware
+    rescues one).  Both the attribute spelling (``web.HTTPNotFound``) and the
+    direct-import spelling (``from aiohttp.web import HTTPNotFound``) count.
+    The module's entry in ``ERROR_ENVELOPE_HELPERS`` is checked too: a helper
+    the file no longer binds is reported at line 0.
+
+    A tripwire for the easy regression, not a proof.  What still escapes it,
+    and what no site in the tree uses today: a class reached through an alias
+    (``NotFound = web.HTTPNotFound``), one held in a variable or a lookup
+    table, and one whose name does not start with ``HTTP``.
+    """
+
+    def http_class(expr):
+        """``(class name, takes no arguments)`` for an aiohttp error expr.
+
+        Covers ``web.HTTPNotFound()``, the class-only ``web.HTTPNotFound``
+        and the direct-import ``HTTPNotFound()`` alike.  ``(None, False)``
+        when the expression is not one of them, which is the case for every
+        conforming site: the helpers are plain names, and the two that pick a
+        class do it through a ``factory`` variable.
+        """
+        bare = True
+        if isinstance(expr, ast.Call):
+            bare = not expr.args and not expr.keywords
+            expr = expr.func
+        if isinstance(expr, ast.Attribute) and expr.attr.startswith("HTTP"):
+            return expr.attr, bare
+        if isinstance(expr, ast.Name) and expr.id.startswith("HTTP"):
+            return expr.id, bare
+        return None, False
+
+    offenders = []
+    bound = set()
+    filename = os.path.basename(str(path))
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+
+    def walk(node, stack):
+        if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            bound.add(node.name)
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound.add(alias.asname or alias.name.split(".")[0])
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            stack = stack + [node.name]
+        where = stack[-1] if stack else "<module>"
+        if isinstance(node, ast.Raise) and node.exc is not None:
+            name, bare = http_class(node.exc)
+            if name is not None and not (
+                bare and name in BARE_HTTP_RAISE_ALLOWED
+            ):
+                offenders.append((filename, node.lineno, where))
+        if isinstance(node, ast.Return) and node.value is not None:
+            # no allowlist here: a returned web.HTTPUnauthorized() is a
+            # Response the middleware never sees, so it would reach the
+            # caller as text/plain.
+            name, _ = http_class(node.value)
+            if name is not None:
+                offenders.append((filename, node.lineno, where))
+        for child in ast.iter_child_nodes(node):
+            walk(child, stack)
+
+    walk(tree, [])
+    for helper in ERROR_ENVELOPE_HELPERS.get(filename, ()):
+        if helper not in bound:
+            offenders.append((filename, 0, "missing helper " + helper))
+    return offenders

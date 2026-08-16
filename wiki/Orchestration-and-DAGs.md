@@ -72,8 +72,9 @@ A task's readiness is governed by its `triggerRule`:
 
 Per-task launch fields mirror a job: `shell`, `environment`, `captureStdout` /
 `captureStderr`, `executionTimeout`, `killTimeout`, `user` / `group`,
-`failsWhen`, run-scoped `secrets`, `monitorResources`, and the rest of the
-shared launch keys; the complete list, with types and defaults, is in the
+`workingDirectory`, `priority`, `failsWhen`, run-scoped `secrets`,
+`monitorResources`, and the rest of the shared launch keys; the complete
+list, with types and defaults, is in the
 [configuration reference](Configuration-Reference#dags). Because a task **is**
 a job invocation, its launch fields inherit the file's
 [`defaults:` block](Includes-and-Defaults#the-defaults-section) the same way a
@@ -311,5 +312,5 @@ orchestration UI -- a DAG card and a per-DAG drawer (runs, tasks, graph, XCom,
 logs) with trigger, backfill, and approval decisions; its page documents that
 UI.
 
-See [example/dag/](https://github.com/ptweezy/cronstable/tree/develop/example/dag)
+See [example/dag/](https://github.com/ptweezy/cronstable/tree/main/example/dag)
 for a complete configuration exercising every node type.

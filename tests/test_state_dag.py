@@ -2161,7 +2161,7 @@ def test_maybe_terminalise_ignores_unmaterialised_mapped_task():
     assert result.changed is True
 
 
-# _mapped_instance_state: the barrier and the terminaliser share one
+# _fold_mapped_instances: the barrier and the terminaliser share one
 # absent-entry rule
 
 
@@ -2170,7 +2170,7 @@ def test_absent_mapped_instance_holds_run_open_like_the_barrier():
     # run-recorded instance index while the fan-in barrier read the same
     # hole as pending, so a damaged run document could complete as a run
     # whose mapped group still read "running" to every downstream.  Both
-    # consumers now share _mapped_instance_state: the hole holds the run
+    # consumers now share _fold_mapped_instances: the hole holds the run
     # open.  This calls the terminaliser directly, so it pins that rule in
     # isolation; a real advance pass runs _propagate_and_claim first, which
     # repairs the hole (see the test below) rather than leaving it open.
@@ -2250,6 +2250,38 @@ def test_claim_pass_leaves_a_plain_task_with_no_entry_alone():
     dag._maybe_terminalise(spec, body, 6.0, result)
     assert result.run_terminal is True
     assert body["state"] == dag.SUCCESS
+
+
+def test_a_null_task_entry_is_refused_before_any_mutation():
+    # tasks: {x: null} only appears in a damaged or foreign document, and
+    # the readers disagree about it (absent to the dependency check,
+    # pending to effective_state). Without the up-front refusal the
+    # outcome depended on entry order: a null scanned first crashed the
+    # pass, one scanned later silently un-gated its dependents.
+    spec = _spec(TaskSpec("up"), TaskSpec("down", depends_on=("up",)))
+    body = _body(spec)
+    body["tasks"]["up"] = None
+    transform = dag.plan_and_claim(spec, 1.0, "p", "h", {})
+    with pytest.raises(ValueError, match="task entry 'up' is null"):
+        transform(body)
+    assert body["tasks"]["down"]["state"] == dag.PENDING  # untouched
+
+
+def test_a_null_mapped_map_is_refused_before_any_mutation():
+    # mapped: null is the same class of damage. The read paths all treat
+    # it as "no fan-out", but the expansion write path cannot, so without
+    # the refusal a run claimed real work first and wedged only when the
+    # first expansion tried to record itself.
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec("w", expand=ExpandSpec(from_task="gen", key="items")),
+    )
+    body = _body(spec)
+    body["mapped"] = None
+    transform = dag.plan_and_claim(spec, 1.0, "p", "h", {})
+    with pytest.raises(ValueError, match="'mapped' is null"):
+        transform(body)
+    assert body["tasks"]["gen"]["state"] == dag.PENDING  # never claimed
 
 
 # set_task_pid: no-op on missing run / non-running entry

@@ -1,9 +1,11 @@
+import logging
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
 
-from cronstable import config
+from cronstable import config, platform
 from cronstable.config import (
     DEFAULT_CONFIG,
     ConfigError,
@@ -138,6 +140,9 @@ jobs:
                     config.DEFAULT_CONFIG["onFailure"]["report"]["webhook"]
                 ),
                 "push": config.DEFAULT_CONFIG["onFailure"]["report"]["push"],
+                "eventlog": (
+                    config.DEFAULT_CONFIG["onFailure"]["report"]["eventlog"]
+                ),
             },
             "retry": {
                 "backoffMultiplier": 2,
@@ -216,6 +221,9 @@ jobs:
                     config.DEFAULT_CONFIG["onFailure"]["report"]["webhook"]
                 ),
                 "push": config.DEFAULT_CONFIG["onFailure"]["report"]["push"],
+                "eventlog": (
+                    config.DEFAULT_CONFIG["onFailure"]["report"]["eventlog"]
+                ),
             },
             "retry": {
                 "backoffMultiplier": 2,
@@ -1218,6 +1226,327 @@ def test_monitor_resources_out_of_range(snippet, match):
         _monitor_job(snippet)
 
 
+# ---- workingDirectory: normalization and inheritance ------------------------
+#
+# Every fixture path below is built from tmp_path or the process CWD, never
+# from a POSIX-looking literal like "/srv/app": the set of strings that count
+# as absolute is not the same on both platforms (and, for ntpath, not even the
+# same across the interpreters this project supports), so a literal would pin
+# the tests to whichever box wrote them.
+
+
+def _wd_job(snippet):
+    """The single job of a config carrying ``snippet`` as an extra key."""
+    return config.parse_config_string(
+        "jobs:\n"
+        "  - name: wd\n"
+        "    command: echo hi\n"
+        '    schedule: "* * * * *"\n' + snippet,
+        "",
+    ).jobs[0]
+
+
+def test_working_directory_absolute_path_is_kept_as_written(tmp_path):
+    # The ordinary case: an already-absolute directory reaches the job
+    # unchanged, so what the operator reads in the config is what the spawn
+    # gets.  Single-quoted in the YAML because a Windows path carries
+    # backslashes and a drive colon.
+    job = _wd_job("    workingDirectory: '{}'\n".format(tmp_path))
+    assert job.workingDirectory == str(tmp_path)
+
+
+def test_working_directory_defaults_to_none():
+    # No key means "inherit the daemon's CWD", which is what every job got
+    # before the key existed; RunningJob.start omits the cwd kwarg for it
+    # rather than passing None.
+    assert _wd_job("").workingDirectory is None
+
+
+def test_working_directory_expands_tilde():
+    # `~/jobs` must mean the home directory, not a literal "~" directory
+    # under wherever the daemon happened to start (cronstable.state expands
+    # its own `path:` for the same reason).
+    job = _wd_job('    workingDirectory: "~/jobs"\n')
+    assert job.workingDirectory == os.path.abspath(
+        os.path.expanduser("~/jobs")
+    )
+
+
+def test_relative_working_directory_is_settled_at_load():
+    # Relative values are accepted, not rejected.  An absolute-only gate
+    # would have to ask os.path.isabs, whose answer for the same string
+    # changed in 3.13, so the same config would load on one supported
+    # interpreter and fail on the next.  Settling it here instead means the
+    # directory is decided once, and the resolved form is what the spawn log
+    # and any start failure show.
+    job = _wd_job("    workingDirectory: data/in\n")
+    assert job.workingDirectory == os.path.abspath("data/in")
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        pytest.param("    workingDirectory:\n", id="valueless"),
+        pytest.param('    workingDirectory: ""\n', id="quoted-empty"),
+        pytest.param("    workingDirectory: ${WD_EMPTY}\n", id="empty-var"),
+    ],
+)
+def test_blank_working_directory_means_inherit(snippet, monkeypatch):
+    # A blank value must land on None, never on abspath(""), which would
+    # silently freeze the daemon's load-time CWD into the job as if the
+    # operator had named that directory on purpose.
+    monkeypatch.setenv("WD_EMPTY", "")
+    assert _wd_job(snippet).workingDirectory is None
+
+
+def test_working_directory_inherits_from_defaults_and_is_overridable(
+    tmp_path,
+):
+    # The key lives in _job_defaults_common, so `defaults:` covers it with no
+    # new mechanism.  The third job is why the schema is EmptyNone() | Str():
+    # under an inherited value, a bare `workingDirectory:` is the only
+    # spelling that means "inherit the daemon's CWD instead".
+    base = tmp_path / "base"
+    own = tmp_path / "own"
+    conf = config.parse_config_string(
+        """
+defaults:
+  workingDirectory: '{base}'
+
+jobs:
+  - name: inherits
+    command: echo hi
+    schedule: "* * * * *"
+  - name: overrides
+    command: echo hi
+    schedule: "* * * * *"
+    workingDirectory: '{own}'
+  - name: opts-out
+    command: echo hi
+    schedule: "* * * * *"
+    workingDirectory:
+""".format(base=base, own=own),
+        "",
+    )
+    assert {job.name: job.workingDirectory for job in conf.jobs} == {
+        "inherits": str(base),
+        "overrides": str(own),
+        "opts-out": None,
+    }
+
+
+def test_working_directory_reaches_dag_task_templates(tmp_path):
+    # A task is a job invocation and where it runs from is a launch field, so
+    # it has to be in _DAG_TASK_LAUNCH_KEYS.  Without that entry a `defaults:`
+    # value still reaches the template (DagTaskConfig merges the whole
+    # defaults base) while a per-task key is a schema error, which is a
+    # confusing asymmetry rather than a clean failure.
+    base = tmp_path / "base"
+    own = tmp_path / "own"
+    conf = config.parse_config_string(
+        """
+defaults:
+  workingDirectory: '{base}'
+
+dags:
+  - name: pipe
+    schedule: "* * * * *"
+    tasks:
+      - id: a
+        command: foo
+      - id: b
+        command: bar
+        dependsOn:
+          - a
+        workingDirectory: '{own}'
+""".format(base=base, own=own),
+        "",
+    )
+    templates = {
+        task.id: task.job_template.workingDirectory
+        for task in conf.dags[0].tasks
+    }
+    assert templates == {"a": str(base), "b": str(own)}
+
+
+def test_working_directory_interpolates_env_vars(monkeypatch, tmp_path):
+    # workingDirectory is an ordinary scalar, so ${VAR} expands at load
+    # against the DAEMON environment; it is not on the skip list that leaves
+    # `command` and `shell` for the runtime shell to expand.
+    monkeypatch.setenv("WD_ROOT", str(tmp_path))
+    job = _wd_job("    workingDirectory: ${WD_ROOT}/app\n")
+    assert job.workingDirectory == os.path.join(str(tmp_path), "app")
+
+
+def test_unset_working_directory_variable_is_a_config_error(monkeypatch):
+    # And, being ordinary, it gets the standard unset-variable diagnostic
+    # naming the config location rather than a directory literally called
+    # "${WD_MISSING}".
+    #
+    # The two assertions below are the interpolation diagnostic and nothing
+    # else.  Do not weaken them to "WD_MISSING" in message or to the file
+    # name: interpolation runs after schema validation, so on a tree without
+    # this key the same YAML raises the strictyaml "unexpected key not in
+    # schema" error, which quotes the offending source line (WD_MISSING and
+    # all) and names prod.yaml too.  Either of those would pass against a
+    # workingDirectory that does not exist.
+    monkeypatch.delenv("WD_MISSING", raising=False)
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config_string(
+            "jobs:\n"
+            "  - name: wd\n"
+            "    command: echo hi\n"
+            '    schedule: "* * * * *"\n'
+            "    workingDirectory: ${WD_MISSING}\n",
+            "prod.yaml",
+        )
+    message = str(exc.value)
+    assert "jobs[0].workingDirectory" in message
+    assert "which is not set" in message
+
+
+# ---- priority: the vocabulary, its default, and the load-time advisory ------
+
+
+def _priority_job(snippet):
+    """The single job of a config carrying ``snippet`` as an extra key."""
+    return config.parse_config_string(
+        "jobs:\n"
+        "  - name: p\n"
+        "    command: echo hi\n"
+        '    schedule: "* * * * *"\n' + snippet,
+        "",
+    ).jobs[0]
+
+
+def test_priority_parses_and_defaults_to_the_inherit_level():
+    assert (
+        _priority_job("    priority: below-normal\n").priority
+        == "below-normal"
+    )
+    # No key means the level nothing is ever applied for, so the spawn stays
+    # what it always was.  The literal, not platform.DEFAULT_PRIORITY, since
+    # this is the place that pins the constant's value: product code compares
+    # against the name, so only a test can say what the name has to be.
+    assert _priority_job("").priority == "normal"
+
+
+def test_priority_inherits_from_defaults_and_is_overridable():
+    # The key lives in _job_defaults_common, so a `defaults:` block covers a
+    # whole fleet with no new mechanism, and a job can still say otherwise.
+    conf = config.parse_config_string(
+        """
+defaults:
+  priority: idle
+
+jobs:
+  - name: inherits
+    command: echo hi
+    schedule: "* * * * *"
+  - name: overrides
+    command: echo hi
+    schedule: "* * * * *"
+    priority: normal
+""",
+        "",
+    )
+    assert {job.name: job.priority for job in conf.jobs} == {
+        "inherits": "idle",
+        "overrides": "normal",
+    }
+
+
+@pytest.mark.parametrize(
+    "level",
+    [
+        # Excluded on purpose, not by oversight: REALTIME outranks the
+        # threads servicing disk, keyboard and mouse, so a runaway job at
+        # that class can put the host out of its operator's reach.  This
+        # test is the executable record of that decision, and goes red if
+        # anyone adds it to PRIORITY_LEVELS.
+        pytest.param("realtime", id="realtime"),
+        pytest.param("turbo", id="unknown"),
+        # a Task Scheduler number, which is a different vocabulary (0 to 10,
+        # highest first); refusing it is better than reading it as a level.
+        pytest.param("7", id="task-scheduler-number"),
+    ],
+)
+def test_priority_refuses_levels_outside_the_vocabulary(level):
+    with pytest.raises(ConfigError) as exc:
+        _priority_job("    priority: {}\n".format(level))
+    # the load error lists what IS accepted, so the fix is in the message
+    message = str(exc.value)
+    for accepted in platform.PRIORITY_LEVELS:
+        assert accepted in message
+
+
+def test_priority_applies_to_dag_tasks():
+    # A task is a job invocation, so it takes the launch keys a job takes;
+    # without the _DAG_TASK_LAUNCH_KEYS entry a `defaults:` value would
+    # still reach the template while a per-task key was a schema error.
+    conf = config.parse_config_string(
+        """
+dags:
+  - name: pipe
+    schedule: "* * * * *"
+    tasks:
+      - id: a
+        command: foo
+        priority: idle
+""",
+        "",
+    )
+    task = conf.dags[0].tasks[0]
+    assert task.id == "a"
+    assert task.job_template.priority == "idle"
+
+
+# Not skipped on Windows.  config.py reads sys.platform at call time, so
+# both arms of the advisory run on every matrix cell instead of only on the
+# OS they ship for, which is the injection its platform.py siblings got.  The
+# POSIX-only names are stood in for with raising=False, the same pattern
+# tests/test_platform.py::_record_setpriority uses for os.setpriority.
+@pytest.mark.parametrize(
+    "platform_name, level, euid, expected",
+    [
+        # A raise from an unprivileged daemon is the case worth saying out
+        # loud, once, at load: the kernel may refuse it every run, and the
+        # per-run refusal is only DEBUG (see platform.apply_priority).
+        pytest.param("linux", "high", 1000, True, id="unprivileged-raise"),
+        # root can renice freely, so there is nothing to advise about
+        pytest.param("linux", "high", 0, False, id="root-raise"),
+        # and a LOWERING never needs privilege, whoever is asking
+        pytest.param("linux", "idle", 1000, False, id="unprivileged-lowering"),
+        # Windows hands every class in this vocabulary to an unprivileged
+        # account, so the advisory has nothing to say there.  Same inputs as
+        # the first case: only the platform differs, so a lost win32 guard
+        # shows up as the advisory firing where the docs promise silence.
+        pytest.param("win32", "high", 1000, False, id="windows-never-refuses"),
+    ],
+)
+def test_a_raise_that_may_be_refused_is_advised_at_load(
+    monkeypatch, caplog, platform_name, level, euid, expected
+):
+    monkeypatch.setattr(sys, "platform", platform_name)
+    monkeypatch.setattr(os, "geteuid", lambda: euid, raising=False)
+    # cronstable's own nice, pinned so the comparison does not depend on
+    # what the test runner happens to have been started at.
+    monkeypatch.setattr(os, "nice", lambda increment: 0, raising=False)
+    with caplog.at_level("WARNING", logger="cronstable"):
+        job = _priority_job("    priority: {}\n".format(level))
+    assert job.priority == level
+    advisories = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "priority" in rec.getMessage()
+    ]
+    assert (len(advisories) == 1) is expected
+    if expected:
+        # it has to name the job, or an operator with 300 of them cannot act
+        assert "'p'" in advisories[0]
+        assert "high" in advisories[0]
+
+
 # ---- web.nodeHistory validation ---------------------------------------------
 
 
@@ -1285,6 +1614,19 @@ def test_resolve_secret_unreadable_file_is_config_error(tmp_path, content):
         blob.write_bytes(content)
     with pytest.raises(ConfigError, match="could not be read"):
         config._resolve_secret({"fromFile": str(blob)}, "job j secret s")
+
+
+def test_resolve_secret_file_is_utf8_and_tolerates_a_bom(tmp_path):
+    # The sibling of parse_environment_file's utf-8-sig.  Read with the
+    # locale codec this file is two different secrets on two OSes: on
+    # Windows "rt" decodes the ANSI code page, so the non-ASCII byte is
+    # mojibake from a file that is correct on Linux.  And a BOM (Notepad's
+    # "UTF-8 with BOM", a PowerShell redirect) is not whitespace, so
+    # .strip() cannot remove it and it rides into the secret itself.
+    blob = tmp_path / "secret.txt"
+    blob.write_bytes("\ufeffs\xfcper-secret\n".encode("utf-8"))
+    resolved = config._resolve_secret({"fromFile": str(blob)}, "what")
+    assert resolved == "s\xfcper-secret"
 
 
 def test_web_allowed_origins_parse():
@@ -2063,6 +2405,22 @@ def test_onlate_without_sla_is_rejected(snippet):
         _sla_job("    onLate:\n      report:\n" + snippet)
 
 
+def test_onlate_with_only_push_requires_sla():
+    # push is a report destination like the other four, so an onLate that
+    # enables only push and sets no sla threshold is the same dead hook.
+    # It is its own test rather than a row in the list above because it is
+    # the one destination that also has a cross-section validator: without
+    # the sla check firing first, this config fails later and elsewhere,
+    # with the "no push: section" message, which names the wrong mistake.
+    with pytest.raises(ConfigError, match="onLate requires sla"):
+        _sla_job(
+            "    onLate:\n"
+            "      report:\n"
+            "        push:\n"
+            "          enabled: true\n"
+        )
+
+
 def test_onlate_with_sla_is_accepted():
     job = _sla_job(
         "    sla:\n"
@@ -2501,3 +2859,115 @@ def test_duplicate_job_names_rejected(tmp_path):
         config.parse_config(str(cfg))
     assert "duplicate job name" in str(exc.value)
     assert "backup" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# report.eventlog (the Windows Event Log reporter)
+# ---------------------------------------------------------------------------
+
+_EVENTLOG_JOB = """
+jobs:
+  - name: el
+    command: echo hi
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        eventlog:
+          enabled: {enabled}
+          source: {source}
+"""
+
+
+def _eventlog_conf(tmp_path, source="cronstable", enabled="true"):
+    """Parse through parse_config, the only entry point that runs the
+    cross-section validators the eventlog checks live in."""
+    (tmp_path / "jobs.yaml").write_text(
+        _EVENTLOG_JOB.format(enabled=enabled, source=source), encoding="utf-8"
+    )
+    return config.parse_config(str(tmp_path))
+
+
+def test_eventlog_report_defaults():
+    job = config.parse_config_string(
+        "jobs:\n  - name: a\n    command: x\n    schedule: '* * * * *'\n", ""
+    ).jobs[0]
+    for hook in ("onFailure", "onPermanentFailure", "onSuccess", "onLate"):
+        assert getattr(job, hook)["report"]["eventlog"] == {
+            "enabled": False,
+            "source": "cronstable",
+            "includeOutput": False,
+        }
+
+
+@pytest.mark.parametrize(
+    "source", ["''", r"'a\b'", "'a/b'", "Application", "security"]
+)
+def test_eventlog_source_rejects_a_separator_or_a_log_name(source, tmp_path):
+    # the source names a registry key UNDER a log, so a path separator
+    # addresses something else, and the three log names are not source names
+    # at all (Security additionally needs a privilege the daemon lacks).
+    with pytest.raises(ConfigError, match="report.eventlog.source"):
+        _eventlog_conf(tmp_path, source=source)
+
+
+def test_eventlog_source_is_validated_on_dag_task_templates(tmp_path):
+    # the walker once covered jobs and notify only, so a source refused on
+    # a job loaded clean on a DAG task template and only failed at runtime
+    (tmp_path / "jobs.yaml").write_text(
+        """
+state:
+  path: /tmp/x
+dags:
+  - name: pipe
+    schedule: "* * * * *"
+    tasks:
+      - id: a
+        command: foo
+        onFailure:
+          report:
+            eventlog:
+              enabled: true
+              source: Application
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="dag pipe task a"):
+        config.parse_config(str(tmp_path))
+
+
+def test_eventlog_source_is_ignored_in_a_disabled_block(tmp_path):
+    # `source` carries a default into every report block of every hook, so
+    # inspecting disabled blocks would let a stray value in a block nobody
+    # turned on refuse the whole configuration.
+    conf = _eventlog_conf(tmp_path, source="Application", enabled="false")
+    assert conf.jobs[0].onFailure["report"]["eventlog"]["enabled"] is False
+
+
+def test_eventlog_on_posix_warns_once_naming_every_user(
+    tmp_path, caplog, monkeypatch
+):
+    monkeypatch.setattr(config.platform, "IS_WINDOWS", False)
+    with caplog.at_level(logging.WARNING):
+        _eventlog_conf(tmp_path)
+    warnings = [
+        r for r in caplog.records if "report.eventlog is enabled" in r.message
+    ]
+    assert len(warnings) == 1
+    assert "job el" in warnings[0].getMessage()
+
+
+def test_eventlog_on_windows_stays_quiet(tmp_path, caplog, monkeypatch):
+    monkeypatch.setattr(config.platform, "IS_WINDOWS", True)
+    with caplog.at_level(logging.WARNING):
+        _eventlog_conf(tmp_path)
+    assert "report.eventlog is enabled" not in caplog.text
+
+
+def test_onlate_with_only_eventlog_requires_sla():
+    with pytest.raises(ConfigError, match="onLate requires sla"):
+        _sla_job(
+            "    onLate:\n"
+            "      report:\n"
+            "        eventlog:\n"
+            "          enabled: true\n"
+        )

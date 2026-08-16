@@ -51,15 +51,22 @@ not the raw YAML text, which gives it these properties:
   `onFailure` / `onPermanentFailure` / `onSuccess` (including the retry and
   reporting policy, with secret values redacted); the sorted *names* of
   `environment` variables; `executionTimeout`; `killTimeout`; `statsd`;
-  `user`; `group`; and `concurrencyScope` when set to `cluster`.
+  `user`; `group`; `concurrencyScope` when set to `cluster`; and `priority`
+  when set to anything but `normal` (the level, never the nice value or
+  priority class a given platform resolves it to, so a Windows replica and a
+  Linux one still agree).
 
 Deliberately **not** part of the identity: the catch-up trio (`onMissed`,
 `startingDeadlineSeconds`, `catchupJitterSeconds`) and the archival pair
 (`archiveOutput`, `redactArchivedSecrets`), which are restart-time or
-observability-only, node-local behaviour; environment variable *values* and
-inline secret values (next section); and everything outside the job
-definitions, in particular the `cluster` section itself (the peer list,
-`distribution`, and the rest of the coordination config never move the id).
+observability-only, node-local behaviour; `workingDirectory`, for the same
+reason environment *values* are excluded (it is a per-host path, and a fleet
+can legitimately run the same logical job from `D:\jobs` on a Windows replica
+and `/srv/jobs` on a Linux one, which must not read as permanent drift);
+environment variable *values* and inline secret values (next section); and
+everything outside the job definitions, in particular the `cluster` section
+itself (the peer list, `distribution`, and the rest of the coordination config
+never move the id).
 
 Fields added after the `v1` scheme shipped enter the identity only when they
 are set away from their default (`concurrencyScope` above is one), so

@@ -20,7 +20,12 @@ from tests._cron_helpers import (
     _FakeMesh,
     fixed_current_time,  # noqa: F401
 )
-from tests._helpers import _drain_state_writes, _state_cfg, _wait_until
+from tests._helpers import (
+    _drain_state_writes,
+    _state_cfg,
+    _wait_until,
+    bare_http_raises,
+)
 from tests.conftest import Req, _cron
 
 
@@ -136,6 +141,31 @@ def test_resolve_web_token_empty_file_fails_closed(tmp_path):
                 }
             }
         )
+
+
+def test_resolve_web_token_file_tolerates_a_bom(tmp_path):
+    # The failure this closes is silent at both ends.  A BOM is not
+    # whitespace, so .strip() leaves it on the front of the token; the
+    # non-empty check above therefore passes, the daemon starts
+    # authenticated, and every request carrying the token the operator
+    # actually wrote comes back 401 with nothing in the log to say why.
+    # Notepad's "UTF-8 with BOM" and a PowerShell redirect both write one,
+    # and wiki/Running-on-Windows.md documents exactly this file as the
+    # unattended POST /shutdown stop path.
+    token = tmp_path / "token"
+    token.write_bytes("\ufeffhunter2\n".encode("utf-8"))
+    assert (
+        cronstable.cron.Cron._resolve_web_token(
+            {
+                "authToken": {
+                    "value": None,
+                    "fromFile": str(token),
+                    "fromEnvVar": None,
+                }
+            }
+        )
+        == "hunter2"
+    )
 
 
 @pytest.mark.asyncio
@@ -800,6 +830,70 @@ def test_run_stats_cpu_and_memory_aggregates():
     assert stats["last_rss_bytes"] is None
 
 
+def test_run_stats_last_fields_take_the_newest_by_finished_at():
+    # run records are appended unserialized and a peer node sharing the mount
+    # appends through its own process, so the last row in the list can be an
+    # older run.  Inverted on purpose: the newer run is FIRST.
+    from cronstable.resources import ResourceUsage
+
+    newer = _mk_run("success", dur=5.0)
+    newer.resource_usage = ResourceUsage(3.0, 0.0, 7000, 1)
+    older = _mk_run("success", dur=1.0)
+    older.resource_usage = ResourceUsage(1.0, 0.0, 1000, 1)
+    stats = cronstable.cron._run_stats([newer, older])
+    assert stats["last_duration"] == 5.0
+    assert stats["last_cpu_seconds"] == 3.0
+    assert stats["last_rss_bytes"] == 7000
+    # the aggregates are untouched: only the "last" selection moved
+    assert stats["avg_duration"] == 3.0
+    assert stats["max_cpu_seconds"] == 3.0
+
+
+def test_run_stats_equal_finish_instants_resolve_to_the_later_position():
+    # the documented tiebreak, and the guard for a plain max(): max returns
+    # the FIRST maximum it walks, so folding forwards over rows sharing an
+    # instant would report the OLDEST position's run as "last" and quietly
+    # invert test_run_stats_cpu_and_memory_aggregates above.
+    from cronstable.resources import ResourceUsage
+
+    first = _mk_run("success")
+    first.resource_usage = ResourceUsage(1.0, 0.0, 1000, 1)
+    second = _mk_run("success")
+    second.resource_usage = ResourceUsage(9.0, 0.0, 9000, 1)
+    stats = cronstable.cron._run_stats([first, second])
+    assert stats["last_cpu_seconds"] == 9.0
+    assert stats["last_rss_bytes"] == 9000
+
+
+def test_run_stats_row_without_a_finish_instant_never_wins_the_fold():
+    # the key function is total, so no caller has to pre-filter its rows: a
+    # JobRunInfo without a finish instant sorts oldest instead of making the
+    # fold raise TypeError.  The ledger cannot produce one (a record with
+    # neither finished_at nor interruptedAt is rejected outright by
+    # _job_run_info_from_dict, and a crash-reconciled row carrying only
+    # interruptedAt is rebuilt with the interruption instant standing in), so
+    # this row is hand-constructed.
+    from cronstable.resources import ResourceUsage
+
+    orphan = cronstable.cron.JobRunInfo(
+        outcome="unknown",
+        exit_code=None,
+        started_at=None,
+        finished_at=None,
+        fail_reason="no finish instant",
+        output=JobOutputStream(),
+    )
+    real = _mk_run("success", dur=2.0)
+    real.resource_usage = ResourceUsage(4.0, 0.0, 4000, 1)
+    assert cronstable.cron._run_finish_key(
+        orphan
+    ) < cronstable.cron._run_finish_key(real)
+    stats = cronstable.cron._run_stats([real, orphan])
+    assert stats["last_duration"] == 2.0
+    assert stats["last_cpu_seconds"] == 4.0
+    assert stats["total"] == 2
+
+
 def test_run_stats_no_monitored_runs_leaves_resource_fields_none():
     stats = cronstable.cron._run_stats(
         [_mk_run("success"), _mk_run("failure")]
@@ -851,6 +945,63 @@ def test_record_run_releases_superseded_ring():
     assert [line for _s, line in cron.last_run["alpha"].output.lines] == [
         "the new newest"
     ]
+
+
+def test_record_run_releases_the_ring_of_whichever_row_is_not_newest():
+    # the other direction of the same invariant, and a two-directional trap.
+    # A completion landing older than one already recorded (a peer node's
+    # append on a shared mount, or a backward wall-clock step) does not take
+    # over last_run, so the release has to follow the promotion rather than
+    # the call order: freeing the previous record unconditionally would empty
+    # the drawer the log replay still serves, and freeing nothing would leak
+    # the un-promoted row's 1000-line ring for the whole history window.
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    newer = _mk_run("success", dur=5.0)
+    newer.output.publish("stdout", "kept while newest")
+    newer.output.close()
+    cron._record_run("alpha", newer)
+
+    older = _mk_run("failure", exit_code=1, dur=1.0)
+    older.output.publish("stdout", "landed late")
+    older.output.close()
+    cron._record_run("alpha", older)
+
+    assert cron.last_run["alpha"] is newer
+    assert [line for _s, line in newer.output.lines] == ["kept while newest"]
+    # the un-promoted row is the superseded one, so ITS ring is released
+    assert list(older.output.lines) == []
+    assert older.output.published == 1
+    # both rows stay in history as summaries
+    assert list(cron.run_history["alpha"]) == [newer, older]
+    # and the watermarks did not rewind with it
+    assert cron._sla_last_success["alpha"] == newer.finished_at
+    assert cron._last_completed_at["alpha"] == newer.finished_at
+    assert cron._last_real_outcome["alpha"] == (newer.finished_at, "success")
+
+
+async def test_reconcile_open_record_releases_the_superseded_ring():
+    # the third writer of last_run, and the one that installs a row it did
+    # not run: on a runtime slot takeover the outgoing last_run is a real
+    # local run holding a full ring, which would otherwise sit in
+    # run_history until it fell out of RUN_HISTORY_LIMIT.
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    ran = _mk_run("success", dur=1.0)
+    ran.output.publish("stdout", "replayable while newest")
+    ran.output.close()
+    cron._record_run("alpha", ran)
+
+    # this host's own crash, so the synthetic row is promoted whatever its
+    # instant, and the run it supersedes gives up its ring
+    cron._reconcile_open_record(
+        "alpha",
+        cron.cron_jobs["alpha"],
+        {"startedAt": "2020-01-01T00:00:00+00:00", "host": cron._state_host},
+        "reconciled-crash",
+    )
+    assert cron.last_run["alpha"].outcome == "unknown"
+    assert list(ran.output.lines) == []
+    assert ran.output.published == 1
+    await asyncio.gather(*list(cron._pending_state_writes))
 
 
 _ARCHIVE_JOB = """
@@ -1149,7 +1300,14 @@ async def test_web_job_runs_endpoint_returns_runs_and_stats():
     assert stats["avg_duration"] == pytest.approx((2 + 4 + 6 + 1) / 4)
     assert stats["min_duration"] == 1.0
     assert stats["max_duration"] == 6.0
-    assert stats["last_duration"] == 1.0
+    # "last" is the newest run by finished_at, not the last one appended:
+    # _mk_run shares one start instant across the four rows and varies the
+    # duration, so the dur=6.0 run is the one that finished last even
+    # though the dur=1.0 cancellation was recorded after it.
+    assert stats["last_duration"] == 6.0
+    # ...and last_run follows the same rule, so the older cancellation
+    # recorded last did not become the job's latest run.
+    assert cron.last_run["alpha"].outcome == "success"
 
 
 @pytest.mark.asyncio
@@ -1231,19 +1389,46 @@ def test_strip_headers_drops_names_in_any_spelling():
 @pytest.mark.asyncio
 async def test_handler_errors_carry_the_json_envelope():
     # every 4xx body on this origin is the ONE envelope {"error": msg}
-    # (matching jobapi and /mcp) instead of per-handler text/plain; the
-    # bare-404 routes carry the reason too
+    # (matching jobapi and /mcp) instead of per-handler text/plain. The
+    # exception a handler RAISES carries it, not just the response the
+    # middleware eventually writes: a direct call never touches the
+    # middleware, and neither do the two middleware-less test apps below.
     import json
 
     from aiohttp import web
 
     cron = _cron(TWO_JOBS)
-    with pytest.raises(web.HTTPNotFound) as raised:
-        await cron._web_job_runs(Req(match={"name": "nope"}))
-    assert raised.value.content_type == "application/json"
-    assert json.loads(raised.value.text or "") == {
-        "error": "job 'nope' not found"
-    }
+    for handler, request, reason in (
+        (
+            cron._web_job_runs,
+            Req(match={"name": "nope"}),
+            "job 'nope' not found",
+        ),
+        (
+            cron._web_get_job,
+            Req(match={"name": "nope"}),
+            "job 'nope' not found",
+        ),
+        (
+            cron._web_job_trends,
+            Req(match={"name": "nope"}),
+            "job 'nope' not found",
+        ),
+        (
+            cron._web_schedule_why,
+            Req(query={"job": "nope", "at": "2026-01-01T00:00:00Z"}),
+            "no job or DAG schedule named 'nope'",
+        ),
+        (
+            cron._web_job_calendar,
+            Req(match={"name": "nope"}),
+            "no job or DAG schedule named 'nope'",
+        ),
+    ):
+        with pytest.raises(web.HTTPNotFound) as raised:
+            await handler(request)
+        assert raised.value.content_type == "application/json"
+        assert json.loads(raised.value.text or "") == {"error": reason}
 
     with pytest.raises(web.HTTPBadRequest) as raised:
         await cron._web_pause_job(
@@ -1555,11 +1740,18 @@ async def test_web_job_logs_unknown_job():
     from aiohttp.test_utils import TestClient, TestServer
 
     cron = _cron(TWO_JOBS)
+    # a bare Application with NO middleware, deliberately: this is where
+    # the handler's own response reaches the wire unrewrapped, so it shows
+    # the handler is a conforming object rather than one the envelope
+    # middleware happens to rescue. Adding the middleware here for tidiness
+    # would silently retire that half of the assertion.
     app = web.Application()
     app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
     async with TestClient(TestServer(app)) as client:
         resp = await client.get("/jobs/nope/logs")
         assert resp.status == 404
+        assert resp.content_type == "application/json"
+        assert (await resp.json())["error"] == "job 'nope' not found"
 
 
 # ---------------------------------------------------------------------------
@@ -1829,6 +2021,162 @@ async def test_web_errors_carry_the_json_envelope(start_web_app):
             assert resp.content_type == "application/json"
             assert "error" in await resp.json()
             assert "GET" in resp.headers.get("Allow", "")
+
+
+@pytest.mark.asyncio
+async def test_chunked_oversized_mcp_body_413s_with_the_envelope(
+    start_web_app,
+):
+    # The fourth family the envelope middleware catches, and the only one
+    # that starts below the application: a transport 413. POST /mcp refuses
+    # an oversized body from request.content_length BEFORE reading it, but a
+    # chunked request carries no length for that check to read, so the
+    # handler goes on to `await request.read()` and aiohttp's own
+    # client_max_size failure escapes it as an HTTPException nothing in the
+    # handler built. Without the middleware the caller gets that as
+    # text/plain, which is the shape /mcp clients never otherwise see.
+    import aiohttp
+
+    from cronstable.config import _build_mcp_config
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await start_web_app(
+        cron,
+        {"listen": ["http://127.0.0.1:0"], "ui": False},
+        _build_mcp_config({"enabled": True}),
+    )
+    port = cron.web_runner.addresses[0][1]
+
+    async def chunks():
+        # 1.25 MiB, over BOTH caps: mcp.maxBodyBytes (1 MiB by default) and
+        # aiohttp's client_max_size (1 MiB, the Application default this
+        # app takes). Over both is what makes the body of the reply tell
+        # the two refusals apart below. An async iterable is what makes the
+        # request chunked: the client cannot size one, so it sends no
+        # Content-Length and frames the body with Transfer-Encoding.
+        for _ in range(20):
+            yield b"x" * (64 * 1024)
+
+    async with aiohttp.ClientSession() as session:
+        url = "http://127.0.0.1:{}/mcp".format(port)
+        async with session.post(url, data=chunks()) as resp:
+            # The request really went out chunked. Asserted because the
+            # test degrades into a second spelling of test_mcp.py's
+            # test_http_oversized_body_is_413 (which drives the pre-check,
+            # its FakeReq carrying a content_length) the moment the body
+            # stops being an async iterable, and it degrades silently: the
+            # status, the content type and the envelope are identical down
+            # either path.
+            sent = resp.request_info.headers
+            assert sent.get("Transfer-Encoding") == "chunked"
+            assert "Content-Length" not in sent
+            assert resp.status == 413
+            assert resp.content_type == "application/json"
+            body = await resp.json()
+            assert set(body) == {"error"}
+            # ...and the server agrees it saw no length: the pre-check
+            # answers with its own sentence (mcp.py:_http_error), which
+            # never reaches the middleware because it is a RETURNED
+            # Response. Any other reason means the read is what failed.
+            assert body["error"] != "request body too large"
+
+
+# Every route that used to answer with a bare `raise web.HTTPNotFound()`,
+# with the reason its own lookup justifies. The two calendar/schedule rows
+# resolve through _job_or_dag_schedule, so a DAG's synthetic dag:<name>
+# schedule job is a legitimate 200 on them and the reason must not claim a
+# job was the only thing searched; the rest really do look only in
+# cron_jobs (or cron_dags). Parametrized rather than kept as a table keyed
+# on WEB_ROUTES: that lockstep contract already has two owners
+# (tests/test_openapi.py, tests/test_mcp_tools.py), and a third would mean
+# one added route fails three tests in three files. The general rule (no
+# handler raises a bare web.HTTP*) is carried by the AST guard below.
+_CONVERTED_404_ROUTES = [
+    (
+        "/schedule/why?job=nope&at=2026-01-01T00:00:00Z",
+        "no job or DAG schedule named 'nope'",
+    ),
+    ("/jobs/nope/calendar.ics", "no job or DAG schedule named 'nope'"),
+    ("/jobs/nope", "job 'nope' not found"),
+    ("/jobs/nope/trends", "job 'nope' not found"),
+    ("/jobs/nope/logs", "job 'nope' not found"),
+    ("/dags/nope/runs/rk/tasks/tk/logs", "dag 'nope' not found"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,reason", _CONVERTED_404_ROUTES)
+async def test_converted_404s_name_what_was_not_found(
+    start_web_app, path, reason
+):
+    # These six answered with aiohttp's own `404: Not Found`, which names
+    # neither the subject nor what was searched for it. The envelope
+    # middleware made the BODY json, so the defect survived a content-type
+    # check; assert the reason itself.
+    import aiohttp
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await start_web_app(cron, {"listen": ["http://127.0.0.1:0"], "ui": False})
+    port = cron.web_runner.addresses[0][1]
+    async with aiohttp.ClientSession() as session:
+        url = "http://127.0.0.1:{}{}".format(port, path)
+        async with session.get(url) as resp:
+            assert resp.status == 404
+            assert resp.content_type == "application/json"
+            assert await resp.json() == {"error": reason}
+
+
+@pytest.mark.asyncio
+async def test_dag_run_404_splits_unknown_dag_from_no_state_store():
+    # DagRunStore answers a plain None for two different causes (dagrun.py:
+    # `backend is None or dag_name not in self._dags()`), so the old single
+    # reason told an operator with no `state:` section that every DAG they
+    # configured did not exist. docs/openapi.yaml describes both causes on
+    # these routes; the body now distinguishes them.
+    import json
+
+    from aiohttp import web
+
+    cron = _cron(_DAG_LOGS_YAML)  # dags: lin, and no `state:` section
+    assert cron.state_backend is None
+    no_store = (
+        "no `state:` store is configured; DAG run documents only exist "
+        "in a durable store"
+    )
+    for handler, request in (
+        (cron._web_dag_runs, Req(match={"name": "lin"})),
+        (cron._web_dag_run, Req(match={"name": "lin", "run_key": "rk"})),
+        (cron._web_dag_xcom, Req(match={"name": "lin", "run_key": "rk"})),
+    ):
+        with pytest.raises(web.HTTPNotFound) as raised:
+            await handler(request)
+        assert json.loads(raised.value.text or "") == {"error": no_store}
+
+    # with a store configured the two DAG-side causes read as they did
+    cron.state_backend = object()
+    assert cron._dag_run_lookup_reason("ghost") == "dag 'ghost' not found"
+    assert (
+        cron._dag_run_lookup_reason("ghost", "rk") == "dag 'ghost' not found"
+    )
+    assert (
+        cron._dag_run_lookup_reason("lin", "rk") == "dag 'lin' has no run 'rk'"
+    )
+
+
+def test_no_web_handler_raises_a_bare_http_error():
+    # The pin that keeps the next handler from shipping a reasonless 404:
+    # an error response is built through one of the named envelope helpers
+    # (_api_error, _action_http_error, _http_for_action_error,
+    # _push_store_unavailable), never by naming a web.HTTP* class in a
+    # raise OR a return. The return half matters most: the envelope
+    # middleware rescues a RAISED HTTPException only, so a returned one
+    # reaches the wire as aiohttp's own text/plain. HTTPUnauthorized is
+    # allowlisted for an ARGUMENTLESS raise, which is what makes its body
+    # reasonless, and the rationale is written at its four sites here.
+    # jobapi.py carries the same rule, pinned in
+    # tests/test_state_job_api.py (its own test home).
+    path = Path(cronstable.cron.__file__)
+    assert bare_http_raises(path) == []
 
 
 @pytest.mark.asyncio
@@ -2244,7 +2592,7 @@ jobs:
     pause = SimpleNamespace(
         until=DT(2020, 1, 1, tzinfo=UTC), by="op", note=None
     )
-    monkeypatch.setattr(cron, "_pause_active", lambda name: pause)
+    monkeypatch.setattr(cron, "_pause_active", lambda name, now=None: pause)
     payload = cron.schedule_why_payload("boot", "2020-01-01T00:00:00")
     assert payload is not None
     assert payload["reboot"] is True
@@ -2480,6 +2828,8 @@ async def test_webloop_web_dag_task_logs_unknown_dag():
     from aiohttp.test_utils import TestClient, TestServer
 
     cron = _cron(_DAG_LOGS_YAML)
+    # no middleware here on purpose, as in test_web_job_logs_unknown_job:
+    # the handler's own response is what reaches the wire.
     app = web.Application()
     app.router.add_get(
         "/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs",
@@ -2488,6 +2838,8 @@ async def test_webloop_web_dag_task_logs_unknown_dag():
     async with TestClient(TestServer(app)) as client:
         resp = await client.get("/dags/nope/runs/rk/tasks/a/logs")
         assert resp.status == 404
+        assert resp.content_type == "application/json"
+        assert (await resp.json())["error"] == "dag 'nope' not found"
 
 
 @pytest.mark.asyncio

@@ -46,6 +46,8 @@ minimal/slim images that do not include the system tz data. See
 | pip | PyPI (`cronstable`) | No (uses your interpreter) | No |
 | pipx | PyPI (`cronstable`) | No (uses your interpreter) | No |
 | Standalone binary | GitHub Releases | Yes (embedded) | **Yes** |
+| Windows zip (one-directory) | GitHub Releases | Yes (embedded) | No |
+| Windows MSI | GitHub Releases | Yes (embedded) | No |
 | Homebrew | cronstable tap (release binary) | Yes (embedded) | **Yes** |
 | winget | winget-pkgs (release binary) | Yes (embedded) | **Yes** |
 
@@ -53,8 +55,8 @@ Only the standalone binary, including the copies Homebrew and winget install,
 self-extracts at startup and therefore needs a
 writable and executable temp directory (see
 [Standalone binary temp-directory requirement](#standalone-binary-temp-directory-requirement)).
-The image and the `pip`/`pipx` installs run cronstable as a normal Python package
-with the interpreter on disk and never self-extract.
+The image, the `pip`/`pipx` installs, and the Windows zip and MSI (whose
+files sit on disk beside `cronstable.exe`) run without self-extracting.
 
 ## Run with Docker
 
@@ -105,12 +107,12 @@ also available explicitly as `-debian`):
 | --- | --- | --- | --- |
 | *(none)* / `-debian` | `python:3.14-slim` | 3.14 | Default. Widest architecture coverage. |
 | `-alpine` | `python:3.14-alpine` | 3.14 | musl libc; smallest image. |
-| `-ubuntu` | `ubuntu:24.04` | 3.12 | Ubuntu LTS userland. |
-| `-rhel` | UBI 9 (`ubi-minimal`) | 3.12 | Red Hat base for RHEL / OpenShift. |
-| `-fedora` | `fedora:41` | 3.13 | Leading-edge RPM userland. |
-| `-opensuse` | `opensuse/leap:15.6` | 3.11 | SUSE / SLES family. |
+| `-ubuntu` | `ubuntu:26.04` | 3.14 | Ubuntu LTS userland. |
+| `-rhel` | UBI 10 (`ubi-minimal`) | 3.12 | Red Hat base for RHEL / OpenShift. |
+| `-fedora` | `fedora:44` | 3.14 | Leading-edge RPM userland. |
+| `-opensuse` | `opensuse/leap:16.0` | 3.13 | SUSE / SLES family. |
 | `-amazonlinux` | `amazonlinux:2023` | 3.11 | AWS-centric deployments. |
-| `-distroless` | `gcr.io/distroless/python3` | 3.11 | No shell or package manager; minimal attack surface. |
+| `-distroless` | `gcr.io/distroless/python3-debian13` | 3.13 | No shell or package manager; minimal attack surface. |
 
 ```shell
 # e.g. the Alpine variant, pinned to a version:
@@ -213,6 +215,10 @@ following assets, built natively on a matching runner:
 | `cronstable-macos-amd64` | macOS | Intel (x86_64) | Developer ID signed and notarized. |
 | `cronstable-windows-amd64.exe` | Windows | x64 (amd64) | Self-contained `.exe`; Python not required on the target. |
 | `cronstable-windows-arm64.exe` | Windows | ARM64 | Self-contained `.exe`; Python not required on the target. |
+| `cronstable-windows-amd64.zip` | Windows | x64 (amd64) | One-directory build (`cronstable\` folder holding `cronstable.exe` and `_internal\`); runs in place and can host the [Windows service](Windows-Service). |
+| `cronstable-windows-arm64.zip` | Windows | ARM64 | One-directory build; runs in place and can host the [Windows service](Windows-Service). |
+| `cronstable-windows-amd64.msi` | Windows | x64 (amd64) | Machine-wide installer; registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
+| `cronstable-windows-arm64.msi` | Windows | ARM64 | Machine-wide installer; registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
 
 The glibc Linux builds target glibc 2.39 (the Ubuntu 24.04 runner's libc) and
 work on any Linux host with glibc 2.39 or newer on the matching CPU. The musl builds
@@ -245,13 +251,31 @@ on ARM64) and run it directly; no `chmod` is needed:
 .\cronstable-windows-amd64.exe --version
 ```
 
-The Windows binaries carry a version resource but are not
-Authenticode-signed, so the first run of a browser-downloaded copy trips
-SmartScreen: choose "More info", then "Run anyway", and verify the download
-against the release's `SHA256SUMS` if your policy calls for it. `winget
-install ptweezy.cronstable` installs the same binary through the Windows
-Package Manager. See [Running on Windows](Running-on-Windows) for the full
+The Windows binaries carry a version resource and are Authenticode-signed
+with Azure Artifact Signing. The first run of a browser-downloaded copy can
+still trip SmartScreen while the signing identity's reputation accrues:
+choose "More info", then "Run anyway", and verify the download against the
+release's `SHA256SUMS` if your policy calls for it. `winget install
+ptweezy.cronstable` installs the same binary through the Windows Package
+Manager. See [Running on Windows](Running-on-Windows) for the full
 Windows install and deployment story.
+
+Windows releases also attach `cronstable-windows-amd64.zip` and
+`cronstable-windows-arm64.zip`, one-directory builds of the same program.
+Each extracts to a single `cronstable\` folder and is the download that can
+host the [Windows service](Windows-Service), which the one-file `.exe`
+cannot. Clear the Mark of the Web from the zip before extracting, so the
+extracted files do not each carry it; use an elevated PowerShell, since
+writing into `C:\Program Files` needs one:
+
+```powershell
+Unblock-File .\cronstable-windows-amd64.zip
+Expand-Archive .\cronstable-windows-amd64.zip -DestinationPath 'C:\Program Files'
+& 'C:\Program Files\cronstable\cronstable.exe' --version
+```
+
+For managed machine-wide deployment (GPO, Intune, SCCM) there is also an
+MSI per architecture; see [Windows MSI](Windows-MSI).
 
 ### macOS signing and notarization
 
@@ -299,7 +323,9 @@ directory. See [Production and Container Deployment](Production-Deployment).
 
 On Windows the self-extracting `.exe` uses the standard Windows temp directory
 (`%TEMP%`), which is writable and executable by default; the read-only-rootfs and
-`noexec` caveats above are Linux-container concerns only.
+`noexec` caveats above are Linux-container concerns only. The Windows zip and
+MSI installs keep their files on disk beside `cronstable.exe` and never
+unpack at startup, so this requirement does not apply to them at all.
 
 ## After installation
 

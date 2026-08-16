@@ -19,9 +19,13 @@ It runs over one of **two interchangeable transports** (see
 The decision logic -- parsing a Lease, deciding whether it is expired, choosing
 the action (create / acquire / renew / wait), and building the object to write
 back -- lives in the small pure helpers below and is fully unit-tested; both
-transports feed it the same JSON dict shape.  The transport layer that performs
-the calls and loads credentials is ``# pragma: no cover`` (exercised only by
-the Docker integration tests).
+transports feed it the same JSON dict shape.  The lifecycle around those
+helpers (:meth:`KubernetesBackend.start`, the renew loop, the round, the
+teardown that hands the Lease back) drives the Lease through the
+``_K8sTransport`` interface, so tests/test_backend_kubernetes.py covers it
+with an in-memory transport.  The two real transports perform the calls and
+load credentials: they are ``# pragma: no cover``, exercised by the Docker
+integration tests.
 
 The safety property is *local*: :meth:`KubernetesBackend.is_leader` is gated on
 a locally-computed expiry (``renew time + leaseDurationSeconds`` minus a small
@@ -603,7 +607,10 @@ class KubernetesBackend(StoreLeaseBackend):
                 holder = display_holder(self._observed_holder)
             self._holder = holder if holder is not None else _UNKNOWN_HOLDER
 
-    # --- transport selection + renew loop (integration-only) -------------
+    # --- transport selection, the renew loop and the teardown ------------
+    #
+    # Everything here reaches the apiserver through the _K8sTransport
+    # interface, so the tests drive it end to end with an in-memory one.
 
     def _native_available(self) -> bool:  # pragma: no cover - import probe
         try:
@@ -613,7 +620,7 @@ class KubernetesBackend(StoreLeaseBackend):
         except ImportError:
             return False
 
-    async def start(self) -> None:  # pragma: no cover - network/credential I/O
+    async def start(self) -> None:
         # `import kubernetes` pulls in urllib3/requests etc. -- a heavy
         # one-time import that must not block the run loop start_stop_cluster
         # awaits us from; probe it in a worker thread.
@@ -658,14 +665,20 @@ class KubernetesBackend(StoreLeaseBackend):
             # clean up half-started state (an open session, temp cert files, a
             # created renew task) so a failed start leaks nothing, honouring
             # the caller's contract.
-            if self._task is not None:
+            #
+            # The task arm is defensive: create_task is the LAST statement in
+            # the try, so nothing after it can raise with _task set. That
+            # ordering is an invariant of this method rather than a guarantee,
+            # so the arm stays for any statement added below it. A test cannot
+            # reach it, hence the pragma.
+            if self._task is not None:  # pragma: no cover - defensive
                 self._task.cancel()
                 self._task = None
             await self._transport.close()
             self._transport = None
             raise
 
-    async def _renew_loop(self) -> None:  # pragma: no cover - network loop
+    async def _renew_loop(self) -> None:
         assert self._transport is not None
         while not self._stop.is_set():
             try:
@@ -688,7 +701,7 @@ class KubernetesBackend(StoreLeaseBackend):
             except asyncio.TimeoutError:
                 pass
 
-    async def _renew_once(self) -> None:  # pragma: no cover - network
+    async def _renew_once(self) -> None:
         assert self._transport is not None
         # Serialise with the eager reboot-ran persist so the two writes do not
         # race on resourceVersion (see _persist_reboot_ran / the write lock).
@@ -746,7 +759,7 @@ class KubernetesBackend(StoreLeaseBackend):
                 )
             self._apply_round(action, write_ok, state, now, mono)
 
-    async def _persist_reboot_ran(self) -> None:  # pragma: no cover - network
+    async def _persist_reboot_ran(self) -> None:
         """Eagerly write the @reboot-ran set into the Lease annotations.
 
         cron records a deferred @reboot one-shot as run via ``mark_reboot_ran``
@@ -771,7 +784,7 @@ class KubernetesBackend(StoreLeaseBackend):
                 "cluster: kubernetes reboot-ran eager persist failed: %s", ex
             )
 
-    async def stop(self) -> None:  # pragma: no cover - network
+    async def stop(self) -> None:
         self._stop.set()
         if self._task is not None:
             self._task.cancel()
@@ -807,7 +820,7 @@ class KubernetesBackend(StoreLeaseBackend):
             self._transport = None
         self._is_leader = False
 
-    async def _release(self) -> None:  # pragma: no cover - network
+    async def _release(self) -> None:
         """Best-effort: clear ``holderIdentity`` so a peer can take over."""
         assert self._transport is not None
         try:
@@ -860,7 +873,7 @@ class KubernetesBackend(StoreLeaseBackend):
             logger.debug("cluster: kubernetes lease release failed: %s", ex)
 
 
-def _incluster_namespace() -> Optional[str]:  # pragma: no cover - file I/O
+def _incluster_namespace() -> Optional[str]:
     try:
         # utf-8 stated rather than inherited here and at the other three
         # reads in this module (the token and the two kubeconfigs): the
@@ -953,20 +966,18 @@ def _kubeconfig_cert_files(path: str) -> list[Optional[str]]:
 class _K8sTransport:
     """The observe/write/close surface the renew loop drives a Lease over."""
 
-    async def setup(self) -> None:  # pragma: no cover - integration
+    async def setup(self) -> None:
         raise NotImplementedError
 
     async def observe(
         self,
-    ) -> Optional[dict[str, Any]]:  # pragma: no cover - integration
+    ) -> Optional[dict[str, Any]]:
         raise NotImplementedError
 
-    async def write(
-        self, body: dict[str, Any], *, create: bool
-    ) -> bool:  # pragma: no cover - integration
+    async def write(self, body: dict[str, Any], *, create: bool) -> bool:
         raise NotImplementedError
 
-    async def close(self) -> None:  # pragma: no cover - integration
+    async def close(self) -> None:
         raise NotImplementedError
 
 

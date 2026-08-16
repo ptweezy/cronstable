@@ -13,7 +13,7 @@ name: CI
 # fails the gate, while the resulting chart + summary are attached to the
 # GitHub Release and appended to its notes.
 # No SOFTWARE is published on an ordinary commit; the
-# one thing that is, is documentation -- a push to `develop` publishes wiki/ to
+# one thing that is, is documentation -- a push to `main` publishes wiki/ to
 # the GitHub wiki (the `wiki` job, ungated, since a doc is not an artifact).
 #
 # A release happens ONLY when either:
@@ -64,19 +64,33 @@ on:
         type: string
         default: ""
 
-# One in-flight run per (head repo, branch). A same-repo branch push and its
-# PR still share a group, so the duplicate is cancelled rather than run twice.
-# The group is qualified by the HEAD repository because cancel-in-progress
-# evaluates on the INCOMING run: an unqualified group let a fork PR whose head
-# branch was named `main` land in the push-to-main group and cancel an
-# in-flight release mid-publish (its own ref is refs/pull/N/merge, so the
-# expression below was true for it). main is never cancelled by main pushes
-# (cancel-in-progress false there): consecutive main pushes QUEUE so releases
-# serialize instead of racing, and a workflow_dispatch release is likewise
-# protected from a later push cancelling it.
+# One in-flight run per (head repo, branch, kind). A same-repo branch push and
+# its PR still share a group, so the duplicate is cancelled rather than run
+# twice. The group is qualified by the HEAD repository because
+# cancel-in-progress evaluates on the INCOMING run: an unqualified group let a
+# fork PR whose head branch was named `main` land in the push-to-main group and
+# cancel an in-flight release mid-publish (its own ref is refs/pull/N/merge).
+#
+# It is also qualified by kind, and that is what protects a release now that
+# main is the only branch. `cancel-in-progress: false` protects a run that has
+# already started, and only that one; a run still waiting in the queue loses
+# its slot to the next push. So gating on the ref alone cost coverage rather
+# than minutes, and 555845a is the proof: it landed on main and its run died
+# in the queue before a single job started. Splitting the groups lets ordinary
+# pushes collapse freely while a release sits alone in its own group, starting
+# at once and running to completion; consecutive releases still share one
+# group and serialize.
+#
+# The release test errs on the side of caution and, unlike `decide`, is
+# allowed to be fuzzy: a false positive costs one extra run that survives to
+# the end, while a false negative could cancel a publish. It says yes to a
+# manual dispatch, to any pushed commit whose full message contains `[release`
+# (a superset of decide's stricter scan, which reads subject lines only), and
+# to any push of 20+ commits, the point at which the event payload truncates
+# and hides the rest.
 concurrency:
-  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'workflow_dispatch' }}
+  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}-${{ (github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null) && 'release' || 'ci' }}
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null) }}
 
 # Least-privilege default for all jobs; the publish jobs opt up to the narrower
 # write scopes they actually need (see each one's own permissions:).
@@ -136,9 +150,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Decide release
         id: d
         env:
@@ -155,9 +169,8 @@ jobs:
             release=true
             bump="${INPUT_BUMP:-minor}"
           elif [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/main" ]; then
-            # Trigger if ANY commit introduced by this push has a [release]
-            # marker -- not just the tip commit (the marker usually sits on a
-            # develop commit one behind the merge commit that lands on main).
+            # Trigger if any commit introduced by this push has a [release]
+            # marker.
             # The range is the commits new in this push (BEFORE..AFTER); on a
             # brand-new branch BEFORE is all-zeros, so fall back to the tip.
             zero="0000000000000000000000000000000000000000"
@@ -304,9 +317,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Install runtime + distributable extras
         run: |
           set -euo pipefail
@@ -392,7 +405,11 @@ jobs:
           set -euo pipefail
           pip install "$(grep -E '^playwright' requirements_dev.txt)"
           python -m playwright install --with-deps chromium
-      - run: tox -e py
+      # Both arms on every runner: the one that does not match the OS skips
+      # (a pass, no venv), so ubuntu-latest, windows-latest and
+      # windows-11-arm all take the same line and each measures the coverage
+      # profile for the OS it is on. See tox.ini's `platform` key.
+      - run: tox -e py-windows,py-posix
         # Newest-interpreter cells only, so the settled rows keep their current
         # output byte for byte. GitHub renders the false branch as an empty
         # string, which CPython reads the same as unset. tox forwards the name;
@@ -425,12 +442,12 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
         run: |
           set -euo pipefail
-          .tox/py/bin/python -m pytest \
+          .tox/py-posix/bin/python -m pytest \
             tests/test_web_engine_parity.py \
             tests/test_web_heat_e2e.py \
             tests/test_web_drawer_e2e.py \
             -v -rs --junitxml=parity-enforce.xml
-          .tox/py/bin/python - <<'EOF'
+          .tox/py-posix/bin/python - <<'EOF'
           import xml.etree.ElementTree as ET
           totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
           for suite in ET.parse("parity-enforce.xml").getroot().iter("testsuite"):
@@ -470,9 +487,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Build distributions
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -539,9 +556,9 @@ jobs:
         with:
           python-version: '3.15'
           allow-prereleases: true  # 3.15 is an rc until 2026-10-01
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -552,7 +569,7 @@ jobs:
           # cp315 wheel yet, so it compiles from sdist here. These runners have a
           # toolchain, so the cost is build time.
           uv venv --python 3.15
-          uv pip install pyinstaller==6.21.0  # supports 3.15 (requires_python <3.16)
+          uv pip install pyinstaller==6.22.1  # pin matches pyinstaller/Dockerfile
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) so the binary runs the faster
           # event loop. Install a wheel where one exists, else build it from
@@ -576,7 +593,7 @@ jobs:
           # push channel disabled. verify_extra.py round-trips a real
           # sealed box so a miscompiled libsodium also fails the job.
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" hard
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
           # Bundle zeroconf (the `discovery` extra) for web.bonjour. Pure
           # Python with optional speedups, so the install works on every
           # arch and is a HARD failure too. It is LGPL-2.1: the notice
@@ -584,7 +601,7 @@ jobs:
           # archive is attached to the Release, and the public build
           # recipe is the relink path. See LICENSING.md.
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too: a
@@ -734,7 +751,7 @@ jobs:
               # here (under QEMU on ppc64le/s390x/riscv64, which runs long).
               ${{ matrix.toolchain }}
               pip install --upgrade pip
-              pip install pyinstaller==6.21.0   # pin matches the other binary jobs
+              pip install pyinstaller==6.22.1   # pin matches the other binary jobs
               pip install .                     # bakes the pinned version into cronstable/version.py
               # Bundle uvloop (the `speedups` extra): a wheel where one exists
               # (amd64/arm64), else a source build. The shared script has
@@ -762,13 +779,13 @@ jobs:
               # uninstalled, so the binary never ships a miscompiled
               # libsodium (push fails closed).
               ${{ matrix.nacl_tools }}
-              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
               # Bundle zeroconf (the `discovery` extra): pure Python with
               # optional speedups, so a HARD install even under QEMU. It
               # is LGPL-2.1; the in-binary notice, Release source
               # archive, and public build recipe are the compliance kit
               # (see LICENSING.md).
-              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version            # smoke test, native or emulated on its own libc
               # Whenever the build env kept pynacl, the frozen binary
@@ -795,10 +812,10 @@ jobs:
       # with that exporter's multi-GB layer blobs, and this job alone is 13
       # matrix rows. Writing from every branch and every fork PR would evict
       # the layer cache the docker build depends on. Every other branch
-      # still RESTORES through to what develop and main stored, which is
+      # still RESTORES through to what main stored, which is
       # where the QEMU compile savings actually come from.
-      - name: Save pip cache (long-lived branches only)
-        if: ${{ steps.pip-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') }}
+      - name: Save pip cache (trunk only)
+        if: ${{ steps.pip-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v6.1.0
         with:
           path: .pip-cache
@@ -850,9 +867,9 @@ jobs:
         with:
           python-version: '3.15'  # set explicitly; don't rely on the runner's preinstalled patch level
           allow-prereleases: true  # 3.15 is an rc until 2026-10-01
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -862,7 +879,7 @@ jobs:
           # it with `uv run` (uv discovers the setup-python 3.15). aiohttp has no
           # cp315 wheel yet and compiles from sdist here.
           uv venv --python 3.15
-          uv pip install pyinstaller==6.21.0  # pin matches the Linux jobs
+          uv pip install pyinstaller==6.22.1  # pin matches the Linux jobs
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) for the faster event loop; macOS
           # ships wheels for both arches. The shared script has verify_extra.py
@@ -880,12 +897,12 @@ jobs:
           # are HARD failures on this lane (a soft-fail would silently
           # ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" hard
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on both arches, HARD failure. LGPL-2.1; in-binary notice +
           # Release source archive + public build recipe (LICENSING.md).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
@@ -965,9 +982,16 @@ jobs:
   # windows-11-arm runner. Any C-extension dep lacking a wheel (on 3.15 that is
   # aiohttp and zeroconf on BOTH arches, plus ruamel.yaml.clib and the rest of
   # the aiohttp stack on arm64) compiles from sdist via the runner's Visual
-  # Studio toolchain. Same pyinstaller pin + `--version` smoke test;
-  # the assets are cronstable-windows-<arch>.exe. Steps use bash (git bash ships
-  # on the Windows runners).
+  # Studio toolchain. Same pyinstaller pin + `--version` smoke test.
+  # Three assets per arch come out of here: the one-file
+  # cronstable-windows-<arch>.exe, the one-directory cronstable-windows-<arch>.zip
+  # (the shape that can host the Windows service; the one-file bootloader runs
+  # the app in a child process the SCM never sees), and the WiX MSI
+  # cronstable-windows-<arch>.msi carrying the same one-directory payload.
+  # These six artifacts are the unsigned gate set: on a release, the
+  # sign-windows job signs and repackages them and the release ships
+  # that set.
+  # Steps use bash (git bash ships on the Windows runners).
   binaries-windows:
     needs: version
     strategy:
@@ -991,12 +1015,16 @@ jobs:
         with:
           python-version: '3.15'
           allow-prereleases: true  # 3.15 is an rc until 2026-10-01
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+          # The spec's "both" mode emits dist/cronstable.exe and the
+          # service-hosting dist/cronstable/ from one Analysis, instead
+          # of paying the dependency scan twice per arch on every push.
+          CRONSTABLE_BUNDLE: both
         run: |
           set -euo pipefail
           # Runner-native (uv ships a win_arm64 build too); install into a
@@ -1010,7 +1038,7 @@ jobs:
           # aiohttp stack has a win_arm64 wheel to fall back on. Read a red here
           # as upstream wheel lag before suspecting a cronstable defect.
           uv venv --python 3.15
-          uv pip install pyinstaller==6.21.0  # supports 3.15 (requires_python <3.16)
+          uv pip install pyinstaller==6.22.1  # pin matches the Linux/macOS jobs
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle orjson (the `speedups` extra) for the durable-state / cluster
           # JSON paths; Windows amd64 ships a wheel (arm64 falls back if none).
@@ -1023,13 +1051,13 @@ jobs:
           # and verify are HARD failures on this lane (a soft-fail would
           # silently ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" hard
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on win32/amd64/arm64, HARD failure. LGPL-2.1; in-binary
           # notice + Release source archive + public build recipe
           # (LICENSING.md).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           ./dist/cronstable.exe --version      # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
@@ -1040,6 +1068,128 @@ jobs:
         with:
           name: cronstable-windows-${{ matrix.arch }}
           path: dist/cronstable-windows-${{ matrix.arch }}.exe
+          if-no-files-found: error
+          retention-days: 7
+      - name: Smoke-test and zip the one-directory bundle
+        run: |
+          set -euo pipefail
+          # dist/cronstable/ came out of the same spec run as the
+          # one-file exe (CRONSTABLE_BUNDLE=both), so the two layouts
+          # share one Analysis and cannot drift.
+          ./dist/cronstable/cronstable.exe --version
+          ./dist/cronstable/cronstable.exe --validate-config -c pyinstaller/smoke-push.yaml
+          # A real SCM round trip, because hosting a service is this
+          # artifact's whole point and the hosted runners are elevated.
+          # `service install` only needs the -c path to exist (it is baked
+          # absolute into the ImagePath); it never opens the service's log.
+          # Never `service start` here: there is nothing to run and a start
+          # would burn the recovery retries the install just configured.
+          # The trap keeps a failed step from leaking the service on the VM.
+          trap './dist/cronstable/cronstable.exe service remove --name cronstable-ci-smoke >/dev/null 2>&1 || true' EXIT
+          ./dist/cronstable/cronstable.exe service install --name cronstable-ci-smoke -c pyinstaller/smoke-push.yaml
+          ./dist/cronstable/cronstable.exe service status --name cronstable-ci-smoke | grep -i stopped
+          ./dist/cronstable/cronstable.exe service remove --name cronstable-ci-smoke
+          # Zip with the single top-level cronstable/ directory, so
+          # extracting into C:\Program Files yields the exact
+          # C:\Program Files\cronstable\cronstable.exe path the Windows
+          # documentation uses. root_dir/base_dir keep the folder prefix on
+          # every entry.
+          uv run python -c "import shutil; shutil.make_archive('dist/cronstable-windows-${{ matrix.arch }}', 'zip', root_dir='dist', base_dir='cronstable')"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-windows-${{ matrix.arch }}-zip
+          path: dist/cronstable-windows-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          retention-days: 7
+      # The recipe lives in the shared script because sign-windows
+      # rebuilds the MSIs with the SAME script: one recipe is what makes
+      # "the gate already proved this MSI" true. test_ci_fences pins
+      # both call sites.
+      - name: Build MSI
+        env:
+          VERSION: ${{ needs.version.outputs.new }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          sh .github/scripts/build_msi.sh "$ARCH" "$VERSION" \
+            dist/cronstable "dist/cronstable-windows-${ARCH}.msi"
+      # A real machine-wide install/uninstall on the elevated runner. The
+      # service must exist afterwards but never be started: the runner has
+      # no configuration, and the .wxs only starts a service on an upgrade
+      # that finds one, or on an explicit STARTSERVICE=1.
+      - name: Smoke-test MSI (install, verify, uninstall)
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/msi_smoke.sh
+          msi_install "dist/cronstable-windows-${ARCH}.msi" msi-install.log
+          # Registered, stopped, and the ImagePath is the exact quoted
+          # command line winservice.host_argv/image_path would write.
+          sc query cronstable | grep -q 'STOPPED'
+          sc qc cronstable | grep -F '"C:\Program Files\cronstable\cronstable.exe" -l INFO service run --name cronstable -c "C:\ProgramData\cronstable"'
+          # The recovery actions the Util custom action configured.
+          sc qfailure cronstable | grep -qi 'RESTART'
+          # The installed exe runs from Program Files.
+          "/c/Program Files/cronstable/cronstable.exe" --version
+          msi_uninstall "dist/cronstable-windows-${ARCH}.msi" msi-uninstall.log
+          # Service and files are gone.
+          if sc query cronstable >/dev/null 2>&1; then
+            echo "service still registered after uninstall" >&2
+            exit 1
+          fi
+          test ! -e "/c/Program Files/cronstable/cronstable.exe"
+      # A real major-upgrade round trip; the fresh-install smoke above
+      # exercises none of the upgrade choreography. Install with a
+      # CUSTOM config directory, upgrade to a patch-bumped twin without
+      # re-passing any property, then require the service still points
+      # at the custom directory and was started by the upgrade. Either
+      # assert missing re-opens the fleet failure: upgrades silently
+      # resetting the config dir and leaving the service stopped.
+      - name: Smoke-test MSI upgrade (remembered properties, restart)
+        env:
+          VERSION: ${{ needs.version.outputs.new }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/msi_smoke.sh
+          sh .github/scripts/build_msi.sh "$ARCH" "$VERSION" \
+            dist/cronstable upgrade-twin.msi bump-patch
+          cfg="/c/cronstable-ci-upgrade-cfg"
+          cfgwin='C:\cronstable-ci-upgrade-cfg'
+          mkdir -p "$cfg"
+          cp pyinstaller/smoke-push.yaml "$cfg/"
+          # Leave neither the install nor the service behind on failure.
+          trap '. .github/scripts/msi_smoke.sh; \
+            msi_uninstall upgrade-twin.msi cleanup-twin.log >/dev/null 2>&1 || true; \
+            msi_uninstall "dist/cronstable-windows-${ARCH}.msi" cleanup-v1.log >/dev/null 2>&1 || true; \
+            rm -rf "$cfg"' EXIT
+          msi_install "dist/cronstable-windows-${ARCH}.msi" upgrade-v1.log \
+            CONFIGDIR="$cfgwin"
+          sc qc cronstable | grep -F "$cfgwin"
+          # The upgrade: no properties on the command line, the managed
+          # rollout's normal shape.
+          msi_install upgrade-twin.msi upgrade-v2.log
+          # The custom directory survived the re-registration.
+          sc qc cronstable | grep -F "$cfgwin"
+          # The probe found the remembered directory: the start
+          # component's marker exists and the service reaches RUNNING
+          # (the config in $cfg already passed --validate-config).
+          MSYS2_ARG_CONV_EXCL='*' reg query 'HKLM\SOFTWARE\cronstable' /v ServiceStartedByMsi
+          for _ in $(seq 1 15); do
+            sc query cronstable | grep -q 'RUNNING' && break
+            sleep 2
+          done
+          sc query cronstable | grep -q 'RUNNING'
+          msi_uninstall upgrade-twin.msi upgrade-uninstall.log
+          if sc query cronstable >/dev/null 2>&1; then
+            echo "service still registered after upgrade uninstall" >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-windows-${{ matrix.arch }}-msi
+          path: dist/cronstable-windows-${{ matrix.arch }}.msi
           if-no-files-found: error
           retention-days: 7
 
@@ -1111,7 +1261,7 @@ jobs:
           #
           # ignore-error is the second line of defence. A cache export is an
           # optimization; it must never be able to red a build that succeeded.
-          cache-to: ${{ (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') && format('type=gha,mode=max,scope={0},ignore-error=true', matrix.distro) || '' }}
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope={0},ignore-error=true', matrix.distro) || '' }}
 
   # Paired performance benchmark. The suite in benchmarks/ runs against BOTH
   # this commit and the latest published release tag, interleaved on one
@@ -1145,9 +1295,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Install current and baseline environments
         id: envs
         env:
@@ -1364,9 +1514,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.12.1"
+          version: "0.12.5"
       - name: Build core + pro, prove the boundary, run pro's tests
         run: |
           set -euo pipefail
@@ -1382,6 +1532,245 @@ jobs:
   # when `release` is skipped on an ordinary commit (do NOT add always()).
   # ---------------------------------------------------------------------------
 
+  # Authenticode-sign the Windows assets with Azure Artifact Signing, on
+  # a release only. A separate x64 job for two reasons: the signing
+  # client does not support Windows ARM runners, so the arm64 lane
+  # cannot sign its own build, and keeping id-token: write out of the
+  # build lanes means their third-party build code can never mint a
+  # signing token. Authenticode is architecture-agnostic; one runner
+  # signs both arches' PEs.
+  #
+  # The payload exe must be signed before it is packaged, so this job
+  # unzips both zips, signs, re-zips, rebuilds both MSIs from the signed
+  # tree with the same pinned WiX, and signs those. The signed amd64 MSI
+  # gets a real msiexec round trip here; the arm64 MSI cannot execute on
+  # this runner, and binaries-windows' native smoke already proved the
+  # .wxs semantics this same run on the unsigned twin.
+  #
+  # Missing secrets warn and the release ships unsigned, the macOS
+  # lane's rule. A signing failure with the secrets present fails the
+  # release: shipping unsigned silently while signing is configured is
+  # the stale-tap failure mode.
+  sign-windows:
+    needs: [version, binaries-windows]
+    if: needs.version.outputs.release == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write   # OIDC federation for azure/login; no stored client secret
+    outputs:
+      signed: ${{ steps.decide.outputs.signed }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1    # for packaging/msi/cronstable.wxs
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Decide whether to sign
+        id: decide
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
+        run: |
+          set -euo pipefail
+          # All six or none, docker-push's registry-gate rule: a partial
+          # set would fail azure/login mid-release instead of degrading
+          # to the unsigned ship. The name list IS the env block above
+          # (an unset secret still materializes as an empty env var);
+          # test_ci_fences keeps the env block covering every secret the
+          # job references.
+          names="$(compgen -A export AZURE_ | sort || true)"  # no-match exits 1; the guard below owns that case
+          if [ -z "$names" ]; then
+            echo "no AZURE_* env vars found; the decide step lost its env block" >&2
+            exit 1
+          fi
+          missing=""
+          for name in $names; do
+            [ -n "${!name:-}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::Windows signing secrets not configured (missing:$missing); shipping unsigned Windows binaries. See wiki/Contributing-and-Releasing.md."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          fi
+      # The six Windows artifacts, flattened. The MSIs ride along for
+      # the pattern but are rebuilt below; an MSI's payload cannot be
+      # swapped after the fact.
+      - name: Download Windows artifacts
+        if: steps.decide.outputs.signed == 'true'
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: cronstable-windows-*
+          merge-multiple: true
+          path: signdir
+      - name: Log in to Azure (OIDC)
+        if: steps.decide.outputs.signed == 'true'
+        uses: azure/login@v3.0.1
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Unpack the payloads and stage the exes
+        if: steps.decide.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p out exes
+          for arch in amd64 arm64; do
+            python -c "import zipfile; zipfile.ZipFile('signdir/cronstable-windows-${arch}.zip').extractall('work/${arch}')"
+            test -f "work/${arch}/cronstable/cronstable.exe"
+            cp "signdir/cronstable-windows-${arch}.exe" exes/
+          done
+      # Three PE signing calls: the staged one-file exes, then each
+      # payload's root exe. The filter with recursion off keeps the
+      # third-party DLLs under _internal out of our signature. The
+      # timestamps are required: Artifact Signing rotates leaf
+      # certificates within days, and an untimestamped signature dies
+      # with its certificate (test_ci_fences pins the inputs on every
+      # signing step).
+      - name: Sign the one-file exes
+        if: steps.decide.outputs.signed == 'true'
+        uses: azure/artifact-signing-action@v2.0.0
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\exes
+          files-folder-filter: exe
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: Sign the amd64 payload exe
+        if: steps.decide.outputs.signed == 'true'
+        uses: azure/artifact-signing-action@v2.0.0
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\work\amd64\cronstable
+          files-folder-filter: exe
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: Sign the arm64 payload exe
+        if: steps.decide.outputs.signed == 'true'
+        uses: azure/artifact-signing-action@v2.0.0
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\work\arm64\cronstable
+          files-folder-filter: exe
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: Re-zip the signed payloads
+        if: steps.decide.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          # Same shape the build lane produced: a single top-level
+          # cronstable/ folder, so extracting into C:\Program Files
+          # yields the documented path.
+          for arch in amd64 arm64; do
+            python -c "import shutil; shutil.make_archive('out/cronstable-windows-${arch}', 'zip', root_dir='work/${arch}', base_dir='cronstable')"
+            cp "exes/cronstable-windows-${arch}.exe" out/
+          done
+      - name: Rebuild the MSIs from the signed payload
+        if: steps.decide.outputs.signed == 'true'
+        env:
+          VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          # The SAME recipe as binaries-windows' Build MSI step, by
+          # construction: one shared script, so the signed rebuild
+          # cannot drift from the MSI the gate's msiexec smoke proved.
+          # -arch is metadata, so this x64 runner builds the arm64
+          # package too.
+          for arch in amd64 arm64; do
+            sh .github/scripts/build_msi.sh "$arch" "$VERSION" \
+              "work/${arch}/cronstable" "out/cronstable-windows-${arch}.msi"
+          done
+      - name: Sign the MSIs
+        if: steps.decide.outputs.signed == 'true'
+        uses: azure/artifact-signing-action@v2.0.0
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\out
+          files-folder-filter: msi
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      # The action can exit 0 having signed nothing (a filter typo), so
+      # check the exact bytes being uploaded. The set is DERIVED, not
+      # enumerated: everything in out/ except the zips, plus each
+      # payload root's exes (work/ is the tree the zips were built
+      # from, so that covers the exe inside each zip). A new asset in
+      # out/ is verified without being listed here; the count floor
+      # catches the set shrinking.
+      - name: Verify every signature
+        if: steps.decide.outputs.signed == 'true'
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem out -File | Where-Object Extension -ne '.zip') +
+                   @(Get-ChildItem work\*\cronstable\*.exe -File)
+          if ($files.Count -lt 6) {
+            throw "expected at least 6 signed files (2 exes, 2 MSIs, 2 payload exes), found $($files.Count)"
+          }
+          foreach ($f in $files) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            if ($sig.Status -ne 'Valid') {
+              throw "unsigned or invalid signature on $($f.FullName): $($sig.Status) $($sig.StatusMessage)"
+            }
+            Write-Host "OK $($f.FullName) -> $($sig.SignerCertificate.Subject)"
+          }
+      # A real msiexec round trip on the signed amd64 package (this
+      # runner is x64 and elevated). The ImagePath/recovery greps stay
+      # in binaries-windows' native smoke; this one proves the signed
+      # rebuild still installs, registers the service and runs. The
+      # trap keeps a failed step from leaking the install.
+      - name: Smoke-test the signed amd64 MSI (install, uninstall)
+        if: steps.decide.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          . .github/scripts/msi_smoke.sh
+          msi="out/cronstable-windows-amd64.msi"
+          trap 'msi_uninstall "$msi" signed-cleanup.log >/dev/null 2>&1 || true' EXIT
+          msi_install "$msi" signed-install.log
+          sc query cronstable | grep -q 'STOPPED'
+          "/c/Program Files/cronstable/cronstable.exe" --version
+          msi_uninstall "$msi" signed-uninstall.log
+      - name: Upload the signed set
+        if: steps.decide.outputs.signed == 'true'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          # Named outside the cronstable-* pattern on purpose: the
+          # release job merges that glob into one directory, and a
+          # matching name would leave signed and unsigned copies of the
+          # same filenames to fight over download order. test_ci_fences
+          # pins the name outside the glob.
+          name: signed-windows
+          path: |
+            out/cronstable-windows-amd64.exe
+            out/cronstable-windows-arm64.exe
+            out/cronstable-windows-amd64.zip
+            out/cronstable-windows-arm64.zip
+            out/cronstable-windows-amd64.msi
+            out/cronstable-windows-arm64.msi
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     needs:
       - version
@@ -1393,6 +1782,7 @@ jobs:
       - binaries-container
       - binaries-macos
       - binaries-windows
+      - sign-windows
       - docker
       - perf
     if: needs.version.outputs.release == 'true'
@@ -1462,6 +1852,19 @@ jobs:
           pattern: cronstable-*
           merge-multiple: true
 
+      # On a signed release, replace the six Windows files before
+      # anything hashes or attaches them, so SHA256SUMS, the Release
+      # assets and the winget manifests describe the signed bytes.
+      # Gated on the sign job's output because this job cannot see the
+      # secrets, and downloading a never-uploaded artifact would fail
+      # the publish. test_ci_fences pins the position.
+      - name: Overlay the signed Windows artifacts
+        if: needs.sign-windows.outputs.signed == 'true'
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: signed-windows
+          path: binaries
+
       # One SHA256SUMS over the dist + every SHIPPED binary (bare filenames, so
       # `sha256sum -c` works from any directory). Enumerated explicitly -- a
       # `cronstable-*` glob would fold the CI-only macOS 26 binaries into the
@@ -1481,6 +1884,8 @@ jobs:
              binaries/cronstable-linux-riscv64-musl binaries/cronstable-linux-armv6-musl \
              binaries/cronstable-macos-amd64 binaries/cronstable-macos-arm64 \
              binaries/cronstable-windows-amd64.exe binaries/cronstable-windows-arm64.exe \
+             binaries/cronstable-windows-amd64.zip binaries/cronstable-windows-arm64.zip \
+             binaries/cronstable-windows-amd64.msi binaries/cronstable-windows-arm64.msi \
              "$work"/
           ( cd "$work" && sha256sum -- * ) > SHA256SUMS
           cat SHA256SUMS
@@ -1541,7 +1946,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p third-party
-          python3 -m pip download "zeroconf>=0.132" --no-deps --no-binary :all: -d third-party
+          python3 -m pip download "zeroconf>=0.149.16" --no-deps --no-binary :all: -d third-party
           cp cronstable/licenses/THIRD-PARTY-NOTICES.txt third-party/
           ls -l third-party
 
@@ -1593,6 +1998,10 @@ jobs:
             binaries/cronstable-macos-arm64
             binaries/cronstable-windows-amd64.exe
             binaries/cronstable-windows-arm64.exe
+            binaries/cronstable-windows-amd64.zip
+            binaries/cronstable-windows-arm64.zip
+            binaries/cronstable-windows-amd64.msi
+            binaries/cronstable-windows-arm64.msi
 
   # Build + push the multi-arch container images at the just-released version.
   # Runs after `release` (so the tag it checks out exists) and is thus gated on
@@ -1843,12 +2252,10 @@ jobs:
   # written). wiki/ is the source of truth; the wiki is the render target (the
   # pages use ~460 bare `[Page](Page)` wiki links, which ONLY resolve there).
   #
-  # Publishes from `develop`, not `main`: develop is the default branch and
-  # where wiki/ is edited, and the pages hardcode /blob/develop/ links and
-  # raw.githubusercontent.com/.../develop/ screenshots -- the wiki documents
-  # develop by construction. Syncing from both would also race: `concurrency` is
-  # keyed per branch, so a develop push and a main merge are NOT serialized
-  # against each other and their wiki pushes would collide.
+  # Publishes from `main`, the repository's only long-lived branch: it is where
+  # wiki/ is edited, and the pages hardcode /blob/main/ links and
+  # raw.githubusercontent.com/.../main/ screenshots, so the wiki documents the
+  # trunk by construction. Only a push to main publishes.
   #
   # GITHUB_TOKEN with `contents: write` can push a repo's OWN wiki -- no PAT.
   # The widespread "wikis need a PAT" advice traces to one archived action's
@@ -1857,12 +2264,12 @@ jobs:
   # is only needed for a wiki in a DIFFERENT repo -- which is why the Homebrew
   # tap push above needs HOMEBREW_TAP_TOKEN and this job needs no secret at all.
   wiki:
-    # The repository guard is not redundant: a fork has its OWN develop, and a
+    # The repository guard earns its place: a fork has its OWN main, and a
     # fork's wiki is uninitialized (a wiki repo does not exist until someone
     # creates a page), so `<fork>/cronstable.wiki` 404s and the checkout fails.
     # Every other job in this pipeline is fork-clean, so without this the wiki
-    # job would be a permanent red X on every fork's develop push.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.repository == 'ptweezy/cronstable'
+    # job would be a permanent red X on every fork's main push.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'ptweezy/cronstable'
     runs-on: ubuntu-latest
     permissions:
       # The one grant that allows pushing the wiki. GitHub's docs never mention
@@ -1893,10 +2300,11 @@ jobs:
           git -C .wiki config user.name  "github-actions[bot]"
           git -C .wiki config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # The wiki accepts web-UI edits and two develop pushes can overlap
-          # before cancel-in-progress lands, so a push CAN lose a race. The
-          # commit is a pure snapshot of wiki/, so there is nothing to rebase --
-          # re-mirror onto the new tip and retry instead of reddening a docs run.
+          # The wiki accepts web-UI edits, and a release run sits in its own
+          # concurrency group alongside an ordinary one, so two publishes can
+          # overlap and a push can lose a race. The commit is a pure snapshot
+          # of wiki/, so there is nothing to rebase: re-mirror onto the new tip
+          # and retry instead of reddening a docs run.
           for attempt in 1 2 3; do
             git -C .wiki fetch -q origin master
             git -C .wiki reset -q --hard origin/master

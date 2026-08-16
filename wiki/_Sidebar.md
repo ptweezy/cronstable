@@ -4,6 +4,9 @@
   - [Installation](Installation)
   - [Command-Line Reference](CLI-Reference)
   - [Running on Windows](Running-on-Windows)
+  - [Windows Service](Windows-Service)
+  - [Windows MSI](Windows-MSI)
+  - [Importing from Task Scheduler](Importing-Task-Scheduler)
   - [Production and Container Deployment](Production-Deployment)
 - **Configuration**
   - [Configuration Reference](Configuration-Reference)
@@ -30,6 +33,7 @@
 - **Integrations**
   - [Reporting (Mail, Sentry, Shell, Webhook)](Reporting)
   - [Push Notifications](Push-Notifications)
+  - [Windows Event Log](Windows-Event-Log)
   - [Metrics with Prometheus](Metrics-with-Prometheus)
   - [Metrics with statsd](Metrics-with-Statsd)
   - [HTTP Control API](HTTP-API)

@@ -4389,10 +4389,7 @@ def bench_loop_idle_wake():
 
         cron._launch_plan = _capture
 
-        def _spin(subminute=False):
-            # counted at the END of each pass: the first call closes the
-            # start-up pass (fixtures, seeding, catch-up) and opens the
-            # measured window, the last closes it and stops the loop.
+        def _spin(subminute=False, now=None):
             state["n"] += 1
             if state["n"] == 1:
                 state["t0"] = time.perf_counter()

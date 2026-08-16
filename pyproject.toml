@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77", "setuptools_scm>=8"]
+requires = ["setuptools>=83", "setuptools_scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -41,10 +41,10 @@ keywords = [
 dynamic = ["version"]
 dependencies = [
     "strictyaml>=1.7,<2",
-    "aiohttp>=3.10,<4",
-    "sentry-sdk>=2,<3",
-    "aiosmtplib>=3,<6",
-    "jinja2>=3,<4",
+    "aiohttp>=3.14.3,<4",
+    "sentry-sdk>=2.8,<3",
+    "aiosmtplib>=5.1.1,<6",
+    "jinja2>=3.1.6,<4",
     # zoneinfo's tz database, so timezones resolve on minimal/slim images
     # that don't ship the system tzdata.
     "tzdata>=2024.1",
@@ -114,7 +114,7 @@ speedups = [
     # so it stays optional and the zero-new-dep, architecture-portable core
     # install runs on stock json without it. It does have Windows wheels, so
     # (unlike uvloop) it needs no platform marker.
-    "orjson>=3.9",
+    "orjson>=3.11.6",
 ]
 # End-to-end encrypted push alerts (the `push` reporter; see cronstable.push).
 # PyNaCl bundles libsodium (pure C, no Rust), ships abi3 wheels for every
@@ -124,11 +124,11 @@ speedups = [
 # is no silent runtime fallback: a config with a `push:` section refuses to
 # start when this is absent (an alerting channel must fail closed, not
 # self-disable). See config._validate_push_config.
-push = ["pynacl>=1.5"]
+push = ["pynacl>=1.6.2"]
 # Zero-config LAN discovery (the opt-in `web.bonjour` mDNS advert; see
 # cronstable.discovery). Same fail-closed contract: web.bonjour without this
 # installed is a ConfigError, never a silent no-advert.
-discovery = ["zeroconf>=0.132"]
+discovery = ["zeroconf>=0.149.16"]
 dev = [
     # only the cluster mTLS tests use it, and it has no win-arm64 wheel; see
     # requirements_dev.txt for why it's gated to other platforms.
@@ -139,9 +139,9 @@ dev = [
     # the importorskip blind spot that file warns about: the accelerated
     # JSON, push-sealing, and mDNS test arms all self-skip.  This list and
     # requirements_dev.txt are pinned equal by tests/test_dev_deps_parity.py.
-    "orjson>=3.9; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
-    "pynacl>=1.5",
-    "zeroconf>=0.132",
+    "orjson>=3.11.6; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+    "pynacl>=1.6.2",
+    "zeroconf>=0.149.16",
     # drives a real Chromium for the client/daemon cron-engine differential;
     # requirements_dev.txt explains the marker and the separate browser step.
     "playwright; platform_machine != 'ARM64' or sys_platform != 'win32'",
@@ -210,8 +210,18 @@ max-complexity = 20
 python_version = "3.10"
 # Type-check against the POSIX API surface (grp/pwd/os.setuid/...), which is
 # where those calls actually run; the Windows-specific branches are guarded at
-# runtime (sys.platform checks / getattr) and covered by the test suite. CI
-# runs mypy on Linux, so pinning this keeps local runs on any OS consistent.
+# runtime (sys.platform checks / getattr). CI runs mypy on Linux, so pinning
+# this keeps local runs on any OS consistent.
+#
+# The gate that reads the Windows branches is the test suite, and until the
+# per-OS coverage profiles below existed that claim was hollow: every Windows
+# branch was pragma'd out of the measurement on the Windows rows too. It is
+# now true, because `# pragma: no cover (windows)` code is measured there. A
+# second `mypy --platform win32` pass would be the stronger check and is not
+# wired yet; `cronstable.platform.apply_priority` reaches os.setpriority
+# behind a plain bool (the `windows=` override its tests drive both arms
+# with), which no sys.platform spelling can prune, so that pass currently
+# needs a `type: ignore` the Linux pass considers unused.
 platform = "linux"
 no_implicit_optional = true
 warn_no_return = true
@@ -252,6 +262,11 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# A wedged await (the intermittent 3.12 test_dag_tools_full_flow hang) must
+# dump every thread's stack and fail the run, not burn the 30 min CI job
+# timeout and report "cancelled". Armed per test; no test comes near 300s.
+faulthandler_timeout = 300
+faulthandler_exit_on_timeout = true
 
 [tool.coverage.run]
 source = ["cronstable"]
@@ -260,6 +275,39 @@ omit = ["cronstable/version.py"]
 
 [tool.coverage.report]
 show_missing = true
+# Three pragma tokens, two profiles. A bare `# pragma: no cover` is hidden on
+# every OS (defensive branches, unreachable raises, the etcd/kubernetes
+# network glue). `# pragma: no cover (windows)` is hidden on POSIX and
+# MEASURED on Windows; `# pragma: no cover (posix)` is the mirror. Without
+# them the Windows cells scored the wrong file: the Windows code that runs
+# there was excluded, and the POSIX code that cannot run there was counted
+# and missed.
+#
+# Rule 2 is the only difference between the two profiles. coverage
+# substitutes the environment variable when it reads this file, and tox.ini
+# sets it from the `windows`/`posix` factor to name the platform whose
+# branches CANNOT run in that env. The default (`windows`) is the historical
+# POSIX-shaped measurement, so a bare `pytest --cov` or an IDE run reports
+# what it always did.
+#
+# exclude_lines REPLACES coverage's defaults rather than appending to them
+# (which is what `exclude_also` does, and the default catch-all pragma rule
+# would then swallow the tagged pragmas before rule 2 ever saw them). So rule
+# 1 is coverage's own DEFAULT_EXCLUDE[0] with a lookahead appended, and the
+# last two entries are the copies of DEFAULT_EXCLUDE[1] and [2] this project
+# still wants. Both OS rules accept the token anywhere after `cover`, so a
+# site can keep the trailing prose that explains it.
+# tests/test_coverage_profiles.py pins rule 1 against DEFAULT_EXCLUDE[0]
+# verbatim, because that relationship is the point of rule 1; it pins the
+# last two by what they exclude instead, since coverage rewords those two
+# between patch releases and a verbatim pin would red every cell whose
+# resolved coverage is a patch out of step with this one.
+exclude_lines = [
+    '#\s*(pragma|PRAGMA)[:\s]?\s*(no|NO)\s*(cover|COVER)(?!.*\((windows|posix)\))',
+    '#\s*(pragma|PRAGMA)[:\s]?\s*(no|NO)\s*(cover|COVER).*\(${CRONSTABLE_COVERAGE_SKIP-windows}\)',
+    '^\s*(((async )?def .*?)?[\])]+(\s*->.*?)?:\s*)?\.\.\.\s*(#|$)',
+    'if (typing\.)?TYPE_CHECKING:',
+]
 
 [tool.bandit]
 exclude_dirs = ["tests"]

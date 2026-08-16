@@ -13,6 +13,7 @@ import types
 
 import pytest
 
+from cronstable import platform
 from cronstable.config import ConfigError, parse_config_string
 from cronstable.cron import Cron
 from cronstable.job import RunningJob, report_config_enabled
@@ -115,10 +116,37 @@ def test_report_config_enabled_probes_each_reporter():
         ),
         lambda r: r["shell"].__setitem__("command", "notify.sh"),
         lambda r: r["webhook"]["url"].__setitem__("value", "https://x"),
+        # push was never added here when push shipped, so the function's
+        # claim to mirror every reporter went unchecked for one of them.
+        lambda r: r["push"].__setitem__("enabled", True),
     ):
         report = json.loads(json.dumps(disabled))
         enable(report)
         assert report_config_enabled(report)
+
+
+def test_report_config_enabled_probes_eventlog_on_windows(monkeypatch):
+    # eventlog is the one reporter whose early return is the PLATFORM, so
+    # the mirror has to test the platform too.
+    monkeypatch.setattr(platform, "IS_WINDOWS", True)
+    conf = parse_config_string(
+        "jobs:\n  - name: a\n    command: 'x'\n    schedule: '@reboot'\n", ""
+    )
+    report = json.loads(json.dumps(conf.jobs[0].onFailure["report"]))
+    report["eventlog"]["enabled"] = True
+    assert report_config_enabled(report)
+
+
+def test_report_config_enabled_ignores_eventlog_on_posix(monkeypatch):
+    # without the platform half, an eventlog-only config would schedule a
+    # fan-out on every completion on Linux for reporters that all drop it.
+    monkeypatch.setattr(platform, "IS_WINDOWS", False)
+    conf = parse_config_string(
+        "jobs:\n  - name: a\n    command: 'x'\n    schedule: '@reboot'\n", ""
+    )
+    report = json.loads(json.dumps(conf.jobs[0].onFailure["report"]))
+    report["eventlog"]["enabled"] = True
+    assert not report_config_enabled(report)
 
 
 # ---------------------------------------------------------------------------

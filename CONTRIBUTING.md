@@ -30,7 +30,7 @@ CI (the `dco` job) checks that every commit in a pull request carries this
 trailer. Forgot it? Sign off the whole branch and force-push:
 
 ```sh
-git rebase --signoff origin/develop
+git rebase --signoff origin/main
 git push --force-with-lease
 ```
 
@@ -65,19 +65,90 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 > `user`/`group` feature imports `grp`/`pwd` lazily and is rejected on Windows.
 > mypy is pinned to the `linux` platform (it type-checks the POSIX API surface;
 > the Windows branches are runtime-guarded), so type-checking is identical on
-> every OS.
+> every OS. The coverage gate is the one check that reads those Windows
+> branches, and it only does so when they are tagged: write
+> `# pragma: no cover (windows)`, not a bare
+> `# pragma: no cover`. See [the pragma vocabulary](#coverage-pragmas).
+
+## Branching
+
+cronstable develops on a single branch, `main`. Open your pull request against
+it.
+
+CI collapses superseded runs: pushing again cancels the earlier run, whether it
+had already started or was still waiting in the queue, so an intermediate
+commit can land with its run cut short. Push a commit you want fully tested on
+its own. Releases are the exception. They sit in their own concurrency group,
+where they start at once and always run to completion.
 
 ## Running the checks
 
 Everything CI runs is driven by `tox`:
 
 ```sh
-tox            # all envs: py310-py315, lint, mypy, bandit, openapi
-tox -e lint    # ruff check + ruff format --check
-tox -e mypy    # mypy
-tox -e bandit  # bandit security lint (medium+ severity)
-tox -e py      # pytest on the current interpreter
+tox                # all envs: py310-py315 (each in a windows and a posix arm),
+                   # lint, mypy, bandit, openapi
+tox -e lint        # ruff check + ruff format --check
+tox -e mypy        # mypy
+tox -e bandit      # bandit security lint (medium+ severity)
+tox -e py          # pytest on the current interpreter, POSIX coverage profile
+tox -e py-windows  # Windows hosts: the Windows coverage profile explicitly
+tox -e py-posix    # POSIX hosts: the POSIX coverage profile explicitly
 ```
+
+Each interpreter row exists twice, once per OS profile, and `tox.ini`'s
+`platform` key makes the arm that does not match the machine skip. A skip
+counts as a pass as long as the invocation also names an arm that does match;
+an invocation whose only env skips exits 1. So a bare `tox` works everywhere,
+and CI names both arms in one command (`tox -e py-windows,py-posix`), but
+naming the single wrong arm for your box fails. On Windows, `tox -e py-posix`
+prints `py-posix: skipped because platform win32 does not match (?!win32).*`
+and then `evaluation failed :(`.
+
+`tox -e py`, `tox -e py312` and the other unfactored envs still run the whole
+suite, at the POSIX profile that the coverage numbers have always used. On
+Windows, prefer a bare `tox` or `tox -e py-windows`: the POSIX profile hides
+the Windows branches you are editing and counts the POSIX ones you cannot run
+as missed, all against the same `--cov-fail-under`.
+
+### Coverage pragmas
+
+`# pragma: no cover` comes in three forms, and picking the wrong one is how a
+branch stops being gated:
+
+| Form | Hidden on | Measured on |
+| --- | --- | --- |
+| `# pragma: no cover` | every OS | nowhere |
+| `# pragma: no cover (windows)` | POSIX | Windows |
+| `# pragma: no cover (posix)` | Windows | POSIX |
+
+Use the bare form only for code no CI row can reach: defensive branches,
+unreachable raises, the etcd/kubernetes network glue, and `tui.py`'s macOS
+branch (the matrix has no macOS row, so a third token would have no profile to
+be measured in).
+
+A branch guarded by `IS_WINDOWS` or `sys.platform == "win32"` takes a token
+where its clause genuinely cannot execute on the other OS, because it reaches
+for something that only exists there: `msvcrt`, `fcntl`, `grp`/`pwd`,
+`os.nice`, `os.killpg`, `ctypes.windll`. Where it does, the other side of the
+branch takes the other token, and that half is the one people forget. Plenty of
+platform branches here are plain Python that the tests drive from either box by
+monkeypatching `IS_WINDOWS`; those stay untagged on purpose, since they really
+are measured on both. A few things to get right when you tag a branch:
+
+- Tagging an `if` header excludes that clause only. An `else` needs its own
+  tag, and a fall-through tail (code after the `if` block rather than inside an
+  `else`) has no header to tag at all, which is why `cronstable/platform.py`
+  spells its POSIX arms out as explicit `else` clauses.
+- The token may sit anywhere after `cover`, so a site can keep the trailing
+  prose that explains it.
+- Keep the guard spelled the way the tests drive it. Several Windows arms are
+  exercised from Linux by monkeypatching `platform.IS_WINDOWS`, which cannot
+  patch `sys.platform`; rewriting such a guard to `sys.platform == "win32"`
+  sends the test down the POSIX arm for real.
+
+`tests/test_coverage_profiles.py` holds the vocabulary and both profiles, and
+fails a branch that is tagged on one side only.
 
 `tox.ini` declares `requires = tox-uv`, so `tox` provisions its environments and
 installs dependencies with uv automatically (much faster; behavior-identical).
@@ -145,7 +216,7 @@ workflow**, then pick the bump level from the dropdown.
 
 The same pipeline runs on every commit and PR; only the publish steps are
 gated behind the release check (the lone exception is the `wiki` job, which
-publishes documentation on every push to `develop` — see [Editing the
+publishes documentation on every push to `main` — see [Editing the
 wiki](#editing-the-wiki)). On a release it, in order:
 
 1. **decides** whether to release and at what level (the strict marker check,
@@ -167,13 +238,13 @@ wiki](#editing-the-wiki)). On a release it, in order:
    GitHub Release with the wheel, sdist, and all the binaries
    (`cronstable-linux-{amd64,arm64,i686,armv7,ppc64le,s390x,riscv64}`, their
    `-musl` variants plus `cronstable-linux-armv6-musl`, `cronstable-macos-{arm64,amd64}`,
-   and `cronstable-windows-{amd64,arm64}.exe`) plus a single `SHA256SUMS`
+   and `cronstable-windows-{amd64,arm64}.exe`, `.zip` and `.msi`) plus a single `SHA256SUMS`
    attached, then pushes the multi-arch container images and updates the
    Homebrew tap.
 
 Because no file is committed back to *this* repo, a release never re-triggers
 the workflow. (Two jobs do push elsewhere — the Homebrew tap on a release, and
-the wiki on a `develop` commit — but both targets are separate repositories and
+the wiki on a `main` commit — but both targets are separate repositories and
 a push to either raises no event here.) Because the tag is
 created *after* publishing, a failed publish leaves no orphan tag and a re-run
 cleanly retries the same version.
@@ -207,12 +278,12 @@ docker run --rm -v "$PWD/example/docker/cronstable.yaml:/etc/cronstable.d/cronst
 
 Edit [`wiki/`](wiki) in this repo — not the wiki in the browser. The
 [GitHub wiki](https://github.com/ptweezy/cronstable/wiki) is a published copy:
-every push to `develop` runs the pipeline's `wiki` job, which mirrors
+every push to `main` runs the pipeline's `wiki` job, which mirrors
 `wiki/*.md` onto it (one file per page, named as the page's URL:
 `Web-Dashboard.md` → `/wiki/Web-Dashboard`).
 
 The mirror is authoritative, so it **deletes**: a page created or edited from
-the wiki's web UI is reverted on the next push to `develop`. The job prints
+the wiki's web UI is reverted on the next push to `main`. The job prints
 every add/modify/delete to the run log.
 
 Pages link to each other with bare wiki links — `[Installation](Installation)` —
