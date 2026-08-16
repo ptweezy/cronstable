@@ -12,8 +12,12 @@ Talks to etcd over the v3 gRPC-gateway JSON/HTTP API with the core
 architecture coverage); keys and values are base64-encoded per that API.
 
 As with the Kubernetes backend, the decision logic is in pure, unit-tested
-helpers; the HTTP glue is ``# pragma: no cover`` and exercised only by the
-Docker integration tests.  :meth:`EtcdBackend.is_leader` is gated on a
+helpers.  The lifecycle around them (:meth:`EtcdBackend.start`, the renew
+loop, the round, the campaign, the @reboot-ran CAS, the teardown that revokes
+the lease) reaches etcd only through :meth:`_post`, so
+tests/test_backend_etcd.py drives it with ``_post`` replaced.  The HTTP
+request/failover glue inside ``_post`` is ``# pragma: no cover``, exercised by
+the Docker integration tests.  :meth:`EtcdBackend.is_leader` is gated on a
 locally-computed lease deadline, so a stalled keepalive self-demotes without
 a network call, and ``is_quorate`` reflects a fresh successful call (stale ->
 ``Leader`` fails closed, never-skip ``PreferLeader`` runs anyway).
@@ -514,9 +518,12 @@ class EtcdBackend(StoreLeaseBackend):
                 fence_anchor, self._effective_ttl
             )
 
-    # --- network glue (integration-only) ---------------------------------
+    # --- the lifecycle: session, campaign, renew loop, teardown ----------
+    #
+    # Everything here reaches etcd through _post (the one integration-only
+    # member), so the tests drive it end to end with _post replaced.
 
-    async def start(self) -> None:  # pragma: no cover - network/credential I/O
+    async def start(self) -> None:
         self._ssl = self._build_ssl()
         self._record_tls_files(self._tls_file_paths())
         timeout = aiohttp.ClientTimeout(total=self.connect_timeout)
@@ -567,14 +574,19 @@ class EtcdBackend(StoreLeaseBackend):
             # this the open ClientSession leaks, once per reload, and is
             # never closed (the caller never stores the manager to stop()
             # it). BaseException also covers a cancellation mid-handshake.
-            if self._task is not None:
+            # Defensive: create_task is the LAST statement in the try, so
+            # nothing after it can raise with _task set. That ordering is an
+            # invariant of this method rather than a guarantee, so the arm
+            # stays for any statement added below it. A test cannot reach it,
+            # hence the pragma.
+            if self._task is not None:  # pragma: no cover - defensive
                 self._task.cancel()
                 self._task = None
             await self._session.close()
             self._session = None
             raise
 
-    def _build_ssl(self) -> Optional[ssl.SSLContext]:  # pragma: no cover
+    def _build_ssl(self) -> Optional[ssl.SSLContext]:
         if not any(self.endpoint_is_https(e) for e in self.endpoints):
             return None
         ctx = ssl.create_default_context(cafile=self._tls.get("ca") or None)
@@ -598,7 +610,7 @@ class EtcdBackend(StoreLeaseBackend):
                 paths.append(value)
         return paths
 
-    def tls_files_loadable(self) -> bool:  # pragma: no cover - ssl file I/O
+    def tls_files_loadable(self) -> bool:
         """Dry-run-load the current on-disk client-TLS material.
 
         Consulted by ``start_stop_cluster`` before tearing the backend down
@@ -615,7 +627,7 @@ class EtcdBackend(StoreLeaseBackend):
             return False
         return True
 
-    async def _authenticate(self) -> Optional[str]:  # pragma: no cover
+    async def _authenticate(self) -> Optional[str]:
         resp = await self._post(
             "/v3/auth/authenticate",
             {"name": self.username, "password": self.password},
@@ -710,7 +722,7 @@ class EtcdBackend(StoreLeaseBackend):
 
     async def _grant_lease(
         self,
-    ) -> "tuple[Optional[str], Optional[int]]":  # pragma: no cover
+    ) -> "tuple[Optional[str], Optional[int]]":
         """Grant a lease; return ``(lease_id, server_granted_ttl)``.
 
         The granted TTL may be lower than requested, so the caller narrows the
@@ -719,15 +731,11 @@ class EtcdBackend(StoreLeaseBackend):
         resp = await self._post("/v3/lease/grant", {"TTL": str(self.ttl)})
         return lease_id_from_grant(resp), lease_ttl_from_grant(resp)
 
-    async def _keepalive(
-        self, lease_id: str
-    ) -> Optional[int]:  # pragma: no cover - network
+    async def _keepalive(self, lease_id: str) -> Optional[int]:
         resp = await self._post("/v3/lease/keepalive", {"ID": str(lease_id)})
         return lease_ttl_from_keepalive(resp)
 
-    async def _campaign(
-        self, lease_id: str
-    ) -> "tuple[Optional[str], bool]":  # pragma: no cover - network
+    async def _campaign(self, lease_id: str) -> "tuple[Optional[str], bool]":
         """Campaign for the election key; return ``(holder, won)``.
 
         ``holder`` is the display name stored at the key; ``won`` is whether
@@ -773,7 +781,7 @@ class EtcdBackend(StoreLeaseBackend):
             campaign_won(resp, lease_id),
         )
 
-    async def _renew_loop(self) -> None:  # pragma: no cover - network loop
+    async def _renew_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 # Bound each round by round_deadline (< the effective ttl,
@@ -796,7 +804,7 @@ class EtcdBackend(StoreLeaseBackend):
             except asyncio.TimeoutError:
                 pass
 
-    async def _renew_once(self) -> None:  # pragma: no cover - network
+    async def _renew_once(self) -> None:
         # Anchor the local leadership fence to a monotonic instant captured
         # BEFORE the lease-renewing POST is sent: etcd resets the lease TTL
         # when it *processes* the request, so a pre-send sample is a
@@ -881,7 +889,7 @@ class EtcdBackend(StoreLeaseBackend):
 
     async def _sync_reboot_ran(
         self, *, leaderish: Optional[bool] = None
-    ) -> None:  # pragma: no cover - network
+    ) -> None:
         """Best-effort: read the @reboot-ran key, fold it in, re-persist marks.
 
         A read/write failure never fails the leadership round (the local set
@@ -960,7 +968,7 @@ class EtcdBackend(StoreLeaseBackend):
                     )
                 logger.debug("cluster: etcd reboot-ran sync failed: %s", ex)
 
-    async def _cas_write_reboot_ran(self) -> None:  # pragma: no cover
+    async def _cas_write_reboot_ran(self) -> None:
         """Read-modify-write the @reboot-ran key with optimistic concurrency.
 
         Reads the key (and its ``mod_revision``), folds the stored set into
@@ -1030,7 +1038,7 @@ class EtcdBackend(StoreLeaseBackend):
             _REBOOT_RAN_CAS_ATTEMPTS,
         )
 
-    async def _persist_reboot_ran(self) -> None:  # pragma: no cover - network
+    async def _persist_reboot_ran(self) -> None:
         # eager write on mark_reboot_ran (before the deferred job launches);
         # best-effort -- _sync_reboot_ran retries it each round if it fails.
         try:
@@ -1075,7 +1083,7 @@ class EtcdBackend(StoreLeaseBackend):
             )
         return False
 
-    async def stop(self) -> None:  # pragma: no cover - network
+    async def stop(self) -> None:
         self._stop.set()
         if self._task is not None:
             self._task.cancel()
