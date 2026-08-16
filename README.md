@@ -1115,9 +1115,10 @@ defaults:
 ride the durable store and are visible to every node sharing it.)
 
 Pair a device from the dashboard ("Pair a device" in the command palette or
-settings, a QR scan) or with one call:
+settings; the QR is a deep link, so scanning it with the phone's camera
+opens the app directly) or with one call:
 
-[![The dashboard's Pair a device panel: a QR code of the connection payload, the same JSON as a copyable string, and a warning that the embedded token holds every scope](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
+[![The dashboard's Pair a device panel: a QR code deep-linking the connection payload into the app being paired, the same payload as a copyable JSON string, and a warning that the embedded token holds every scope](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
 
 ```shell
 curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
@@ -1127,7 +1128,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 
 Setting `web.bonjour: true` (with the `discovery` extra installed)
 additionally advertises the web API as a `_cronstable._tcp` mDNS service on
-the local network, so a companion app finds the daemon without a typed URL;
+the local network, so client apps find the daemon without a typed URL;
 see the
 [LAN Discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)
 wiki page.
