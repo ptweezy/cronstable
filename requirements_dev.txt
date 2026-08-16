@@ -8,12 +8,14 @@ cryptography; platform_machine != "ARM64" or sys_platform != "win32"
 # installs it: they were importorskip-guarded and therefore skipped in all 12
 # matrix cells, so the orjson arm of cronstable._json shipped unexercised.
 # Installed here so `tox -e py` really runs it. Excluded where a wheel is not
-# reliably available (win-arm64; a just-released Python that orjson has not
-# built for yet) since it needs a Rust toolchain to build from source; those
-# cells still self-skip via importorskip, and
+# reliably available (a just-released Python that orjson has not built for
+# yet) since it needs a Rust toolchain to build from source; those cells still
+# self-skip via importorskip, and
 # test_orjson_is_installed_where_a_wheel_exists fails if this line ever stops
-# covering the cells that DO have wheels.
-orjson>=3.11.6; python_version < "3.15" and (platform_machine != "ARM64" or sys_platform != "win32")
+# covering the cells that DO have wheels. win-arm64 is NOT excluded: unlike
+# cryptography and playwright above, orjson has shipped a win_arm64 wheel
+# since 3.10.17, well under the floor here.
+orjson>=3.11.6; python_version < "3.15"
 # pynacl backs the optional `push` extra (E2E-encrypted push alerts). Installed
 # in dev unconditionally so the sealing/round-trip tests in tests/test_push.py
 # really run in every CI cell: its cp38-abi3 wheels cover every runner we use
