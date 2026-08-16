@@ -258,14 +258,15 @@ pipx install cronstable
 ### Install using Homebrew or winget
 
 Both package managers install the self-contained release binary for your
-platform, so no Python is required. On macOS or Linux, from the cronstable
-tap:
+platform, so no Python is required.
+
+macOS or Linux:
 
 ```shell
 brew install ptweezy/tap/cronstable
 ```
 
-On Windows:
+Windows:
 
 ```shell
 winget install ptweezy.cronstable
