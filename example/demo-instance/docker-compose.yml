@@ -4,7 +4,7 @@
 #   docker compose -f example/demo-instance/docker-compose.yml up -d --build
 #
 # Two containers: the daemon, and a Cloudflare Tunnel that publishes it at
-# demo.cronstable.com.  The tunnel dials OUT to Cloudflare, so the host
+# demo.cronstable.com.  The tunnel dials out to Cloudflare, so the host
 # needs no port forwarding, no static IP and no inbound firewall hole,
 # which is what makes running this on a machine at home reasonable.  TLS
 # terminates at Cloudflare, so there is no certificate to manage here.
@@ -14,10 +14,25 @@ services:
     build:
       context: ../..
     container_name: cronstable-demo
+    # Point at the config file, not the image's default `-c /etc/cronstable.d`
+    # directory. `include: legacy.crontab` resolves next to the config, so
+    # under a directory scan the crontab would load twice (once by the scan,
+    # which treats a `.crontab` entry as a config in its own right, and once
+    # by the include) and the daemon would refuse to start on duplicate job
+    # names. This also matches how launchd/install.sh runs it.
+    command: ["-c", "/etc/cronstable.d/cronstable.yaml"]
     environment:
-      # The view-scoped demo credential. Public BY DESIGN (it ships in the
+      # The view-scoped demo credential. Public by design (it ships in the
       # companion app); override to rotate, then update the app config.
+      # Anonymous visitors already hold the same view scope, so this token
+      # is a convenience for clients that authenticate, not a gate.
       CRONSTABLE_DEMO_VIEW_TOKEN: ${CRONSTABLE_DEMO_VIEW_TOKEN:-cronstable-public-demo-view}
+      # The demo-operator job's control+approve credential. Deliberately has
+      # no default: a literal here would be a published control token for
+      # every host that ran this file unmodified. Generate one into .env:
+      #   printf 'CRONSTABLE_DEMO_OPERATOR_TOKEN=%s\n' \
+      #     "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" >> .env
+      CRONSTABLE_DEMO_OPERATOR_TOKEN: ${CRONSTABLE_DEMO_OPERATOR_TOKEN:?generate one into example/demo-instance/.env (see the comment above)}
     # Loopback only, and only so the operator can curl it on the box: the
     # tunnel reaches the daemon over the compose network as
     # http://cronstable-demo:8080, never through a published port.
@@ -25,6 +40,9 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - ./cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro
+      # `include:` resolves next to the config, so the migrated crontab has
+      # to be mounted beside it.
+      - ./legacy.crontab:/etc/cronstable.d/legacy.crontab:ro
       - demo-state:/var/lib/cronstable/state
     restart: unless-stopped
     # Demo jobs are pure shell noise; keep the blast radius tiny anyway.
@@ -33,18 +51,17 @@ services:
       - no-new-privileges:true
     mem_limit: 512m
     cpus: 1.0
+    # Probes the way a visitor arrives: no credential at all. On this board
+    # that is the supported path (web.anonymousScopes grants view), so a
+    # healthy container means the public experience works.
     healthcheck:
       test:
         - CMD
         - python3
         - -c
         - |
-          import os, urllib.request
-          req = urllib.request.Request(
-              "http://127.0.0.1:8080/summary",
-              headers={"Authorization": "Bearer " + os.environ["CRONSTABLE_DEMO_VIEW_TOKEN"]},
-          )
-          urllib.request.urlopen(req, timeout=5)
+          import urllib.request
+          urllib.request.urlopen("http://127.0.0.1:8080/summary", timeout=5)
       interval: 60s
       timeout: 10s
       retries: 3

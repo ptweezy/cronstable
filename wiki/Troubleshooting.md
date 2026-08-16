@@ -116,7 +116,10 @@ database, the gid is left unset and supplementary groups are cleared. See
 
 **Symptom (intended hardening).** With `web.authToken` configured, cronstable either
 logs `web: requiring bearer-token authentication` and requires
-`Authorization: Bearer <token>` on every route, or raises:
+`Authorization: Bearer <token>` on every route (with `web.anonymousScopes`
+set, credential-less requests are the exception: they hold read-only view
+scope, and the log line gains `; anonymous requests granted scopes: view`),
+or raises:
 
 ```text
 web.authToken is configured but resolved to an empty token; refusing to start the web API without authentication
