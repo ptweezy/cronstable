@@ -169,10 +169,8 @@ jobs:
             release=true
             bump="${INPUT_BUMP:-minor}"
           elif [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/main" ]; then
-            # Trigger if ANY commit introduced by this push has a [release]
-            # marker, scanning the whole push rather than the tip alone: a
-            # push can carry several commits and the marker can sit on any of
-            # them.
+            # Trigger if any commit introduced by this push has a [release]
+            # marker.
             # The range is the commits new in this push (BEFORE..AFTER); on a
             # brand-new branch BEFORE is all-zeros, so fall back to the tip.
             zero="0000000000000000000000000000000000000000"
