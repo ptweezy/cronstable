@@ -20,6 +20,28 @@ All fields described here are versioned under `"v": 1`. Both the relay
 envelope and the sealed plaintext carry their own `v`, so either side of the
 protocol can evolve independently.
 
+## Pairing links
+
+Separate from the alert path, the dashboard's "Pair a device" QR encodes a
+pairing link rather than the bare pairing JSON, so a phone's system camera
+deep-links straight into the mobile app:
+
+```text
+https://relay.cronstable.com/pair#<base64url({"v":1,"name":…,"url":…,"token":…})>
+```
+
+The payload (the same `{v, name, url, token}` JSON the panel shows as a
+copyable string) rides in the URL fragment, base64url-encoded with padding
+stripped. Fragments are never sent with an HTTP request, so the landing
+host serves a static page and never sees the daemon address or the token.
+The hosted relay serves that landing page at `GET /pair` (install pointers
+plus a `cronstable://pair#<fragment>` fallback link carrying the identical
+fragment) and the app-association file at
+`GET /.well-known/apple-app-site-association`; a client app accepts the
+payload as raw JSON or inside either link form. A self-hosted relay is free
+to skip both routes: they are a convenience for camera scans, not part of
+the daemon wire contract.
+
 ## Inbound request
 
 The daemon sends one HTTP POST per (alert, device) to `push.relay.url`, with
