@@ -6,6 +6,8 @@
 - Build and CI toolchain version bumps
 - Development consolidated onto a single `main` branch; the wiki publishes
   from `main`, and the README and wiki pages link to it
+- Release CI runs get their own concurrency group, where they start at once
+  and run to completion regardless of other pushes
 
 ## 1.2.41
 

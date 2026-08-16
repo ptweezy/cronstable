@@ -129,15 +129,32 @@ def test_every_actions_cache_write_is_branch_gated():
 
 
 def test_workflow_names_no_retired_branch():
-    # The repository develops on ONE trunk. A leftover `refs/heads/develop`
-    # condition is never true again and nothing reds to say so, so the cache
-    # write or wiki publish it guards would just stop happening.
+    # The repository develops on a single trunk. A leftover
+    # `refs/heads/develop` condition is dead but silent: it evaluates false
+    # forever, so the cache write or wiki publish it guards simply stops
+    # happening.
     with open(WORKFLOW, encoding="utf-8") as fobj:
         body = fobj.read()
     assert "refs/heads/develop" not in body, (
         "release.yml still gates on the retired `develop` branch; those "
         "conditions are now permanently false"
     )
+
+
+def test_release_runs_are_never_cancelled():
+    # The release test is spelled twice, in `group` and again in
+    # `cancel-in-progress`. Let them drift and a release lands in the
+    # cancellable group, where the next push kills it mid-publish. A queued
+    # run loses its slot too (cancel-in-progress false protects only a run
+    # already in flight), so the split group is the whole protection.
+    con = _workflow()["concurrency"]
+    group = str(con["group"])
+    cancel = str(con["cancel-in-progress"])
+    for probe in ("workflow_dispatch", "'[release'", "commits[19]"):
+        assert probe in group, "concurrency.group lost {}".format(probe)
+        assert probe in cancel, "cancel-in-progress lost {}".format(probe)
+    # and it must split the group on that test, so check for both arms
+    assert "'release'" in group and "'ci'" in group, group
 
 
 def test_every_browser_backed_test_module_is_fenced():
