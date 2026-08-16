@@ -409,3 +409,35 @@ def test_demo_mirror_has_no_crlf():
     # trips the repo's LF-only CI check.
     for path in (WEB, DEMO, FRAGMENT, ENGINE_JS):
         assert "\r\n" not in _read(path), "%s picked up CRLF endings" % path
+
+
+def test_pair_link_contract_matches_the_protocol_doc():
+    """The pairing QR's deep link exists as prose in docs/relay-protocol.md
+    and as code here, with two external implementations (relay landing,
+    companion app) built against it; the demo copy is generated from the
+    same source, so only this guard catches shared drift."""
+    web = _read(WEB)
+    doc = _read(os.path.join(ROOT, "docs", "relay-protocol.md"))
+    m = re.search(r'const PAIR_LINK_BASE = "([^"]+)";', web)
+    assert m, "const PAIR_LINK_BASE literal not found in %s" % WEB
+    assert m.group(1) + "#" in doc, (
+        "PAIR_LINK_BASE %r has drifted from the pairing-link example in "
+        "docs/relay-protocol.md" % m.group(1)
+    )
+    from cronstable.cron import WEB_PAIR_LINK_FALLBACK
+
+    assert m.group(1) == WEB_PAIR_LINK_FALLBACK, (
+        "the dashboard's fallback link base and cron.py's "
+        "WEB_PAIR_LINK_FALLBACK have drifted apart"
+    )
+    encoder = web[web.index("function pairLink(") : web.index("function openPair(")]
+    for transform in (
+        'replace(/\\+/g, "-")',
+        'replace(/\\//g, "_")',
+        'replace(/=+$/, "")',
+        '+ "#" +',
+    ):
+        assert transform in encoder, (
+            "pairLink no longer performs the documented transform %r "
+            "(docs/relay-protocol.md, Pairing links)" % transform
+        )
