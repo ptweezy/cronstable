@@ -242,22 +242,33 @@ hardened Kubernetes/Docker setup.
 ### Install using pip
 
 cronstable requires Python >= 3.10 (for systems with an older Python, use the
-binary instead). Install it in a virtual environment, or let
-[pipx](https://github.com/pipxproject/pipx) create one for you:
+binary instead). Install it in a virtual environment:
 
 ```shell
-pip install cronstable   # inside a venv
-pipx install cronstable  # or isolated, via pipx
+pip install cronstable
+```
+
+or let [pipx](https://github.com/pipxproject/pipx) create an isolated one
+for you:
+
+```shell
+pipx install cronstable
 ```
 
 ### Install using Homebrew or winget
 
 Both package managers install the self-contained release binary for your
-platform, so no Python is required:
+platform, so no Python is required. On macOS or Linux, from the cronstable
+tap:
 
 ```shell
-brew install ptweezy/tap/cronstable  # macOS or Linux, from the cronstable tap
-winget install ptweezy.cronstable    # Windows
+brew install ptweezy/tap/cronstable
+```
+
+On Windows:
+
+```shell
+winget install ptweezy.cronstable
 ```
 
 Upgrade later with `brew upgrade cronstable` or
@@ -1108,7 +1119,7 @@ settings, a QR scan) or with one call:
 [![The dashboard's Pair a device panel: a QR code of the connection payload, the same JSON as a copyable string, and a warning that the embedded token holds every scope](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)
 
 ```shell
-$ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -d '{"name": "my-iphone", "platform": "ios", "publicKey": "<base64 X25519 key>", "pushToken": "<device push token>"}' \
     http://127.0.0.1:8080/push/devices
 ```
