@@ -164,7 +164,7 @@ Pick a backend by whether you already run a coordination store:
   `Lease` RBAC (`get`/`create`/`update`). Likewise `backend: etcd` if you run
   etcd. See
   [Operating the lease backends](Clustering-and-Leader-Election#operating-the-lease-backends-kubernetes-and-etcd)
-  and [`example/kubernetes/`](https://github.com/ptweezy/cronstable/tree/develop/example/kubernetes).
+  and [`example/kubernetes/`](https://github.com/ptweezy/cronstable/tree/main/example/kubernetes).
 * **`backend: gossip` (the default, no coordination store).** A quorum-gated,
   mutual-TLS election that keeps no shared state, so:
   * **Use an odd replica count.** 3 replicas tolerate one failure, 5 tolerate
