@@ -11,7 +11,6 @@ without orjson -- and :func:`dumps_bytes` enforces it at every write.
 
 import importlib.util
 import json as stdlib_json
-import platform
 import sys
 
 import pytest
@@ -230,8 +229,6 @@ def test_orjson_is_installed_where_a_wheel_exists():
     # shipped unexercised. requirements_dev.txt now installs orjson wherever a
     # wheel is reliably available; this fails loudly if that line is dropped
     # or its markers stop matching, instead of degrading back to a skip.
-    if sys.platform == "win32" and platform.machine().upper() == "ARM64":
-        pytest.skip("no orjson wheel for win-arm64; it builds only with Rust")
     if sys.version_info >= (3, 15):
         pytest.skip("orjson may not have built for this Python yet")
     assert importlib.util.find_spec("orjson") is not None, (
