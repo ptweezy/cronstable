@@ -53,6 +53,7 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `cronstable/con
 | `allowedOrigins` | sequence of strings | `[]` | Extra exact-match browser `Origin`s allowed to call the mutating `POST` endpoints (see [Cross-site request defense](#cross-site-request-defense)). |
 | `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes as an all-scopes token (see [Authentication](#authentication)). |
 | `authTokens` | sequence of maps (`value`/`fromFile`/`fromEnvVar` + `scopes` + optional `label`) | `[]` | Additional per-device scoped bearer tokens (`view`/`control`/`approve`); revoke one by dropping its entry and reloading (see [Scoped tokens](#scoped-tokens-webauthtokens)). |
+| `anonymousScopes` | sequence of strings (`view` only) | `[]` | Scopes granted to requests presenting no credential, turning the instance into a public read-only board. Requires at least one configured token; mutating scopes are refused by the schema (see [Public read-only access](#public-read-only-access-webanonymousscopes)). |
 | `socketMode` | string (octal) | (none) | File mode applied via `chmod` to `unix://` listen sockets (see [Unix socket permissions](#unix-socket-permissions)). Applies only to `unix://` sockets, so it is irrelevant on Windows (where unix-socket listeners are unsupported and skipped with a warning). |
 | `tls` | map (`cert`/`key`/`clientCa`) | (none) | Certificate and key served by every `https://` listen address, plus an optional CA that makes those listeners require a client certificate (mutual TLS). `cert` and `key` are required together; the block and the `https://` addresses are validated against each other at load. See [Listener TLS](Listener-TLS). |
 | `ui` | bool | `true` | Serve the [Web Dashboard](Web-Dashboard) page at `/` (see [`GET /`](#get--the-dashboard-page)); `ui: false` exposes only the REST endpoints. |
@@ -1167,10 +1168,14 @@ When `authToken` is set, an aiohttp middleware (`_make_auth_middleware`) require
 - A missing/malformed `Authorization` header, a wrong scheme, or a non-matching
   token returns `401 Unauthorized`.
 
-The one configurable exception: setting `web.metrics.public: true` exempts
-`/metrics` (and only `/metrics`) from the bearer token, for scrapers that
-cannot send credentials; every other route stays gated (see
-[`GET /metrics`](#get-metrics)).
+Two settings relax that. `web.metrics.public: true` exempts `/metrics` (and
+only `/metrics`) from the bearer token, for scrapers that cannot send
+credentials (see [`GET /metrics`](#get-metrics)). `web.anonymousScopes`
+grants named scopes (`view` only) to callers presenting no credential,
+which is how a public read-only board is served; a wrong token is still
+`401`, and everything outside the grant is `403` (see
+[Public read-only access](#public-read-only-access-webanonymousscopes)).
+Without either, every route stays gated.
 
 One built-in carve-out: paths ending in `.ics` (the
 [calendar feeds](Calendar-Export)) also accept the same token as a `token`
@@ -1263,6 +1268,82 @@ messages; matching is by the secret.
 > narrower credentials beside it. These transport scopes are unrelated to the
 > loopback [job-state API](Durable-State)'s `scope` (a key-value isolation
 > boundary); same word, different feature.
+
+### Public read-only access (`web.anonymousScopes`)
+
+Some boards are meant to be read by anyone who can reach them: a wallboard in
+the hallway, or a published demo. When the token every viewer would paste is
+one you were going to hand out anyway, it costs them a step and buys you
+nothing. Listing scopes in `web.anonymousScopes` grants them to requests that
+present **no credential at all**:
+
+```yaml
+web:
+  listen:
+    - http://0.0.0.0:8080
+  authTokens:
+    - label: operator
+      scopes: [control, approve]
+      fromEnvVar: CRONSTABLE_OPERATOR_TOKEN
+  anonymousScopes:
+    - view
+```
+
+That instance serves its dashboard, run history, SSE log tails, `/metrics` and
+calendar feeds to anyone, while start/cancel/pause, DAG trigger and backfill,
+approval decisions, device pairing, `/shutdown` and `/mcp` all still require
+the operator token.
+
+Four limits are fixed in the code, and no setting relaxes them:
+
+- Only **`view`** may be granted. The config schema rejects `control` and
+  `approve` at parse time, so a daemon cannot be configured into anonymous
+  mutation, and the other validators never have to reason about one.
+- At least one token must also be configured. A daemon with no tokens installs
+  no auth middleware, so *every* request already holds every scope, and an
+  anonymous grant there would look like a restriction while restricting
+  nothing. That combination is a config error that names the fix.
+- **`GET /push/devices`** is excluded. The registry names paired devices, so
+  it answers `403` to a credential-less caller even though it is a `GET`.
+- A presented credential is judged the same way it is on any other daemon. A
+  wrong or revoked token still gets `401`, so on such a daemon `401` narrows
+  to "credentials were presented and are invalid", while a caller carrying
+  nothing gets either content or a reasoned `403`.
+
+`GET /whoami` tells a client which of the three worlds it is in. Branch on
+`allScopes`, never on `authenticated`:
+
+| Caller | Response |
+| --- | --- |
+| Matched token | `{"authenticated": true, "label": "operator", "scopes": [...], "allScopes": …}` |
+| No auth configured | `{"authenticated": false, "label": null, "scopes": ["approve","control","view"], "allScopes": true}` |
+| Anonymous grant | `{"authenticated": false, "label": "anonymous", "scopes": ["view"], "allScopes": false}` |
+
+`anonymous` is a reserved label; do not name a real token with it. The bundled
+dashboard already keys on this. On an anonymous instance it skips the token
+prompt entirely, badges itself **view only**, and hides the action buttons a
+visitor cannot use, while an operator can still enter a token to elevate.
+
+The startup log always names the grant, so an operator can grep for it:
+
+```text
+web: requiring bearer-token authentication (1 token; anonymous requests granted scopes: view)
+```
+
+Two things to weigh before enabling it:
+
+- `view` covers **full job output over the log tail**, along with schedules,
+  commands, run history and `/metrics`. If your jobs print secrets, anyone who
+  can reach the listener can read them.
+- It removes the bearer token as a second barrier against **DNS rebinding**. A
+  malicious page cannot read a cross-origin response from a daemon that sends
+  no CORS headers, and the [Origin gate](#cross-site-request-defense) still
+  refuses forged mutations. But a rebinding attack that makes a browser treat
+  your daemon as same-origin can now read the board without guessing a token.
+  On a loopback or LAN listener, weigh that against how public the board is
+  meant to be.
+
+`example/demo-instance/` is a worked example of the whole shape.
 
 ### Client certificates (mutual TLS)
 

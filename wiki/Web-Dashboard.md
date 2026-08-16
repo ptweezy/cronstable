@@ -692,6 +692,26 @@ dashboard then prompts you for the token, stores it **only in that browser tab**
 subsequent request. You can update or clear the stored token from the header's
 token button at any time.
 
+### Scope-aware chrome
+
+On load the dashboard asks [`GET /whoami`](HTTP-API#get-whoami) what it is
+allowed to do, and draws only the controls that scope covers. Holding
+`control`, or talking to a daemon with no authentication configured, shows
+the full interface.
+
+Without `control`, the dashboard omits the Run, Stop, Pause and Resume
+buttons, the DAG Trigger and Backfill buttons, "run failing" and the mitigate
+console. The palette entries and the `r`/`x`/`p` shortcuts that reach those
+same actions go with them, so a read-only visitor is never offered a button
+that can only answer `403`. Without `approve`, a waiting gate is drawn as a
+state rather than as a pair of decision buttons.
+
+The same rule covers a scoped `web.authTokens` entry and a
+[public read-only board](HTTP-API#public-read-only-access-webanonymousscopes).
+On a public board the token prompt never appears: the header's token button
+reads **view only**, and pressing it lets an operator paste a token, which
+re-probes `/whoami` and redraws.
+
 ## What it polls, and the data model
 
 The dashboard is a thin client over the [HTTP Control API](HTTP-API):

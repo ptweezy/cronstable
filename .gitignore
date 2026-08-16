@@ -71,13 +71,6 @@ target/
 /scripts/*
 !/scripts/build_demo.py
 
-# Local working ledgers for the 2026-08 code-reduction program. Never
-# commit these: MANIFEST.in is opt-out, so a tracked root .md ships in
-# the sdist (they were committed once by accident and history-rewritten
-# back out).
-/reduction-findings.md
-/reduction-handoff.md
-
 # Screenshot-pipeline scratch output: raw captures land here for review before
 # the keepers are copied over docs/img/ (the tracked, published set)
 /docs/screenshots/shots/
@@ -87,12 +80,6 @@ target/
 # token here; anyone holding it can publish through the tunnel).
 .env
 
-# Claude Code local files. CLAUDE.md carries local development notes that must
-# stay out of the public history, and settings.local.json holds machine-specific
-# paths. These live here rather than in .git/info/exclude so the protection is
-# cloned with the repository instead of existing only on one machine: a fresh
-# clone or a new worktree is covered too. A shared, reviewed .claude/settings.json
-# may still be committed if the project ever wants one.
 /CLAUDE.md
 /.claude/*
 !/.claude/settings.json

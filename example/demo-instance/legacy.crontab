@@ -1,0 +1,5 @@
+# Dropped in from the old Mac mini's `crontab -l`, unchanged: cronstable
+# lowers classic Vixie entries into normal jobs (names embed the line
+# number) and lints their schedules like everything else.
+*/45 * * * * echo "guest-wifi lease sweep done; stale leases expired"
+20 5 * * 1 echo "weekly router config snapshot saved"
