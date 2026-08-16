@@ -25,6 +25,8 @@ import cronstable.cron
 from cronstable.config import ConfigError
 from cronstable.cron import (
     _WEB_ALL_SCOPES,
+    WEB_ANON_REQUEST_KEY,
+    WEB_TOKEN_REQUEST_KEY,
     Cron,
     _effective_web_scopes,
     _required_web_scope,
@@ -422,6 +424,151 @@ def test_resolve_tokens_two_scoped_duplicates_refused():
 
 
 # --------------------------------------------------------------------------
+# web.anonymousScopes: credential-less requests hold `view` and nothing more
+# --------------------------------------------------------------------------
+
+_ANON_VIEW = frozenset({"view"})
+
+
+def _anon_mw(scopes=_ANON_VIEW):
+    return Cron._make_auth_middleware(
+        _table(("viewtok", ["view"], "phone"), ("ctltok", ["control"], "ci")),
+        anonymous_scopes=scopes,
+    )
+
+
+async def test_anonymous_view_serves_a_credential_less_get():
+    req = _ScopedReq("/jobs")
+    assert await _run(_anon_mw(), req) == "ok"
+    # the granted scopes are filed under their own key: handlers that key on
+    # the token key's absence (the /shutdown refusal, the pairing audit)
+    # must keep seeing an anonymous caller as unauthenticated.
+    assert req.get(WEB_ANON_REQUEST_KEY) == _ANON_VIEW
+    assert req.get(WEB_TOKEN_REQUEST_KEY) is None
+
+
+@pytest.mark.parametrize(
+    ("path", "canonical", "method", "required"),
+    [
+        pytest.param(
+            "/jobs/x/start",
+            "/jobs/{name}/start",
+            "POST",
+            "control",
+            id="start-needs-control",
+        ),
+        pytest.param(
+            "/dags/d/runs/r/tasks/t/decision",
+            "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
+            "POST",
+            "approve",
+            id="decision-needs-approve",
+        ),
+        pytest.param("/mcp", "/mcp", "POST", "control", id="mcp-post"),
+        pytest.param("/mcp", "/mcp", "GET", "control", id="mcp-get"),
+    ],
+)
+async def test_anonymous_view_refuses_mutating_routes(
+    path, canonical, method, required
+):
+    with pytest.raises(web.HTTPForbidden) as exc:
+        await _run(
+            _anon_mw(), _ScopedReq(path, method=method, canonical=canonical)
+        )
+    # reasoned, unlike the 401: the caller presented nothing, so naming the
+    # missing scope leaks nothing about any configured token.
+    assert required in str(exc.value.text)
+
+
+async def test_anonymous_view_excludes_the_device_registry():
+    # the registry names every paired phone; a token-holding viewer may read
+    # it, a stranger may not.
+    with pytest.raises(web.HTTPForbidden) as exc:
+        await _run(
+            _anon_mw(), _ScopedReq("/push/devices", canonical="/push/devices")
+        )
+    assert "device registry" in str(exc.value.text)
+
+
+async def test_anonymous_view_does_not_rescue_a_wrong_token():
+    # a typo'd or revoked token must 401 rather than silently degrading to
+    # the anonymous grant: 401 keeps meaning "you presented credentials and
+    # they are wrong".
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run(_anon_mw(), _ScopedReq("/jobs", headers=_bearer("nope")))
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param({"Authorization": "Basic Zm9vOmJhcg=="}, id="basic"),
+        pytest.param({"Authorization": "Bearer"}, id="bearer-no-value"),
+        pytest.param({"Authorization": "Bearer "}, id="bearer-empty"),
+    ],
+)
+async def test_anonymous_view_does_not_rescue_a_malformed_header(headers):
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run(_anon_mw(), _ScopedReq("/jobs", headers=headers))
+
+
+async def test_anonymous_view_leaves_the_token_path_intact():
+    # the companion app's baked view token keeps authenticating normally.
+    req = _ScopedReq("/jobs", headers=_bearer("viewtok"))
+    assert await _run(_anon_mw(), req) == "ok"
+    assert req.get(WEB_TOKEN_REQUEST_KEY).label == "phone"
+    assert req.get(WEB_ANON_REQUEST_KEY) is None
+    # and a control token still controls
+    assert (
+        await _run(
+            _anon_mw(),
+            _ScopedReq(
+                "/jobs/x/start",
+                method="POST",
+                canonical="/jobs/{name}/start",
+                headers=_bearer("ctltok"),
+            ),
+        )
+        == "ok"
+    )
+
+
+async def test_anonymous_view_serves_a_bare_calendar_feed():
+    assert await _run(_anon_mw(), _ScopedReq("/calendar.ics")) == "ok"
+
+
+async def test_anonymous_view_still_401s_a_wrong_calendar_query_token():
+    # the ?token= carve-out is a presented credential like any other.
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run(
+            _anon_mw(), _ScopedReq("/calendar.ics", query={"token": "nope"})
+        )
+
+
+async def test_anonymous_view_treats_a_query_token_as_presented_anywhere():
+    # `?token=` authenticates only the calendar feeds, but it counts as a
+    # presented credential on every path: a caller whose stale token is
+    # refused elsewhere must not find this request quietly served instead.
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run(_anon_mw(), _ScopedReq("/jobs", query={"token": "nope"}))
+    # ...including one that would otherwise match a real token, since the
+    # carve-out is scoped to the calendar routes by path.
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run(_anon_mw(), _ScopedReq("/jobs", query={"token": "viewtok"}))
+
+
+async def test_anonymous_view_unmatched_route_reaches_routing():
+    # a 404-bound GET is view by method default, so it reaches the router
+    # and 404s instead of 401ing.
+    assert await _run(_anon_mw(), _ScopedReq("/nope", canonical=None)) == "ok"
+
+
+async def test_no_anonymous_scopes_keeps_todays_401():
+    mw = Cron._make_auth_middleware(_table(("viewtok", ["view"], "phone")))
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run(mw, _ScopedReq("/jobs"))
+
+
+# --------------------------------------------------------------------------
 # end-to-end over a real aiohttp app
 # --------------------------------------------------------------------------
 
@@ -507,6 +654,94 @@ async def test_scoped_tokens_end_to_end():
                 base + "/status", headers=_bearer("apprtok")
             ) as resp:
                 assert resp.status == 200
+    finally:
+        await cron.start_stop_web_app(None)
+        await asyncio.sleep(0.25)
+
+
+@pytest.mark.asyncio
+async def test_anonymous_view_end_to_end(caplog):
+    """A public-view instance over real HTTP: strangers read, only tokens
+    mutate, and the startup log says so."""
+    import aiohttp
+
+    from cronstable.config import _build_mcp_config
+
+    cron = cronstable.cron.Cron(None, config_yaml=_DISABLED_JOB)
+    web_config = {
+        "listen": ["http://127.0.0.1:0"],
+        "authTokens": [
+            {"value": "viewtok", "scopes": ["view"], "label": "phone"},
+            {"value": "ctltok", "scopes": ["control"], "label": "ci"},
+        ],
+        "anonymousScopes": ["view"],
+    }
+    with caplog.at_level(logging.INFO, logger="cronstable"):
+        await cron.start_stop_web_app(
+            web_config, _build_mcp_config({"enabled": True})
+        )
+    assert "anonymous requests granted scopes: view" in caplog.text
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        async with aiohttp.ClientSession() as session:
+            # a stranger reads
+            async with session.get(base + "/status") as resp:
+                assert resp.status == 200
+            async with session.get(base + "/jobs") as resp:
+                assert resp.status == 200
+            # ...and is told exactly what it holds
+            async with session.get(base + "/whoami") as resp:
+                assert resp.status == 200
+                assert await resp.json() == {
+                    "authenticated": False,
+                    "label": "anonymous",
+                    "scopes": ["view"],
+                    "allScopes": False,
+                    "pairLinkBase": "https://relay.cronstable.com/pair",
+                }
+            # ...but cannot act, on any of the three mutating gates
+            async with session.post(base + "/jobs/test/start") as resp:
+                assert resp.status == 403
+            async with session.post(
+                base + "/dags/d/runs/r/tasks/t/decision",
+                json={"decision": "approve"},
+            ) as resp:
+                assert resp.status == 403
+            async with session.get(base + "/mcp") as resp:
+                assert resp.status == 403
+            # ...nor read the device registry; the exclusion 403 names the
+            # scope the method actually needs
+            async with session.get(base + "/push/devices") as resp:
+                assert resp.status == 403
+                assert "'view'" in (await resp.json())["error"]
+            async with session.post(base + "/push/devices", json={}) as resp:
+                assert resp.status == 403
+                assert "'control'" in (await resp.json())["error"]
+            # ...nor stop the daemon (control-gated first, and the handler
+            # refuses an unauthenticated caller besides)
+            async with session.post(base + "/shutdown") as resp:
+                assert resp.status == 403
+            # a wrong token is still wrong
+            async with session.get(
+                base + "/status", headers=_bearer("bogus")
+            ) as resp:
+                assert resp.status == 401
+            # tokens behave exactly as they do without the anonymous grant
+            async with session.get(
+                base + "/whoami", headers=_bearer("viewtok")
+            ) as resp:
+                body = await resp.json()
+                assert body["authenticated"] is True
+                assert body["label"] == "phone"
+            async with session.post(
+                base + "/jobs/test/start", headers=_bearer("ctltok")
+            ) as resp:
+                assert resp.status == 409
+            async with session.post(
+                base + "/jobs/test/start", headers=_bearer("viewtok")
+            ) as resp:
+                assert resp.status == 403
     finally:
         await cron.start_stop_web_app(None)
         await asyncio.sleep(0.25)

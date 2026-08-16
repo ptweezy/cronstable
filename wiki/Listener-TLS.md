@@ -32,9 +32,9 @@ this page.
 Reach for `web.tls` when the dashboard or the API is reachable from anywhere
 that is not this host: another machine on the network, a colleague's laptop, a
 CI runner, a desktop MCP client. The API carries the bearer token
-(`web.authToken`) in an `Authorization` header on every request, so a plaintext
-listener on a routable interface puts that token, and every job name, command
-and captured output the API returns, on the wire in the clear.
+(`web.authToken`) in an `Authorization` header, so a plaintext listener on
+a routable interface puts that token, and every job name, command and
+captured output the API returns, on the wire in the clear.
 
 Three cases where it buys nothing:
 

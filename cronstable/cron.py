@@ -342,6 +342,17 @@ _WEB_SCOPE_OVERRIDES = {
     "/mcp": "control",
 }
 
+# Routes a view-scoped anonymous grant (web.anonymousScopes) deliberately
+# does not cover, keyed by canonical path like _WEB_SCOPE_OVERRIDES. The
+# device registry names every paired phone (name, platform, createdBy): a
+# token-holding viewer may see it, an anonymous stranger may not.
+_WEB_ANONYMOUS_EXCLUDED = frozenset({"/push/devices"})
+
+# Fallback base for the dashboard's pairing deep link while no push section
+# is applied. With one, /whoami derives the base from push.relay.url's
+# origin, so a self-hosted relay keeps camera pairing on its own domain.
+WEB_PAIR_LINK_FALLBACK = "https://relay.cronstable.com/pair"
+
 # The web API's complete route table: (method, path, handler, gate).
 # `handler` names a Cron method except "mcp"-gated rows (MCPHandler);
 # `gate` marks conditionally registered groups (None, "mcp", "metrics",
@@ -457,6 +468,13 @@ def _required_web_scope(request) -> str:
 #: (GET /whoami; the pairing endpoints' createdBy audit field). Absent when
 #: no auth middleware is installed (no token configured).
 WEB_TOKEN_REQUEST_KEY = "cronstable_web_token"
+
+#: Request-storage key the auth middleware files the granted scope set
+#: under when a credential-less request is served via web.anonymousScopes.
+#: Deliberately distinct from WEB_TOKEN_REQUEST_KEY: handlers keying on
+#: that key's absence (the /shutdown refusal, the pairing createdBy audit)
+#: keep treating anonymous callers as unauthenticated.
+WEB_ANON_REQUEST_KEY = "cronstable_web_anonymous"
 
 
 class _WebToken(NamedTuple):
@@ -3362,11 +3380,23 @@ class Cron:
         hand a phone the all-scopes token, and a companion app can show
         what it is allowed to do. With no auth middleware installed
         there is no token to describe: ``authenticated`` is false and
-        every scope is effectively granted.
+        every scope is effectively granted. A request served through
+        web.anonymousScopes is also unauthenticated, but reports the
+        granted scope set under the reserved label ``anonymous`` with
+        ``allScopes`` false, the discriminator clients key on. Every
+        shape carries ``pairLinkBase``, the pairing QR's deep-link base.
         """
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
-        if matched is None:
+        anon = request.get(WEB_ANON_REQUEST_KEY)
+        if matched is None and anon is not None:
             payload: dict[str, Any] = {
+                "authenticated": False,
+                "label": "anonymous",
+                "scopes": sorted(anon),
+                "allScopes": frozenset(anon) == _WEB_ALL_SCOPES,
+            }
+        elif matched is None:
+            payload = {
                 "authenticated": False,
                 "label": None,
                 "scopes": sorted(_WEB_ALL_SCOPES),
@@ -3379,7 +3409,21 @@ class Cron:
                 "scopes": sorted(matched.scopes),
                 "allScopes": matched.scopes == _WEB_ALL_SCOPES,
             }
+        payload["pairLinkBase"] = self._web_pair_link_base()
         return _json_response(payload, headers=self._web_headers())
+
+    def _web_pair_link_base(self) -> str:
+        """Origin of push.relay.url plus /pair; the hosted fallback while
+        no push section is applied. Credentials embedded in the relay URL
+        are dropped: the base goes into a user-visible QR link."""
+        applied = self._applied_push_config
+        url = applied["relay"]["url"] if applied else ""
+        parts = urlparse(url)
+        if not parts.scheme or not parts.netloc:
+            return WEB_PAIR_LINK_FALLBACK
+        return "{}://{}/pair".format(
+            parts.scheme, parts.netloc.rsplit("@", 1)[-1]
+        )
 
     def _push_service_required(self) -> "push.PushService":
         """The running push service, or the 404 the route contract says.
@@ -6631,10 +6675,22 @@ class Cron:
                 )
             token_table = self._resolve_web_tokens(web_config)
             if token_table is not None:
+                anonymous_scopes = frozenset(
+                    web_config.get("anonymousScopes") or ()
+                )
+                # the log line stays honest: an operator grepping startup
+                # logs must see any anonymous grant.
                 logger.info(
-                    "web: requiring bearer-token authentication (%d token%s)",
+                    "web: requiring bearer-token authentication "
+                    "(%d token%s%s)",
                     len(token_table),
                     "" if len(token_table) == 1 else "s",
+                    (
+                        "; anonymous requests granted scopes: "
+                        + ", ".join(sorted(anonymous_scopes))
+                        if anonymous_scopes
+                        else ""
+                    ),
                 )
                 # the UI page is served unauthenticated (it holds no data); the
                 # browser then sends the token on every data request.
@@ -6644,7 +6700,11 @@ class Cron:
                     # send a bearer token; everything else stays gated.
                     public.add("/metrics")
                 middlewares.append(
-                    self._make_auth_middleware(token_table, frozenset(public))
+                    self._make_auth_middleware(
+                        token_table,
+                        frozenset(public),
+                        anonymous_scopes=anonymous_scopes,
+                    )
                 )
             app = web.Application(middlewares=middlewares)
             # New app generation: tails may subscribe again, and the
@@ -7973,7 +8033,9 @@ class Cron:
 
     @staticmethod
     def _make_auth_middleware(
-        tokens, public_paths: "frozenset[str]" = frozenset()
+        tokens,
+        public_paths: "frozenset[str]" = frozenset(),
+        anonymous_scopes: "frozenset[str]" = frozenset(),
     ):
         # A bare string is a single all-scopes token (callers/tests rely
         # on this).
@@ -7997,6 +8059,49 @@ class Cron:
             ):
                 return await handler(request)
             header = request.headers.get("Authorization", "")
+            # The anonymous grant (web.anonymousScopes) is strictly for
+            # requests presenting no credential of any kind: no
+            # Authorization header and no `token` query parameter. A
+            # presented-but-unknown token still 401s below rather than
+            # degrading to anonymous, so 401 keeps meaning "credentials
+            # were presented and are invalid". `?token=` counts as a
+            # credential on every path, including the ones that would
+            # ignore it, so that a caller whose stale token is refused
+            # elsewhere finds it refused here too. The branch runs before
+            # any compare_digest, which keeps the constant-time table
+            # scan separate from the anonymous decision.
+            if (
+                anonymous_scopes
+                and not header
+                and not request.query.get("token", "")
+            ):
+                resource = getattr(request.match_info.route, "resource", None)
+                canonical = getattr(resource, "canonical", None)
+                required = _required_web_scope(request)
+                if (
+                    required in anonymous_scopes
+                    and canonical not in _WEB_ANONYMOUS_EXCLUDED
+                ):
+                    request[WEB_ANON_REQUEST_KEY] = anonymous_scopes
+                    return await handler(request)
+                if canonical in _WEB_ANONYMOUS_EXCLUDED:
+                    raise _api_error(
+                        web.HTTPForbidden,
+                        "the device registry is not served anonymously; "
+                        "present a bearer token with the {!r} "
+                        "scope".format(required),
+                    )
+                raise _api_error(
+                    web.HTTPForbidden,
+                    "anonymous access to this daemon grants only the "
+                    "{} scope; this endpoint requires {!r}; present a "
+                    "bearer token".format(
+                        " and ".join(
+                            repr(s) for s in sorted(anonymous_scopes)
+                        ),
+                        required,
+                    ),
+                )
             scheme, _, presented = header.partition(" ")
             # RFC 7235: the auth scheme is case-insensitive (Bearer/bearer).
             # Compare only the token, in constant time, to avoid leaking it via
@@ -8073,7 +8178,8 @@ class Cron:
         an Origin matching this daemon's authority or web.allowedOrigins
         passes; anything else is 403. Residual: a rebinding page served on
         the daemon's OWN port passes the equality test; web.authToken
-        closes that completely.
+        closes that, except for the read-only routes a web.anonymousScopes
+        grant deliberately serves credential-less.
         """
 
         @web.middleware
