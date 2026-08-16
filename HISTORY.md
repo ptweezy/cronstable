@@ -4,6 +4,8 @@
 
 - Dependency floors raised to clear published security advisories
 - Build and CI toolchain version bumps
+- Development consolidated onto a single `main` branch; the wiki publishes
+  from `main`, and the README and wiki pages link to it
 
 ## 1.2.41
 

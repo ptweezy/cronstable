@@ -7,11 +7,11 @@ window too many. It is a client of the same
 [HTTP Control API](HTTP-API) the web page uses, so there is nothing
 extra to enable on the daemon: if the dashboard works, so does the TUI.
 
-[![The cronstable TUI against a live 9-node fleet: 59 jobs with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, the cluster owner column, and the verdict bar](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-overview.png)
+[![The cronstable TUI against a live 9-node fleet: 59 jobs with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, the cluster owner column, and the verdict bar](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)
 
 *(This screenshot — like the larger gallery in the README's Terminal
 dashboard section — is the real TUI driven against the running
-[grand tour](https://github.com/ptweezy/cronstable/tree/develop/example/grand-tour)
+[grand tour](https://github.com/ptweezy/cronstable/tree/main/example/grand-tour)
 fleet, the same one the web dashboard's screenshots use.)*
 
 ```shell
