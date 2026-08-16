@@ -2236,7 +2236,7 @@ jobs:
           git -C .wiki config user.name  "github-actions[bot]"
           git -C .wiki config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # The wiki accepts web-UI edits, so a push CAN still lose a race even
+          # The wiki accepts web-UI edits, so a push can still lose a race even
           # though runs on main queue rather than overlap. The commit is a pure
           # snapshot of wiki/, so there is nothing to rebase: re-mirror onto the
           # new tip and retry instead of reddening a docs run.
