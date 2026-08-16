@@ -11,23 +11,23 @@ RUN curl https://pyenv.run | bash
 ENV PATH="/root/.pyenv/bin:$PATH"
 
 RUN pyenv install -l | grep 3.13
-RUN CONFIGURE_OPTS=--enable-shared pyenv install 3.13.14
-RUN pyenv global 3.13.14
+RUN CONFIGURE_OPTS=--enable-shared pyenv install 3.13.15
+RUN pyenv global 3.13.15
 
 # uv accelerates the installs below (parallel downloads + a shared cache). This
 # is an amd64-only local build, so the amd64/arm64 uv image covers it and the
 # clean `COPY --from` pattern applies -- unlike the multi-arch release
 # Dockerfile, which stays on pip for architecture portability. Pin matches the
 # CI setup-uv version.
-COPY --from=ghcr.io/astral-sh/uv:0.12.1 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /uvx /bin/
 
-RUN /root/.pyenv/versions/3.13.14/bin/python -m venv /cronstable
+RUN /root/.pyenv/versions/3.13.15/bin/python -m venv /cronstable
 # Point uv at that venv (VIRTUAL_ENV) and never let it fetch a managed Python --
-# the pyenv-built 3.13.14 (--enable-shared, above) is what must be baked in.
+# the pyenv-built 3.13.15 (--enable-shared, above) is what must be baked in.
 ENV PATH=/cronstable/bin:$PATH \
     VIRTUAL_ENV=/cronstable \
     UV_PYTHON_DOWNLOADS=never
-RUN uv pip install setuptools pyinstaller==6.21.0
+RUN uv pip install setuptools pyinstaller==6.22.1
 
 COPY . /root/cronstable
 WORKDIR /root/cronstable

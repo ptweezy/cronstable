@@ -899,17 +899,18 @@ class EtcdBackend(StoreLeaseBackend):
         if leaderish is None:
             leaderish = self._is_leader
         try:
+            live_id = self.get_job_set_id()
             # drop our own marks first if the job set changed, so a redefined
             # @reboot one-shot is not re-suppressed by a stale local mark
             # (see LeaseBackend._reconcile_local_reboot_ran).
-            self._reconcile_local_reboot_ran()
+            self._reconcile_local_reboot_ran(live_id)
             # Throttle the steady state (mirrors the filesystem backend's
             # _maintain_reboot_ran). Never throttled: a leaderish node that
             # has not read the key back since gaining (or losing) its lease
             # (it is DEFERRING its one-shots on that read), and a node with
             # a mark the store may not carry yet (a failed eager persist
             # retries here).
-            self._reconcile_observed_reboot_ran()
+            self._reconcile_observed_reboot_ran(live_id)
             unpersisted = self._reboot_ran_local - self._reboot_ran
             if (
                 not (leaderish and not self._reboot_ran_synced)

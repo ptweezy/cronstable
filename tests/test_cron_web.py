@@ -2592,7 +2592,7 @@ jobs:
     pause = SimpleNamespace(
         until=DT(2020, 1, 1, tzinfo=UTC), by="op", note=None
     )
-    monkeypatch.setattr(cron, "_pause_active", lambda name: pause)
+    monkeypatch.setattr(cron, "_pause_active", lambda name, now=None: pause)
     payload = cron.schedule_why_payload("boot", "2020-01-01T00:00:00")
     assert payload is not None
     assert payload["reboot"] is True

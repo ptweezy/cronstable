@@ -1710,10 +1710,12 @@ def test_pause_and_overdue_widths_never_cost_the_command_column(tmp_path):
     job must not shed the whole command column for the other 39."""
     app = _bare_app(tmp_path)
     app.jobs = [_job("job-%02d" % i, outcome="success") for i in range(40)]
+    app._refresh_job_aggregates()
     plain = app._columns(80)
     assert "cmd" in [c for c, _ in plain]
     app.jobs[3]["paused"] = _job("x", paused=True)["paused"]
     app.jobs[4].update(_job("y", late=True))
+    app._refresh_job_aggregates()
     mixed = app._columns(80)
     assert [c for c, _ in mixed] == [c for c, _ in plain]
     assert dict(mixed)["cmd"] >= 20

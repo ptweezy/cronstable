@@ -90,7 +90,7 @@ RUN /opt/venv/bin/python -c 'from nacl.public import PrivateKey, SealedBox; k = 
 # invalidates their cache.
 COPY docker/install_orjson.sh /tmp/deps/install_orjson.sh
 RUN set -eux; \
-    sh /tmp/deps/install_orjson.sh "orjson>=3.9"
+    sh /tmp/deps/install_orjson.sh "orjson>=3.11.6"
 
 # ---- project install: the only per-commit layers ------------------------
 
