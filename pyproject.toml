@@ -139,7 +139,7 @@ dev = [
     # the importorskip blind spot that file warns about: the accelerated
     # JSON, push-sealing, and mDNS test arms all self-skip.  This list and
     # requirements_dev.txt are pinned equal by tests/test_dev_deps_parity.py.
-    "orjson>=3.11.6; python_version < '3.15'",
+    "orjson>=3.12.0",
     "pynacl>=1.6.2",
     "zeroconf>=0.149.16",
     # drives a real Chromium for the client/daemon cron-engine differential;
