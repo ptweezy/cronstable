@@ -484,6 +484,9 @@
   .iconbtn svg, .ghostbtn svg { width: 15px; height: 15px; }
   .iconbtn.spin svg { animation: spin .7s linear infinite; }
   .ghostbtn.on { color: var(--fg); border-color: var(--border2); }
+  /* public-view badge: the auth button announces read-only instead of
+     inviting a token nobody needs */
+  .ghostbtn.ro { color: var(--pending); border-color: var(--pending); opacity: .85; }
   @keyframes spin { to { transform: rotate(360deg); } }
   kbd {
     font-family: var(--mono); font-size: 10px; padding: 1px 5px; border-radius: 3px;
@@ -1901,7 +1904,7 @@
       </div>
       <div class="setrow"><span class="lab">Alarm escalation<small>wallboard reddens &amp; the alarm quickens the longer a failure goes unacked (a)</small></span><label class="switch"><input type="checkbox" id="setEscalate"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Keyboard shortcuts</span><button class="ghostbtn" id="openHelp">view (?)</button></div>
-      <div class="setrow"><span class="lab">Pair a device<small>QR for the companion app</small></span><button class="ghostbtn" id="openPair">pair</button></div>
+      <div class="setrow"><span class="lab">Pair a device<small>QR to pair your phone</small></span><button class="ghostbtn" id="openPair">pair</button></div>
     </div>
   </div>
 </div>
@@ -1925,7 +1928,7 @@
 <div class="overlay" id="pairWrap">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pairTitle" aria-describedby="pairMsg">
     <h3 id="pairTitle">Pair a device</h3>
-    <p id="pairMsg">Scan with the companion app to link it to this dashboard. The code carries this page's address and your bearer token, so pair over HTTPS or a trusted network. After pairing, compare the key fingerprint the app shows with the one <code>GET /push/devices</code> reports; a mismatch means the stored key is not your phone's.</p>
+    <p id="pairMsg">Scan with your phone's camera to open the companion app and pair it with this dashboard, or scan from inside the app. The QR is a link on the push relay's host carrying this page's address and your bearer token in its fragment, so pair over HTTPS or a trusted network. After pairing, compare the key fingerprint the app shows with the one <code>GET /push/devices</code> reports; a mismatch means the stored key is not your phone's.</p>
     <div class="pair-qr" id="pairQr"></div>
     <div class="pair-hint" id="pairHint" style="display:none"><span>No token is stored in this tab; the payload pairs unauthenticated.</span><button class="ghostbtn mini" id="pairToken">set token</button></div>
     <div class="pair-payload" id="pairPayload"></div>
@@ -6239,6 +6242,7 @@ var qrcode = function() {
     prevFail: {},              // name -> finished_at of last seen failure (notifications)
     seenFirst: false,
     connected: true,
+    auth: null,                // /whoami payload; null until the probe resolves (scope-aware chrome)
     clusterNode: null,         // this node's name (from /cluster), for owner self-highlight
     clusterSpread: false,      // distribution: spread is active (drives the Owner column)
     palette: { open: false, items: [], cur: 0 },
@@ -6288,10 +6292,34 @@ var qrcode = function() {
   //  auth-aware fetch
   // ===================================================================
   function token() { return sessionStorage.getItem(TOKEN_KEY) || ""; }
+  // Scope-aware chrome. state.auth is the /whoami payload: null means the
+  // probe has not resolved yet, and `allScopes` covers both the open daemon
+  // (no auth middleware) and an all-scopes token. The full UI shows in all
+  // three of those cases. Only a restricted scope set (a scoped token, or
+  // the anonymous grant of a public-view instance) hides the mutating
+  // affordances.
+  function canScope(s) {
+    const a = state.auth;
+    if (!a || a.allScopes) return true;
+    return (a.scopes || []).includes(s);
+  }
+  const canControl = () => canScope("control");
+  const canApprove = () => canScope("approve");
+  // A public-view instance: no token stored, and the daemon answered the
+  // credential-less /whoami with a restricted anonymous grant.
+  function publicView() {
+    const a = state.auth;
+    return !token() && !!a && a.authenticated === false && a.allScopes === false;
+  }
   function updateAuthBtn() {
     const has = !!token();
-    $("authLabel").textContent = has ? "token ✓" : "token";
+    const pub = publicView();
+    $("authLabel").textContent = has ? "token ✓" : pub ? "view only" : "token";
     $("authBtn").classList.toggle("on", has);
+    $("authBtn").classList.toggle("ro", pub);
+    $("authBtn").title = pub
+      ? "Read-only public view. Set a token to run and pause jobs."
+      : "Set access token";
     $("authIcon").innerHTML = has
       ? '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>'
       : '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-1.8"/>';
@@ -7156,7 +7184,9 @@ var qrcode = function() {
     // for no visible change — and takes text selection, hover and focus with
     // it. So the wholesale rebuild is reserved for the first paint and for a
     // gsig change, and the steady state reconciles per row below.
-    const gsig = JSON.stringify({ ow: showOwner, cn: state.clusterNode });
+    // ctl reaches every row (the action-button pair), so a scope change
+    // (whoami resolving, a token saved or cleared) rebuilds the table.
+    const gsig = JSON.stringify({ ow: showOwner, cn: state.clusterNode, ctl: canControl() });
     const sigs = jobs.map(rowSig);
     if (gsig !== state.lastRowSig) {
       state.lastRowSig = gsig;
@@ -7275,11 +7305,13 @@ var qrcode = function() {
       ? '<span class="faint">—</span>'
       : '<span class="nowrap" title="' + escAttr(fmtAtTitle(atMs)) + '">' + fmtAt(atMs) + "</span>";
     const rowCls = (state.drawerJob === job.name ? " active" : "") + (state.selected === job.name ? " sel" : "");
-    const runBtn = job.running
+    // Without the control scope (a view token, or a public-view instance's
+    // anonymous grant) the action buttons would only 403; emit Logs alone.
+    const runBtn = !canControl() ? "" : job.running
       ? '<button class="btn cancel" data-cancel="' + escAttr(job.name) + '"><i class="ic stop"></i>Stop</button>'
       : '<button class="btn run" data-run="' + escAttr(job.name) + '"' + (job.enabled ? "" : ' disabled title="job is disabled"') +
         '><i class="ic play"></i>Run</button>';
-    const pauseBtn = job.paused
+    const pauseBtn = !canControl() ? "" : job.paused
       ? '<button class="btn resume" data-resume="' + escAttr(job.name) + '"><i class="ic play"></i>Resume</button>'
       : '<button class="btn pause" data-pause="' + escAttr(job.name) + '"><i class="ic pause"></i>Pause</button>';
     return (
@@ -8878,6 +8910,12 @@ var qrcode = function() {
         (checks ? ' · <span class="faint">' + esc(checks) + "</span>" : "") + "</span>");
     }
     $("dMeta").innerHTML = parts.join("");
+    // Without `control` these three would only 403; the drawer opens on
+    // every poll's re-render, so re-apply the scope here rather than
+    // leaving applyScopeChrome's one-shot write to be overwritten.
+    const ctl = canControl();
+    for (const id of ["dRun", "dCancel", "dPause"])
+      $(id).style.display = ctl ? "" : "none";
     $("dRun").disabled = !job.enabled || job.running;
     $("dCancel").disabled = !job.running;
     // the pause button doubles as resume; a manual Run stays allowed while paused
@@ -9902,9 +9940,14 @@ var qrcode = function() {
   //  command palette
   // ===================================================================
   function baseCommands() {
+    // The palette is a parallel route to the same actions the buttons
+    // expose, so it honours the same scope: offering a read-only visitor a
+    // verb that can only answer 403 is a worse experience than not
+    // listing it.
+    const ctl = canControl();
     return [
       { ic: "↻", lbl: "Refresh now", hint: "g", run: loadJobs },
-      { ic: "▶", lbl: "Run all failing jobs", run: runAllFailing },
+      ...(ctl ? [{ ic: "▶", lbl: "Run all failing jobs", run: runAllFailing }] : []),
       { ic: "◐", lbl: "Cycle theme", hint: "t", run: cycleTheme },
       { ic: "◑", lbl: "Toggle light / dark", sub: "phosphor ↔ paper", hint: "T", run: toggleLightDark },
       { ic: "▤", lbl: "Toggle CRT effects", run: () => setFx(!prefs.fx) },
@@ -9927,7 +9970,7 @@ var qrcode = function() {
       { ic: "≋", lbl: "Multi-tail: running jobs", run: () => tailPreset("run") },
       { ic: "▣", lbl: "Wallboard / TV mode", hint: "w", run: () => setWallboard(!state.wallboard) },
       { ic: "▤", lbl: "Incident timeline", hint: "i", run: openTimeline },
-      { ic: "▸", lbl: "Mitigate failing jobs", run: () => openMitigate(state.jobs.filter((j) => health(j).key === "fail").map((j) => j.name), "failing jobs") },
+      ...(ctl ? [{ ic: "▸", lbl: "Mitigate failing jobs", run: () => openMitigate(state.jobs.filter((j) => health(j).key === "fail").map((j) => j.name), "failing jobs") }] : []),
       { ic: "◴", lbl: "Cron sandbox", run: () => openSandbox() },
       { ic: "◱", lbl: "Toggle run ledger", run: () => setLedger(!prefs.ledger) },
       { ic: "▮", lbl: "Toggle boot self-test", run: () => setBoot(!prefs.boot) },
@@ -9946,12 +9989,13 @@ var qrcode = function() {
   }
   function jobCommands() {
     const out = [];
+    const ctl = canControl();   // same scope rule as the row buttons
     for (const j of state.jobs) {
       out.push({ ic: GLYPH[health(j).key], lbl: "Logs: " + j.name, sub: "open", run: () => openDrawer(j.name, "logs") });
-      if (j.enabled && !j.running) out.push({ ic: "▶", lbl: "Run: " + j.name, run: () => runJob(j.name) });
-      if (j.running) out.push({ ic: "■", lbl: "Cancel: " + j.name, run: () => cancelJob(j.name) });
-      if (j.paused) out.push({ ic: "▶", lbl: "Resume: " + j.name, run: () => resumeJob(j.name) });
-      else out.push({ ic: "⏸", lbl: "Pause: " + j.name, run: () => pauseJob(j.name) });
+      if (ctl && j.enabled && !j.running) out.push({ ic: "▶", lbl: "Run: " + j.name, run: () => runJob(j.name) });
+      if (ctl && j.running) out.push({ ic: "■", lbl: "Cancel: " + j.name, run: () => cancelJob(j.name) });
+      if (ctl && j.paused) out.push({ ic: "▶", lbl: "Resume: " + j.name, run: () => resumeJob(j.name) });
+      else if (ctl) out.push({ ic: "⏸", lbl: "Pause: " + j.name, run: () => pauseJob(j.name) });
       out.push({ ic: "❏", lbl: "Copy command: " + j.name, run: () => copyText(j.command, "command") });
       out.push({ ic: "◴", lbl: "Schedule: " + j.name, run: () => openDrawer(j.name, "schedule") });
       out.push({ ic: "≋", lbl: "Tail: " + j.name, sub: "multi-tail", run: () => openTail([j.name]) });
@@ -9960,9 +10004,10 @@ var qrcode = function() {
   }
   function dagCommands() {
     const out = [];
+    const ctl = canControl();   // same scope rule as the DAG card's Run button
     for (const d of state.dags.list) {
       out.push({ ic: d.latestRun ? dstGlyph(d.latestRun.state) : "⧉", lbl: "DAG: " + d.name, sub: "open", run: () => openDagDrawer(d.name) });
-      out.push({ ic: "▶", lbl: "Trigger DAG: " + d.name, run: () => dagTrigger(d.name) });
+      if (ctl) out.push({ ic: "▶", lbl: "Trigger DAG: " + d.name, run: () => dagTrigger(d.name) });
     }
     return out;
   }
@@ -10156,30 +10201,59 @@ var qrcode = function() {
       qr.addData(text, "Byte");
       qr.make();
       const n = qr.getModuleCount(), quiet = 4, dim = n + quiet * 2;
+      const px = Math.max(220, dim * 4);   // ≥4 CSS px per module keeps dense codes scannable
       let d = "";
       for (let r = 0; r < n; r++)
         for (let c = 0; c < n; c++)
           if (qr.isDark(r, c)) d += "M" + (c + quiet) + " " + (r + quiet) + "h1v1h-1z";
       box.innerHTML =
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + dim + " " + dim +
-        '" width="220" height="220" shape-rendering="crispEdges" role="img" aria-label="pairing QR code">' +
+        '" width="' + px + '" height="' + px + '" shape-rendering="crispEdges" role="img" aria-label="pairing QR code">' +
         '<rect width="' + dim + '" height="' + dim + '" fill="#fff"/>' +
         '<path d="' + d + '" fill="#000"/></svg>';
     } catch (err) {
       box.textContent = "QR render failed: " + (err && err.message ? err.message : err);
     }
   }
+  // The QR encodes a pairing *link* (a camera scan deep-links into the
+  // companion app); the payload rides in the URL fragment as
+  // base64url(JSON), out of the HTTP request, though the landing page's
+  // script reads it to build its cronstable:// fallback. The base comes
+  // from /whoami's pairLinkBase (push.relay.url's origin); the constant
+  // covers the calls before that answer lands. The copyable string under
+  // the QR stays the raw JSON. Landing and fallback details:
+  // docs/relay-protocol.md, "Pairing links".
+  const PAIR_LINK_BASE = "https://relay.cronstable.com/pair";
+  function pairLinkBase() {
+    const a = state.auth;
+    return (a && typeof a.pairLinkBase === "string" && a.pairLinkBase) || PAIR_LINK_BASE;
+  }
+  function pairLink(payload, base) {
+    const bytes = new TextEncoder().encode(payload);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    const b64 = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    return (base || pairLinkBase()) + "#" + b64;
+  }
   function openPair() {
     if (!openOverlay("pairWrap")) return;
     const payload = JSON.stringify({ v: 1, name: state.clusterNode || location.host, url: location.origin, token: token() });
-    renderPairQr(payload);
+    let renderedBase = pairLinkBase();
+    renderPairQr(pairLink(payload, renderedBase));
     $("pairPayload").textContent = payload;
     $("pairHint").style.display = token() ? "none" : "";
+    $("pairHint").querySelector("span").textContent = publicView()
+      ? "No token is stored; this instance serves anonymous read-only viewing, and pairing needs an operator token."
+      : "No token is stored in this tab; the payload pairs unauthenticated.";
     $("pairWarn").style.display = "none";
     focusFirst($("pairWrap"));
     const seq = ++pairSeq;
     apiFetch("/whoami").then((r) => (r.ok ? r.json() : null)).then((w) => {
       if (!w || seq !== pairSeq) return;
+      if (typeof w.pairLinkBase === "string" && w.pairLinkBase && w.pairLinkBase !== renderedBase) {
+        renderedBase = w.pairLinkBase;
+        renderPairQr(pairLink(payload, renderedBase));
+      }
       if (w.authenticated === true && w.allScopes === true) $("pairWarn").style.display = "";
     }).catch(() => {});
   }
@@ -10197,7 +10271,9 @@ var qrcode = function() {
       $("modalMsg").textContent = "This cronstable instance requires a bearer token. It is stored only in this browser tab.";
     } else {
       $("modalTitle").textContent = has ? "Update access token" : "Set access token";
-      $("modalMsg").textContent = "Stored only in this browser tab and sent as a bearer token with each request.";
+      $("modalMsg").textContent = publicView()
+        ? "This instance is publicly viewable without a token. Enter an operator token to run, pause and approve."
+        : "Stored only in this browser tab and sent as a bearer token with each request.";
     }
     $("tokenClear").style.display = has ? "" : "none";
     $("tokenInput").value = token();
@@ -10406,9 +10482,11 @@ var qrcode = function() {
       case "T": e.preventDefault(); toggleLightDark(); break;
       case "i": e.preventDefault(); openTimeline(); break;
       case "Enter": { const j = selectedJob(); if (j) openDrawer(j.name); break; }
-      case "r": { const j = selectedJob(); if (j && j.enabled && !j.running) runJob(j.name); break; }
-      case "x": { const j = selectedJob(); if (j && j.running) cancelJob(j.name); break; }
-      case "p": { const j = selectedJob(); if (j) (j.paused ? resumeJob : pauseJob)(j.name); break; }
+      // r/x/p are the keyboard route to the row buttons, so they carry the
+      // same scope check: on a read-only board they are simply inert.
+      case "r": { const j = selectedJob(); if (canControl() && j && j.enabled && !j.running) runJob(j.name); break; }
+      case "x": { const j = selectedJob(); if (canControl() && j && j.running) cancelJob(j.name); break; }
+      case "p": { const j = selectedJob(); if (canControl() && j) (j.paused ? resumeJob : pauseJob)(j.name); break; }
       case "c": { const j = selectedJob(); if (j) copyText(j.command, "command"); break; }
     }
   });
@@ -10542,7 +10620,7 @@ var qrcode = function() {
     const sig = JSON.stringify(dags.map((d) => [
       d.name, d.enabled, d.schedule, (d.tasks || []).length, d.totalRuns,
       d.latestRun && d.latestRun.state, d.latestRun && d.latestRun.updatedAt,
-      d.runCounts, state.dagDrawer.dag,
+      d.runCounts, state.dagDrawer.dag, canControl(),
     ]));
     if (sig === state.dags.sig) return;
     state.dags.sig = sig;
@@ -10572,7 +10650,11 @@ var qrcode = function() {
         "<td>" + latest + "</td>" +
         '<td class="muted nowrap">' + esc(runsCount) + "</td>" +
         '<td style="text-align:right"><div class="actions" style="justify-content:flex-end">' +
-        '<button class="btn run" data-dagtrigger="' + escAttr(d.name) + '" title="Trigger a manual run"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>Run</button>' +
+        // triggering needs `control`; a read-only visitor gets Open alone,
+        // matching the DAG drawer's gated Trigger button
+        (canControl()
+          ? '<button class="btn run" data-dagtrigger="' + escAttr(d.name) + '" title="Trigger a manual run"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>Run</button>'
+          : "") +
         '<button class="btn" data-dagopen="' + escAttr(d.name) + '">Open</button>' +
         "</div></td></tr>";
     }).join("");
@@ -10793,9 +10875,13 @@ var qrcode = function() {
         bits.push('<span class="' + (ap.decision === "approved" ? "apprv" : "aprej") + '">' + esc(ap.decision) +
           (ap.by ? " by " + esc(ap.by) : "") + "</span>");
       } else if (st === "running" && e.awaitingApproval) {
-        bits.push('<span class="approw"><span class="pending">⏸ awaiting</span>' +
-          '<button class="btn run" data-approve="' + escAttr(taskkey) + '">✓ Approve</button>' +
-          '<button class="btn cancel" data-reject="' + escAttr(taskkey) + '">✕ Reject</button></span>');
+        // decision buttons need the approve scope; without it the gate
+        // still shows, as a fact rather than an affordance
+        bits.push(canApprove()
+          ? '<span class="approw"><span class="pending">⏸ awaiting</span>' +
+            '<button class="btn run" data-approve="' + escAttr(taskkey) + '">✓ Approve</button>' +
+            '<button class="btn cancel" data-reject="' + escAttr(taskkey) + '">✕ Reject</button></span>'
+          : '<span class="approw"><span class="pending">⏸ awaiting approval</span></span>');
       }
     }
     if (spec && spec.type === "sensor" && e.pokeCount != null) {
@@ -11585,9 +11671,9 @@ var qrcode = function() {
     $("tokenSave").addEventListener("click", () => {
       const v = $("tokenInput").value.trim();
       if (v) sessionStorage.setItem(TOKEN_KEY, v); else sessionStorage.removeItem(TOKEN_KEY);
-      updateAuthBtn(); closeModal(); loadJobs();
+      updateAuthBtn(); closeModal(); loadWhoami(); loadJobs();
     });
-    $("tokenClear").addEventListener("click", () => { sessionStorage.removeItem(TOKEN_KEY); updateAuthBtn(); closeModal(); loadJobs(); });
+    $("tokenClear").addEventListener("click", () => { sessionStorage.removeItem(TOKEN_KEY); updateAuthBtn(); closeModal(); loadWhoami(); loadJobs(); });
     $("tokenCancel").addEventListener("click", closeModal);
     $("modalWrap").addEventListener("click", (e) => { if (e.target === $("modalWrap")) closeModal(); });
     $("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("tokenSave").click(); });
@@ -11643,6 +11729,36 @@ var qrcode = function() {
       el.textContent = "v" + (await r.text()).trim();
       el.title = "version (click to copy)";
     } catch (_) {}
+  }
+
+  // Which scopes this browser holds: an anonymous public-view grant, a
+  // scoped token, or everything. Resolves before the first jobs render so
+  // the first paint already shows the right affordances; re-runs whenever
+  // the stored token changes.
+  function loadWhoami() {
+    return singleFlight("whoami", async () => {
+      try {
+        const r = await apiFetch("/whoami");
+        if (r.ok) state.auth = await r.json();
+      } catch (_) { /* a 401 already opened the token modal; keep prior scopes */ }
+      updateAuthBtn();
+      applyScopeChrome();
+    });
+  }
+  function applyScopeChrome() {
+    const ctl = canControl();
+    for (const id of ["runFailingBtn", "vMitigate", "dgTrigger", "dgBackfillBtn",
+                      "dRun", "dCancel", "dPause"])
+      $(id).style.display = ctl ? "" : "none";
+    // The rows and the DAG card carry the scope in their signatures. Only
+    // repaint once a poll has landed: before the first /jobs response
+    // state.jobs is still empty, and renderRows would flash the "No jobs
+    // configured." empty state over a board that is merely still loading.
+    if (state.fetchedAt) {
+      renderRows();
+      state.dags.sig = null;
+      renderDagCard();
+    }
   }
 
   async function loadJobSetId() {
@@ -12771,6 +12887,20 @@ var qrcode = function() {
       res(l2, '<span class="val">v' + esc(version) + "</span>");
       await pause(110); if (skipped) return;
 
+      // public-view instances announce themselves; every other shape
+      // (token, open daemon) boots exactly as before, with no extra line
+      const w = await probe("/whoami"); if (skipped) return;
+      if (w.ok) {
+        try {
+          const a = await w.r.json();
+          if (a.authenticated === false && a.allScopes === false && !token()) {
+            const la = line("ACCESS");
+            res(la, '<span class="val">PUBLIC VIEW</span> <span class="lbl">[read-only]</span>');
+            await pause(110); if (skipped) return;
+          }
+        } catch (_) {}
+      }
+
       // 2) job-set id + job count (one JSON call)
       const l3 = line("JOB SET");
       const js = await probe("/job-set-id", { headers: { Accept: "application/json" } }); if (skipped) return;
@@ -12859,8 +12989,9 @@ var qrcode = function() {
     loadJobSetId();
     // /cluster rides along on loadJobs' success path (loadCluster there); a
     // direct call here would just guarantee two overlapping /cluster fetches
-    // at every startup.
-    loadJobs().then(openFromHash);
+    // at every startup. Scopes resolve first so the first row render
+    // already knows which action buttons to draw.
+    loadWhoami().then(() => loadJobs().then(openFromHash));
     restartPolling();
   }
   setInterval(tick, 1000);

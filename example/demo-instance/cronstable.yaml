@@ -1,71 +1,222 @@
-# The PUBLIC READ-ONLY DEMO instance (demo.cronstable.com).
+# The public read-only demo instance (demo.cronstable.com).
 #
-# This board backs the companion app's "Try the demo" button and App Store
-# review. It is a plausible homelab fleet with something on every screen:
-# healthy heartbeats, a live log streamer, a failure with a meaty log tail
-# to triage, a flaky job that retries its way out, a long runner you can
-# catch mid-run, an SLA-monitored job, and a small DAG.
+# This board backs the dashboard anyone can open at demo.cronstable.com, the
+# companion app's "Try the demo" button, and App Store review. It is one
+# plausible homelab (media library, photo pipeline, backups, home sensors,
+# family reminders) curated as a feature tour: every job exists to light up
+# one capability, and its name, comment and log lines say which, so a
+# first-time visitor can answer "what can this thing do?" by scrolling.
 #
 # Access model, on purpose:
-#   - The only credential is a VIEW-scoped bearer token (below). It is
-#     deliberately public: it ships inside the app and appears in the runbook
-#     (see README.md). View scope can read state and logs, and nothing else:
-#     no run/cancel/pause, no approvals, no pairing.
-#   - No `push:` block: pairing a device against the demo makes no sense and
-#     would need control of a relay topic; the app's demo mode renders its
-#     own sample alerts locally.
+#   - Anyone may read, with no credential at all: `web.anonymousScopes` below
+#     grants the `view` scope to unauthenticated requests, so the dashboard,
+#     the log tails and the calendar feeds open for a visitor who has never
+#     heard of a bearer token. Nothing mutating is reachable that way; every
+#     such call answers 403 by scope.
+#   - The view-scoped token below still exists for clients that authenticate
+#     (the companion app bakes it in). It grants exactly what anonymous
+#     visitors already have, so it is public by design.
+#   - The operator token belongs to the `demo-operator` job on this host.
+#     Visitors cannot mutate anything, so a scripted operator performs the
+#     mutating actions that make those states visible on the board: it decides
+#     the firmware-rollout approval gate, opens a scheduled maintenance-window
+#     pause, and clears meter-export's depends-on-past gate with a manual
+#     start. Its secret is generated per host, lives only in the daemon's
+#     environment, and is never printed and never leaves the machine.
+#   - No `push:` block: pairing a device against a public board makes no sense
+#     and would need control of a relay topic; the app's demo mode renders its
+#     own sample alerts locally. `GET /push/devices` is never anonymous.
+#   - No job talks to the outside world. The only "network" any job touches is
+#     the daemon's own loopback API (the job-facing state endpoint, the public
+#     /metrics scrape, and the operator's control calls).
 #
-# Bring-up: docker-compose.yml next to this file, which also runs the
-# Cloudflare Tunnel that publishes this daemon and terminates TLS.
+# Every command here runs on both supported hosts: bash plus python3 only, no
+# curl and no coreutils-only binaries, because the container image is
+# python:3.14-slim and the native host is a Mac.
+#
+# Bring-up: launchd/install.sh (native launchd agent + Cloudflare Tunnel, the
+# live deployment) or docker-compose.yml next to this file. Both retarget the
+# state path and the listener; see README.md.
+
+# Two classic crontab lines, migrated as-is: cronstable lowers Vixie-style
+# entries into normal jobs whose names embed their line numbers, and the
+# schedule doctor lints them like everything else (the */45 below earns an
+# uneven-step warning it deserved all along).
+include:
+  - legacy.crontab
 
 defaults:
   shell: /bin/bash
   captureStdout: true
   captureStderr: true
 
-# Durable run history: job detail and run screens stay populated across
-# container restarts, and the DAG below requires the state store + loopback.
+# Durable run history: job detail and run screens stay populated across daemon
+# restarts, jobs get the loopback state API (cursor/idempotent/lock/artifact/
+# secret/xcom below), and the DAGs require the store for run documents.
+# maxRunsPerJob bounds ledger growth on a board that runs 24/7.
 state:
   path: /var/lib/cronstable/state
+  maxRunsPerJob: 200
   jobApi:
     enabled: true
 
 web:
-  # Plaintext on the container port; TLS is the reverse proxy's job.
+  # Plaintext on the local port; TLS is the tunnel's job.
   listen:
     - http://0.0.0.0:8080
+  # The whole point of a public demo: a visitor with no token reads the board.
+  # Only `view` may be granted this way, and the schema enforces it, so no
+  # anonymous path to a mutating endpoint can be configured by accident.
+  anonymousScopes:
+    - view
+  # Prometheus exposition, tokenless by design: `curl demo.cronstable.com/metrics`
+  # works with no credential at all, a small proof the instance is real.
+  metrics:
+    enabled: true
+    public: true
+  # Node CPU/memory ring behind the dashboard header meter and the app's node
+  # tab: 5s resolution, two hours of window.
+  nodeHistory:
+    interval: 5
+    points: 1440
   authTokens:
     - label: public-demo-viewer
       scopes:
         - view
       fromEnvVar: CRONSTABLE_DEMO_VIEW_TOKEN
+    # The scripted operator's credential (see the header note and the
+    # demo-operator job). control+approve imply view. Generated per host by
+    # launchd/install.sh; never checked in and never defaulted.
+    #
+    # Both bring-up paths guarantee it is set, and they have to: an
+    # authTokens entry whose source resolves empty fails closed, and that
+    # takes the whole web API down (jobs keep running, nothing serves,
+    # including the anonymous view). Running this config by hand without
+    # the variable is the one way to see that, and the daemon logs it.
+    - label: demo-operator
+      scopes:
+        - control
+        - approve
+      fromEnvVar: CRONSTABLE_DEMO_OPERATOR_TOKEN
 
 jobs:
-  # A first run the moment the daemon starts, so a fresh deploy is never an
-  # empty board.
+  # =====================================================================
+  #  Pulse: the board is alive the moment you open it
+  # =====================================================================
+
+  # [shows: @reboot] A first run the moment the daemon starts, so a fresh
+  # deploy is never an empty board. With the durable store above, @reboot
+  # fires once per OS boot where the platform exposes a boot identity
+  # (Linux); macOS has none, so on the launchd host every daemon start
+  # counts as a fresh boot and re-fires it. Its log doubles as the board's
+  # welcome mat and names the scripted operator honestly.
   - name: welcome
-    command: echo "👋 cronstable public demo up on $HOSTNAME at $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
+    command: |
+      echo "cronstable public demo up on $HOSTNAME at $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
+      echo "every job on this board exists to show one capability; scroll and read"
+      echo "you are reading this without a token: this instance grants anonymous view scope"
+      echo "visitors are read-only; the demo-operator job performs the approvals and pauses you will see"
     schedule: "@reboot"
 
-  # The steady green pulse.
+  # [shows: durable KV counter] The steady green pulse, with a proof of
+  # durability: the beat number lives in the state store, so it keeps counting
+  # across daemon restarts and redeploys instead of resetting.
   - name: heartbeat
-    command: echo "♥ heartbeat $(date -u +%H:%M:%S) UTC"
+    command: |
+      n=$(cronstable state get beats 2>/dev/null || echo 0)
+      n=$((n + 1))
+      cronstable state set beats "$n" 2>/dev/null || true
+      echo "beat $n at $(date -u +%H:%M:%S) UTC (the count survives restarts: it lives in the durable state store)"
     schedule: "* * * * *"
 
-  # Streams a line per second for ~20 s: the live log tail demo.
+  # [shows: seconds-field scheduling + argv-list command] The object schedule
+  # form takes a `second` field, which makes the whole scheduler tick
+  # per-second; watch the countdown on this row run in seconds. The command is
+  # a list, so it executes directly with no shell in between.
+  - name: load-pulse
+    schedule:
+      second: "*/20"
+    concurrencyPolicy: Forbid
+    executionTimeout: 10
+    command:
+      - python3
+      - -c
+      - "import os; l = os.getloadavg(); print(f'load {l[0]:.2f} {l[1]:.2f} {l[2]:.2f} (1/5/15 min)')"
+
+  # =====================================================================
+  #  Live logs and long runners: something is almost always Running
+  # =====================================================================
+
+  # [shows: live log streaming (SSE)] Streams a line per second for ~20 s: open
+  # the job and watch the tail move. The lines rotate through the house's
+  # telemetry vocabulary so the stream reads like a homelab, not a counter.
   - name: sensor-sweep
     command: |
-      echo "sweeping 20 sensors..."
+      echo "sweeping 20 telemetry points..."
       for i in $(seq 1 20); do
-        echo "sensor $i/20: ok ($((RANDOM % 30 + 40)).$((RANDOM % 9))°C) at $(date -u +%T)"
+        case $((i % 4)) in
+          1) echo "point $i/20: attic $((RANDOM % 8 + 24)).$((RANDOM % 9))C, humidity $((RANDOM % 20 + 40))%" ;;
+          2) echo "point $i/20: NAS fans $((RANDOM % 400 + 800)) rpm, drives cool" ;;
+          3) echo "point $i/20: UPS on line power, battery $((RANDOM % 5 + 95))%" ;;
+          0) echo "point $i/20: garage door closed, beam clear ($(date -u +%T))" ;;
+        esac
         sleep 1
       done
       echo "sweep complete: 20/20 nominal"
     schedule: "*/3 * * * *"
 
-  # ALWAYS fails, with a log tail worth reading: the app's incident /
-  # verdict showcase. The stderr lines are what the push payload's
-  # log_tail would carry for a real failure.
+  # [shows: Forbid concurrency + per-run resource charts + duration variance]
+  # Runs 60-90 s with progress output and real CPU pulses the resource sampler
+  # draws; batch count varies, so the Trends duration chart is not a flat line.
+  # Forbid means a still-running instance makes the next tick skip rather than
+  # stack (contrast cam-timelapse's Replace).
+  - name: media-reindex
+    command: |
+      batches=$((RANDOM % 7 + 12))
+      echo "reindexing library in $batches batches..."
+      for i in $(seq 1 $batches); do
+        python3 -c "import hashlib; h = hashlib.sha256(); block = b'x' * 1048576; [h.update(block) for _ in range(400)]; print('batch digest', h.hexdigest()[:12])"
+        echo "batch $i/$batches indexed ($((i * 512)) items)"
+        sleep 4
+      done
+      echo "reindex complete: $((batches * 512)) items"
+    schedule: "*/15 * * * *"
+    concurrencyPolicy: Forbid
+    monitorResources:
+      interval: 0.5
+      history: 240
+
+  # [shows: Replace concurrency -> Cancelled runs + a near-always-Running row]
+  # Stitches "camera stills" for 3.5-7 minutes on a 5-minute schedule: when a
+  # run overshoots its interval, Replace cancels it in favor of the new fire,
+  # and the ledger records Cancelled (not a failure). The short lock at the end
+  # shares the `photo-library` mutex with photo-tagger.
+  - name: cam-timelapse
+    schedule: "2-57/5 * * * *"
+    concurrencyPolicy: Replace
+    monitorResources: true
+    command: |
+      segs=$((RANDOM % 15 + 14))
+      echo "stitching driveway-cam stills ($segs segments planned)"
+      i=1
+      while [ $i -le $segs ]; do
+        echo "segment $i/$segs rendered at $(date -u +%T)"
+        sleep 15
+        i=$((i + 1))
+      done
+      cronstable lock run --global --wait --timeout 60 photo-library -- sh -c 'echo "publishing segments into the shared photo library (holds the photo-library mutex)"; sleep 5'
+      echo "timelapse updated: $segs segments"
+
+  # =====================================================================
+  #  Failure school: every way a run can go wrong, each on its own job
+  # =====================================================================
+
+  # [shows: the incident showcase + SLA breach + archived output] always fails,
+  # with a log tail worth reading; the stderr lines are what a push payload's
+  # log_tail would carry for a real failure. It never succeeds, so its
+  # maxTimeSinceSuccess SLA is permanently breached: this one row carries the
+  # OVERDUE badge, and archiveOutput keeps every failure's output readable in
+  # the durable ledger.
   - name: backup-verify
     command: |
       echo "verify: opening snapshot catalog..."
@@ -75,9 +226,28 @@ jobs:
       echo "hint: run 'restic check --read-data' on the backup host" 1>&2
       exit 1
     schedule: "*/10 * * * *"
+    sla:
+      maxTimeSinceSuccessSeconds: 3600
+    archiveOutput: true
 
-  # Fails about a third of the time, and retries usually rescue it: the
-  # retry/backoff timeline demo, flipping green most of the time.
+  # [shows: SLA panel, healthy + the duplicates panel] backup-verify's
+  # counterpart: same */10 spelling on purpose (the schedule tab's duplicate
+  # detector pairs them), but this one always succeeds, so its job detail shows
+  # a live green SLA panel next to its neighbor's permanent breach. The small
+  # random sleep keeps its Trends duration chart honest.
+  - name: offsite-snapshot
+    command: |
+      sleep $((RANDOM % 20 + 5))
+      echo "snapshot shipped at $(date -u +%T) ($((RANDOM % 400 + 200)) MiB)"
+    schedule: "*/10 * * * *"
+    sla:
+      maxTimeSinceSuccessSeconds: 1800
+      maxRuntimeSeconds: 300
+
+  # [shows: retry with exponential backoff] Fails about a third of the time,
+  # and retries usually rescue it: catch the Retrying state and the attempt
+  # timeline. (The demo-operator also pauses this job for 15 minutes a few
+  # times a day, so the Paused badge and pause note get stage time too.)
   - name: feed-sync
     command: |
       echo "pulling 14 feeds at $(date -u +%T)..."
@@ -94,45 +264,396 @@ jobs:
         maximumDelay: 60
         backoffMultiplier: 2
 
-  # Runs ~90 s with progress output: catch it Running, watch the live
-  # tail, later the Live Activity demo.
-  - name: media-reindex
+  # [shows: failsWhen.producesStderr, failure by output, not exit code] Always
+  # exits 0; a few times a day it prints one stderr warning and that alone
+  # marks the run failed. Cron's oldest gotcha, made explicit. The inline
+  # environment value it echoes shows per-job env injection.
+  - name: config-drift-check
     command: |
-      echo "reindexing library..."
-      for i in $(seq 1 18); do
-        echo "batch $i/18 indexed ($((i * 512)) items)"
-        sleep 5
+      echo "auditing homelab configs against baseline $DRIFT_BASELINE"
+      if [ "$(date -u +%-M)" = "39" ] && [ $(( $(date -u +%-H) % 3 )) -eq 0 ]; then
+        echo "drift: docker-compose.media.yml differs from baseline (2 keys)" 1>&2
+      fi
+      echo "audit pass complete (exit code 0 either way; stderr is the verdict)"
+    schedule: "9-54/15 * * * *"
+    environment:
+      - key: DRIFT_BASELINE
+        value: main@4f2c9e1
+    failsWhen:
+      producesStdout: false
+      producesStderr: true
+      nonzeroReturn: true
+
+  # [shows: executionTimeout + killTimeout] Probes the dashboard's own loopback
+  # endpoint and reports the round-trip. Four times a day it "hangs" past its
+  # 30 s budget and cronstable terminates it: the run records a timeout
+  # fail_reason (the classic exit 137/143 story).
+  - name: gateway-probe
+    command: |
+      echo "probing the local dashboard endpoint (loopback)..."
+      python3 -c "
+      import os, time, urllib.request
+      start = time.monotonic()
+      with urllib.request.urlopen(os.environ['DEMO_WEB_URL'] + '/metrics', timeout=10) as r:
+          r.read()
+          print(f'answered HTTP {r.status} in {time.monotonic() - start:.3f}s')
+      "
+      if [ "$(date -u +%-M)" = "40" ] && [ $(( $(date -u +%-H) % 6 )) -eq 1 ]; then
+        echo "response stalled mid-read; waiting on the socket..."
+        sleep 120
+      fi
+      echo "probe complete"
+    schedule: "*/20 * * * *"
+    executionTimeout: 30
+    killTimeout: 5
+    # The daemon's own listener, injected rather than hardcoded so a
+    # re-hosted board (a different port, a different bind) edits one line.
+    environment:
+      - key: DEMO_WEB_URL
+        value: http://127.0.0.1:8080
+
+  # =====================================================================
+  #  Durable state primitives: cursor, idempotency, depends-on-past
+  # =====================================================================
+
+  # [shows: cursor watermark + onlyIfLastSucceeded (depends-on-past)] An
+  # incremental export: each run reads the durable watermark, exports "rows",
+  # and advances it (advance is monotonic; a replay can never move it
+  # backwards). Six times a day it aborts before the watermark moves, and
+  # onlyIfLastSucceeded then skips the next scheduled fire rather than export on
+  # top of a failure; the demo-operator clears the gate with a manual start,
+  # which is exactly the operator override the gate is designed for.
+  - name: meter-export
+    schedule: "4-54/10 * * * *"
+    onlyIfLastSucceeded: true
+    command: |
+      set -u
+      last=$(cronstable cursor get meter-rows 2>/dev/null || echo 0)
+      if [ "$(date -u +%-M)" = "44" ] && [ $(( $(date -u +%-H) % 4 )) -eq 1 ]; then
+        echo "smart-meter bridge returned a torn page at row $last; aborting before the watermark moves" 1>&2
+        exit 1
+      fi
+      rows=$((RANDOM % 40 + 10))
+      next=$((last + rows))
+      echo "exporting meter rows $last..$next"
+      sleep $((rows / 10 + 2))
+      # advance echoes the new value; the narrated line below is the one
+      # worth reading in the log
+      cronstable cursor advance meter-rows "$next" > /dev/null
+      echo "watermark now $next"
+
+  # [shows: exactly-once via `cronstable idempotent`] Scheduled hourly on
+  # purpose, rotates exactly once per day: the first run of the day wins the
+  # claim (exit 0), later runs find it taken (exit 5) and skip, and a store
+  # error (exit 1) fails the run rather than guessing "already done".
+  - name: rotate-journal
+    schedule: "0 * * * *"
+    command: |
+      set -u
+      key="journal-$(date -u +%F)"
+      cronstable idempotent "$key" && rc=0 || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        echo "rotating the homelab journal for $(date -u +%F) (won claim $key)"
+        sleep 2
+        echo "journal rotated and compressed"
+      elif [ "$rc" -eq 5 ]; then
+        echo "journal already rotated today (claim $key taken); nothing to do"
+      else
+        echo "state store unreachable; failing rather than guessing" 1>&2
+        exit "$rc"
+      fi
+
+  # [shows: memory profile on the Resources chart + below-normal priority + the
+  # photo-library mutex] "Tags photos with a small on-device model": a stepped
+  # RAM ramp to ~170 MiB the resource sampler draws as a staircase, then a short
+  # write under the same lock cam-timelapse publishes with, so the two
+  # occasionally wait on each other, visibly and harmlessly.
+  - name: photo-tagger
+    schedule: "7-59/15 * * * *"
+    priority: below-normal
+    monitorResources:
+      interval: 0.5
+      history: 240
+    command: |
+      echo "tagging new photos with the on-device model"
+      python3 - <<'PY'
+      import time
+      blobs = []
+      for step in range(6):
+          blobs.append(bytearray(28 * 1024 * 1024))
+          print(f"model pass {step + 1}/6: resident set ~{28 * (step + 1)} MiB", flush=True)
+          time.sleep(7)
+      print("tagged 214 photos; releasing model memory")
+      PY
+      cronstable lock run --global --wait --timeout 90 photo-library -- sh -c 'echo "writing tags into the shared photo library (holds the photo-library mutex)"; sleep 4'
+
+  # =====================================================================
+  #  Schedule showpieces: the schedule tab, calendar, and lint findings
+  # =====================================================================
+
+  # [shows: H hashed schedules + missed-run catch-up (run-all)] `H/10` picks
+  # this job's own stable phase from a hash of its name, the cure for
+  # every-job-at-:00 stampedes; the schedule tab names the exact minutes it
+  # resolved to. After daemon downtime, run-all replays each missed slot (up to
+  # 2 h back, launches spread by catch-up jitter), so a redeploy leaves a
+  # visible catch-up burst in the ledger.
+  - name: metrics-rollup
+    schedule: "H/10 * * * *"
+    onMissed: run-all
+    startingDeadlineSeconds: 7200
+    catchupJitterSeconds: 20
+    environment:
+      - key: DEMO_WEB_URL
+        value: http://127.0.0.1:8080
+    command: |
+      python3 -c "
+      import os, urllib.request
+      with urllib.request.urlopen(os.environ['DEMO_WEB_URL'] + '/metrics', timeout=10) as r:
+          body = r.read().decode('utf-8', 'replace')
+      series = sum(1 for line in body.splitlines() if line.startswith('cronstable_'))
+      print(f'rolled up {series} cronstable series from /metrics')
+      "
+      echo "that endpoint is public on this demo: curl https://demo.cronstable.com/metrics yourself, no token needed"
+
+  # [shows: the uneven-step lint warning] */7 does not divide 60, so the last
+  # interval of each hour is short; the schedule doctor flags it. The warning
+  # badge on this row is the point.
+  - name: dns-flush
+    schedule: "*/7 * * * *"
+    command: echo "flushed $((RANDOM % 300 + 100)) cached lookups from the lab resolver"
+
+  # [shows: LW, last weekday of the month] Business-day cron: fires on the final
+  # Mon-Fri of every month, skipping the weekend, and the daemon works out
+  # where the month ends. The week calendar renders the odd cadence.
+  - name: bill-reminder
+    schedule: "0 9 LW * *"
+    command: 'echo "utilities autopay clears today (last weekday): balances checked, nothing overdrawn"'
+
+  # [shows: nth-weekday (sun#1) + idle priority + archived output] The monthly
+  # storage-pool scrub, first Sunday at 02:00, at idle priority so it never
+  # outranks real work (lowering priority needs no privilege; raising does).
+  # archiveOutput keeps each month's scrub report forever.
+  - name: pool-scrub
+    schedule: "0 2 * * sun#1"
+    priority: idle
+    archiveOutput: true
+    monitorResources: true
+    command: |
+      echo "monthly scrub of the storage pool (idle priority)"
+      for disk in ssd0 hdd1 hdd2; do
+        python3 -c "import hashlib; h = hashlib.sha256(); block = b'x' * 1048576; [h.update(block) for _ in range(800)]; print('surface digest', h.hexdigest()[:12])"
+        echo "$disk: surface pass clean"
       done
-      echo "reindex complete: 9216 items"
-    schedule: "*/15 * * * *"
-    concurrencyPolicy: Forbid
+      echo "scrub complete: 0 repaired, 0 unrecoverable"
 
-  # SLA-monitored: succeeds every 10 minutes, monitored for staleness and
-  # overrun, so the job detail screen shows a live SLA panel (and never
-  # breaches while healthy).
-  - name: offsite-snapshot
+  # [shows: L-3 (offset from month end) + run-scoped secrets + redaction]
+  # Renewal check three days before month end, whatever length the month has.
+  # Its dummy account key is a run-scoped secret served over the loopback
+  # endpoint (never via the environment); the job proves it has it by printing
+  # only its length, and redactArchivedSecrets scrubs the value from the
+  # archived output should it ever leak into a log line.
+  - name: cert-check
+    schedule: "0 4 L-3 * *"
+    archiveOutput: true
+    redactArchivedSecrets: true
+    secrets:
+      - name: ACME_ACCOUNT_KEY
+        value: demo-acme-key-000000000000
     command: |
-      echo "snapshot shipped at $(date -u +%T) ($((RANDOM % 400 + 200)) MiB)"
-    schedule: "*/10 * * * *"
-    sla:
-      maxTimeSinceSuccessSeconds: 1800
-      maxRuntimeSeconds: 300
+      set -u
+      key=$(cronstable secret get ACME_ACCOUNT_KEY)
+      echo "renewal window opens 3 days before month end; account key staged (${#key} chars, value never printed)"
+      echo "cert lab.internal: 41 days left; no renewal needed"
 
-  # Effectively never scheduled; exists to show the Pending state (and,
-  # on installs with control scope, the "Run now" button, not here).
+  # [shows: per-job timezone + DST advisory + weekday names] Runs on New York
+  # market mornings; 09:30 America/New_York is DST-sensitive, and the schedule
+  # tab names the next transition.
+  - name: market-open-note
+    schedule: "30 9 * * mon-fri"
+    timezone: America/New_York
+    command: 'echo "market open: refreshed the ticker tile on the kitchen wallboard"'
+
+  # [shows: a second timezone] Sends at 21:00 Tokyo time, whatever that is here:
+  # per-job timezones make "9 pm at grandma's" a one-liner.
+  - name: photo-frame-sync
+    schedule: "0 21 * * *"
+    timezone: Asia/Tokyo
+    command: echo "queued 12 new photos for the family frame in Osaka (arrives 9 pm their time)"
+
+  # [shows: @daily nickname + utc:false + onMissed run-once + workingDirectory]
+  # The nightly report in local time. If the host was down over midnight,
+  # run-once coalesces however many days were missed into one catch-up run at
+  # startup (bounded to 12 h). workingDirectory is the "Start in" knob; pwd in
+  # the output proves it.
+  - name: disk-report
+    schedule: "@daily"
+    utc: false
+    onMissed: run-once
+    startingDeadlineSeconds: 43200
+    workingDirectory: /tmp
+    command: |
+      echo "nightly disk report, running from $(pwd)"
+      df -h / | tail -1
+      echo "report filed"
+
+  # [shows: weekday hour-ranges + the heatmap's diurnal shape] Weekday mornings
+  # only: the kitchen wallboard gets weather, the family calendar, and the bus
+  # ETA at the top of hours 6-9 local. Together with the :00 herd this makes
+  # mornings visibly hotter than nights on the pressure heatmap, which is
+  # exactly the shape the suggest tool exists to read.
+  - name: morning-briefing
+    schedule: "0 6-9 * * mon-fri"
+    utc: false
+    command: |
+      echo "refreshing the kitchen wallboard for the $(date +%H):00 block"
+      sleep $((RANDOM % 20 + 5))
+      echo "weather, family calendar, and bus-ETA tiles updated"
+
+  # [shows: the duplicates panel's second group + the :00 herd] Shares
+  # rotate-journal's exact `0 * * * *` spelling on purpose: the duplicate
+  # detector shows a second group (backup-verify/offsite-snapshot at */10 is the
+  # first), and the top-of-hour stampede gets one more member for the pressure
+  # heatmap to point at.
+  - name: thermostat-sync
+    schedule: "0 * * * *"
+    command: |
+      echo "reading 6 thermostat setpoints..."
+      sleep $((RANDOM % 6 + 2))
+      echo "6/6 zones synced to the schedule ($((RANDOM % 3 + 19))C target)"
+
+  # [shows: the never-fires lint finding] The 6th field is a year; pinning a
+  # past year is the documented idiom for parking a job without deleting its
+  # config. The scheduler drops it from the fire index and every surface reports
+  # never_fires with a warning badge.
+  - name: ipv6-cutover
+    schedule: "0 3 1 1 * 2020"
+    command: echo "dual-stack migration runbook (completed 2020; parked by pinning the year, kept for the audit trail)"
+
+  # =====================================================================
+  #  Manual, disabled, and the scripted operator
+  # =====================================================================
+
+  # [shows: the Pending state] Effectively never scheduled; on installs with
+  # control scope this is what the "Run now" button is for. A read-only visitor
+  # gets a 403 by scope instead, which is its own demo.
   - name: restore-drill
-    command: echo "🚀 restore drill launched at $(date -u +%T) UTC"
+    command: echo "restore drill launched at $(date -u +%T) UTC"
     schedule: "0 3 1 1 *"
 
-  # The disabled state.
+  # [shows: enabled:false] The disabled state.
   - name: legacy-mirror
     enabled: false
     command: echo "decommissioned 2025; kept for reference"
     schedule: "0 4 * * *"
 
-# A small, healthy pipeline for the DAG screens: fan out over three
-# shares, then summarize. Every 30 minutes, history capped.
+  # [shows: scoped tokens in action + secrets fromEnvVar; the narrator of the
+  # mutating features] Visitors are read-only, so this job performs the mutating
+  # actions that keep those states on the board, over loopback, with its own
+  # control+approve token (a run-scoped secret from the daemon's environment; on
+  # a host that never staged one it stands down politely). Each sweep:
+  #   - :22-:40  decide a waiting firmware-rollout gate as by:"demo-operator"
+  #              (rejected during hours 3, 9, 15, 21 UTC, approved otherwise, so
+  #              both decision paths appear daily without implying half of all
+  #              rollouts fail review)
+  #   - any run  if meter-export sits failed >12 min, a manual start clears its
+  #              depends-on-past gate
+  #   - :32 of hours 2, 8, 14, 20 UTC  pause feed-sync for 15 min with a note,
+  #              so the Paused badge and skipped ledger rows get stage time
+  # Its own log narrates every action it takes.
+  - name: demo-operator
+    schedule: "2-57/5 * * * *"
+    executionTimeout: 60
+    secrets:
+      - name: OPERATOR_TOKEN
+        fromEnvVar: CRONSTABLE_DEMO_OPERATOR_TOKEN
+    environment:
+      - key: DEMO_WEB_URL
+        value: http://127.0.0.1:8080
+    command: |
+      set -u
+      OPERATOR_TOKEN=$(cronstable secret get OPERATOR_TOKEN 2>/dev/null) || { echo "operator token not staged on this host; standing down"; exit 0; }
+      export OPERATOR_TOKEN
+      python3 - <<'PY'
+      import json, os, urllib.error, urllib.request
+      from datetime import datetime, timezone
+
+      BASE = os.environ["DEMO_WEB_URL"]
+      BY = "demo-operator"
+      TOKEN = os.environ["OPERATOR_TOKEN"]
+
+      def call(method, path, body=None):
+          req = urllib.request.Request(BASE + path, method=method)
+          req.add_header("Authorization", "Bearer " + TOKEN)
+          data = None
+          if body is not None:
+              data = json.dumps(body).encode()
+              req.add_header("Content-Type", "application/json")
+          try:
+              with urllib.request.urlopen(req, data=data, timeout=10) as resp:
+                  return resp.status, json.loads(resp.read() or b"{}")
+          except urllib.error.HTTPError as exc:
+              return exc.code, {}
+
+      now = datetime.now(timezone.utc)
+      minute, hour = now.minute, now.hour
+
+      # 1) decide every waiting firmware-rollout approval gate.
+      #
+      # An approval task parks forever until someone decides it, and
+      # retainRuns only prunes runs that reached success or failed, so a
+      # gate nobody answers is a run document that never ages out and gets
+      # re-read on every /dags poll. This sweep is therefore the only thing
+      # bounding them: it looks back far enough to drain a backlog left by
+      # an operator that was down for a while, not just the current hour.
+      if 22 <= minute <= 40:
+          decision = "reject" if hour % 6 == 3 else "approve"
+          _, doc = call("GET", "/dags/firmware-rollout/runs?limit=100")
+          for run in doc.get("runs") or []:
+              if run.get("state") in ("success", "failed"):
+                  continue        # terminal: no gate left to decide
+              status, _ = call(
+                  "POST",
+                  "/dags/firmware-rollout/runs/{}/tasks/approve/decision".format(run["runKey"]),
+                  {"decision": decision, "by": BY},
+              )
+              if status == 200:
+                  print("{}d firmware-rollout run {} as {}".format(decision, run["runKey"], BY))
+              # 409 means that run is not sitting at its gate yet (the
+              # sensor is still poking); the next sweep catches it
+
+      # 2) meter-export rescue: a manual start bypasses its depends-on-past gate
+      _, doc = call("GET", "/jobs/meter-export/runs")
+      runs = [r for r in doc.get("runs") or [] if r.get("finished_at")]
+      runs.sort(key=lambda r: r["finished_at"], reverse=True)
+      for run in runs:
+          if run.get("outcome") == "failure":
+              finished = datetime.fromisoformat(run["finished_at"].replace("Z", "+00:00"))
+              age = (now - finished).total_seconds()
+              if age > 720:
+                  status, _ = call("POST", "/jobs/meter-export/start")
+                  print("meter-export sat failed {}s; manual start to clear its depends-on-past gate (HTTP {})".format(int(age), status))
+          break
+
+      # 3) a scripted maintenance window on feed-sync
+      if hour % 6 == 2 and 32 <= minute <= 36:
+          status, _ = call(
+              "POST",
+              "/jobs/feed-sync/pause",
+              {"durationSeconds": 900, "note": "upstream feed maintenance window (scripted demo)", "by": BY},
+          )
+          print("paused feed-sync for 15 min (HTTP {})".format(status))
+
+      print("operator sweep complete")
+      PY
+
+# =====================================================================
+#  Orchestration: three DAGs, one per pattern
+# =====================================================================
 dags:
+  # [shows: dynamic fan-out via XCom expand + fan-in + artifacts] The flagship
+  # pipeline: plan the share list, archive each share in parallel (one mapped
+  # task instance per share), then write a manifest and publish it to the
+  # content-addressed artifact store. Every 30 minutes, history capped.
   - name: nightly-archive
     schedule: "*/30 * * * *"
     onMissed: skip
@@ -141,7 +662,7 @@ dags:
       - id: plan
         command: |
           set -eu
-          echo '["documents", "media", "homelab-configs"]' | cronstable xcom push --key shares
+          echo '["documents", "media", "homelab-configs", "photos", "paperless"]' | cronstable xcom push --key shares
       - id: archive-share
         dependsOn:
           - plan
@@ -158,4 +679,105 @@ dags:
           - archive-share
         command: |
           set -eu
-          echo "manifest written for 3 shares at $(date -u +%T)"
+          shares=$(cronstable xcom pull --task plan --key shares)
+          printf 'archived at %s\nshares: %s\n' "$(date -u +%FT%TZ)" "$shares" > /tmp/archive-manifest.txt
+          cronstable artifact put archive-manifest /tmp/archive-manifest.txt
+          echo "manifest for $shares published to the artifact store"
+
+  # [shows: a frequent pipeline you can catch mid-flight + per-task retries +
+  # triggerRule all_done + a deterministic failure] Every 5 minutes: scan,
+  # render thumbnails per album in parallel, update the search index, tidy. At
+  # the top of odd hours the index task hits a "stale writer" and fails through
+  # its retry, so the workflows tab shows real mixed health, and `tidy` runs
+  # anyway because all_done counts failures as done.
+  - name: photo-pipeline
+    schedule: "1-56/5 * * * *"
+    onMissed: skip
+    retainRuns: 60
+    tasks:
+      - id: scan
+        command: |
+          set -eu
+          echo '["family", "trips", "garden", "screenshots"]' | cronstable xcom push --key albums
+          echo "scanned the inbox: 4 albums have new photos"
+      - id: thumbs
+        dependsOn:
+          - scan
+        expand:
+          fromTask: scan
+          key: albums
+        retries: 2
+        retryDelaySeconds: 15
+        command: |
+          set -eu
+          n=$((RANDOM % 14 + 4))
+          echo "album $CRONSTABLE_DAG_MAP_ITEM: rendering $n thumbnails (worker #$CRONSTABLE_DAG_MAP_INDEX)"
+          sleep $((n / 2 + 4))
+          echo "album $CRONSTABLE_DAG_MAP_ITEM done"
+      - id: index
+        dependsOn:
+          - thumbs
+        retries: 1
+        retryDelaySeconds: 45
+        command: |
+          set -eu
+          if [ $(( $(date -u +%-H) % 2 )) -eq 1 ] && [ "$(date -u +%-M)" -lt 5 ]; then
+            echo "search index segment locked by a stale writer (clears within the hour)" 1>&2
+            exit 1
+          fi
+          echo "search index updated for 4 albums"
+      - id: tidy
+        dependsOn:
+          - index
+        triggerRule: all_done
+        command: 'echo "scratch space cleared (all_done: runs after success and after the odd-hour index failure)"'
+
+  # [shows: sensor task + approval gate + onReject skip + all_done report + a
+  # durably recorded decision] The hourly rollout: stage the build, a sensor
+  # pokes every 30 s until the canary window opens (minute 14), then an approval
+  # gate waits for a human. The demo-operator decides it around :22 (rejects
+  # during hours 3/9/15/21 UTC, approves otherwise; the run document records
+  # by:"demo-operator" and the timestamp durably). Rejection skips `apply`
+  # rather than failing it, and `report` files either way.
+  - name: firmware-rollout
+    schedule: "10 * * * *"
+    onMissed: skip
+    retainRuns: 48
+    tasks:
+      - id: stage
+        command: |
+          set -eu
+          v="fw-$(date -u +%Y%m%d-%H)00"
+          echo "$v" | cronstable xcom push --key version
+          echo "staged $v for the smart-plug fleet"
+      - id: canary-window
+        type: sensor
+        dependsOn:
+          - stage
+        pokeIntervalSeconds: 30
+        pokeTimeoutSeconds: 1200
+        pokeJitterSeconds: 5
+        command: |
+          [ "$(date -u +%-M)" -ge 14 ]
+      - id: approve
+        type: approval
+        dependsOn:
+          - canary-window
+        onReject: skip
+      - id: apply
+        dependsOn:
+          - approve
+        command: |
+          set -eu
+          v=$(cronstable xcom pull --task stage --key version)
+          echo "rolling $v out to 6 plugs"
+          for i in $(seq 1 6); do
+            echo "plug $i/6 flashed"
+            sleep 3
+          done
+          echo "$v applied everywhere"
+      - id: report
+        dependsOn:
+          - apply
+        triggerRule: all_done
+        command: 'echo "rollout report filed (all_done: written whether the gate approved, rejected, or apply failed)"'

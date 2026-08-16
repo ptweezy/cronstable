@@ -2,19 +2,16 @@
 
 ## 1.2.42
 
-- Python 3.15 is supported and tested. It gates in CI on both Linux and
-  Windows, and it has a PyPI classifier, `py315` tox envs and matching
-  docs. Windows is covered as widely as Linux because 3.15 makes UTF-8 the
-  default encoding (PEP 686) and the Linux runners were already UTF-8, so
-  a regression from that change could only ever surface on Windows. One
-  thing still waits on an upstream wheel: aiohttp publishes none for
-  `win_arm64`, so Windows on ARM64 stays on 3.14. The optional `speedups`
-  extra keeps orjson on 3.15, whose wheels there want glibc 2.39 or newer
-  on Linux; JSON falls back to the standard library wherever it is
-  missing. Nothing changes for 3.10 through 3.14. The standalone binaries
-  are built on 3.15 across all five lanes (Linux glibc and musl, macOS,
-  Windows), where aiohttp, zeroconf and uvloop compile from source for
-  want of a cp315 wheel. The Docker images are still built on 3.14.
+- The dashboard's "Pair a device" QR encodes a deep link: a phone-camera
+  scan opens the companion app, or a landing page with install pointers
+  when the app is missing, with the pairing payload riding in the URL
+  fragment. The link's base follows `push.relay.url`; the copyable string
+  stays the raw pairing JSON.
+- `web.anonymousScopes: [view]` grants credential-less requests read-only
+  view scope for public boards: the dashboard draws view-only chrome,
+  mutating routes answer 403, and `GET /push/devices` stays token-gated.
+  `/whoami` reports the grant under the reserved `anonymous` label and
+  carries the pairing QR's `pairLinkBase`.
 - Dependency floors raised to clear published security advisories
 - Build and CI toolchain version bumps
 - Development consolidated onto a single `main` branch; the wiki publishes

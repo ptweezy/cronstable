@@ -25,6 +25,7 @@ include docs/logo-engine.js
 include docs/logo-lab.html
 include docs/comparison.html
 include docs/palette.css
+include docs/relay-protocol.md
 
 # wiki/ and benchmarks/ deliberately stay. Together they are ~1.2 MB, and the
 # shipped test suite reads both: tests/test_tui.py asserts against

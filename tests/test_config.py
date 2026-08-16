@@ -1867,6 +1867,84 @@ def test_web_auth_tokens_rejected(tokens_yaml):
 
 
 # ---------------------------------------------------------------------------
+# web.anonymousScopes (opt-in public read-only access)
+# ---------------------------------------------------------------------------
+
+_ANON_TOKEN_YAML = (
+    "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+    "  authTokens:\n"
+    "    - label: public-viewer\n"
+    "      scopes:\n        - view\n"
+    "      value: secret-tok\n"
+)
+
+
+def test_web_anonymous_scopes_parse():
+    conf = parse_config_string(
+        _ANON_TOKEN_YAML + "  anonymousScopes:\n    - view\n", ""
+    )
+    assert conf.web_config["anonymousScopes"] == ["view"]
+
+
+@pytest.mark.parametrize(
+    "scope", [pytest.param("control"), pytest.param("approve")]
+)
+def test_web_anonymous_scopes_refuses_mutating_scopes(scope):
+    # the schema itself is the gate: there is no anonymous path to a
+    # mutating scope, so no downstream validator has to reason about one.
+    with pytest.raises(ConfigError):
+        parse_config_string(
+            _ANON_TOKEN_YAML + "  anonymousScopes:\n    - " + scope + "\n", ""
+        )
+
+
+def test_web_anonymous_scopes_requires_a_configured_token():
+    # with no token the web API installs no auth middleware and every
+    # request already holds every scope, so the key would read as a
+    # restriction while restricting nothing.
+    yaml = (
+        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+        "  anonymousScopes:\n    - view\n"
+    )
+    with pytest.raises(ConfigError) as exc:
+        parse_config_string(yaml, "")
+    assert "anonymousScopes" in str(exc.value)
+    assert "authTokens" in str(exc.value)
+
+
+def test_web_anonymous_scopes_accepts_the_scalar_auth_token():
+    yaml = (
+        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+        "  authToken:\n    value: secret-tok\n"
+        "  anonymousScopes:\n    - view\n"
+    )
+    assert parse_config_string(yaml, "").web_config["anonymousScopes"] == [
+        "view"
+    ]
+
+
+def test_web_anonymous_scopes_rejects_an_empty_list():
+    with pytest.raises(ConfigError):
+        parse_config_string(_ANON_TOKEN_YAML + "  anonymousScopes: []\n", "")
+
+
+def test_web_auth_token_label_anonymous_is_refused():
+    # /whoami and the pairing audit log use 'anonymous' for the
+    # credential-less grant; a real token wearing the label would
+    # masquerade as it there.
+    yaml = (
+        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+        "  authTokens:\n"
+        "    - label: anonymous\n"
+        "      scopes:\n        - view\n"
+        "      value: secret-tok\n"
+    )
+    with pytest.raises(ConfigError) as exc:
+        parse_config_string(yaml, "")
+    assert "reserved" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
 # pure helpers
 # ---------------------------------------------------------------------------
 
