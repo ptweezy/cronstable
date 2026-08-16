@@ -349,9 +349,9 @@ jobs:
         #
         # Note what the 3.15 cells install: there is no aiohttp cp315 wheel
         # yet, so it (and zeroconf) compile from sdist there, which is why
-        # those rows are slower than the rest. orjson cannot compile: it needs
-        # a Rust toolchain, so requirements_dev.txt excludes it on 3.15 and
-        # the orjson tests self-skip. See tests/test_json_portability.py.
+        # those rows are slower than the rest. orjson does ship one as of
+        # 3.12.0, so these cells run the accelerated JSON arm like every
+        # other row rather than self-skipping it.
         python: ['3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
         # No row is experimental: 3.15 sits in the matrix above and 3.16 has
         # no alpha yet. The axis and the continue-on-error wiring stay so that

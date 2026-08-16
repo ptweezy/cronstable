@@ -6,15 +6,15 @@
   Windows, and it has a PyPI classifier, `py315` tox envs and matching
   docs. Windows is covered as widely as Linux because 3.15 makes UTF-8 the
   default encoding (PEP 686) and the Linux runners were already UTF-8, so
-  a regression from that change could only ever surface on Windows. Two
-  things still wait on upstream wheels: orjson publishes none for 3.15, so
-  the optional `speedups` extra leaves it out there and JSON falls back to
-  the standard library, and aiohttp publishes none for `win_arm64`, so
-  Windows on ARM64 stays on 3.14. Nothing changes for 3.10 through 3.14.
-  The standalone binaries are built on 3.15 across all five lanes (Linux
-  glibc and musl, macOS, Windows). Those lanes exercise 3.15 without any
-  wheels available, since aiohttp, zeroconf and uvloop all compile from
-  source there. The Docker images are still built on 3.14.
+  a regression from that change could only ever surface on Windows. One
+  thing still waits on an upstream wheel: aiohttp publishes none for
+  `win_arm64`, so Windows on ARM64 stays on 3.14. The optional `speedups`
+  extra keeps orjson on 3.15, whose wheels there want glibc 2.39 or newer
+  on Linux; JSON falls back to the standard library wherever it is
+  missing. Nothing changes for 3.10 through 3.14. The standalone binaries
+  are built on 3.15 across all five lanes (Linux glibc and musl, macOS,
+  Windows), where aiohttp, zeroconf and uvloop compile from source for
+  want of a cp315 wheel. The Docker images are still built on 3.14.
 - Dependency floors raised to clear published security advisories
 - Build and CI toolchain version bumps
 - Development consolidated onto a single `main` branch; the wiki publishes

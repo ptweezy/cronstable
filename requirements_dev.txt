@@ -7,15 +7,20 @@ cryptography; platform_machine != "ARM64" or sys_platform != "win32"
 # accelerated durable-state/gossip JSON paths are worthless if no CI cell ever
 # installs it: they were importorskip-guarded and therefore skipped in all 12
 # matrix cells, so the orjson arm of cronstable._json shipped unexercised.
-# Installed here so `tox -e py` really runs it. Excluded where a wheel is not
-# reliably available (a just-released Python that orjson has not built for
-# yet) since it needs a Rust toolchain to build from source; those cells still
-# self-skip via importorskip, and
-# test_orjson_is_installed_where_a_wheel_exists fails if this line ever stops
-# covering the cells that DO have wheels. win-arm64 is NOT excluded: unlike
-# cryptography and playwright above, orjson has shipped a win_arm64 wheel
-# since 3.10.17, well under the floor here.
-orjson>=3.11.6; python_version < "3.15"
+# Installed here so `tox -e py` really runs it, on every cell: orjson 3.12.0
+# added cp315 wheels, so the version gate this line used to carry is gone and
+# every interpreter row now exercises the accelerated arm. The floor is 3.12.0
+# for that reason and not for an API change, so it may look higher than the
+# code needs; drop it only when nothing runs 3.15. win-arm64 is NOT excluded
+# either, unlike cryptography and playwright above: orjson has shipped a
+# win_arm64 wheel since 3.10.17. test_orjson_is_installed_where_a_wheel_exists
+# fails if this line ever stops covering a cell that has a wheel.
+#
+# Note the 3.15 Linux wheels are manylinux_2_39 (glibc >= 2.39) where 3.14's
+# are manylinux_2_17. Every runner clears that (ubuntu-24.04 is exactly 2.39),
+# but a 3.15 box on an older glibc gets no wheel and, since orjson needs Rust
+# to build, no orjson; that cell self-skips via importorskip as before.
+orjson>=3.12.0
 # pynacl backs the optional `push` extra (E2E-encrypted push alerts). Installed
 # in dev unconditionally so the sealing/round-trip tests in tests/test_push.py
 # really run in every CI cell: its cp38-abi3 wheels cover every runner we use

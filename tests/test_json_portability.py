@@ -226,14 +226,15 @@ def test_orjson_is_installed_where_a_wheel_exists():
     # Guards the two tests below from going silently dead. They are
     # importorskip-guarded, and for a while orjson was in no test environment
     # at all, so both skipped in every CI cell and the accelerated JSON arm
-    # shipped unexercised. requirements_dev.txt now installs orjson wherever a
-    # wheel is reliably available; this fails loudly if that line is dropped
-    # or its markers stop matching, instead of degrading back to a skip.
-    if sys.version_info >= (3, 15):
-        pytest.skip("orjson may not have built for this Python yet")
+    # shipped unexercised. requirements_dev.txt installs orjson unconditionally
+    # now that 3.12.0 covers every interpreter we run; this fails loudly if
+    # that line is dropped, instead of degrading back to a skip.
     assert importlib.util.find_spec("orjson") is not None, (
         "orjson is missing from this environment, so the orjson tests below "
-        "silently skip. Check the orjson line in requirements_dev.txt."
+        "silently skip. Check the orjson line in requirements_dev.txt. The "
+        "one environment that legitimately has no wheel is 3.15 on glibc "
+        "< 2.39 (its wheels are manylinux_2_39, unlike 3.14's 2_17), which "
+        "no CI runner is."
     )
 
 
