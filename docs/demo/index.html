@@ -1925,7 +1925,7 @@
 <div class="overlay" id="pairWrap">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pairTitle" aria-describedby="pairMsg">
     <h3 id="pairTitle">Pair a device</h3>
-    <p id="pairMsg">Scan with the companion app to link it to this dashboard. The code carries this page's address and your bearer token, so pair over HTTPS or a trusted network. After pairing, compare the key fingerprint the app shows with the one <code>GET /push/devices</code> reports; a mismatch means the stored key is not your phone's.</p>
+    <p id="pairMsg">Scan with your phone's camera to open the app and pair it with this dashboard, or scan from inside the app. The code carries this page's address and your bearer token, so pair over HTTPS or a trusted network. After pairing, compare the key fingerprint the app shows with the one <code>GET /push/devices</code> reports; a mismatch means the stored key is not your phone's.</p>
     <div class="pair-qr" id="pairQr"></div>
     <div class="pair-hint" id="pairHint" style="display:none"><span>No token is stored in this tab; the payload pairs unauthenticated.</span><button class="ghostbtn mini" id="pairToken">set token</button></div>
     <div class="pair-payload" id="pairPayload"></div>
@@ -10169,10 +10169,26 @@ var qrcode = function() {
       box.textContent = "QR render failed: " + (err && err.message ? err.message : err);
     }
   }
+  // The QR encodes a pairing *link*, not the bare JSON: scanned with a
+  // phone's system camera it deep-links straight into the app
+  // (universal link; the landing page below offers a cronstable:// fallback
+  // and install pointers when the app is missing), and the app's own
+  // scanner reads both forms. The payload rides in the URL fragment as
+  // base64url(JSON), and fragments are never sent with the request, so the
+  // landing host serves a static page and never sees the token. The
+  // copyable string under the QR stays the raw JSON.
+  const PAIR_LINK_BASE = "https://relay.cronstable.com/pair";
+  function pairLink(payload) {
+    const bytes = new TextEncoder().encode(payload);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    const b64 = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    return PAIR_LINK_BASE + "#" + b64;
+  }
   function openPair() {
     if (!openOverlay("pairWrap")) return;
     const payload = JSON.stringify({ v: 1, name: state.clusterNode || location.host, url: location.origin, token: token() });
-    renderPairQr(payload);
+    renderPairQr(pairLink(payload));
     $("pairPayload").textContent = payload;
     $("pairHint").style.display = token() ? "none" : "";
     $("pairWarn").style.display = "none";
