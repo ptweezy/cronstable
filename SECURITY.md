@@ -55,8 +55,12 @@ routed to the right one.
 
 ## What is out of scope
 
-- the public demo's read-only bearer token. It is published deliberately in
-  `example/demo-instance/`, is view-scoped, and every mutating route rejects it.
+- the public demo being readable without any credential. `demo.cronstable.com`
+  runs with `web.anonymousScopes: [view]` on purpose, so a tokenless request
+  reads jobs, run history, logs and the calendar feeds. Its published
+  view-scoped token grants exactly the same thing. What *is* in scope there is
+  any path by which a credential-less caller reaches a `control` or `approve`
+  route, reads `GET /push/devices`, or otherwise acts on the daemon.
 - configurations that hand cronstable a deliberately dangerous job, such as a
   crontab line that a local user can already edit. cronstable runs the commands
   it is given; the trust boundary is who may write the config.

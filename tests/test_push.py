@@ -35,7 +35,12 @@ import cronstable.cron as cron_mod
 import cronstable.discovery as discovery
 import cronstable.push as push
 from cronstable.config import ConfigError, parse_config_string
-from cronstable.cron import WEB_TOKEN_REQUEST_KEY, Cron, _WebToken
+from cronstable.cron import (
+    WEB_ANON_REQUEST_KEY,
+    WEB_TOKEN_REQUEST_KEY,
+    Cron,
+    _WebToken,
+)
 from cronstable.fingerprint import canonical_job
 from cronstable.job import (
     NotifyEventContext,
@@ -1654,13 +1659,15 @@ class _Req:
     ``json()`` so the malformed-body arms stay reachable.
     """
 
-    def __init__(self, match=None, body=None, token=None):
+    def __init__(self, match=None, body=None, token=None, anon=None):
         self.match_info = match or {}
         self._body = body
         self.can_read_body = body is not None
         self._store: dict[str, Any] = {}
         if token is not None:
             self._store[WEB_TOKEN_REQUEST_KEY] = token
+        if anon is not None:
+            self._store[WEB_ANON_REQUEST_KEY] = anon
 
     def get(self, key, default=None):
         return self._store.get(key, default)
@@ -1970,6 +1977,22 @@ async def test_whoami_with_and_without_token():
     assert body["authenticated"] is False
     assert body["allScopes"] is True
     assert body["scopes"] == sorted(["view", "control", "approve"])
+
+
+async def test_whoami_reports_an_anonymous_grant():
+    # the fourth shape: unauthenticated like the open daemon, but with a
+    # restricted scope set. `allScopes` is the discriminator clients key on
+    # (the open daemon answers authenticated:false with allScopes:true).
+    cron = _cron()
+    body = json.loads(
+        (await cron._web_whoami(_Req(anon=frozenset({"view"})))).body
+    )
+    assert body == {
+        "authenticated": False,
+        "label": "anonymous",
+        "scopes": ["view"],
+        "allScopes": False,
+    }
 
 
 async def test_all_scopes_token_reports_all_scopes():

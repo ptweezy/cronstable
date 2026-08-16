@@ -1,29 +1,77 @@
 # Public read-only demo instance
 
-The always-on demo daemon behind the companion app's **"Try the demo"**
-button (and App Store review): a plausible homelab board with something
-on every screen. `cronstable.yaml` here is the whole personality:
-healthy pulses, a live log streamer, one failure with a log tail worth
-triaging (`backup-verify`), a retrying flaky job, a long runner, an
-SLA-monitored job, and a small DAG.
+The always-on demo daemon behind <https://demo.cronstable.com>, the
+companion app's **"Try the demo"** button, and App Store review.
+`cronstable.yaml` here is the whole personality: 30 jobs and 3 DAGs
+curated as a **feature tour**, where every entry exists to light up one
+capability and says so in its name, its comment, and its log lines, so a
+visitor who has never heard of cronstable can answer "what can this
+thing do?" by scrolling.
+
+What is on the board: healthy pulses, a per-second schedule, a live log
+streamer, and two long runners you can catch mid-flight. The failure
+school covers a log tail worth triaging (`backup-verify`), a flaky job
+that retries its way out, a job that fails on *stderr* alone, and one
+that gets killed by its timeout. Durable state shows up as cursor
+watermarks, exactly-once claims, and a depends-on-past gate the operator
+has to clear. On the schedule side there are hashed `H/10` slots,
+business-day forms (`LW`, `sun#1`, `L-3`), two timezones, and three
+deliberate lint findings. Three DAGs cover fan-out with XCom, retries with
+`all_done`, and a sensor feeding an approval gate. Two classic crontab
+lines ride along through `include:` to show the migration path.
 
 ## Access model (deliberately public)
 
-The instance serves **one credential: a `view`-scoped bearer token**,
-and it is public *by design*; it ships inside the app and sits in plain
-sight in this directory (default `cronstable-public-demo-view`). View
-scope reads jobs, runs, logs and `/summary`; every mutating call
-(run/cancel/pause, approvals, device pairing) answers 403 by scope.
-There is no `push:` block: nothing can pair with the demo, and the
-app's demo mode renders its own sample alerts locally.
+Anyone may read this board with **no credential at all**.
+`web.anonymousScopes` grants the `view` scope to unauthenticated
+requests, so the dashboard, the log tails, `/summary` and the calendar
+feeds all open for a visitor who never sees a token prompt:
 
-Treat the token like the public URL it effectively is. Rotating it is
-an env-var change plus an app-config update:
+```sh
+curl https://demo.cronstable.com/summary        # no Authorization header
+open https://demo.cronstable.com/               # no token modal
+```
+
+Reads are all it grants. Every call needing `control` or `approve`
+(run/cancel/pause, DAG trigger and backfill, approval decisions, device
+pairing, `/shutdown`, `/mcp`) answers a reasoned 403, and the config
+schema refuses to grant those scopes anonymously in the first place.
+`GET /push/devices` is excluded from anonymous access too, since the
+registry names paired devices. There is no `push:` block here anyway, so
+nothing can pair with the demo, and the app's demo mode renders its own
+sample alerts locally.
+
+Two tokens still exist:
+
+| Token | Scopes | Public? | Why it exists |
+| --- | --- | --- | --- |
+| `public-demo-viewer` | `view` | Yes, by design | The companion app authenticates with it. It grants exactly what anonymous visitors already hold, so publishing it costs nothing. |
+| `demo-operator` | `control`, `approve` | **No** | The `demo-operator` job's own credential. Visitors cannot act, so this scripted operator performs the mutating actions the board shows off: it decides the `firmware-rollout` approval gate, opens maintenance-window pauses on `feed-sync`, and clears `meter-export`'s depends-on-past gate with a manual start. |
+
+The operator token is generated per host, never printed by any job, and
+never checked in. On the native path it lives in two `0600` files, the
+token file (`$(brew --prefix)/etc/cronstable-demo/operator-token`) and
+the LaunchAgent plist that hands it to the daemon; on the container path
+it lives in `.env`, which is gitignored. It reaches the job as a
+run-scoped secret over loopback, so it never appears in a command line
+or in any view-scoped API response. Rotating either one:
+
+Either token can be rotated on either deployment path by setting its
+variable and re-running the bring-up command:
 
 ```sh
 CRONSTABLE_DEMO_VIEW_TOKEN=new-value docker compose up -d    # containers
 CRONSTABLE_DEMO_VIEW_TOKEN=new-value ./launchd/install.sh    # native
 ```
+
+Rotating the *view* token additionally means updating the app config.
+Rotating the operator token affects only this host.
+
+> **Daemon version.** No released cronstable carries
+> `web.anonymousScopes` yet; 1.2.41 is the latest tag. An older daemon
+> rejects this config outright and names the key as unexpected, so this
+> board needs a daemon built from `develop`, or the first release that
+> carries the feature. Deploy the config and the daemon together.
 
 ## Standing it up
 
@@ -47,25 +95,30 @@ is still a perfectly good demo host, and it is what serves
    - Type **HTTP**, URL **`cronstable-demo:8080`**, the daemon's name on
      the compose network, not `localhost`; the tunnel runs in its own
      container. Cloudflare creates the DNS record for you.
-3. Put the token in place:
+3. Put both required secrets in place. `.env` needs the tunnel token you
+   just copied and an operator token you generate; the daemon refuses to
+   start without either:
 
    ```sh
    cp .env.example .env    # then paste the token into CLOUDFLARE_TUNNEL_TOKEN
+   printf 'CRONSTABLE_DEMO_OPERATOR_TOKEN=%s\n' \
+     "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" >> .env
    ```
 
 4. `docker compose up -d --build`
-5. Verify from anywhere:
+5. Verify from anywhere, the way a visitor arrives:
 
    ```sh
-   curl -H "Authorization: Bearer cronstable-public-demo-view" \
-        https://demo.cronstable.com/summary
+   curl https://demo.cronstable.com/summary          # 200, no credential
+   curl -X POST https://demo.cronstable.com/jobs/heartbeat/start   # 403
    ```
 
 The daemon keeps run history in the `demo-state` volume (so the board
 survives restarts populated), drops all capabilities, and is memory and
-CPU capped; the demo jobs are pure shell noise with no network egress
-worth speaking of. Nothing is published to the host except a loopback
-port for local `curl`.
+CPU capped. The jobs are bash and `python3` only: no `curl`, no
+coreutils-only binaries, and no outbound network. The only sockets any
+job opens are to the daemon's own loopback API. Nothing is published to
+the host except a loopback port for local `curl`.
 
 ### Natively, under launchd (macOS)
 
@@ -96,6 +149,14 @@ refusing to run if either stops matching what is in this directory:
 | --- | --- |
 | `state.path` | `/var/lib` needs root; the Homebrew prefix does not |
 | `listen` → `127.0.0.1:8080` | the container published only a loopback port, so binding the wildcard natively would newly expose the daemon to the LAN |
+
+It copies `legacy.crontab` alongside it (the config's `include:`
+resolves next to the deployed file, not next to this one), generates the
+operator token on first run, and finishes by proving both halves of the
+access model against the live daemon: an anonymous `GET /summary` must
+answer 200, and an anonymous `POST /jobs/heartbeat/start` must answer
+403. A regression in either one fails the install rather than quietly
+publishing a board that acts on strangers' requests.
 
 It then loads two agents, both `RunAtLoad` + `KeepAlive`:
 `com.cronstable.demo` (the daemon) and `com.cronstable.tunnel`
@@ -136,7 +197,13 @@ self-hosted way to find out before Apple does.
 ## What the app points at
 
 - Base URL: `https://demo.cronstable.com`
-- Token: the view token above (bake into the "Try the demo" action).
-- `GET /whoami` answers `{label: "public-demo-viewer", scopes: ["view"]}`,
+- Token: the view token above (baked into the "Try the demo" action).
+  Keeping it is the simpler path; the app could also drop it entirely
+  now that the instance serves anonymous view.
+- `GET /whoami` with that token answers
+  `{authenticated: true, label: "public-demo-viewer", scopes: ["view"], allScopes: false}`,
   exactly the shape the app uses to hide mutating affordances in demo
-  mode.
+  mode. With **no** token the same endpoint answers
+  `{authenticated: false, label: "anonymous", scopes: ["view"], allScopes: false}`,
+  so a client that keys on `allScopes` (not on `authenticated`) degrades
+  identically either way.
