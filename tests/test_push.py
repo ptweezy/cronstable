@@ -256,19 +256,164 @@ jobs:
     assert payload["observed_seconds"] == 190.0
 
 
+def _tail_ctx(count=5000, width=200):
+    """A job context whose stderr overflows the plaintext cap.
+
+    ``width`` matters: build_payload already caps the tail at
+    LOG_TAIL_MAX_LINES, so narrow lines produce a payload that fits and never
+    reaches the trimming code. Real failure output (a stack trace, a
+    subprocess command line) is wide, and width is what forces a trim.
+    """
+    lines = [
+        "line-{:05d} ".format(i).ljust(width, "x") for i in range(count)
+    ]
+    return _FakeJobCtx(stderr="\n".join(lines)), lines
+
+
+def _fits(payload, tail_lines):
+    """Whether ``payload`` carrying exactly ``tail_lines`` fits the cap."""
+    probe = dict(payload, log_tail=list(tail_lines))
+    return len(push._encode(probe)) <= push.MAX_PLAINTEXT_BYTES
+
+
 def test_fit_payload_trims_oldest_tail_lines_first():
-    ctx = _FakeJobCtx(
-        stderr="\n".join("line-{:05d}".format(i) for i in range(5000))
-    )
+    ctx, lines = _tail_ctx()
+    payload = push.build_payload(ctx, False, True)
+    kept_before = list(payload["log_tail"])
+    assert not _fits(payload, kept_before)  # the trim really is needed
+    data = push.fit_payload(payload)
+
+    assert len(data) <= push.MAX_PLAINTEXT_BYTES
+    # the returned bytes and the mutated payload must agree: fit_payload
+    # bisects the drop count and re-applies when the last probe was the
+    # failing one just below the answer, so an off-by-one there returns the
+    # encoding of a payload the caller does not hold.
+    assert push._encode(payload) == data
+
+    fitted = json.loads(data.decode("utf-8"))
+    kept = fitted["log_tail"]
+    # newest lines survive (a failure's reason lives at the end)
+    assert kept[-1] == lines[-1]
+    assert kept == kept_before[-len(kept) :]
+    # and the fewest were dropped: putting one back would not fit.
+    assert len(kept) < len(kept_before)
+    assert not _fits(payload, kept_before[-(len(kept) + 1) :])
+    # the identity core is intact
+    assert fitted["name"] == "backup"
+    assert fitted["kind"] == "failure"
+
+
+def test_fit_payload_leaves_a_fitting_payload_untouched():
+    # the common case: a small tail already fits, so fit_payload must leave
+    # every line and field in place.
+    ctx, _lines = _tail_ctx(count=3, width=20)
+    payload = push.build_payload(ctx, False, True)
+    before = json.loads(push._encode(payload))
+    data = push.fit_payload(payload)
+    assert json.loads(data.decode("utf-8")) == before
+
+
+def test_fit_payload_drops_the_whole_tail_when_no_line_fits():
+    # even a single line of this width overflows, so the tail cannot be
+    # trimmed into the cap: the key itself goes (that is what frees the last
+    # bytes) and the fit falls through to the free-text fields.
+    ctx, _lines = _tail_ctx(count=40, width=3000)
     payload = push.build_payload(ctx, False, True)
     data = push.fit_payload(payload)
     assert len(data) <= push.MAX_PLAINTEXT_BYTES
+    assert push._encode(payload) == data
     fitted = json.loads(data.decode("utf-8"))
-    tail = fitted["log_tail"]
-    # newest lines survive; the identity core is intact
-    assert tail[-1] == "line-04999"
+    assert "log_tail" not in fitted  # the key goes, rather than an empty list
     assert fitted["name"] == "backup"
     assert fitted["kind"] == "failure"
+
+
+def test_fit_payload_drops_the_tail_then_halves_a_long_reason():
+    # Both shrink stages in one alert: a wide log tail plus a long failure
+    # reason, the ordinary shape of a crashed job. No drop count fits while
+    # the reason is still there, so the bisect gives up, the tail goes
+    # entirely, and the loop moves on to halving the reason.
+    ctx, _lines = _tail_ctx(count=40, width=200)
+    ctx.template_vars["fail_reason"] = "x" * 50_000
+    payload = push.build_payload(ctx, False, True)
+    assert payload["log_tail"]  # the precondition: there IS a tail to drop
+    data = push.fit_payload(payload)
+    assert len(data) <= push.MAX_PLAINTEXT_BYTES
+    assert push._encode(payload) == data
+    fitted = json.loads(data.decode("utf-8"))
+    assert "log_tail" not in fitted
+    assert 64 <= len(fitted["fail_reason"]) < 50_000
+    assert fitted["name"] == "backup"
+
+
+def test_fit_payload_skips_context_fields_the_alert_does_not_carry():
+    # An event alert has no schedule; the fallback must walk past the fields
+    # that are absent rather than stopping at the first name in its list.
+    payload = {
+        "v": push.PUSH_PROTOCOL_VERSION,
+        "kind": "event",
+        "name": "etl",
+        "host": "node-a",
+        "started_at": "z" * 2500,
+        "run_id": "run-123",
+    }
+    data = push.fit_payload(payload)
+    assert len(data) <= push.MAX_PLAINTEXT_BYTES
+    assert push._encode(payload) == data
+    fitted = json.loads(data.decode("utf-8"))
+    assert "started_at" not in fitted
+    assert fitted["run_id"] == "run-123"
+    assert fitted["name"] == "etl"
+
+
+def test_fit_payload_drops_context_fields_when_nothing_long_is_left():
+    # No tail, and no free-text field long enough to halve, but still over
+    # the cap: the optional context fields go one at a time so the alert
+    # keeps its identity (name, kind, host).
+    payload = {
+        "v": push.PUSH_PROTOCOL_VERSION,
+        "kind": "failure",
+        "name": "backup",
+        "host": "node-a",
+        "fail_reason": "x" * 60,  # <= 64: not eligible for halving
+        "schedule": "y" * 2500,  # the overage, and the first to go
+        "started_at": "2026-07-23T01:00:00+00:00",
+        "run_id": "run-123",
+    }
+    data = push.fit_payload(payload)
+    assert len(data) <= push.MAX_PLAINTEXT_BYTES
+    assert push._encode(payload) == data
+    fitted = json.loads(data.decode("utf-8"))
+    assert "schedule" not in fitted
+    # only as much as was needed: the later context fields survive
+    assert fitted["run_id"] == "run-123"
+    assert fitted["started_at"] == "2026-07-23T01:00:00+00:00"
+    # as do the identity core and the untouched short reason.
+    assert fitted["name"] == "backup"
+    assert fitted["kind"] == "failure"
+    assert fitted["host"] == "node-a"
+    assert fitted["fail_reason"] == "x" * 60
+
+
+@pytest.mark.parametrize("width", [40, 55, 56, 57, 80, 111, 200, 512])
+def test_fit_payload_is_minimal_at_every_tail_width(width):
+    # The bisect's answer must match a line-at-a-time walk's at every shape.
+    # Pinned as an invariant (it fits, the bytes agree, and one line more
+    # would overflow) rather than as an expected drop count, so it holds if
+    # the cap, the field set or the encoding ever changes.
+    ctx, _lines = _tail_ctx(count=200, width=width)
+    payload = push.build_payload(ctx, False, True)
+    kept_before = list(payload["log_tail"])
+    data = push.fit_payload(payload)
+
+    assert len(data) <= push.MAX_PLAINTEXT_BYTES
+    assert push._encode(payload) == data
+    kept = payload.get("log_tail", [])
+    if kept:
+        assert kept == kept_before[-len(kept) :]  # oldest-first, in order
+        if len(kept) < len(kept_before):
+            assert not _fits(payload, kept_before[-(len(kept) + 1) :])
+    assert json.loads(data.decode("utf-8"))["name"] == "backup"
 
 
 def test_fit_payload_truncates_long_text_without_tail():
