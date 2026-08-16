@@ -1,10 +1,14 @@
-"""Pure-helper and local-state tests for the Kubernetes Lease backend.
+"""Unit tests for the Kubernetes Lease backend.
 
-No apiserver and no crypto: the network glue is ``# pragma: no cover`` and
-exercised only by the Docker integration tests; everything here is the decision
-logic plus the locally-computed leader/quorum state.
+No apiserver: the pure decision helpers and the locally-computed leader/quorum
+state run directly, and the lifecycle around them (start, the renew loop, the
+round, the teardown that hands the Lease back) runs over an in-memory
+``_K8sTransport``.  The two real transports perform the calls and load
+credentials: they are ``# pragma: no cover``, exercised by the Docker
+integration tests.
 """
 
+import asyncio
 import copy
 import datetime
 import time
@@ -16,6 +20,7 @@ from cronstable.backends import (
     TRANSPORT_LIBRARY,
     select_transport,
 )
+from cronstable.backends import kubernetes as kubernetes_backend
 from cronstable.backends.kubernetes import (
     _UNKNOWN_HOLDER,
     ACTION_ACQUIRE,
@@ -1221,3 +1226,378 @@ def test_deadline_passed_branches():
     later = NOW + datetime.timedelta(seconds=20)
     assert _deadline_passed(later, NOW, 15) is True
     assert _deadline_passed(NOW, NOW, 15) is False
+
+
+# --- the lifecycle around the round: start / renew loop / stop / release ---
+#
+# _renew_once and _release are driven above through _StoreTransport. What
+# follows covers the code around them: transport binding, the best-effort
+# initial round, the retry loop's failure arm, and the teardown that hands the
+# Lease back. All of it runs over an in-memory transport rather than an
+# apiserver.
+
+
+class _ScriptedTransport(_StoreTransport):
+    """A ``_StoreTransport`` that can fail on demand and counts its calls."""
+
+    def __init__(self, store, *, fail_observe=None, fail_close=False):
+        super().__init__(store)
+        # a list of booleans consumed per observe() call; True raises. A short
+        # list (or None) means "never fail" once exhausted.
+        self.fail_observe = list(fail_observe or [])
+        self.fail_close = fail_close
+        self.setup_calls = 0
+        self.close_calls = 0
+        self.observe_calls = 0
+        self.writes = []
+        self.on_observe = None
+
+    async def setup(self):
+        self.setup_calls += 1
+
+    async def observe(self):
+        self.observe_calls += 1
+        if self.on_observe is not None:
+            self.on_observe()
+        if self.fail_observe and self.fail_observe.pop(0):
+            raise _StoreNotFound("apiserver unreachable")
+        return await super().observe()
+
+    async def write(self, body, *, create):
+        self.writes.append((copy.deepcopy(body), create))
+        return await super().write(body, create=create)
+
+    async def close(self):
+        self.close_calls += 1
+        if self.fail_close:
+            raise _StoreNotFound("close timed out")
+
+
+def _bind(monkeypatch, transport):
+    """Make ``start()`` bind ``transport`` instead of a real one."""
+    monkeypatch.setattr(
+        kubernetes_backend, "_K8sHttpTransport", lambda backend: transport
+    )
+
+
+def _fast_backend(extra=""):
+    # retryPeriodSeconds must be > 0 and < renewDeadlineSeconds, so the loop
+    # always sleeps at least a second between rounds; every test below sets
+    # _stop from inside the round instead of waiting that out.
+    return _backend("    clientLibrary: http\n" + extra)
+
+
+def test_native_available_matches_the_installed_client():
+    # the import probe start() runs in a worker thread before choosing a
+    # transport; it must answer for the interpreter actually running rather
+    # than raise. Pin the relationship rather than the answer, so a cell with
+    # the `kubernetes` package installed passes too.
+    try:
+        import kubernetes  # noqa: F401
+
+        installed = True
+    except ImportError:
+        installed = False
+    assert _backend()._native_available() is installed
+
+
+async def test_transport_base_declares_the_four_calls():
+    # the interface the renew loop drives a Lease over: an implementation that
+    # forgets one must fail loudly rather than silently no-op.
+    base = kubernetes_backend._K8sTransport()
+    with pytest.raises(NotImplementedError):
+        await base.setup()
+    with pytest.raises(NotImplementedError):
+        await base.observe()
+    with pytest.raises(NotImplementedError):
+        await base.write({}, create=False)
+    with pytest.raises(NotImplementedError):
+        await base.close()
+
+
+async def test_start_runs_a_round_before_returning(monkeypatch):
+    # The initial round exists so is_quorate()/is_leader() reflect a real read
+    # of the Lease BEFORE the first spawn_jobs. Without it the backend is
+    # "never contacted" for one cycle and every PreferLeader job runs on every
+    # node at boot (and on every reload that rebuilds the manager).
+    store = _FakeApiStore()
+    transport = _ScriptedTransport(store)
+    _bind(monkeypatch, transport)
+    b = _fast_backend()
+    await b.start()
+    try:
+        assert transport.setup_calls == 1
+        # the round really ran: the Lease exists and we hold it, so leader
+        # gating is correct on the very first spawn_jobs.
+        assert b.is_leader() is True
+        assert b.is_quorate() is True
+        assert parse_lease(store.get()).holder == b.identity
+        assert b._task is not None and not b._task.done()
+    finally:
+        await b.stop()
+
+
+async def test_start_survives_a_failing_initial_round(monkeypatch):
+    # Best-effort by contract: an apiserver that is down at boot must not fail
+    # manager start (which would wedge leader gating off until the next
+    # reload). The backend comes up not-quorate, the honest state, and the
+    # loop retries.
+    transport = _ScriptedTransport(_FakeApiStore(), fail_observe=[True])
+    _bind(monkeypatch, transport)
+    b = _fast_backend()
+    await b.start()
+    try:
+        assert b.is_quorate() is False
+        assert b.is_leader() is False
+        assert b._task is not None  # the retry loop still started
+    finally:
+        await b.stop()
+
+
+async def test_start_closes_the_transport_when_setup_fails(monkeypatch):
+    # the "a backend cleans up its own half-started state" contract: a failed
+    # setup (bad credentials, unreachable apiserver, an unreadable kubeconfig)
+    # must not leak the session/temp cert files it opened, once per reload.
+    class _BadSetup(_ScriptedTransport):
+        async def setup(self):
+            self.setup_calls += 1
+            raise _StoreNotFound("bad kubeconfig")
+
+    transport = _BadSetup(_FakeApiStore())
+    _bind(monkeypatch, transport)
+    b = _fast_backend()
+    with pytest.raises(_StoreNotFound):
+        await b.start()
+    assert transport.close_calls == 1  # cleaned up
+    assert b._transport is None  # and not left half-bound
+    assert b._task is None  # no orphaned renew loop
+
+
+async def test_renew_loop_retries_after_a_failed_round(monkeypatch):
+    # A round that cannot reach the apiserver must NOT advance the contact
+    # clock (is_quorate goes stale, so Leader fails closed and the never-skip
+    # PreferLeader default runs), and the loop must survive to try again.
+    store = _FakeApiStore()
+    transport = _ScriptedTransport(store, fail_observe=[True, False])
+    _bind(monkeypatch, transport)
+    b = _fast_backend()
+    await b.start()  # round 1 fails: not quorate
+    try:
+        assert b.is_quorate() is False
+        # let the loop take exactly one more round, then stop it from inside
+        # the observe so the test never waits out retryPeriodSeconds.
+        transport.on_observe = b._stop.set
+        await asyncio.wait_for(b._task, 5)
+        assert transport.observe_calls == 2  # it really retried
+        assert b.is_quorate() is True  # and recovered
+        assert parse_lease(store.get()).holder == b.identity
+    finally:
+        await b.stop()
+
+
+async def test_renew_loop_stops_when_cancelled(monkeypatch):
+    # stop() cancels the loop task; CancelledError must propagate out of the
+    # round rather than be swallowed as "a failed round" and retried forever.
+    transport = _ScriptedTransport(_FakeApiStore())
+    _bind(monkeypatch, transport)
+    b = _fast_backend()
+    await b.start()
+    task = b._task
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await b.stop()
+    assert b._transport is None
+
+
+async def test_stop_releases_the_lease_so_a_peer_takes_over(monkeypatch):
+    # A graceful stop hands the Lease back at once (clearing holderIdentity)
+    # instead of making a peer wait out the full leaseDuration.
+    store = _FakeApiStore()
+    transport = _ScriptedTransport(store)
+    _bind(monkeypatch, transport)
+    b = _fast_backend()
+    await b.start()
+    assert b.is_leader() is True
+    await b.stop()
+    assert b.is_leader() is False
+    assert b._task is None
+    assert b._transport is None
+    assert transport.close_calls == 1
+    assert parse_lease(store.get()).holder is None  # handed back
+    # and a peer picks it up on its very next round, without waiting out the
+    # leaseDuration.
+    peer = _store_backend(store, "node-b#2")
+    await peer._renew_once()
+    assert peer.is_leader() is True
+
+
+async def test_stop_does_not_release_a_lease_we_do_not_hold(monkeypatch):
+    # a follower's stop must never clear the real holder's identity.
+    store = _FakeApiStore()
+    holder = _store_backend(store, "node-b#2")
+    await holder._renew_once()
+    transport = _ScriptedTransport(store)
+    _bind(monkeypatch, transport)
+    follower = _fast_backend()
+    await follower.start()
+    assert follower.is_leader() is False
+    writes_before = len(transport.writes)
+    await follower.stop()
+    assert len(transport.writes) == writes_before  # no release write
+    assert parse_lease(store.get()).holder == holder.identity
+
+
+async def test_stop_completes_when_release_and_close_fail(monkeypatch):
+    # A hung apiserver must not wedge the inline start_stop_cluster reload:
+    # both the release and the close are bounded and their failures swallowed
+    # (a lease left held simply falls back to TTL expiry).
+    store = _FakeApiStore()
+    transport = _ScriptedTransport(store, fail_close=True)
+    _bind(monkeypatch, transport)
+    b = _fast_backend()
+    await b.start()
+    assert b.is_leader() is True
+    transport.fail_observe = [True]  # the release's observe blows up
+    await b.stop()  # must not raise
+    assert b.is_leader() is False
+    assert b._transport is None
+    assert parse_lease(store.get()).holder == b.identity  # TTL fallback
+
+
+async def test_release_ignores_an_absent_or_foreign_lease():
+    # both early returns: nothing to hand back, and never clear someone else's
+    # holderIdentity.
+    store = _FakeApiStore()
+    b = _store_backend(store, "node-a#1")
+    await b._release()  # no Lease at all
+    assert store.get() is None
+
+    peer = _store_backend(store, "node-b#2")
+    await peer._renew_once()
+    await b._release()  # a Lease, but not ours
+    assert parse_lease(store.get()).holder == peer.identity
+
+
+async def test_release_swallows_a_transport_failure():
+    # best-effort: a failed release is safe (TTL expiry covers it) and must
+    # never escape into stop().
+    store = _FakeApiStore()
+    b = _store_backend(store, "node-a#1")
+    await b._renew_once()
+    b._transport = _ScriptedTransport(store, fail_observe=[True])
+    await b._release()  # must not raise
+    assert parse_lease(store.get()).holder == b.identity
+
+
+async def test_persist_reboot_ran_without_a_transport_is_a_noop():
+    # mark_reboot_ran can fire before start() has bound a transport (or after
+    # stop() cleared it); the eager persist must degrade to the in-memory set.
+    b = _backend()
+    assert b._transport is None
+    await b._persist_reboot_ran()  # must not raise
+
+
+async def test_persist_reboot_ran_swallows_a_failed_round():
+    # cron calls mark_reboot_ran OUTSIDE the run loop's guard, so a failed
+    # eager persist must never escape; the periodic round retries it.
+    store = _FakeApiStore()
+    b = _store_backend(store, "node-a#1")
+    await b._renew_once()
+    b._transport = _ScriptedTransport(store, fail_observe=[True])
+    await b._persist_reboot_ran()  # must not raise
+
+
+def test_incluster_namespace_reads_the_service_account_file(
+    tmp_path, monkeypatch
+):
+    # in-pod namespace discovery: the file's contents, stripped; a missing
+    # file (out-of-cluster) resolves to None rather than raising.
+    monkeypatch.setattr(kubernetes_backend, "_SA_DIR", str(tmp_path))
+    assert kubernetes_backend._incluster_namespace() is None
+    (tmp_path / "namespace").write_text("team-batch\n")
+    assert kubernetes_backend._incluster_namespace() == "team-batch"
+
+
+async def test_renew_loop_logs_and_continues_when_a_round_fails(monkeypatch):
+    # the loop's own failure arm (as opposed to start()'s initial round): a
+    # mid-life apiserver outage must be logged and retried rather than escape.
+    store = _FakeApiStore()
+    transport = _ScriptedTransport(store, fail_observe=[False, True])
+    _bind(monkeypatch, transport)
+    b = _fast_backend()
+    b.retry_period = 0.01  # don't wait out the configured second
+    await b.start()  # round 1 succeeds
+    try:
+        assert b.is_leader() is True
+        # round 2 raises inside the loop; round 3 stops it.
+        transport.on_observe = lambda: (
+            b._stop.set() if transport.observe_calls > 2 else None
+        )
+        await asyncio.wait_for(b._task, 5)
+        assert transport.observe_calls >= 3  # failed, then kept going
+    finally:
+        await b.stop()
+
+
+async def test_renew_loop_propagates_cancellation_from_inside_a_round(
+    monkeypatch,
+):
+    # a cancel landing mid-round must end the loop, not be caught by the
+    # "failed round" handler and retried forever (which would ignore stop()).
+    in_round = asyncio.Event()
+
+    class _HangsOnTheSecondRound(_ScriptedTransport):
+        async def observe(self):
+            self.observe_calls += 1
+            if self.observe_calls == 1:
+                return await _StoreTransport.observe(self)
+            in_round.set()
+            await asyncio.Event().wait()  # a wedged apiserver call
+
+    transport = _HangsOnTheSecondRound(_FakeApiStore())
+    _bind(monkeypatch, transport)
+    b = _fast_backend()
+    b.retry_period = 0.01
+    # the teardown's release observes through the same wedged transport; bound
+    # it so this test does not wait out the configured renewDeadline.
+    b.renew_deadline = 0.01
+    await b.start()  # round 1 lands; the loop's round 2 then hangs
+    await asyncio.wait_for(in_round.wait(), 5)
+    b._task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await b._task
+    b._task = None
+    await b.stop()
+
+
+async def test_stop_before_start_is_a_noop():
+    # start_stop_cluster can stop a backend that never started (a config error
+    # aborted the build); it must not raise or touch a transport it never had.
+    b = _backend()
+    await b.stop()
+    assert b._task is None
+    assert b._transport is None
+    assert b.is_leader() is False
+
+
+async def test_stop_survives_a_release_that_hangs(monkeypatch):
+    # _release is bounded by renewDeadline so an unresponsive apiserver cannot
+    # wedge the inline reload; a release that blows past it is logged and the
+    # teardown continues to the close.
+    store = _FakeApiStore()
+    transport = _ScriptedTransport(store)
+    _bind(monkeypatch, transport)
+    b = _fast_backend()
+    await b.start()
+    assert b.is_leader() is True
+
+    async def _hang():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(b, "_release", _hang)
+    b.renew_deadline = 0.01  # bound it to something a test can wait out
+    await b.stop()  # must not raise, and must still close the transport
+    assert transport.close_calls == 1
+    assert b._transport is None
+    assert b.is_leader() is False
