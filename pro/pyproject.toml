@@ -4,7 +4,7 @@
 # inside the MIT package. `pro/` is also pruned from the core's public sdist in
 # the root MANIFEST.in, so it is never shipped through the MIT distribution.
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=83"]
 build-backend = "setuptools.build_meta"
 
 [project]

@@ -107,12 +107,12 @@ also available explicitly as `-debian`):
 | --- | --- | --- | --- |
 | *(none)* / `-debian` | `python:3.14-slim` | 3.14 | Default. Widest architecture coverage. |
 | `-alpine` | `python:3.14-alpine` | 3.14 | musl libc; smallest image. |
-| `-ubuntu` | `ubuntu:24.04` | 3.12 | Ubuntu LTS userland. |
-| `-rhel` | UBI 9 (`ubi-minimal`) | 3.12 | Red Hat base for RHEL / OpenShift. |
-| `-fedora` | `fedora:41` | 3.13 | Leading-edge RPM userland. |
-| `-opensuse` | `opensuse/leap:15.6` | 3.11 | SUSE / SLES family. |
+| `-ubuntu` | `ubuntu:26.04` | 3.14 | Ubuntu LTS userland. |
+| `-rhel` | UBI 10 (`ubi-minimal`) | 3.12 | Red Hat base for RHEL / OpenShift. |
+| `-fedora` | `fedora:44` | 3.14 | Leading-edge RPM userland. |
+| `-opensuse` | `opensuse/leap:16.0` | 3.13 | SUSE / SLES family. |
 | `-amazonlinux` | `amazonlinux:2023` | 3.11 | AWS-centric deployments. |
-| `-distroless` | `gcr.io/distroless/python3` | 3.11 | No shell or package manager; minimal attack surface. |
+| `-distroless` | `gcr.io/distroless/python3-debian13` | 3.13 | No shell or package manager; minimal attack surface. |
 
 ```shell
 # e.g. the Alpine variant, pinned to a version:

@@ -382,7 +382,9 @@ def redact_lines(lines: Iterable[str]) -> list[str]:
     orphaned body is redacted rather than passed through -- the symmetric case
     to a truncated trailing ``END``.
     """
-    materialised = list(lines)
+    # both passes below only read the batch, so a caller's list is walked
+    # in place and only a lazy iterable is materialised
+    materialised = lines if isinstance(lines, list) else list(lines)
     out: list[str] = []
     in_pem = _starts_mid_pem(materialised)
     for line in materialised:

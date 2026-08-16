@@ -35,7 +35,6 @@ job).  The daemon serves them as ``GET /schedule/pressure``,
 same payloads locally from its ``/jobs`` snapshot.
 """
 
-import calendar
 import datetime
 import functools
 import itertools
@@ -52,6 +51,7 @@ from cronstable.cronexpr import (
     _DOW_NAMES,
     _MONTH_NAMES,
     CronTab,
+    _month_end,
     expand_field,
 )
 
@@ -271,6 +271,16 @@ def _engine_accepts(expr: str, hash_key: Optional[str]) -> bool:
     return True
 
 
+#: The macros the engine itself parses, computed once at import: macro
+#: acceptance is a fact of the engine's grammar, fixed for the process
+#: lifetime (@midnight is the one _MACRO_TEXT key the engine refuses).
+_ENGINE_MACROS = frozenset(m for m in _MACRO_TEXT if _engine_accepts(m, None))
+
+#: The ``*/n`` step form of a time field, shared by the time and seconds
+#: describers.
+_STAR_STEP = re.compile(r"^\*/(\d+)$")
+
+
 def describe_cron(
     expr: str, hash_key: Optional[str] = None, tab: Optional[CronTab] = None
 ) -> str:
@@ -294,19 +304,20 @@ def describe_cron(
     low = (expr or "").strip().lower()
     if low == "@reboot":
         return "Once, when cronstable starts (@reboot)"
-    # @midnight fails the engine side of this gate: it is classic-crontab-
-    # only (the loader rewrites it to @daily before the engine ever sees
-    # it), so the literal is a config parse error and must not read as a
-    # supported spelling. It falls through to the fields path below, whose
-    # own engine gate on the ORIGINAL text sends it to the Custom line.
-    if low in _MACRO_TEXT and _engine_accepts(low, None):
+    # @midnight is absent from the engine-accepted set: it is classic-
+    # crontab-only (the loader rewrites it to @daily before the engine
+    # ever sees it), so the literal is a config parse error and must not
+    # read as a supported spelling. It falls through to the fields path
+    # below, whose own engine gate on the ORIGINAL text sends it to the
+    # Custom line.
+    if low in _ENGINE_MACROS:
         return _MACRO_TEXT[low]
     if hash_key is not None and _HASH_HINT.search(expr or ""):
         try:
             tab = CronTab(expr, hash_key=hash_key)
         except (ValueError, KeyError):
             return "Custom schedule: %s" % expr
-        if tab.resolved_source != str(tab):
+        if tab.resolved_differs:
             return "%s (H slots hashed from the job name)" % describe_cron(
                 tab.resolved_source
             )
@@ -404,8 +415,8 @@ def _describe_time(
     hours: Optional[list[int]],
 ) -> str:
     """The leading time-of-day phrase of :func:`describe_cron`."""
-    step_m = re.match(r"^\*/(\d+)$", mi)
-    step_h = re.match(r"^\*/(\d+)$", hr)
+    step_m = _STAR_STEP.match(mi)
+    step_h = _STAR_STEP.match(hr)
     # "*/n" only reads as a true fixed interval when n divides the span;
     # otherwise the pre-boundary gap is shorter, so enumerate instead.
     step_m_ok = step_m is not None and 60 % int(step_m.group(1)) == 0
@@ -456,7 +467,7 @@ def _describe_seconds(
     merely sub-select within the matched minutes, so they append as a
     qualifying clause instead of overstating the frequency.
     """
-    step_s = re.match(r"^\*/(\d+)$", sec_spec)
+    step_s = _STAR_STEP.match(sec_spec)
     step_s_ok = step_s is not None and 60 % int(step_s.group(1)) == 0
     if top_free:
         if seconds is None:
@@ -485,6 +496,7 @@ def next_fires(
     tz: Optional[datetime.tzinfo] = None,
     start: Optional[datetime.datetime] = None,
     hash_key: Optional[str] = None,
+    tab: Optional[CronTab] = None,
 ) -> list[datetime.datetime]:
     """The next ``count`` fire times of a schedule, straight from the
     daemon's own engine (:meth:`CronTab.occurrences`), so the preview
@@ -499,10 +511,11 @@ def next_fires(
     text = (schedule or "").strip()
     if text.lower() == "@reboot":
         return []
-    try:
-        tab = CronTab(text, hash_key=hash_key)
-    except (ValueError, KeyError):
-        return []
+    if tab is None:
+        try:
+            tab = CronTab(text, hash_key=hash_key)
+        except (ValueError, KeyError):
+            return []
     zone = tz or datetime.timezone.utc
     current = start if start is not None else datetime.datetime.now(zone)
     return list(itertools.islice(tab.occurrences(current), count))
@@ -597,12 +610,13 @@ def lint_schedule(
     if now is None:
         now = datetime.datetime.now(timezone or datetime.timezone.utc)
     findings: list[Finding] = []
-    # NOT `!= text`: on the re-parsing branch above, `text` is the caller's
-    # RAW expression, which differs from the canonical `str(tab)` whenever the
-    # author used non-single-space separators ("0  0 * * *"). Comparing
-    # against `text` there would report a spurious "hashed-slot" finding for
-    # a schedule that contains no H item at all.
-    if tab.resolved_source != str(tab):
+    # resolved_differs compares against the canonical str(tab), NOT `text`:
+    # on the re-parsing branch above, `text` is the caller's RAW expression,
+    # which differs from the canonical form whenever the author used
+    # non-single-space separators ("0  0 * * *"). Comparing against `text`
+    # there would report a spurious "hashed-slot" finding for a schedule
+    # that contains no H item at all.
+    if tab.resolved_differs:
         findings.append(
             Finding(
                 "hashed-slot",
@@ -1116,8 +1130,8 @@ def why_no_run(
     (the run fires at the shifted label) or repeats it (the run fires on
     the first occurrence only).
     """
-    month_end = calendar.monthrange(when.year, when.month)[1]
-    dow = (datetime.date(when.year, when.month, when.day).weekday() + 1) % 7
+    month_end = _month_end(when.year, when.month)
+    dow = (when.weekday() + 1) % 7
     # the engine's own per-side predicates, so this decomposition can
     # never disagree with what the scheduler computes
     dom_ok = tab._dom_matches(when.year, when.month, when.day, month_end)
@@ -1474,9 +1488,8 @@ def schedule_pressure(
         start = datetime.datetime.now(datetime.timezone.utc)
     hours = max(1, min(int(hours), 168))
     grid, cell_jobs, minute_jobs = _fire_cells(entries, start, hours, zone)
-    by_minute_fires = [
-        sum(grid[hour][minute] for hour in range(24)) for minute in range(60)
-    ]
+    # zip(*grid) walks the 24x60 grid once, one column tuple per minute
+    by_minute_fires = [sum(column) for column in zip(*grid, strict=True)]
     by_minute_jobs = [len(minute_jobs[minute]) for minute in range(60)]
     by_hour = [sum(row) for row in grid]
     busiest = max(
@@ -1631,10 +1644,7 @@ def suggest_slot(
             entries, start, 24, zone, names=False
         )
     if period == "hourly":
-        loads = [
-            sum(grid[hour][minute] for hour in range(24))
-            for minute in range(60)
-        ]
+        loads = [sum(column) for column in zip(*grid, strict=True)]
         busiest = max(range(60), key=lambda m: (loads[m], -m))
         order = sorted(
             range(60),
