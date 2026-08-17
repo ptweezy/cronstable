@@ -10,7 +10,8 @@ anything that implements this contract can serve as the relay a daemon's
 `push.relay.url` points at.
 
 The design goal is that the relay is not a trusted party. Every alert is
-sealed end to end (a libsodium sealed box: X25519 + XSalsa20-Poly1305) to
+sealed end to end (by default a libsodium sealed box: X25519 +
+XSalsa20-Poly1305; see [Suites](#suites)) to
 each paired device's public key before it leaves the daemon. The relay
 handles ciphertext and routing metadata only; the paired device's app
 decrypts the payload on the phone, inside its Notification Service
@@ -70,7 +71,8 @@ shape rather than for a serial stream.
   "ciphertext": "TmV2ZXIgcGxhaW50ZXh0…",
   "collapseId": "93bc5d02dc2a24b5365347573b6f5115",
   "priority": "time-sensitive",
-  "event": false
+  "event": false,
+  "suite": "x25519"
 }
 ```
 
@@ -78,7 +80,8 @@ shape rather than for a serial stream.
 | --- | --- | --- |
 | `v` | int | Protocol version. Always `1`. |
 | `device` | string | The platform push token (APNs device token), exactly as the device registered it at pairing time. Opaque to the daemon; the relay uses it to address the notification. |
-| `ciphertext` | string | The sealed alert, base64. A libsodium sealed box encrypted to the target device's X25519 public key. At most 3000 characters, so the relay's final APNs JSON stays under the 4096-byte APNs cap with headroom for the relay's own envelope. |
+| `ciphertext` | string | The sealed alert, base64, sealed to the target device's public key under `suite`. At most 3800 characters (see [Size budget](#size-budget)). |
+| `suite` | string | The sealing suite the ciphertext was produced under, so neither relay nor app has to infer the algorithm from a length. Optional: an absent value means `x25519`. See [Suites](#suites). |
 | `collapseId` | string | An opaque coalescing key: 32 lowercase hex characters (a truncated SHA-256 over the alert's identity fields, keyed with a per-installation secret salt the relay never sees). The same alert, reported again or by any node sharing the installation's device registry, produces the same id; without the salt the id is not invertible even for guessable job names. Test alerts are the exception: each carries a fresh random id so a coalescing relay never swallows one. |
 | `priority` | string | `time-sensitive` or `passive`. The relay maps it to the APNs interruption level: `time-sensitive` breaks through scheduled summaries, `passive` does not. |
 | `event` | bool | `true` when the alert is a daemon event (the `notify:` fan-out: DAG failures, approval gates, leadership and quorum changes), `false` for job, SLA, and test alerts. Routing metadata only; the event's content is inside the ciphertext. |
@@ -86,6 +89,57 @@ shape rather than for a serial stream.
 The request carries no authentication from the daemon in v1; relay
 deployments own their admission policy (network controls, per-device rate
 limits keyed on `device`).
+
+## Suites
+
+`suite` names the public-key algorithm a device's registered key belongs
+to. It rides on the pairing record, this envelope, and the APNs payload
+the relay builds, so the algorithm is always stated rather than inferred
+from a key or ciphertext length.
+
+| Suite | Algorithm | Public key | Sealing overhead |
+| --- | --- | ---: | ---: |
+| `x25519` | libsodium sealed box (X25519 + XSalsa20-Poly1305) | 32 B | 48 B |
+| `xwing` | X-Wing (ML-KEM-768 + X25519), reserved | 1216 B | 1136 B |
+
+`x25519` is the default and the only suite a daemon seals under today.
+`xwing` is registered so that the wire format, the size fitting and the
+pairing validation are already suite-driven; a daemon that cannot seal to
+a suite refuses the pairing rather than storing a record whose every alert
+would fail. Post-quantum sealing lands when PyNaCl exposes libsodium
+1.0.22's `crypto_kem_*` functions.
+
+Relays MUST treat `suite` as opaque routing metadata: the ciphertext is
+sealed to the device either way, and a relay that does not recognize a
+suite should still forward it. Relays MUST NOT reject an envelope for
+carrying an unknown suite.
+
+## Size budget
+
+APNs rejects notifications whose final JSON exceeds **4096 bytes**. That
+frame is divided as:
+
+| Part | Bytes |
+| --- | ---: |
+| The relay's APNs envelope (alert stub, `mutable-content`, `v`, `suite`) | 189 |
+| `ciphertext`, base64 | ≤ 3800 |
+| Reserve for future protocol fields | 107 |
+
+The 189 is measured, not estimated: the relay's `tests/apns-size.spec.ts`
+serializes the real envelope at a max-length ciphertext and asserts the
+total stays under the cap. The daemon derives its own cap from the same
+three numbers.
+
+What that leaves for plaintext, after each suite's sealing overhead:
+
+| Suite | Plaintext budget |
+| --- | ---: |
+| `x25519` | 2802 B |
+| `xwing` | 1714 B |
+
+A daemon fits each device's payload to **that device's** suite budget, so
+a device paired under a wider-ciphertext suite is trimmed harder without
+costing the devices beside it any log lines.
 
 ## Responses
 
@@ -200,8 +254,9 @@ fields plus a fixed `message`.
 ### Size fitting
 
 The daemon guarantees the sealed, base64-encoded ciphertext never exceeds
-3000 characters. When a payload is too large it is shrunk in this order,
-re-checking after each step:
+3800 characters, and fits each target device's payload to that device's
+own suite budget (see [Size budget](#size-budget)). When a payload is too
+large it is shrunk in this order, re-checking after each step:
 
 1. `log_tail` lines are dropped oldest-first (the newest lines carry the
    failure).

@@ -996,7 +996,8 @@ $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/push/devices
 
 Pairs a device for encrypted push alerts. The JSON body carries four
 required fields: `name` (up to 64 characters), `platform` (up to 32),
-`publicKey` (base64 decoding to exactly 32 bytes, an X25519 public key), and
+`publicKey` (base64, decoding to the length its optional `suite` requires:
+32 bytes for the default `x25519`), and
 `pushToken` (the platform push token, up to 512 characters). Requires the
 `control` scope.
 

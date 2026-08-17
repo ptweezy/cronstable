@@ -354,7 +354,9 @@ def test_fit_payload_skips_context_fields_the_alert_does_not_carry():
         "kind": "event",
         "name": "etl",
         "host": "node-a",
-        "started_at": "z" * 2500,
+        # Sized off the budget, not a literal, so this stays an
+        # overflow whatever the cap is worth.
+        "started_at": "z" * (push.MAX_PLAINTEXT_BYTES + 300),
         "run_id": "run-123",
     }
     data = push.fit_payload(payload)
@@ -376,7 +378,8 @@ def test_fit_payload_drops_context_fields_when_nothing_long_is_left():
         "name": "backup",
         "host": "node-a",
         "fail_reason": "x" * 60,  # <= 64: not eligible for halving
-        "schedule": "y" * 2500,  # the overage, and the first to go
+        # Budget-relative for the same reason as the test above.
+        "schedule": "y" * (push.MAX_PLAINTEXT_BYTES + 300),  # first to go
         "started_at": "2026-07-23T01:00:00+00:00",
         "run_id": "run-123",
     }
@@ -531,6 +534,209 @@ def test_validate_pairing_normalizes_and_rejects():
                 "publicKey": public_b64,
             }
         )
+
+
+# ------------------------------------------------------- suites and budget
+
+
+def test_ciphertext_cap_fits_the_apns_frame_with_its_reserve():
+    # Derive the cap here the same way push.py does, so an edit to any
+    # of the three inputs has to keep the arithmetic true; the relay's
+    # apns-size.spec.ts pins RELAY_ENVELOPE_BYTES against the envelope it
+    # really serializes.
+    assert (
+        push.RELAY_ENVELOPE_BYTES
+        + push.CIPHERTEXT_B64_MAX
+        + push.RELAY_ENVELOPE_RESERVE
+        <= push.APNS_PAYLOAD_MAX
+    )
+    # And the reserve is real slack, not a rounding artifact.
+    assert push.RELAY_ENVELOPE_RESERVE > 0
+
+
+def test_suite_budgets_track_their_sealing_overhead():
+    # Every suite's budget is the same raw cap minus its own overhead, so
+    # a wider ciphertext costs log lines and nothing else.
+    raw = push.CIPHERTEXT_B64_MAX // 4 * 3
+    for name, spec in push.SUITES.items():
+        assert push.max_plaintext_bytes(name) == raw - spec.overhead
+    # X-Wing's ciphertext is 1088 bytes wider than a sealed box's, which
+    # is the whole cost of the post-quantum swap on this path.
+    assert (
+        push.SUITES[push.SUITE_X25519].overhead
+        + 1088
+        == push.SUITES[push.SUITE_XWING].overhead
+    )
+    assert push.MAX_PLAINTEXT_BYTES == push.max_plaintext_bytes(
+        push.SUITE_X25519
+    )
+
+
+def test_unknown_suite_is_named_not_guessed():
+    with pytest.raises(push.PushError) as excinfo:
+        push.suite_or_error("rot13")
+    # The message lists what this daemon does know, so an operator
+    # pairing a newer app build learns which side is behind.
+    assert "rot13" in str(excinfo.value)
+    assert push.SUITE_X25519 in str(excinfo.value)
+    # Present-but-empty is malformed input, not "unspecified": the relay
+    # rejects it too, and the two sides must agree on what is a suite.
+    with pytest.raises(push.PushError):
+        push.suite_or_error("")
+
+
+def test_absent_suite_reads_as_x25519():
+    # A record that names no suite is an X25519 pairing.
+    assert push.suite_or_error(None).name == push.SUITE_X25519
+    assert push.public_device({"id": "d", "publicKey": None})["suite"] == (
+        push.SUITE_X25519
+    )
+
+
+@requires_pynacl
+def test_pairing_accepts_an_explicit_x25519_suite():
+    _, public_b64 = _device_keypair()
+    fields = push.validate_pairing(
+        {
+            "name": "phone",
+            "platform": "ios",
+            "publicKey": public_b64,
+            "pushToken": "tok",
+            "suite": push.SUITE_X25519,
+        }
+    )
+    assert fields["suite"] == push.SUITE_X25519
+
+
+def test_pairing_refuses_a_suite_the_daemon_cannot_seal_to():
+    # Fail closed, exactly like the PyNaCl config gate: accepting an
+    # X-Wing pairing this daemon cannot seal to would store a record that
+    # silently fails every later alert -- a missed page, which is the one
+    # failure mode this feature exists to prevent.
+    key = base64.b64encode(
+        b"\x01" * push.SUITES[push.SUITE_XWING].public_key_bytes
+    ).decode()
+    with pytest.raises(push.PushError) as excinfo:
+        push.validate_pairing(
+            {
+                "name": "phone",
+                "platform": "ios",
+                "publicKey": key,
+                "pushToken": "tok",
+                "suite": push.SUITE_XWING,
+            }
+        )
+    assert "not sealable" in str(excinfo.value)
+
+
+def test_pairing_checks_key_length_against_its_own_suite():
+    # A 32-byte key is correct for x25519 and wrong for xwing; the check
+    # must follow the suite rather than a single hard-coded 32.
+    short = base64.b64encode(b"\x01" * 32).decode()
+    with pytest.raises(push.PushError) as excinfo:
+        push.validate_public_key(short, push.SUITE_XWING)
+    assert "1216" in str(excinfo.value)
+    assert "suite must be a string" in str(
+        pytest.raises(
+            push.PushError,
+            push.validate_pairing,
+            {
+                "name": "p",
+                "platform": "ios",
+                "pushToken": "t",
+                "publicKey": short,
+                "suite": 7,
+            },
+        ).value
+    )
+
+
+@requires_pynacl
+def test_seal_rejects_a_suite_with_no_implementation():
+    key = base64.b64encode(
+        b"\x01" * push.SUITES[push.SUITE_XWING].public_key_bytes
+    ).decode()
+    with pytest.raises(push.PushError):
+        push.seal_to_device(key, b"{}", push.SUITE_XWING)
+
+
+def test_fit_payload_honors_a_narrower_suite_budget():
+    # The same alert, fitted twice: the narrower budget keeps fewer log
+    # lines and both stay inside their own cap.
+    def payload():
+        return {
+            "v": 1,
+            "kind": "failure",
+            "name": "etl",
+            "host": "node-a",
+            "log_tail": ["line {}".format(i) * 6 for i in range(40)],
+        }
+
+    wide = payload()
+    narrow = payload()
+    wide_bytes = push.fit_payload(
+        wide, push.max_plaintext_bytes(push.SUITE_X25519)
+    )
+    narrow_bytes = push.fit_payload(
+        narrow, push.max_plaintext_bytes(push.SUITE_XWING)
+    )
+    assert len(wide_bytes) <= push.max_plaintext_bytes(push.SUITE_X25519)
+    assert len(narrow_bytes) <= push.max_plaintext_bytes(push.SUITE_XWING)
+    assert len(narrow["log_tail"]) < len(wide["log_tail"])
+    # Both keep the newest lines: trimming is oldest-first regardless of
+    # how hard the budget bites.
+    assert narrow["log_tail"][-1] == wide["log_tail"][-1]
+
+
+def test_fit_for_does_not_leak_one_devices_trimming_into_another(tmp_path):
+    # The regression per-device fitting could have introduced: fit_payload
+    # trims in place, so a shared dict (or a shared log_tail list behind a
+    # shallow copy) would let the narrowest device decide what every other
+    # device sees.
+    service = _service(push.FileDeviceStore(str(tmp_path / "d.json")))
+    shared = {
+        "v": 1,
+        "kind": "failure",
+        "name": "etl",
+        "host": "node-a",
+        "log_tail": ["line {}".format(i) * 6 for i in range(40)],
+    }
+    before = len(shared["log_tail"])
+    narrow = service._fit_for(shared, push.SUITE_XWING)
+    wide = service._fit_for(shared, push.SUITE_X25519)
+    # The caller's payload is untouched by either fitting...
+    assert len(shared["log_tail"]) == before
+    # ...and the wide device is not charged for the narrow one's trimming.
+    assert len(wide) > len(narrow)
+
+
+def test_collapse_id_is_unchanged_by_fitting():
+    # collapse_id hashes run_id, and fit_payload's last resort drops it,
+    # so the id has to come off the untrimmed payload: otherwise an
+    # oversized alert coalesces under a different id than the same alert
+    # from a node whose copy fits, and per-device fitting widens that to
+    # one id per suite.
+    # The identity core is never trimmed, so it takes a pathologically
+    # long job name to push the fit loop all the way down its context
+    # list to run_id -- the shape where the coupling would show.
+    payload = {
+        "v": 1,
+        "kind": "failure",
+        "name": "etl-" + "n" * push.MAX_PLAINTEXT_BYTES,
+        "host": "node-a",
+        "run_id": "run-123",
+        "schedule": "17 2 * * *",
+        "started_at": "2026-08-17T02:14:02+00:00",
+    }
+    expected = push.collapse_id(payload, "salt")
+    trimmed = dict(payload)
+    push.fit_payload(trimmed)
+    # The trimmed copy really did lose run_id, so the assertion below is
+    # live rather than vacuous.
+    assert "run_id" not in trimmed
+    assert push.collapse_id(payload, "salt") == expected
+    # The point: the id the relay coalesces on is the same either way.
+    assert push.collapse_id(trimmed, "salt") != expected
 
 
 # ---------------------------------------------------------- device stores
@@ -954,6 +1160,10 @@ async def test_send_report_seals_to_each_device_and_posts_relay(tmp_path):
         assert body["priority"] == "passive"
         assert body["event"] is False
         assert len(body["collapseId"]) == 32
+        # The suite rides on the envelope so the relay bound-checks the
+        # ciphertext against the right one and the app knows which key
+        # opens it, neither having to infer it from a length.
+        assert body["suite"] == push.SUITE_X25519
         opened = _open_sealed(private, body["ciphertext"])
         assert opened["name"] == "backup"
         assert opened["kind"] == "failure"
@@ -2062,7 +2272,9 @@ async def test_relay_outcome_redacts_url_credentials(tmp_path, monkeypatch):
     # is logged by send_report and returned as a test alert's 502 body.
     import aiohttp
 
-    monkeypatch.setattr(push, "seal_to_device", lambda key, plain: "Y2k=")
+    monkeypatch.setattr(
+        push, "seal_to_device", lambda key, plain, suite=None: "Y2k="
+    )
     service = _service(
         push.FileDeviceStore(str(tmp_path / "d.json")),
         # port out of range: yarl refuses it, so this never leaves the box
@@ -2071,7 +2283,12 @@ async def test_relay_outcome_redacts_url_credentials(tmp_path, monkeypatch):
     device = {"id": "d1", "publicKey": "k", "pushToken": "t"}
     async with aiohttp.ClientSession() as session:
         outcome = await service._send_to_device(
-            session, device, b"{}", "collapse", "time-sensitive", False
+            session,
+            device,
+            {"v": 1, "kind": "test", "name": "t"},
+            "collapse",
+            "time-sensitive",
+            False,
         )
     assert outcome["error"]
     assert "p4ssw0rd" not in outcome["error"]
