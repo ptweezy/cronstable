@@ -646,43 +646,39 @@ def test_web_site_from_url_unix_socket():
         assert isinstance(site, web.UnixSite)
 
 
-def test_install_shutdown_handlers_roundtrip():
-    # Exercises install + the returned cleanup on both platforms (loop signal
-    # handlers on POSIX; signal.signal + console handler + heartbeat on
-    # Windows) without firing a real signal.  Must run on the main thread
-    # (signal.signal requires it).
+@pytest.mark.parametrize(
+    "installer",
+    [platform.install_shutdown_handlers, platform.install_reload_handler],
+)
+def test_install_handlers_roundtrip(installer):
+    # Exercises install + the returned cleanup on both platforms (loop
+    # signal handlers on POSIX; for shutdown on Windows the signal.signal +
+    # console handler + heartbeat fallback, for reload a documented no-op)
+    # without firing a real signal.  Must run on the main thread
+    # (signal.signal requires it, and add_signal_handler refuses
+    # elsewhere).
     loop = asyncio.new_event_loop()
     try:
         called = []
-        cleanup = platform.install_shutdown_handlers(
-            loop, lambda: called.append(1)
-        )
+        cleanup = installer(loop, lambda: called.append(1))
         assert callable(cleanup)
         cleanup()
     finally:
         loop.close()
 
 
-@pytest.mark.skipif(
-    not platform.IS_WINDOWS, reason="Windows signal-delivery path"
-)
-def test_windows_sigint_delivery_reaches_the_callback():
-    # End to end through the signal.signal fallback and its heartbeat: a
-    # real SIGINT raised while the loop is parked must run the callback on
-    # the loop thread (the docs' Ctrl-C promise; the POSIX sibling is
-    # test_cron.py's SIGTERM test). Before this test existed, the only
-    # Windows coverage installed the handlers without ever firing one.
+def _assert_signal_delivered(installer, sig):
+    # shared end-to-end harness: a real signal raised while the loop is
+    # parked must run the installed callback on the loop thread.
     loop = asyncio.new_event_loop()
     called = []
-    cleanup = platform.install_shutdown_handlers(
-        loop, lambda: called.append(1)
-    )
+    cleanup = installer(loop, lambda: called.append(1))
     try:
 
         async def fire_and_park():
-            signal.raise_signal(signal.SIGINT)
-            # generous park: the heartbeat only guarantees the pending C
-            # handler is observed within its 0.25s tick.
+            signal.raise_signal(sig)
+            # generous park: the Windows heartbeat only guarantees the
+            # pending C handler is observed within its 0.25s tick.
             deadline = time.monotonic() + 5
             while not called and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
@@ -692,6 +688,19 @@ def test_windows_sigint_delivery_reaches_the_callback():
         cleanup()
         loop.close()
     assert called == [1]
+
+
+@pytest.mark.skipif(
+    not platform.IS_WINDOWS, reason="Windows signal-delivery path"
+)
+def test_windows_sigint_delivery_reaches_the_callback():
+    # End to end through the signal.signal fallback and its heartbeat (the
+    # docs' Ctrl-C promise; the POSIX sibling is test_cron.py's SIGTERM
+    # test). Before this test existed, the only Windows coverage installed
+    # the handlers without ever firing one.
+    _assert_signal_delivered(
+        platform.install_shutdown_handlers, signal.SIGINT
+    )
 
 
 def test_console_events_route_close_and_shutdown_to_the_drain():
@@ -808,19 +817,25 @@ def test_os_boot_id_reads_the_kernel_value_or_none():
     assert value is None or (isinstance(value, str) and value)
 
 
-def test_os_boot_id_returns_none_when_unreadable(monkeypatch):
-    # A missing/unreadable boot_id file yields None (callers fall back to
-    # os_boot_time), not an exception.
+def _hide_proc_file(monkeypatch, needle):
+    # make open() refuse any path containing `needle`, as if the /proc
+    # entry did not exist on this platform.
     import builtins
 
     real_open = builtins.open
 
     def refuse(path, *a, **k):
-        if "boot_id" in str(path):
+        if needle in str(path):
             raise OSError("no such file")
         return real_open(path, *a, **k)
 
     monkeypatch.setattr(builtins, "open", refuse)
+
+
+def test_os_boot_id_returns_none_when_unreadable(monkeypatch):
+    # A missing/unreadable boot_id file yields None (callers fall back to
+    # os_boot_time), not an exception.
+    _hide_proc_file(monkeypatch, "boot_id")
     assert platform.os_boot_id() is None
 
 
@@ -828,19 +843,53 @@ def test_os_boot_id_returns_none_when_unreadable(monkeypatch):
     platform.IS_WINDOWS, reason="reads /proc/uptime, POSIX-only"
 )
 def test_os_boot_time_returns_none_when_uptime_unreadable(monkeypatch):
-    # /proc/uptime unreadable (or garbage) -> cannot tell -> None, so callers
-    # treat the daemon start as a fresh boot instead of crashing.
-    import builtins
+    # /proc/uptime unreadable AND the psutil fallback failing -> cannot
+    # tell -> None, so callers treat the daemon start as a fresh boot
+    # instead of crashing.
+    import psutil
 
-    real_open = builtins.open
+    def boom():
+        raise RuntimeError("no boottime either")
 
-    def refuse(path, *a, **k):
-        if "uptime" in str(path):
-            raise OSError("no such file")
-        return real_open(path, *a, **k)
-
-    monkeypatch.setattr(builtins, "open", refuse)
+    _hide_proc_file(monkeypatch, "uptime")
+    monkeypatch.setattr(psutil, "boot_time", boom)
     assert platform.os_boot_time() is None
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="reads /proc/uptime, POSIX-only"
+)
+def test_os_boot_time_uses_psutil_without_proc_uptime(monkeypatch):
+    # The /proc-less POSIX systems (macOS/BSD) read the kernel's own record
+    # of the boot instant via psutil instead of returning None -- the boot
+    # identity that keeps the @reboot once-per-boot dedupe live there
+    # (without it, every daemon restart re-runs the one-shots).
+    import psutil
+
+    _hide_proc_file(monkeypatch, "uptime")
+    monkeypatch.setattr(psutil, "boot_time", lambda: 1_755_000_000)
+    assert platform.os_boot_time() == 1_755_000_000.0
+
+
+def test_process_start_time_pins_pid_identity():
+    # the pid-reuse disambiguator: a live pid reports a readable start
+    # time that stays identical across reads (same process), and an
+    # impossible pid reports None (cannot tell), never raises.
+    first = platform.process_start_time(os.getpid())
+    assert first is not None and first > 0
+    assert platform.process_start_time(os.getpid()) == first
+    assert platform.process_start_time(-1) is None
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="SIGHUP is POSIX-only"
+)
+def test_posix_sighup_delivery_reaches_the_callback():
+    # End to end: a real SIGHUP raised while the loop is parked must run
+    # the reload callback on the loop thread. The installed handler is all
+    # that stands between SIGHUP and its default action, which kills the
+    # daemon outright with no drain and orphans its running jobs.
+    _assert_signal_delivered(platform.install_reload_handler, signal.SIGHUP)
 
 
 @pytest.mark.skipif(

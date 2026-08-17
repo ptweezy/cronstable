@@ -12,7 +12,7 @@ from tests._cron_helpers import (
     UTC,
     fixed_current_time,  # noqa: F401
 )
-from tests._helpers import _state_cfg
+from tests._helpers import _seed_orphan_open, _state_cfg
 
 # ===================== rehydrate additions =====================
 #
@@ -186,20 +186,8 @@ def _many_jobs_yaml(count):
     )
 
 
-async def _seed_orphan_open(cron, name):
-    # an open record left by a PREVIOUS daemon on this host (same host, a
-    # different proc token, no pid to probe): exactly what the boot
-    # reconciliation is meant to close.
-    await cron.state_backend.append_record(
-        cron._inflight_stream(name),
-        {
-            "kind": "open",
-            "host": cron._state_host,
-            "proc": "a-dead-daemon",
-            "pid": None,
-            "startedAt": "2026-07-01T10:00:00+00:00",
-        },
-    )
+# _seed_orphan_open moved to tests/_helpers.py (shared with the durability
+# suite); imported above.
 
 
 async def test_rehydrate_reconcile_inflight_reads_jobs_concurrently(tmp_path):
