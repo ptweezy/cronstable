@@ -683,6 +683,47 @@ reduced motion the mark parks in a still pose that stays honest about daemon
 state — upright when live, hanging when not — and without JavaScript the
 letter is simply printed.
 
+## Tab title and favicon
+
+The browser tab is the dashboard's smallest display, and the one that stays
+visible after you switch away. The title leads with the worst current
+condition, so even a truncated tab reads at a glance:
+
+| Condition | Title |
+| :-- | :-- |
+| Connection lost | `no signal · cronstable` |
+| Cluster degraded | `cluster alert · cronstable` |
+| One job failing | `backup-db failing · cronstable` |
+| Several jobs failing | `3 jobs failing · cronstable`, then each failing job by name |
+| One job running | `backup-db running · 42s · cronstable` |
+| Several jobs running | `3 running · cronstable`, then each run with its elapsed time |
+| All quiet | `14 ok · cronstable`, then `next: backup-db in 12m · cronstable` |
+
+When a state has more to say than one tab-width line, the title rotates
+complete readouts every four seconds rather than scrolling characters. A
+fleet event cycles the failing count and then every failing job by name;
+several runs page through each job with its elapsed time; a cluster alert
+adds its reason; the quiet state alternates the healthy count with the
+next fire. Each frame is a whole line, so a backgrounded tab, which
+advances only as the slow poll refreshes it, always shows one true readout
+instead of a fragment of scrolled text.
+
+The readouts are plain words with middle-dot separators, and elapsed times
+tick each second while the tab is visible. On a
+[cluster](Clustering-and-Leader-Election) node the trailing brand is the
+node's own name, so with a tab open per node you can tell which is which.
+
+The favicon is the cronstable mark: the pendulum standing on its cart,
+inlined into the page as a data URI so the dashboard stays a single
+self-contained file. It holds steady whatever the fleet is doing, so a
+pinned tab reads as the app rather than as an alarm.
+
+A hidden tab keeps polling at a slow 30-second cadence rather than stopping,
+so the title, [desktop notifications](#settings-themes-and-notifications),
+the audible alarm, and the [run ledger](#run-ledger) stay current while you
+work elsewhere. The foreground refresh interval resumes the moment the tab
+returns.
+
 ## Authentication
 
 When [bearer-token authentication](HTTP-API#authentication) is enabled

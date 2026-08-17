@@ -35,6 +35,16 @@
   unchanged, and retries after a failed parse, exactly as `SIGHUP` does.
   Previously the service accepted no reload control and Windows waited
   on the housekeeping pass; a console run on Windows still does.
+- The dashboard's tab title reports live fleet state, worst condition
+  first: connection lost, cluster alert, jobs failing (named outright when
+  only one is), jobs running, or a quiet fleet with its healthy count and
+  next fire. The readouts are plain words with middle-dot separators, and
+  running jobs show their elapsed time. When several jobs fail or run at
+  once, the title rotates complete readouts every few seconds and pages
+  through each job by name rather than truncating. A hidden tab keeps
+  polling at a slow 30-second cadence so the title stays current in the
+  background, and on a cluster node the title signs with the node's name.
+  The page carries a favicon: the cronstable pendulum mark.
 
 ## 1.2.42
 

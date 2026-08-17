@@ -4,7 +4,9 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="color-scheme" content="dark" />
-<title>cronstable // job scheduler</title>
+<title>cronstable</title>
+<!-- the cronstable mark, shared with the iOS app icon; inlined so the page stays one file -->
+<link rel="icon" sizes="32x32" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEMUlEQVR42r2XTWhcVRTHf+feN29m8jVN2kkz/dCmtcEP2i4qiqBFRAWRhC7qRqRIpVCQKoJi0YWKKBTUjR8ILnQhXRQX0a7EXUVrRcW2SotNLI3NR8O0k3aaZPI+7nUxd0xMMyVvkvbu3sx97/zP//7Puecv2m8G0EAMrAP2A73AHYAHCEtbFoiAAeAI8CFwoRZTtN9cC74T+BhYw81dI8DzQD+gxTHQC3zjNkQOnSxzYOsS9dxzH3BEtN9cAE4Cq9wGvfhvivtuolWLUQS2aqX9N4BHkwZXSmNMjFIKkURkKRerBbCi/eazwCaXilps5nFwDS/dQjRTAaXQKR/sotkwjr5BBWx0D2pxmSvicJrHd+3m8LFfee9QPx35TmwcJWFCuZgbtdL+W4s+cRHiKKIl184Hh74m37Werff1cLU0wy9Hv8VLZ7HGJDkOUUkVJEoRBTNcLo6TTsPUREhxfHRW50m/p/3mRK8ppYjCCt09d7H/4EcE2U5ef/JejI0R0YlRJGbAGIPnN/H36ZO8c+AA522OlnwXmBhpoHOoRjqKMTE61cTU8AAmDFixaRsmDhClbw0ArEW0ZurKONniAPteeoH2fAETBUl7QmMAlFJEM1Pc3rOFvoe2s7N3By++/T5xOI1KyIJqjACLKM3U5DVKpRJBCKP/DLlCSCZCrbT/ZiMgdCpN+fIYdsN2zg5d5JNXnsPzm5P2gQY14ISIKPzCJo59/wPWxLdQhCLYOMZvytGW72JyZBAkOf0NAxAEEwW05At4mSYuDQ2AlSSX0dIZgJgVa7oxcUR57AKiUssL4Eb1rLSH0h4dGzZTuVKiUp5A+xlsHQA3/Fa9P6IgwNqFFR1MljBxRH7j3UwMnyMOJokqV+uUrCEKgmRlKCK0dRYwcYyJo+qlKVLNxBrueeJpNj/cx9qtD6B9n7bV68kVuikO/oGo6t7qMVlS6SytqzoJp6cWcRs6dacyGZ45+AXfffouQ6eOo1NZrLWYKCLTmmPvVydoXb2W6YlLIEI210H54jCf7dpGpXwF5XnV2SGc5rYt9/PYvtf48tVnCSsVROv/acWrR43np/Fb20m1tONlXIOxIFpx/vcfWdV9J3EUVmm8OEzx3BkknSXjpUHc3FCZxG9tx/PTdY/Ac/OZmj9Al4tjrNz2IKbQQyqVqgpMwBrLn8ePon/76T/RVbMNWPfIU4iSKlARwjBkZWcn5eJYvTHB1B1KU+kMxtrrK0uqfWC+4kWk2ojs9RWrRAhnKgsOpZ5zKC+7H2eVXhNNbfSXOfbCgZiNNif4vH21LaLUfJOigP76xkTEvWxZ2hIHxC5oTBQwCuyplaWzZo77pQZ3CVg716TWbqw9wKhW2tfAGeAEsAPI3QRfyBzvMQLsdl5Ua6V961CdBg47lB3AijkGYjns+V/A58Be4OeaPf8XiHKXj2H2wl0AAAAASUVORK5CYII=" />
 <style>
   /* ============================================================= *
    *  cronstable dashboard                                     *
@@ -6025,6 +6027,76 @@ var qrcode = function() {
       (paused ? '<span class="pill opt"><span class="dot paused"></span><b>' + paused + "</b>&nbsp;paused</span>" : "");
   }
 
+  // ---- live tab title ----
+  // The tab strip is the smallest surface the dashboard renders, and the one
+  // that shows while nobody is looking at the page. Worst condition first
+  // (the verdict bar's ladder), then work in flight, then the quiet fleet
+  // summary with the next fire. Tab truncation eats from the right, so state
+  // leads and the brand trails; the demo page swaps the brand via
+  // window.CRONSTABLE_BRAND, and a clustered node signs with its node name
+  // so one tab per node stays readable.
+  //
+  // Plain words only: every readout is a short sentence fragment with
+  // middle-dot separators, no leading status glyph. The wording itself
+  // carries the state ("failing", "running", "no signal"), so nothing
+  // depends on a symbol surviving the platform's tab-strip font.
+  // Dwell per rotating readout. Split-flap, not marquee: when a state has
+  // more to say than one tab-width line (several failures, several runs,
+  // the quiet fleet's next fire), the title cycles COMPLETE lines at this
+  // pace instead of scrolling characters. Wherever the rotation halts (a
+  // hidden tab advances only as its slow poll refreshes the title), the
+  // strip shows one true readout, never a mid-scroll fragment.
+  const TITLE_FLIP_MS = 4000;
+  function titleInfo() {
+    if (!state.connected) return ["no signal"];
+    const alert = state.clusterAlert;
+    if (alert && alert.bad) {
+      return alert.reason ? ["cluster alert", alert.reason] : ["cluster alert"];
+    }
+    let ok = 0, next = null, nextName = null;
+    const failNames = [], runNames = [];
+    for (const j of state.jobs) {
+      const k = health(j).key;
+      if (k === "fail") failNames.push(j.name);
+      else if (k === "ok") ok++;
+      if (j.running) runNames.push(j.name);
+      else if (j.enabled && !j.paused) {
+        const n = nextRunSeconds(j);
+        if (n != null && n > 0 && (next == null || n < next)) { next = n; nextName = j.name; }
+      }
+    }
+    if (failNames.length) {
+      const frames = failNames.length > 1 ? [failNames.length + " jobs failing"] : [];
+      for (const n of failNames) frames.push(n + " failing");
+      return frames;
+    }
+    if (runNames.length) {
+      // observed-since elapsed (the table's honest basis), one coarse unit
+      // so the readout stays tab-sized
+      const dur = (name) => {
+        const s = state.runSince[name] ? Math.floor((Date.now() - state.runSince[name]) / 1000) : 0;
+        return s >= 3600 ? Math.floor(s / 3600) + "h" : s >= 60 ? Math.floor(s / 60) + "m" : s + "s";
+      };
+      const frames = runNames.length > 1 ? [runNames.length + " running"] : [];
+      for (const n of runNames) frames.push(n + " running · " + dur(n));
+      return frames;
+    }
+    const total = state.jobs.length;
+    const frames = [!total ? "no jobs" : !ok ? total + " jobs" : (ok === total ? total : ok + "/" + total) + " ok"];
+    // minute-floor countdown: a hidden tab only refreshes per poll, so a
+    // seconds readout would sit stale between polls
+    if (next != null) frames.push("next: " + nextName + (next < 3600 ? " in " + Math.max(1, Math.ceil(next / 60)) + "m" : " " + fmtIn(next)));
+    return frames;
+  }
+  let titleStr = null;
+  function updateTitle() {
+    if (!state.seenFirst && state.connected) return;  // hold the static title until the first poll settles
+    const frames = titleInfo();
+    const frame = frames[Math.floor(Date.now() / TITLE_FLIP_MS) % frames.length];
+    const s = frame + " · " + (window.CRONSTABLE_BRAND || state.clusterNode || "cronstable");
+    if (s !== titleStr) { titleStr = s; document.title = s; }
+  }
+
   // Duration-scaled outcome bars: one <i> per run, height proportional to
   // duration against the window's max. Serves the jobs table sparkline and
   // the history pane's bar chart, which differ only in scale and in the
@@ -6418,6 +6490,8 @@ var qrcode = function() {
     // value. A foreground wallboard (the common case) has hidden === false and
     // is unaffected.
     if (document.hidden) return;
+    updateTitle();   // countdown / elapsed readouts in the tab title tick
+                     // with the page (write-on-change, so usually a no-op)
     // Compare before writing, in every sweep below: most relative strings
     // ("5m ago") change once a minute or slower, yet an unconditional
     // assignment replaces the text node and dirties layout every second
@@ -7787,6 +7861,7 @@ var qrcode = function() {
       state.connected = ok;
       $("conn").innerHTML = '<span class="dot ' + (ok ? "live" : "dead") + '"></span><span>' + (ok ? "live" : "no signal") + "</span>";
       kickMark();  // the pendulum logo follows the live state (collapses when dead, recovers when live)
+      updateTitle();  // "○ no signal" / recovery reach the tab without waiting for a render pass
     }
     updateConnTooltip();
   }
@@ -10377,36 +10452,22 @@ var qrcode = function() {
   //  polling control
   // ===================================================================
   let pollTimer = null;
-  // Cadence while the tab is hidden and an alerting pref is armed. Slow
-  // enough to keep the hidden-tab saving most of its value, frequent enough
-  // that a failure alert is not meaningfully stale.
+  // Cadence while the tab is hidden. Slow enough that an idle backgrounded
+  // viewer costs the daemon little, frequent enough that nothing reading
+  // the poll goes meaningfully stale.
   const HIDDEN_POLL_MS = 30000;
   function restartPolling() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     if (!(prefs.pollMs > 0)) return;
-    // Don't poll at the FOREGROUND rate while the tab is hidden: an idle
-    // backgrounded viewer would otherwise keep the daemon serving its full
-    // /jobs + /cluster + /dags fan-out every pollMs forever. The
-    // visibilitychange handler calls this again (and forces one immediate
-    // refresh) when the tab comes back.
-    //
-    // Stopping outright is wrong when something is consuming the poll,
-    // though. Three opt-in features refresh ONLY off loadJobs and all three
-    // exist precisely for the tab nobody is watching: desktop notifications
-    // (maybeNotify), the standing alarm (state.anyFailing, which alarmTick
-    // reads on its own ungated 1s interval), and the run ledger
-    // (ledgerRecord, which accumulates history per poll). Gating purely on
-    // visibility silenced new-failure notifications while hidden, left
-    // alarmTick pulsing on a stale anyFailing (a resolved failure kept
-    // sounding, a fresh one stayed quiet), and punched a hole in the ledger
-    // for as long as the tab was backgrounded. Polling slowly keeps all
-    // three honest and still drops hidden-tab load by 6x at the default 5s
-    // cadence. With none of them on, nothing reads a hidden-tab poll, so it
-    // is skipped entirely.
-    if (
-      document.hidden
-      && !(prefs.notify || prefs.sound || state.ledger.on)
-    ) return;
+    // A hidden tab keeps polling, at HIDDEN_POLL_MS instead of the
+    // foreground rate: the live tab title exists precisely for the tab
+    // nobody is watching, and desktop notifications (maybeNotify), the
+    // standing alarm (alarmTick reads state.anyFailing on its own 1s
+    // interval), and the run ledger (ledgerRecord accumulates per poll)
+    // consume hidden-tab polls the same way. 30s still drops hidden-tab
+    // load 6x against the default 5s cadence; the visibilitychange handler
+    // restores the foreground rate (and forces one immediate refresh) when
+    // the tab comes back.
     pollTimer = setInterval(
       loadJobs,
       document.hidden ? Math.max(prefs.pollMs, HIDDEN_POLL_MS) : prefs.pollMs,
@@ -11332,6 +11393,8 @@ var qrcode = function() {
     return { sev: sev, glyph: glyph, head: head, sub: sub };
   }
   function renderVerdict() {
+    updateTitle();   // the tab title mirrors this ladder; every caller that
+                     // moves verdict-relevant state lands here
     const bar = $("verdictBar");
     const v = verdictInfo();
     if (state.wallboard) renderWbVerdict(v);   // cluster alerts land here too (loadCluster)
