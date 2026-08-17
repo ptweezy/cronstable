@@ -12,7 +12,7 @@
 #   1. Open http://localhost:8080/
 #   2. (optional, for speed) Settings -> "Zen idle" -> 10s
 #   3. Press  w  to enter the wallboard, then don't touch anything.
-#   4. After the idle delay the grid dissolves into a breathing phosphor field;
+#   4. After the idle delay the grid dissolves into a breathing field of dots;
 #      each dot pulses on its job's REAL next fire, so a moving field proves the
 #      poll is still live. Move the mouse or press a key to wake it; Esc exits.
 #

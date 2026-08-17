@@ -14,7 +14,7 @@ seamless loops:
   the readable proportional-sans interface font.
 
 Each also gets a `.gif` twin as a fallback for clients that don't render
-animated WebP. WebP is the primary (24-bit colour, no phosphor-glow banding);
+animated WebP. WebP is the primary (24-bit colour, no glow banding);
 the GIF is 256-colour and scaled down.
 
 How it stays small: animated WebP stores each frame in full (no interframe

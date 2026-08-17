@@ -20,22 +20,11 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
 
 ## Why cronstable?
 
-* **Built for locked-down containers.** Runs unmodified under restricted
-  Kubernetes PodSecurity: non-root, read-only root filesystem,
-  `RuntimeDefault` seccomp, every Linux capability dropped (see
-  [Production container deployment](#production-container-deployment)).
-* **Prebuilt for practically everything.** Multi-architecture images on GHCR
-  and Docker Hub. Also, self-contained binaries for Linux (glibc and musl),
-  macOS (signed and notarized) and Windows, so Python on the host is optional
-  (see [Installation](#installation)).
-* **Observability and durability**: A live
-  [web dashboard](#web-dashboard), native [Prometheus metrics](#metrics),
-  per-job [resource monitoring](#resource-monitoring), and opt-in
-  [durable state](https://github.com/ptweezy/cronstable/wiki/Durable-State),
-  [orchestration DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs)
-  and [leader-elected clustering](#clustering-and-leader-election).
+cronstable keeps cron's model (a schedule file running your commands) and
+builds in the tooling that otherwise accumulates around it: retries,
+alerting, durable state, orchestration, clustering, and a live dashboard.
 
-## Features
+### Scheduling
 
 * "Crontab" is in YAML format; classic crontab files are accepted as-is too
   (see [Classic crontab files](#classic-crontab-files))
@@ -50,6 +39,19 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   semantics, uneven `*/n` steps, day-31-in-April, schedules that DST skips or
   repeats) are flagged at config load, in the dashboards, and over the API
   (see [Schedule introspection](#schedule-introspection))
+* Arbitrary timezone support
+* **iCal calendar export**: subscribe any calendar app to `GET /calendar.ics`
+  (or one job's `/jobs/{name}/calendar.ics`) and the fleet's upcoming fires,
+  enumerated by the scheduler's own engine, land on the on-call engineer's
+  calendar; the dashboard draws the same data as a seven-day **week
+  calendar** (see the
+  [Calendar Export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export)
+  wiki page)
+
+### Failure handling
+
+* Flexible configuration: you decide how to determine if a cron job fails or not
+* Option to automatically retry failing cron jobs, with exponential backoff
 * Builtin sending of Sentry, Mail, and webhook (Slack-compatible)
   notifications when cron jobs fail
 * **End-to-end encrypted push notifications**: a dedicated reporter seals each
@@ -61,16 +63,6 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   [Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
   and [LAN Discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)
   wiki pages)
-* Flexible configuration: you decide how to determine if a cron job fails or not
-* Designed for running in Docker, Kubernetes, or 12 factor environments:
-  * Runs in the foreground
-  * Logs everything to stdout/stderr
-  * Production-ready for locked-down corporate container platforms: runs as a
-    non-root user, under a restricted seccomp profile, with a read-only root
-    filesystem, an `fsGroup`-mounted config, and all Linux capabilities
-    dropped, so no writable paths or elevated privileges are required (see
-    [Production container deployment](#production-container-deployment))
-* Option to automatically retry failing cron jobs, with exponential backoff
 * **Per-job SLA monitoring**: an `sla:` block declares thresholds for the runs
   that did not happen: too long without a success, a due slot that never
   started, a run exceeding its runtime bound. A breach fires a dedicated
@@ -79,14 +71,9 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   (see [Late-run detection](#late-run-detection-sla-monitoring) and the
   [Late-Run Detection](https://github.com/ptweezy/cronstable/wiki/Late-Run-Detection)
   wiki page)
-* **Runtime pause/resume**: pause any job's scheduled fires for a bounded
-  window (an hour by default, thirty days at most) over the API, the
-  dashboards, or MCP, without touching the config. Skipped slots are recorded
-  visibly, pending retries defer, catch-up owes nothing for the window, and
-  with a `state:` store the pause survives restarts and is honored by every
-  node (see the
-  [Pausing Jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs)
-  wiki page)
+
+### Durability and orchestration
+
 * **Opt-in durable state**: point a single `state:` config block at a local
   directory (or an Amazon S3 Files / EFS mount to share it fleet-wide) and jobs
   gain durability across restarts: missed-run catch-up after downtime and
@@ -105,8 +92,25 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   never double-launches (see the
   [Orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs)
   wiki page)
+
+### Observability and control
+
+* Optional **[live control panel](#web-dashboard)**: watch every job's status,
+  tail its logs in real time, run or cancel jobs on demand, review run history
+  and success rates, drive DAG runs and approvals, and keep an eye on the whole
+  cluster, from one self-contained page with ten themes and a shortcut for
+  everything and a **[terminal twin](#terminal-dashboard)**
+  (`cronstable tui`) with the same keys
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
+* **Runtime pause/resume**: pause any job's scheduled fires for a bounded
+  window (an hour by default, thirty days at most) over the API, the
+  dashboards, or MCP, without touching the config. Skipped slots are recorded
+  visibly, pending retries defer, catch-up owes nothing for the window, and
+  with a `state:` store the pause survives restarts and is honored by every
+  node (see the
+  [Pausing Jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs)
+  wiki page)
 * **Native TLS on the listeners**: `web.listen` accepts `https://` addresses
   served from a `web.tls` block, mixed freely with plaintext and unix-socket
   entries on one runner, and an optional `clientCa` makes the listener require
@@ -117,13 +121,6 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   gain `--cacert`, `--client-cert`, `--client-key` and `--insecure` (see
   [Serving the API over TLS](#serving-the-api-over-tls) and the
   [Listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS)
-  wiki page)
-* **iCal calendar export**: subscribe any calendar app to `GET /calendar.ics`
-  (or one job's `/jobs/{name}/calendar.ics`) and the fleet's upcoming fires,
-  enumerated by the scheduler's own engine, land on the on-call engineer's
-  calendar; the dashboard draws the same data as a seven-day **week
-  calendar** (see the
-  [Calendar Export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export)
   wiki page)
 * Optional **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)** for
   AI agents. An agent can **observe**
@@ -141,6 +138,9 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   each run's CPU time and peak memory across its whole process tree, live and
   per run, in the dashboard, the metrics, and the failure reports (see
   [Resource monitoring](#resource-monitoring))
+
+### Fleets
+
 * A **job-set id**: an order-independent fingerprint of every job's effective
   configuration, so replicas deployed from the same config can confirm they
   hold an identical set of jobs (see [Job-set id](#job-set-id))
@@ -149,13 +149,20 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   **elect a leader** so several replicas can run from one config without
   double-running jobs (see
   [Clustering and leader election](#clustering-and-leader-election))
-* Arbitrary timezone support
-* Optional **[live control panel](#web-dashboard)**: watch every job's status,
-  tail its logs in real time, run or cancel jobs on demand, review run history
-  and success rates, drive DAG runs and approvals, and keep an eye on the whole
-  cluster, from one self-contained page with ten themes and a shortcut for
-  everything and a **[terminal twin](#terminal-dashboard)**
-  (`cronstable tui`) with the same keys
+
+### Deployment
+
+* **Built for locked-down containers.** Runs in the foreground, logs
+  everything to stdout/stderr, 12-factor style, and works unmodified under
+  restricted Kubernetes PodSecurity: as a non-root user, on a read-only root
+  filesystem with an `fsGroup`-mounted config, under a `RuntimeDefault`
+  seccomp profile, and with every Linux capability dropped, so it needs no
+  writable paths or elevated privileges (see
+  [Production container deployment](#production-container-deployment))
+* **Prebuilt for practically everything.** Multi-architecture images on GHCR
+  and Docker Hub, plus self-contained binaries for Linux (glibc and musl),
+  macOS (signed and notarized), and Windows, so Python on the host is
+  optional (see [Installation](#installation))
 
 [![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](#web-dashboard)
 
@@ -367,8 +374,10 @@ POSIX. A few platform details differ:
   Service Control Manager, so it starts at boot, runs whether or not anyone
   is logged on, appears in `services.msc`, and gets Windows' own recovery
   actions; stopping it drains running jobs first, and the SCM is told the
-  stop is still in progress for as long as that takes. It is a ctypes shim
-  over advapi32, so it adds no dependency. The published one-file `.exe`
+  stop is still in progress for as long as that takes. `cronstable service
+  reload` makes it reparse the configuration immediately, the forced
+  reload `SIGHUP` performs on POSIX. It is a ctypes shim over advapi32,
+  so it adds no dependency. The published one-file `.exe`
   cannot host a service (its bootloader runs the program in a child process
   the SCM never sees) and `install` says so; install with pip or pipx for
   that, or use the `schtasks` recipe. See
@@ -505,18 +514,18 @@ counters, artifacts, and quarantine.
 
 ### Themes, Readability, and Accessibility
 
-**Ten themes**: **carolina** (the default, a Carolina-blue CRT phosphor),
-amber and green phosphor, and flat **modern** and **standard** looks, each in
-a dark (phosphor) and a light (paper) variant. Cycle hues with `t`, flip
+**Ten themes**: **carolina** (the default, Carolina blue),
+**amber** and **green**, and flat **modern** and **standard** looks, each in
+a dark and a light (paper) variant. Cycle hues with `t`, flip
 light/dark with `T`:
 
-[![The same cronstable board cycling through all ten themes (carolina, amber, green, modern and standard, each in a dark phosphor and a light paper variant) and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)
+[![The same cronstable board cycling through all ten themes (carolina, amber, green, modern and standard, each in a dark and a light paper variant) and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)
 
 *(One board, ten themes, two interface fonts, animated: [WebP](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp), [GIF](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.gif). The four stills below are pulled from it.)*
 
-| Amber phosphor CRT | Green phosphor CRT |
+| Amber | Green |
 | :---: | :---: |
-| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) |
+| [![The dashboard in the amber theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) |
 
 | Flat modern theme | Carolina, on paper (light) |
 | :---: | :---: |
@@ -524,7 +533,7 @@ light/dark with `T`:
 
 Beyond the themes: an optional proportional-sans interface font (shown per
 theme in the animation above), UI scaling, deuteranopia- and tritanopia-safe
-palettes, reduced-motion support, CRT-effect and notification toggles, all
+palettes, reduced-motion support, and notification toggles, all
 remembered per browser, with status always carried by glyphs and text, not
 colour or animation alone. There is also an optional (on by default, once per
 12 hours) BIOS-style boot self-test that checks the daemon, job set, cluster,
@@ -532,7 +541,7 @@ and schedules for real while it types:
 
 | Settings | Startup self-test |
 | :---: | :---: |
-| [![The settings panel: theme picker with carolina selected, CRT toggles, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png) |
+| [![The settings panel: theme picker with carolina selected, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png) |
 
 The `l` in the header's "cronstable" is a live cart-and-double-pendulum
 simulation. I like to call him double-P, Peter Parker, or PP.
@@ -597,12 +606,12 @@ So are the wallboard, the heatmap, and the state inspector:
 | [![The wallboard: worst-first tiles with failure ages and exit codes, run sparklines, and the tally foot](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-wallboard.png) | [![The activity heatmap: one row per job, one cell per hour, worst outcome colored and shaded by volume](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-heatmap.png) | [![The state inspector: store inventory, record streams, and document namespaces from the durable state store](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-state.png) |
 
 The same ten themes as the browser (`t` cycles the hue, `T` flips
-phosphor ↔ paper), with the same colour-vision-safe remaps and an
+dark ↔ paper), with the same colour-vision-safe remaps and an
 `--ascii` glyph mode:
 
-| Amber phosphor | Green phosphor |
+| Amber | Green |
 | :---: | :---: |
-| [![The TUI in the amber phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png) | [![The TUI in the green phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png) |
+| [![The TUI in the amber theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png) | [![The TUI in the green theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png) |
 
 | Flat modern | Carolina, on paper (light) |
 | :---: | :---: |
