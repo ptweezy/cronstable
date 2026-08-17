@@ -142,6 +142,24 @@ The daemon-version note above applies here: a brew-installed release
 without `web.anonymousScopes` stops `install.sh` at its config-validation
 step, and a failed validation leaves any previous install untouched.
 
+The daemon it deploys is the `cronstable` on PATH unless `CRONSTABLE_BIN`
+points at another build. The agent runs that binary, and its directory
+leads the jobs' `PATH`, so every `cronstable` a job shells out to is the
+same build. `install.sh` also refuses a PyInstaller build older than
+1.2.43: on those, jobs cannot invoke the cronstable CLI at all (the
+daemon's inherited bootloader variables kill it before the subcommand
+runs), so every state, cursor, lock, XCom and secret feature on this
+board fails silently and the board looks fine while doing nothing. If the
+brew build is one of those, install from source and point `CRONSTABLE_BIN`
+at it:
+
+```sh
+python3 -m venv "$(brew --prefix)/var/cronstable-demo/venv"
+"$(brew --prefix)/var/cronstable-demo/venv/bin/pip" install cronstable
+CRONSTABLE_BIN="$(brew --prefix)/var/cronstable-demo/venv/bin/cronstable" \
+  ./launchd/install.sh
+```
+
 No dashboard steps and no tunnel token: `cloudflared tunnel login`
 writes a certificate that authorizes creating the tunnel and its DNS
 record from the CLI, so `.env` stays a container-path concern.
