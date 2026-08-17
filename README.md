@@ -20,22 +20,11 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
 
 ## Why cronstable?
 
-* **Built for locked-down containers.** Runs unmodified under restricted
-  Kubernetes PodSecurity: non-root, read-only root filesystem,
-  `RuntimeDefault` seccomp, every Linux capability dropped (see
-  [Production container deployment](#production-container-deployment)).
-* **Prebuilt for practically everything.** Multi-architecture images on GHCR
-  and Docker Hub. Also, self-contained binaries for Linux (glibc and musl),
-  macOS (signed and notarized) and Windows, so Python on the host is optional
-  (see [Installation](#installation)).
-* **Observability and durability**: A live
-  [web dashboard](#web-dashboard), native [Prometheus metrics](#metrics),
-  per-job [resource monitoring](#resource-monitoring), and opt-in
-  [durable state](https://github.com/ptweezy/cronstable/wiki/Durable-State),
-  [orchestration DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs)
-  and [leader-elected clustering](#clustering-and-leader-election).
+cronstable keeps cron's model (a schedule file running your commands) and
+builds in the tooling that otherwise accumulates around it: retries,
+alerting, durable state, orchestration, clustering, and a live dashboard.
 
-## Features
+### Scheduling
 
 * "Crontab" is in YAML format; classic crontab files are accepted as-is too
   (see [Classic crontab files](#classic-crontab-files))
@@ -50,6 +39,19 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   semantics, uneven `*/n` steps, day-31-in-April, schedules that DST skips or
   repeats) are flagged at config load, in the dashboards, and over the API
   (see [Schedule introspection](#schedule-introspection))
+* Arbitrary timezone support
+* **iCal calendar export**: subscribe any calendar app to `GET /calendar.ics`
+  (or one job's `/jobs/{name}/calendar.ics`) and the fleet's upcoming fires,
+  enumerated by the scheduler's own engine, land on the on-call engineer's
+  calendar; the dashboard draws the same data as a seven-day **week
+  calendar** (see the
+  [Calendar Export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export)
+  wiki page)
+
+### Failure handling
+
+* Flexible configuration: you decide how to determine if a cron job fails or not
+* Option to automatically retry failing cron jobs, with exponential backoff
 * Builtin sending of Sentry, Mail, and webhook (Slack-compatible)
   notifications when cron jobs fail
 * **End-to-end encrypted push notifications**: a dedicated reporter seals each
@@ -61,16 +63,6 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   [Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
   and [LAN Discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)
   wiki pages)
-* Flexible configuration: you decide how to determine if a cron job fails or not
-* Designed for running in Docker, Kubernetes, or 12 factor environments:
-  * Runs in the foreground
-  * Logs everything to stdout/stderr
-  * Production-ready for locked-down corporate container platforms: runs as a
-    non-root user, under a restricted seccomp profile, with a read-only root
-    filesystem, an `fsGroup`-mounted config, and all Linux capabilities
-    dropped, so no writable paths or elevated privileges are required (see
-    [Production container deployment](#production-container-deployment))
-* Option to automatically retry failing cron jobs, with exponential backoff
 * **Per-job SLA monitoring**: an `sla:` block declares thresholds for the runs
   that did not happen: too long without a success, a due slot that never
   started, a run exceeding its runtime bound. A breach fires a dedicated
@@ -79,14 +71,9 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   (see [Late-run detection](#late-run-detection-sla-monitoring) and the
   [Late-Run Detection](https://github.com/ptweezy/cronstable/wiki/Late-Run-Detection)
   wiki page)
-* **Runtime pause/resume**: pause any job's scheduled fires for a bounded
-  window (an hour by default, thirty days at most) over the API, the
-  dashboards, or MCP, without touching the config. Skipped slots are recorded
-  visibly, pending retries defer, catch-up owes nothing for the window, and
-  with a `state:` store the pause survives restarts and is honored by every
-  node (see the
-  [Pausing Jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs)
-  wiki page)
+
+### Durability and orchestration
+
 * **Opt-in durable state**: point a single `state:` config block at a local
   directory (or an Amazon S3 Files / EFS mount to share it fleet-wide) and jobs
   gain durability across restarts: missed-run catch-up after downtime and
@@ -105,8 +92,25 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   never double-launches (see the
   [Orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs)
   wiki page)
+
+### Observability and control
+
+* Optional **[live control panel](#web-dashboard)**: watch every job's status,
+  tail its logs in real time, run or cancel jobs on demand, review run history
+  and success rates, drive DAG runs and approvals, and keep an eye on the whole
+  cluster, from one self-contained page with ten themes and a shortcut for
+  everything and a **[terminal twin](#terminal-dashboard)**
+  (`cronstable tui`) with the same keys
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
+* **Runtime pause/resume**: pause any job's scheduled fires for a bounded
+  window (an hour by default, thirty days at most) over the API, the
+  dashboards, or MCP, without touching the config. Skipped slots are recorded
+  visibly, pending retries defer, catch-up owes nothing for the window, and
+  with a `state:` store the pause survives restarts and is honored by every
+  node (see the
+  [Pausing Jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs)
+  wiki page)
 * **Native TLS on the listeners**: `web.listen` accepts `https://` addresses
   served from a `web.tls` block, mixed freely with plaintext and unix-socket
   entries on one runner, and an optional `clientCa` makes the listener require
@@ -117,13 +121,6 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   gain `--cacert`, `--client-cert`, `--client-key` and `--insecure` (see
   [Serving the API over TLS](#serving-the-api-over-tls) and the
   [Listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS)
-  wiki page)
-* **iCal calendar export**: subscribe any calendar app to `GET /calendar.ics`
-  (or one job's `/jobs/{name}/calendar.ics`) and the fleet's upcoming fires,
-  enumerated by the scheduler's own engine, land on the on-call engineer's
-  calendar; the dashboard draws the same data as a seven-day **week
-  calendar** (see the
-  [Calendar Export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export)
   wiki page)
 * Optional **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)** for
   AI agents. An agent can **observe**
@@ -141,6 +138,9 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   each run's CPU time and peak memory across its whole process tree, live and
   per run, in the dashboard, the metrics, and the failure reports (see
   [Resource monitoring](#resource-monitoring))
+
+### Fleets
+
 * A **job-set id**: an order-independent fingerprint of every job's effective
   configuration, so replicas deployed from the same config can confirm they
   hold an identical set of jobs (see [Job-set id](#job-set-id))
@@ -149,13 +149,20 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   **elect a leader** so several replicas can run from one config without
   double-running jobs (see
   [Clustering and leader election](#clustering-and-leader-election))
-* Arbitrary timezone support
-* Optional **[live control panel](#web-dashboard)**: watch every job's status,
-  tail its logs in real time, run or cancel jobs on demand, review run history
-  and success rates, drive DAG runs and approvals, and keep an eye on the whole
-  cluster, from one self-contained page with ten themes and a shortcut for
-  everything and a **[terminal twin](#terminal-dashboard)**
-  (`cronstable tui`) with the same keys
+
+### Deployment
+
+* **Built for locked-down containers.** Runs in the foreground, logs
+  everything to stdout/stderr, 12-factor style, and works unmodified under
+  restricted Kubernetes PodSecurity: as a non-root user, on a read-only root
+  filesystem with an `fsGroup`-mounted config, under a `RuntimeDefault`
+  seccomp profile, and with every Linux capability dropped, so it needs no
+  writable paths or elevated privileges (see
+  [Production container deployment](#production-container-deployment))
+* **Prebuilt for practically everything.** Multi-architecture images on GHCR
+  and Docker Hub, plus self-contained binaries for Linux (glibc and musl),
+  macOS (signed and notarized), and Windows, so Python on the host is
+  optional (see [Installation](#installation))
 
 [![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](#web-dashboard)
 
