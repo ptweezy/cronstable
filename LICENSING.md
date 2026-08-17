@@ -31,7 +31,7 @@ cronstable is planned to grow.
 | --- | --- | --- |
 | `/` core (`cronstable/`, docs, tests, CI, packaging, ...) | MIT | See [LICENSE](LICENSE). |
 | `pro/` | Proprietary | cronstable Pro (the `cronstable-pro` package). See [pro/LICENSE](pro/LICENSE). Not open source. |
-| rendered brand artwork under `docs/` | Reserved | The finished logo and social card. See [Brand assets](#brand-assets) below. |
+| rendered brand artwork under `docs/` | Reserved | The finished logo. See [Brand assets](#brand-assets) below. |
 
 As more proprietary components are added, each gets its own `LICENSE` file under
 the same rule, and a row here. Proprietary directories are pruned from the public
@@ -56,7 +56,6 @@ The list:
 | --- | --- |
 | `docs/**/logo-balance.gif`, `docs/**/logo-balance.webp` | the animated wordmark, dark |
 | `docs/**/logo-balance-light.gif`, `docs/**/logo-balance-light.webp` | the animated wordmark, light |
-| `docs/**/social-preview.png` | the repository social card |
 
 These are the finished logo, not source. They may be reproduced **unmodified**
 when referring to cronstable itself, which is the same latitude the nominative

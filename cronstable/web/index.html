@@ -10,7 +10,7 @@
    *  cronstable dashboard                                     *
    * ============================================================= */
 
-  /* ---------- phosphor palettes ---------- */
+  /* ---------- dark palettes ---------- */
   :root {
     color-scheme: dark;
     --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Cascadia Code",
@@ -18,7 +18,7 @@
     --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue",
             Arial, "Noto Sans", sans-serif;
 
-    /* semantic status colors — tuned to read on any dark phosphor bg */
+    /* semantic status colors — tuned to read on any dark bg */
     --ok: #3fd271;
     --fail: #ff5f56;
     --run: #4aa8ff;
@@ -36,7 +36,7 @@
     --peer-self: #58a6ff;
     --peer-unknown: #7d8590;
 
-    /* ANSI log palette — phosphor-bright; the paper themes re-ink these */
+    /* ANSI log palette — bright for the dark themes; the paper themes re-ink these */
     --ansi-30: #555;    --ansi-31: #ff5f56; --ansi-32: #3fd271; --ansi-33: #ffbf47;
     --ansi-34: #4aa8ff; --ansi-35: #c98bff; --ansi-36: #56d4dd; --ansi-37: #cfd6e0;
     --ansi-90: #7d8590; --ansi-91: #ff8783; --ansi-92: #7ee2a0; --ansi-93: #ffd47a;
@@ -93,7 +93,7 @@
     --glow:     rgba(121, 192, 255, .0);
     --selbg:    rgba(121, 192, 255, .12);
   }
-  /* Carolina Blue CRT phosphor — #4B9CD3 is the hero (seated as --fg-dim) */
+  /* Carolina Blue — #4B9CD3 is the hero (seated as --fg-dim) */
   html[data-theme="carolina"] {
     --bg:       #04070b;
     --bg2:      #060c13;
@@ -110,7 +110,7 @@
     --selbg:    rgba(75, 156, 211, .12);
   }
   /* "standard" — the family's plain member: neutral charcoal, saturated
-     inks, no phosphor physics (flat like modern) */
+     inks (flat like modern) */
   html[data-theme="standard"] {
     --bg:       #0f1114;
     --bg2:      #14161a;
@@ -129,7 +129,7 @@
 
   /* ---------- paper (light) palettes ---------- */
   /* Light twins of the themes above in the idiom of the paper-white
-     terminals: dark ink on a tinted screen, same hue family as the phosphor
+     terminals: dark ink on a tinted screen, same hue family as the dark
      original. Every ink/surface pairing holds >=4.2:1 (body text >=7:1). */
   html[data-theme="amber-light"] {
     --bg:       #f3e9d2;
@@ -210,7 +210,7 @@
   }
   /* what the dark themes take for granted about the surface: native control
      scheme, shadow weight, and the status inks (the :root set is tuned for
-     dark phosphor and washes out on paper) */
+     the dark themes and washes out on paper) */
   html[data-theme$="-light"] {
     color-scheme: light;
     --shadow-lg: 0 10px 40px rgba(0, 0, 0, .18);
@@ -261,7 +261,7 @@
      same paper-contrast floor as the blocks above). Status glyphs already
      differ per state; these make the colors carry too. Each -light pair MUST
      re-ink every key its dark twin sets: these blocks follow the paper
-     palettes in source order, so an unset key would leak a phosphor-bright
+     palettes in source order, so an unset key would leak a dark-theme
      ink onto paper. */
   html[data-cvd="deutan"] {
     /* red-green (deuter-/protanopia): success → teal, failure → vermillion,
@@ -335,13 +335,6 @@
   html[data-font="sans"] body { font-family: var(--sans); letter-spacing: 0; font-variant-numeric: tabular-nums; }
   .term, .chip, .sbx-fld .fv, .brand { font-family: var(--mono); }
 
-  /* glow only when CRT effects are enabled */
-  body.fx .glow,
-  body.fx .brand h1,
-  body.fx .st .label,
-  body.fx h2,
-  body.fx .term { text-shadow: 0 0 6px var(--glow); }
-
   ::selection { background: var(--accent); color: var(--bg); }
 
   a { color: var(--accent); }
@@ -353,53 +346,16 @@
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .switch input:focus-visible + .sl { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-  /* ---------- CRT overlay (scanlines + vignette + flicker) ---------- */
-  #crt { position: fixed; inset: 0; pointer-events: none; z-index: 9000; }
-  body.scan #crt::before {
-    content: ""; position: absolute; inset: 0;
-    background: repeating-linear-gradient(
-      to bottom,
-      rgba(0,0,0,0) 0px,
-      rgba(0,0,0,0) 1px,
-      rgba(0,0,0,.16) 1px,
-      rgba(0,0,0,.16) 3px);
-    mix-blend-mode: multiply;
-  }
-  body.fx #crt::after {
-    content: ""; position: absolute; inset: 0;
-    background: radial-gradient(ellipse at center,
-      rgba(0,0,0,0) 55%, rgba(0,0,0,.45) 100%);
-  }
-  /* on paper the dark-strength scanlines/vignette read as grime — cut way down */
-  html[data-theme$="-light"] body.scan #crt::before {
-    background: repeating-linear-gradient(
-      to bottom,
-      rgba(0,0,0,0) 0px,
-      rgba(0,0,0,0) 1px,
-      rgba(0,0,0,.05) 1px,
-      rgba(0,0,0,.05) 3px);
-  }
-  html[data-theme$="-light"] body.fx #crt::after {
-    background: radial-gradient(ellipse at center,
-      rgba(0,0,0,0) 55%, rgba(0,0,0,.12) 100%);
-  }
-  body.fx.flicker #crt { animation: flicker 3.2s infinite steps(60); }
-  @keyframes flicker {
-    0%,100% { opacity: 1; } 97% { opacity: 1; }
-    97.5% { opacity: .82; } 98% { opacity: 1; } 98.5% { opacity: .9; }
-  }
   @media (prefers-reduced-motion: reduce) {
-    body.fx.flicker #crt { animation: none; }
-    .dot.run, .dot.live, .blink, .dst-running .g { animation: none !important; }
+    .dot.run, .dot.live, .blink { animation: none !important; }
     .iconbtn.spin svg { animation: none !important; }
     .toast { animation: none !important; }   /* !important: the base .toast rule is later in the sheet */
   }
   /* app-level Reduce motion (Settings) — body.reduce-motion twins every
      @media (prefers-reduced-motion) rule in this sheet, so either switch
      stops the animation. Keep the pairs in step. */
-  body.reduce-motion.fx.flicker #crt { animation: none; }
   body.reduce-motion .dot.run, body.reduce-motion .dot.live, body.reduce-motion .blink,
-  body.reduce-motion .dst-running .g, body.reduce-motion .iconbtn.spin svg { animation: none !important; }
+  body.reduce-motion .iconbtn.spin svg { animation: none !important; }
   body.reduce-motion .toast { animation: none; }
 
   /* ---------- header ---------- */
@@ -975,7 +931,6 @@
 
   /* ---------- wallboard / TV kiosk ---------- */
   .wallboard { position: fixed; inset: 0; z-index: 8000; background: var(--bg); display: flex; flex-direction: column; }
-  body.fx .wallboard { background: radial-gradient(ellipse at center, var(--bg2) 0%, var(--bg) 82%); }
   .wb-grid { flex: 1; min-height: 0; overflow: auto; padding: 18px; display: grid; gap: 12px;
     grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); grid-auto-rows: minmax(98px, auto); align-content: start; }
   .wb-tile { border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); padding: 12px 14px;
@@ -1023,7 +978,6 @@
   /* SLA overdue badge on a tile: orthogonal to outcome, never recolors the tile */
   .wb-overdue { color: var(--fail); font-weight: 700; font-size: calc(10.5px * var(--wb-u, 1));
     letter-spacing: 1px; text-transform: uppercase; white-space: nowrap; }
-  body.fx .wb-tile.st-fail { box-shadow: 0 0 16px color-mix(in srgb, var(--fail) 30%, transparent); }
   .wb-tile.flip { animation: wbflip .7s ease-out; }
   /* no 100% frame: the flip settles to the tile's own (tinted) background */
   @keyframes wbflip { 0% { background: var(--fail); } }
@@ -1050,7 +1004,6 @@
     border-bottom: 1px solid var(--fail); }
   .wallboard.stale .wb-nosignal { display: flex; }
   .wallboard.stale .wb-grid, .wallboard.stale .wb-foot { opacity: .45; }
-  body.fx .wallboard.stale .wb-nosignal { text-shadow: 0 0 8px color-mix(in srgb, var(--fail) 60%, transparent); }
   /* verdict headline: the dashboard's correlation verdict at TV scale --
      scope + likely cause in one sentence instead of "count the red tiles".
      position/z-index lift it above the #wbAlarm vignette, like .wb-nosignal */
@@ -1062,7 +1015,6 @@
   .wb-verdict.sev-warn .head { color: var(--pending); }
   .wb-verdict.sev-crit { background: color-mix(in srgb, var(--fail) 12%, var(--bg)); border-bottom-color: var(--fail); }
   .wb-verdict.sev-crit .head { color: var(--fail); }
-  body.fx .wb-verdict.sev-crit .head { text-shadow: 0 0 10px color-mix(in srgb, var(--fail) 60%, transparent); }
   /* compact tile mode (fit governor): denser tiles before anything has to be
      cut. Compact rows stretch (1fr) to fill the glass, so the spark is only
      dropped while the rows are actually tight -- wb-roomy (stretched rows
@@ -1182,14 +1134,12 @@
     display: flex; align-items: center; justify-content: center; transition: opacity .25s ease; }
   .boot.done { opacity: 0; }
   .boot-log { margin: 0; width: min(660px, 92vw); font-family: var(--mono); font-size: 13px; line-height: 1.75; color: var(--fg); }
-  body.fx .boot-log { text-shadow: 0 0 6px var(--glow); }
   .boot-banner { font-weight: 700; letter-spacing: 2px; color: var(--accent); }
   .boot-sub { color: var(--fg-faint); text-transform: uppercase; letter-spacing: 1px; font-size: 10.5px; margin-bottom: 14px; }
   .boot-line { white-space: pre-wrap; word-break: break-word; }
   .boot-line .lbl { color: var(--fg-dim); }
   .boot-line .val { color: var(--accent); }
-  /* probe rows: "label ······· result" with a CRISP CSS dotted leader. (A run
-     of middot glyphs smears into a fuzzy oval under the phosphor text glow.) */
+  /* probe rows: "label ······· result" with a crisp CSS dotted leader */
   .boot-probe { display: flex; align-items: baseline; white-space: nowrap; }
   .boot-probe .lbl { flex: 0 0 auto; }
   .boot-probe .lead { flex: 1 1 auto; align-self: center; border-bottom: 1px dotted var(--fg-faint); opacity: .5; margin: 0 10px; }
@@ -1216,7 +1166,6 @@
   }
   .verdict.sev-warn { border-left-color: var(--pending); background: color-mix(in srgb, var(--pending) 7%, var(--panel)); }
   .verdict.sev-crit { border-left-color: var(--fail); background: color-mix(in srgb, var(--fail) 8%, var(--panel)); }
-  body.fx .verdict.sev-crit { box-shadow: 0 0 18px color-mix(in srgb, var(--fail) 22%, transparent); }
   .verdict .vg { font-size: 20px; line-height: 1; flex: none; }
   .verdict.sev-warn .vg { color: var(--pending); }
   .verdict.sev-crit .vg { color: var(--fail); }
@@ -1339,7 +1288,6 @@
   .zen-dot.due { opacity: 1; box-shadow: 0 0 10px 2px var(--glow); animation: zenpulse .9s ease-out; }
   @keyframes zenpulse { 0% { transform: translate(-50%,-50%) scale(2.6); opacity: 1; } 100% { transform: translate(-50%,-50%) scale(1); opacity: 1; } }
   .zen-title { font-size: clamp(20px, 4vw, 40px); font-weight: 700; letter-spacing: 3px; color: var(--ok); text-align: center; }
-  body.fx .zen-title { text-shadow: 0 0 14px color-mix(in srgb, var(--ok) 60%, transparent); }
   .zen-sub { color: var(--fg-dim); font-variant-numeric: tabular-nums; font-size: 15px; text-align: center; }
   .zen-hint { position: absolute; bottom: 16px; color: var(--fg-faint); font-size: 11px; }
   @media (prefers-reduced-motion: reduce) { .zen-dot.due { animation: none; } }
@@ -1355,7 +1303,6 @@
   .wb-incident { position: relative; z-index: 4; display: flex; align-items: center; justify-content: center;
     padding: 6px 18px; border-bottom: 1px solid color-mix(in srgb, var(--fail) 40%, var(--border));
     color: var(--fail); font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; }
-  body.fx .wb-incident { text-shadow: 0 0 8px color-mix(in srgb, var(--fail) 60%, transparent); }
   .wb-incident.ackd { color: var(--pending); }
   /* The alarm breathes on the compositor, not on the main thread. Blur radius
      is a paint property: interpolating it re-rasterizes a Gaussian around
@@ -1416,7 +1363,6 @@
   .dst-upstream_failed{ color: color-mix(in srgb, var(--fail) 60%, var(--fg-faint)); }
   .dst-expanded       { color: var(--fg-faint); }
   .dst-unknown        { color: var(--unknown); }
-  body.fx .dst-running .g { animation: pulse 1.8s infinite; }
 
   /* run-state pill (a DAG run is running | success | failed) */
   .rpill { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; padding: 1px 8px;
@@ -1509,11 +1455,10 @@
 </style>
 </head>
 <body>
-<div id="crt"></div>
 
 <header>
   <div class="brand">
-    <h1 class="glow" id="brandName" title="the cronstable logo, the l is self-balancing double pendulum">cronstab<span class="mark" id="mark">l</span>e</h1><span class="tm" title="cronstable is a trademark of the cronstable authors">™</span>
+    <h1 id="brandName" title="the cronstable logo, the l is self-balancing double pendulum">cronstab<span class="mark" id="mark">l</span>e</h1><span class="tm" title="cronstable is a trademark of the cronstable authors">™</span>
     <span class="ver" id="ver"></span>
     <span class="ver" id="jobset" title=""></span>
   </div>
@@ -1831,21 +1776,21 @@
     <h3>settings</h3>
     <div class="body">
       <div class="setrow">
-        <span class="lab">Theme<small>phosphor (dark) or paper (light)</small></span>
+        <span class="lab">Theme<small>dark or paper (light)</small></span>
         <select class="mini" id="setTheme">
-          <optgroup label="phosphor">
+          <optgroup label="dark">
             <option value="carolina">carolina</option>
             <option value="amber">amber</option>
             <option value="green">green</option>
-            <option value="modern">modern (no CRT)</option>
-            <option value="standard">standard (no CRT)</option>
+            <option value="modern">modern</option>
+            <option value="standard">standard</option>
           </optgroup>
           <optgroup label="paper">
             <option value="carolina-light">carolina</option>
             <option value="amber-light">amber</option>
             <option value="green-light">green</option>
-            <option value="modern-light">modern (no CRT)</option>
-            <option value="standard-light">standard (no CRT)</option>
+            <option value="modern-light">modern</option>
+            <option value="standard-light">standard</option>
           </optgroup>
         </select>
       </div>
@@ -1857,8 +1802,6 @@
           <option value="tritan">blue-yellow friendly</option>
         </select>
       </div>
-      <div class="setrow"><span class="lab">CRT effects<small>glow, vignette, flicker</small></span><label class="switch"><input type="checkbox" id="setFx"><span class="sl"></span></label></div>
-      <div class="setrow"><span class="lab">Scanlines</span><label class="switch"><input type="checkbox" id="setScan"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Compact density<small>tighter rows</small></span><label class="switch"><input type="checkbox" id="setDensity"><span class="sl"></span></label></div>
       <div class="setrow">
         <span class="lab">Interface font<small>terminal monospace, or a proportional sans for easier reading (logs &amp; cron strings stay monospace)</small></span>
@@ -1874,7 +1817,7 @@
           <option value="125">125%</option><option value="140">140%</option>
         </select>
       </div>
-      <div class="setrow"><span class="lab">Reduce motion<small>suppress spinners, pulsing dots &amp; flicker (your OS setting is always honored too)</small></span><label class="switch"><input type="checkbox" id="setMotion"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Reduce motion<small>suppress spinners &amp; pulsing dots (your OS setting is always honored too)</small></span><label class="switch"><input type="checkbox" id="setMotion"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Boot self-test<small>BIOS-style POST screen on load (replays after 12h)</small></span><label class="switch"><input type="checkbox" id="setBoot"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Desktop notifications<small>alert when a job fails</small></span><label class="switch"><input type="checkbox" id="setNotify"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Audible cues<small>tick on ok, buzz on failure, alarm until ack (a)</small></span><label class="switch"><input type="checkbox" id="setSound"><span class="sl"></span></label></div>
@@ -5314,7 +5257,7 @@ var qrcode = function() {
 
   // ---- preferences ----
   const prefs = {
-    theme: "carolina", fx: true, scan: true, density: false, notify: false,
+    theme: "carolina", density: false, notify: false,
     // accessibility: interface font (mono/sans), whole-UI zoom %, app-level
     // reduce-motion (ORed with the OS prefers-reduced-motion setting), and
     // color-vision remap (none/deutan/tritan)
@@ -8479,7 +8422,7 @@ var qrcode = function() {
     return segs;
   }
   // values are --ansi-* custom properties (see the palette CSS) so already-
-  // rendered log lines re-ink live when the theme flips phosphor <-> paper
+  // rendered log lines re-ink live when the theme flips dark <-> paper
   const ANSI_FG = {};
   for (const c of [30, 31, 32, 33, 34, 35, 36, 37, 90, 91, 92, 93, 94, 95, 96, 97]) ANSI_FG[c] = "var(--ansi-" + c + ")";
   function applySgr(style, code) {
@@ -9064,9 +9007,7 @@ var qrcode = function() {
       { ic: "↻", lbl: "Refresh now", hint: "g", run: loadJobs },
       ...(ctl ? [{ ic: "▶", lbl: "Run all failing jobs", run: runAllFailing }] : []),
       { ic: "◐", lbl: "Cycle theme", hint: "t", run: cycleTheme },
-      { ic: "◑", lbl: "Toggle light / dark", sub: "phosphor ↔ paper", hint: "T", run: toggleLightDark },
-      { ic: "▤", lbl: "Toggle CRT effects", run: () => setFx(!prefs.fx) },
-      { ic: "≡", lbl: "Toggle scanlines", run: () => setScan(!prefs.scan) },
+      { ic: "◑", lbl: "Toggle light / dark", sub: "dark ↔ paper", hint: "T", run: toggleLightDark },
       { ic: "⊟", lbl: "Toggle compact density", run: () => setDensity(!prefs.density) },
       { ic: "A", lbl: "Toggle readable font", sub: "proportional sans-serif UI", run: () => setFont(fontPref() === "sans" ? "mono" : "sans") },
       { ic: "⤢", lbl: "Cycle UI scale", sub: "100 → 110 → 125 → 140%", run: cycleScale },
@@ -9174,9 +9115,8 @@ var qrcode = function() {
   // ===================================================================
   //  settings / theme / prefs application
   // ===================================================================
-  // every theme is a hue x variant pair: "green" (phosphor) / "green-light" (paper)
+  // every theme is a hue x variant pair: "green" (dark) / "green-light" (paper)
   const THEME_HUES = ["carolina", "amber", "green", "modern", "standard"];
-  const FLAT_HUES = ["modern", "standard"];   // no CRT physics on these
   function themeParts(t) {
     const light = /-light$/.test(t);
     const hue = light ? t.slice(0, -6) : t;
@@ -9186,11 +9126,6 @@ var qrcode = function() {
   function applyTheme() {
     const p = themeParts(prefs.theme);
     document.documentElement.setAttribute("data-theme", p.hue + (p.light ? "-light" : ""));
-    // CRT effects are meaningless on the flat themes (modern, standard)
-    const fxAllowed = !FLAT_HUES.includes(p.hue);
-    document.body.classList.toggle("fx", prefs.fx && fxAllowed);
-    document.body.classList.toggle("flicker", prefs.fx && fxAllowed);
-    document.body.classList.toggle("scan", prefs.scan && fxAllowed);
   }
   function setTheme(v) { prefs.theme = v; savePref("theme"); applyTheme(); syncSettings(); }
   function cycleTheme() {
@@ -9204,8 +9139,6 @@ var qrcode = function() {
     setTheme(p.light ? p.hue : p.hue + "-light");
     toast("info", "theme: " + prefs.theme);
   }
-  function setFx(v) { prefs.fx = v; savePref("fx"); applyTheme(); syncSettings(); }
-  function setScan(v) { prefs.scan = v; savePref("scan"); applyTheme(); syncSettings(); }
   function setDensity(v) { prefs.density = v; savePref("density"); document.body.classList.toggle("density-compact", v); syncSettings(); }
 
   // ---- accessibility: interface font / UI scale / reduce motion / color vision ----
@@ -9268,8 +9201,6 @@ var qrcode = function() {
   // standalone because the command palette and hotkeys call them directly.
   const PREFS = [
     ["setTheme", () => prefs.theme, (e) => setTheme(e.target.value)],
-    ["setFx", () => prefs.fx, (e) => setFx(e.target.checked)],
-    ["setScan", () => prefs.scan, (e) => setScan(e.target.checked)],
     ["setDensity", () => prefs.density, (e) => setDensity(e.target.checked)],
     ["setFont", fontPref, (e) => setFont(e.target.value)],
     ["setScale", () => String(scalePref()), (e) => setScale(parseInt(e.target.value, 10))],
@@ -9292,11 +9223,6 @@ var qrcode = function() {
       else control.value = read();
     }
     refreshLedgerStat();
-    // CRT effects / scanlines do nothing on the flat themes (modern, standard)
-    // — disable those toggles there so they aren't inoperative-yet-interactive.
-    const crt = !FLAT_HUES.includes(themeParts(prefs.theme).hue);
-    $("setFx").disabled = !crt;
-    $("setScan").disabled = !crt;
   }
   function openSettings() { if (!openOverlay("settingsWrap")) return; syncSettings(); focusFirst($("settingsWrap")); }
   function closeSettings() { closeOverlay("settingsWrap"); }

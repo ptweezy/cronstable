@@ -9,7 +9,7 @@
 <style>
   /* ============================================================= *
    *  cronstable // feature comparison                             *
-   *  Same phosphor-CRT design language as the live dashboard.     *
+   *  Same design language as the live dashboard.                  *
    *  Theme palette (surfaces + status inks): docs/palette.css.    *
    * ============================================================= */
 
@@ -21,7 +21,7 @@
             Arial, "Noto Sans", sans-serif;
     --radius:3px;
     --maxw:1200px;
-    /* marketing accents mapped onto the phosphor palette */
+    /* marketing accents mapped onto the theme palette */
     --yes:var(--ok);
     --partial:var(--pending);
     --gold:var(--pending);
@@ -41,28 +41,6 @@
   :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--radius)}
   /* prose runs in the interface sans, like the dashboard's reader mode */
   .lede,.sec-head p,.mcp-top p,.quad li,.tk p,footer p,.cta-note{font-family:var(--sans);letter-spacing:0}
-
-  /* ---------- CRT overlay ---------- */
-  #crt{position:fixed;inset:0;pointer-events:none;z-index:9000}
-  body.scan #crt::before{
-    content:"";position:absolute;inset:0;mix-blend-mode:multiply;
-    background:repeating-linear-gradient(to bottom,
-      rgba(0,0,0,0) 0,rgba(0,0,0,0) 1px,rgba(0,0,0,.16) 1px,rgba(0,0,0,.16) 3px);
-  }
-  body.fx #crt::after{
-    content:"";position:absolute;inset:0;
-    background:radial-gradient(ellipse at center,rgba(0,0,0,0) 55%,rgba(0,0,0,.42) 100%);
-  }
-  body.fx.flicker #crt{animation:flicker 3.2s infinite steps(60)}
-  @keyframes flicker{0%,97%,100%{opacity:1}97.5%{opacity:.85}98%{opacity:1}98.5%{opacity:.92}}
-  html[data-theme$="-light"] body.scan #crt::before{
-    background:repeating-linear-gradient(to bottom,
-      rgba(0,0,0,0) 0,rgba(0,0,0,0) 1px,rgba(0,0,0,.05) 1px,rgba(0,0,0,.05) 3px);
-  }
-  html[data-theme$="-light"] body.fx #crt::after{
-    background:radial-gradient(ellipse at center,rgba(0,0,0,0) 55%,rgba(0,0,0,.12) 100%);
-  }
-  body.fx .glow,body.fx h1,body.fx h2,body.fx .mark,body.fx .snip{text-shadow:0 0 6px var(--glow)}
 
   /* ---------- product top bar (mirrors the dashboard chrome) ---------- */
   .topbar{
@@ -334,13 +312,11 @@
   @media(max-width:560px){.mcp-grid{grid-template-columns:1fr}.pillars{grid-template-columns:1fr}.spectrum{grid-template-columns:1fr}}
   @media(prefers-reduced-motion:reduce){
     .dot.live{animation:none}
-    body.fx.flicker #crt{animation:none}
     *{scroll-behavior:auto}
   }
 </style>
 </head>
-<body class="fx scan">
-<div id="crt"></div>
+<body>
 <header class="topbar">
   <span class="brand"><b>cronstab<span class="mark" id="tbMark">l</span>e</b> <span class="slash">//</span> feature comparison</span>
   <span class="pill tb-hide"><span class="dot ok"></span>v1.2.8</span>
@@ -934,7 +910,7 @@
       <div class="ph"><span class="pi" aria-hidden="true">
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="1.4"></rect><path d="M8 20h8M12 16v4"></path></svg>
       </span>Live console</div>
-      <p>A web dashboard that <b>tails logs</b>, <b>runs and cancels</b> jobs on demand, and walks any DAG's task graph, with 10 phosphor themes. Backed by an <b>HTTP REST API</b> and native <b>Prometheus + statsd</b>.</p>
+      <p>A web dashboard that <b>tails logs</b>, <b>runs and cancels</b> jobs on demand, and walks any DAG's task graph, with 10 themes. Backed by an <b>HTTP REST API</b> and native <b>Prometheus + statsd</b>.</p>
       <div class="tags"><span>live tail</span><span>run/cancel</span><span>REST API</span><span>Prometheus</span><span>10 themes</span></div>
     </div>
 
