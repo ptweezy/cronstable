@@ -252,7 +252,7 @@ def test_msi_smoke_steps_share_the_msiexec_helpers():
         ("binaries-windows", "Smoke-test MSI (install, verify, uninstall)"),
         (
             "binaries-windows",
-            "Smoke-test MSI upgrade (remembered properties, restart)",
+            "Smoke-test MSI upgrade (remembered properties, restart, reload)",
         ),
         ("sign-windows", "Smoke-test the signed amd64 MSI (install, uninstall)"),
     ]:

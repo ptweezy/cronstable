@@ -614,7 +614,7 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 | `c` | Copy the selected job's command |
 | `g` | Refresh now |
 | `t` | Cycle the theme |
-| `T` | Flip light / dark (phosphor ↔ paper) |
+| `T` | Flip light / dark (dark ↔ paper) |
 | `i` | Open the [incident timeline](#incident-tools-verdict-bar-timeline-and-mitigate-console) |
 | `w` | Toggle the [wallboard / TV mode](#wallboard--tv-mode) |
 | `a` | Acknowledge the [failure alarm](#settings-themes-and-notifications) |
@@ -623,17 +623,16 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 
 ## Settings, themes, and notifications
 
-[![The settings panel: theme, CRT effects, scanlines, compact density, desktop notifications, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)
+[![The settings panel: theme, compact density, desktop notifications, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)
 
 The settings panel (and the command palette) expose:
 
-- **Ten themes**: **carolina** (the default, a Carolina-blue CRT phosphor), amber and green **phosphor CRT**, plus flat **modern** and **standard** looks, each in a dark (phosphor) and a light (paper) variant — the light ones trade the glass-black glow for dark ink on tinted paper, and **standard** is the plain white-and-saturated-color look. Cycle hues with `t`; flip light/dark with `T`.
-- A **color vision** mode that remaps the status, cluster-peer, and log-ANSI colors for **red-green** (deuteranopia/protanopia) or **blue-yellow** (tritanopia) color blindness, on both the phosphor and paper palettes. The remapped pairs were chosen with a dichromacy simulation so every meaningful pair (ok/fail, fail/pending, agreed/drifted, …) stays clearly apart, and every status glyph differs by shape as well, in every mode.
-- **CRT effects** (phosphor glow, vignette, and a subtle flicker) and **scanlines**, each toggleable. They apply only to the CRT themes (much softer on the paper variants) and automatically respect `prefers-reduced-motion`.
+- **Ten themes**: **carolina** (the default, Carolina blue), **amber** and **green**, plus flat **modern** and **standard** looks, each in a dark and a light (paper) variant — the light ones are dark ink on tinted paper, and **standard** is the plain white-and-saturated-color look. Cycle hues with `t`; flip light/dark with `T`.
+- A **color vision** mode that remaps the status, cluster-peer, and log-ANSI colors for **red-green** (deuteranopia/protanopia) or **blue-yellow** (tritanopia) color blindness, on both the dark and paper palettes. The remapped pairs were chosen with a dichromacy simulation so every meaningful pair (ok/fail, fail/pending, agreed/drifted, …) stays clearly apart, and every status glyph differs by shape as well, in every mode.
 - **Compact density** for tighter rows.
 - An **interface font** choice: the terminal monospace (default) or a proportional sans-serif that is easier on the eyes for long reading. Log output, cron expressions, and keycaps stay monospace either way, and numerals stay tabular so the clocks don't jitter.
 - A **UI scale** of 100% / 110% / 125% / 140% that enlarges the whole dashboard — handy for wallboard TVs viewed from across the room, too.
-- A **reduce motion** switch that stops the spinners, pulsing status dots, flicker, and the boot self-test without touching your OS preference (`prefers-reduced-motion` is always honored regardless).
+- A **reduce motion** switch that stops the spinners, pulsing status dots, and the boot self-test without touching your OS preference (`prefers-reduced-motion` is always honored regardless).
 - The **boot self-test**: a BIOS-style POST screen on load that probes the daemon, job set, cluster, and schedules for real while it types. It replays only after a 12-hour cooldown, any key dismisses it, and re-enabling the toggle clears the cooldown so the next load shows it.
 - **Desktop notifications** that fire when a job fails (after you grant the browser permission).
 - **Audible cues**: a short tick when a run succeeds and a buzz when one fails, at a selectable **cue volume** of 25% / 50% / 75% / 100%. A failure also arms a repeating **failure alarm** that sounds until acknowledged with `a` (which works on the wallboard too); the all-clear, or a fresh failure, re-arms it.
@@ -659,9 +658,9 @@ token in one scan. The panel checks the stored token against
 give a phone a scoped `web.authTokens` entry instead. See
 [Push Notifications](Push-Notifications) for the pairing flow this feeds.
 
-| Amber phosphor CRT | Green phosphor CRT |
+| Amber | Green |
 | :---: | :---: |
-| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) |
+| [![The dashboard in the amber theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) |
 
 | Flat modern theme | Carolina, on paper (light) |
 | :---: | :---: |
@@ -683,6 +682,47 @@ over to watch a full recovery (on a touch screen, a tap nudges it). Under
 reduced motion the mark parks in a still pose that stays honest about daemon
 state — upright when live, hanging when not — and without JavaScript the
 letter is simply printed.
+
+## Tab title and favicon
+
+The browser tab is the dashboard's smallest display, and the one that stays
+visible after you switch away. The title leads with the worst current
+condition, so even a truncated tab reads at a glance:
+
+| Condition | Title |
+| :-- | :-- |
+| Connection lost | `no signal · cronstable` |
+| Cluster degraded | `cluster alert · cronstable` |
+| One job failing | `backup-db failing · cronstable` |
+| Several jobs failing | `3 jobs failing · cronstable`, then each failing job by name |
+| One job running | `backup-db running · 42s · cronstable` |
+| Several jobs running | `3 running · cronstable`, then each run with its elapsed time |
+| All quiet | `14 ok · cronstable`, then `next: backup-db in 12m · cronstable` |
+
+When a state has more to say than one tab-width line, the title rotates
+complete readouts every four seconds rather than scrolling characters. A
+fleet event cycles the failing count and then every failing job by name;
+several runs page through each job with its elapsed time; a cluster alert
+adds its reason; the quiet state alternates the healthy count with the
+next fire. Each frame is a whole line, so a backgrounded tab, which
+advances only as the slow poll refreshes it, always shows one true readout
+instead of a fragment of scrolled text.
+
+The readouts are plain words with middle-dot separators, and elapsed times
+tick each second while the tab is visible. On a
+[cluster](Clustering-and-Leader-Election) node the trailing brand is the
+node's own name, so with a tab open per node you can tell which is which.
+
+The favicon is the cronstable mark: the pendulum standing on its cart,
+inlined into the page as a data URI so the dashboard stays a single
+self-contained file. It holds steady whatever the fleet is doing, so a
+pinned tab reads as the app rather than as an alarm.
+
+A hidden tab keeps polling at a slow 30-second cadence rather than stopping,
+so the title, [desktop notifications](#settings-themes-and-notifications),
+the audible alarm, and the [run ledger](#run-ledger) stay current while you
+work elsewhere. The foreground refresh interval resumes the moment the tab
+returns.
 
 ## Authentication
 

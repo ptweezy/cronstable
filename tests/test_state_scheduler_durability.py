@@ -17,6 +17,7 @@ ordering/completion -- never durations (Windows CI has coarse timers).
 import asyncio
 import datetime
 import json
+import os
 
 import pytest
 from aiohttp import web
@@ -26,7 +27,7 @@ from cronstable.cron import Cron, PauseInfo
 from cronstable.fingerprint import job_digest
 from cronstable.job import JobRetryState
 from cronstable.prometheus import PrometheusMetrics
-from tests._helpers import _newest
+from tests._helpers import _newest, _seed_orphan_open
 from tests.test_state import (
     _count_launcher,
     _drain_state_writes,
@@ -1076,6 +1077,92 @@ async def test_reboot_marker_recorded_before_launch(tmp_path, monkeypatch):
         assert events == ["record", "launch"]
     finally:
         cron.state_backend = None
+
+
+async def test_reboot_gate_skips_when_previous_run_still_alive(
+    monkeypatch, stateful_cron
+):
+    # the scenario this guards: a daemon killed without a drain leaves its
+    # @reboot run alive, and the respawned daemon's marker cannot prove
+    # this boot (no boot identity, as monkeypatched here). On the marker's
+    # word alone the gate would launch a second copy beside the survivor.
+    # The reconciliation's finding feeds the boot gate instead: a boot run
+    # that is literally still running stays this boot's only copy,
+    # whatever the marker says.
+    monkeypatch.setattr(platform_mod, "os_boot_id", lambda: None)
+    monkeypatch.setattr(platform_mod, "os_boot_time", lambda: None)
+    cron = await stateful_cron(_REBOOT_JOB)
+    await _seed_orphan_open(
+        cron, "r", pid=os.getpid(), started_at=_now_utc().isoformat()
+    )
+    await cron._reconcile_inflight()
+    pid, _started = cron._boot_survivors["r"]
+    assert pid == os.getpid()
+    calls, fake = _count_launcher()
+    cron.maybe_launch_job = fake  # type: ignore[method-assign]
+    await cron._spawn_reboot_jobs()
+    assert calls == []
+    # the skip left the marker stream empty: once the survivor is gone,
+    # the marker alone decides (erring at-least-once, the documented
+    # degrade)
+    assert await _newest(cron, "reboot/r") is None
+
+
+async def test_reboot_gate_launches_when_the_survivor_died(
+    monkeypatch, stateful_cron
+):
+    # liveness is re-checked at the gate: a survivor that exited between
+    # reconciliation and the gate releases the gate, and the marker dedupe
+    # decides exactly as it would on a clean start (marker absent here ->
+    # the boot run happens, and the marker is written as usual).
+    monkeypatch.setattr(platform_mod, "os_boot_id", lambda: "boot-A")
+    cron = await stateful_cron(_REBOOT_JOB)
+    cron._boot_survivors["r"] = (2**22 + 12345, None)  # long gone
+    calls, fake = _count_launcher()
+    cron.maybe_launch_job = fake  # type: ignore[method-assign]
+    await cron._spawn_reboot_jobs()
+    assert calls == ["r"]
+    assert "r" not in cron._boot_survivors
+    rec = await _newest(cron, "reboot/r")
+    assert rec is not None
+    assert rec["bootId"] == "boot-A"
+
+
+async def test_reconcile_closes_record_whose_pid_was_recycled(stateful_cron):
+    # a live pid alone is not a survivor: the process behind it must
+    # predate the record. Here the record claims a run from years back
+    # while the pid (this test process) started long after -- a recycled
+    # pid, the cross-boot power-loss shape. The reconciliation closes the
+    # record as a crash and records no survivor, so the marker dedupe
+    # decides normally.
+    cron = await stateful_cron(_REBOOT_JOB)
+    await _seed_orphan_open(
+        cron, "r", pid=os.getpid(), started_at="2020-01-01T00:00:00+00:00"
+    )
+    await cron._reconcile_inflight()
+    assert cron._boot_survivors == {}
+    await asyncio.gather(*list(cron._pending_state_writes))
+    rec = await _newest(cron, cron._inflight_stream("r"))
+    assert rec is not None
+    assert rec["kind"] == "closed"
+
+
+async def test_recycled_pid_at_the_gate_releases_the_survivor(
+    monkeypatch, stateful_cron
+):
+    # identity, not bare existence, is re-checked at consult time: a
+    # survivor whose pid now carries a different process start time (the
+    # OS recycled it -- a pause can lift days later) releases the gate,
+    # and the marker dedupe decides as on a clean start.
+    monkeypatch.setattr(platform_mod, "os_boot_id", lambda: "boot-A")
+    cron = await stateful_cron(_REBOOT_JOB)
+    # a live pid recorded with a deliberately wrong start time = recycled
+    cron._boot_survivors["r"] = (os.getpid(), 12345.0)
+    calls, fake = _count_launcher()
+    cron.maybe_launch_job = fake  # type: ignore[method-assign]
+    await cron._spawn_reboot_jobs()
+    assert calls == ["r"]
+    assert "r" not in cron._boot_survivors
 
 
 async def test_paused_reboot_defers_its_boot_run_across_a_restart(
