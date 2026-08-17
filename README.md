@@ -507,18 +507,18 @@ counters, artifacts, and quarantine.
 
 ### Themes, Readability, and Accessibility
 
-**Ten themes**: **carolina** (the default, a Carolina-blue CRT phosphor),
-amber and green phosphor, and flat **modern** and **standard** looks, each in
-a dark (phosphor) and a light (paper) variant. Cycle hues with `t`, flip
+**Ten themes**: **carolina** (the default, Carolina blue),
+**amber** and **green**, and flat **modern** and **standard** looks, each in
+a dark and a light (paper) variant. Cycle hues with `t`, flip
 light/dark with `T`:
 
-[![The same cronstable board cycling through all ten themes (carolina, amber, green, modern and standard, each in a dark phosphor and a light paper variant) and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)
+[![The same cronstable board cycling through all ten themes (carolina, amber, green, modern and standard, each in a dark and a light paper variant) and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)
 
 *(One board, ten themes, two interface fonts, animated: [WebP](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp), [GIF](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.gif). The four stills below are pulled from it.)*
 
-| Amber phosphor CRT | Green phosphor CRT |
+| Amber | Green |
 | :---: | :---: |
-| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) |
+| [![The dashboard in the amber theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) |
 
 | Flat modern theme | Carolina, on paper (light) |
 | :---: | :---: |
@@ -526,7 +526,7 @@ light/dark with `T`:
 
 Beyond the themes: an optional proportional-sans interface font (shown per
 theme in the animation above), UI scaling, deuteranopia- and tritanopia-safe
-palettes, reduced-motion support, CRT-effect and notification toggles, all
+palettes, reduced-motion support, and notification toggles, all
 remembered per browser, with status always carried by glyphs and text, not
 colour or animation alone. There is also an optional (on by default, once per
 12 hours) BIOS-style boot self-test that checks the daemon, job set, cluster,
@@ -534,7 +534,7 @@ and schedules for real while it types:
 
 | Settings | Startup self-test |
 | :---: | :---: |
-| [![The settings panel: theme picker with carolina selected, CRT toggles, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png) |
+| [![The settings panel: theme picker with carolina selected, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png) |
 
 The `l` in the header's "cronstable" is a live cart-and-double-pendulum
 simulation. I like to call him double-P, Peter Parker, or PP.
@@ -599,12 +599,12 @@ So are the wallboard, the heatmap, and the state inspector:
 | [![The wallboard: worst-first tiles with failure ages and exit codes, run sparklines, and the tally foot](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-wallboard.png) | [![The activity heatmap: one row per job, one cell per hour, worst outcome colored and shaded by volume](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-heatmap.png) | [![The state inspector: store inventory, record streams, and document namespaces from the durable state store](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-state.png) |
 
 The same ten themes as the browser (`t` cycles the hue, `T` flips
-phosphor ↔ paper), with the same colour-vision-safe remaps and an
+dark ↔ paper), with the same colour-vision-safe remaps and an
 `--ascii` glyph mode:
 
-| Amber phosphor | Green phosphor |
+| Amber | Green |
 | :---: | :---: |
-| [![The TUI in the amber phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png) | [![The TUI in the green phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png) |
+| [![The TUI in the amber theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png) | [![The TUI in the green theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png) |
 
 | Flat modern | Carolina, on paper (light) |
 | :---: | :---: |

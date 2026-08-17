@@ -721,7 +721,7 @@ def compute_view(
 # ===================================================================
 #  themes: the web dashboard's ten looks, re-inked in ANSI
 # ===================================================================
-#: hue -> (dark aka phosphor, light aka paper) palettes.  Each palette is
+#: hue -> (dark, light aka paper) palettes.  Each palette is
 #: a flat name->#rrggbb map; the painter turns them into SGR sequences.
 #: Same five hues and the same t / T cycling as the web page; the hue list
 #: itself lives in cronstable._cliargs (the --theme choices are built from
@@ -729,7 +729,7 @@ def compute_view(
 THEME_HUES = _cliargs.THEME_HUES
 
 _P = {
-    # carolina: the default Carolina-blue CRT phosphor
+    # carolina: the default Carolina Blue
     "carolina": {
         "bg": "#06131d",
         "fg": "#9ed3f5",
@@ -760,7 +760,7 @@ _P = {
         "warn": "#a05e00",
         "off": "#8aa0b1",
     },
-    # amber phosphor CRT
+    # amber
     "amber": {
         "bg": "#160d02",
         "fg": "#f5c169",
@@ -791,7 +791,7 @@ _P = {
         "warn": "#a05e00",
         "off": "#a8956a",
     },
-    # green phosphor CRT
+    # green
     "green": {
         "bg": "#03130a",
         "fg": "#7ee2a1",
@@ -822,7 +822,7 @@ _P = {
         "warn": "#a05e00",
         "off": "#7fa38c",
     },
-    # flat modern (no CRT physics on the web; plain here too)
+    # flat modern
     "modern": {
         "bg": "#101418",
         "fg": "#d7dde3",
@@ -1303,7 +1303,7 @@ def colour_runs(cells: list[tuple[str, str]]) -> list[tuple[str, str]]:
 #: Defaults mirror the web page's prefs where they translate to a tty.
 PREF_DEFAULTS: dict[str, Any] = {
     "theme": "carolina",  # hue
-    "light": False,  # phosphor (dark) vs paper (light)
+    "light": False,  # dark vs paper (light)
     "cvd": "none",  # colour-vision remap
     "poll_ms": DEFAULT_POLL_MS,
     "wrap": False,  # log line wrap
@@ -3509,7 +3509,7 @@ class AppActions(App):
         self.save_prefs()
         self._retheme()
         self.toast(
-            "info", "◑ %s" % ("paper" if self.prefs["light"] else "phosphor")
+            "info", "◑ %s" % ("paper" if self.prefs["light"] else "dark")
         )
 
     def cycle_cvd(self) -> None:
@@ -3822,7 +3822,7 @@ class AppPalette(AppActions):
     def palette_commands(self) -> list[tuple[str, str, Callable[[], Any]]]:
         """(icon, label, action) rows: the page's three command pools.
 
-        Web-only rows (CRT effects, desktop notifications, UI scale, run
+        Web-only rows (desktop notifications, UI scale, run
         ledger, columns) have no terminal analogue and are omitted; the
         panel toggles reach the TUI's overlay screens instead of inline
         cards, which is the same action under the same name.
@@ -5569,7 +5569,7 @@ class AppOverlays(AppRender):
             ("Theme", "%s" % self.theme.name, self.cycle_theme),
             (
                 "Light / dark",
-                "paper" if prefs["light"] else "phosphor",
+                "paper" if prefs["light"] else "dark",
                 self.toggle_light_dark,
             ),
             ("Color vision", str(prefs["cvd"]), self.cycle_cvd),

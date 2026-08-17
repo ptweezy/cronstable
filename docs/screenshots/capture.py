@@ -9,7 +9,6 @@ order and output paths are unchanged):
   tui        terminal-dashboard stills off the same fleet
   showcase   still frames for the animated reel + theme row (same fleet)
   logo       the pendulum-logo loops (needs no daemon)
-  social     the GitHub social-preview card (needs no daemon)
   logs       the single-job live-log-tail closeup (logs-demo daemon)
 
 dashboard, tui and showcase accept shot/scene names after the target to
@@ -1216,9 +1215,8 @@ manifest = {}   # scene -> [theme, ...] actually captured
 
 def set_theme_live(page, theme):
     """Flip the palette on the *current* frame, no reload. Drives the app's own
-    settings <select id=setTheme> so the real applyTheme() runs -- prefs persist
-    and the CRT fx/scanline classes toggle correctly (the flat modern/standard
-    themes drop them). Falls back to setting the attribute by hand."""
+    settings <select id=setTheme> so the real applyTheme() runs and prefs
+    persist. Falls back to setting the attribute by hand."""
     ok = page.evaluate(
         """(t) => {
           const s = document.querySelector('#setTheme');
@@ -1230,15 +1228,9 @@ def set_theme_live(page, theme):
         theme,
     )
     if not ok:
-        flat = theme in ("modern", "standard", "modern-light", "standard-light")
         page.evaluate(
-            """([t, flat]) => {
-              document.documentElement.setAttribute('data-theme', t);
-              document.body.classList.toggle('fx', !flat);
-              document.body.classList.toggle('flicker', !flat);
-              document.body.classList.toggle('scan', !flat);
-            }""",
-            [theme, flat],
+            "(t) => { document.documentElement.setAttribute('data-theme', t); }",
+            theme,
         )
     page.wait_for_timeout(450)
 
@@ -1998,7 +1990,7 @@ def new_page(browser, theme):
         viewport={"width": 900, "height": 260},
         device_scale_factor=SCALE,
         bypass_csp=True,
-        reduced_motion="no-preference",  # keep the CRT glow classes on
+        reduced_motion="no-preference",  # keep the logo animating (reduced motion parks it)
     )
     ctx.add_init_script(
         "try{localStorage.setItem('cronstable.boot','false');"
@@ -2010,13 +2002,11 @@ def new_page(browser, theme):
     page.goto(f"http://127.0.0.1:{LOGO_PORT}/index.html")
     page.wait_for_selector("#mark svg")
     page.evaluate("document.fonts.ready")  # settle glyph/wordmark metrics
-    # pin the CRT flicker (a 100 ms opacity dip every 3.2 s) at its 97%-of-the-
-    # time state so frozen stretches and re-runs are deterministic. The header's
-    # bottom border would cross the frame as a stray horizontal line (the clip
-    # pads below the mark's swing box, past the header's edge), so it is dropped
-    # and the header's own background is extended down over the padding band.
+    # The header's bottom border would cross the frame as a stray horizontal
+    # line (the clip pads below the mark's swing box, past the header's edge),
+    # so it is dropped and the header's own background is extended down over
+    # the padding band.
     page.add_style_tag(content=
-        "#crt { animation: none !important; }"
         "header { border-bottom: none !important;"
         f" padding-bottom: {2 * PAD}px !important; }}")
     return ctx, page
@@ -2213,9 +2203,7 @@ def run_logo():
     simply EXTENDS the previous frame's on-screen duration while the physics
     steps on underneath (batched, render-free) until the next hop. A quiet
     stretch therefore costs zero frames and zero bytes, which is how a 3-minute
-    loop stays the size of the old 40-second one. (The page's CRT flicker, a
-    100 ms opacity dip every 3.2 s, is pinned off during capture so the frozen
-    stretches are honest; opacity 1 is that animation's state 97% of the time.)
+    loop stays the size of the old 40-second one.
 
     The pendulum is chaotic, so the choreography is SEED-SEARCHED: each
     candidate seed gets its own poke schedule (same generator, seeded by the
@@ -2252,67 +2240,6 @@ def run_logo():
             capture(browser, base, theme, stops, seed)
         browser.close()
     srv.shutdown()
-
-
-# ===================================================================
-#  target: social (the GitHub social-preview card)
-# ===================================================================
-SOCIAL_PORT = 8125
-
-
-def engine_js():
-    """Lift the logo-engine <script> block out of the dashboard page, so the
-    card always wears the real mark (never a drifting copy)."""
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    i = html.index("logo engine — a real self-balancing")
-    start = html.rindex("<script>", 0, i) + len("<script>")
-    return html[start:html.index("</script>", i)]
-
-
-def run_social():
-    """Render social-card.html to the 1280x640 GitHub social-preview PNG.
-
-    Needs no daemon: the card is a static page styled after the dashboard's
-    carolina theme, with docs/img/dashboard-overview.png inset for the product
-    shot (regenerate that first if the UI changed). The PNG lands in shots/;
-    GitHub wants it uploaded by hand under Settings -> General -> Social
-    preview (there is no API for it), and the upload limit is 1 MB.
-
-    Needs playwright (+ its Chromium) and Pillow.
-    """
-    from PIL import Image
-    from playwright.sync_api import sync_playwright
-
-    handler = partial(Quiet, directory=str(ROOT))
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", SOCIAL_PORT), handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(viewport={"width": 1280, "height": 640})
-        page.goto(
-            f"http://127.0.0.1:{SOCIAL_PORT}/docs/screenshots/social-card.html"
-        )
-        page.evaluate("document.fonts.ready")
-        page.wait_for_function(
-            "const i = document.querySelector('.shot');"
-            "i.complete && i.naturalWidth > 0"
-        )
-        # mount the pendulum as the wordmark's l, parked balanced-upright
-        # (reducedMotion -> the engine's honest still pose for a live daemon)
-        page.add_script_tag(content=engine_js())
-        page.evaluate(
-            "CronstableLogo.mountGlyph(document.getElementById('mark'),"
-            " { connected: () => true, reducedMotion: () => true })"
-        )
-        png = page.screenshot()
-        browser.close()
-    srv.shutdown()
-    SHOTS.mkdir(exist_ok=True)
-    img = Image.open(BytesIO(png))
-    img.save(SHOTS / "social-preview.png", optimize=True)
-    kb = (SHOTS / "social-preview.png").stat().st_size // 1024
-    print(f"[shot] social-preview.png {img.size[0]}x{img.size[1]}, {kb} KB"
-          + (" (over GitHub's 1 MB upload limit!)" if kb > 1024 else ""))
 
 
 # ===================================================================
@@ -2403,8 +2330,6 @@ def main(argv=None):
     add("showcase", run_showcase,
         "still frames for the animated reel + theme row", "scenes")
     add("logo", run_logo, "the pendulum-logo loops (needs no daemon)")
-    add("social", run_social,
-        "the GitHub social-preview card (needs no daemon)")
     add("logs", run_logs, "the log-tail closeup off the logs-demo daemon")
 
     args = top.parse_args(argv)
@@ -2416,8 +2341,6 @@ def main(argv=None):
         run_showcase(args.scenes)
     elif args.target == "logo":
         run_logo()
-    elif args.target == "social":
-        run_social()
     else:
         run_logs()
 
