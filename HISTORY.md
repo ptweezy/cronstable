@@ -1,5 +1,35 @@
 # History
 
+## 1.2.43
+
+- The state-backed `@reboot` once-per-boot dedupe now works on macOS and
+  the BSDs: with no `/proc` to read, the boot instant comes from the
+  kernel's own `kern.boottime` record (via psutil, already a core
+  dependency). Previously the daemon lacked any boot identity on those
+  platforms, so every daemon restart re-ran `@reboot` one-shots.
+- A starting daemon that finds the previous daemon's run of an `@reboot`
+  job still running on this host now treats that surviving run as this
+  boot's run and skips the duplicate launch, whatever the boot marker
+  says: the boot gate and the deferred cluster launch paths both consult
+  the in-flight reconciliation's finding. The remembered pid is pinned to
+  its process start time, so a pid the OS recycled never counts as the
+  survivor -- and reconciliation closes an open record whose live pid
+  provably belongs to a younger process (the record of a run cut short by
+  power loss, whose pid an unrelated process holds after the reboot).
+- In-place rewrites of `web.authToken`/`authTokens` `fromFile` secret
+  files now take effect without a restart: the token sources are
+  fingerprinted like TLS certificates, so the next housekeeping pass (or
+  a `SIGHUP`) rebuilds the web app against the rotated secret, while a
+  half-written rotation (an emptied file) keeps the running listener up
+  and retries.
+- `SIGHUP` requests an immediate config reload, and forces a reparse even
+  when file stats are unchanged (a `fromFile` credential rewritten in
+  place, a coarse-mtime filesystem); the request survives a failed parse
+  and keeps retrying until one succeeds. Previously the signal fell
+  through to its default action: it killed the daemon outright and the
+  shutdown drain never ran, even though the wiki told operators to reload
+  with `SIGHUP`/`cronstable reload`.
+
 ## 1.2.42
 
 - The dashboard's "Pair a device" QR encodes a deep link: a phone-camera
