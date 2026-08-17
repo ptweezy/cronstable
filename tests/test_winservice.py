@@ -21,16 +21,21 @@ from cronstable import platform, winservice
 from cronstable.winservice import (
     ERROR_ACCESS_DENIED,
     ERROR_FAILED_SERVICE_CONTROLLER_CONNECT,
+    ERROR_INVALID_SERVICE_CONTROL,
+    ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
     ERROR_SERVICE_MARKED_FOR_DELETE,
     ERROR_SERVICE_SPECIFIC_ERROR,
+    SERVICE_ACCEPT_PARAMCHANGE,
     SERVICE_ACCEPT_PRESHUTDOWN,
     SERVICE_ACCEPT_SHUTDOWN,
     SERVICE_ACCEPT_STOP,
     SERVICE_AUTO_START,
     SERVICE_CONTROL_INTERROGATE,
+    SERVICE_CONTROL_PARAMCHANGE,
     SERVICE_CONTROL_PRESHUTDOWN,
     SERVICE_CONTROL_SHUTDOWN,
     SERVICE_CONTROL_STOP,
+    SERVICE_PAUSE_CONTINUE,
     SERVICE_DEMAND_START,
     SERVICE_RUNNING,
     SERVICE_START_PENDING,
@@ -155,6 +160,7 @@ def test_image_path_quotes_a_path_with_spaces():
         (SERVICE_CONTROL_STOP, "stop"),
         (SERVICE_CONTROL_SHUTDOWN, "stop"),
         (SERVICE_CONTROL_PRESHUTDOWN, "stop"),
+        (SERVICE_CONTROL_PARAMCHANGE, "reload"),
         (SERVICE_CONTROL_INTERROGATE, "report"),
         (0x20, "unhandled"),
     ],
@@ -179,6 +185,13 @@ def test_accepted_controls_when_running_includes_preshutdown():
     assert mask & SERVICE_ACCEPT_STOP
     assert mask & SERVICE_ACCEPT_SHUTDOWN
     assert mask & SERVICE_ACCEPT_PRESHUTDOWN
+
+
+def test_accepted_controls_when_running_includes_paramchange():
+    # the reload control rides the same pending-state gate as stop: only
+    # the RUNNING mask advertises it, so the SCM itself refuses a reload
+    # before the loop it would wake exists.
+    assert accepted_controls(SERVICE_RUNNING) & SERVICE_ACCEPT_PARAMCHANGE
 
 
 def test_status_fields_order_and_service_type():
@@ -271,6 +284,18 @@ def test_describe_error_names_the_fix_not_the_number():
     assert "1234" in describe_error(1234, "install")
 
 
+def test_describe_error_explains_a_refused_control():
+    # 1052 is what a reload gets from a running service that predates the
+    # control (an upgrade leaves the old binary running); 1061 is any
+    # control sent mid-transition, when the pending mask accepts nothing.
+    assert "restart" in describe_error(
+        ERROR_INVALID_SERVICE_CONTROL, "reload the service"
+    )
+    assert "settle" in describe_error(
+        ERROR_SERVICE_CANNOT_ACCEPT_CTRL, "reload the service"
+    )
+
+
 def test_display_name_distinguishes_extra_instances():
     assert display_name("cronstable") == "cronstable scheduler"
     assert "second" in display_name("second")
@@ -327,8 +352,8 @@ class _FakeLoop:
     def call_soon(self, callback):
         self.callbacks.append(callback)
 
-    def call_soon_threadsafe(self, callback):
-        self.threadsafe.append(callback)
+    def call_soon_threadsafe(self, callback, *args):
+        self.threadsafe.append((callback, args))
 
     def close(self):
         self.closed = True
@@ -338,9 +363,13 @@ class _FakeCron:
     def __init__(self, config):
         self.config = config
         self.signalled = 0
+        self.reloaded = []
 
     def signal_shutdown(self):
         self.signalled += 1
+
+    def signal_reload(self, source):
+        self.reloaded.append(source)
 
 
 def _args(**over):
@@ -420,7 +449,7 @@ def test_host_stop_control_drains_through_the_loop(monkeypatch):
     assert SERVICE_STOP_PENDING in api.states()
     # the handler must not do the draining itself: it hands the signal to
     # the loop thread and returns, or the SCM reports the service hung.
-    assert loop.threadsafe == [seen["cron"].signal_shutdown]
+    assert loop.threadsafe == [(seen["cron"].signal_shutdown, ())]
 
 
 def test_host_interrogate_is_answered_without_stopping(monkeypatch):
@@ -437,6 +466,28 @@ def test_host_interrogate_is_answered_without_stopping(monkeypatch):
     assert seen_codes["code"] == winservice.NO_ERROR
     assert SERVICE_STOP_PENDING not in api.states()
     assert loop.threadsafe == []
+
+
+def test_host_paramchange_posts_the_reload_and_stays_running(monkeypatch):
+    api = _FakeApi()
+    captured = {}
+
+    def during():
+        captured["result"] = api.handler(
+            SERVICE_CONTROL_PARAMCHANGE, 0, 0, 0
+        )
+
+    host, loop, seen = _host(monkeypatch, api, during=during)
+    host.run()
+    assert captured["result"] == winservice.NO_ERROR
+    # a reload is not a stop: no pending state is reported, so the SCM
+    # keeps showing RUNNING and starts no drain countdown.
+    assert SERVICE_STOP_PENDING not in api.states()
+    # the handler only posts; the loop thread runs the reload, and the
+    # log line it produces names the SCM control rather than SIGHUP.
+    (callback, args), = loop.threadsafe
+    callback(*args)
+    assert seen["cron"].reloaded == ["service control PARAMCHANGE"]
 
 
 def test_host_unknown_control_reports_not_implemented(monkeypatch):
@@ -703,6 +754,7 @@ class _StateApi(_FakeApi):
         super().__init__()
         self.queue = list(states)
         self.controlled = []
+        self.control_kwargs = []
         self.started = 0
         self.deleted = 0
 
@@ -710,8 +762,9 @@ class _StateApi(_FakeApi):
         state = self.queue.pop(0) if self.queue else SERVICE_STOPPED
         return (SERVICE_WIN32_OWN_PROCESS, state, 0, 0, 0, 0, 0, 4242, 0)
 
-    def control_service(self, name, control):
+    def control_service(self, name, control, **kwargs):
         self.controlled.append(control)
+        self.control_kwargs.append(kwargs)
 
     def start_service(self, name):
         self.started += 1
@@ -756,7 +809,7 @@ def test_stop_waits_for_the_drain():
 
 def test_remove_tolerates_an_already_stopped_service():
     class _NotActive(_StateApi):
-        def control_service(self, name, control):
+        def control_service(self, name, control, **kwargs):
             raise ServiceError(
                 "not running", winerror=winservice.ERROR_SERVICE_NOT_ACTIVE
             )
@@ -764,6 +817,58 @@ def test_remove_tolerates_an_already_stopped_service():
     api = _NotActive([SERVICE_STOPPED])
     assert winservice.remove(_args(), api) == 0
     assert api.deleted == 1
+
+
+def test_reload_sends_paramchange_with_the_pause_continue_right(capsys):
+    api = _StateApi([SERVICE_RUNNING])
+    assert winservice.reload(_args(), api) == 0
+    assert api.controlled == [SERVICE_CONTROL_PARAMCHANGE]
+    # ControlService checks a per-control right on the handle: PARAMCHANGE
+    # needs SERVICE_PAUSE_CONTINUE, and the stop right would be refused as
+    # access denied even from an elevated prompt.
+    (kwargs,) = api.control_kwargs
+    assert kwargs["access"] == SERVICE_PAUSE_CONTINUE
+    assert "reload" in kwargs["action"]
+    assert "reload" in capsys.readouterr().out
+
+
+def test_reload_of_a_stopped_service_says_so(capsys):
+    class _NotActive(_StateApi):
+        def control_service(self, name, control, **kwargs):
+            raise ServiceError(
+                describe_error(
+                    winservice.ERROR_SERVICE_NOT_ACTIVE, kwargs["action"]
+                ),
+                winerror=winservice.ERROR_SERVICE_NOT_ACTIVE,
+            )
+
+    assert winservice.reload(_args(), _NotActive([])) == 1
+    assert "not running" in capsys.readouterr().err
+
+
+def test_dispatch_routes_reload(monkeypatch):
+    monkeypatch.setattr(platform, "IS_WINDOWS", True)
+    api = _StateApi([])
+    code = winservice.dispatch(
+        _args(service_command="reload"),
+        run_daemon=lambda *a, **k: None,
+        new_event_loop=lambda: None,
+        api=api,
+    )
+    assert code == 0
+    assert api.controlled == [SERVICE_CONTROL_PARAMCHANGE]
+
+
+def test_service_reload_parses_with_a_name():
+    import argparse
+
+    from cronstable import _cliargs
+
+    parser = argparse.ArgumentParser()
+    _cliargs.add_service_command(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(["service", "reload", "--name", "second"])
+    assert args.service_command == "reload"
+    assert args.name == "second"
 
 
 def test_start_reports_a_service_that_never_comes_up(capsys):

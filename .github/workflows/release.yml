@@ -1091,7 +1091,10 @@ jobs:
       # at the custom directory and was started by the upgrade. Either
       # assert missing re-opens the fleet failure: upgrades silently
       # resetting the config dir and leaving the service stopped.
-      - name: Smoke-test MSI upgrade (remembered properties, restart)
+      # The running service this leaves behind is also the one place a
+      # real PARAMCHANGE delivery can be proven, so the reload round
+      # trip lives here too.
+      - name: Smoke-test MSI upgrade (remembered properties, restart, reload)
         env:
           VERSION: ${{ needs.version.outputs.new }}
           ARCH: ${{ matrix.arch }}
@@ -1125,6 +1128,20 @@ jobs:
             sc query cronstable | grep -q 'RUNNING' && break
             sleep 2
           done
+          sc query cronstable | grep -q 'RUNNING'
+          # A real forced-reload round trip. `service reload` sends the
+          # SCM's paramchange control, which succeeds only when the
+          # running service advertises it in its accepted mask; the
+          # handler posts the reparse onto the loop, whose log line
+          # lands in the bootstrap log (smoke-push.yaml has no logging:
+          # section to replace it).
+          "/c/Program Files/cronstable/cronstable.exe" service reload
+          for _ in $(seq 1 15); do
+            grep -q 'service control PARAMCHANGE' "$cfg/logs/cronstable-service.log" 2>/dev/null && break
+            sleep 1
+          done
+          grep -q 'service control PARAMCHANGE' "$cfg/logs/cronstable-service.log"
+          # A reload is not a stop: the service is still RUNNING.
           sc query cronstable | grep -q 'RUNNING'
           msi_uninstall upgrade-twin.msi upgrade-uninstall.log
           if sc query cronstable >/dev/null 2>&1; then
