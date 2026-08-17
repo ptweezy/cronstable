@@ -1612,50 +1612,43 @@ jobs:
           done
       # Three PE signing calls: the staged one-file exes, then each
       # payload's root exe. The filter with recursion off keeps the
-      # third-party DLLs under _internal out of our signature. The
-      # timestamps are required: Artifact Signing rotates leaf
-      # certificates within days, and an untimestamped signature dies
-      # with its certificate (test_ci_fences pins the inputs on every
-      # signing step).
+      # third-party DLLs under _internal out of our signature. Every
+      # call goes through the local action, which retries a failed
+      # attempt twice: the signing action reinstalls its module from the
+      # PowerShell gallery on each call, and a gallery blip fails the
+      # step before anything is signed. That action also owns the digest
+      # and timestamp inputs (test_ci_fences pins both the ladder and
+      # the inputs).
       - name: Sign the one-file exes
         if: steps.decide.outputs.signed == 'true'
-        uses: azure/artifact-signing-action@v2.0.0
+        uses: ./.github/actions/sign-artifacts
         with:
+          label: the one-file exes
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
           files-folder: ${{ github.workspace }}\exes
           files-folder-filter: exe
-          files-folder-recurse: false
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
       - name: Sign the amd64 payload exe
         if: steps.decide.outputs.signed == 'true'
-        uses: azure/artifact-signing-action@v2.0.0
+        uses: ./.github/actions/sign-artifacts
         with:
+          label: the amd64 payload exe
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
           files-folder: ${{ github.workspace }}\work\amd64\cronstable
           files-folder-filter: exe
-          files-folder-recurse: false
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
       - name: Sign the arm64 payload exe
         if: steps.decide.outputs.signed == 'true'
-        uses: azure/artifact-signing-action@v2.0.0
+        uses: ./.github/actions/sign-artifacts
         with:
+          label: the arm64 payload exe
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
           files-folder: ${{ github.workspace }}\work\arm64\cronstable
           files-folder-filter: exe
-          files-folder-recurse: false
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
       - name: Re-zip the signed payloads
         if: steps.decide.outputs.signed == 'true'
         run: |
@@ -1684,17 +1677,14 @@ jobs:
           done
       - name: Sign the MSIs
         if: steps.decide.outputs.signed == 'true'
-        uses: azure/artifact-signing-action@v2.0.0
+        uses: ./.github/actions/sign-artifacts
         with:
+          label: the MSIs
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
           files-folder: ${{ github.workspace }}\out
           files-folder-filter: msi
-          files-folder-recurse: false
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
       # The action can exit 0 having signed nothing (a filter typo), so
       # check the exact bytes being uploaded. The set is DERIVED, not
       # enumerated: everything in out/ except the zips, plus each

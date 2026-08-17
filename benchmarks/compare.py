@@ -63,11 +63,11 @@ _DARK = {
 # Significance guard for the gate.  A metric's round-to-round scatter is
 # estimated as the coefficient of variation of its per-round estimator values;
 # the two sides' CoVs combine in quadrature into a noise band.  A regression
-# gates only when it also exceeds _SIG_SIGMA noise bands, so measurement
-# noise can never trip the gate, and the gate percentage can be tightened
-# without drowning in false positives.  When a side has fewer than two rounds
-# the noise cannot be estimated, and the guard falls back to not suppressing
-# (the percentage and floor tests then apply on their own).
+# gates only when it also exceeds _SIG_SIGMA noise bands, so measurement noise
+# alone never trips the gate and the gate percentage can be tight without
+# generating false positives.  When a side has fewer than two rounds the noise
+# cannot be estimated, and the guard stands down: the percentage and floor
+# tests then decide on their own.
 _SIG_SIGMA = 2.0
 _MIN_ROUNDS_FOR_NOISE = 2
 
@@ -320,9 +320,9 @@ def _adjusted_values(name, base, cur, base_floor, cur_floor):
 # been subtracted.  The raw 10ms default (bench.py) is calibrated against the
 # ~40ms totals; applied to an own share of a few ms it swamps gate_pct
 # entirely.  2ms sits below gate_pct for every own share big enough to gate on
-# a percentage, so gate_pct is what actually binds, while still declining to
-# fail a release over a sub-2ms move on a tiny metric, where the own share's
-# relative noise is worst.
+# a percentage, so gate_pct is what actually binds; a sub-2ms move on a tiny
+# metric still passes, because a small own share has the worst relative
+# noise.
 ADJUSTED_GATE_FLOOR = 0.002
 
 
@@ -471,12 +471,10 @@ def _compare(baseline, current):
         # The gate a metric actually delivers rather than the one it
         # declares: the percentage and absolute tests are ANDed, so on a
         # metric whose value sits near (or under) its floor the floor binds
-        # and the real sensitivity is 100*floor/value, however tight
-        # gate_pct reads.  The floor itself is deliberate harness policy
-        # (jitter on a tiny metric must never gate), but until this figure
-        # was reported nothing showed when the floor binds, and a third of
-        # the suite ran undersized against the harness's own 50ms+ sizing
-        # rule without anyone seeing it.
+        # and the real sensitivity is 100*floor/value, however tight gate_pct
+        # reads.  The floor itself is deliberate harness policy (jitter on a
+        # tiny metric must never gate); this figure is what shows when a
+        # workload is undersized against the harness's own 50ms+ sizing rule.
         effective_pct = gate_pct
         if gate_pct is not None and adj_base > 0:
             effective_pct = max(gate_pct, 100.0 * floor_used / adj_base)
@@ -713,9 +711,9 @@ def build_svg(rows, base_label, cur_label):
             )
         # Place the percentage just past the bar's data-end, unless a large
         # (clamped) bar would push it off the plot: past the right edge, or
-        # left into the metric-name gutter (the bug where a -94% label landed
-        # on top of the name). Then draw it inside the bar's end instead, so
-        # the number stays readable rather than colliding or clipping.
+        # left into the metric-name gutter, where a -94% label would land on
+        # top of the name.  Then draw it inside the bar's end instead, so the
+        # number stays readable rather than colliding or clipping.
         pad = 6.0
         # rough font-size-10 advance; err high so a borderline label goes
         # inside (always legible) rather than half-off the edge.
@@ -773,9 +771,8 @@ def build_md(
     lines.append("")
     if baseline_missing:
         lines.append(
-            "No previous release baseline exists, so this release records "
-            "benchmark results without a comparison. The next release will "
-            "diff against these numbers."
+            "There is no previous release to compare against, so this run "
+            "only records its numbers. The next release diffs against them."
         )
         lines.append("")
     if img_url:
@@ -806,50 +803,49 @@ def build_md(
             )
             if missed:
                 lines.append(
-                    "**Gate: passed** over %d of %d gated metrics. No "
-                    "compared metric exceeded its regression limit."
+                    "**Gate: passed** over %d of %d gated metrics."
                     % (cov.get("compared", 0), cov.get("compared", 0) + missed)
                 )
             else:
                 lines.append(
-                    "**Gate: passed.** No metric exceeded its regression "
-                    "limit."
+                    "**Gate: passed.** Every metric stayed inside its "
+                    "regression limit."
                 )
         if budget_breaches:
             lines.append("")
             lines.append(
-                "**Absolute budget: FAILED** (`benchmarks/budgets.json`; "
-                "raising a ceiling is a deliberate, reviewed edit to that "
-                "file):"
+                "**Absolute budget: FAILED.** These metrics are over the "
+                "ceilings in `benchmarks/budgets.json`, and raising a ceiling "
+                "takes an edit to that file:"
             )
             lines.extend("- %s" % b for b in budget_breaches)
         if expected_missing:
             lines.append("")
             lines.append(
-                "**Gate integrity: FAILED.** Metrics listed in "
-                "`benchmarks/expected_gated.txt` that this run did not "
-                "compare (a dead gate rather than a pass): %s."
+                "**Gate integrity: FAILED.** `benchmarks/expected_gated.txt` "
+                "lists these metrics, but the run never compared them, so "
+                "their gates are dead rather than passing: %s."
                 % ", ".join(expected_missing)
             )
         lines.append("")
         lines.append(
-            "Both versions ran interleaved on one runner; time metrics "
-            "compare best-of-rounds, memory metrics compare medians. "
-            "Negative change is faster or smaller."
+            "Both versions ran interleaved on one runner. Time metrics "
+            "compare the best round of each and memory metrics the median. "
+            "A negative change means faster or smaller."
         )
         lines.append("")
         lines.append(
             "A regression gates only when it exceeds both its declared limit "
-            "and %.0f noise bands (the +- column: the two sides' "
-            "round-to-round scatter combined in quadrature), so measurement "
-            "noise alone cannot fail the gate." % _SIG_SIGMA
+            "and %.0f noise bands. The +- column is that band: the "
+            "round-to-round scatter of the two sides, combined in "
+            "quadrature." % _SIG_SIGMA
         )
         lines.append("")
         suppressed = [r for r in rows if r.get("suppressed")]
         if suppressed:
             lines.append(
-                "Over the raw limit but within the noise band (reported, not "
-                "gated): %s."
+                "Some moves cleared their raw limit but stayed inside the "
+                "noise band, so they are reported without gating: %s."
                 % ", ".join(
                     "%s (%+.1f%%, noise +-%.1f%%)"
                     % (r["name"], r["delta_pct"], r["noise_pct"] or 0.0)

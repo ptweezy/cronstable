@@ -368,18 +368,80 @@ def test_refusal_message_assets_are_release_assets():
         )
 
 
+def _sign_action():
+    path = os.path.join(ROOT, ".github", "actions", "sign-artifacts", "action.yml")
+    with open(path, encoding="utf-8") as fobj:
+        return YAML(typ="safe").load(fobj.read())
+
+
+def _sign_attempts():
+    """The signing calls inside the local retrying action, in order."""
+    return [
+        step
+        for step in _sign_action()["runs"]["steps"]
+        if "artifact-signing-action" in str(step.get("uses", ""))
+    ]
+
+
 def test_every_signing_step_carries_a_timestamp():
     # Artifact Signing rotates its leaf certificates within days and
     # the signing action does not timestamp by default, so an
-    # untimestamped signature dies with its certificate. Every signing
-    # step must pin both timestamp inputs.
-    steps = [
-        step
-        for step in _workflow()["jobs"][SIGN_JOB]["steps"]
-        if "artifact-signing-action" in str(step.get("uses", ""))
-    ]
-    assert steps, "no signing steps found: the detector went stale"
-    for step in steps:
+    # untimestamped signature dies with its certificate. Every attempt
+    # must pin both timestamp inputs.
+    attempts = _sign_attempts()
+    assert attempts, "no signing steps found: the detector went stale"
+    for step in attempts:
         with_block = step.get("with") or {}
         assert with_block.get("timestamp-rfc3161"), step.get("name")
         assert with_block.get("timestamp-digest"), step.get("name")
+
+
+def test_signing_goes_through_the_retrying_action():
+    # A call site that reaches for the vendor action directly gets no
+    # retry, so one gallery blip fails the release again.
+    for step in _workflow()["jobs"][SIGN_JOB]["steps"]:
+        assert "artifact-signing-action" not in str(step.get("uses", "")), (
+            "{}: signs outside the retrying local action".format(
+                step.get("name")
+            )
+        )
+    call_sites = [
+        step
+        for step in _workflow()["jobs"][SIGN_JOB]["steps"]
+        if str(step.get("uses", "")) == "./.github/actions/sign-artifacts"
+    ]
+    assert call_sites, "no signing call sites: the detector went stale"
+
+
+def test_signing_retries_a_transient_failure():
+    # The vendor action reinstalls its module from the PowerShell
+    # gallery on every call, and a gallery blip fails the step before a
+    # byte is signed (a 2026-08-17 release run died on "Unable to find
+    # repository 'PSGallery'" and a plain re-run signed fine). So the
+    # ladder must keep more than one attempt, every attempt but the
+    # last must be non-fatal, and the last must NOT be: an exhausted
+    # ladder has to fail the release rather than ship unsigned bytes
+    # under a green check.
+    attempts = _sign_attempts()
+    assert len(attempts) > 1, "the signing retry ladder lost its retries"
+    for step in attempts[:-1]:
+        assert step.get("continue-on-error") is True, step.get("name")
+    assert not attempts[-1].get("continue-on-error"), (
+        "the last signing attempt swallows its own failure, so an "
+        "exhausted ladder would ship unsigned"
+    )
+    # Each retry runs only when the attempt before it failed, so a
+    # first attempt that signs costs nothing.
+    for previous, step in zip(attempts, attempts[1:]):
+        gate = "steps.{}.outcome".format(previous["id"])
+        assert gate in str(step.get("if", "")), step.get("name")
+
+
+def test_signing_retries_repeat_the_same_call():
+    # One call written three times: a `with` or a version that drifts
+    # between attempts means the retry signs on terms the first attempt
+    # was never given.
+    attempts = _sign_attempts()
+    for step in attempts[1:]:
+        assert step["uses"] == attempts[0]["uses"], step.get("name")
+        assert step["with"] == attempts[0]["with"], step.get("name")
