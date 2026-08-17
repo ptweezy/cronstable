@@ -379,10 +379,13 @@ def build_payload(
     tv = ctx.template_vars
     event = getattr(ctx, "event", None)
     sla_check = getattr(ctx, "sla_check", None)
+    heartbeat = getattr(ctx, "heartbeat", None)
     if event is not None:
         kind = "event"
     elif sla_check is not None:
         kind = "sla"
+    elif heartbeat is not None:
+        kind = "heartbeat"
     else:
         kind = "success" if success else "failure"
     payload: dict[str, Any] = {
@@ -421,6 +424,26 @@ def build_payload(
             value = tv.get(field)
             if value is not None:
                 payload[field] = value
+    elif kind == "heartbeat":
+        # `name` already carries the heartbeat's name (its shim config is
+        # named after it), so only the detail a job alert has no room for
+        # is added here.  The ping's own body rides `log_tail` below, in
+        # the field a client already renders as "what it said".
+        for field in (
+            "state",
+            "reason",
+            "description",
+            "last_ping_at",
+            "expected_at",
+            "overdue_seconds",
+        ):
+            value = tv.get(field)
+            if value not in (None, ""):
+                payload[field] = value
+        if include_log_tail:
+            body = tv.get("ping_body")
+            if body:
+                payload["log_tail"] = body.splitlines()[-LOG_TAIL_MAX_LINES:]
     elif include_log_tail:
         # stderr first: it is captured by default and is where a failing
         # job's reason usually lives; stdout only when that's all there

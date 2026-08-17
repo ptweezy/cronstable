@@ -1,0 +1,145 @@
+# Inbound heartbeats — watching the work cronstable does NOT run.
+#
+# Everything else in cronstable watches jobs it launched itself, from the
+# inside: it knows when the process started, what it exited with, how long
+# it took. A HEARTBEAT is the mirror image. Something else does the work —
+# a crontab line on a NAS, a GitHub Actions workflow, a Kubernetes CronJob,
+# a backup appliance with a "notify URL" field and nothing else — and calls
+# a URL when it finishes. cronstable alerts when that call does not arrive.
+#
+# The signal is an ABSENCE, which is what makes it a dead man's switch: it
+# catches the backup that silently stopped running months ago, which no
+# amount of watching the jobs you DO run will ever surface.
+#
+# Nothing has to be migrated for this to work. The far end keeps its own
+# scheduler; you append one `curl` to a command line it already runs.
+#
+#   # print the URLs to paste into those command lines:
+#   cronstable -c example/heartbeats/cronstable.yaml heartbeats --urls
+#
+#   # then run it:
+#   cronstable -c example/heartbeats/cronstable.yaml
+#
+# Then open http://localhost:8080/ and watch them. A heartbeat that has
+# never been pinged starts in `new`, ages through `late` (past due, still
+# inside its grace window — visible, deliberately silent), and reports once
+# it reaches `down`.
+
+web:
+  listen:
+    - http://0.0.0.0:8080
+  # THE one secret. Every heartbeat's ping URL is an HMAC of its name under
+  # this value, so the URLs are stable across restarts, reloads and cluster
+  # nodes with nothing stored anywhere — and rotating this one value rotates
+  # every URL at once.
+  #
+  # A literal here ONLY so this example runs with nothing set up. In a real
+  # deployment take it from the environment or a file — anything that can
+  # read your config repo can otherwise mark every heartbeat alive:
+  #
+  #   pingSecret:
+  #     fromEnvVar: CRONSTABLE_PING_SECRET
+  #
+  # It is resolved when the config loads, so an unset variable fails the
+  # load loudly rather than leaving the URLs quietly wrong.
+  pingSecret:
+    value: example-only-not-a-real-secret
+
+# Durable, so a restart is not read as a fleet-wide silence: without a
+# store, every heartbeat would re-anchor on boot and anything whose period
+# is shorter than the outage would report for a ping that did arrive.
+state:
+  path: ./cronstable-state
+
+heartbeats:
+  # -- interval mode: "I expect to hear from it at least this often" --------
+  # Anchored on the LAST PING, not on a fixed grid, so a job that drifts is
+  # judged against its own last success. The right spelling whenever you
+  # care about the gap rather than about the wall clock.
+  - name: nas-backup
+    description: restic to Backblaze B2, from the Synology
+    periodSeconds: 86400          # daily
+    graceSeconds: 7200            # ...give it two hours of slack
+    onLate:
+      report:
+        webhook:
+          url:
+            fromEnvVar: SLACK_WEBHOOK_URL
+    onRecovery:
+      report:
+        webhook:
+          url:
+            fromEnvVar: SLACK_WEBHOOK_URL
+
+  # -- schedule mode: "I expect a ping after each fire of this expression" --
+  # The full cron dialect a real job gets, business-day expressions
+  # included, in the heartbeat's own timezone. Use this when the far end
+  # runs on a wall clock you know, and you want to be told the morning the
+  # 02:00 run does not happen rather than 24 hours later.
+  - name: nightly-etl
+    description: the warehouse load in Airflow (which we do not run)
+    schedule: "0 2 * * *"
+    timezone: America/New_York
+    graceSeconds: 1800            # half an hour past 02:00
+    # This one brackets its work: it pings /start first, so a run that
+    # BEGINS and then hangs is caught by the runtime bound rather than
+    # waiting for tomorrow's missed ping. Without a /start ping this key
+    # does nothing.
+    maxRuntimeSeconds: 5400
+    onLate:
+      report:
+        mail:
+          to: oncall@example.com
+          from: cronstable@example.com
+          smtpHost: smtp.example.com
+    onFailure:
+      report:
+        mail:
+          to: oncall@example.com
+          from: cronstable@example.com
+          smtpHost: smtp.example.com
+
+  # -- business-day schedules work here too --------------------------------
+  # `LW` is the month's last weekday: payroll ran, or it did not.
+  - name: payroll-export
+    description: the finance SaaS export nobody here controls
+    schedule: "0 18 LW * *"
+    timezone: Europe/London
+    graceSeconds: 3600
+    onLate:
+      report:
+        # An encrypted push alert to the paired phone; needs a `push:`
+        # section, which this example leaves out. See the Push
+        # Notifications wiki page.
+        push:
+          enabled: false
+
+  # -- a pinned token ------------------------------------------------------
+  # This one derives its URL like the rest. But for a URL that ALREADY
+  # exists somewhere you cannot easily edit — a vendor's web form, a
+  # device's firmware — pin it instead, and a `pingSecret` rotation leaves
+  # this heartbeat's URL alone:
+  #
+  #   token:
+  #     fromEnvVar: VENDOR_PING_TOKEN
+  - name: vendor-sftp-drop
+    description: the partner's nightly drop, which pings us on arrival
+    periodSeconds: 90000          # daily, generously
+    graceSeconds: 0               # the period already carries the slack
+
+  # -- a heartbeat with no reporter is still useful ------------------------
+  # It is counted in /summary, shown on the dashboards and exported to
+  # Prometheus; it just does not page anyone. Alert on
+  # `cronstable_heartbeat_state{state="down"}` and let Alertmanager route it.
+  - name: lab-sensor-rollup
+    description: the greenhouse Pi, watched but not paged on
+    periodSeconds: 3600
+    graceSeconds: 600
+
+# A real job, so the example shows both halves of the picture in one
+# dashboard: what cronstable runs, and what it merely watches.
+jobs:
+  - name: local-housekeeping
+    command: echo "the jobs cronstable DOES run still look like this"
+    schedule: "*/15 * * * *"
+    captureStdout: true

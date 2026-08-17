@@ -1435,6 +1435,8 @@ _TOOL_REST_TWINS = {
     "cron_get_job_resources": (("GET", "/jobs/{name}/resources"),),
     "cron_get_cluster": (("GET", "/cluster"),),
     "cron_get_fleet": (("GET", "/fleet"),),
+    "cron_list_heartbeats": (("GET", "/heartbeats"),),
+    "cron_get_heartbeat": (("GET", "/heartbeats/{name}"),),
     # the tool's `history` argument folds in the second route
     "cron_get_node": (("GET", "/node"), ("GET", "/node/history")),
     "cron_query_metrics": (("GET", "/metrics"),),

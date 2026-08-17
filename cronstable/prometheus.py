@@ -39,6 +39,11 @@ from typing import (
 
 import cronstable.version
 from cronstable.cronexpr import CronTab
+from cronstable.heartbeat import (
+    DOWN_REASONS,
+    HEARTBEAT_STATES,
+    PING_KINDS,
+)
 
 if TYPE_CHECKING:  # pragma: no cover -- import cycle guard, types only
     from cronstable.cron import Cron
@@ -506,6 +511,13 @@ class PrometheusMetrics:
         # durable-state writes that failed and were dropped, by kind
         # (run-record, checkpoint, retry, reboot-marker, counters, manifest)
         self._state_dropped: dict[str, int] = {}
+        # Inbound heartbeat counters, keyed by (name, kind) / (name, reason)
+        # / reason. Accumulators like the job counters above, so they
+        # survive a web-app restart; the heartbeat GAUGES are read live off
+        # the scheduler at scrape time instead (see _heartbeat_families).
+        self._heartbeat_pings: dict[tuple[str, str], int] = {}
+        self._heartbeat_downs: dict[tuple[str, str], int] = {}
+        self._heartbeat_rejected: dict[str, int] = {}
         # Whole {k="v",...} label blocks, kept ACROSS scrapes: the label
         # universe is a pure function of the job set and a fixed set of
         # static labels, so a scrape that rebuilds it from cold re-escapes
@@ -891,9 +903,128 @@ class PrometheusMetrics:
         """
         families = self._daemon_families(cron)
         families.extend(self._job_families(cron))
+        families.extend(self._heartbeat_families(cron))
         families.extend(self._state_families(cron))
         families.extend(self._cluster_families(cron))
         return families
+
+    def _heartbeat_families(self, cron: "Cron") -> list[MetricFamily]:
+        """Inbound-heartbeat families, read from live scheduler state.
+
+        Emitted only when the config declares heartbeats, so a fleet that
+        uses none pays nothing and its scrape is byte-identical to before
+        the feature existed.
+
+        ``cronstable_heartbeat_state`` is deliberately a per-state 0/1
+        gauge set rather than one gauge carrying an enum-coded number:
+        alerting on ``state="down"`` is then a label match, and a state
+        added in a later release cannot silently renumber an existing
+        alerting rule.
+        """
+        observed = cron.heartbeat_observations()
+        if not observed and not self._heartbeat_pings:
+            return []
+        state = MetricFamily(
+            "cronstable_heartbeat_state",
+            "gauge",
+            "Whether the inbound heartbeat is currently in this state "
+            "(one series per state; exactly one is 1).",
+        )
+        last_ping = MetricFamily(
+            "cronstable_heartbeat_last_ping_timestamp_seconds",
+            "gauge",
+            "Unix time of the newest ping received for the heartbeat "
+            "(absent until one arrives).",
+        )
+        due = MetricFamily(
+            "cronstable_heartbeat_due_timestamp_seconds",
+            "gauge",
+            "Unix time the heartbeat's next ping is expected by.",
+        )
+        overdue = MetricFamily(
+            "cronstable_heartbeat_overdue_seconds",
+            "gauge",
+            "Seconds the heartbeat is past due; 0 while inside its window.",
+        )
+        pings = MetricFamily(
+            "cronstable_heartbeat_pings",
+            "counter",
+            "Pings accepted for the heartbeat, by kind "
+            "(success, fail, start).",
+        )
+        rejected = MetricFamily(
+            "cronstable_heartbeat_pings_rejected",
+            "counter",
+            "Pings refused at ingest, by reason (unknown-token, "
+            "rate-limited, bad-request).",
+        )
+        downs = MetricFamily(
+            "cronstable_heartbeat_downs",
+            "counter",
+            "Times the heartbeat transitioned into the down state, by "
+            "reason (missed, failed, overrun).",
+        )
+        for name in sorted(observed):
+            obs = observed[name]
+            for value in HEARTBEAT_STATES:
+                state.add(
+                    {"heartbeat": name, "state": value},
+                    1 if obs.state == value else 0,
+                )
+            if obs.due_at is not None:
+                due.add({"heartbeat": name}, obs.due_at.timestamp())
+            overdue.add({"heartbeat": name}, obs.overdue_seconds)
+            record = cron.heartbeat_record(name)
+            if record is not None and record.last_ping_at is not None:
+                last_ping.add(
+                    {"heartbeat": name}, record.last_ping_at.timestamp()
+                )
+        for (name, kind), count in sorted(self._heartbeat_pings.items()):
+            pings.add({"heartbeat": name, "kind": kind}, count)
+        for (name, reason), count in sorted(self._heartbeat_downs.items()):
+            downs.add({"heartbeat": name, "reason": reason}, count)
+        for reason, count in sorted(self._heartbeat_rejected.items()):
+            rejected.add({"reason": reason}, count)
+        return [state, last_ping, due, overdue, pings, rejected, downs]
+
+    def heartbeat_ping(self, name: str, kind: str) -> None:
+        key = (name, kind)
+        self._heartbeat_pings[key] = self._heartbeat_pings.get(key, 0) + 1
+
+    def heartbeat_ping_rejected(self, reason: str) -> None:
+        self._heartbeat_rejected[reason] = (
+            self._heartbeat_rejected.get(reason, 0) + 1
+        )
+
+    def heartbeat_down(self, name: str, reason: str) -> None:
+        key = (name, reason)
+        self._heartbeat_downs[key] = self._heartbeat_downs.get(key, 0) + 1
+
+    def heartbeat_seed(self, name: str) -> None:
+        """Zero-fill a heartbeat's counter series.
+
+        Called when the monitor first evaluates a heartbeat, so
+        ``increase()`` has a baseline sample before the first ping or the
+        first down -- the same zero-fill reasoning as
+        :meth:`job_sla_late`.
+        """
+        for kind in PING_KINDS:
+            self._heartbeat_pings.setdefault((name, kind), 0)
+        for reason in DOWN_REASONS:
+            self._heartbeat_downs.setdefault((name, reason), 0)
+
+    def heartbeat_prune(self, keep: "frozenset[str] | set[str]") -> None:
+        """Drop counter series for heartbeats a reload removed."""
+        self._heartbeat_pings = {
+            key: value
+            for key, value in self._heartbeat_pings.items()
+            if key[0] in keep
+        }
+        self._heartbeat_downs = {
+            key: value
+            for key, value in self._heartbeat_downs.items()
+            if key[0] in keep
+        }
 
     def render_prepared(
         self, families: list[MetricFamily], openmetrics: bool = False

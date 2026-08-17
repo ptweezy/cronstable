@@ -828,6 +828,44 @@ here; see [Output Capturing](Output-Capturing). The response carries
 `X-Accel-Buffering: no` so reverse proxies (e.g. nginx) do not buffer the
 stream.
 
+### Heartbeat endpoints
+
+The [inbound heartbeats](Inbound-Heartbeats) (the `heartbeats:` section) are
+introspected and held here. `GET /heartbeats` returns the whole set plus the
+same per-state counts `GET /summary` carries; `GET /heartbeats/{name}` adds
+the newest ping's own exit code, correlation id, body and origin, the
+schedule lint, and which hooks would really fire.
+`POST /heartbeats/{name}/pause` and `/resume` hold and release one for
+planned maintenance, taking the same `durationSeconds` / `until` / `note` /
+`by` body a [job pause](Pausing-Jobs) takes.
+
+These four are token-gated like every other route. The **ping ingest is
+not**, and cannot be:
+
+#### `POST|GET /ping/{token}` and `/ping/{token}/{signal}`
+
+The one route in this API that no bearer token gates. The URL goes into a
+crontab line on a machine that must never hold the dashboard's token, so the
+unguessable token in the path *is* the credential, and it authorises exactly
+one thing: saying that one heartbeat is alive. `GET` as well as `POST`,
+because a great many things that can call a URL cannot choose the method.
+
+`{signal}` is `start`, `fail`, or an exit code (`0` succeeds, anything else
+fails and is kept for the alert); omitting it is a success. A `POST` body up
+to 8 KiB is read and its first 1000 characters kept, shown in alerts. An
+optional `?rid=` correlates a `start` with its finish.
+
+Unknown tokens, malformed tokens, tokens for a heartbeat a reload just
+removed, and unrecognised signals all answer the same `404` with the same
+body: probing the URL space learns nothing either way. Each heartbeat's
+ingest is rate-limited to a burst of 20 then one per second, past which it
+answers `429`.
+
+Because a URL that can silence a monitor is a write credential and `view` is
+handed out freely, **no response from any of these routes ever contains a
+ping URL, at any scope.** Read them with `cronstable heartbeats --urls` on
+the daemon's own host.
+
 ### DAG endpoints
 
 The orchestration DAGs (the [`dags:`](Orchestration-and-DAGs) section) are

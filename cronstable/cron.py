@@ -53,13 +53,22 @@ if TYPE_CHECKING:  # the loopback job-state API is imported lazily at runtime
     from cronstable.jobapi import JobStateAPI
 
 import cronstable.version
-from cronstable import _json, discovery, platform, push, statsd, tlsutil
+from cronstable import (
+    _json,
+    discovery,
+    heartbeat,
+    platform,
+    push,
+    statsd,
+    tlsutil,
+)
 from cronstable.config import (
     WEB_TOKEN_SCOPES,
     ClusterConfig,
     ConfigError,
     CronstableConfig,
     DagConfig,
+    HeartbeatConfig,
     JobConfig,
     JobDefaults,
     LoggingConfig,
@@ -86,6 +95,7 @@ from cronstable.dagrun import DAG_CATCHUP_STREAM_PREFIX, DagScheduler
 from cronstable.fingerprint import job_digest_cached, job_set_id
 from cronstable.ical import CalendarEntry, render_calendar
 from cronstable.job import (
+    HeartbeatContext,
     JobOutputStream,
     JobRetryState,
     NotifyEventContext,
@@ -95,6 +105,7 @@ from cronstable.job import (
     close_webhook_pool,
     report_config_enabled,
     report_event,
+    report_heartbeat,
     report_hostname,
     report_sla_breach,
     retire_event_log_writers,
@@ -305,6 +316,29 @@ SLA_SUCCESS_SCAN_LIMIT = 1000
 # Pause windows kept per job for the staleness credit; overflow drops the
 # oldest, understating the credit rather than overstating it.
 SLA_PAUSE_SPANS_MAX = 64
+
+# --- inbound heartbeats (cronstable.heartbeat) ------------------------
+# The durable document namespace: one document per heartbeat, holding the
+# ping record and any operator hold. One document rather than a record
+# stream because a ping's VALUE is entirely in the newest one -- history
+# beyond that belongs in the metrics, and an append-per-ping would make a
+# chatty heartbeat the largest writer in the store.
+HEARTBEAT_NAMESPACE = "heartbeat"
+# Longest ping body read off the wire. A ping is a signal, not a log
+# shipper; a job with more to say has stdout and a real job runner.
+HEARTBEAT_BODY_READ_MAX = 8 * 1024
+# ...of which this much is kept and shown in alerts.
+HEARTBEAT_BODY_KEEP_CHARS = 1000
+# Longest `?rid=` correlation id accepted; anything longer is dropped
+# rather than refused, so a caller's oversized id never fails its ping.
+HEARTBEAT_RUN_ID_MAX = 64
+# How the ping's origin is recorded: the peer address only, never a
+# forwarded-for chain (unverifiable) and never a full URL. Observability
+# for "which box is pinging this", not an audit trail.
+HEARTBEAT_SOURCE_MAX = 64
+# Ping-document write timeout; a wedged store must not hold the HTTP
+# response open, and the in-memory record has already been updated.
+HEARTBEAT_STORE_TIMEOUT = 5.0
 # Aggregation windows for GET /jobs/{name}/trends (label, seconds).
 TREND_WINDOWS: tuple[tuple[str, float], ...] = (
     ("1h", 3600.0),
@@ -320,6 +354,15 @@ TREND_SCAN_LIMIT = 5000
 JOB_TRENDS_CACHE_TTL = 5.0
 # Served without bearer auth: only the UI page, which carries no secrets.
 WEB_PUBLIC_PATHS = frozenset({"/"})
+
+# The heartbeat ping ingest, served without bearer auth by design: the
+# unguessable token in the path IS the credential, and the whole point is
+# that the URL can be pasted into a crontab line on a machine that must
+# never hold the dashboard's token (see Cron._web_ping). Matched as a
+# PREFIX rather than through WEB_PUBLIC_PATHS because the path carries the
+# token; the trailing slash is load-bearing, so a route named
+# "/pingsomething" could never inherit the exemption.
+WEB_PING_PATH_PREFIX = "/ping/"
 
 # Methods the cross-site Origin gate waves through (reads mutate nothing);
 # OPTIONS passes so the /mcp CORS preflight keeps answering.
@@ -408,6 +451,22 @@ WEB_ROUTES: "tuple[tuple[str, str, str, Optional[str]], ...]" = (
         "_web_dag_decision",
         None,
     ),
+    # inbound heartbeats: the read/control surface (bearer-gated like
+    # every other route), and the ping ingest below, which is NOT.
+    ("GET", "/heartbeats", "_web_list_heartbeats", None),
+    ("GET", "/heartbeats/{name}", "_web_get_heartbeat", None),
+    ("POST", "/heartbeats/{name}/pause", "_web_heartbeat_pause", None),
+    ("POST", "/heartbeats/{name}/resume", "_web_heartbeat_resume", None),
+    # The ping endpoint. Unauthenticated by necessity (the token in the
+    # path IS the credential; see _web_ping) and therefore listed in
+    # WEB_PING_PATH_PREFIX so the auth middleware waves it through.
+    # GET as well as POST because a great many things that can call a
+    # URL cannot choose the method; HEAD is not listed because aiohttp
+    # derives it from GET and registering it explicitly is a hard error.
+    ("GET", "/ping/{token}", "_web_ping", None),
+    ("POST", "/ping/{token}", "_web_ping", None),
+    ("GET", "/ping/{token}/{signal}", "_web_ping", None),
+    ("POST", "/ping/{token}/{signal}", "_web_ping", None),
     # durable state inspector (metadata-only)
     ("GET", "/state", "_web_state", None),
     ("GET", "/state/documents", "_web_state_documents", None),
@@ -877,6 +936,84 @@ class PauseInfo:
             "by": self.by,
             "channel": self.channel,
         }
+
+
+def _iso_or_none(value: Optional[datetime.datetime]) -> Optional[str]:
+    """ISO-8601 text for an instant, or ``None`` -- the payload idiom."""
+    return value.isoformat() if value is not None else None
+
+
+def _pause_from_dict(body: Any) -> Optional[PauseInfo]:
+    """A :class:`PauseInfo` from a stored ``pause`` object, or ``None``.
+
+    Total, like every other reader of stored heartbeat state: a
+    hand-edited, truncated or absent object reads as "no hold" rather
+    than raising, because a corrupt hold must not be able to wedge the
+    monitor for a heartbeat that is otherwise fine.
+    """
+    if not isinstance(body, dict):
+        return None
+    until = _parse_iso_utc(body.get("until"))
+    if until is None:
+        return None
+    since = _parse_iso_utc(body.get("since"))
+    note = body.get("note")
+    by = body.get("by")
+    channel = body.get("channel")
+    return PauseInfo(
+        since=since if since is not None else until,
+        until=until,
+        note=note if isinstance(note, str) else "",
+        by=by if isinstance(by, str) else "",
+        channel=channel if isinstance(channel, str) else "",
+    )
+
+
+def _heartbeat_signal(signal: str) -> "tuple[Optional[str], Optional[int]]":
+    """Map a ping URL's suffix to ``(kind, exit_code)``.
+
+    The vocabulary a caller types into a crontab line, so it stays small
+    and forgiving of case: nothing or ``0`` is a success, ``fail`` or any
+    other integer is a failure carrying that exit code, ``start`` opens a
+    run for the ``maxRuntime`` check. ``(None, None)`` means the suffix
+    is not one of those, which the handler answers 404 -- the same answer
+    a bad token gets, so probing the URL space learns nothing either way.
+
+    Accepting a bare exit code is what lets a shell script end with one
+    line and no branching::
+
+        curl -fsS -m 10 "$URL/$?"
+    """
+    text = signal.strip().lower()
+    if text in ("", "0", "ok", "success"):
+        return heartbeat.PING_SUCCESS, 0 if text in ("0",) else None
+    if text == heartbeat.PING_START:
+        return heartbeat.PING_START, None
+    if text in ("fail", "failure"):
+        return heartbeat.PING_FAIL, None
+    try:
+        code = int(text, 10)
+    except ValueError:
+        return None, None
+    # A negative code is what a shell reports for a signal-killed child
+    # ($? is 128+n, but a Python caller may send -n); either way it is a
+    # failure, and the number is kept verbatim for the alert.
+    return heartbeat.PING_FAIL, code
+
+
+def _peer_address(request: "web.Request") -> Optional[str]:
+    """The ping's peer address, bounded, for display only.
+
+    Deliberately the socket peer and never ``X-Forwarded-For``: the
+    header is caller-controlled, this endpoint is unauthenticated, and a
+    field rendered in an alert must not be something the alert's subject
+    can write. Behind a proxy every ping therefore reads as the proxy,
+    which is honest -- that IS the peer.
+    """
+    peer = request.remote
+    if not peer:
+        return None
+    return str(peer)[:HEARTBEAT_SOURCE_MAX]
 
 
 #: What a row with no finish instant sorts as: OLDEST.  Shared by
@@ -2046,6 +2183,39 @@ class Cron:
         # name -> start of the current DISABLED span; banked as staleness
         # credit on re-enable (via _sla_bank_pause). Node-local.
         self._sla_disabled_since: dict[str, datetime.datetime] = {}
+        # --- inbound heartbeats (see cronstable.heartbeat) ------------
+        # The loaded set, name -> HeartbeatConfig, and the ping-token index
+        # the unauthenticated ingest path resolves against. Both are
+        # rebuilt wholesale by _apply_heartbeats on every reload, so a
+        # rotated web.pingSecret takes effect without a restart.
+        self.heartbeats: "OrderedDict[str, HeartbeatConfig]" = OrderedDict()
+        self._heartbeat_tokens: dict[str, str] = {}
+        # name -> the newest ping record. Authoritative in memory; mirrored
+        # to the durable store when one exists, and warmed back from it at
+        # startup (_rehydrate_heartbeats) so a restart does not read as a
+        # fleet-wide silence.
+        self._heartbeat_records: dict[str, heartbeat.PingRecord] = {}
+        # name -> (state, reason, since): the report latch. Entering an
+        # alerting state fires ONCE; leaving it fires the recovery hook
+        # once. In memory only, exactly like _sla_state, so a restart
+        # re-reports a heartbeat that is still down -- the conservative
+        # direction for a monitor whose whole job is to not stay quiet.
+        self._heartbeat_state: dict[
+            str, tuple[str, Optional[str], datetime.datetime]
+        ] = {}
+        # name -> when this daemon first loaded it; the expectation anchor
+        # for a heartbeat that has never been pinged, so a fresh boot gets
+        # a full window before it can report (the _sla_first_seen rule).
+        self._heartbeat_first_seen: dict[str, datetime.datetime] = {}
+        # name -> operator hold; the heartbeat is excused while it lasts.
+        # Rides the same document as the ping record, so a hold is durable
+        # and cluster-visible wherever the record is.
+        self._heartbeat_paused: dict[str, PauseInfo] = {}
+        # per-heartbeat report chains, for the reason _sla_report_tail has
+        # its own: a monitor report must never sit in front of a run's.
+        self._heartbeat_report_tail: dict[str, asyncio.Task] = {}
+        # ingest throttle, keyed by heartbeat name (never by token)
+        self._heartbeat_limiter = heartbeat.PingRateLimiter()
         # Next-fire index: name -> aware-UTC next fire for every enabled
         # CronTab job. _fire_heap is a min-heap over the same data and may
         # hold STALE entries (names reseeded/removed on reload), validated
@@ -2098,6 +2268,9 @@ class Cron:
             )
             self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
             self._notify_config = config.notify_config
+            # Through the same path a reload takes, so a test's Cron has
+            # the token index and first-seen anchors a real one would.
+            self._apply_heartbeats(config)
             self._job_set_id_cache = None
             self._needs_subminute_cache = None
             self._job_pos_cache = None
@@ -2700,6 +2873,9 @@ class Cron:
         self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
         # read live by _dispatch_notify, so a reload takes effect at once.
         self._notify_config = config.notify_config
+        # Inbound heartbeats and their ping-token index; rebuilt whole so
+        # a rotated web.pingSecret takes effect without a restart.
+        self._apply_heartbeats(config)
         # Retire the Event Log writer of a source this config no longer
         # names. A writer is an OS thread plus a registered source handle,
         # keyed on a config STRING rather than on anything that dies by
@@ -3354,6 +3530,13 @@ class Cron:
         }
         if self.cron_dags:
             summary["dags"] = {"total": len(self.cron_dags)}
+        if self.heartbeats:
+            # Conditional, like `dags` above and for the same reason: a
+            # fleet that declares none gets the payload it always got,
+            # and a client can use the key's presence as the feature
+            # probe. `now` is shared, so the counts describe the same
+            # instant as the job counts beside them.
+            summary["heartbeats"] = self.heartbeat_counts(now)
         if mgr is not None:
             summary["cluster"] = {
                 "enabled": True,
@@ -4519,6 +4702,9 @@ class Cron:
             # without a state backend (hence a sibling of _state_periodic,
             # not part of it).
             self._sla_periodic()
+            # Inbound heartbeats, on the same terms and for the same
+            # reason: in-memory, so a stateless daemon monitors them too.
+            self._heartbeat_periodic()
         except Exception:  # pragma: nocover
             logger.exception("please report this as a bug (5)")
 
@@ -4779,6 +4965,862 @@ class Cron:
                     continue
                 if self._sla_state.pop((name, check), None) is not None:
                     self.metrics.job_sla_late(name, check, False)
+
+    # --- inbound heartbeats -------------------------------------------
+    # Ingest (_web_ping), the monitor (_heartbeat_periodic) and the
+    # durable mirror. The state machine itself is cronstable.heartbeat;
+    # everything here is the I/O around it.
+
+    def _apply_heartbeats(self, config: CronstableConfig) -> None:
+        """Install a reload's heartbeat set and rebuild the token index.
+
+        Called from :meth:`_apply_reload`, so a rotated ``web.pingSecret``
+        or an edited heartbeat takes effect on the next housekeeping pass
+        with no restart. Per-name state (records, latches, holds) is kept
+        for names that survive and dropped for the rest, exactly as the
+        SLA trackers are: an operator editing a heartbeat's grace has not
+        told us to forget when it last pinged.
+        """
+        secret = self._heartbeat_ping_secret(config.web_config)
+        self.heartbeats = OrderedDict(
+            (hb.name, hb) for hb in config.heartbeats
+        )
+        tokens: dict[str, str] = {}
+        for name, hb in self.heartbeats.items():
+            token = hb.ping_token(secret)
+            if token is None:
+                # _validate_heartbeats refuses this at load, so reaching
+                # here means the invariant slipped; the heartbeat stays
+                # configured and visible but has no reachable URL, which
+                # is the fail-closed direction (nothing can ping it).
+                logger.error(
+                    "heartbeat %r has no ping token, so its URL is "
+                    "unreachable; set web.pingSecret or its own token",
+                    name,
+                )
+                continue
+            tokens[token] = name
+        self._heartbeat_tokens = tokens
+        keep = set(self.heartbeats)
+        now = get_now(datetime.timezone.utc)
+        for name in keep:
+            self._heartbeat_first_seen.setdefault(name, now)
+        self._heartbeat_records = {
+            name: record
+            for name, record in self._heartbeat_records.items()
+            if name in keep
+        }
+        self._heartbeat_state = {
+            name: latch
+            for name, latch in self._heartbeat_state.items()
+            if name in keep
+        }
+        self._heartbeat_first_seen = {
+            name: at
+            for name, at in self._heartbeat_first_seen.items()
+            if name in keep
+        }
+        self._heartbeat_paused = {
+            name: info
+            for name, info in self._heartbeat_paused.items()
+            if name in keep
+        }
+        self._heartbeat_limiter.retain(keep)
+        self.metrics.heartbeat_prune(keep)
+
+    @staticmethod
+    def _heartbeat_ping_secret(
+        web_config: Optional[WebConfig],
+    ) -> Optional[str]:
+        """``web.pingSecret``, resolved, or ``None``.
+
+        Resolution failures are swallowed into ``None`` rather than
+        raised: this runs on the reload path, and an unreadable secret
+        file must not take the whole config down with it. The heartbeats
+        whose tokens derived from it then log their unreachability above,
+        one line each, which is the diagnosis the operator needs.
+        """
+        if web_config is None:
+            return None
+        spec = web_config.get("pingSecret")
+        if not spec:
+            return None
+        try:
+            return Cron._resolve_web_secret(spec, "web.pingSecret")
+        except ConfigError as ex:
+            logger.error("web.pingSecret could not be resolved: %s", ex)
+            return None
+
+    def heartbeat_record(self, name: str) -> Optional[heartbeat.PingRecord]:
+        """The newest ping record for ``name`` (read by the metrics)."""
+        return self._heartbeat_records.get(name)
+
+    def _heartbeat_observe(
+        self, name: str, now: Optional[datetime.datetime] = None
+    ) -> Optional[heartbeat.Observation]:
+        """One heartbeat's live verdict, or ``None`` if it is not loaded.
+
+        The single place every surface -- the monitor, ``/heartbeats``,
+        ``/summary`` and the metrics -- asks "how is this doing", so none
+        of them can drift from the others by re-deriving it.
+        """
+        hb = self.heartbeats.get(name)
+        if hb is None:
+            return None
+        if now is None:
+            now = get_now(datetime.timezone.utc)
+        return heartbeat.observe(
+            hb,
+            self._heartbeat_records.get(name) or heartbeat.PingRecord(),
+            now,
+            first_seen=self._heartbeat_first_seen.get(name, now),
+            paused=self._heartbeat_pause_active(name, now) is not None,
+        )
+
+    def heartbeat_observations(
+        self, now: Optional[datetime.datetime] = None
+    ) -> dict[str, heartbeat.Observation]:
+        """Every loaded heartbeat's verdict at one instant.
+
+        One clock read for the whole set, so a scrape or a payload cannot
+        show two heartbeats judged microseconds apart.
+        """
+        if not self.heartbeats:
+            return {}
+        if now is None:
+            now = get_now(datetime.timezone.utc)
+        out = {}
+        for name in self.heartbeats:
+            observed = self._heartbeat_observe(name, now)
+            if observed is not None:
+                out[name] = observed
+        return out
+
+    def _heartbeat_pause_active(
+        self, name: str, now: Optional[datetime.datetime] = None
+    ) -> Optional[PauseInfo]:
+        """The heartbeat's live hold, or ``None``; expiry enforced here.
+
+        The same reader-enforced expiry a job pause gets
+        (:meth:`_pause_active`), for the same reason: within one pass an
+        expired hold must read as absent everywhere at once.
+        """
+        info = self._heartbeat_paused.get(name)
+        if info is None:
+            return None
+        if now is None:
+            now = get_now(datetime.timezone.utc)
+        if info.until <= now:
+            return None
+        return info
+
+    def _heartbeat_periodic(self) -> None:
+        """Evaluate every heartbeat; latch, meter and report transitions.
+
+        A sibling of :meth:`_sla_periodic` in every respect: purely in
+        memory (so it runs with or without a state backend), latched so
+        each transition reports once, and it never awaits a reporter on
+        the scheduler loop.
+
+        The cluster gate is the leader's, not per-heartbeat: a ping may
+        land on ANY node, so with a shared store every node holds the same
+        record and only one may report on it. Without a store each node
+        judges what it personally heard, and the wiki page says so.
+        """
+        if not self.heartbeats:
+            if self._heartbeat_state:
+                self._heartbeat_state.clear()
+            return
+        now = get_now(datetime.timezone.utc)
+        reports = self._heartbeat_may_report()
+        for name in self.heartbeats:
+            self.metrics.heartbeat_seed(name)
+            self._heartbeat_evaluate(name, now=now, reports=reports)
+
+    def _heartbeat_evaluate(
+        self,
+        name: str,
+        *,
+        now: Optional[datetime.datetime] = None,
+        reports: Optional[bool] = None,
+    ) -> None:
+        """Latch, meter and report one heartbeat's transition, if any.
+
+        The single transition engine, with two callers that need it for
+        opposite halves of the same signal. The periodic pass finds the
+        BAD news, because only the clock can: silence is not an event.
+        :meth:`record_ping` calls it for the GOOD news the instant a ping
+        lands, so a recovery is reported in the moment rather than up to
+        a housekeeping pass later -- which also keeps ``/heartbeats``
+        from serving a stale ``down`` to a dashboard that is watching.
+
+        Idempotent by construction: everything it does is a function of
+        the observation against the latch, so calling it twice for one
+        transition is a no-op the second time.
+        """
+        hb = self.heartbeats.get(name)
+        if hb is None:
+            return
+        if now is None:
+            now = get_now(datetime.timezone.utc)
+        observed = self._heartbeat_observe(name, now)
+        if observed is None:  # pragma: no cover - removed mid-pass
+            return
+        if reports is None:
+            reports = self._heartbeat_may_report()
+        latched = self._heartbeat_state.get(name)
+        if observed.alerting:
+            if latched is not None and latched[1] == observed.reason:
+                return
+            # Either the first alert, or a reason that CHANGED under us
+            # (missed -> failed, when a job that went quiet finally comes
+            # back with a failure). A changed reason is a new fact about
+            # the same outage, so it re-reports rather than sitting silent
+            # behind the first latch -- but it keeps the FIRST onset the
+            # observation gave, because the outage did not restart.
+            since = (
+                latched[2] if latched is not None else (observed.since or now)
+            )
+            self._heartbeat_state[name] = (
+                observed.state,
+                observed.reason,
+                since,
+            )
+            self.metrics.heartbeat_down(name, observed.reason or "missed")
+            logger.warning(
+                "Heartbeat %s is down (%s); expected a ping by %s",
+                name,
+                observed.reason,
+                observed.due_at.isoformat()
+                if observed.due_at is not None
+                else "never (no future fire)",
+            )
+            if reports:
+                self._queue_heartbeat_report(hb, observed, down_since=since)
+        elif latched is not None:
+            # Recovered. An excusal (paused, disabled) clears the latch
+            # too, but must NOT claim a recovery: nothing came back, the
+            # operator just stopped asking.
+            del self._heartbeat_state[name]
+            excused = observed.state in (
+                heartbeat.STATE_PAUSED,
+                heartbeat.STATE_DISABLED,
+            )
+            logger.info(
+                "Heartbeat %s %s",
+                name,
+                "is excused (%s)" % observed.state if excused else "recovered",
+            )
+            if reports and not excused:
+                self._queue_heartbeat_report(
+                    hb, observed, down_since=latched[2]
+                )
+
+    def _heartbeat_may_report(self) -> bool:
+        """Whether THIS node should report on heartbeat transitions.
+
+        Without leader election every node reports on what it heard: it
+        is the only node, or the operator has accepted duplicates. With
+        election and a shared store, every node sees the same record, so
+        only the leader reports -- otherwise a five-node cluster pages
+        five times for one silent backup.
+
+        Fails OPEN, unlike the job Leader gate: a heartbeat report is an
+        alert about something already wrong, and the failure mode of
+        reporting twice is far kinder than the failure mode of a cluster
+        that has lost its leader reporting not at all.
+        """
+        if not self._elect_leader_configured:
+            return True
+        manager = self.cluster_manager
+        if manager is None:
+            return True
+        return bool(manager.is_leader())
+
+    def _queue_heartbeat_report(
+        self,
+        hb: HeartbeatConfig,
+        observed: heartbeat.Observation,
+        *,
+        down_since: datetime.datetime,
+    ) -> None:
+        """Dispatch one heartbeat transition as a tracked, chained task.
+
+        Which hook fires is decided here, once: a recovery takes
+        ``onRecovery``, an explicit failure ping takes ``onFailure``, and
+        every other way of going down takes ``onLate`` -- the same word a
+        job's missed-SLA hook uses, for the same event.
+        """
+        name = hb.name
+        record = self._heartbeat_records.get(name) or heartbeat.PingRecord()
+        recovered = not observed.alerting
+        if recovered:
+            hook = hb.onRecovery
+        elif observed.reason == heartbeat.REASON_FAILED:
+            hook = hb.onFailure
+        else:
+            hook = hb.onLate
+        report_config = hook["report"]
+        if not report_config_enabled(report_config):
+            return
+        now = get_now(datetime.timezone.utc)
+        ctx = HeartbeatContext(
+            name=name,
+            expectation=self._heartbeat_expectation(hb),
+            success=recovered,
+            state=observed.state,
+            reason=observed.reason,
+            description=hb.description,
+            last_ping_at=(
+                record.last_ping_at.isoformat()
+                if record.last_ping_at is not None
+                else None
+            ),
+            expected_at=(
+                observed.due_at.isoformat()
+                if observed.due_at is not None
+                else None
+            ),
+            overdue_seconds=observed.overdue_seconds,
+            down_since=down_since.isoformat(),
+            down_seconds=(now - down_since).total_seconds(),
+            exit_code=record.last_exit_code,
+            run_id=record.last_run_id,
+            ping_body=record.last_body,
+        )
+        self._install_tail_task(
+            self._heartbeat_report_tail,
+            name,
+            lambda: report_heartbeat(ctx, report_config),
+            spawn=self._spawn_completion,
+            after=[
+                self._completion_tail.get(name),
+                self._heartbeat_report_tail.get(name),
+            ],
+            bug_log="Unexpected error reporting heartbeat %s; please "
+            "report this as a bug (8)",
+        )
+
+    def heartbeat_payload(
+        self,
+        name: str,
+        *,
+        now: Optional[datetime.datetime] = None,
+        detail: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        """One heartbeat as the API renders it, or ``None`` if unknown.
+
+        The ping URL is NEVER in this payload, at any scope. It is a
+        write credential for the heartbeat, the `view` scope is handed
+        out freely (a wallboard, a phone, an anonymous grant), and a
+        reader who can silence a monitor is not a reader. Operators get
+        the URLs from ``cronstable heartbeats --urls`` on the box, where
+        the config already is.
+        """
+        hb = self.heartbeats.get(name)
+        if hb is None:
+            return None
+        if now is None:
+            now = get_now(datetime.timezone.utc)
+        observed = self._heartbeat_observe(name, now)
+        record = self._heartbeat_records.get(name) or heartbeat.PingRecord()
+        held = self._heartbeat_pause_active(name, now)
+        payload: dict[str, Any] = {
+            "name": name,
+            "description": hb.description,
+            "enabled": hb.enabled,
+            "state": observed.state if observed else heartbeat.STATE_NEW,
+            "reason": observed.reason if observed else None,
+            "expectation": self._heartbeat_expectation(hb),
+            "periodSeconds": hb.period,
+            "schedule": (
+                str(hb.schedule_tab) if hb.schedule_tab is not None else None
+            ),
+            "timezone": str(hb.timezone) if hb.timezone is not None else None,
+            "graceSeconds": hb.grace,
+            "maxRuntimeSeconds": hb.max_runtime,
+            "lastPingAt": _iso_or_none(record.last_ping_at),
+            "lastPingKind": record.last_kind,
+            "lastSuccessAt": _iso_or_none(record.last_success_at),
+            "lastFailAt": _iso_or_none(record.last_fail_at),
+            "lastDurationSeconds": record.last_duration_seconds,
+            "expectedAt": _iso_or_none(observed.due_at if observed else None),
+            "downAt": _iso_or_none(observed.down_at if observed else None),
+            "overdueSeconds": observed.overdue_seconds if observed else 0.0,
+            "totalPings": record.total_pings,
+            "totalFails": record.total_fails,
+            "paused": held.to_dict() if held is not None else None,
+        }
+        # From the observation, so a heartbeat that went down since the
+        # last monitor pass still shows WHEN, rather than a null beside a
+        # `down` state until the next pass latches it. The latch is the
+        # fallback for the mid-outage reason change it deliberately
+        # remembers (see _heartbeat_evaluate).
+        latched = self._heartbeat_state.get(name)
+        down_since = latched[2] if latched is not None else None
+        if observed is not None and observed.since is not None:
+            down_since = min(down_since or observed.since, observed.since)
+        payload["downSince"] = _iso_or_none(down_since)
+        if detail:
+            # The ping's own words and origin: useful on one heartbeat's
+            # page, noise (and a payload multiplier) on the list.
+            payload["lastExitCode"] = record.last_exit_code
+            payload["lastRunId"] = record.last_run_id
+            payload["lastBody"] = record.last_body
+            payload["lastSource"] = record.last_source
+            payload["lastHost"] = record.last_host
+            payload["lastStartAt"] = _iso_or_none(record.last_start_at)
+            payload["scheduleFindings"] = [
+                finding._asdict() for finding in hb.schedule_findings
+            ]
+            payload["reports"] = sorted(
+                hook
+                for hook, block in (
+                    ("onLate", hb.onLate),
+                    ("onFailure", hb.onFailure),
+                    ("onRecovery", hb.onRecovery),
+                )
+                if report_config_enabled(block["report"])
+            )
+        return payload
+
+    def heartbeats_payload(self) -> dict[str, Any]:
+        """The whole heartbeat set, plus the counts ``/summary`` shows."""
+        now = get_now(datetime.timezone.utc)
+        rows = [
+            payload
+            for payload in (
+                self.heartbeat_payload(name, now=now)
+                for name in self.heartbeats
+            )
+            if payload is not None
+        ]
+        return {"heartbeats": rows, "counts": self.heartbeat_counts(now)}
+
+    def heartbeat_counts(
+        self, now: Optional[datetime.datetime] = None
+    ) -> dict[str, int]:
+        """Heartbeats per state, every state present even at zero.
+
+        Zero-filled so a dashboard binding to ``counts.down`` renders 0
+        rather than blank on a healthy fleet, and so the shape of the
+        object never depends on the data in it.
+        """
+        counts = dict.fromkeys(heartbeat.HEARTBEAT_STATES, 0)
+        counts["total"] = len(self.heartbeats)
+        for observed in self.heartbeat_observations(now).values():
+            counts[observed.state] += 1
+        return counts
+
+    async def _web_list_heartbeats(self, request: web.Request) -> web.Response:
+        return _json_response(
+            self.heartbeats_payload(), headers=self._web_headers()
+        )
+
+    async def _web_get_heartbeat(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        payload = self.heartbeat_payload(name, detail=True)
+        if payload is None:
+            raise _api_error(
+                web.HTTPNotFound, "no such heartbeat: {}".format(name)
+            )
+        return _json_response(payload, headers=self._web_headers())
+
+    async def _web_heartbeat_pause(self, request: web.Request) -> web.Response:
+        """Hold a heartbeat: excused from every check until it expires.
+
+        The planned-maintenance switch. Bounded like a job pause, and for
+        the same reason: an unbounded hold on a monitor is how a fleet
+        ends up with a backup nobody has watched since March.
+        """
+        name = request.match_info["name"]
+        if name not in self.heartbeats:
+            raise _api_error(
+                web.HTTPNotFound, "no such heartbeat: {}".format(name)
+            )
+        body = await self._web_json_body(request)
+        until = self._pause_window_from_body(body)
+        note = body.get("note")
+        if note is not None and not isinstance(note, str):
+            raise _api_error(web.HTTPBadRequest, "note must be a string")
+        by = body.get("by")
+        if by is not None and not isinstance(by, str):
+            raise _api_error(web.HTTPBadRequest, "by must be a string")
+        info = PauseInfo(
+            since=get_now(datetime.timezone.utc),
+            until=until,
+            note=note or "",
+            by=by or "api",
+            channel="api",
+        )
+        self._heartbeat_paused[name] = info
+        # Excused from here on: drop any latch it holds so the response
+        # itself already shows the hold, rather than a minute later. No
+        # recovery report fires for it (see _heartbeat_periodic).
+        self._heartbeat_state.pop(name, None)
+        self._track_state_write(self._persist_heartbeat_pause(name, info))
+        logger.info(
+            "Heartbeat %s paused until %s by %s%s",
+            name,
+            until.isoformat(),
+            info.by,
+            ": " + info.note if info.note else "",
+        )
+        return _json_response(
+            {"paused": info.to_dict(), "heartbeat": name},
+            headers=self._web_headers(),
+        )
+
+    async def _web_heartbeat_resume(
+        self, request: web.Request
+    ) -> web.Response:
+        name = request.match_info["name"]
+        if name not in self.heartbeats:
+            raise _api_error(
+                web.HTTPNotFound, "no such heartbeat: {}".format(name)
+            )
+        was = self._heartbeat_paused.pop(name, None)
+        if was is not None:
+            self._track_state_write(self._persist_heartbeat_pause(name, None))
+            logger.info("Heartbeat %s resumed", name)
+        return _json_response(
+            {"resumed": name, "wasPaused": was is not None},
+            headers=self._web_headers(),
+        )
+
+    def _pause_window_from_body(
+        self, body: dict[str, Any]
+    ) -> datetime.datetime:
+        """``until`` for a pause request, from ``durationSeconds``/``until``.
+
+        The same two spellings and the same validation a job pause takes,
+        so the two endpoints cannot drift in what they accept.
+        """
+        duration = body.get("durationSeconds")
+        if duration is not None and (
+            not isinstance(duration, int) or isinstance(duration, bool)
+        ):
+            raise _api_error(
+                web.HTTPBadRequest, "durationSeconds must be an integer"
+            )
+        until_raw = body.get("until")
+        until = None
+        if until_raw is not None:
+            if not isinstance(until_raw, str):
+                raise _api_error(
+                    web.HTTPBadRequest,
+                    "until must be an ISO-8601 timestamp string",
+                )
+            until = _parse_iso_utc(until_raw)
+            if until is None:
+                raise _api_error(
+                    web.HTTPBadRequest,
+                    "until is not a valid ISO-8601 timestamp",
+                )
+        now = get_now(datetime.timezone.utc)
+        if duration is not None and until is not None:
+            raise _api_error(
+                web.HTTPBadRequest,
+                "give durationSeconds or until, not both",
+            )
+        if until is None:
+            seconds = PAUSE_DEFAULT_SECONDS if duration is None else duration
+            if not 1 <= seconds <= PAUSE_MAX_SECONDS:
+                raise _api_error(
+                    web.HTTPBadRequest,
+                    "durationSeconds must be between 1 and {}".format(
+                        PAUSE_MAX_SECONDS
+                    ),
+                )
+            return now + datetime.timedelta(seconds=seconds)
+        if until <= now:
+            raise _api_error(web.HTTPBadRequest, "until is in the past")
+        if (until - now).total_seconds() > PAUSE_MAX_SECONDS:
+            raise _api_error(
+                web.HTTPBadRequest,
+                "until is more than {} seconds away".format(PAUSE_MAX_SECONDS),
+            )
+        return until
+
+    async def _web_ping(self, request: web.Request) -> web.Response:
+        """Accept one inbound heartbeat ping. Deliberately unauthenticated.
+
+        This is the one route in the whole API that carries no bearer
+        token, and it has to be: the URL goes into a crontab line on a
+        NAS, a GitHub Actions step, an appliance's "notify" field. Handing
+        those the dashboard's token would be far worse than what this
+        endpoint actually grants, which is the ability to say "the thing
+        behind this URL is alive" to exactly one heartbeat.
+
+        The token IS the credential, so the handler gives a caller no way
+        to learn anything from a wrong one: an unknown token, a malformed
+        token and a token for a heartbeat that was just removed all
+        answer the same 404 with the same body, and none of them touches
+        the store or the rate limiter.
+
+        Signals are the URL suffix: none or ``0`` is a success, ``fail``
+        or any nonzero exit code is a failure, ``start`` opens a run. The
+        response is deliberately tiny and uncacheable -- most callers are
+        a ``curl`` in a shell script whose exit code is all anyone reads.
+        """
+        token = request.match_info["token"]
+        name = None
+        if heartbeat.token_is_wellformed(token):
+            # constant-time-ish: a dict lookup on an already-shaped key.
+            # The token space is 130 bits, so the comparison timing of a
+            # miss carries nothing an attacker can walk.
+            name = self._heartbeat_tokens.get(token)
+        if name is None:
+            self.metrics.heartbeat_ping_rejected("unknown-token")
+            raise _api_error(web.HTTPNotFound, "unknown ping token")
+        signal = request.match_info.get("signal") or ""
+        kind, exit_code = _heartbeat_signal(signal)
+        if kind is None:
+            self.metrics.heartbeat_ping_rejected("bad-request")
+            raise _api_error(
+                web.HTTPNotFound,
+                "unknown ping signal {!r}; expected one of: (nothing), "
+                "start, fail, or an exit code".format(signal),
+            )
+        loop_now = asyncio.get_running_loop().time()
+        if not self._heartbeat_limiter.allow(name, loop_now):
+            self.metrics.heartbeat_ping_rejected("rate-limited")
+            raise _api_error(
+                web.HTTPTooManyRequests,
+                "too many pings for this heartbeat",
+            )
+        body = await self._heartbeat_ping_body(request)
+        run_id = request.query.get("rid") or None
+        if run_id is not None and len(run_id) > HEARTBEAT_RUN_ID_MAX:
+            # Truncated rather than refused: a caller's oversized
+            # correlation id is its problem to fix, and failing the ping
+            # over it would turn a cosmetic mistake into a false outage.
+            run_id = run_id[:HEARTBEAT_RUN_ID_MAX]
+        await self.record_ping(
+            name,
+            kind,
+            exit_code=exit_code,
+            run_id=run_id,
+            body=body,
+            source=_peer_address(request),
+        )
+        return _json_response(
+            {"ok": True, "heartbeat": name, "kind": kind},
+            headers=self._web_headers(),
+        )
+
+    async def _heartbeat_ping_body(
+        self, request: web.Request
+    ) -> Optional[str]:
+        """The ping's body text, bounded, or ``None``.
+
+        Read with an explicit cap rather than trusting Content-Length: a
+        chunked request declares none, and this endpoint is reachable by
+        anything that can route to the daemon. Undecodable bytes are
+        replaced rather than refused -- a job piping a binary tail into
+        curl still deserves to have its ping counted.
+        """
+        if request.method in ("GET", "HEAD"):
+            return None
+        try:
+            raw = await request.content.read(HEARTBEAT_BODY_READ_MAX + 1)
+        except (asyncio.TimeoutError, OSError, web.HTTPException):
+            return None
+        if not raw:
+            return None
+        text = raw[:HEARTBEAT_BODY_READ_MAX].decode("utf-8", "replace")
+        text = text.strip()
+        if not text:
+            return None
+        return text[:HEARTBEAT_BODY_KEEP_CHARS]
+
+    async def record_ping(
+        self,
+        name: str,
+        kind: str,
+        *,
+        exit_code: Optional[int] = None,
+        run_id: Optional[str] = None,
+        body: Optional[str] = None,
+        source: Optional[str] = None,
+        at: Optional[datetime.datetime] = None,
+    ) -> heartbeat.PingRecord:
+        """Record one ping for ``name``, in memory and (if any) in store.
+
+        The in-memory record is updated FIRST and unconditionally, so a
+        ping is never lost to a slow or broken store: the monitor reads
+        memory, and a dropped durable write costs a restart's worth of
+        history rather than a false alert while the daemon is up.
+
+        The durable write is a read-modify-write through the store's own
+        transform, which serialises it fleet-wide: two nodes accepting
+        pings for one heartbeat cannot clobber each other, and the
+        clamping in :meth:`PingRecord.apply` means an out-of-order
+        delivery still cannot move the record backwards.
+        """
+        if at is None:
+            at = get_now(datetime.timezone.utc)
+        current = self._heartbeat_records.get(name) or heartbeat.PingRecord()
+        applied = current.apply(
+            kind,
+            at,
+            exit_code=exit_code,
+            run_id=run_id,
+            body=body,
+            source=source,
+            host=self._state_host,
+        )
+        self._heartbeat_records[name] = applied
+        self.metrics.heartbeat_ping(name, kind)
+        logger.debug("Heartbeat %s: %s ping accepted", name, kind)
+        backend = self.state_backend
+        if backend is None:
+            # A ping is the one heartbeat event that is not an absence,
+            # so it resolves its own latch here and now rather than
+            # waiting for the next housekeeping pass to notice.
+            self._heartbeat_evaluate(name, now=at)
+            return applied
+        pause = self._heartbeat_paused.get(name)
+
+        def transform(current_body):
+            # Pure and retry-safe (the store may re-run it on a torn
+            # read): it folds this ping into whatever the document holds
+            # NOW, which is what makes a peer's concurrent ping merge
+            # instead of being overwritten by this node's stale view.
+            stored = heartbeat.PingRecord.from_dict(current_body)
+            merged = stored.apply(
+                kind,
+                at,
+                exit_code=exit_code,
+                run_id=run_id,
+                body=body,
+                source=source,
+                host=self._state_host,
+            )
+            document = merged.to_dict()
+            # The hold is the document's other half and is not this
+            # write's business: carry whatever is there through, falling
+            # back to this node's view for a document being created.
+            held = (current_body or {}).get("pause")
+            if held is None and pause is not None:
+                held = pause.to_dict()
+            document["pause"] = held
+            return document, merged
+
+        merged: heartbeat.PingRecord
+        try:
+            _stored, merged = await asyncio.wait_for(
+                backend.mutate_document(HEARTBEAT_NAMESPACE, name, transform),
+                timeout=HEARTBEAT_STORE_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - best-effort; log, survive
+            self.metrics.state_write_dropped("heartbeat")
+            logger.warning(
+                "state: failed to record the ping of heartbeat %s: %s",
+                name,
+                ex,
+            )
+            self._heartbeat_evaluate(name)
+            return applied
+        # The store's merge is authoritative once it lands: it saw every
+        # node's pings, this process only saw its own.
+        self._heartbeat_records[name] = merged
+        self._heartbeat_evaluate(name)
+        return merged
+
+    async def _rehydrate_heartbeats(self) -> None:
+        """Warm the ping records and holds from the durable store.
+
+        Without this a restart reads as a fleet-wide silence: every
+        heartbeat would anchor on "first seen" and, for anything whose
+        period is shorter than the outage, report down for a ping that
+        did arrive. Best-effort, like every other rehydrate: a store that
+        cannot answer leaves the daemon in its stateless behaviour rather
+        than refusing to start.
+        """
+        backend = self.state_backend
+        if backend is None or not self.heartbeats:
+            return
+        warmed = 0
+        for name in self.heartbeats:
+            try:
+                body = await asyncio.wait_for(
+                    backend.read_document(HEARTBEAT_NAMESPACE, name),
+                    timeout=HEARTBEAT_STORE_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - best-effort
+                logger.warning(
+                    "state: could not read the heartbeat record of %s: %s",
+                    name,
+                    ex,
+                )
+                continue
+            if not body:
+                continue
+            record = heartbeat.PingRecord.from_dict(body)
+            if record.last_ping_at is not None:
+                self._heartbeat_records[name] = record
+                warmed += 1
+            held = _pause_from_dict(body.get("pause"))
+            if held is not None:
+                self._heartbeat_paused[name] = held
+        if warmed:
+            logger.info(
+                "Restored the last ping of %d heartbeat(s) from the "
+                "durable state store",
+                warmed,
+            )
+
+    async def _persist_heartbeat_pause(
+        self, name: str, pause: Optional[PauseInfo]
+    ) -> None:
+        """Mirror a heartbeat hold into its document (best effort).
+
+        The hold rides the ping record's own document rather than a
+        stream of its own: it is one small mutable fact per heartbeat,
+        exactly the shape a document is for, and keeping it there is what
+        makes a hold cluster-visible with no new storage machinery.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return
+        payload = pause.to_dict() if pause is not None else None
+
+        def transform(current_body):
+            document = dict(current_body or {})
+            document["pause"] = payload
+            return document, None
+
+        try:
+            await asyncio.wait_for(
+                backend.mutate_document(HEARTBEAT_NAMESPACE, name, transform),
+                timeout=HEARTBEAT_STORE_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - best-effort; log, survive
+            self.metrics.state_write_dropped("heartbeat")
+            logger.warning(
+                "state: failed to record the hold on heartbeat %s: %s",
+                name,
+                ex,
+            )
+
+    @staticmethod
+    def _heartbeat_expectation(hb: HeartbeatConfig) -> str:
+        """The heartbeat's window in one phrase, for alerts and payloads.
+
+        The cron expression when there is one, so ``{{schedule}}`` reads
+        exactly as it does in a job's alert; otherwise the interval, in
+        the same words the config used.
+        """
+        if hb.schedule_tab is not None:
+            return str(hb.schedule_tab)
+        return "every {}s".format(hb.period)
 
     def _sla_clear_latches(self, name: str) -> None:
         """Drop every breach latch of ``name`` and clear its late gauge.
@@ -8049,6 +9091,8 @@ class Cron:
         async def auth_middleware(request, handler):
             if public_paths and request.path in public_paths:
                 return await handler(request)
+            if request.path.startswith(WEB_PING_PATH_PREFIX):
+                return await handler(request)
             # CORS preflights pass without a token: the Fetch standard
             # strips credentials from them, and a preflight response
             # carries only CORS policy. Matched by the defining header,
@@ -8187,6 +9231,12 @@ class Cron:
             if request.method in WEB_SAFE_METHODS:
                 return await handler(request)
             if request.path in WEB_ORIGIN_EXEMPT_PATHS:
+                return await handler(request)
+            if request.path.startswith(WEB_PING_PATH_PREFIX):
+                # The token in the path is the credential, so an Origin
+                # check adds nothing a caller who already has the URL
+                # could not pass anyway -- and gating it here would break
+                # every legitimate pinger that does send an Origin.
                 return await handler(request)
             origin = request.headers.get("Origin")
             if origin is None:
@@ -11623,6 +12673,9 @@ class Cron:
         # analogue of _reconcile_inflight); resumed from that state,
         # never from memory.
         await self._dag.reconcile_on_boot()
+        # Inbound heartbeats: without this a restart would read as a
+        # fleet-wide silence and page for pings that did arrive.
+        await self._rehydrate_heartbeats()
 
     async def _rehydrate_counters(self) -> None:
         """Seed the Prometheus accumulators from the newest durable snapshot.

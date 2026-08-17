@@ -42,7 +42,7 @@ from typing import (
 
 from aiohttp import web
 
-from cronstable import _json
+from cronstable import _json, heartbeat
 from cronstable import version as _version
 from cronstable.cron import (
     WEB_TOKEN_REQUEST_KEY,
@@ -638,6 +638,34 @@ class MCPHandler:
             ),
             _tool(
                 "observe",
+                "cron_list_heartbeats",
+                "List heartbeats",
+                "Inbound heartbeats: work cronstable does NOT run, watched "
+                "by the ping it is expected to send. State is new/up/late/"
+                "down/paused/disabled; `late` is past due but inside its "
+                "grace window and does not alert. Optional `state` filter. "
+                "Ping URLs are credentials and are never returned.",
+                obj(
+                    {
+                        "state": _enum(list(heartbeat.HEARTBEAT_STATES)),
+                        "offset": _INT,
+                        "limit": _INT,
+                    }
+                ),
+                self._t_list_heartbeats,
+            ),
+            _tool(
+                "observe",
+                "cron_get_heartbeat",
+                "Get one heartbeat",
+                "Full detail for one inbound heartbeat: state, why it is "
+                "down, when the next ping is due, and the newest ping's own "
+                "exit code, body and origin.",
+                obj({"name": _STR}, ["name"]),
+                self._t_get_heartbeat,
+            ),
+            _tool(
+                "observe",
                 "cron_get_node",
                 "Node resources",
                 "This node's live whole-host CPU/memory (optionally with the "
@@ -1065,6 +1093,38 @@ class MCPHandler:
         payload = self._cron.fleet_payload()
         return _result(
             payload, "fleet enabled={}".format(payload.get("enabled"))
+        )
+
+    async def _t_list_heartbeats(self, args: dict[str, Any]) -> dict[str, Any]:
+        payload = self._cron.heartbeats_payload()
+        rows = payload["heartbeats"]
+        state = args.get("state")
+        if isinstance(state, str) and state:
+            rows = [row for row in rows if row["state"] == state]
+        page, meta = self._page(rows, args.get("offset"), args.get("limit"))
+        counts = payload["counts"]
+        return _result(
+            {"heartbeats": page, "counts": counts, "page": meta},
+            "{} heartbeat(s), {} down; {} returned".format(
+                counts["total"], counts["down"], meta["returned"]
+            ),
+        )
+
+    async def _t_get_heartbeat(self, args: dict[str, Any]) -> dict[str, Any]:
+        name = _req_str(args, "name")
+        payload = self._cron.heartbeat_payload(name, detail=True)
+        if payload is None:
+            return _tool_error(
+                "heartbeat not found: {!r}. Use cron_list_heartbeats to "
+                "enumerate.".format(name)
+            )
+        return _result(
+            payload,
+            "heartbeat {} is {}{}".format(
+                name,
+                payload["state"],
+                " ({})".format(payload["reason"]) if payload["reason"] else "",
+            ),
         )
 
     async def _t_get_node(self, args: dict[str, Any]) -> dict[str, Any]:

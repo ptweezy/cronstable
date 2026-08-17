@@ -166,6 +166,8 @@ def test_eventlog_event_ids_are_the_documented_table():
         "late": (1003, platform.EVENTLOG_WARNING_TYPE, 1),
         "event": (1010, platform.EVENTLOG_INFORMATION_TYPE, 2),
         "event-alert": (1011, platform.EVENTLOG_ERROR_TYPE, 2),
+        "heartbeat-down": (1020, platform.EVENTLOG_ERROR_TYPE, 3),
+        "heartbeat-up": (1021, platform.EVENTLOG_INFORMATION_TYPE, 3),
     }
 
 

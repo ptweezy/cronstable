@@ -21,6 +21,7 @@ cronstable mcp [--url URL] [--token TOKEN | --token-env VAR] [--check]
 cronstable tui [--url URL] [--token TOKEN | --token-env VAR] [options]
 cronstable service install|remove|start|stop|status|run [options]
 cronstable import-taskscheduler PATH... [-o FILE] [--timezone NAME]
+cronstable heartbeats [--urls] [--json] [--base URL] [-c FILE-OR-DIR]
 ```
 
 Without a subcommand, `cronstable` is the scheduler daemon described below. With
@@ -451,6 +452,40 @@ task the DAG scheduler launched, the commands print a clean error and exit
 non-zero. `push` reads `FILE` or stdin; `pull` writes to `-o FILE` or stdout,
 `--map-index I` selecting one instance of a
 [mapped](Orchestration-and-DAGs#fan-out-dynamic-mapping) upstream.
+
+## The `heartbeats` subcommand
+
+```
+cronstable heartbeats [--urls] [--json] [--base URL] [-c FILE-OR-DIR]
+```
+
+Lists the configured [inbound heartbeats](Inbound-Heartbeats) -- the work
+cronstable does *not* run, watched by the ping it is expected to send -- and,
+with `--urls`, the ping URL of each.
+
+This is the **only** place a ping URL is ever printed. The HTTP API never
+serves one at any scope, because a URL that can silence a monitor is a write
+credential and the `view` scope is handed out freely. This command reads the
+same configuration the daemon does, on the daemon's own host, where
+`web.pingSecret` already lives.
+
+Like `init`, it is config-only: no daemon, no store, no network. That is
+deliberate -- it has to answer *before* anything is running, because its
+output is what goes into the crontab lines you are about to write.
+
+```console
+$ cronstable heartbeats --urls
+nas-backup    every 86400s   grace 7200s
+    https://cron.example/ping/53vgfgiod3dwmmrtkr5spih4l2
+nightly-etl   0 2 * * *      grace 1800s
+    https://cron.example/ping/s5spg6lqy7f332xsodpon5zlnq
+```
+
+| Option | Description |
+| --- | --- |
+| `--urls` | Print each heartbeat's full ping URL. Treat the output as a credential. |
+| `--json` | Emit JSON (always including `pingUrl`) instead of the table. |
+| `--base URL` | Base the URLs on `URL` instead of the first `http(s)` entry in `web.listen`. Needed when the daemon binds a wildcard address, which is not one anything can ping; the printed host is then an obvious placeholder until you supply one. |
 
 ## The `mcp` subcommand
 

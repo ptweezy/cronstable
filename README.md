@@ -20,22 +20,11 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
 
 ## Why cronstable?
 
-* **Built for locked-down containers.** Runs unmodified under restricted
-  Kubernetes PodSecurity: non-root, read-only root filesystem,
-  `RuntimeDefault` seccomp, every Linux capability dropped (see
-  [Production container deployment](#production-container-deployment)).
-* **Prebuilt for practically everything.** Multi-architecture images on GHCR
-  and Docker Hub. Also, self-contained binaries for Linux (glibc and musl),
-  macOS (signed and notarized) and Windows, so Python on the host is optional
-  (see [Installation](#installation)).
-* **Observability and durability**: A live
-  [web dashboard](#web-dashboard), native [Prometheus metrics](#metrics),
-  per-job [resource monitoring](#resource-monitoring), and opt-in
-  [durable state](https://github.com/ptweezy/cronstable/wiki/Durable-State),
-  [orchestration DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs)
-  and [leader-elected clustering](#clustering-and-leader-election).
+cronstable keeps cron's model (a schedule file running your commands) and
+builds in the tooling that otherwise accumulates around it: retries,
+alerting, durable state, orchestration, clustering, and a live dashboard.
 
-## Features
+### Scheduling
 
 * "Crontab" is in YAML format; classic crontab files are accepted as-is too
   (see [Classic crontab files](#classic-crontab-files))
@@ -50,6 +39,19 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   semantics, uneven `*/n` steps, day-31-in-April, schedules that DST skips or
   repeats) are flagged at config load, in the dashboards, and over the API
   (see [Schedule introspection](#schedule-introspection))
+* Arbitrary timezone support
+* **iCal calendar export**: subscribe any calendar app to `GET /calendar.ics`
+  (or one job's `/jobs/{name}/calendar.ics`) and the fleet's upcoming fires,
+  enumerated by the scheduler's own engine, land on the on-call engineer's
+  calendar; the dashboard draws the same data as a seven-day **week
+  calendar** (see the
+  [Calendar Export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export)
+  wiki page)
+
+### Failure handling
+
+* Flexible configuration: you decide how to determine if a cron job fails or not
+* Option to automatically retry failing cron jobs, with exponential backoff
 * Builtin sending of Sentry, Mail, and webhook (Slack-compatible)
   notifications when cron jobs fail
 * **End-to-end encrypted push notifications**: a dedicated reporter seals each
@@ -61,16 +63,6 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   [Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
   and [LAN Discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)
   wiki pages)
-* Flexible configuration: you decide how to determine if a cron job fails or not
-* Designed for running in Docker, Kubernetes, or 12 factor environments:
-  * Runs in the foreground
-  * Logs everything to stdout/stderr
-  * Production-ready for locked-down corporate container platforms: runs as a
-    non-root user, under a restricted seccomp profile, with a read-only root
-    filesystem, an `fsGroup`-mounted config, and all Linux capabilities
-    dropped, so no writable paths or elevated privileges are required (see
-    [Production container deployment](#production-container-deployment))
-* Option to automatically retry failing cron jobs, with exponential backoff
 * **Per-job SLA monitoring**: an `sla:` block declares thresholds for the runs
   that did not happen: too long without a success, a due slot that never
   started, a run exceeding its runtime bound. A breach fires a dedicated
@@ -79,14 +71,18 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   (see [Late-run detection](#late-run-detection-sla-monitoring) and the
   [Late-Run Detection](https://github.com/ptweezy/cronstable/wiki/Late-Run-Detection)
   wiki page)
-* **Runtime pause/resume**: pause any job's scheduled fires for a bounded
-  window (an hour by default, thirty days at most) over the API, the
-  dashboards, or MCP, without touching the config. Skipped slots are recorded
-  visibly, pending retries defer, catch-up owes nothing for the window, and
-  with a `state:` store the pause survives restarts and is honored by every
-  node (see the
-  [Pausing Jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs)
+* **Inbound heartbeat monitoring**: a `heartbeats:` block watches work
+  cronstable does *not* run. Something else — a classic crontab line on a
+  NAS, a GitHub Actions workflow, a Kubernetes CronJob, an appliance
+  nobody can install a daemon on — calls an unguessable `/ping/<token>`
+  URL when it finishes, and cronstable alerts when that call does not
+  arrive: a dead man's switch for schedules the scheduler has no other way
+  to see (see [Inbound heartbeats](#inbound-heartbeats) and the
+  [Inbound Heartbeats](https://github.com/ptweezy/cronstable/wiki/Inbound-Heartbeats)
   wiki page)
+
+### Durability and orchestration
+
 * **Opt-in durable state**: point a single `state:` config block at a local
   directory (or an Amazon S3 Files / EFS mount to share it fleet-wide) and jobs
   gain durability across restarts: missed-run catch-up after downtime and
@@ -105,8 +101,25 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   never double-launches (see the
   [Orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs)
   wiki page)
+
+### Observability and control
+
+* Optional **[live control panel](#web-dashboard)**: watch every job's status,
+  tail its logs in real time, run or cancel jobs on demand, review run history
+  and success rates, drive DAG runs and approvals, and keep an eye on the whole
+  cluster, from one self-contained page with ten themes and a shortcut for
+  everything and a **[terminal twin](#terminal-dashboard)**
+  (`cronstable tui`) with the same keys
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
+* **Runtime pause/resume**: pause any job's scheduled fires for a bounded
+  window (an hour by default, thirty days at most) over the API, the
+  dashboards, or MCP, without touching the config. Skipped slots are recorded
+  visibly, pending retries defer, catch-up owes nothing for the window, and
+  with a `state:` store the pause survives restarts and is honored by every
+  node (see the
+  [Pausing Jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs)
+  wiki page)
 * **Native TLS on the listeners**: `web.listen` accepts `https://` addresses
   served from a `web.tls` block, mixed freely with plaintext and unix-socket
   entries on one runner, and an optional `clientCa` makes the listener require
@@ -117,13 +130,6 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   gain `--cacert`, `--client-cert`, `--client-key` and `--insecure` (see
   [Serving the API over TLS](#serving-the-api-over-tls) and the
   [Listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS)
-  wiki page)
-* **iCal calendar export**: subscribe any calendar app to `GET /calendar.ics`
-  (or one job's `/jobs/{name}/calendar.ics`) and the fleet's upcoming fires,
-  enumerated by the scheduler's own engine, land on the on-call engineer's
-  calendar; the dashboard draws the same data as a seven-day **week
-  calendar** (see the
-  [Calendar Export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export)
   wiki page)
 * Optional **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)** for
   AI agents. An agent can **observe**
@@ -141,6 +147,9 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   each run's CPU time and peak memory across its whole process tree, live and
   per run, in the dashboard, the metrics, and the failure reports (see
   [Resource monitoring](#resource-monitoring))
+
+### Fleets
+
 * A **job-set id**: an order-independent fingerprint of every job's effective
   configuration, so replicas deployed from the same config can confirm they
   hold an identical set of jobs (see [Job-set id](#job-set-id))
@@ -149,13 +158,20 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   **elect a leader** so several replicas can run from one config without
   double-running jobs (see
   [Clustering and leader election](#clustering-and-leader-election))
-* Arbitrary timezone support
-* Optional **[live control panel](#web-dashboard)**: watch every job's status,
-  tail its logs in real time, run or cancel jobs on demand, review run history
-  and success rates, drive DAG runs and approvals, and keep an eye on the whole
-  cluster, from one self-contained page with ten themes and a shortcut for
-  everything and a **[terminal twin](#terminal-dashboard)**
-  (`cronstable tui`) with the same keys
+
+### Deployment
+
+* **Built for locked-down containers.** Runs in the foreground, logs
+  everything to stdout/stderr, 12-factor style, and works unmodified under
+  restricted Kubernetes PodSecurity: as a non-root user, on a read-only root
+  filesystem with an `fsGroup`-mounted config, under a `RuntimeDefault`
+  seccomp profile, and with every Linux capability dropped, so it needs no
+  writable paths or elevated privileges (see
+  [Production container deployment](#production-container-deployment))
+* **Prebuilt for practically everything.** Multi-architecture images on GHCR
+  and Docker Hub, plus self-contained binaries for Linux (glibc and musl),
+  macOS (signed and notarized), and Windows, so Python on the host is
+  optional (see [Installation](#installation))
 
 [![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](#web-dashboard)
 
@@ -1339,6 +1355,102 @@ both dashboards, an `sla` object on `GET /jobs`, and
 monitor runs inside the daemon and cannot report its own death, so pair it
 with an external Prometheus staleness alert. See the
 [Late-Run Detection](https://github.com/ptweezy/cronstable/wiki/Late-Run-Detection)
+wiki page.
+
+### Inbound heartbeats
+
+Everything above watches jobs cronstable runs. A **heartbeat** is the
+mirror image: work cronstable does *not* run, watched by the ping it is
+expected to send. The signal is an absence, so it covers the schedules
+that are otherwise invisible — a crontab line on a NAS, a GitHub Actions
+workflow, a Kubernetes CronJob, a backup appliance — with no daemon to
+install on the far end and nothing to migrate.
+
+```yaml
+web:
+  listen:
+    - http://0.0.0.0:8080
+  # One secret; every heartbeat's URL derives from it, and rotating it
+  # rotates them all at once.
+  pingSecret:
+    fromEnvVar: CRONSTABLE_PING_SECRET
+
+heartbeats:
+  - name: nas-backup
+    description: restic to B2, from the NAS
+    periodSeconds: 86400        # expect a ping at least daily
+    graceSeconds: 3600          # ...with an hour of slack
+    onLate:
+      report:
+        webhook:
+          url:
+            fromEnvVar: SLACK_WEBHOOK_URL
+
+  - name: nightly-etl
+    schedule: "0 2 * * *"       # expect a ping after each 02:00 fire
+    timezone: America/New_York
+    graceSeconds: 1800
+    maxRuntimeSeconds: 7200     # for a job that also pings /start
+```
+
+`cronstable heartbeats --urls` prints the URL of each (the only place they
+are ever printed — see below), and the far end calls it:
+
+```sh
+# the whole integration, at the end of the existing crontab line
+0 3 * * * /usr/local/bin/backup.sh && curl -fsS -m 10 https://cron.example/ping/<token>
+
+# or, reporting the outcome either way, in one unbranching line
+0 3 * * * /usr/local/bin/backup.sh; curl -fsS -m 10 https://cron.example/ping/<token>/$?
+
+# a long job can bracket itself, arming maxRuntimeSeconds
+curl -fsS "$URL/start"; ./etl.sh; curl -fsS --data-raw "$(tail -c 400 etl.log)" "$URL/$?"
+```
+
+**States.** `new` (never pinged, still inside its first window) → `up` →
+`late` (past due, inside `graceSeconds`: visible everywhere, deliberately
+silent) → `down`. Only `down` reports, and it latches: one report per
+outage, not one per minute. A heartbeat goes down for one of three
+reasons — `missed` (no ping before due + grace), `failed` (a `/fail` ping
+or a nonzero exit code said so, which short-circuits the clock), or
+`overrun` (`/start` arrived, `maxRuntimeSeconds` elapsed, no finish ever
+landed). Recovery is the next good ping, which fires `onRecovery` and is
+processed the instant it lands rather than on the next monitor pass.
+
+A heartbeat that has *never* been pinged ages exactly like the others,
+anchored on when the daemon first loaded it: a restart grants a full
+window before anything can report, and a backup that never ran once still
+eventually pages. Silence is detected on the housekeeping cadence (about
+once a minute), so a window shorter than that is meaningless.
+
+**The three hooks** take the same `report` block as a job's: `onLate` when
+it goes down, `onFailure` when a `/fail` ping says so, `onRecovery` when
+it comes back. Mail, Sentry, shell, webhook, Windows Event Log, and the
+end-to-end encrypted push reporter all work unchanged; shell reporters
+additionally get `CRONSTABLE_HEARTBEAT*` in their environment.
+
+**The ping URL is a credential.** It is the one route in the API that no
+bearer token gates — it has to be, because it goes into a crontab line on
+a machine that must never hold the dashboard's token. The unguessable
+token (130 bits, derived by HMAC from `web.pingSecret`, or pinned per
+heartbeat with `token:`) authorises exactly one thing: saying that one
+heartbeat is alive. Because a URL that can silence a monitor is a write
+credential, and `view` scope is handed out freely, **no API response ever
+contains it at any scope** — `cronstable heartbeats --urls`, on the
+daemon's own host, is where operators read them. Unknown, malformed and
+removed tokens all answer the same 404, and each heartbeat's ingest is
+rate-limited to a burst of 20 then one per second.
+
+**Surfaces.** `GET /heartbeats` and `GET /heartbeats/{name}`;
+`POST /heartbeats/{name}/pause` and `/resume` for planned maintenance;
+per-state counts on `GET /summary`; and
+`cronstable_heartbeat_state{heartbeat, state}`,
+`cronstable_heartbeat_pings_total{heartbeat, kind}` and
+`cronstable_heartbeat_downs_total{heartbeat, reason}` in the metrics.
+With a `state:` section the last ping and any hold are durable and shared
+fleet-wide, so a restart is not read as silence and only the leader
+reports; without one both are node-local. See the
+[Inbound Heartbeats](https://github.com/ptweezy/cronstable/wiki/Inbound-Heartbeats)
 wiki page.
 
 ### Concurrency
