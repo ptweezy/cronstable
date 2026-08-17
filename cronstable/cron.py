@@ -1918,6 +1918,25 @@ def web_site_from_url(
         raise ValueError(url)
 
 
+class _StopEvent(asyncio.Event):
+    """The run loop's stop flag, mirrored into the loop's wake event.
+
+    Setting this directly (tests do, and so does signal_shutdown) has to
+    cut the run loop's sleep short.  Mirroring the set is what lets that
+    sleep park on the single wake event rather than race one waiter task
+    per source: the loop runs the sleep on every pass, so a second waiter
+    is per-pass churn on the idlest path there is.
+    """
+
+    def __init__(self, wake: asyncio.Event) -> None:
+        super().__init__()
+        self._wake = wake
+
+    def set(self) -> None:
+        super().set()
+        self._wake.set()
+
+
 class Cron:
     def __init__(
         self, config_arg: Optional[str], *, config_yaml: Optional[str] = None
@@ -2116,12 +2135,14 @@ class Cron:
             self._any_sla_cache = None
 
         self._wait_for_running_jobs_task: asyncio.Task | None = None
-        self._stop_event = asyncio.Event()
-        # signal_reload (SIGHUP, or the Windows service's PARAMCHANGE):
-        # the event wakes the run loop's sleep so
-        # the reload happens now rather than at the next housekeeping
-        # minute; the reparse itself is forced by voiding _config_sig.
-        self._reload_event = asyncio.Event()
+        # Every wake source for the run loop's sleep feeds this one
+        # event: a shutdown (_stop_event mirrors its own set into it) and
+        # a reload request (signal_reload -- SIGHUP, or the Windows
+        # service's PARAMCHANGE), which wakes the sleep so the reload
+        # happens now rather than at the next housekeeping minute; the
+        # reparse itself is forced by voiding _config_sig.
+        self._wake_event = asyncio.Event()
+        self._stop_event = _StopEvent(self._wake_event)
         self._jobs_running = asyncio.Event()
         self.retry_state: dict[str, JobRetryState] = {}
         self.web_runner: web.AppRunner | None = None
@@ -2530,33 +2551,25 @@ class Cron:
     async def _sleep_until_wake(self, sleep_interval: float) -> None:
         """Park the run loop until the interval elapses or a wake arrives.
 
-        Two waiters, not one: a shutdown request wakes the sleep (tests
-        set ``_stop_event`` directly), and a reload request
+        One waiter, not one per source: a shutdown request wakes the
+        sleep (tests set ``_stop_event`` directly, and it mirrors itself
+        into the wake event), and a reload request
         (:meth:`signal_reload`) wakes it too, so the reload happens now
-        rather than up to a housekeeping minute later.
+        rather than up to a housekeeping minute later.  This runs on
+        every pass of the loop, idle ones included, so it stays a single
+        Event.wait: racing a waiter task per source doubled the cost of
+        an idle pass.
         """
-        waiters = (
-            asyncio.create_task(self._stop_event.wait()),
-            asyncio.create_task(self._reload_event.wait()),
-        )
         try:
-            await asyncio.wait(
-                waiters,
-                timeout=sleep_interval,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        finally:
-            # asyncio.wait never cancels its waiters, so reap them here
-            # even when this coroutine is itself cancelled mid-sleep --
-            # otherwise both Event.wait tasks outlive the sleep as
-            # orphans. Cleared here, not in reload_config: the event only
-            # wakes this sleep; the voided _config_sig carries the
-            # force-reparse into housekeeping (which the cleared
-            # _last_housekeeping_minute guarantees runs next pass).
-            for waiter in waiters:
-                waiter.cancel()
-            await asyncio.gather(*waiters, return_exceptions=True)
-            self._reload_event.clear()
+            await asyncio.wait_for(self._wake_event.wait(), sleep_interval)
+        except asyncio.TimeoutError:
+            return
+        # Cleared here, not in reload_config: the event only wakes this
+        # sleep; the voided _config_sig carries the force-reparse into
+        # housekeeping (which the cleared _last_housekeeping_minute
+        # guarantees runs next pass).  A shutdown wake leaves the loop at
+        # its own _stop_event check, which the clear does not disturb.
+        self._wake_event.clear()
 
     def signal_reload(self, source: str = "SIGHUP") -> None:
         """Request an immediate config reload; ``source`` names the
@@ -2576,7 +2589,7 @@ class Cron:
         logger.info("Reload requested (%s); reloading configuration", source)
         self._config_sig = None
         self._last_housekeeping_minute = None
-        self._reload_event.set()
+        self._wake_event.set()
 
     def signal_shutdown(self) -> None:
         logger.debug("Signalling shutdown")
