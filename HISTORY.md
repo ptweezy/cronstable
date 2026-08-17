@@ -45,6 +45,19 @@
   polling at a slow 30-second cadence so the title stays current in the
   background, and on a cluster node the title signs with the node's name.
   The page carries a favicon: the cronstable pendulum mark.
+- Jobs on the packaged builds (the Homebrew formula, the release
+  binaries, the Windows service) can shell out to the `cronstable` CLI:
+  the daemon strips PyInstaller's private `_PYI_*` process-linkage
+  variables from the environment of every job, DAG task and shell
+  reporter, and `cronstable lock run` does the same for the command it
+  wraps. Previously those inherited variables made the frozen CLI's
+  bootloader refuse to start (its parent is the job's shell, not the
+  daemon it expects), so on a frozen install every `state`, `cursor`,
+  `lock`, `xcom` and `secret` call from a job failed before the
+  subcommand ran, and usually silently: defensively written commands
+  (`... || true`) exited 0 while writing nothing. The release binary
+  lanes run this shape against each built binary and assert the durable
+  write rather than the exit status.
 
 ## 1.2.42
 
