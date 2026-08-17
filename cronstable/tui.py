@@ -50,7 +50,9 @@ import heapq
 import itertools
 import json
 import logging
+import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -1315,6 +1317,7 @@ PREF_DEFAULTS: dict[str, Any] = {
     "zen": True,  # wallboard screensaver
     "zen_idle_s": 90,
     "ascii": False,  # ASCII status glyphs
+    "motion": True,  # the living logo mark (off = honest still pose)
 }
 
 
@@ -1367,6 +1370,346 @@ def save_prefs(prefs: dict[str, Any], path: Optional[str] = None) -> None:
             )
     except OSError as exc:  # pragma: no cover - depends on host FS
         logger.debug("could not save TUI prefs: %s", exc)
+
+
+# ===================================================================
+#  the living mark: the logo engine, one link, one terminal cell
+# ===================================================================
+#: The header wordmark's ``l`` is a cart-and-pendulum simulation, the
+#: terminal sibling of the web page's logo engine (whose double link
+#: projects to a single glyph here, so the TUI simulates the one link a
+#: cell can show).  Constants carry the web engine's flavor where it
+#: translates: gravity, an authority budget per mode, the 0.55 s
+#: motor-dead dangle, the strive-but-never-top energy target while the
+#: signal is lost, and the two-timescale breeze.
+_MARK_G = 9.81  # gravity (m/s^2)
+_MARK_L = 0.34  # arm length (m), the web engine's shoulder link
+_MARK_DAMP = 0.15  # viscous damping on the joint (1/s)
+_MARK_TRACK = 0.42  # cart travel each side of home (m)
+_MARK_DT = 1.0 / 120.0  # physics substep (s)
+_MARK_A_BAL = 18.0  # accel authority while balancing (m/s^2)
+_MARK_A_SWING = 6.0  # swing-up authority (m/s^2)
+_MARK_LIMP_S = 0.55  # motor-dead dangle before the swing starts
+_MARK_DEAD_FRAC = 0.93  # climb fraction to strive for while signal-lost
+_MARK_STRIVE_S = 28.0  # how long a dead mark strives before resting
+_MARK_CATCH_TH = 0.50  # catch basin: |theta| (rad)
+_MARK_CATCH_W = 1.80  # catch basin: |omega| (rad/s)
+_MARK_W0 = 0.9  # breeze strength on the joint (rad/s^2)
+_MARK_GUST_ON = 0.85  # wind ema that starts the shiver ink...
+_MARK_GUST_OFF = 0.62  # ...and the lower bound that ends it
+_MARK_POKE = 1.5  # one keyboard gust (rad/s)
+_MARK_POKE_GROW = 0.5  # escalation per still-warm earlier poke
+_MARK_POKE_CAP = 3.5  # angriest possible gust (rad/s)
+
+#: Balance law, cart acceleration a = K.[x, xd, theta, omega]: LQR by
+#: discrete Riccati iteration over the upright linearization (the same
+#: synthesis the web engine runs at page load), with Q = diag(4, 3.2,
+#: 140, 2), R = 0.12 at the 1/120 s step.  Precomputed because the
+#: gains are constants of the model, and ``import cronstable.tui``
+#: stays free of a few thousand 4x4 iterations.
+_MARK_K = (5.2462, 8.8505, 62.0987, 10.5907)
+
+
+def clamp_f(value: float, lo: float, hi: float) -> float:
+    return lo if value < lo else hi if value > hi else value
+
+
+def _mark_wrap(angle: float) -> float:
+    """Fold an angle into (-pi, pi], zero at upright."""
+    tau = 2.0 * math.pi
+    angle = ((angle % tau) + tau) % tau
+    return angle - tau if angle > math.pi else angle
+
+
+class PendulumMark:
+    """The ``l`` of the header wordmark, kept upright by simulation.
+
+    The dashboard's logo is a self-balancing pendulum standing in for
+    the wordmark's ``l``; this is the same creature living in one
+    terminal cell.  While the daemon is live it balances upright (the
+    mark reads as the letter) under a breeze that swells, lulls, and
+    leaves real near-still spells; a strong gust shivers the letter's
+    ink.  Lose the signal and the motor cuts: it collapses, swings
+    hard with what authority it has left (held just short of the top,
+    on purpose), then tires into a resting dangle so a long outage
+    costs no frames.  When the signal returns it swings itself back up
+    and catches into balance.  :meth:`poke` is the keyboard analogue
+    of brushing the web mark with the pointer, and repeated pokes
+    escalate until the mark goes over and earns its recovery.
+
+    The physics is real: RK4 over the nonlinear cart/pendulum dynamics
+    at 120 Hz, a state-feedback balance law, an energy-pumping
+    swing-up.  A terminal cell is simply a very blunt renderer, so the
+    pose projects to a glyph (``l`` upright, ``/`` and ``\\`` tipping,
+    ``_`` down) plus an ink.  Every frame is plain ASCII, so --ascii
+    changes nothing here.
+
+    Deterministic under a fixed ``seed`` (the app seeds from the
+    clock, the tests pin it); ``breeze=False`` stills the wind for
+    rigs that need bit-stable frames.
+    """
+
+    def __init__(
+        self,
+        seed: Optional[int] = None,
+        connected: bool = False,
+        breeze: bool = True,
+    ) -> None:
+        self.rand = random.Random(seed)
+        self.breeze = breeze
+        self.connected = connected
+        self.x = 0.0  # cart position (m, 0 = the l's cell)
+        self.xd = 0.0  # cart velocity
+        self.th = 0.0 if connected else math.pi  # angle from upright
+        self.w = 0.0  # angular velocity
+        self.mode = "balance" if connected else "limp"
+        self.t = 0.0
+        self.limp_until = 0.0 if connected else _MARK_LIMP_S
+        self.catch_t = -9.0
+        self._strive_until = 0.0 if connected else _MARK_STRIVE_S
+        self._nb = 0.0  # slow breeze envelope (OU, 9 s memory)
+        self._nf = 0.0  # fast flutter (OU, 0.8 s memory)
+        self._wind_ema = 0.0
+        self._gust = False
+        self._poke_t = -9.0
+        self._poke_heat = 0.0
+        self._knocked = False
+        self._bucket = 0 if connected else 3
+
+    # ---- inputs -----------------------------------------------------
+    def set_connected(self, up: bool) -> bool:
+        """Follow the daemon signal; True when the state flipped."""
+        up = bool(up)
+        if up == self.connected:
+            return False
+        self.connected = up
+        if not up:
+            self._strive_until = self.t + _MARK_STRIVE_S
+            if self.mode == "balance":
+                self._to_limp()
+        return True
+
+    def poke(self, strength: float = _MARK_POKE) -> None:
+        """A keyboard gust at the joint.  Pokes remember each other
+        for a moment and escalate, so a mash overwhelms the balance
+        authority where a lone jab only staggers it."""
+        sign = -1.0 if self.rand.random() < 0.5 else 1.0
+        k = min(
+            _MARK_POKE_CAP,
+            strength * (1.0 + _MARK_POKE_GROW * self._poke_heat),
+        )
+        self._poke_heat += 1.0
+        self.w += sign * k * (0.75 + 0.5 * self.rand.random())
+        self._poke_t = self.t
+        if not self.connected:
+            # rattling a dead mark wakes it back into its striving
+            self._strive_until = self.t + _MARK_STRIVE_S
+
+    def consume_knockover(self) -> bool:
+        """True once per fall that a recent poke caused."""
+        hit, self._knocked = self._knocked, False
+        return hit
+
+    def park(self, connected: bool) -> None:
+        """A still pose that stays honest about state, for reduced
+        motion: upright when live, hanging when not."""
+        self.connected = bool(connected)
+        self.x = self.xd = self.w = 0.0
+        self.th = 0.0 if connected else math.pi
+        self.mode = "balance" if connected else "limp"
+        self.limp_until = self.t + _MARK_LIMP_S
+        self.catch_t = -9.0
+        self._strive_until = 0.0
+        self._nb = self._nf = self._wind_ema = 0.0
+        self._gust = False
+        self._bucket = 0 if connected else 3
+
+    # ---- time -------------------------------------------------------
+    def step(self, elapsed: float) -> None:
+        """Advance by real seconds (clamped, substepped at 120 Hz)."""
+        remaining = min(max(elapsed, 0.0), 1.5)
+        while remaining > 1e-9:
+            dt = _MARK_DT if remaining > _MARK_DT else remaining
+            remaining -= dt
+            self._substep(dt)
+
+    def _to_limp(self) -> None:
+        self.mode = "limp"
+        self.limp_until = self.t + _MARK_LIMP_S
+        if self.t - self._poke_t < 2.0:
+            self._knocked = True
+
+    def _balance_accel(self, thw: float, dt: float) -> float:
+        a = clamp_f(
+            _MARK_K[0] * self.x
+            + _MARK_K[1] * self.xd
+            + _MARK_K[2] * thw
+            + _MARK_K[3] * self.w,
+            -_MARK_A_BAL,
+            _MARK_A_BAL,
+        )
+        if self.breeze:
+            # The web engine's breeze, verbatim in character: a fast
+            # Ornstein-Uhlenbeck flutter whose strength is breathed by
+            # a slow envelope (squared then saturated, so a swell has
+            # a hard ceiling), faded by how far the cart has strayed.
+            rt = math.sqrt(dt)
+            rnd = self.rand.random
+            self._nb += (-self._nb / 9.0) * dt + 1.63 * rt * (rnd() - 0.5)
+            self._nf += (-self._nf / 0.8) * dt + 5.48 * rt * (rnd() - 0.5)
+            room = 1.0 / (1.0 + 40.0 * self.x * self.x)
+            ease = (
+                clamp_f((self.t - self.catch_t) / 1.5, 0.0, 1.0)
+                if self.catch_t >= 0
+                else 1.0
+            )
+            swell = self._nb * self._nb
+            wind = (
+                _MARK_W0
+                * (0.25 + 1.05 * swell / (1.0 + swell))
+                * self._nf
+                * room
+                * ease
+            )
+            self.w += wind * dt
+            # the shiver ink keys off the wind itself: the balance law
+            # hides the lean, but it cannot hide the weather
+            self._wind_ema += (abs(wind) - self._wind_ema) * min(1.0, dt / 0.4)
+        return a
+
+    def _swing_accel(self, thw: float) -> float:
+        # energy pump (dE/dt tracks the target from either side); while
+        # the signal is dead the target starts at 93% of the climb and,
+        # once the striving window lapses, eases down to a rest dangle
+        e = 0.5 * (_MARK_L * self.w) ** 2 + _MARK_G * _MARK_L * (
+            math.cos(self.th) - 1.0
+        )
+        if self.connected:
+            etgt = 0.0
+        else:
+            hang = -2.0 * _MARK_G * _MARK_L
+            strive = clamp_f((self._strive_until - self.t) / 8.0, 0.0, 1.0)
+            etgt = hang * 0.995 + strive * (
+                hang * (1.0 - _MARK_DEAD_FRAC) - hang * 0.995
+            )
+        a = clamp_f(
+            3.0 * (e - etgt) * self.w * math.cos(self.th),
+            -_MARK_A_SWING,
+            _MARK_A_SWING,
+        )
+        a = clamp_f(
+            a + clamp_f(-1.6 * self.x - 1.2 * self.xd, -1.5, 1.5),
+            -_MARK_A_SWING,
+            _MARK_A_SWING,
+        )
+        if self.connected:
+            if abs(thw) < _MARK_CATCH_TH and abs(self.w) < _MARK_CATCH_W:
+                self.mode = "balance"
+                self.catch_t = self.t
+        elif abs(thw) < 0.45:
+            # held just short of the top, literally: while the daemon
+            # is dead an approach to upright is shoved back down
+            a = -_MARK_A_SWING if thw > 0 else _MARK_A_SWING
+        return a
+
+    def _substep(self, dt: float) -> None:
+        self.t += dt
+        self._poke_heat -= self._poke_heat * min(1.0, dt / 1.6)
+        thw = _mark_wrap(self.th)
+        a = 0.0
+        if self.mode == "balance":
+            if abs(thw) > 1.0 or abs(self.x) > _MARK_TRACK * 1.02:
+                self._to_limp()
+            else:
+                a = self._balance_accel(thw, dt)
+        elif self.mode == "limp":
+            a = clamp_f(-2.0 * self.xd, -3.0, 3.0)  # rolling drag only
+            if self.t >= self.limp_until:
+                self.mode = "swing"
+        else:
+            a = self._swing_accel(thw)
+        self._integrate(a, dt)
+        lim = _MARK_TRACK * 1.05
+        if abs(self.x) > lim:  # hard end-stops
+            self.x = clamp_f(self.x, -lim, lim)
+            self.xd = 0.0
+            if self.mode == "balance":
+                self.mode = "swing"
+
+    def _integrate(self, a: float, dt: float) -> None:
+        def deriv(
+            x: float, xd: float, th: float, w: float
+        ) -> tuple[float, float, float, float]:
+            return (
+                xd,
+                a,
+                w,
+                (_MARK_G * math.sin(th) - a * math.cos(th)) / _MARK_L
+                - _MARK_DAMP * w,
+            )
+
+        s = (self.x, self.xd, self.th, self.w)
+        k1 = deriv(*s)
+        k2 = deriv(*(s[i] + 0.5 * dt * k1[i] for i in range(4)))
+        k3 = deriv(*(s[i] + 0.5 * dt * k2[i] for i in range(4)))
+        k4 = deriv(*(s[i] + dt * k3[i] for i in range(4)))
+        self.x, self.xd, self.th, self.w = (
+            s[i] + (dt / 6.0) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i])
+            for i in range(4)
+        )
+
+    # ---- projection -------------------------------------------------
+    def frame(self) -> tuple[str, Optional[str]]:
+        """The mark's cell: ``(glyph, ink)``, ink None for the
+        wordmark's own.  Buckets carry hysteresis so a pose riding an
+        edge cannot flicker."""
+        thw = _mark_wrap(self.th)
+        ath = abs(thw)
+        b = self._bucket
+        if b == 0:
+            if ath > 0.55:
+                b = 3 if ath > 2.1 else (1 if thw > 0 else 2)
+        elif b in (1, 2):
+            if ath < 0.45:
+                b = 0
+            elif ath > 2.1:
+                b = 3
+            else:
+                b = 1 if thw > 0 else 2
+        elif ath < 1.95:
+            b = 0 if ath < 0.45 else (1 if thw > 0 else 2)
+        self._bucket = b
+        glyph = ("l", "/", "\\", "_")[b]
+        if self.mode == "balance":
+            if self.t - self.catch_t < 0.9:
+                ink: Optional[str] = "ok"  # the catch, flashed
+            else:
+                self._gust = self._wind_ema > (
+                    _MARK_GUST_OFF if self._gust else _MARK_GUST_ON
+                )
+                ink = "accent" if self._gust else None
+        else:
+            ink = "accent" if self.connected else "fail"
+        return glyph, ink
+
+    def quiescent(self) -> bool:
+        """True when 1 Hz sampling does the motion justice: balanced
+        under ordinary breeze, or long-dead and resting.  Everything
+        else (collapses, striving, swing-ups, catches, pokes) deserves
+        the fast clock."""
+        if self.mode == "balance":
+            return (
+                abs(_mark_wrap(self.th)) < 0.35
+                and abs(self.w) < 1.0
+                and self.t - self.catch_t > 1.4
+            )
+        if self.mode == "swing" and not self.connected:
+            return (
+                self.t > self._strive_until
+                and abs(_mark_wrap(self.th)) > 2.7
+                and abs(self.w) < 1.0
+            )
+        return False
 
 
 # ===================================================================
@@ -2461,6 +2804,15 @@ class App:
         self._start_job = start_job
         self._boot_override = boot
 
+        # ---- the living mark (the header wordmark's l) ----
+        # born hanging and signal-less: the first successful poll is
+        # what stands it up, so every launch opens on a swing-up
+        self.mark_sim = PendulumMark(seed=time.time_ns() & 0x7FFFFFFF)
+        self._mark_wake = asyncio.Event()
+        self._mark_fast = False
+        self._mark_mono = 0.0
+        self._mark_egg_toast = False
+
         # ---- verdict / alarm (fleetSound port) ----
         self.verdict: Optional[dict[str, Any]] = None
         self.incident_set: list[str] = []
@@ -2727,6 +3079,7 @@ class App:
                     self._tick_loop(),
                     self._input_loop(),
                     self._paint_loop(),
+                    self._mark_loop(),
                 )
             ]
             done, pending = await asyncio.wait(
@@ -2841,6 +3194,7 @@ class App:
         except Unauthorized:
             self.connected = False
             self.conn_error = "unauthorized"
+            self._mark_signal(False)
             if not self.is_open("token"):
                 self.open("token")
                 self.focus = "token"
@@ -2849,11 +3203,13 @@ class App:
         except Exception as exc:  # noqa: BLE001 - shown in the header
             self.connected = False
             self.conn_error = str(exc) or exc.__class__.__name__
+            self._mark_signal(False)
             self.mark()
             return
         first = self.fetched_mono == 0.0
         self.connected = True
         self.conn_error = ""
+        self._mark_signal(True)
         self.jobs = jobs if isinstance(jobs, list) else []
         self.by_name = {j.get("name", ""): j for j in self.jobs}
         self.fetched_mono = time.monotonic()
@@ -2968,7 +3324,80 @@ class App:
                     self.zen_on = want
             elif self.zen_on:
                 self.zen_on = False
+            self._mark_ambient()
             self.mark()  # clocks, countdowns, ages
+
+    # ---------------------------------------------------------------
+    #  the living mark: cadence + signal plumbing
+    # ---------------------------------------------------------------
+    def _mark_ambient(self) -> None:
+        """One 1 Hz breath for the header mark, riding the tick (whose
+        ``mark()`` already repaints the header row for the clock, so a
+        calm board pays nothing extra for staying alive).  When the
+        sim turns lively, hand the clock to the fast loop."""
+        if self._mark_fast or not self.prefs["motion"]:
+            return
+        now = time.monotonic()
+        if self._mark_mono:
+            self.mark_sim.step(now - self._mark_mono)
+        self._mark_mono = now
+        if not self.mark_sim.quiescent():
+            self._mark_wake.set()
+
+    async def _mark_loop(self) -> None:
+        """~12 fps for the mark, but only while it is worth watching:
+        collapses, striving, swing-ups, catches, pokes.  Parked on an
+        event the rest of the time, so a balanced (or long-dead,
+        resting) mark animates on the tick alone."""
+        while not self.quit:
+            await self._mark_wake.wait()
+            self._mark_wake.clear()
+            self._mark_fast = True
+            try:
+                self._mark_mono = time.monotonic()
+                shown = self.mark_sim.frame()
+                while (
+                    not self.quit
+                    and bool(self.prefs["motion"])
+                    and not self.mark_sim.quiescent()
+                ):
+                    now = time.monotonic()
+                    self.mark_sim.step(now - self._mark_mono)
+                    self._mark_mono = now
+                    if self.mark_sim.consume_knockover():
+                        self._mark_egg()
+                    frame = self.mark_sim.frame()
+                    if frame != shown:
+                        shown = frame
+                        self.mark()
+                    await asyncio.sleep(0.08)
+            finally:
+                self._mark_fast = False
+
+    def _mark_egg(self) -> None:
+        # the once-a-session payoff for battering the mark over by
+        # hand; the recovery it is about to perform is the proof
+        if not self._mark_egg_toast:
+            self._mark_egg_toast = True
+            self.toast("info", "⌁ stability is not a metaphor")
+
+    def _mark_signal(self, up: bool) -> None:
+        """Feed the poll outcome to the mark: losing the daemon cuts
+        the motor, getting it back starts the swing-up."""
+        if not self.mark_sim.set_connected(up):
+            return
+        if self.prefs["motion"]:
+            self._mark_wake.set()
+        else:
+            self.mark_sim.park(up)
+
+    def _sync_mark_motion(self) -> None:
+        """The settings toggle: still pose off, live physics on."""
+        if self.prefs["motion"]:
+            self._mark_mono = 0.0
+            self._mark_wake.set()
+        else:
+            self.mark_sim.park(self.connected)
 
     async def _input_loop(self) -> None:
         while not self.quit:
@@ -4322,6 +4751,14 @@ class AppKeys(AppPalette):
             self.recompute_view()
         elif key == "m":
             self.open_tail([])
+        elif key == "~":
+            # the pointer brushes the web page's mark; the keyboard
+            # gusts this one.  Deliberately absent from the help
+            # overlay: the boot self-test whispers the key, and a mash
+            # is answered in kind (see PendulumMark.poke)
+            if self.prefs["motion"]:
+                self.mark_sim.poke()
+                self._mark_wake.set()
 
     # ---------------------------------------------------------------
     async def _overlay_key(self, top: str, key: str) -> None:
@@ -4863,8 +5300,14 @@ class AppRender(AppKeys):
         return rows
 
     def render_header(self, paint: Painter, cols: int) -> str:
+        # the wordmark's l is the living mark: while it balances, the
+        # word reads whole; lose the daemon and the letter itself goes
+        # over ("cronstab_e"), exactly like the web page's logo
+        glyph, ink = self.mark_sim.frame()
         left = [
-            paint.style(" cronstable ", "bright", bold=True),
+            paint.style(" cronstab", "bright", bold=True),
+            paint.style(glyph, ink or "bright", bold=True),
+            paint.style("e ", "bright", bold=True),
             paint.style("⌁ tui ", "accent"),
         ]
         if self.version:
@@ -5560,6 +6003,8 @@ class AppOverlays(AppRender):
                 self.save_prefs()
                 if key in ("wrap", "timestamps"):
                     setattr(self, key, bool(prefs[key]))
+                if key == "motion":
+                    self._sync_mark_motion()
                 self.mark()
 
             return action
@@ -5582,6 +6027,7 @@ class AppOverlays(AppRender):
             ("Zen idle", "%ds" % int(prefs["zen_idle_s"]), zen_idle_cycle),
             ("Boot self-test", onoff("boot"), flip("boot")),
             ("ASCII glyphs", onoff("ascii"), flip("ascii")),
+            ("Living logo", onoff("motion"), flip("motion")),
         ]
 
     def render_settings(
@@ -7693,6 +8139,11 @@ class TuiApp(AppDrawers):
                     )
             push()
             if await type_line(" cluster ..... %s" % cluster_line, "fg"):
+                return
+            push()
+            if await type_line(
+                " gravity ..... 9.81 m/s² · breeze on the ~ key", "dim"
+            ):
                 return
             failing = sum(1 for j in jobs if health(j)[0] == "fail")
             push()
