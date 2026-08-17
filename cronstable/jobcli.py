@@ -604,6 +604,24 @@ def _lock_release(token: str) -> None:
     _ok(status, data)
 
 
+def _spawn_environment() -> dict[str, str]:
+    """:data:`os.environ` for a wrapped command, PyInstaller scrub applied.
+
+    Mirrors :func:`cronstable.job.fixup_pyinstaller_env`, inline because this
+    module stays stdlib-only (see the module docstring): restore the loader
+    paths a frozen bootloader rewrote and strip its ``_PYI_*`` linkage vars,
+    so the wrapped command can itself invoke a frozen binary (this CLI
+    included) without the bootloader's parent-process check killing it.
+    """
+    env = dict(os.environ)
+    if getattr(sys, "frozen", False) and sys.platform != "win32":
+        for env_var in ("LD_LIBRARY_PATH", "LIBPATH"):
+            env[env_var] = env.get(env_var + "_ORIG", "")
+    for key in [k for k in env if k.startswith("_PYI_")]:
+        del env[key]
+    return env
+
+
 def _cmd_lock(args: argparse.Namespace) -> int:
     if args.lock_command == "acquire":
         acquired, token = _lock_acquire(args)
@@ -629,7 +647,9 @@ def _cmd_lock(args: argparse.Namespace) -> int:
             print("lock not acquired: {}".format(args.name), file=sys.stderr)
             return EXIT_NOT_ACQUIRED
         try:
-            completed = subprocess.run(args.run_command)  # noqa: S603
+            completed = subprocess.run(  # noqa: S603
+                args.run_command, env=_spawn_environment()
+            )
             return completed.returncode
         except OSError as ex:
             # a bad argv (command not found, not executable): report it

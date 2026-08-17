@@ -17,13 +17,13 @@
 :root {
   color-scheme: dark;
   --shadow-lg: 0 10px 40px rgba(0, 0, 0, .7);
-  /* semantic status inks, tuned for dark phosphor surfaces */
+  /* semantic status inks, tuned for dark surfaces */
   --ok: #3fd271; --fail: #ff5f56; --run: #4aa8ff; --pending: #ffbf47;
   --disabled: #7d8590; --cancelled: #c98bff; --unknown: #9aa5b1;
   --paused: #56d4dd;
 }
 
-/* ---------- dark phosphor themes ---------- */
+/* ---------- dark themes ---------- */
 html[data-theme="amber"], html[data-pal="amber"] {
   --bg: #0a0806; --bg2: #0f0b07; --panel: #110c07; --panel2: #160f08;
   --hover: #1d1409; --border: #3a2a12; --border2: #523c1a;
@@ -45,7 +45,7 @@ html[data-theme="modern"] {
   --accent: #79c0ff; --glow: rgba(121, 192, 255, .0);
   --selbg: rgba(121, 192, 255, .12);
 }
-/* Carolina Blue CRT phosphor: #4B9CD3 is the hero (seated as --fg-dim) */
+/* Carolina Blue: #4B9CD3 is the hero (seated as --fg-dim) */
 html[data-theme="carolina"], html[data-pal="carolina"] {
   --bg: #04070b; --bg2: #060c13; --panel: #081019; --panel2: #0b1620;
   --hover: #0f1e2b; --border: #173347; --border2: #22506e;

@@ -567,6 +567,26 @@ async def _taskkill_tree(pid: int) -> bool:  # pragma: no cover (windows)
 
 
 # --- Graceful shutdown signalling ----------------------------------------
+def _install_loop_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    sigs: "tuple[signal.Signals, ...]",
+    callback: Callable[[], None],
+) -> Callable[[], None]:
+    """Install ``callback`` for ``sigs`` on ``loop``; return the remover.
+
+    The one place the install + removal-closure pair lives, so the
+    shutdown and reload installers cannot drift apart.
+    """
+    for sig in sigs:
+        loop.add_signal_handler(sig, callback)
+
+    def remove_loop_handlers() -> None:
+        for sig in sigs:
+            loop.remove_signal_handler(sig)
+
+    return remove_loop_handlers
+
+
 def install_shutdown_handlers(
     loop: asyncio.AbstractEventLoop, callback: Callable[[], None]
 ) -> Callable[[], None]:
@@ -588,15 +608,9 @@ def install_shutdown_handlers(
     Windows grants before terminating the process regardless.
     """
     if not IS_WINDOWS:  # pragma: no cover (posix) - loop signal handlers
-        sigs = (signal.SIGINT, signal.SIGTERM)
-        for sig in sigs:
-            loop.add_signal_handler(sig, callback)
-
-        def remove_loop_handlers() -> None:
-            for sig in sigs:
-                loop.remove_signal_handler(sig)
-
-        return remove_loop_handlers
+        return _install_loop_signal_handlers(
+            loop, (signal.SIGINT, signal.SIGTERM), callback
+        )
 
     # Windows path lives in its own helper so it is measured only where it can
     # run (like :func:`_taskkill_tree`); this delegation never executes on
@@ -604,6 +618,26 @@ def install_shutdown_handlers(
     return _install_windows_shutdown_handlers(  # pragma: no cover (windows)
         loop, callback
     )
+
+
+def install_reload_handler(
+    loop: asyncio.AbstractEventLoop, callback: Callable[[], None]
+) -> Callable[[], None]:
+    """Arrange for ``callback`` to run on a reload request (SIGHUP).
+
+    Returns a zero-argument cleanup function, like
+    :func:`install_shutdown_handlers`; call it once the loop has finished.
+
+    POSIX only: Windows has no SIGHUP.  The Windows service takes the
+    same forced reload from the SCM instead (the ``PARAMCHANGE``
+    control, wired in :mod:`cronstable.winservice`), and a Windows
+    console run rides the config-file stat watch on the housekeeping
+    pass; nothing is installed here on Windows and the cleanup is a
+    no-op.
+    """
+    if not IS_WINDOWS:  # pragma: no cover (posix) - loop signal handler
+        return _install_loop_signal_handlers(loop, (signal.SIGHUP,), callback)
+    return lambda: None  # pragma: no cover (windows) - nothing to install
 
 
 def _install_windows_shutdown_handlers(  # pragma: no cover (windows)
@@ -776,9 +810,13 @@ def os_boot_time() -> Optional[float]:
     unaffected by wall-clock steps), on POSIX from ``/proc/uptime``.  The
     derivation rides the *current* wall clock, so an NTP step shifts the
     result by the step size, which is why consumers compare boot times with
-    a tolerance rather than exactly.  ``None`` where neither source exists
-    (macOS/BSD): the caller then treats every daemon start as a fresh boot,
-    which is the pre-dedupe behaviour.
+    a tolerance rather than exactly.  Where ``/proc/uptime`` is absent or
+    unreadable (macOS/BSD), the boot instant comes from
+    ``psutil.boot_time()`` (``kern.boottime``); the kernel adjusts that
+    record when the wall clock steps, so the same tolerance applies to
+    it.  ``None`` only when every source failed: the
+    caller then treats every daemon start as a fresh boot, so ``@reboot``
+    one-shots run on every daemon start.
     """
     if IS_WINDOWS:  # pragma: no cover (windows) - Windows-only path
         try:
@@ -796,7 +834,17 @@ def os_boot_time() -> Optional[float]:
             with open("/proc/uptime", encoding="ascii") as fobj:
                 uptime = float(fobj.read().split()[0])
         except (OSError, ValueError, IndexError):
-            return None
+            # No usable /proc/uptime (macOS/BSD): the kernel records the
+            # boot instant itself and psutil (a core dependency) reads it
+            # portably (sysctl kern.boottime).  Imported lazily so the
+            # thin-client commands that import this module early do not
+            # pay for psutil on every invocation.
+            try:
+                import psutil
+
+                return float(psutil.boot_time())
+            except Exception:  # noqa: BLE001 - any failure -> cannot tell
+                return None
         return time.time() - uptime
 
 
@@ -850,6 +898,25 @@ def pid_alive(pid: int) -> Optional[bool]:
         except OSError:
             return None
         return True
+
+
+def process_start_time(pid: int) -> Optional[float]:
+    """Wall-clock epoch seconds ``pid`` started at, or ``None`` (cannot tell).
+
+    The pid-reuse disambiguator for :func:`pid_alive` consumers that must
+    not mistake a recycled pid for a recorded process: two reads that
+    return the same start time name the same process. ``None`` wherever
+    the platform refuses the read; callers treat that as "cannot tell"
+    and fall back to bare existence.
+    """
+    if pid <= 0:
+        return None
+    try:
+        import psutil
+
+        return float(psutil.Process(pid).create_time())
+    except Exception:  # noqa: BLE001 - any failure -> cannot tell
+        return None
 
 
 # --- Advisory exclusive file locking -------------------------------------

@@ -1918,6 +1918,25 @@ def web_site_from_url(
         raise ValueError(url)
 
 
+class _StopEvent(asyncio.Event):
+    """The run loop's stop flag, mirrored into the loop's wake event.
+
+    Setting this directly (tests do, and so does signal_shutdown) has to
+    cut the run loop's sleep short.  Mirroring the set is what lets that
+    sleep park on the single wake event rather than race one waiter task
+    per source: the loop runs the sleep on every pass, so a second waiter
+    is per-pass churn on the idlest path there is.
+    """
+
+    def __init__(self, wake: asyncio.Event) -> None:
+        super().__init__()
+        self._wake = wake
+
+    def set(self) -> None:
+        super().set()
+        self._wake.set()
+
+
 class Cron:
     def __init__(
         self, config_arg: Optional[str], *, config_yaml: Optional[str] = None
@@ -2087,6 +2106,18 @@ class Cron:
         # zero. A plain running_jobs check would race the window between a
         # claim succeeding and its RunningJob being registered.
         self._slot_refs: dict[str, int] = {}
+        # name -> (pid, start time) of a PREVIOUS daemon's run of an
+        # @reboot job that is still alive on this host, as found by the
+        # boot in-flight reconciliation (which leaves such records open).
+        # The boot gate and the deferred-launch paths consult it: a boot
+        # run that is literally still running must remain this boot's
+        # only copy, whatever the boot marker says -- the marker can be
+        # missing (written by an older build, or the boot instant was
+        # unknowable) while the process is plainly there. The start time
+        # (None when unreadable) pins the pid's identity so a recycled
+        # pid never counts. Declared above the config load and pruned in
+        # _apply_reload with the other per-job maps.
+        self._boot_survivors: dict[str, tuple[int, Optional[float]]] = {}
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -2104,7 +2135,14 @@ class Cron:
             self._any_sla_cache = None
 
         self._wait_for_running_jobs_task: asyncio.Task | None = None
-        self._stop_event = asyncio.Event()
+        # Every wake source for the run loop's sleep feeds this one
+        # event: a shutdown (_stop_event mirrors its own set into it) and
+        # a reload request (signal_reload -- SIGHUP, or the Windows
+        # service's PARAMCHANGE), which wakes the sleep so the reload
+        # happens now rather than at the next housekeeping minute; the
+        # reparse itself is forced by voiding _config_sig.
+        self._wake_event = asyncio.Event()
+        self._stop_event = _StopEvent(self._wake_event)
         self._jobs_running = asyncio.Event()
         self.retry_state: dict[str, JobRetryState] = {}
         self.web_runner: web.AppRunner | None = None
@@ -2118,6 +2156,10 @@ class Cron:
         # them (an in-place rotation is otherwise invisible); cleared on
         # every teardown. See _web_tls_files_changed.
         self._web_tls_signature: dict[str, Any] | None = None
+        # same idea for the bearer tokens' fromFile sources: the config
+        # holds only the PATH, so a secret rewritten in place never trips
+        # the web_config inequality gate. See _web_token_files_changed.
+        self._web_token_files_signature: dict[str, Any] | None = None
         # the optional MCP config and handler; (re)built inside
         # start_stop_web_app so they track reloads.
         self.mcp_config: MCPConfig | None = None
@@ -2391,10 +2433,7 @@ class Cron:
             # re-fires already-fired slots.
             sleep_interval = self._sleep_interval()
             logger.debug("Will sleep for %.1f seconds", sleep_interval)
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), sleep_interval)
-            except asyncio.TimeoutError:
-                pass
+            await self._sleep_until_wake(sleep_interval)
 
         logger.info("Shutting down (after currently running jobs finish)...")
         while self.retry_state:
@@ -2508,6 +2547,49 @@ class Cron:
         if self._pause_refresh_task is not None:
             self._pause_refresh_task.cancel()
             self._pause_refresh_task = None
+
+    async def _sleep_until_wake(self, sleep_interval: float) -> None:
+        """Park the run loop until the interval elapses or a wake arrives.
+
+        One waiter, not one per source: a shutdown request wakes the
+        sleep (tests set ``_stop_event`` directly, and it mirrors itself
+        into the wake event), and a reload request
+        (:meth:`signal_reload`) wakes it too, so the reload happens now
+        rather than up to a housekeeping minute later.  This runs on
+        every pass of the loop, idle ones included, so it stays a single
+        Event.wait: racing a waiter task per source doubled the cost of
+        an idle pass.
+        """
+        try:
+            await asyncio.wait_for(self._wake_event.wait(), sleep_interval)
+        except asyncio.TimeoutError:
+            return
+        # Cleared here, not in reload_config: the event only wakes this
+        # sleep; the voided _config_sig carries the force-reparse into
+        # housekeeping (which the cleared _last_housekeeping_minute
+        # guarantees runs next pass).  A shutdown wake leaves the loop at
+        # its own _stop_event check, which the clear does not disturb.
+        self._wake_event.clear()
+
+    def signal_reload(self, source: str = "SIGHUP") -> None:
+        """Request an immediate config reload; ``source`` names the
+        requester in the log (SIGHUP, or the Windows service's
+        PARAMCHANGE control).
+
+        Safe to call from a loop signal handler: it only sets flags and an
+        event. Clearing ``_last_housekeeping_minute`` makes the woken pass
+        run housekeeping even when the minute has not turned over, and
+        voiding ``_config_sig`` makes that pass reparse even when the stat
+        fingerprint is unchanged, because the operator asking for a reload
+        knows something the fingerprint can miss (a credential file
+        rewritten in place, a coarse-mtime or network filesystem). The
+        void survives a failed parse, so the request keeps retrying until
+        a parse succeeds and re-records the signature.
+        """
+        logger.info("Reload requested (%s); reloading configuration", source)
+        self._config_sig = None
+        self._last_housekeeping_minute = None
+        self._wake_event.set()
 
     def signal_shutdown(self) -> None:
         logger.debug("Signalling shutdown")
@@ -2629,6 +2711,8 @@ class Cron:
         if self.config_arg is None:
             return self._empty_config()
         loop = asyncio.get_running_loop()
+        # a signal_reload voids _config_sig, so this skip cannot fire
+        # again until a parse succeeds and re-records the signature.
         if self._last_config is not None and (
             await self._current_config_signature(loop) == self._config_sig
         ):
@@ -2731,6 +2815,13 @@ class Cron:
         self._trends_cache = {
             name: entry
             for name, entry in self._trends_cache.items()
+            if name in keep
+        }
+        # a removed job's survivor entry must not outlive its job (and a
+        # re-added name must not inherit a stale pid).
+        self._boot_survivors = {
+            name: entry
+            for name, entry in self._boot_survivors.items()
             if name in keep
         }
         # the job set itself changed: the shared /jobs product is stale
@@ -4319,6 +4410,10 @@ class Cron:
                 name,
             )
             if self._state_configured:
+                # the manual run, not any survivor, claims boot-run
+                # status: drop the survivor entry so the gate reaches its
+                # marker write (the survivor skip records nothing).
+                self._boot_survivors.pop(name, None)
                 await self._reboot_boot_gate(job)
         await self.maybe_launch_job(job)
 
@@ -6541,6 +6636,12 @@ class Cron:
         # serving the old certificate until it expires.
         elif self._web_tls_files_changed():
             reason = "TLS certificate files changed"
+        # an in-place rewrite of a bearer token's fromFile source likewise
+        # leaves the config bytes identical; without this the running app
+        # keeps the token table it resolved at build, so a rotated secret
+        # never takes effect and a revoked one keeps authenticating.
+        elif self._web_token_files_changed():
+            reason = "web token files changed"
         else:
             return None
         if web_config is not None and not tlsutil.listener_tls_loadable(
@@ -6554,6 +6655,18 @@ class Cron:
                 "web: new TLS material is not yet loadable (a "
                 "partial/half-written rotation, or a config edit racing "
                 "one?); keeping the running listener and retrying next reload"
+            )
+            return None
+        if web_config is not None and not self._web_tokens_resolvable(
+            web_config
+        ):
+            # The same rule for the token table: tearing the listener
+            # down for tokens that cannot resolve (a half-written
+            # rotation, an emptied file) would leave nothing serving.
+            logger.warning(
+                "web: a bearer token source is not resolvable (a "
+                "half-written rotation, or a config edit racing one?); "
+                "keeping the running listener and retrying next reload"
             )
             return None
         return reason
@@ -6607,6 +6720,7 @@ class Cron:
                 self.web_runner = None
                 self._web_tcp_bound = []
                 self._web_tls_signature = None
+                self._web_token_files_signature = None
 
         # Build the listener's TLS context ONCE per (re)start, before anything
         # is bound, so a context failure never leaves a half-built runner.
@@ -6673,6 +6787,11 @@ class Cron:
                 middlewares.append(
                     self._make_origin_middleware(frozenset(allowed_origins))
                 )
+            # Snapshot the token files BEFORE resolving them (the
+            # _build_web_tls order): a rotation landing in the gap then
+            # compares unequal on the next reload, a spurious restart
+            # rather than a missed one.
+            token_files_signature = self._web_token_file_signature(web_config)
             token_table = self._resolve_web_tokens(web_config)
             if token_table is not None:
                 anonymous_scopes = frozenset(
@@ -6796,6 +6915,7 @@ class Cron:
                 self.web_config = web_config
                 self.mcp_config = mcp_config
                 self._web_tls_signature = tls_signature
+                self._web_token_files_signature = token_files_signature
 
         # Node history sampling follows the web API's lifecycle: the ring
         # only feeds the dashboard's node chart, so it runs whenever the web
@@ -8223,6 +8343,47 @@ class Cron:
         )
 
     @staticmethod
+    def _web_token_file_signature(web_config: WebConfig) -> dict[str, Any]:
+        """On-disk fingerprint of every bearer token ``fromFile`` source.
+
+        The token-table analogue of :func:`tlsutil.tls_file_signature`:
+        the secrets live outside the config bytes, so this mapping
+        changing across reloads is what makes an in-place rotation or
+        revocation visible.
+        """
+        out: dict[str, Any] = {}
+        specs: list[Any] = [web_config.get("authToken")]
+        specs.extend(web_config.get("authTokens") or ())
+        for index, spec in enumerate(specs):
+            path = spec.get("fromFile") if isinstance(spec, dict) else None
+            if path:
+                out["{}:{}".format(index, path)] = tlsutil.file_signature(path)
+        return out
+
+    def _web_token_files_changed(self) -> bool:
+        """Whether a token's fromFile source differs from what the app built.
+
+        Gated on the build-time signature because a teardown leaves
+        web_config stale while clearing it (the _web_tls_files_changed
+        rule).
+        """
+        if self.web_config is None or self._web_token_files_signature is None:
+            return False
+        return (
+            self._web_token_file_signature(self.web_config)
+            != self._web_token_files_signature
+        )
+
+    @staticmethod
+    def _web_tokens_resolvable(web_config: WebConfig) -> bool:
+        """Whether every configured bearer token source resolves right now."""
+        try:
+            Cron._resolve_web_tokens(web_config)
+        except ConfigError:
+            return False
+        return True
+
+    @staticmethod
     def _apply_socket_mode(addr: str, socket_mode: str) -> None:
         parsed = urlparse(addr)
         if parsed.scheme != "unix":
@@ -9323,6 +9484,49 @@ class Cron:
             return self._same_boot(rec)
         return False
 
+    def _boot_survivor_running(self, name: str) -> Optional[int]:
+        """The still-live pid of a previous daemon's run of ``name``.
+
+        Re-validates the reconciliation's finding at consult time: the
+        pid must still exist AND still carry the start time captured when
+        it was recorded, so a pid the OS recycled (this consult can come
+        long after boot -- a pause lifting, a deferred launch) never
+        counts. A dead or recycled survivor is forgotten, leaving the
+        caller's own dedupe to decide as if it had never survived.
+        """
+        survivor = self._boot_survivors.get(name)
+        if survivor is None:
+            return None
+        pid, started = survivor
+        if platform.pid_alive(pid) and (
+            started is None or platform.process_start_time(pid) == started
+        ):
+            return pid
+        self._boot_survivors.pop(name, None)
+        return None
+
+    def _survivor_holds_boot_run(self, name: str) -> bool:
+        """Whether a surviving run makes launching ``name`` a double.
+
+        True skips the launch: the survivor stays this boot's only copy,
+        whatever the boot marker says -- the marker can be absent while
+        the process is plainly there (an older build wrote none, or the
+        boot instant was unknowable). The skip leaves the marker stream
+        as it was: if the survivor dies and a LATER daemon start finds
+        neither marker nor survivor, re-running errs the documented
+        at-least-once way.
+        """
+        survivor = self._boot_survivor_running(name)
+        if survivor is None:
+            return False
+        logger.info(
+            "Job %s (@reboot): a previous daemon's run (pid %d) is still "
+            "running; it counts as the boot run and the launch is skipped",
+            name,
+            survivor,
+        )
+        return True
+
     async def _reboot_boot_gate(self, job: JobConfig) -> bool:
         """Record-then-run boot dedupe for a non-deferred @reboot job.
 
@@ -9334,6 +9538,8 @@ class Cron:
         _reboot_gate_sick so the remaining @reboot jobs apply the policy
         without serially stalling on a hung mount.
         """
+        if self._survivor_holds_boot_run(job.name):
+            return False
         backend = self.state_backend
         fail_closed = self._state_on_unavailable == "fail-closed"
         if backend is None or self._reboot_gate_sick:
@@ -9452,57 +9658,11 @@ class Cron:
         if not self._pending_reboot_jobs:
             return
         if not self._elect_leader_configured:
-            # election removed on reload: gating is gone, so run the
-            # CURRENT job for any present name still defining an @reboot
-            # one-shot; absent names stay pending (never-lose), reused
-            # names retire without running.
-            for name in list(self._pending_reboot_jobs):
-                job = self.cron_jobs.get(name)
-                if job is None:
-                    continue  # transiently absent -> keep pending, re-check
-                if self._pause_active(name) is not None:
-                    # a pause DEFERS the boot run: keep it pending rather
-                    # than retiring it unrun, and re-check next wakeup.
-                    continue
-                del self._pending_reboot_jobs[name]
-                # a disabled job retires without running, mirroring
-                # job_should_run; enabled is checked last so a name reused
-                # for a non-@reboot job short-circuits on the schedule
-                # check.
-                if (
-                    isinstance(job.schedule, str)
-                    and job.schedule == "@reboot"
-                    and job.enabled
-                ):
-                    await self.launch_scheduled_job(job)
+            await self._process_pending_reboots_unelected()
             return
         mgr = self.cluster_manager
         if mgr is None:
-            # Election wanted but no manager. Leader one-shots stay
-            # fail-closed (pending). PreferLeader is NEVER-SKIP: it must
-            # run even with the store unreachable (accepting a possible
-            # double-run), the same asymmetry _cluster_allows applies to
-            # scheduled PreferLeader jobs in this mgr-is-None case.
-            for name in list(self._pending_reboot_jobs):
-                if name not in self.cron_jobs:
-                    continue  # transiently absent -> keep pending (never-lose)
-                job = self.cron_jobs[name]
-                if not self._is_deferrable_reboot(job) or not job.enabled:
-                    # reused or disabled -> retire without running.
-                    del self._pending_reboot_jobs[name]
-                    continue
-                if self._pause_active(name) is not None:
-                    continue  # deferred by the pause; still owed
-                if job.clusterPolicy == "PreferLeader":
-                    del self._pending_reboot_jobs[name]
-                    logger.info(
-                        "cluster: running deferred @reboot PreferLeader job "
-                        "%s (no leadership manager; never-skip semantics)",
-                        name,
-                    )
-                    await self.launch_scheduled_job(job)
-                # Leader one-shots: keep pending, fail closed, re-check next
-                # wakeup once a manager is available.
+            await self._process_pending_reboots_no_manager()
             return
         for name in list(self._pending_reboot_jobs):
             if name not in self.cron_jobs:
@@ -9548,6 +9708,11 @@ class Cron:
             # itself and never run the one-shot on any node.
             if self._cluster_allows(job):
                 del self._pending_reboot_jobs[name]
+                if self._survivor_holds_boot_run(name):
+                    # the surviving run IS the boot run: record it as ran
+                    # so the cluster stands down, and skip the relaunch.
+                    await mgr.mark_reboot_ran(name)
+                    continue
                 logger.info(
                     "cluster: running deferred @reboot job %s (this node is "
                     "the elected owner)",
@@ -9561,6 +9726,69 @@ class Cron:
             # else: another node owns it or the cluster has not converged
             # -> keep pending. Never drop a one-shot on another node's
             # behalf.
+
+    async def _process_pending_reboots_unelected(self) -> None:
+        """The no-election arm of :meth:`_process_pending_reboots`.
+
+        Election removed on reload: gating is gone, so run the CURRENT
+        job for any present name still defining an @reboot one-shot;
+        absent names stay pending (never-lose), reused names retire
+        without running.
+        """
+        for name in list(self._pending_reboot_jobs):
+            job = self.cron_jobs.get(name)
+            if job is None:
+                continue  # transiently absent -> keep pending, re-check
+            if self._pause_active(name) is not None:
+                # a pause DEFERS the boot run: keep it pending rather
+                # than retiring it unrun, and re-check next wakeup.
+                continue
+            del self._pending_reboot_jobs[name]
+            # a disabled job retires without running, mirroring
+            # job_should_run; enabled is checked last so a name reused
+            # for a non-@reboot job short-circuits on the schedule
+            # check.
+            if (
+                isinstance(job.schedule, str)
+                and job.schedule == "@reboot"
+                and job.enabled
+            ):
+                if self._survivor_holds_boot_run(name):
+                    continue
+                await self.launch_scheduled_job(job)
+
+    async def _process_pending_reboots_no_manager(self) -> None:
+        """The election-wanted-but-no-manager arm of
+        :meth:`_process_pending_reboots`.
+
+        Leader one-shots stay fail-closed (pending). PreferLeader is
+        NEVER-SKIP: it must run even with the store unreachable
+        (accepting a possible double-run), the same asymmetry
+        _cluster_allows applies to scheduled PreferLeader jobs in this
+        mgr-is-None case.
+        """
+        for name in list(self._pending_reboot_jobs):
+            if name not in self.cron_jobs:
+                continue  # transiently absent -> keep pending (never-lose)
+            job = self.cron_jobs[name]
+            if not self._is_deferrable_reboot(job) or not job.enabled:
+                # reused or disabled -> retire without running.
+                del self._pending_reboot_jobs[name]
+                continue
+            if self._pause_active(name) is not None:
+                continue  # deferred by the pause; still owed
+            if job.clusterPolicy == "PreferLeader":
+                del self._pending_reboot_jobs[name]
+                if self._survivor_holds_boot_run(name):
+                    continue
+                logger.info(
+                    "cluster: running deferred @reboot PreferLeader job "
+                    "%s (no leadership manager; never-skip semantics)",
+                    name,
+                )
+                await self.launch_scheduled_job(job)
+            # Leader one-shots: keep pending, fail closed, re-check next
+            # wakeup once a manager is available.
 
     def _cluster_allows(self, job: JobConfig) -> bool:
         """Whether this node may run *scheduled* ``job`` this cycle.
@@ -10700,7 +10928,8 @@ class Cron:
         process is gone becomes an ``unknown``-outcome ledger row. Three
         guards keep live runs safe: a record by THIS process is skipped,
         live local instances outrank the ledger, and a recorded pid that
-        still exists is left alone. Uses the bounded boot-scan pool; safe
+        still exists bearing a start time no later than the record's is
+        left alone. Uses the bounded boot-scan pool; safe
         because each per-job step touches only its own stream/keys and
         per-job write order still goes through _queue_inflight_write.
         """
@@ -10732,7 +10961,7 @@ class Cron:
             recs = await asyncio.wait_for(
                 backend.list_records(
                     self._inflight_stream(name),
-                    limit=1,
+                    limit=INFLIGHT_STREAM_KEEP,
                     newest_first=True,
                 ),
                 timeout=STATE_OP_TIMEOUT,
@@ -10748,11 +10977,16 @@ class Cron:
                 ex,
             )
             return None
-        rec = recs[0] if recs else None
+        # judge THIS host's newest record: on a shared store, peers'
+        # records interleave in the one stream, and a foreign newer
+        # record must not hide a local open one (the host-filter rule
+        # _reboot_marker_covers applies). Foreign records are the slot
+        # takeover's business.
+        rec = next(
+            (r for r in recs if r.get("host") == self._state_host), None
+        )
         if rec is None or rec.get("kind") != "open":
             return None
-        if rec.get("host") != self._state_host:
-            return None  # another node's business (see the slot takeover)
         if rec.get("proc") == self._proc_token:
             return None  # our own live run; the backend was just rebuilt
         pid = rec.get("pid")
@@ -10761,6 +10995,22 @@ class Cron:
             and not isinstance(pid, bool)
             and platform.pid_alive(pid)
         ):
+            started = platform.process_start_time(pid)
+            if not self._pid_could_be_record(started, rec):
+                # the pid exists but its process began after the record
+                # was written: a recycled pid (an earlier OS boot's
+                # record, typically). The recorded run cannot still be
+                # running, so close it like any other crash instead of
+                # leaving it open behind a stranger forever.
+                self._reconcile_open_record(name, job, rec, "reconciled-crash")
+                return None
+            if isinstance(job.schedule, str) and job.schedule == "@reboot":
+                # remembered for the @reboot boot gate and the deferred
+                # launch paths: a boot run that is still running must not
+                # be launched again by THIS daemon, whatever the boot
+                # marker turns out to say. Only @reboot jobs are
+                # recorded; nothing consults survivors of ordinary runs.
+                self._boot_survivors[name] = (pid, started)
             logger.warning(
                 "Job %s: the previous daemon's run (pid %d) still "
                 "appears to be running; leaving its in-flight record "
@@ -10771,6 +11021,29 @@ class Cron:
             return None
         self._reconcile_open_record(name, job, rec, "reconciled-crash")
         return None
+
+    @staticmethod
+    def _pid_could_be_record(
+        started: Optional[float], rec: dict[str, Any]
+    ) -> bool:
+        """False only when the pid's process provably postdates ``rec``.
+
+        A genuine survivor started before its record was written; a
+        recycled pid's process started after it. Compared with
+        :data:`BOOT_TIME_TOLERANCE` slack, since process start times ride
+        the wall clock. Unreadable on either side -> True, keeping the
+        leave-the-record-open direction pid probes err toward.
+        """
+        if started is None:
+            return True
+        raw = rec.get("startedAt")
+        if not isinstance(raw, str):
+            return True
+        try:
+            recorded = datetime.datetime.fromisoformat(raw).timestamp()
+        except ValueError:
+            return True
+        return started <= recorded + BOOT_TIME_TOLERANCE
 
     async def _reconcile_takeover_inflight(self, job: JobConfig) -> None:
         """On a fresh slot win, close a foreign holder's orphaned run.
