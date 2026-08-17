@@ -42,6 +42,7 @@ from strictyaml.ruamel.error import YAMLError
 from cronstable import crontabs, dag, platform
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import Finding, lint_schedule
+from cronstable.heartbeat import derive_token
 
 
 def _patch_strictyaml_seq_deepcopy() -> None:
@@ -374,6 +375,62 @@ DEFAULT_LATE_WEBHOOK_BODY_TEMPLATE = (
     + DEFAULT_LATE_SUBJECT_TEMPLATE
     + "\n"
     + DEFAULT_LATE_BODY_TEMPLATE
+    + "{% endfilter %}}"
+)
+
+# Defaults for a heartbeat's report blocks.  A heartbeat has no run of its
+# own to describe -- the daemon never launched anything -- so the standard
+# templates' completed/failed wording does not fit, and neither does the
+# SLA wording (there is no threshold/observed pair, there is a thing that
+# should have called and did not).  These key on the heartbeat's own vars:
+# `state`, `reason`, `last_ping_at`, `overdue_seconds`.
+DEFAULT_HEARTBEAT_DOWN_SUBJECT_TEMPLATE = (
+    "Heartbeat '{{name}}' is down ({{reason}})"
+)
+
+DEFAULT_HEARTBEAT_DOWN_BODY_TEMPLATE = """
+Heartbeat: {{name}}
+{% if description -%}
+{{description}}
+{% endif -%}
+Reason: {{reason}}
+Expected: {{expected_at}}
+{% if last_ping_at -%}
+Last ping: {{last_ping_at}} ({{overdue_seconds}} seconds ago)
+{% else -%}
+Last ping: (none ever received)
+{% endif -%}
+{% if exit_code is not none -%}
+Exit code: {{exit_code}}
+{% endif -%}
+{% if ping_body %}
+{{ping_body}}
+{% endif %}
+"""
+
+DEFAULT_HEARTBEAT_DOWN_WEBHOOK_BODY_TEMPLATE = (
+    '{"text": {% filter tojson %}'
+    + DEFAULT_HEARTBEAT_DOWN_SUBJECT_TEMPLATE
+    + "\n"
+    + DEFAULT_HEARTBEAT_DOWN_BODY_TEMPLATE
+    + "{% endfilter %}}"
+)
+
+DEFAULT_HEARTBEAT_UP_SUBJECT_TEMPLATE = "Heartbeat '{{name}}' recovered"
+
+DEFAULT_HEARTBEAT_UP_BODY_TEMPLATE = """
+Heartbeat: {{name}}
+Recovered at: {{last_ping_at}}
+{% if down_since -%}
+Down since: {{down_since}} ({{down_seconds}} seconds)
+{% endif %}
+"""
+
+DEFAULT_HEARTBEAT_UP_WEBHOOK_BODY_TEMPLATE = (
+    '{"text": {% filter tojson %}'
+    + DEFAULT_HEARTBEAT_UP_SUBJECT_TEMPLATE
+    + "\n"
+    + DEFAULT_HEARTBEAT_UP_BODY_TEMPLATE
     + "{% endfilter %}}"
 )
 
@@ -981,6 +1038,44 @@ _dag_schema_dict = {
     "tasks": Seq(Map(_dag_task_schema_dict)),
 }
 
+# One inbound heartbeat: work cronstable does NOT run, watched by the ping
+# it is expected to send (see cronstable.heartbeat).  `periodSeconds` and
+# `schedule` are the two mutually exclusive ways to say when a ping is
+# due; exactly one is required, enforced in HeartbeatConfig rather than in
+# the schema because strictyaml cannot express "exactly one of these".
+_heartbeat_schema_dict = {
+    "name": Str(),
+    Opt("description"): Str(),
+    # interval mode: a ping at least this often, measured from the last one
+    Opt("periodSeconds"): EmptyNone() | Int(),
+    # schedule mode: a ping after each fire of this expression.  The full
+    # dialect a job gets, business-day expressions included.
+    Opt("schedule"): _schedule_schema,
+    Opt("timezone"): Str(),
+    Opt("utc"): Bool(),
+    # slack past the due instant before the heartbeat is called down
+    Opt("graceSeconds"): Int(),
+    # for jobs that ping /start: how long the run may take before the
+    # silence is called an overrun rather than waited out
+    Opt("maxRuntimeSeconds"): EmptyNone() | Int(),
+    # an explicit ping token, instead of one derived from web.pingSecret.
+    # Same value/fromFile/fromEnvVar sources as every other secret here.
+    Opt("token"): Map(
+        {
+            Opt("value"): EmptyNone() | Str(),
+            Opt("fromFile"): EmptyNone() | Str(),
+            Opt("fromEnvVar"): EmptyNone() | Str(),
+        }
+    ),
+    Opt("enabled"): Bool(),
+    # the three hooks, each the same report block a job's hooks take:
+    # onLate fires when it goes down, onFailure when a /fail ping says so,
+    # onRecovery when the next good ping arrives.
+    Opt("onLate"): Map({Opt("report"): _report_schema}),
+    Opt("onFailure"): Map({Opt("report"): _report_schema}),
+    Opt("onRecovery"): Map({Opt("report"): _report_schema}),
+}
+
 # Bearer-token scopes for the web control API (web.authTokens[].scopes):
 # `view` = read-only GETs; `control` = mutating POSTs; `approve` = the DAG
 # approval decision only. `control`/`approve` imply `view`; the scalar
@@ -993,6 +1088,11 @@ CONFIG_SCHEMA = EmptyDict() | Map(
         Opt("defaults"): Map(_job_defaults_common),
         Opt("jobs"): Seq(Map(_job_schema_dict)),
         Opt("dags"): Seq(Map(_dag_schema_dict)),
+        # Inbound heartbeats: a Seq like `jobs` and `dags`, so a fleet can
+        # spread them over included files and config-dir siblings the same
+        # way.  The HMAC secret their ping URLs derive from is
+        # `web.pingSecret`, beside the listener that serves those URLs.
+        Opt("heartbeats"): Seq(Map(_heartbeat_schema_dict)),
         Opt("web"): Map(
             {
                 "listen": Seq(Str()),
@@ -1032,6 +1132,21 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 # _validate_web_config); a wrong or unknown presented token
                 # still 401s rather than degrading to anonymous.
                 Opt("anonymousScopes"): Seq(Enum(["view"])),
+                # HMAC secret every heartbeat's /ping/{token} URL derives
+                # from (cronstable.heartbeat.derive_token).  It lives here,
+                # in the web section, because it is a credential for a URL
+                # this listener serves -- exactly like authToken above --
+                # and because that keeps `heartbeats:` itself a plain list
+                # that included files can extend.  Rotating it rotates
+                # every derived URL at once; a heartbeat that pins its own
+                # `token` is unaffected.
+                Opt("pingSecret"): Map(
+                    {
+                        Opt("value"): EmptyNone() | Str(),
+                        Opt("fromFile"): EmptyNone() | Str(),
+                        Opt("fromEnvVar"): EmptyNone() | Str(),
+                    }
+                ),
                 # octal permissions to apply to a unix:// listen socket
                 Opt("socketMode"): Str(),
                 # native TLS for the `https://` entries in `listen`;
@@ -3987,6 +4102,282 @@ def _validate_push_config(config: "CronstableConfig") -> None:
             )
 
 
+#: Slack allowed past a heartbeat's due instant before it is called down.
+#: Five minutes: long enough to absorb the ordinary gap between "the job
+#: fired" and "the ping landed" (a slow upload, one curl retry, a minute of
+#: clock skew), short enough that the default is still a monitor rather
+#: than a formality.  Every real deployment should set its own.
+DEFAULT_HEARTBEAT_GRACE_SECONDS = 300
+
+# The heartbeat report blocks, built exactly like `_late_report` above: a
+# deepcopy of the standard block with the wording swapped for the
+# heartbeat templates, and their own sentry grouping so a heartbeat going
+# down is never folded in with a job run's failures.  _REPORT_DEFAULTS
+# itself stays untouched, for the reason stated there.
+_HEARTBEAT_DOWN_REPORT: dict[str, Any] = copy.deepcopy(_REPORT_DEFAULTS)
+_HEARTBEAT_DOWN_REPORT["mail"]["subject"] = (
+    DEFAULT_HEARTBEAT_DOWN_SUBJECT_TEMPLATE
+)
+_HEARTBEAT_DOWN_REPORT["mail"]["body"] = DEFAULT_HEARTBEAT_DOWN_BODY_TEMPLATE
+_HEARTBEAT_DOWN_REPORT["webhook"]["body"] = (
+    DEFAULT_HEARTBEAT_DOWN_WEBHOOK_BODY_TEMPLATE
+)
+_HEARTBEAT_DOWN_REPORT["sentry"]["body"] = (
+    DEFAULT_HEARTBEAT_DOWN_SUBJECT_TEMPLATE
+    + "\n"
+    + DEFAULT_HEARTBEAT_DOWN_BODY_TEMPLATE
+)
+_HEARTBEAT_DOWN_REPORT["sentry"]["fingerprint"] = [
+    "cronstable",
+    "heartbeat",
+    "{{ name }}",
+]
+
+_HEARTBEAT_UP_REPORT: dict[str, Any] = copy.deepcopy(_REPORT_DEFAULTS)
+_HEARTBEAT_UP_REPORT["mail"]["subject"] = DEFAULT_HEARTBEAT_UP_SUBJECT_TEMPLATE
+_HEARTBEAT_UP_REPORT["mail"]["body"] = DEFAULT_HEARTBEAT_UP_BODY_TEMPLATE
+_HEARTBEAT_UP_REPORT["webhook"]["body"] = (
+    DEFAULT_HEARTBEAT_UP_WEBHOOK_BODY_TEMPLATE
+)
+_HEARTBEAT_UP_REPORT["sentry"]["body"] = (
+    DEFAULT_HEARTBEAT_UP_SUBJECT_TEMPLATE
+    + "\n"
+    + DEFAULT_HEARTBEAT_UP_BODY_TEMPLATE
+)
+_HEARTBEAT_UP_REPORT["sentry"]["fingerprint"] = [
+    "cronstable",
+    "heartbeat",
+    "{{ name }}",
+]
+
+#: Every key a heartbeat entry may carry, with the value it takes when the
+#: entry says nothing.  Deliberately NOT merged with the job `defaults:`
+#: block: that block's keys are job-launch keys (command, shell, retries),
+#: none of which a heartbeat has, and silently inheriting a fleet-wide
+#: `onFailure` reporter onto every heartbeat would be a surprise.
+HEARTBEAT_DEFAULTS: dict[str, Any] = {
+    "description": None,
+    "periodSeconds": None,
+    "schedule": None,
+    "timezone": None,
+    "utc": False,
+    "graceSeconds": DEFAULT_HEARTBEAT_GRACE_SECONDS,
+    "maxRuntimeSeconds": None,
+    "token": None,
+    "enabled": True,
+    "onLate": {"report": copy.deepcopy(_HEARTBEAT_DOWN_REPORT)},
+    "onFailure": {"report": copy.deepcopy(_HEARTBEAT_DOWN_REPORT)},
+    "onRecovery": {"report": copy.deepcopy(_HEARTBEAT_UP_REPORT)},
+}
+
+
+class HeartbeatConfig:
+    """One configured inbound heartbeat.
+
+    The scheduling half of the domain lives here (when is a ping due, in
+    which zone, with how much slack); the verdict that reads it is
+    :func:`cronstable.heartbeat.observe`, which duck-types exactly the
+    attributes this class exposes under those names -- ``enabled``,
+    ``period``, ``schedule_tab``, ``timezone``, ``grace``,
+    ``max_runtime`` -- so the pure state machine never imports the config
+    layer.
+
+    ``periodSeconds`` and ``schedule`` are mutually exclusive and one is
+    required.  strictyaml cannot express "exactly one of", so the check is
+    here, where the error can name the heartbeat and say which spelling to
+    keep.
+    """
+
+    __slots__ = (
+        "name",
+        "description",
+        "period",
+        "schedule_unparsed",
+        "schedule_tab",
+        "schedule_findings",
+        "utc",
+        "timezone",
+        "grace",
+        "max_runtime",
+        "token",
+        "enabled",
+        "onLate",
+        "onFailure",
+        "onRecovery",
+    )
+
+    def __init__(
+        self,
+        raw: dict[str, Any],
+        lint_cache: Optional["LintCache"] = None,
+    ) -> None:
+        config = dict(raw)
+        self.name: str = config.pop("name")
+        self.description: Optional[str] = config.pop("description")
+        self.period: Optional[int] = config.pop("periodSeconds")
+        self.schedule_unparsed = config.pop("schedule")
+        self.utc: bool = config.pop("utc")
+        self.timezone: Optional[datetime.tzinfo] = self._resolve_timezone(
+            config.pop("timezone")
+        )
+        self.grace: int = config.pop("graceSeconds")
+        self.max_runtime: Optional[int] = config.pop("maxRuntimeSeconds")
+        self.enabled: bool = config.pop("enabled")
+        self.token: Optional[str] = _resolve_secret(
+            config.pop("token"),
+            "heartbeat {!r} token".format(self.name),
+        )
+        self.onLate = config.pop("onLate")
+        self.onFailure = config.pop("onFailure")
+        self.onRecovery = config.pop("onRecovery")
+        self.schedule_tab: Optional[CronTab] = None
+        self.schedule_findings: list[Finding] = []
+        self._validate_window()
+        if self.schedule_unparsed is not None:
+            self.schedule_tab = self._parse_schedule()
+            self.schedule_findings = self._lint_schedule(lint_cache)
+            for finding in self.schedule_findings:
+                logger.log(
+                    logging.WARNING
+                    if finding.level == "warning"
+                    else logging.INFO,
+                    "heartbeat %r: schedule %r: [%s] %s",
+                    self.name,
+                    str(self.schedule_tab),
+                    finding.code,
+                    finding.message,
+                )
+
+    def _reject(self, message: str) -> ConfigError:
+        return ConfigError("heartbeat {!r}: {}".format(self.name, message))
+
+    def _validate_window(self) -> None:
+        """Enforce the shape of the expectation window.
+
+        Exactly one spelling, positive numbers, and no zone on an
+        interval: a ``timezone`` beside ``periodSeconds`` means the
+        operator believes the interval is anchored to a wall clock, which
+        it is not, and silently ignoring it would leave that belief
+        intact until the first missed alert.
+        """
+        if self.period is None and self.schedule_unparsed is None:
+            raise self._reject(
+                "needs either `periodSeconds` (expect a ping at least "
+                "this often) or `schedule` (expect a ping after each "
+                "fire); it has neither"
+            )
+        if self.period is not None and self.schedule_unparsed is not None:
+            raise self._reject(
+                "sets both `periodSeconds` and `schedule`, which are two "
+                "different ways to say when a ping is due; keep one"
+            )
+        if self.period is not None:
+            if self.period <= 0:
+                raise self._reject("periodSeconds must be > 0")
+            if self.timezone is not None:
+                raise self._reject(
+                    "`timezone`/`utc` only apply to a `schedule`; a "
+                    "`periodSeconds` window is measured from the last "
+                    "ping, so it has no wall clock to be in"
+                )
+        if self.grace < 0:
+            raise self._reject("graceSeconds must be >= 0")
+        if self.max_runtime is not None and self.max_runtime <= 0:
+            raise self._reject("maxRuntimeSeconds must be > 0 when set")
+
+    def _resolve_timezone(
+        self, timezone: Optional[str]
+    ) -> Optional[datetime.tzinfo]:
+        """The heartbeat's zone; ``None`` means the daemon's own clock.
+
+        Same three failure modes ZoneInfo has for a job (see
+        :meth:`JobConfig._resolve_timezone`), turned into a ConfigError
+        naming the zone rather than a raw traceback at load.
+        """
+        if timezone is not None:
+            try:
+                return ZoneInfo(timezone)
+            except (ZoneInfoNotFoundError, ValueError, OSError) as err:
+                raise self._reject(
+                    "unknown timezone: {}".format(timezone)
+                ) from err
+        if self.utc:
+            return datetime.timezone.utc
+        return None
+
+    def _parse_schedule(self) -> CronTab:
+        """The heartbeat's ``schedule`` as a CronTab.
+
+        Accepts everything a job's schedule does except ``@reboot``,
+        which names an event rather than a cadence and so can never
+        describe when a ping is due.
+        """
+        raw = self.schedule_unparsed
+        if raw == "@reboot":
+            raise self._reject(
+                "`schedule: @reboot` names a daemon event, not a cadence, "
+                "so it cannot say when a ping is due; use `periodSeconds`"
+            )
+        if isinstance(raw, dict):
+            raw = schedule_object_to_crontab(raw)
+        try:
+            # the name seeds the H hash form, exactly as for a job, so an
+            # `H 2 * * *` heartbeat keeps its slot across restarts.
+            return CronTab(raw, hash_key=self.name)
+        except ValueError as err:
+            raise self._reject(
+                "invalid schedule {!r}: {}".format(raw, err)
+            ) from err
+
+    def _lint_schedule(
+        self, lint_cache: Optional["LintCache"]
+    ) -> list[Finding]:
+        """Advisory findings, memoized exactly like a job's.
+
+        A heartbeat's schedule can be as dead as a job's -- and a dead
+        one is worse here, because it silently means "no ping is ever
+        due" rather than "nothing ever runs".
+        """
+        tab = self.schedule_tab
+        if tab is None:
+            return []
+        if lint_cache is None:
+            return lint_schedule(timezone=self.timezone, tab=tab)
+        key = (str(tab), tab.resolved_source, self.timezone)
+        findings = lint_cache.get(key)
+        if findings is None:
+            findings = lint_schedule(timezone=self.timezone, tab=tab)
+            lint_cache[key] = findings
+        return list(findings)
+
+    def ping_token(self, secret: Optional[str]) -> Optional[str]:
+        """This heartbeat's ping token, or ``None`` if it has none.
+
+        An explicit ``token:`` wins; otherwise it derives from the
+        fleet's ``web.pingSecret``.  ``None`` can only happen when
+        neither exists, which :func:`_validate_heartbeats` refuses at
+        load -- the return type stays optional so callers on the serving
+        path fail closed rather than crash if that invariant ever slips.
+        """
+        if self.token:
+            return self.token
+        if secret:
+            return derive_token(secret, self.name)
+        return None
+
+    def names_a_destination(self) -> bool:
+        """Whether any of the three hooks would really report anything.
+
+        Reuses the onLate reporter census, so a reporter added there is
+        automatically understood here too -- the exact drift that made
+        `push` silently dead on onLate once already.
+        """
+        return any(
+            _onlate_names_a_destination(hook)
+            for hook in (self.onLate, self.onFailure, self.onRecovery)
+        )
+
+
 @dataclass(slots=True)
 class CronstableConfig:
     jobs: list[JobConfig]
@@ -4003,6 +4394,9 @@ class CronstableConfig:
     mcp_config: Optional[MCPConfig] = None
     notify_config: Optional[dict[str, Any]] = None
     push_config: Optional[dict[str, Any]] = None
+    # Inbound heartbeats; a list like `jobs`/`dags`, so included files and
+    # config-dir siblings extend it rather than conflicting over it.
+    heartbeats: list["HeartbeatConfig"] = field(default_factory=list)
 
 
 # Environment-variable interpolation over the validated config document.
@@ -4337,6 +4731,7 @@ def _config_from_doc(
     inc_defaults_merged: dict = {}
     jobs = []
     dags: list[DagConfig] = []
+    heartbeats: list[HeartbeatConfig] = []
     webconf = WebConfig(doc["web"]) if "web" in doc else None
     if webconf is not None:
         # (an included file's web section was already validated when that
@@ -4364,6 +4759,7 @@ def _config_from_doc(
         )
         jobs.extend(inc_config.jobs)
         dags.extend(inc_config.dags)
+        heartbeats.extend(inc_config.heartbeats)
         if inc_config.web_config:
             if webconf:
                 raise ConfigError("multiple web configs")
@@ -4411,6 +4807,16 @@ def _config_from_doc(
     # so a global reporter does not fire on every DAG tick.
     for config_dag in doc.get("dags", []):
         dags.append(DagConfig(config_dag, defaults))
+    # Heartbeats merge over HEARTBEAT_DEFAULTS only, never over the job
+    # `defaults:` block; see that constant for why.  They share the job
+    # lint cache because they share the schedule shapes.
+    for config_hb in doc.get("heartbeats", []):
+        heartbeats.append(
+            HeartbeatConfig(
+                mergedicts(HEARTBEAT_DEFAULTS, config_hb),
+                lint_cache=lint_cache,
+            )
+        )
     return CronstableConfig(
         jobs=jobs,
         web_config=webconf,
@@ -4422,6 +4828,7 @@ def _config_from_doc(
         mcp_config=mcpconf,
         notify_config=notifyconf,
         push_config=pushconf,
+        heartbeats=heartbeats,
     )
 
 
@@ -4531,9 +4938,106 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
                     "{}".format(", ".join(secret_offenders))
                 )
     _validate_dags(config)
+    _validate_heartbeats(config)
     _validate_mcp_config(config)
     _validate_push_config(config)
     _validate_eventlog_config(config)
+
+
+def _validate_heartbeats(config: CronstableConfig) -> None:
+    """Cross-section invariants for the inbound heartbeats.
+
+    Three things can only be judged once the whole config is assembled:
+    names must be unique (the monitor, the metrics and the ping registry
+    all key on the name), every heartbeat needs a reachable ping URL, and
+    that URL needs a listener to serve it.  Each is fatal at load rather
+    than a warning at runtime, because all three fail the same silent
+    way: a heartbeat that looks configured, is visible in the dashboard,
+    and can never be pinged, so it reports down forever or not at all.
+    """
+    if not config.heartbeats:
+        return
+    dups = sorted(
+        name
+        for name, count in Counter(hb.name for hb in config.heartbeats).items()
+        if count > 1
+    )
+    if dups:
+        raise ConfigError(
+            "duplicate heartbeat name(s): {}; heartbeats are tracked by "
+            "name, so all but the last definition would be "
+            "unreachable. Rename the duplicates.".format(", ".join(dups))
+        )
+    # A heartbeat and a job may not share a name: alerts, metric labels
+    # and the dashboard's incident list all key on `name`, so a collision
+    # makes "backup is down" ambiguous exactly when it matters most.
+    job_names = {job.name for job in config.jobs}
+    collisions = sorted(
+        hb.name for hb in config.heartbeats if hb.name in job_names
+    )
+    if collisions:
+        raise ConfigError(
+            "heartbeat name(s) already used by a job: {}; alerts and "
+            "metrics key on the name, so the two would be "
+            "indistinguishable. Rename one side.".format(", ".join(collisions))
+        )
+    secret = None
+    if config.web_config is not None:
+        secret = _resolve_secret(
+            config.web_config.get("pingSecret"), "web.pingSecret"
+        )
+    tokenless = sorted(
+        hb.name for hb in config.heartbeats if hb.ping_token(secret) is None
+    )
+    if tokenless:
+        raise ConfigError(
+            "heartbeat(s) {} have no ping URL: set `web.pingSecret` (one "
+            "secret, from which every heartbeat's URL is derived and "
+            "which rotates them all at once) or give each one its own "
+            "`token:`. Without either there is no address for the job to "
+            "ping, so the heartbeat could only ever report down.".format(
+                ", ".join(tokenless)
+            )
+        )
+    # `tokenless` above already refused every None, so the tokens here
+    # are all strings; the filter is what tells the type checker that.
+    dup_tokens = sorted(
+        token
+        for token, count in Counter(
+            token
+            for token in (hb.ping_token(secret) for hb in config.heartbeats)
+            if token is not None
+        ).items()
+        if count > 1
+    )
+    if dup_tokens:
+        # Only reachable through explicit `token:` values: derived ones
+        # are HMACs of distinct names. Two heartbeats on one URL means a
+        # ping silently answers for whichever the registry resolved.
+        raise ConfigError(
+            "two or more heartbeats share the same explicit `token:`, so "
+            "one ping URL would answer for several of them; give each "
+            "heartbeat its own token"
+        )
+    if config.web_config is None:
+        raise ConfigError(
+            "heartbeats need a `web` section: the ping URLs they are "
+            "watching for are served by the web listener, and with none "
+            "configured nothing can ever ping them"
+        )
+    for hb in config.heartbeats:
+        if not hb.names_a_destination():
+            # Not an error: a heartbeat with no reporter is still shown
+            # on the dashboards, counted in /summary and exported to
+            # Prometheus, which is a legitimate (if quiet) way to run
+            # one. It is worth one line at load, because the far more
+            # likely reading is that a reporter was meant to be there.
+            logger.info(
+                "heartbeat %r names no report destination: it will be "
+                "visible in the dashboards, /heartbeats and the metrics, "
+                "but going down will not notify anyone",
+                hb.name,
+            )
 
 
 def _validate_dags(config: CronstableConfig) -> None:
@@ -4781,6 +5285,7 @@ def _parse_config_dir(
 ) -> CronstableConfig:
     jobs: list[JobConfig] = []
     dags: list[DagConfig] = []
+    heartbeats: list[HeartbeatConfig] = []
     config_errors: dict[str, str] = {}
     web_config: Optional[WebConfig] = None
     web_config_source_fname: Optional[str] = None
@@ -4832,6 +5337,7 @@ def _parse_config_dir(
             _sources.update(file_sources)
         jobs.extend(config.jobs)
         dags.extend(config.dags)
+        heartbeats.extend(config.heartbeats)
         web_config, web_config_source_fname = _claim_config_dir_section(
             "web",
             config.web_config,
@@ -4904,4 +5410,5 @@ def _parse_config_dir(
         mcp_config=mcp_config,
         notify_config=notify_config,
         push_config=push_config,
+        heartbeats=heartbeats,
     )

@@ -1058,6 +1058,23 @@ class ShellReporter(Reporter):
         ):
             value = sla_vars.get(key)
             env[env_name] = str(value) if value is not None else ""
+        # Heartbeat detail, for an onLate/onFailure/onRecovery dispatch of
+        # an inbound heartbeat (only HeartbeatContext carries these).
+        # Exported on the same terms as the SLA block above: always
+        # present, empty when this report is not a heartbeat's.
+        hb_vars = getattr(job, "heartbeat_vars", None)
+        if not isinstance(hb_vars, dict):
+            hb_vars = {}
+        for env_name, key in (
+            ("CRONSTABLE_HEARTBEAT", "heartbeat"),
+            ("CRONSTABLE_HEARTBEAT_STATE", "state"),
+            ("CRONSTABLE_HEARTBEAT_REASON", "reason"),
+            ("CRONSTABLE_HEARTBEAT_LAST_PING_AT", "last_ping_at"),
+            ("CRONSTABLE_HEARTBEAT_EXPECTED_AT", "expected_at"),
+            ("CRONSTABLE_HEARTBEAT_OVERDUE_SECONDS", "overdue_seconds"),
+        ):
+            value = hb_vars.get(key)
+            env[env_name] = str(value) if value is not None else ""
 
         logger.debug("Executing shell report cmd: %s", cmd)
         # Same process-group isolation as the job itself, so the timeout kill
@@ -1404,6 +1421,9 @@ EVENTLOG_EVENTS: dict[str, tuple[int, int, int]] = {
     "late": (1003, platform.EVENTLOG_WARNING_TYPE, 1),
     "event": (1010, platform.EVENTLOG_INFORMATION_TYPE, 2),
     "event-alert": (1011, platform.EVENTLOG_ERROR_TYPE, 2),
+    # inbound heartbeats: the thing cronstable watches but does not run
+    "heartbeat-down": (1020, platform.EVENTLOG_ERROR_TYPE, 3),
+    "heartbeat-up": (1021, platform.EVENTLOG_INFORMATION_TYPE, 3),
 }
 
 #: What each insertion string means, BY POSITION, which is the other half of
@@ -1499,6 +1519,12 @@ def _eventlog_summary(outcome: str, tvars: dict[str, Any]) -> str:
         return "Cron job {!r} is overdue on {} ({})".format(
             name, host, tvars.get("sla_check")
         )
+    if outcome in ("heartbeat-down", "heartbeat-up"):
+        if outcome == "heartbeat-up":
+            return "Heartbeat {!r} recovered on {}".format(name, host)
+        return "Heartbeat {!r} is down on {} ({})".format(
+            name, host, tvars.get("reason")
+        )
     if outcome == "success":
         return "Cron job {!r} succeeded on {}".format(name, host)
     what = "failed permanently" if outcome == "permanent-failure" else "failed"
@@ -1518,6 +1544,13 @@ def _eventlog_detail(outcome: str, tvars: dict[str, Any]) -> str:
         )
     if outcome in ("event", "event-alert"):
         return "event={}".format(tvars.get("event"))
+    if outcome in ("heartbeat-down", "heartbeat-up"):
+        return "state={} reason={} lastPing={} overdue={}s".format(
+            tvars.get("state"),
+            tvars.get("reason"),
+            tvars.get("last_ping_at"),
+            tvars.get("overdue_seconds"),
+        )
     usage = []
     for key in ("cpu_seconds", "max_rss_bytes"):
         value = tvars.get(key)
@@ -1535,6 +1568,8 @@ def _eventlog_outcome(ctx: Any, config: dict[str, Any], success: bool) -> str:
 
     * a notify event is the only context carrying ``event``;
     * an SLA breach is the only one carrying ``sla_vars``;
+    * a heartbeat transition is the only one carrying ``heartbeat_vars``,
+      and its ``success`` says which direction it moved;
     * onFailure and onPermanentFailure are told apart by the IDENTITY of the
       report dict.  Each hook's block is an independent ``copy.deepcopy`` of
       ``_REPORT_DEFAULTS`` and ``mergedicts`` is copy-on-write, so the test
@@ -1553,6 +1588,8 @@ def _eventlog_outcome(ctx: Any, config: dict[str, Any], success: bool) -> str:
         return "event" if success else "event-alert"
     if getattr(ctx, "sla_vars", None) is not None:
         return "late"
+    if getattr(ctx, "heartbeat_vars", None) is not None:
+        return "heartbeat-up" if success else "heartbeat-down"
     if not success:
         job_config = getattr(ctx, "config", None)
         permanent = getattr(job_config, "onPermanentFailure", None)
@@ -1948,7 +1985,8 @@ STANDARD_TEMPLATE_VARS = (
 
 
 def _base_template_vars(
-    ctx: "RunningJob | SlaBreachContext | NotifyEventContext",
+    ctx: "RunningJob | SlaBreachContext | NotifyEventContext"
+    " | HeartbeatContext",
     *,
     success: bool,
     schedule: str,
@@ -1986,7 +2024,8 @@ def _base_template_vars(
 
 
 async def _fan_out_reports(
-    ctx: "RunningJob | SlaBreachContext | NotifyEventContext",
+    ctx: "RunningJob | SlaBreachContext | NotifyEventContext"
+    " | HeartbeatContext",
     success: bool,
     report_config: dict,
     error_fmt: str,
@@ -2727,6 +2766,134 @@ async def report_sla_breach(
         report_config,
         "Problem reporting job %s SLA breach: %s",
         ctx.config.name,
+    )
+
+
+class _HeartbeatJobShim:
+    """The ``JobConfig`` slice the reporters read for a heartbeat.
+
+    A heartbeat has no command, shell or schedule string to launch, but
+    the reporters reach into ``job.config`` for all three (the shell
+    reporter encodes them into its child's environment, where a ``None``
+    dies in ``os.fsencode``).  ``schedule_unparsed`` carries the
+    heartbeat's own expectation instead -- the cron expression it is
+    watched against, or ``every <n>s`` for an interval -- so an alert
+    still says what was expected of it.
+    """
+
+    __slots__ = ("name", "command", "shell", "schedule_unparsed")
+
+    def __init__(self, name: str, expectation: str) -> None:
+        self.name = name
+        self.command = ""
+        self.shell = platform.DEFAULT_SHELL
+        self.schedule_unparsed = expectation
+
+
+class HeartbeatContext:
+    """Reporting context for one inbound heartbeat transition.
+
+    The third sibling of :class:`SlaBreachContext` and
+    :class:`NotifyEventContext`, and quacks like a :class:`RunningJob`
+    exactly as far as the reporters read one: no process ever ran here
+    either, so every run-shaped field is explicitly empty.  What it adds
+    is the heartbeat detail the templates in
+    :mod:`cronstable.config` render -- ``state``, ``reason``,
+    ``last_ping_at``, ``overdue_seconds`` and the ping's own words.
+
+    ``success`` is threaded from the transition rather than derived: a
+    recovery is a success (and must render the recovery templates), a
+    down is not, and MailReporter's empty-body suppression keys on it.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        expectation: str,
+        success: bool,
+        state: str,
+        reason: Optional[str] = None,
+        description: Optional[str] = None,
+        last_ping_at: Optional[str] = None,
+        expected_at: Optional[str] = None,
+        overdue_seconds: Optional[float] = None,
+        down_since: Optional[str] = None,
+        down_seconds: Optional[float] = None,
+        exit_code: Optional[int] = None,
+        run_id: Optional[str] = None,
+        ping_body: Optional[str] = None,
+    ) -> None:
+        self.config = _HeartbeatJobShim(name, expectation)
+        self.heartbeat = name
+        self._success = success
+        self.fail_reason = (
+            None if success else "heartbeat: {}".format(reason or state)
+        )
+        self.failed = not success
+        self.retcode: int | None = None
+        self.stdout: str | None = None
+        self.stderr: str | None = None
+        self.stdout_discarded = 0
+        self.stderr_discarded = 0
+        self.resource_usage: ResourceUsage | None = None
+        self.env = {"HOSTNAME": report_hostname()}
+        self.run_id = run_id
+        # Read by ShellReporter for its CRONSTABLE_HEARTBEAT_* exports and
+        # merged into template_vars below, so the two can never drift.
+        self.heartbeat_vars: dict[str, Any] = {
+            "heartbeat": name,
+            "state": state,
+            "reason": reason,
+            "description": description,
+            "last_ping_at": last_ping_at,
+            "expected_at": expected_at,
+            "overdue_seconds": (
+                None if overdue_seconds is None else round(overdue_seconds)
+            ),
+            "down_since": down_since,
+            "down_seconds": (
+                None if down_seconds is None else round(down_seconds)
+            ),
+            "exit_code": exit_code,
+            "ping_body": ping_body,
+        }
+
+    @property
+    def template_vars(self) -> dict:
+        # STANDARD_TEMPLATE_VARS with the run-shaped keys emptied, plus
+        # the heartbeat detail.  `schedule` comes from the shim, so
+        # {{schedule}} renders the expectation the heartbeat is judged
+        # against exactly as it renders a job's cron line.
+        return {
+            **_base_template_vars(
+                self,
+                success=self._success,
+                schedule=self.config.schedule_unparsed,
+                run_id=self.run_id,
+            ),
+            **self.heartbeat_vars,
+        }
+
+
+async def report_heartbeat(ctx: HeartbeatContext, report_config: dict) -> None:
+    """Fan one heartbeat transition out to every reporter.
+
+    Used by all three hooks (``onLate``, ``onFailure``, ``onRecovery``);
+    which one fired is already baked into ``report_config`` and into the
+    context's ``success``, so there is nothing left here to branch on.
+    """
+    logger.info(
+        "Heartbeat %s: reporting %s",
+        ctx.heartbeat,
+        ctx.heartbeat_vars["state"],
+    )
+    await _fan_out_reports(
+        ctx,
+        ctx._success,
+        report_config,
+        "Problem reporting heartbeat %s: %s",
+        ctx.heartbeat,
     )
 
 

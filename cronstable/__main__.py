@@ -2,7 +2,7 @@ import argparse
 import logging
 import os
 import sys
-from typing import Any
+from typing import Any, Optional
 
 import cronstable.version
 from cronstable import _cliargs, platform
@@ -123,6 +123,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     _cliargs.add_service_command(sub)
     _cliargs.add_import_taskscheduler_command(sub)
     _add_init_command(sub)
+    _add_heartbeats_subcommand(sub)
 
 
 def _add_init_command(sub: Any) -> None:
@@ -147,6 +148,161 @@ def _add_init_command(sub: Any) -> None:
         help="target configuration directory (default: -c/--config if "
         "given, else {})".format(CONFIG_DEFAULT),
     )
+
+
+def _add_heartbeats_subcommand(sub: Any) -> None:
+    """Wire ``cronstable heartbeats``: the ping URLs, off the config.
+
+    The one place the ping URLs are ever printed. The HTTP API never
+    serves them at any scope, because a URL that can silence a monitor is
+    a write credential and ``view`` is handed out freely; this command
+    reads the same config the daemon does, on the daemon's own host,
+    where the secret already lives.
+    """
+    hb = sub.add_parser(
+        "heartbeats",
+        help="list the configured inbound heartbeats and, with --urls, "
+        "the ping URL of each",
+    )
+    hb.add_argument(
+        "--urls",
+        default=False,
+        action="store_true",
+        help="print each heartbeat's full ping URL (a credential: it is "
+        "all anyone needs to mark that heartbeat alive)",
+    )
+    hb.add_argument(
+        "--base",
+        default=None,
+        metavar="URL",
+        help="base URL the ping URLs are built on (default: the first "
+        "http(s) address in the config's web.listen)",
+    )
+    hb.add_argument(
+        "--json",
+        default=False,
+        action="store_true",
+        dest="as_json",
+        help="emit JSON instead of a table",
+    )
+
+
+def _run_heartbeats(args: Any) -> int:
+    """Print the configured heartbeats (`cronstable heartbeats`).
+
+    Reads the configuration directly rather than asking a running daemon:
+    it must work before the daemon is up (the URLs are what you need to
+    put IN the crontab lines you are about to write), and the token
+    derivation is a pure function of the config.
+    """
+    import json as _json_mod
+
+    from cronstable.config import ConfigError, parse_config
+
+    try:
+        config = parse_config(args.config)
+    except ConfigError as err:
+        print("Error in configuration file(s):\n{}".format(err))
+        return 1
+    if not config.heartbeats:
+        print(
+            "No heartbeats configured. A heartbeat watches work cronstable "
+            "does NOT run, by the ping it is expected to send; add a "
+            "`heartbeats:` section to start."
+        )
+        return 0
+    secret = None
+    if config.web_config is not None:
+        from cronstable.config import _resolve_secret
+
+        secret = _resolve_secret(
+            config.web_config.get("pingSecret"), "web.pingSecret"
+        )
+    base = (args.base or _heartbeat_url_base(config) or "").rstrip("/")
+    rows = []
+    for hb in config.heartbeats:
+        token = hb.ping_token(secret)
+        row = {
+            "name": hb.name,
+            "description": hb.description,
+            "enabled": hb.enabled,
+            "expectation": (
+                str(hb.schedule_tab)
+                if hb.schedule_tab is not None
+                else "every {}s".format(hb.period)
+            ),
+            "graceSeconds": hb.grace,
+        }
+        if args.urls or args.as_json:
+            row["pingUrl"] = (
+                "{}/ping/{}".format(base, token) if token else None
+            )
+        rows.append(row)
+    if args.as_json:
+        print(_json_mod.dumps(rows, indent=2))
+        return 0
+    width = max(len(str(row["name"])) for row in rows)
+    for row in rows:
+        line = "{:<{w}}  {:<16}  grace {}s".format(
+            row["name"],
+            row["expectation"],
+            row["graceSeconds"],
+            w=width,
+        )
+        if not row["enabled"]:
+            line += "  (disabled)"
+        print(line)
+        if args.urls:
+            print("    {}".format(row.get("pingUrl") or "(no ping token)"))
+    if args.urls and _HEARTBEAT_URL_HOST_PLACEHOLDER in base:
+        print(
+            "\nNote: web.listen binds a wildcard address, which is not one "
+            "anything can ping; substitute the host this daemon is reached "
+            "on, or pass --base."
+        )
+    elif args.urls and not base:
+        print(
+            "\nNote: no http(s) address in web.listen, so the URLs above "
+            "have no host; pass --base to supply one."
+        )
+    return 0
+
+
+#: Stands in for a host that cannot be read off the config.  Spelled to be
+#: obviously wrong in a pasted crontab line: a URL that merely LOOKED
+#: plausible would be pasted, fail silently, and read as a down heartbeat.
+_HEARTBEAT_URL_HOST_PLACEHOLDER = "THIS-HOST"
+
+#: Bind addresses that mean "every interface" rather than one reachable
+#: host.  A URL built on one works only from the daemon's own box.
+_WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*", ""})
+
+
+def _heartbeat_url_base(config: Any) -> Optional[str]:
+    """The first http(s) ``web.listen`` address, as a URL base.
+
+    Best effort and honest about it. A unix-socket listener has no URL at
+    all, and a wildcard bind is not an address a NAS across the room can
+    ping -- so rather than hand back something that only works on the
+    daemon's own box, the host is replaced with a placeholder the caller
+    cannot mistake for a real one, and _run_heartbeats says why.
+    """
+    if config.web_config is None:
+        return None
+    from urllib.parse import urlparse
+
+    for address in config.web_config.get("listen") or ():
+        text = str(address)
+        if not text.startswith(("http://", "https://")):
+            continue
+        parsed = urlparse(text)
+        if (parsed.hostname or "") not in _WILDCARD_HOSTS:
+            return text
+        port = ":{}".format(parsed.port) if parsed.port else ""
+        return "{}://{}{}".format(
+            parsed.scheme, _HEARTBEAT_URL_HOST_PLACEHOLDER, port
+        )
+    return None
 
 
 #: The starter file `cronstable init` writes: one working job in the
@@ -449,8 +605,13 @@ def main_loop(loop=None):
 
         sys.exit(tui.dispatch(args))
 
-    if command == "init":
-        sys.exit(_run_init(args))
+    # The config-only commands: no daemon, no store, no network. Both
+    # have to answer before anything is running -- `init` writes the
+    # config that does not exist yet, and `heartbeats` prints the URLs
+    # that go INTO the crontab lines the operator is about to write.
+    config_only = {"init": _run_init, "heartbeats": _run_heartbeats}
+    if command in config_only:
+        sys.exit(config_only[command](args))
 
     if command == "import-taskscheduler":
         # Dispatch-time import, like every other subcommand branch: the XML

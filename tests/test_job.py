@@ -2688,6 +2688,15 @@ GOLDEN_SHELL_ENV_KEYS = frozenset(
         "CRONSTABLE_SLA_THRESHOLD_SECONDS",
         "CRONSTABLE_SLA_OBSERVED_SECONDS",
         "CRONSTABLE_LAST_SUCCESS_AT",
+        # inbound-heartbeat detail: exported on the same terms as the SLA
+        # block above, empty on run-completion reports (only a
+        # HeartbeatContext carries heartbeat_vars).
+        "CRONSTABLE_HEARTBEAT",
+        "CRONSTABLE_HEARTBEAT_STATE",
+        "CRONSTABLE_HEARTBEAT_REASON",
+        "CRONSTABLE_HEARTBEAT_LAST_PING_AT",
+        "CRONSTABLE_HEARTBEAT_EXPECTED_AT",
+        "CRONSTABLE_HEARTBEAT_OVERDUE_SECONDS",
     }
 )
 
@@ -2787,6 +2796,10 @@ async def test_report_shell_full_env_contract(monkeypatch):
     assert env["CRONSTABLE_SLA_THRESHOLD_SECONDS"] == ""
     assert env["CRONSTABLE_SLA_OBSERVED_SECONDS"] == ""
     assert env["CRONSTABLE_LAST_SUCCESS_AT"] == ""
+    # nor any heartbeat context, for the same reason
+    assert env["CRONSTABLE_HEARTBEAT"] == ""
+    assert env["CRONSTABLE_HEARTBEAT_STATE"] == ""
+    assert env["CRONSTABLE_HEARTBEAT_REASON"] == ""
 
 
 @pytest.mark.asyncio

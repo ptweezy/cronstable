@@ -80,6 +80,10 @@ tags:
     description: Cluster, fleet, and node views.
   - name: calendar
     description: iCalendar feeds.
+  - name: heartbeats
+    description: >-
+      Inbound heartbeat monitoring: work cronstable does NOT run, watched
+      by the ping it is expected to send.
   - name: state
     description: Durable-state inspector (metadata only).
   - name: push
@@ -474,6 +478,262 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /heartbeats:
+    get:
+      tags: [heartbeats]
+      summary: List inbound heartbeats
+      operationId: listHeartbeats
+      description: >-
+        Every configured heartbeat with its live state, plus the same
+        per-state counts `GET /summary` carries under `heartbeats`. The
+        ping URL is deliberately absent from every response at every
+        scope: it is a write credential for the heartbeat, and `view` is
+        handed out freely. Operators read the URLs from
+        `cronstable heartbeats --urls` on the daemon's own host.
+      responses:
+        "200":
+          description: The heartbeat set and its state counts.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  heartbeats:
+                    type: array
+                    items: { $ref: "#/components/schemas/Heartbeat" }
+                  counts: { $ref: "#/components/schemas/HeartbeatCounts" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /heartbeats/{name}:
+    get:
+      tags: [heartbeats]
+      summary: One heartbeat, in full
+      operationId: getHeartbeat
+      description: >-
+        The list row plus the newest ping's own detail (exit code,
+        correlation id, body, origin) and the heartbeat's schedule lint.
+      parameters:
+        - $ref: "#/components/parameters/HeartbeatName"
+      responses:
+        "200":
+          description: The heartbeat.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HeartbeatDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /heartbeats/{name}/pause:
+    post:
+      tags: [heartbeats]
+      summary: Hold a heartbeat
+      operationId: pauseHeartbeat
+      description: >-
+        Excuse the heartbeat from every check until the window expires:
+        the planned-maintenance switch for the machine behind it. Pings
+        are still accepted and recorded while it is held. Bounded like a
+        job pause, and for the same reason: an unbounded hold on a
+        monitor is how a fleet ends up with a backup nobody has watched
+        since March. With a `state:` store the hold is durable and
+        cluster-visible; without one it is node-local and lost on
+        restart.
+      parameters:
+        - $ref: "#/components/parameters/HeartbeatName"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PauseRequest" }
+      responses:
+        "200":
+          description: The hold that is now in force.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  heartbeat: { type: string }
+                  paused: { $ref: "#/components/schemas/Pause" }
+        "400":
+          description: The window is invalid (out of bounds, or in the past).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /heartbeats/{name}/resume:
+    post:
+      tags: [heartbeats]
+      summary: Release a held heartbeat
+      operationId: resumeHeartbeat
+      description: >-
+        Lift the hold. Resuming a heartbeat that was not held succeeds
+        and reports `wasPaused: false`, so the call is idempotent.
+      parameters:
+        - $ref: "#/components/parameters/HeartbeatName"
+      responses:
+        "200":
+          description: The hold is lifted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  resumed: { type: string }
+                  wasPaused: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /ping/{token}:
+    get:
+      tags: [heartbeats]
+      summary: Ping a heartbeat
+      operationId: pingHeartbeat
+      security: []
+      description: >-
+        Record a heartbeat ping. **This is the one route in this API that
+        is never bearer-authenticated**, and it cannot be: the URL is
+        pasted into a crontab line on a NAS, a CI step, an appliance's
+        "notify" field, and handing those the dashboard's token would
+        grant far more than this endpoint does. The unguessable token in
+        the path IS the credential, and it authorises exactly one thing:
+        saying "the work behind this URL is alive".
+
+
+        Derived from `web.pingSecret` (rotating it rotates every URL) or
+        pinned per heartbeat with `token:`. GET as well as POST, because
+        a great many things that can call a URL cannot choose the method;
+        a POST body up to 8 KiB is kept (trimmed) and shown in alerts.
+
+
+        Unknown, malformed, and just-removed tokens all answer the same
+        404 with the same body, so probing the URL space learns nothing.
+      parameters:
+        - $ref: "#/components/parameters/PingToken"
+        - $ref: "#/components/parameters/PingRunId"
+      responses:
+        "200":
+          description: The ping was recorded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PingAccepted" }
+        "404":
+          description: >-
+            No heartbeat answers this token (unknown, malformed, or
+            removed by a reload). The body never says which.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: >-
+            Per-heartbeat rate limit: a burst of 20 pings, then one per
+            second. A pinger this fast is a loop that got loose.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [heartbeats]
+      summary: Ping a heartbeat
+      operationId: pingHeartbeatPost
+      security: []
+      description: >-
+        As `GET /ping/{token}`, and additionally records the request body
+        (up to 8 KiB read, 1000 characters kept) as the ping's own words:
+        `curl --data-raw "$(tail -c 400 backup.log)" "$URL"`.
+      parameters:
+        - $ref: "#/components/parameters/PingToken"
+        - $ref: "#/components/parameters/PingRunId"
+      requestBody:
+        required: false
+        content:
+          text/plain:
+            schema: { type: string }
+      responses:
+        "200":
+          description: The ping was recorded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PingAccepted" }
+        "404":
+          description: No heartbeat answers this token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: Per-heartbeat rate limit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /ping/{token}/{signal}:
+    get:
+      tags: [heartbeats]
+      summary: Ping a heartbeat with an outcome
+      operationId: pingHeartbeatSignal
+      security: []
+      description: >-
+        As `GET /ping/{token}`, carrying what happened. The vocabulary is
+        small because it is typed into shell scripts: `start` opens a run
+        (arming `maxRuntimeSeconds`), `fail` reports a failure, and a
+        bare exit code lets a script end with one unbranching line:
+        `curl -fsS -m 10 "$URL/$?"`.
+      parameters:
+        - $ref: "#/components/parameters/PingToken"
+        - $ref: "#/components/parameters/PingSignal"
+        - $ref: "#/components/parameters/PingRunId"
+      responses:
+        "200":
+          description: The ping was recorded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PingAccepted" }
+        "404":
+          description: >-
+            No heartbeat answers this token, or the signal is not one of
+            the accepted words.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: Per-heartbeat rate limit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [heartbeats]
+      summary: Ping a heartbeat with an outcome
+      operationId: pingHeartbeatSignalPost
+      security: []
+      description: As `GET /ping/{token}/{signal}`, with a body.
+      parameters:
+        - $ref: "#/components/parameters/PingToken"
+        - $ref: "#/components/parameters/PingSignal"
+        - $ref: "#/components/parameters/PingRunId"
+      requestBody:
+        required: false
+        content:
+          text/plain:
+            schema: { type: string }
+      responses:
+        "200":
+          description: The ping was recorded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PingAccepted" }
+        "404":
+          description: No heartbeat answers this token, or a bad signal.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: Per-heartbeat rate limit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /dags:
     get:
@@ -1443,6 +1703,38 @@ components:
       required: true
       description: The paired device's id (assigned at pairing).
       schema: { type: string }
+    HeartbeatName:
+      name: name
+      in: path
+      required: true
+      description: The heartbeat's configured name.
+      schema: { type: string }
+    PingToken:
+      name: token
+      in: path
+      required: true
+      description: >-
+        The heartbeat's ping token: 26 lowercase base32 characters when
+        derived from `web.pingSecret`, or whatever the heartbeat's own
+        `token:` resolves to. This value is the credential.
+      schema: { type: string }
+    PingSignal:
+      name: signal
+      in: path
+      required: true
+      description: >-
+        What happened: `start`, `fail`, or an exit code (`0` succeeds,
+        anything else fails and is kept for the alert).
+      schema: { type: string }
+    PingRunId:
+      name: rid
+      in: query
+      required: false
+      description: >-
+        Caller-chosen correlation id (max 64 characters; longer is
+        truncated, never refused) tying a `start` to its finish and
+        echoed in alerts.
+      schema: { type: string }
 
   headers:
     ETag:
@@ -1777,6 +2069,145 @@ components:
         until: { type: string, format: date-time }
         note: { type: string }
         by: { type: string }
+
+    Heartbeat:
+      type: object
+      description: >-
+        One inbound heartbeat: work cronstable does not run, judged by
+        whether its ping arrived. Note the absence of the ping URL, at
+        every scope and in every response; see `GET /heartbeats`.
+      properties:
+        name: { type: string }
+        description: { type: string, nullable: true }
+        enabled: { type: boolean }
+        state:
+          type: string
+          enum: [new, up, late, down, paused, disabled]
+          description: >-
+            `new` has never been pinged and is still inside its first
+            window; `late` is past due but inside `graceSeconds`, which
+            is visible everywhere and deliberately reports nothing;
+            `down` is what alerts.
+        reason:
+          type: string
+          nullable: true
+          enum: [missed, failed, overrun]
+          description: >-
+            Why it is down, `null` otherwise. `missed`: no ping before
+            due + grace. `failed`: a `/fail` ping (or a nonzero exit
+            code) said so. `overrun`: `/start` arrived, `maxRuntimeSeconds`
+            elapsed, no finish ever landed.
+        expectation:
+          type: string
+          description: >-
+            The window in one phrase, for display: the cron expression,
+            or `every <n>s`.
+        periodSeconds: { type: integer, nullable: true }
+        schedule: { type: string, nullable: true }
+        timezone: { type: string, nullable: true }
+        graceSeconds: { type: integer }
+        maxRuntimeSeconds: { type: integer, nullable: true }
+        lastPingAt: { type: string, format: date-time, nullable: true }
+        lastPingKind:
+          type: string
+          nullable: true
+          enum: [success, fail, start]
+        lastSuccessAt: { type: string, format: date-time, nullable: true }
+        lastFailAt: { type: string, format: date-time, nullable: true }
+        lastDurationSeconds:
+          type: number
+          nullable: true
+          description: >-
+            Wall time of the last `start`→finish pair; `null` for a job
+            that pings only on finish.
+        expectedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            When the next ping is due. `null` only when the expectation
+            cannot be anchored at all (a `schedule` whose fires have run
+            out past the engine's horizon).
+        downAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: "`expectedAt` + `graceSeconds`: when it flips to down."
+        downSince:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            When the current outage began — the exact instant, derived
+            from the schedule rather than stamped when the monitor
+            noticed, so it is never null beside a `down` state.
+        overdueSeconds: { type: number }
+        totalPings: { type: integer }
+        totalFails: { type: integer }
+        paused:
+          allOf: [{ $ref: "#/components/schemas/Pause" }]
+          nullable: true
+
+    HeartbeatDetail:
+      allOf:
+        - $ref: "#/components/schemas/Heartbeat"
+        - type: object
+          properties:
+            lastExitCode: { type: integer, nullable: true }
+            lastRunId: { type: string, nullable: true }
+            lastBody:
+              type: string
+              nullable: true
+              description: The newest ping's body, trimmed to 1000 characters.
+            lastSource:
+              type: string
+              nullable: true
+              description: >-
+                The socket peer of the newest ping, never a forwarded-for
+                chain: this endpoint is unauthenticated, so a field shown
+                in an alert must not be one the alert's subject can write.
+            lastHost:
+              type: string
+              nullable: true
+              description: Which cluster node accepted the newest ping.
+            lastStartAt: { type: string, format: date-time, nullable: true }
+            scheduleFindings:
+              type: array
+              items: { $ref: "#/components/schemas/ScheduleFinding" }
+            reports:
+              type: array
+              description: Which hooks would really fire for this heartbeat.
+              items:
+                type: string
+                enum: [onLate, onFailure, onRecovery]
+
+    HeartbeatCounts:
+      type: object
+      description: >-
+        Heartbeats per state, every key always present (zero-filled), so
+        a client binding to `down` renders 0 rather than blank.
+      properties:
+        total: { type: integer }
+        new: { type: integer }
+        up: { type: integer }
+        late: { type: integer }
+        down: { type: integer }
+        paused: { type: integer }
+        disabled: { type: integer }
+
+    PingAccepted:
+      type: object
+      properties:
+        ok: { type: boolean }
+        heartbeat:
+          type: string
+          description: >-
+            Which heartbeat the token resolved to. Echoed so a caller
+            setting up a crontab line can confirm the URL it pasted is
+            the one it meant.
+        kind:
+          type: string
+          enum: [success, fail, start]
 
     Dag:
       type: object
