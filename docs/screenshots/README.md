@@ -18,7 +18,7 @@ clipping. To refresh them after a UI change:
 2. **Run the capture script** (needs `playwright` + its Chromium in the
    environment; shots land in a `shots/` directory next to the script). All
    the capture jobs live in one `capture.py` behind a target subcommand
-   (`dashboard`, `tui`, `showcase`, `logo`, `social`, `logs`); each target
+   (`dashboard`, `tui`, `showcase`, `logo`, `logs`); each target
    keeps the flags and output paths its old standalone script had:
 
    ```shell
@@ -60,21 +60,7 @@ clipping. To refresh them after a UI change:
    python docs/screenshots/capture.py logo
    ```
 
-5. **The GitHub social-preview card** (`social-preview.png`, 1280x640) is
-   rendered from `social-card.html`, a static page styled after the carolina
-   theme with `docs/img/dashboard-overview.png` inset as the product shot, so
-   regenerate that overview first if the UI changed. Also needs Pillow:
-
-   ```shell
-   python docs/screenshots/capture.py social
-   ```
-
-   GitHub has no API for the social preview: after regenerating, upload
-   `docs/img/social-preview.png` by hand under **Settings -> General ->
-   Social preview** (1 MB limit). That image is what link unfurls on Slack,
-   Discord, Teams, and X/Twitter show for the repo URL.
-
-6. **The terminal-dashboard set** (`docs/img/tui-*.png`) comes off the same
+5. **The terminal-dashboard set** (`docs/img/tui-*.png`) comes off the same
    running grand-tour fleet, staged the same way: the real
    `cronstable.tui.TuiApp` is driven headless against meridian-a (a scripted
    key queue and an in-memory terminal stand in for the tty), and the
@@ -92,7 +78,7 @@ clipping. To refresh them after a UI change:
    before shooting them — run those three when the window is close, or let
    it wait.
 
-7. Review the PNGs, then copy the keepers over `docs/img/` (re-saving with
+6. Review the PNGs, then copy the keepers over `docs/img/` (re-saving with
    Pillow's `optimize=True` shaves a few percent).
 
 ## Regenerating the animated hero reel + theme row
@@ -141,8 +127,7 @@ Notes:
 * Screenshot prefs are seeded through `localStorage` (`cronstable.boot`,
   `cronstable.zen`, `cronstable.theme`, ...); the context needs `bypass_csp: true`
   (the page CSP has no `unsafe-eval`) and `reduced_motion: "no-preference"`
-  (headless Chromium otherwise suppresses the boot POST screen and CRT
-  animation).
+  (headless Chromium otherwise suppresses the boot POST screen).
 * The header mark is a live pendulum simulation, so the still-capture scripts
   park it balanced at exact upright the moment it mounts (an init-script hook
   around `CronstableLogo.mountGlyph` — see `PARK_HOOK` in `capture.py`); every

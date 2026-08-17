@@ -7,7 +7,7 @@
 <link rel="stylesheet" href="palette.css">
 <style>
   /* colors come from palette.css (cronstable's own palettes; the logo must
-     be judged in its habitat). data-pal picks the phosphor family, paper
+     be judged in its habitat). data-pal picks the hue family, paper
      follows the OS preference via data-mode. */
   :root {
     --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Cascadia Code",
@@ -51,13 +51,6 @@
   .stage { display: flex; justify-content: center; padding: 10px 16px; cursor: crosshair; }
   .stage svg { width: min(100%, 620px); height: auto;
     filter: drop-shadow(0 0 7px var(--glow)); }
-  /* the app's CRT overlay, quoted at low volume */
-  .stagebox::after {
-    content: ""; position: absolute; inset: 0; pointer-events: none;
-    background: repeating-linear-gradient(0deg, rgba(0,0,0,.14) 0 1px, transparent 1px 3px);
-    opacity: .5;
-  }
-  [data-mode="light"] .stagebox::after { opacity: .12; }
   .statechip {
     position: absolute; top: 10px; left: 12px; z-index: 1;
     font-size: 11px; letter-spacing: .12em; font-weight: 700;

@@ -243,6 +243,33 @@ def test_lock_run_wraps_command(job_cli):
     assert any(c["path"] == "/v1/lock/release" for c in http.calls)
 
 
+def test_lock_run_scrubs_pyinstaller_env(job_cli, tmp_path, monkeypatch):
+    # The wrapped command may invoke a frozen binary (this CLI included), so
+    # the bootloader's _PYI_* linkage vars must not follow it: the frozen
+    # CLI's own would make a wrapped script's `cronstable xcom` die with
+    # "parent process has different executable" (_spawn_environment, the
+    # stdlib-only twin of cronstable.job.fixup_pyinstaller_env).
+    monkeypatch.setenv("_PYI_PARENT_PROCESS_LEVEL", "1")
+    monkeypatch.setenv("_PYI_ARCHIVE_FILE", "/bin/cronstable")
+    out = tmp_path / "env.txt"
+    http = _FakeHTTP(
+        {
+            "/v1/lock/acquire": (200, {"acquired": True, "token": "h1"}),
+            "/v1/lock/release": (200, {"released": True}),
+        }
+    )
+    code = (
+        "import os, sys; "
+        "open(sys.argv[1], 'w').write("
+        "','.join(sorted(k for k in os.environ if k.startswith('_PYI_'))))"
+    )
+    argv = ["lock", "run", "L", "--", sys.executable, "-c", code, str(out)]
+    assert job_cli(argv, http) == 0
+    # the real child saw none of them; everything else came through (the
+    # write itself proves PATH/SystemRoot survived enough to run Python).
+    assert out.read_text() == ""
+
+
 def test_lock_run_denied_does_not_run(job_cli):
     http = _FakeHTTP({"/v1/lock/acquire": (200, {"acquired": False})})
     argv = [

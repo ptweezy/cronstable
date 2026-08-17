@@ -411,6 +411,7 @@ jobs:
             tests/test_web_engine_parity.py \
             tests/test_web_heat_e2e.py \
             tests/test_web_drawer_e2e.py \
+            tests/test_web_title_e2e.py \
             -v -rs --junitxml=parity-enforce.xml
           .tox/py-posix/bin/python - <<'EOF'
           import xml.etree.ElementTree as ET
@@ -572,6 +573,10 @@ jobs:
           # catching an analysis or hiddenimport miss that --version
           # cannot.
           dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+          # A job that shells out to the CLI, asserted on the KV side effect:
+          # proves the daemon's PyInstaller env scrub against the real
+          # bootloader, which no venv test reaches (see the script header).
+          bash .github/scripts/cli_job_smoke.sh dist/cronstable
           mv dist/cronstable "dist/cronstable-linux-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
@@ -751,6 +756,10 @@ jobs:
               if python -c "import nacl" 2>/dev/null; then
                 dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
               fi
+              # The CLI-from-job smoke (cli_job_smoke.sh) runs on the native
+              # lanes only: it needs a daemon, loopback HTTP and curl, and
+              # most of these rows run under QEMU. The scrub it proves is
+              # shared Python code, identical on every lane.
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
             '
       # The container runs as root and pip creates its cache files via
@@ -863,6 +872,10 @@ jobs:
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
           # fail closed at config validation when they cannot import).
           dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+          # A job that shells out to the CLI, asserted on the KV side effect:
+          # proves the daemon's PyInstaller env scrub against the real
+          # bootloader, which no venv test reaches (see the script header).
+          bash .github/scripts/cli_job_smoke.sh dist/cronstable
           # Assert the binary is the intended native arch: Rosetta would happily
           # run an x86_64 build on the arm64 runner and let the smoke test pass,
           # silently producing a mislabelled asset. `file` reports x86_64/arm64.
@@ -1008,6 +1021,10 @@ jobs:
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
           # fail closed at config validation when they cannot import).
           ./dist/cronstable.exe --validate-config -c pyinstaller/smoke-push.yaml
+          # A job that shells out to the CLI (through cmd.exe here), asserted
+          # on the KV side effect: proves the daemon's PyInstaller env scrub
+          # against the real bootloader (see the script header).
+          bash .github/scripts/cli_job_smoke.sh dist/cronstable.exe
           mv dist/cronstable.exe "dist/cronstable-windows-${{ matrix.arch }}.exe"
       - uses: actions/upload-artifact@v7.0.1
         with:
@@ -1023,6 +1040,10 @@ jobs:
           # share one Analysis and cannot drift.
           ./dist/cronstable/cronstable.exe --version
           ./dist/cronstable/cronstable.exe --validate-config -c pyinstaller/smoke-push.yaml
+          # The CLI-from-job smoke again, on the one-directory bootloader: a
+          # different runtime shape (single process, the one the service
+          # hosts), so it gets its own pass.
+          bash .github/scripts/cli_job_smoke.sh dist/cronstable/cronstable.exe
           # A real SCM round trip, because hosting a service is this
           # artifact's whole point and the hosted runners are elevated.
           # `service install` only needs the -c path to exist (it is baked
@@ -1091,7 +1112,10 @@ jobs:
       # at the custom directory and was started by the upgrade. Either
       # assert missing re-opens the fleet failure: upgrades silently
       # resetting the config dir and leaving the service stopped.
-      - name: Smoke-test MSI upgrade (remembered properties, restart)
+      # The running service this leaves behind is also the one place a
+      # real PARAMCHANGE delivery can be proven, so the reload round
+      # trip lives here too.
+      - name: Smoke-test MSI upgrade (remembered properties, restart, reload)
         env:
           VERSION: ${{ needs.version.outputs.new }}
           ARCH: ${{ matrix.arch }}
@@ -1125,6 +1149,20 @@ jobs:
             sc query cronstable | grep -q 'RUNNING' && break
             sleep 2
           done
+          sc query cronstable | grep -q 'RUNNING'
+          # A real forced-reload round trip. `service reload` sends the
+          # SCM's paramchange control, which succeeds only when the
+          # running service advertises it in its accepted mask; the
+          # handler posts the reparse onto the loop, whose log line
+          # lands in the bootstrap log (smoke-push.yaml has no logging:
+          # section to replace it).
+          "/c/Program Files/cronstable/cronstable.exe" service reload
+          for _ in $(seq 1 15); do
+            grep -q 'service control PARAMCHANGE' "$cfg/logs/cronstable-service.log" 2>/dev/null && break
+            sleep 1
+          done
+          grep -q 'service control PARAMCHANGE' "$cfg/logs/cronstable-service.log"
+          # A reload is not a stop: the service is still RUNNING.
           sc query cronstable | grep -q 'RUNNING'
           msi_uninstall upgrade-twin.msi upgrade-uninstall.log
           if sc query cronstable >/dev/null 2>&1; then
