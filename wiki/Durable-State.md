@@ -407,7 +407,10 @@ instead of a silent gap:
   record written by this very process is skipped (a `state`-section reload
   rebuilds the backend under live runs); live local instances outrank the
   ledger; and a recorded pid that still exists is left alone with a warning
-  -- a daemon crash does not kill the job processes it spawned.
+  -- a daemon crash does not kill the job processes it spawned. The pid
+  guard checks identity, not bare existence: a live pid whose process
+  started after the record was written is a recycled pid, not that run,
+  and the record is closed like any other crash.
 * **Cross-host reconciliation on a slot takeover.** For a
   [`concurrencyScope: cluster`](Clustering-and-Leader-Election) job, the node
   that wins the job's slot lease fresh also closes a foreign holder's
@@ -618,14 +621,17 @@ and every `@reboot` job runs again. With `state` configured, a standalone
 
 * **Boot identity.** Linux uses `/proc/sys/kernel/random/boot_id` (exact).
   Elsewhere the boot time is derived from uptime (`GetTickCount64` on
-  Windows, `/proc/uptime` on POSIX) and compared with a 60-second tolerance.
-  Where neither exists (macOS, the BSDs) behaviour is unchanged: the job runs
-  every daemon start, exactly as before. One Windows caveat: Fast Startup
-  ("Shut down" with hiberboot enabled, the client default) hibernates the
-  kernel session, so the next power-on resumes the same uptime counter and
-  reads as the *same* boot; `@reboot` does not re-fire after it, only after
-  a Restart (which always begins a new boot). Disable Fast Startup
-  (`powercfg /h off`) if "every power-on" is the behaviour you need.
+  Windows, `/proc/uptime` on POSIX) and compared with a 60-second tolerance;
+  on macOS and the BSDs, which have neither, the daemon reads the kernel's
+  own record of the boot instant (`kern.boottime`, via psutil). Only when
+  every source fails does the daemon fall back to treating each start as a
+  fresh boot (the job then runs every daemon start, the stateless
+  behaviour). One Windows caveat: Fast Startup ("Shut down" with hiberboot
+  enabled, the client default) hibernates the kernel session, so the next
+  power-on resumes the same uptime counter and reads as the *same* boot;
+  `@reboot` does not re-fire after it, only after a Restart (which always
+  begins a new boot). Disable Fast Startup (`powercfg /h off`) if "every
+  power-on" is the behaviour you need.
 * **Record-then-run.** The marker (stream `reboot/<job>`: host, boot
   id/time, job digest) is written *before* the launch, so a crash between
   record and spawn errs toward not re-running -- the same at-most-once
@@ -633,6 +639,17 @@ and every `@reboot` job runs again. With `state` configured, a standalone
 * **A redefined job runs again.** The marker is scoped to the job's config
   digest, so changing the job's definition re-fires it this boot, mirroring
   the cluster path's job-set scoping.
+* **A surviving boot run blocks a relaunch.** When a starting daemon's
+  [in-flight reconciliation](#in-flight-runs-and-crash-reconciliation)
+  finds the previous daemon's run of an `@reboot` job still running on
+  this host, the launch is skipped, by the boot gate and the deferred
+  cluster launch paths alike, even when no marker covers this boot (the
+  marker may predate this build, or the boot instant may be unknowable):
+  the one-shot is literally still running. The remembered
+  pid is pinned to its process start time, so a pid the OS recycled never
+  counts as the survivor. The skip leaves the marker stream exactly as it
+  was, so if the survivor dies before the next daemon start, the marker
+  alone decides then -- erring at-least-once.
 * **Store trouble follows the policy.** Under the default `degrade`, an
   unreadable or unwritable marker runs the job anyway (at-least-once --
   exactly the stateless behaviour). Under `onStoreUnavailable: fail-closed`

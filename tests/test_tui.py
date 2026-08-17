@@ -18,6 +18,7 @@ CI and on a Windows checkout.
 import asyncio
 import datetime
 import json
+import math
 import time
 from typing import Any, Optional
 
@@ -28,6 +29,7 @@ from cronstable.tui import (
     Api,
     HeadlessTerm,
     KeyDecoder,
+    PendulumMark,
     ScriptedKeys,
     Theme,
     TuiApp,
@@ -636,6 +638,157 @@ def test_help_rows_pin_the_pause_row_after_cancel():
 
 
 # ===================================================================
+#  the living mark (the header wordmark's l)
+# ===================================================================
+def _mark_run(mark, seconds, dt=0.1, probe=None):
+    """Advance in app-sized steps; a single ``step`` call clamps its
+    elapsed time (a suspended laptop must not fast-forward physics)."""
+    for _ in range(int(seconds / dt)):
+        mark.step(dt)
+        if probe is not None:
+            probe(mark)
+
+
+def test_mark_balances_the_letter_in_the_breeze():
+    """Live daemon: the mark reads as the letter.  Ten minutes at the
+    ambient 1 Hz cadence never tips the glyph, the cart stays in the
+    l's cell, and the wind shivers the ink now and then."""
+    mark = PendulumMark(seed=7, connected=True)
+    inks = []
+    for _ in range(600):
+        mark.step(1.0)
+        glyph, ink = mark.frame()
+        assert glyph == "l"
+        assert mark.mode == "balance"
+        inks.append(ink)
+    assert abs(mark.x) < 0.1
+    assert inks.count("accent") >= 3  # the breeze is visible...
+    assert inks.count(None) > 540  # ...and mostly resting
+
+
+def test_mark_collapse_strives_then_rests():
+    """Signal loss cuts the motor: the letter goes over, swings hard
+    but is held short of the top (a dead daemon can never look
+    balanced), then tires into a resting dangle that 1 Hz serves."""
+    mark = PendulumMark(seed=5, connected=True)
+    _mark_run(mark, 5)
+    assert mark.set_connected(False)
+    stats = {"glyphs": set(), "inks": set(), "stood": False,
+             "apex": math.pi}
+
+    def probe(m):
+        glyph, ink = m.frame()
+        stats["glyphs"].add(glyph)
+        stats["inks"].add(ink)
+        stats["stood"] = stats["stood"] or m.mode == "balance"
+        if 8.0 < m.t < 31.0:  # the striving window, settled
+            stats["apex"] = min(stats["apex"], abs(tui._mark_wrap(m.th)))
+
+    _mark_run(mark, 120, probe=probe)
+    assert stats["inks"] == {"fail"}
+    assert "_" in stats["glyphs"]
+    assert not stats["stood"]
+    assert 0.4 < stats["apex"] < 1.2  # strives close, denied the top
+    assert mark.quiescent()  # long-dead: resting
+    assert mark.frame() == ("_", "fail")
+
+
+def test_mark_swings_back_up_when_the_signal_returns():
+    mark = PendulumMark(seed=3, connected=True)
+    _mark_run(mark, 3)
+    mark.set_connected(False)
+    _mark_run(mark, 40)
+    assert mark.quiescent()
+    assert mark.frame() == ("_", "fail")
+    assert mark.set_connected(True)
+    caught_at = None
+    saw_ok = False
+    start = mark.t
+    while mark.t - start < 30.0:
+        mark.step(0.05)
+        saw_ok = saw_ok or mark.frame()[1] == "ok"
+        if caught_at is None and mark.mode == "balance":
+            caught_at = mark.t - start
+    assert caught_at is not None and caught_at < 20.0
+    assert saw_ok  # the catch flash
+    _mark_run(mark, 5)
+    assert mark.mode == "balance"
+    assert mark.frame()[0] == "l"  # the letter, home again
+
+
+def test_mark_launch_ritual_from_cold():
+    """A fresh mark is born hanging and signal-less; the first good
+    poll is what stands it up, so every launch opens on a swing-up."""
+    mark = PendulumMark(seed=3000)
+    assert mark.frame() == ("_", "fail")
+    _mark_run(mark, 1)
+    mark.set_connected(True)
+    start = mark.t
+    while mark.t - start < 30.0 and mark.mode != "balance":
+        mark.step(0.05)
+    assert mark.mode == "balance"
+    _mark_run(mark, 3)
+    assert mark.frame()[0] == "l"
+
+
+def test_mark_poke_staggers_and_a_mash_knocks_it_over():
+    calm = PendulumMark(seed=1000, connected=True)
+    _mark_run(calm, 3)
+    calm.poke()
+    _mark_run(calm, 6)
+    assert calm.mode == "balance"  # one gust is only a stagger
+    assert not calm.consume_knockover()
+    assert calm.frame()[0] == "l"
+
+    mashed = PendulumMark(seed=2000, connected=True)
+    _mark_run(mashed, 3)
+    knocked = False
+    for _ in range(6):
+        mashed.poke()
+        mashed.step(0.25)
+        knocked = knocked or mashed.consume_knockover()
+    assert knocked  # escalation wins the battle...
+    start = mashed.t
+    while mashed.t - start < 60.0 and mashed.mode != "balance":
+        mashed.step(0.05)
+    assert mashed.mode == "balance"  # ...and loses the war
+
+
+def test_mark_park_is_a_still_honest_pose():
+    mark = PendulumMark(seed=1)
+    mark.park(True)
+    assert mark.frame() == ("l", None)
+    assert mark.quiescent()
+    mark.park(False)
+    assert mark.frame() == ("_", "fail")
+
+
+def test_mark_frames_are_plain_ascii():
+    """--ascii swaps the status glyph tables; the mark needs no entry
+    there because every frame it can draw is already ASCII."""
+    mark = PendulumMark(seed=11, connected=True)
+    seen = set()
+
+    def probe(m):
+        seen.add(m.frame()[0])
+
+    _mark_run(mark, 4, probe=probe)
+    mark.set_connected(False)
+    _mark_run(mark, 45, probe=probe)
+    mark.set_connected(True)
+    _mark_run(mark, 20, probe=probe)
+    assert seen == {"l", "/", "\\", "_"}
+    assert all(len(g) == 1 and ord(g) < 128 for g in seen)
+
+
+def test_prefs_carry_the_motion_toggle(tmp_path):
+    path = str(tmp_path / "prefs.json")
+    assert load_prefs(path)["motion"] is True
+    save_prefs({**tui.PREF_DEFAULTS, "motion": False}, path)
+    assert load_prefs(path)["motion"] is False
+
+
+# ===================================================================
 #  the app, headless against a fake daemon
 # ===================================================================
 class FakeDaemon:
@@ -978,6 +1131,31 @@ async def test_app_boots_and_paints_the_board(tmp_path):
         assert "2 jobs" in screen
         assert "JOB FAILING — north-beacon" in screen  # verdict bar
         assert "live" in screen  # connection dot
+    finally:
+        await h.stop()
+
+
+async def test_the_wordmark_lives_in_the_header(tmp_path):
+    """The header's l is the living mark: the app launches it hanging
+    (the first good poll starts the swing-up, so early frames may read
+    mid-recovery), it reads whole once balanced, and the ~ key lands
+    a gust on it."""
+    import re
+
+    h = Harness()
+    h.daemon.jobs = [_job("heartbeat", outcome="success")]
+    try:
+        app = await h.start(tmp_path)
+        await _wait_for(lambda: app.connected)
+        assert app.mark_sim.connected
+        await h.settle()
+        assert re.search(r"cronstab[l/\\_]e", h.term.screen())
+        app.mark_sim.park(True)  # pin the pose: the word must read whole
+        app.mark()
+        await h.settle()
+        assert "cronstable" in h.term.screen()
+        h.keys.send("~")
+        await _wait_for(lambda: app.mark_sim._poke_heat > 0)
     finally:
         await h.stop()
 

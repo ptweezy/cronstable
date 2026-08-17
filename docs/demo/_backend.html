@@ -1,6 +1,8 @@
 <script id="cronstable-demo-backend">
 /* Injected before the dashboard app; patches window.fetch to serve a synthetic fleet. */
 try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
+/* the dashboard's live tab title signs with this brand instead of "cronstable" */
+window.CRONSTABLE_BRAND = "cronstable demo";
 
 /* =====================================================================
  *  cronstable dashboard — DEMO backend (synthetic, fully client-side)

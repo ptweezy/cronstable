@@ -61,7 +61,7 @@ one muscle memory. Press `?` at any time for the overlay.
 | `p` | Pause or resume the selected job |
 | `c` | Copy the selected job's command |
 | `g` | Refresh now |
-| `t` / `T` | Cycle theme / flip phosphor ↔ paper |
+| `t` / `T` | Cycle theme / flip dark ↔ paper |
 | `i` | Incident timeline |
 | `w` | Wallboard (TV) mode |
 | `a` | Acknowledge the failure alarm |
@@ -151,15 +151,15 @@ machines over gossip): untrusted output can color a line, but it can
 never move the cursor, retitle your window, or write your clipboard
 via OSC 52.
 
-Web-only physics stay in the browser: CRT glow, scanlines, desktop
-notifications (the TUI rings the terminal bell instead, off by
-default), the run ledger, and the pendulum wordmark.
+Some features stay web-only: desktop notifications (the TUI rings the
+terminal bell instead, off by default), the run ledger, and the
+pendulum wordmark.
 
 ## Themes and accessibility
 
-The same five hues as the web page — **carolina** (default), amber and
-green phosphor, flat **modern** and **standard** — each in a dark
-(phosphor) and light (paper) variant; `t` cycles hues and `T` flips the
+The same five hues as the web page — **carolina** (default), **amber**
+and **green**, flat **modern** and **standard** — each in a dark
+and light (paper) variant; `t` cycles hues and `T` flips the
 variant, exactly as in the browser. The **color-vision** remaps
 (red-green and blue-yellow) re-ink the status colors with the same
 shape-differs-too guarantee, and `--ascii` swaps the status glyphs for

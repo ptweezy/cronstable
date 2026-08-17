@@ -60,6 +60,7 @@ and a real stop control.
 | `cronstable service remove` | Stop it if running, then unregister. Needs elevation. |
 | `cronstable service start` | Start it and wait until it reports running. |
 | `cronstable service stop` | Ask it to stop, and wait for the drain. |
+| `cronstable service reload` | Make the running service reload its configuration now. |
 | `cronstable service status` | Print the state, the process ID, and why it last failed. |
 | `cronstable service run` | What the SCM invokes. Not meant to be typed. |
 
@@ -104,6 +105,31 @@ cronstable service install -c C:\ProgramData\cronstable
 A per-user path you name explicitly is a deliberate act and works, since
 LocalSystem can read the profile; it prints a note about the fragility and
 proceeds.
+
+## Reloading the configuration
+
+The daemon rereads its configuration on the housekeeping pass, within a
+minute of a change. `cronstable service reload` applies it now instead, and
+forces a reparse even when file stats are unchanged, which covers what the
+stat watch cannot see: a `fromFile` credential rewritten in place, a
+coarse-mtime or network filesystem. It is the same forced reload `SIGHUP`
+performs on POSIX, and it survives a failed parse: the retry continues
+until a parse succeeds.
+
+The verb is the Service Control Manager's `paramchange` control, so
+standard service tooling sends it too: `sc.exe control cronstable
+paramchange` does exactly what `cronstable service reload` does. The
+service stays running throughout; only a stop control starts a drain.
+
+A reload needs a running, settled service, and the error message names
+whichever condition is unmet: a service that is starting or stopping takes
+no controls until it settles, a stopped one is not running, and a service
+process still running an older cronstable refuses the control until it is
+restarted on the current binary.
+
+A `cronstable` console run on Windows has no reload signal and picks
+changes up on the housekeeping pass; the reload verb belongs to the
+service.
 
 ## Recovery
 

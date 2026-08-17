@@ -1,5 +1,64 @@
 # History
 
+## 1.2.43
+
+- The state-backed `@reboot` once-per-boot dedupe now works on macOS and
+  the BSDs: with no `/proc` to read, the boot instant comes from the
+  kernel's own `kern.boottime` record (via psutil, already a core
+  dependency). Previously the daemon lacked any boot identity on those
+  platforms, so every daemon restart re-ran `@reboot` one-shots.
+- A starting daemon that finds the previous daemon's run of an `@reboot`
+  job still running on this host now treats that surviving run as this
+  boot's run and skips the duplicate launch, whatever the boot marker
+  says: the boot gate and the deferred cluster launch paths both consult
+  the in-flight reconciliation's finding. The remembered pid is pinned to
+  its process start time, so a pid the OS recycled never counts as the
+  survivor -- and reconciliation closes an open record whose live pid
+  provably belongs to a younger process (the record of a run cut short by
+  power loss, whose pid an unrelated process holds after the reboot).
+- In-place rewrites of `web.authToken`/`authTokens` `fromFile` secret
+  files now take effect without a restart: the token sources are
+  fingerprinted like TLS certificates, so the next housekeeping pass (or
+  a `SIGHUP`) rebuilds the web app against the rotated secret, while a
+  half-written rotation (an emptied file) keeps the running listener up
+  and retries.
+- `SIGHUP` requests an immediate config reload, and forces a reparse even
+  when file stats are unchanged (a `fromFile` credential rewritten in
+  place, a coarse-mtime filesystem); the request survives a failed parse
+  and keeps retrying until one succeeds. Previously the signal fell
+  through to its default action: it killed the daemon outright and the
+  shutdown drain never ran, even though the wiki told operators to reload
+  with `SIGHUP`/`cronstable reload`.
+- The Windows service takes that same forced reload as an SCM control:
+  `cronstable service reload` (or `sc control cronstable paramchange`)
+  reparses the configuration immediately, even when file stats are
+  unchanged, and retries after a failed parse, exactly as `SIGHUP` does.
+  Previously the service accepted no reload control and Windows waited
+  on the housekeeping pass; a console run on Windows still does.
+- The dashboard's tab title reports live fleet state, worst condition
+  first: connection lost, cluster alert, jobs failing (named outright when
+  only one is), jobs running, or a quiet fleet with its healthy count and
+  next fire. The readouts are plain words with middle-dot separators, and
+  running jobs show their elapsed time. When several jobs fail or run at
+  once, the title rotates complete readouts every few seconds and pages
+  through each job by name rather than truncating. A hidden tab keeps
+  polling at a slow 30-second cadence so the title stays current in the
+  background, and on a cluster node the title signs with the node's name.
+  The page carries a favicon: the cronstable pendulum mark.
+- Jobs on the packaged builds (the Homebrew formula, the release
+  binaries, the Windows service) can shell out to the `cronstable` CLI:
+  the daemon strips PyInstaller's private `_PYI_*` process-linkage
+  variables from the environment of every job, DAG task and shell
+  reporter, and `cronstable lock run` does the same for the command it
+  wraps. Previously those inherited variables made the frozen CLI's
+  bootloader refuse to start (its parent is the job's shell, not the
+  daemon it expects), so on a frozen install every `state`, `cursor`,
+  `lock`, `xcom` and `secret` call from a job failed before the
+  subcommand ran, and usually silently: defensively written commands
+  (`... || true`) exited 0 while writing nothing. The release binary
+  lanes run this shape against each built binary and assert the durable
+  write rather than the exit status.
+
 ## 1.2.42
 
 - The dashboard's "Pair a device" QR encodes a deep link: a phone-camera

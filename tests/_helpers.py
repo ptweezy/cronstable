@@ -191,6 +191,25 @@ async def _newest(cron, stream):
     return recs[0] if recs else None
 
 
+async def _seed_orphan_open(
+    cron, name, *, pid=None, started_at="2026-07-01T10:00:00+00:00"
+):
+    # an open in-flight record left by a PREVIOUS daemon on this host (same
+    # host, a different proc token): exactly what the boot reconciliation
+    # judges -- close it (pid absent, dead, or recycled), or leave it open
+    # and, for an @reboot job, remember the survivor.
+    await cron.state_backend.append_record(
+        cron._inflight_stream(name),
+        {
+            "kind": "open",
+            "host": cron._state_host,
+            "proc": "a-dead-daemon",
+            "pid": pid,
+            "startedAt": started_at,
+        },
+    )
+
+
 def _utc_now_plus(seconds):
     # canonical: identical copies in tests/test_backend_etcd.py and
     # tests/test_backend_kubernetes.py

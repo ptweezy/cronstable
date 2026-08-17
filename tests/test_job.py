@@ -3,6 +3,7 @@ import gc
 import logging
 import os
 import signal
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -4623,3 +4624,185 @@ async def test_reporter_fromfile_secret_resolves_off_the_event_loop():
             os.unlink(path)
     finally:
         cronstable.job._resolve_secret = original
+
+
+# ---------------------------------------------------------------------------
+# The PyInstaller scrub: what a frozen daemon's children inherit.
+#
+# A frozen daemon's environ carries the bootloader's _PYI_* process-linkage
+# vars (and rewritten loader paths on POSIX). Inherited through a job's
+# shell, they make any frozen binary the job invokes refuse to start with
+# "parent process has different executable": on the packaged builds that is
+# every `cronstable state|cursor|lock|xcom|secret` call, dying before the
+# subcommand runs and usually silently (`|| true` swallows it). These tests
+# pin the scrub, the spawn gate that applies it to jobs with no custom
+# environment, and the report-template invariant that gate must keep.
+# ---------------------------------------------------------------------------
+
+_PYI_ENV = {
+    "_PYI_ARCHIVE_FILE": "/opt/homebrew/bin/cronstable",
+    "_PYI_APPLICATION_HOME_DIR": "/tmp/_MEI123",
+    "_PYI_PARENT_PROCESS_LEVEL": "1",
+}
+
+_PLAIN_JOB = (
+    "jobs:\n"
+    "  - name: t\n"
+    "    command: echo hi\n"
+    '    schedule: "* * * * *"\n'
+    "    captureStdout: false\n"
+    "    captureStderr: false\n"
+)
+
+
+def _spawn_recorder(monkeypatch):
+    """Both spawn callables faked; returns the list of (kind, kwargs)."""
+    captured = []
+
+    def _recorder(kind):
+        async def fake_spawn(*args, **kwargs):
+            captured.append((kind, kwargs))
+            proc = Mock(stdout=None, stderr=None)
+
+            async def wait():
+                return 0
+
+            proc.wait = wait
+            return proc
+
+        return fake_spawn
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _recorder("exec"))
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _recorder("shell"))
+    return captured
+
+
+def test_fixup_pyinstaller_env_strips_linkage_vars():
+    env = {"PATH": "/usr/bin", "CRONSTABLE_STATE_URL": "http://l", **_PYI_ENV}
+    cronstable.job.fixup_pyinstaller_env(env)
+    assert env == {"PATH": "/usr/bin", "CRONSTABLE_STATE_URL": "http://l"}
+
+
+def test_fixup_pyinstaller_env_strips_without_frozen():
+    # the daemon itself need not be frozen: _PYI_* inherited from a frozen
+    # ancestor is equally poisonous to any frozen binary a job launches.
+    assert not getattr(sys, "frozen", False)
+    env = dict(_PYI_ENV)
+    cronstable.job.fixup_pyinstaller_env(env)
+    assert env == {}
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="loader-path restore is POSIX only")
+def test_fixup_pyinstaller_env_frozen_restores_loader_paths(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    env = {
+        "LD_LIBRARY_PATH": "/tmp/_MEI123",
+        "LD_LIBRARY_PATH_ORIG": "/opt/lib",
+        **_PYI_ENV,
+    }
+    cronstable.job.fixup_pyinstaller_env(env)
+    assert env["LD_LIBRARY_PATH"] == "/opt/lib"
+    # no _ORIG recorded: emptied rather than left pointing at the bundle
+    assert env["LIBPATH"] == ""
+    assert [k for k in env if k.startswith("_PYI_")] == []
+
+
+def test_pyinstaller_env_leaks_tracks_environ(monkeypatch):
+    for key in [k for k in os.environ if k.startswith("_PYI_")]:
+        monkeypatch.delenv(key)
+    assert not cronstable.job.pyinstaller_env_leaks()
+    monkeypatch.setenv("_PYI_PARENT_PROCESS_LEVEL", "1")
+    assert cronstable.job.pyinstaller_env_leaks()
+
+
+def test_pyinstaller_env_leaks_true_when_frozen(monkeypatch):
+    for key in [k for k in os.environ if k.startswith("_PYI_")]:
+        monkeypatch.delenv(key)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert cronstable.job.pyinstaller_env_leaks()
+
+
+@pytest.mark.asyncio
+async def test_spawn_scrubs_env_for_plain_jobs_on_leak(monkeypatch):
+    # no environment:/extra_env, but _PYI_* in the daemon's environ: the
+    # spawn must pass an explicit scrubbed env rather than let the child
+    # inherit the leak.
+    captured = _spawn_recorder(monkeypatch)
+    monkeypatch.setenv("_PYI_PARENT_PROCESS_LEVEL", "1")
+    monkeypatch.setenv("_PYI_ARCHIVE_FILE", "/bin/cronstable")
+    job = _running_job(_PLAIN_JOB)
+    await job.start()
+    _kind, kwargs = captured[-1]
+    env = kwargs["env"]
+    assert [k for k in env if k.startswith("_PYI_")] == []
+    assert env["PATH"] == os.environ["PATH"]
+    # report templates keep `environment: None` for a job that set none
+    assert job.env is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_keeps_plain_inherit_without_leak(monkeypatch):
+    # unfrozen and clean: no env kwarg at all, the child keeps inheriting
+    # the daemon's environ byte for byte as it always has.
+    captured = _spawn_recorder(monkeypatch)
+    for key in [k for k in os.environ if k.startswith("_PYI_")]:
+        monkeypatch.delenv(key)
+    job = _running_job(_PLAIN_JOB)
+    await job.start()
+    _kind, kwargs = captured[-1]
+    assert "env" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_spawn_config_environment_wins_over_scrub(monkeypatch):
+    # explicit environment: entries overlay after the strip, so a job can
+    # still set a _PYI_* var deliberately; self.env keeps feeding templates.
+    captured = _spawn_recorder(monkeypatch)
+    monkeypatch.setenv("_PYI_PARENT_PROCESS_LEVEL", "1")
+    job = _running_job(
+        _PLAIN_JOB + "    environment:\n"
+        "      - key: _PYI_PARENT_PROCESS_LEVEL\n"
+        "        value: '7'\n"
+    )
+    await job.start()
+    _kind, kwargs = captured[-1]
+    assert kwargs["env"]["_PYI_PARENT_PROCESS_LEVEL"] == "7"
+    assert job.env is kwargs["env"]
+
+
+@pytest.mark.asyncio
+async def test_shell_reporter_env_scrubbed(monkeypatch):
+    # reporter commands launch frozen binaries too; same scrub as jobs.
+    captured = _spawn_recorder(monkeypatch)
+    monkeypatch.setenv("_PYI_ARCHIVE_FILE", "/bin/cronstable")
+    conf = cronstable.config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command: foo
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        shell:
+          command: echo done
+""",
+        "",
+    )
+    job_config = conf.jobs[0]
+    job = Mock(
+        config=job_config,
+        stdout="out",
+        stderr="err",
+        retcode=1,
+        fail_reason="",
+        failed=True,
+        run_id="r",
+        started_at=None,
+        resource_usage=None,
+    )
+    await cronstable.job.ShellReporter().report(
+        False, job, job_config.onFailure["report"]
+    )
+    env = captured[-1][1]["env"]
+    assert env["CRONSTABLE_JOB_NAME"] == "test"
+    assert [k for k in env if k.startswith("_PYI_")] == []
