@@ -77,21 +77,135 @@ logger = logging.getLogger("cronstable")
 #: app and relay can evolve the format without guessing.
 PUSH_PROTOCOL_VERSION = 1
 
-#: APNs rejects notifications whose final JSON exceeds 4096 bytes.  The
-#: relay wraps our ciphertext in its own envelope (alert stub, headers,
-#: the mutable-content marker), so the base64 ciphertext we hand it is
-#: capped well below that, leaving the relay ~1 KB of headroom.
-CIPHERTEXT_B64_MAX = 3000
 
-#: A libsodium sealed box adds an ephemeral X25519 public key (32 bytes)
-#: and a Poly1305 MAC (16 bytes) to the plaintext.
-_SEALED_OVERHEAD = 48
+class PushError(Exception):
+    """A push operation failed (bad device material, store trouble)."""
 
-#: The largest plaintext whose sealed, base64-encoded form fits the cap.
-MAX_PLAINTEXT_BYTES = CIPHERTEXT_B64_MAX // 4 * 3 - _SEALED_OVERHEAD
 
-#: X25519 public keys are exactly 32 bytes.
-DEVICE_PUBLIC_KEY_BYTES = 32
+#: APNs rejects notifications whose final JSON exceeds 4096 bytes.
+APNS_PAYLOAD_MAX = 4096
+
+#: What the relay's own APNs envelope costs: ``apnsPayload()`` in the
+#: relay's src/apns.ts, serialized the way ``JSON.stringify`` emits it,
+#: with an empty ciphertext and the longest suite token below, is 189
+#: bytes.  A measurement, not an estimate -- the relay's
+#: tests/apns-size.spec.ts asserts it against the payload that function
+#: really builds, which is what lets the cap below be derived.
+RELAY_ENVELOPE_BYTES = 189
+
+#: Slack kept between the two above and the cap, so a protocol field added
+#: later (or a longer suite token) cannot silently push a max-length
+#: notification over the APNs limit and start bouncing alerts.
+RELAY_ENVELOPE_RESERVE = 107
+
+#: What the APNs frame leaves for the ciphertext once the relay's envelope
+#: and the reserve are taken out.
+_CIPHERTEXT_FRAME = (
+    APNS_PAYLOAD_MAX - RELAY_ENVELOPE_BYTES - RELAY_ENVELOPE_RESERVE
+)
+
+#: The largest base64 ciphertext a daemon will hand the relay: the frame
+#: above rounded down to a readable, quotable 3800.  Both sides hard-code
+#: it (the relay's MAX_CIPHERTEXT_CHARS) because it is part of
+#: docs/relay-protocol.md, not a negotiated value.
+CIPHERTEXT_B64_MAX = _CIPHERTEXT_FRAME // 100 * 100
+
+#: Sealing suites.  ``suite`` names the public-key algorithm a paired
+#: device registered under; it rides in the pairing record, the relay
+#: envelope and (via the relay) the APNs payload, so daemon, relay and app
+#: never have to infer a key's algorithm from its length.
+#:
+#: Only ``x25519`` can be sealed to today.  ``xwing`` is registered but
+#: deliberately unsealable: PyNaCl bundles libsodium 1.0.20, and the
+#: ``crypto_kem_*`` functions that libsodium 1.0.22 added (X-Wing:
+#: ML-KEM-768 + X25519, the hybrid both this daemon's and the companion
+#: app's crypto stacks converge on) have no PyNaCl bindings yet.  Its
+#: sizes are recorded here so the wire format, the size fitting and the
+#: pairing validation are all already suite-driven: when the bindings
+#: land, sealing is the only thing that has to change.  See
+#: docs/push-crypto-review.md.
+SUITE_X25519 = "x25519"
+SUITE_XWING = "xwing"
+
+#: The suite a pairing that names none belongs to.  A record or envelope
+#: carrying no suite is X25519: that is what an app omitting the field
+#: registers, and what a daemon omitting it seals.
+DEFAULT_SUITE = SUITE_X25519
+
+
+class _Suite:
+    """One sealing suite's wire dimensions.
+
+    ``public_key_bytes`` is what a device's registered public key must
+    decode to; ``overhead`` is what sealing adds to the plaintext, which
+    is what the size fitting has to budget for.
+    """
+
+    __slots__ = ("name", "public_key_bytes", "overhead", "sealable")
+
+    def __init__(
+        self,
+        name: str,
+        public_key_bytes: int,
+        overhead: int,
+        sealable: bool,
+    ) -> None:
+        self.name = name
+        self.public_key_bytes = public_key_bytes
+        self.overhead = overhead
+        self.sealable = sealable
+
+
+SUITES: dict[str, _Suite] = {
+    # A libsodium sealed box adds an ephemeral X25519 public key (32
+    # bytes) and a Poly1305 MAC (16 bytes) to the plaintext.
+    SUITE_X25519: _Suite(SUITE_X25519, 32, 48, True),
+    # X-Wing: a 1216-byte encapsulation key (ML-KEM-768's 1184 plus
+    # X25519's 32), a 1120-byte ciphertext (1088 + 32) and a 16-byte AEAD
+    # tag.  draft-connolly-cfrg-xwing-kem-10.
+    SUITE_XWING: _Suite(SUITE_XWING, 1216, 1136, False),
+}
+
+
+def suite_or_error(name: Optional[str]) -> _Suite:
+    """The named suite, or a :class:`PushError` naming the known ones.
+
+    ``None`` means "unspecified" and resolves to :data:`DEFAULT_SUITE`.
+    A present-but-empty name is malformed input instead, so a client
+    sending ``"suite": ""`` gets the same rejection the relay gives it.
+    Callers reading a stored record pass
+    ``record.get("suite") or DEFAULT_SUITE``, which is where a record
+    carrying no suite resolves.
+    """
+    suite = SUITES.get(DEFAULT_SUITE if name is None else name)
+    if suite is None:
+        raise PushError(
+            "unknown suite {!r}; this daemon knows {}".format(
+                name, ", ".join(sorted(SUITES))
+            )
+        )
+    return suite
+
+
+def max_plaintext_bytes(suite: str = DEFAULT_SUITE) -> int:
+    """The largest plaintext whose sealed, base64 form fits the cap.
+
+    Suite-dependent: X-Wing's ciphertext is 1088 bytes wider than a sealed
+    box's, so a device paired under it has that much less room for log
+    lines.  The fan-out fits each device's payload to its own suite rather
+    than to the narrowest one present, so a v1 device keeps its full tail
+    while a v2 device sits beside it.
+    """
+    return CIPHERTEXT_B64_MAX // 4 * 3 - suite_or_error(suite).overhead
+
+
+#: The X25519 budget, kept as a module constant because it is the one the
+#: shipped daemon actually seals under and the tests quote it directly.
+MAX_PLAINTEXT_BYTES = max_plaintext_bytes(SUITE_X25519)
+
+#: X25519 public keys are exactly 32 bytes.  Kept for anything importing
+#: it; code that has a suite in hand reads its ``public_key_bytes``.
+DEVICE_PUBLIC_KEY_BYTES = SUITES[SUITE_X25519].public_key_bytes
 
 #: Durable-state document namespace holding one document per paired
 #: device, keyed by device id.  Documents are never swept by state GC,
@@ -147,10 +261,6 @@ STORE_LOCK_WAIT = STORE_OP_TIMEOUT / 2
 LOG_TAIL_MAX_LINES = 40
 
 _FIELD_LIMITS = {"name": 64, "platform": 32, "pushToken": 512}
-
-
-class PushError(Exception):
-    """A push operation failed (bad device material, store trouble)."""
 
 
 # urlsplit deletes exactly these three characters from a URL before it
@@ -267,29 +377,44 @@ def _utcnow_iso() -> str:
     )
 
 
-def validate_public_key(value: Any) -> str:
-    """Normalize and validate a device public key (base64 X25519).
+def validate_public_key(value: Any, suite: str = DEFAULT_SUITE) -> str:
+    """Normalize and validate a device public key for ``suite``.
 
     Returns the canonical (re-encoded) base64 form; raises
-    :class:`PushError` with an operator-readable reason otherwise.
+    :class:`PushError` with an operator-readable reason otherwise.  The
+    expected length comes from the suite, so a device pairing under a
+    future suite is checked against that suite's key size rather than
+    X25519's 32 bytes.
     """
+    spec = suite_or_error(suite)
     if not isinstance(value, str) or not value.strip():
-        raise PushError("publicKey is required (base64 X25519 key)")
+        raise PushError(
+            "publicKey is required (base64 {} key)".format(spec.name)
+        )
     try:
         raw = base64.b64decode(value.strip(), validate=True)
     except (binascii.Error, ValueError):
         raise PushError("publicKey is not valid base64") from None
-    if len(raw) != DEVICE_PUBLIC_KEY_BYTES:
+    if len(raw) != spec.public_key_bytes:
         raise PushError(
-            "publicKey must decode to exactly {} bytes, got {}".format(
-                DEVICE_PUBLIC_KEY_BYTES, len(raw)
-            )
+            "publicKey must decode to exactly {} bytes for suite {}, "
+            "got {}".format(spec.public_key_bytes, spec.name, len(raw))
         )
-    if HAVE_PYNACL:
-        # 32 bytes is not enough: libsodium refuses to seal to all-zero /
-        # low-order points, and it does so at encrypt time, not at key
-        # construction. Probe a real seal here so an unusable key is a
-        # 400 at pairing instead of a persistent registry record that
+    if not spec.sealable:
+        # Refuse the pairing rather than store a record every later alert
+        # would fail on.  Same fail-closed reasoning as the PyNaCl gate in
+        # config: a paging channel must never accept something it cannot
+        # actually deliver through.
+        raise PushError(
+            "suite {} is not sealable by this daemon yet (it needs "
+            "libsodium 1.0.22's crypto_kem_* through PyNaCl); pair with "
+            "suite {} instead".format(spec.name, DEFAULT_SUITE)
+        )
+    if HAVE_PYNACL and spec.name == SUITE_X25519:
+        # Length is one check of two: libsodium refuses to seal to
+        # all-zero / low-order points, and it does so at encrypt time, not
+        # at key construction. Probe a real seal here so an unusable key
+        # is a 400 at pairing instead of a persistent registry record that
         # fails on every alert until an operator revokes it.
         try:
             _sealed_box(raw).encrypt(b"probe")
@@ -320,24 +445,48 @@ def validate_pairing(payload: Any) -> dict[str, str]:
     """Validate a ``POST /push/devices`` body into a clean field dict.
 
     Raises :class:`PushError` with a message safe to return in a 400.
+
+    ``suite`` is optional and defaults to :data:`DEFAULT_SUITE`: an app
+    that names no suite is registering an X25519 key.
     """
     if not isinstance(payload, dict):
         raise PushError("body must be a JSON object")
+    suite = payload.get("suite")
+    if suite is not None and not isinstance(suite, str):
+        raise PushError("suite must be a string")
+    spec = suite_or_error(suite)
     return {
         "name": _validate_field(payload, "name"),
         "platform": _validate_field(payload, "platform"),
         "pushToken": _validate_field(payload, "pushToken"),
-        "publicKey": validate_public_key(payload.get("publicKey")),
+        "publicKey": validate_public_key(payload.get("publicKey"), spec.name),
+        "suite": spec.name,
     }
 
 
-def seal_to_device(public_key_b64: str, plaintext: bytes) -> str:
+def seal_to_device(
+    public_key_b64: str, plaintext: bytes, suite: str = DEFAULT_SUITE
+) -> str:
     """Seal ``plaintext`` to a device public key; return base64 text.
 
     Anonymous-sender sealed box: an ephemeral key pair per message, so
     the daemon holds no long-lived sending secret and only the device's
     private key (which never leaves the phone) can open it.
+
+    The suite dispatch is the seam the post-quantum swap goes through: a
+    second branch here (X-Wing encapsulation plus an AEAD over the shared
+    secret) is the whole daemon-side change once PyNaCl exposes
+    libsodium's ``crypto_kem_*``.  Everything around it -- pairing
+    validation, size fitting, the wire envelope, the registry -- is
+    already suite-driven.
     """
+    spec = suite_or_error(suite)
+    if not spec.sealable:  # pragma: no cover - pairing refuses these
+        raise PushError(
+            "cannot seal to suite {}: no implementation in this daemon".format(
+                spec.name
+            )
+        )
     if not HAVE_PYNACL:  # pragma: no cover - config validation gates this
         raise PushError(
             "PyNaCl is not installed; install the push extra "
@@ -431,7 +580,9 @@ def build_payload(
     return payload
 
 
-def _trim_log_tail(payload: dict[str, Any], tail: list[str]) -> bytes:
+def _trim_log_tail(
+    payload: dict[str, Any], tail: list[str], limit: int
+) -> bytes:
     """Drop the FEWEST oldest log-tail lines that fit the cap; re-encode.
 
     The encoded size falls monotonically as lines are dropped, so the
@@ -462,7 +613,7 @@ def _trim_log_tail(payload: dict[str, Any], tail: list[str]) -> bytes:
         mid = (lo + hi) // 2
         probe = drop(mid)
         applied = mid
-        if len(probe) <= MAX_PLAINTEXT_BYTES:
+        if len(probe) <= limit:
             fitted = probe
             hi = mid - 1
         else:
@@ -476,19 +627,26 @@ def _trim_log_tail(payload: dict[str, Any], tail: list[str]) -> bytes:
     return fitted
 
 
-def fit_payload(payload: dict[str, Any]) -> bytes:
+def fit_payload(payload: dict[str, Any], limit: Optional[int] = None) -> bytes:
     """Shrink ``payload`` in place until it seals under the APNs cap.
 
     Trim order: oldest log-tail lines first (the newest lines carry the
     failure), then the long free-text fields by halving, so the alert
     always keeps its identity (name, kind, host) intact.  Returns the
     encoded plaintext.
+
+    ``limit`` defaults to the X25519 budget.  The fan-out passes the
+    target device's own suite budget instead, so a device paired under a
+    wider-ciphertext suite is trimmed harder without costing the devices
+    beside it any log lines (see :meth:`PushService._send_payload`).
     """
+    if limit is None:
+        limit = MAX_PLAINTEXT_BYTES
     data = _encode(payload)
-    while len(data) > MAX_PLAINTEXT_BYTES:
+    while len(data) > limit:
         tail = payload.get("log_tail")
         if tail:
-            data = _trim_log_tail(payload, tail)
+            data = _trim_log_tail(payload, tail, limit)
             continue
         for field in ("message", "fail_reason", "subject"):
             value = payload.get(field)
@@ -580,6 +738,8 @@ def public_device(device: dict[str, Any]) -> dict[str, Any]:
         "name": device.get("name"),
         "platform": device.get("platform"),
         "publicKey": device.get("publicKey"),
+        # A record naming no suite is X25519 (see DEFAULT_SUITE).
+        "suite": device.get("suite") or DEFAULT_SUITE,
         "fingerprint": key_fingerprint(device.get("publicKey")),
         "pushToken": "…" + token[-6:] if token else "",
         "createdAt": device.get("createdAt"),
@@ -1265,7 +1425,13 @@ class PushService:
         only: Optional[dict[str, Any]] = None,
         collapse: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        plaintext = fit_payload(payload)
+        # Before any fitting, not after.  fit_payload's last resort drops
+        # `run_id`, which collapse_id hashes as an identity field, so
+        # deriving the id from the trimmed payload made a long alert
+        # coalesce under a different id than the same alert reported by a
+        # node whose copy happened to fit.  Per-device fitting would have
+        # widened that into one id per suite; taking the id from the
+        # untrimmed payload removes the coupling entirely.
         coalesce = collapse or collapse_id(
             payload, self._collapse_salt or self._local_salt
         )
@@ -1293,7 +1459,7 @@ class PushService:
                     self._send_to_device(
                         session,
                         device,
-                        plaintext,
+                        payload,
                         coalesce,
                         priority,
                         is_event,
@@ -1338,11 +1504,29 @@ class PushService:
                 results.append(outcome)
         return results
 
+    @staticmethod
+    def _fit_for(payload: dict[str, Any], suite: str) -> bytes:
+        """This device's copy of the alert, trimmed to its suite budget.
+
+        A private copy per device, because :func:`fit_payload` trims in
+        place and the suites present in one fan-out can have different
+        budgets: sharing the dict would let the narrowest device's
+        trimming decide what every other device sees.  ``log_tail`` is
+        copied out explicitly -- a shallow ``dict()`` would hand every
+        device the same list object, which is exactly what the trimmer
+        mutates.
+        """
+        private = dict(payload)
+        tail = private.get("log_tail")
+        if isinstance(tail, list):
+            private["log_tail"] = list(tail)
+        return fit_payload(private, max_plaintext_bytes(suite))
+
     async def _send_to_device(
         self,
         session: "aiohttp.ClientSession",
         device: dict[str, Any],
-        plaintext: bytes,
+        payload: dict[str, Any],
         coalesce: str,
         priority: str,
         is_event: bool,
@@ -1359,8 +1543,10 @@ class PushService:
             "status": None,
             "error": None,
         }
+        suite = device.get("suite") or DEFAULT_SUITE
         try:
-            ciphertext = seal_to_device(device["publicKey"], plaintext)
+            plaintext = self._fit_for(payload, suite)
+            ciphertext = seal_to_device(device["publicKey"], plaintext, suite)
         except (PushError, KeyError) as exc:
             outcome["error"] = "sealing failed: {}".format(exc)
             return outcome
@@ -1371,6 +1557,10 @@ class PushService:
             "collapseId": coalesce,
             "priority": priority,
             "event": is_event,
+            # So the relay can bound-check the ciphertext against the
+            # right suite and the app knows which key to open it with,
+            # without either having to infer the algorithm from a length.
+            "suite": suite,
         }
         try:
             async with session.post(self.relay_url, json=body) as resp:

@@ -140,9 +140,12 @@ $ curl -X POST http://127.0.0.1:8080/push/devices \
 }
 ```
 
-`publicKey` must be base64 decoding to exactly 32 bytes and be a usable
-X25519 public key (an all-zero or low-order key that libsodium refuses to
-seal to is rejected at pairing, not on the first alert); `name`,
+`publicKey` must be base64 decoding to the length its `suite` requires
+(32 bytes for the default `x25519`) and be usable: an all-zero or
+low-order X25519 key that libsodium refuses to seal to is rejected at
+pairing, not on the first alert. `suite` is optional and defaults to
+`x25519`; a suite this daemon cannot seal to is refused at pairing rather
+than stored as a record whose every alert would fail. `name`,
 `platform`, and `pushToken` are bounded strings. Validation
 failures are a `400` naming the field. Re-pairing the same public key
 (push tokens rotate; phones get renamed) answers `200` with
@@ -257,8 +260,13 @@ The full field-by-field schema is in the
 [relay protocol document](https://github.com/ptweezy/cronstable/blob/main/docs/relay-protocol.md).
 
 APNs rejects notifications over 4096 bytes, so the daemon caps the sealed,
-base64-encoded ciphertext at 3000 characters, leaving the relay headroom
-for its own envelope. An oversized payload is trimmed in order: log-tail
+base64-encoded ciphertext at 3800 characters: the cap is 4096 minus the
+189 bytes the relay's own APNs envelope measures at, minus a 107-byte
+reserve for future protocol fields. Each device's payload is fitted to
+its own suite budget (2802 bytes of plaintext under `x25519`), so a
+device paired under a wider-ciphertext suite is trimmed harder without
+costing the devices beside it any log lines. An oversized payload is
+trimmed in order: log-tail
 lines oldest-first (the newest lines carry the failure), then long
 free-text fields halved (never below 64 characters), then the optional
 context fields dropped. The alert's identity (`name`, `kind`, `host`) is
