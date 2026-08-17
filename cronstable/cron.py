@@ -2117,7 +2117,8 @@ class Cron:
 
         self._wait_for_running_jobs_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
-        # SIGHUP (signal_reload): the event wakes the run loop's sleep so
+        # signal_reload (SIGHUP, or the Windows service's PARAMCHANGE):
+        # the event wakes the run loop's sleep so
         # the reload happens now rather than at the next housekeeping
         # minute; the reparse itself is forced by voiding _config_sig.
         self._reload_event = asyncio.Event()
@@ -2530,7 +2531,7 @@ class Cron:
         """Park the run loop until the interval elapses or a wake arrives.
 
         Two waiters, not one: a shutdown request wakes the sleep (tests
-        set ``_stop_event`` directly), and a SIGHUP
+        set ``_stop_event`` directly), and a reload request
         (:meth:`signal_reload`) wakes it too, so the reload happens now
         rather than up to a housekeeping minute later.
         """
@@ -2557,8 +2558,10 @@ class Cron:
             await asyncio.gather(*waiters, return_exceptions=True)
             self._reload_event.clear()
 
-    def signal_reload(self) -> None:
-        """Request an immediate config reload (the SIGHUP handler).
+    def signal_reload(self, source: str = "SIGHUP") -> None:
+        """Request an immediate config reload; ``source`` names the
+        requester in the log (SIGHUP, or the Windows service's
+        PARAMCHANGE control).
 
         Safe to call from a loop signal handler: it only sets flags and an
         event. Clearing ``_last_housekeeping_minute`` makes the woken pass
@@ -2570,7 +2573,7 @@ class Cron:
         void survives a failed parse, so the request keeps retrying until
         a parse succeeds and re-records the signature.
         """
-        logger.info("Reload requested (SIGHUP); reloading configuration")
+        logger.info("Reload requested (%s); reloading configuration", source)
         self._config_sig = None
         self._last_housekeeping_minute = None
         self._reload_event.set()
@@ -6775,9 +6778,7 @@ class Cron:
             # _build_web_tls order): a rotation landing in the gap then
             # compares unequal on the next reload, a spurious restart
             # rather than a missed one.
-            token_files_signature = self._web_token_file_signature(
-                web_config
-            )
+            token_files_signature = self._web_token_file_signature(web_config)
             token_table = self._resolve_web_tokens(web_config)
             if token_table is not None:
                 anonymous_scopes = frozenset(
@@ -8343,9 +8344,7 @@ class Cron:
         for index, spec in enumerate(specs):
             path = spec.get("fromFile") if isinstance(spec, dict) else None
             if path:
-                out["{}:{}".format(index, path)] = tlsutil.file_signature(
-                    path
-                )
+                out["{}:{}".format(index, path)] = tlsutil.file_signature(path)
         return out
 
     def _web_token_files_changed(self) -> bool:
@@ -8355,10 +8354,7 @@ class Cron:
         web_config stale while clearing it (the _web_tls_files_changed
         rule).
         """
-        if (
-            self.web_config is None
-            or self._web_token_files_signature is None
-        ):
+        if self.web_config is None or self._web_token_files_signature is None:
             return False
         return (
             self._web_token_file_signature(self.web_config)
@@ -9649,61 +9645,11 @@ class Cron:
         if not self._pending_reboot_jobs:
             return
         if not self._elect_leader_configured:
-            # election removed on reload: gating is gone, so run the
-            # CURRENT job for any present name still defining an @reboot
-            # one-shot; absent names stay pending (never-lose), reused
-            # names retire without running.
-            for name in list(self._pending_reboot_jobs):
-                job = self.cron_jobs.get(name)
-                if job is None:
-                    continue  # transiently absent -> keep pending, re-check
-                if self._pause_active(name) is not None:
-                    # a pause DEFERS the boot run: keep it pending rather
-                    # than retiring it unrun, and re-check next wakeup.
-                    continue
-                del self._pending_reboot_jobs[name]
-                # a disabled job retires without running, mirroring
-                # job_should_run; enabled is checked last so a name reused
-                # for a non-@reboot job short-circuits on the schedule
-                # check.
-                if (
-                    isinstance(job.schedule, str)
-                    and job.schedule == "@reboot"
-                    and job.enabled
-                ):
-                    if self._survivor_holds_boot_run(name):
-                        continue
-                    await self.launch_scheduled_job(job)
+            await self._process_pending_reboots_unelected()
             return
         mgr = self.cluster_manager
         if mgr is None:
-            # Election wanted but no manager. Leader one-shots stay
-            # fail-closed (pending). PreferLeader is NEVER-SKIP: it must
-            # run even with the store unreachable (accepting a possible
-            # double-run), the same asymmetry _cluster_allows applies to
-            # scheduled PreferLeader jobs in this mgr-is-None case.
-            for name in list(self._pending_reboot_jobs):
-                if name not in self.cron_jobs:
-                    continue  # transiently absent -> keep pending (never-lose)
-                job = self.cron_jobs[name]
-                if not self._is_deferrable_reboot(job) or not job.enabled:
-                    # reused or disabled -> retire without running.
-                    del self._pending_reboot_jobs[name]
-                    continue
-                if self._pause_active(name) is not None:
-                    continue  # deferred by the pause; still owed
-                if job.clusterPolicy == "PreferLeader":
-                    del self._pending_reboot_jobs[name]
-                    if self._survivor_holds_boot_run(name):
-                        continue
-                    logger.info(
-                        "cluster: running deferred @reboot PreferLeader job "
-                        "%s (no leadership manager; never-skip semantics)",
-                        name,
-                    )
-                    await self.launch_scheduled_job(job)
-                # Leader one-shots: keep pending, fail closed, re-check next
-                # wakeup once a manager is available.
+            await self._process_pending_reboots_no_manager()
             return
         for name in list(self._pending_reboot_jobs):
             if name not in self.cron_jobs:
@@ -9767,6 +9713,69 @@ class Cron:
             # else: another node owns it or the cluster has not converged
             # -> keep pending. Never drop a one-shot on another node's
             # behalf.
+
+    async def _process_pending_reboots_unelected(self) -> None:
+        """The no-election arm of :meth:`_process_pending_reboots`.
+
+        Election removed on reload: gating is gone, so run the CURRENT
+        job for any present name still defining an @reboot one-shot;
+        absent names stay pending (never-lose), reused names retire
+        without running.
+        """
+        for name in list(self._pending_reboot_jobs):
+            job = self.cron_jobs.get(name)
+            if job is None:
+                continue  # transiently absent -> keep pending, re-check
+            if self._pause_active(name) is not None:
+                # a pause DEFERS the boot run: keep it pending rather
+                # than retiring it unrun, and re-check next wakeup.
+                continue
+            del self._pending_reboot_jobs[name]
+            # a disabled job retires without running, mirroring
+            # job_should_run; enabled is checked last so a name reused
+            # for a non-@reboot job short-circuits on the schedule
+            # check.
+            if (
+                isinstance(job.schedule, str)
+                and job.schedule == "@reboot"
+                and job.enabled
+            ):
+                if self._survivor_holds_boot_run(name):
+                    continue
+                await self.launch_scheduled_job(job)
+
+    async def _process_pending_reboots_no_manager(self) -> None:
+        """The election-wanted-but-no-manager arm of
+        :meth:`_process_pending_reboots`.
+
+        Leader one-shots stay fail-closed (pending). PreferLeader is
+        NEVER-SKIP: it must run even with the store unreachable
+        (accepting a possible double-run), the same asymmetry
+        _cluster_allows applies to scheduled PreferLeader jobs in this
+        mgr-is-None case.
+        """
+        for name in list(self._pending_reboot_jobs):
+            if name not in self.cron_jobs:
+                continue  # transiently absent -> keep pending (never-lose)
+            job = self.cron_jobs[name]
+            if not self._is_deferrable_reboot(job) or not job.enabled:
+                # reused or disabled -> retire without running.
+                del self._pending_reboot_jobs[name]
+                continue
+            if self._pause_active(name) is not None:
+                continue  # deferred by the pause; still owed
+            if job.clusterPolicy == "PreferLeader":
+                del self._pending_reboot_jobs[name]
+                if self._survivor_holds_boot_run(name):
+                    continue
+                logger.info(
+                    "cluster: running deferred @reboot PreferLeader job "
+                    "%s (no leadership manager; never-skip semantics)",
+                    name,
+                )
+                await self.launch_scheduled_job(job)
+            # Leader one-shots: keep pending, fail closed, re-check next
+            # wakeup once a manager is available.
 
     def _cluster_allows(self, job: JobConfig) -> bool:
         """Whether this node may run *scheduled* ``job`` this cycle.
@@ -10980,9 +10989,7 @@ class Cron:
                 # record, typically). The recorded run cannot still be
                 # running, so close it like any other crash instead of
                 # leaving it open behind a stranger forever.
-                self._reconcile_open_record(
-                    name, job, rec, "reconciled-crash"
-                )
+                self._reconcile_open_record(name, job, rec, "reconciled-crash")
                 return None
             if isinstance(job.schedule, str) and job.schedule == "@reboot":
                 # remembered for the @reboot boot gate and the deferred
@@ -11017,9 +11024,11 @@ class Cron:
         if started is None:
             return True
         raw = rec.get("startedAt")
+        if not isinstance(raw, str):
+            return True
         try:
             recorded = datetime.datetime.fromisoformat(raw).timestamp()
-        except (TypeError, ValueError):
+        except ValueError:
             return True
         return started <= recorded + BOOT_TIME_TOLERANCE
 

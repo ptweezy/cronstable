@@ -29,6 +29,12 @@
   through to its default action: it killed the daemon outright and the
   shutdown drain never ran, even though the wiki told operators to reload
   with `SIGHUP`/`cronstable reload`.
+- The Windows service takes that same forced reload as an SCM control:
+  `cronstable service reload` (or `sc control cronstable paramchange`)
+  reparses the configuration immediately, even when file stats are
+  unchanged, and retries after a failed parse, exactly as `SIGHUP` does.
+  Previously the service accepted no reload control and Windows waited
+  on the housekeeping pass; a console run on Windows still does.
 
 ## 1.2.42
 

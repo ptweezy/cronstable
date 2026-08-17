@@ -367,8 +367,10 @@ POSIX. A few platform details differ:
   Service Control Manager, so it starts at boot, runs whether or not anyone
   is logged on, appears in `services.msc`, and gets Windows' own recovery
   actions; stopping it drains running jobs first, and the SCM is told the
-  stop is still in progress for as long as that takes. It is a ctypes shim
-  over advapi32, so it adds no dependency. The published one-file `.exe`
+  stop is still in progress for as long as that takes. `cronstable service
+  reload` makes it reparse the configuration immediately, the forced
+  reload `SIGHUP` performs on POSIX. It is a ctypes shim over advapi32,
+  so it adds no dependency. The published one-file `.exe`
   cannot host a service (its bootloader runs the program in a child process
   the SCM never sees) and `install` says so; install with pip or pipx for
   that, or use the `schtasks` recipe. See

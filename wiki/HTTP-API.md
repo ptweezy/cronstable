@@ -1276,10 +1276,11 @@ secret file a `fromFile` entry names -- token source files are
 fingerprinted like TLS certificates, so an in-place rewrite counts. The
 daemon notices either change on its next housekeeping pass (within a
 minute) and rebuilds the web app against the current config, so the
-dropped token stops working while the others keep their sessions. On
-POSIX, send `SIGHUP` to apply the change immediately instead of waiting
-for the pass (Windows has no reload signal; the housekeeping pass covers
-it there).
+dropped token stops working while the others keep their sessions. To
+apply the change immediately instead of waiting for the pass, send
+`SIGHUP` (POSIX) or run `cronstable service reload` (the [Windows
+service](Windows-Service)); a Windows console run has no reload signal
+and rides the housekeeping pass.
 The `label` is only an identifier for humans and log/error messages;
 matching is by the secret.
 

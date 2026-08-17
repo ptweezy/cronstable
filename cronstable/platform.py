@@ -628,10 +628,12 @@ def install_reload_handler(
     Returns a zero-argument cleanup function, like
     :func:`install_shutdown_handlers`; call it once the loop has finished.
 
-    POSIX only: Windows has no SIGHUP, and the service accepts no SCM
-    reload control (``PARAMCHANGE`` is outside its accepted set), so
-    Windows reloads ride the config-file stat watch on the housekeeping
-    pass; nothing is installed there and the cleanup is a no-op.
+    POSIX only: Windows has no SIGHUP.  The Windows service takes the
+    same forced reload from the SCM instead (the ``PARAMCHANGE``
+    control, wired in :mod:`cronstable.winservice`), and a Windows
+    console run rides the config-file stat watch on the housekeeping
+    pass; nothing is installed here on Windows and the cleanup is a
+    no-op.
     """
     if not IS_WINDOWS:  # pragma: no cover (posix) - loop signal handler
         return _install_loop_signal_handlers(loop, (signal.SIGHUP,), callback)
