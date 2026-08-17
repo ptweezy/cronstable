@@ -27,6 +27,7 @@ from aiohttp import web
 from cronstable import jobapi
 from cronstable.config import parse_config_string
 from cronstable.cron import Cron
+from cronstable.job import RunningJob
 from cronstable.jobapi import (
     MAX_LOCK_PERMITS,
     MAX_LOCK_TTL,
@@ -903,6 +904,51 @@ async def test_cli_subprocess_ignores_proxy_env(tmp_path):
 
         body = await jobstate.kv_get(cron.state_backend, "j", "via")
         assert body is not None and body["value"] == "loopback"
+        await cron._job_api.finish_run(token)
+    finally:
+        await cron._stop_job_api()
+        if cron.state_backend is not None:
+            await cron.state_backend.stop()
+
+
+async def test_job_command_invoking_cli_writes_state(tmp_path):
+    # The feature as a job actually uses it: a job COMMAND LINE (string form,
+    # so it runs under the platform's job shell) that shells out to
+    # `cronstable state set`, asserted on the KV side effect rather than the
+    # exit status. The frozen-build failure this shape guards against exited
+    # 0 while writing nothing (the CLI's bootloader died on inherited _PYI_*
+    # vars before the subcommand ran); the release lanes run this same shape
+    # against the real frozen binary in .github/scripts/cli_job_smoke.sh.
+    config = _ONE_JOB.format(path=tmp_path)
+    cron = Cron(None, config_yaml=config)
+    await cron.start_stop_state(_state_cfg(config))
+    try:
+        command = '"{}" -m cronstable state set beats ok'.format(
+            sys.executable
+        )
+        job_yaml = (
+            "jobs:\n"
+            "  - name: j\n"
+            "    command: {}\n"
+            '    schedule: "* * * * *"\n'
+            "    captureStderr: true\n"
+        ).format(json.dumps(command))
+        job = parse_config_string(job_yaml, "").jobs[0]
+        token, env = await cron._prepare_job_api_run(job, None)
+        running = RunningJob(
+            job,
+            None,
+            extra_env=env,
+            state_token=token,
+            run_id=env.get("CRONSTABLE_RUN_ID"),
+        )
+        await running.start()
+        await running.wait()
+        assert running.retcode == 0, running.stderr
+        from cronstable import jobstate
+
+        body = await jobstate.kv_get(cron.state_backend, "j", "beats")
+        assert body is not None and body["value"] == "ok"
         await cron._job_api.finish_run(token)
     finally:
         await cron._stop_job_api()

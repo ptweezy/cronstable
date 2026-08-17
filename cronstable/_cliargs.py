@@ -584,6 +584,14 @@ def add_service_command(sub: Any) -> None:
         "long as the running jobs take",
     )
     _named(
+        actions.add_parser(
+            "reload",
+            help="make the running service reload its configuration now, "
+            "reparsing even when file stats are unchanged (what SIGHUP "
+            "does on POSIX)",
+        )
+    )
+    _named(
         actions.add_parser("status", help="print the service's state and pid")
     )
     run = _named(

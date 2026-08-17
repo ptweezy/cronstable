@@ -19,7 +19,7 @@ cronstable cursor|lock|artifact|idempotent|secret ...  [--scope NAME | --global]
 cronstable xcom push|pull|list ...
 cronstable mcp [--url URL] [--token TOKEN | --token-env VAR] [--check]
 cronstable tui [--url URL] [--token TOKEN | --token-env VAR] [options]
-cronstable service install|remove|start|stop|status|run [options]
+cronstable service install|remove|start|stop|reload|status|run [options]
 cronstable import-taskscheduler PATH... [-o FILE] [--timezone NAME]
 ```
 
@@ -514,16 +514,19 @@ cronstable service install [--name NAME] [-c FILE-OR-DIR]
                            [--start-type auto|delayed|demand]
                            [--log-level LEVEL] [--log-file PATH | --no-log-file]
                            [--console] [--restart-delay SECONDS] [--no-restart]
-cronstable service remove|start|stop|status [--name NAME] [--timeout SECONDS]
+cronstable service remove|start|stop|reload|status [--name NAME]
+                                                   [--timeout SECONDS]
 cronstable service run [--name NAME] [-c FILE-OR-DIR] [options]
 ```
 
 Windows only; on any other platform every action prints one line and exits
 `2`. `cronstable service install` registers the scheduler with the Service
 Control Manager so it starts at boot and runs whether or not anyone is
-logged on, and needs an elevated prompt. `run` is the entry point the SCM
-itself invokes and is not meant to be typed; run by hand it says so and
-exits `2`.
+logged on, and needs an elevated prompt. `reload` makes the running
+service reparse its configuration immediately, the same forced reload
+`SIGHUP` performs on POSIX. `run` is the entry point the SCM itself
+invokes and is not meant to be typed; run by hand it says so and exits
+`2`.
 
 Exit codes for the whole subcommand: `0` success, `1` a Windows failure
 (the message names the fix), `2` a refusal or a usage error.

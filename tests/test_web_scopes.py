@@ -660,6 +660,79 @@ async def test_scoped_tokens_end_to_end():
 
 
 @pytest.mark.asyncio
+async def test_fromfile_token_rotation_rebuilds_the_app(tmp_path):
+    # The config holds only the token file's PATH, so the web_config
+    # inequality gate never fires for a secret rewritten in place; the
+    # token-file fingerprint is what notices it and rebuilds the app --
+    # the in-place revocation/rotation flow the HTTP-API wiki documents.
+    import aiohttp
+
+    token_file = tmp_path / "device.token"
+    token_file.write_text("old-secret")
+    cron = cronstable.cron.Cron(None, config_yaml=_DISABLED_JOB)
+    web_config = {
+        "listen": ["http://127.0.0.1:0"],
+        "authTokens": [
+            {"fromFile": str(token_file), "scopes": ["view"], "label": "ph"}
+        ],
+    }
+    await cron.start_stop_web_app(web_config)
+    try:
+        first = cron.web_runner
+        assert first is not None
+        # an unchanged config with an unchanged file is a no-op
+        await cron.start_stop_web_app(web_config)
+        assert cron.web_runner is first
+
+        token_file.write_text("brand-new-secret")
+        await cron.start_stop_web_app(web_config)
+        assert cron.web_runner is not None
+        assert cron.web_runner is not first
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                base + "/status", headers=_bearer("old-secret")
+            ) as resp:
+                assert resp.status == 401
+            async with session.get(
+                base + "/status", headers=_bearer("brand-new-secret")
+            ) as resp:
+                assert resp.status == 200
+    finally:
+        await cron.start_stop_web_app(None)
+        await asyncio.sleep(0.25)
+
+
+@pytest.mark.asyncio
+async def test_half_written_token_rotation_keeps_the_app(tmp_path, caplog):
+    # A truncate-then-write rotation can be observed half-written; tearing
+    # the app down for a token table that cannot resolve would leave
+    # nothing serving. The listener stays up on the old table and the next
+    # reload retries -- the TLS make-before-break rule, applied to tokens.
+    token_file = tmp_path / "device.token"
+    token_file.write_text("old-secret")
+    cron = cronstable.cron.Cron(None, config_yaml=_DISABLED_JOB)
+    web_config = {
+        "listen": ["http://127.0.0.1:0"],
+        "authTokens": [
+            {"fromFile": str(token_file), "scopes": ["view"], "label": "ph"}
+        ],
+    }
+    await cron.start_stop_web_app(web_config)
+    try:
+        first = cron.web_runner
+        assert first is not None
+        token_file.write_text("")
+        await cron.start_stop_web_app(web_config)
+        assert cron.web_runner is first
+        assert "not resolvable" in caplog.text
+    finally:
+        await cron.start_stop_web_app(None)
+        await asyncio.sleep(0.25)
+
+
+@pytest.mark.asyncio
 async def test_anonymous_view_end_to_end(caplog):
     """A public-view instance over real HTTP: strangers read, only tokens
     mutate, and the startup log says so."""
