@@ -30,21 +30,35 @@ WORK="$(mktemp -d)"
 DAEMON_PID=""
 cleanup() {
   rc=$?
+  set +e
   if [ "$rc" -ne 0 ]; then
     echo "cli_job_smoke: FAILED; daemon log tail:" >&2
-    tail -n 40 "$WORK/daemon.log" >&2 || true
+    tail -n 40 "$WORK/daemon.log" >&2
     echo "cli_job_smoke: job stderr:" >&2
-    cat "$WORK/err.log" >&2 || true
+    cat "$WORK/err.log" >&2
   fi
-  if [ -n "$DAEMON_PID" ]; then
-    kill "$DAEMON_PID" 2>/dev/null || true
-    # let the daemon release the state dir before the rm (Windows locks)
+  if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+    case "$(uname -s)" in
+      MINGW*|MSYS*|CYGWIN*)
+        WINPID="$(cat "/proc/$DAEMON_PID/winpid" 2>/dev/null)"
+        if [ -n "$WINPID" ]; then
+          MSYS2_ARG_CONV_EXCL='*' taskkill /F /T /PID "$WINPID" >/dev/null 2>&1
+        fi
+        ;;
+      *) kill "$DAEMON_PID" 2>/dev/null ;;
+    esac
     for _ in $(seq 1 10); do
       kill -0 "$DAEMON_PID" 2>/dev/null || break
       sleep 1
     done
   fi
-  rm -rf "$WORK"
+  # Removing the shell's own CWD is unreliable on Windows; step out first.
+  cd / 2>/dev/null
+  for _ in $(seq 1 10); do
+    rm -rf "$WORK" 2>/dev/null && break
+    sleep 1
+  done
+  rm -rf "$WORK" 2>/dev/null
   exit "$rc"
 }
 trap cleanup EXIT
@@ -115,6 +129,11 @@ done
 
 curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:$PORT/shutdown" || true
+
+for _ in $(seq 1 45); do
+  kill -0 "$DAEMON_PID" 2>/dev/null || break
+  sleep 1
+done
 
 if [ -z "$ok" ]; then
   echo "cli_job_smoke: no job run ever read back the KV write" >&2
