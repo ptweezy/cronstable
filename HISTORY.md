@@ -1,5 +1,10 @@
 # History
 
+## 1.2.44
+
+- CI tooling updates
+- Documentation updates
+
 ## 1.2.43
 
 - The state-backed `@reboot` once-per-boot dedupe now works on macOS and
