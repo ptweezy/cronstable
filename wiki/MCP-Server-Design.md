@@ -1,14 +1,14 @@
-# Design Document: A Model Context Protocol (MCP) Server for cronstable
+# Design document: a Model Context Protocol (MCP) server for cronstable
 
 **Status:** Implemented · **Author:** Principal Engineering · **Date:** 2026-07-08 · **Target spec:** MCP `2025-11-25`
 
 This page was the design document for cronstable's MCP server. The design
 shipped as `cronstable/mcp.py` (protocol core and tool registry) and
-`cronstable/mcpcli.py` (the `cronstable mcp` stdio bridge), and the
-implementation has since diverged from the text in the points listed below.
-Where they differ, the implementation wins, so the design body is no longer
-kept on this page; the full text as written on 2026-07-08 is available in
-this page's history.
+`cronstable/mcpcli.py` (the `cronstable mcp` stdio bridge). The
+implementation has since diverged from the text in the points listed later.
+Where they differ, the implementation prevails, so the design body is no
+longer on this page. The full text as written on 2026-07-08 is in this
+page's history.
 
 The authoritative sources are:
 
@@ -27,21 +27,21 @@ The document's headline decisions, all of which shipped (details that moved
 are in the divergence list):
 
 - Hand-roll a small pure-Python MCP layer over the existing aiohttp
-  apiserver rather than vendor the official `mcp` SDK, whose transitive
-  tree (Rust-compiled `pydantic-core`, `cryptography`, and `rpds-py`, plus
-  `starlette`/`uvicorn`/`anyio`/`httpx`) breaks cronstable's
-  zero-new-dependency, multi-arch packaging story.
+  apiserver rather than vendor the official `mcp` SDK. Its transitive tree
+  breaks cronstable's zero-new-dependency, multi-arch packaging story. That
+  tree is Rust-compiled `pydantic-core`, `cryptography`, and `rpds-py`, plus
+  `starlette`/`uvicorn`/`anyio`/`httpx`.
 - Two transports, one core: a stateless Streamable HTTP `POST /mcp` route
   embedded in the existing web server (same listeners, auth, and reload
   lifecycle), plus the `cronstable mcp` stdio bridge, a urllib frame-proxy
   with no daemon imports, for local desktop clients.
-- Safe by default: `readOnly: true` strips every mutating tool, the default
-  toolset is `observe`, mutating tools require an explicit `confirm` (and
-  `dry_run` where a preview exists), and annotations are treated as UX
-  hints, never a security boundary.
-- Auth reuses what cronstable already has (`web.authToken` bearer tokens,
-  filesystem-gated unix sockets, mTLS) and fails closed on tokenless
-  routable listeners; no OAuth for the self-hosted case.
+- Safe by default: `readOnly: true` strips every mutating tool. The default
+  toolset is `observe`. Mutating tools require an explicit `confirm` (and
+  `dry_run` where a preview exists). Annotations are treated as UX hints,
+  never a security boundary.
+- Authentication reuses what cronstable already has: `web.authToken` bearer
+  tokens, filesystem-gated Unix sockets, and mutual TLS (mTLS). It fails
+  closed on tokenless routable listeners. No OAuth for the self-hosted case.
 - Build to spec revision `2025-11-25` and stay stateless (no sessions) so
   later spec revisions land small.
 
@@ -55,24 +55,24 @@ history.
 - No per-run job resource template (§5.3): the proposed
   `cronstable://jobs/{name}/runs/{run_id}` shipped as
   `cronstable://jobs/{name}/runs` (the whole retained history, no
-  `run_id`). The DAG template kept `{run_key}`.
-- Three additional config keys (§7): the shipped `mcp:` block also takes
-  `allowUnauthenticated`, `resources`, and `prompts`.
-- Stricter fail-closed rule (§6/§7): there is no
-  bind-safe-listeners-and-warn mode for a mixed listen set. Startup raises
-  a `ConfigError` whenever any routable listener lacks a token;
-  `mcp.allowUnauthenticated: true` is the explicit override.
+  `run_id`). The directed acyclic graph template kept `{run_key}`.
+- Three additional configuration keys (§7): the shipped `mcp:` block also
+  takes `allowUnauthenticated`, `resources`, and `prompts`.
+- Stricter fail-closed rule (§6/§7): no bind-safe-listeners-and-warn mode
+  exists for a mixed listen set. Startup raises a `ConfigError` whenever any
+  routable listener lacks a token. `mcp.allowUnauthenticated: true` is the
+  explicit override.
 - Offset paging, not opaque cursors (§5.1): list tools take
-  `offset`/`limit` and return a `nextOffset`; only the two log-tail tools
+  `offset`/`limit` and return a `nextOffset`. Only the two log-tail tools
   take a `cursor`, an integer position for polling newly appended lines.
-- Resources and prompts are toolset-scoped (§5.3/§5.4): the `dags`
-  resource templates and the `why_did_dag_run_fail` / `backfill_plan`
-  prompts require the `dags` toolset.
-- TLS is served natively, not only by a reverse proxy (§6): where the
-  design text says to terminate TLS/mTLS in a reverse proxy (and cites the
-  [HTTP Control API](HTTP-API) page for it), `web.listen` now accepts
+- Resources and prompts are toolset-scoped (§5.3/§5.4): the `dags` resource
+  templates and the `why_did_dag_run_fail` / `backfill_plan` prompts
+  require the `dags` toolset.
+- TLS is served by the daemon, not only by a reverse proxy (§6): where the
+  design text says to terminate TLS/mTLS in a reverse proxy and cites the
+  [HTTP control API](HTTP-API) page for it, `web.listen` now accepts
   `https://` addresses served from a `web.tls` block, and
   `web.tls.clientCa` makes those listeners require a client certificate.
   That mTLS listener satisfies the fail-closed token gate on its own,
-  exactly as a proxy-terminated one does; plain `https://` does not. See
-  [Listener TLS](Listener-TLS).
+  exactly as a proxy-terminated one does. Plain `https://` does not. See
+  [listener TLS](Listener-TLS).

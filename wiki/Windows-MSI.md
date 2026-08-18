@@ -7,9 +7,9 @@ managed deployment through GPO, Intune, SCCM, or a plain elevated
 holds, so nothing self-extracts at startup and Python is not required on
 the target.
 
-See [Windows Service](Windows-Service) for the service the MSI registers,
-[Running on Windows](Running-on-Windows) for the platform behavior, and
-[Installation](Installation) for every other install method.
+See [Windows service](Windows-Service) for the service the MSI registers,
+[running on Windows](Running-on-Windows) for the platform behavior, and
+[installation](Installation) for every other install method.
 
 ## What the MSI installs
 
@@ -25,9 +25,8 @@ See [Windows Service](Windows-Service) for the service the MSI registers,
   new shell. Shells that were already open do not see the change until
   they are restarted.
 
-Uninstalling removes all three. Configuration and logs under
-`C:\ProgramData\cronstable` are never touched by install, upgrade or
-uninstall.
+Uninstalling removes all three. Install, upgrade, and uninstall never touch
+configuration and logs under `C:\ProgramData\cronstable`.
 
 ## Quick start
 
@@ -43,14 +42,14 @@ The full paths matter: the shell that ran `msiexec` predates the `PATH`
 change the installer made, so a bare `cronstable` only works in shells
 opened later.
 
-The service is registered for automatic start but the MSI does not start
-it on a first install: there is no configuration yet, and a service with
-nothing to read would stop with an error and burn its recovery restarts.
-`cronstable init` writes a commented starter configuration (and tightens
-the directory's permissions where the platform default leaves them loose);
-after that, `cronstable service start` or the next boot brings it up.
-Until then `cronstable service status` reports the service as stopped,
-which is the expected state.
+The service is registered for automatic start, but the MSI does not start
+it on a first install, because there is no configuration yet and a service
+with nothing to read would stop with an error and burn its recovery
+restarts. `cronstable init` writes a commented starter configuration and
+tightens the directory's permissions where the platform default leaves
+them loose. After that, `cronstable service start` or the next boot brings
+it up. Until then, `cronstable service status` reports the service as
+stopped, which is the expected state.
 
 ## Properties
 
@@ -76,21 +75,22 @@ the configuration files first (or in the same policy) and install with
 msiexec /i cronstable-windows-amd64.msi /qn STARTSERVICE=1
 ```
 
-Log an install with `/l*v install.log` when a deployment misbehaves; the
+When a deployment misbehaves, log the install with `/l*v install.log`. The
 log names the exact action that failed.
 
 ## Upgrades
 
 Installing a newer MSI over an older one upgrades in place: the old
 version is removed first, and a running service is stopped for the
-switch. Install-time properties are remembered (see above), so the
-upgraded service keeps its configuration directory. The service is
-started again at the end of the upgrade when that directory exists,
-which is the working deployment's normal case; a machine that never got
-configuration stays stopped. Windows Installer waits for the service's
-stop, and the stop
-drains running jobs first, so an upgrade during a very long job can time
-out and roll back; for maintenance windows, stop the service yourself
+switch. Install-time properties are remembered (see the preceding
+section), so the upgraded service keeps its configuration directory. When
+that directory exists, the service is started again at the end of the
+upgrade. That is the working deployment's normal case. A machine that
+never got configuration stays stopped.
+
+Windows Installer waits for the service's stop, and the stop drains
+running jobs first. An upgrade during a very long job can therefore time
+out and roll back. For maintenance windows, stop the service yourself
 (`cronstable service stop`) before pushing the upgrade.
 
 Downgrades are refused with a message rather than silently replacing a
@@ -99,11 +99,13 @@ newer install.
 ## Signing
 
 The MSI, like every Windows release asset, is Authenticode-signed with
-Azure Artifact Signing, and each signature carries an RFC 3161
-timestamp so it outlives the short-lived signing certificates. UAC
-elevation shows the verified publisher, and AppLocker/WDAC deployments
-can admit the package with a publisher rule. GPO, Intune and SCCM
-deployments do not involve SmartScreen; a browser-downloaded MSI's
-first run can still trip it while the signing identity's reputation
-accrues (choose "More info", then "Run anyway"). Verify a download
-against the release's `SHA256SUMS` when your policy calls for it.
+Azure Artifact Signing. Each signature carries an RFC 3161 timestamp, so
+it outlives the short-lived signing certificates. UAC elevation shows the
+verified publisher, and AppLocker/WDAC deployments can admit the package
+with a publisher rule.
+
+GPO, Intune, and SCCM deployments do not involve SmartScreen. It can still
+appear on a browser-downloaded MSI's first run while the signing identity's
+reputation accrues (choose **More info**, then **Run anyway**).
+When your policy calls for it, verify a download against the release's
+`SHA256SUMS`.

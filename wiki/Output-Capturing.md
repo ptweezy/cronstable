@@ -1,4 +1,4 @@
-# Output Capturing
+# Output capturing
 
 This page documents how cronstable handles a job's standard output and standard
 error: which streams are captured, how captured output is prefixed and
@@ -7,28 +7,30 @@ to the underlying reader.
 
 ## Overview
 
-For each job, cronstable decides per stream whether to *capture* it. The decision
-is made independently for stdout (`captureStdout`, default `false`) and stderr
-(`captureStderr`, default `true`).
+For each job, cronstable decides per stream whether to *capture* it. The
+decision is made independently for stdout (`captureStdout`, default `false`)
+and stderr (`captureStderr`, default `true`).
 
-- A **captured** stream is read line-by-line by cronstable. Each line is decoded as
-  UTF-8, re-emitted to cronstable's own stdout/stderr (with a configurable prefix),
-  and retained in memory (subject to `saveLimit`) so it can be included in
-  [reports](Reporting) and exposed to [failure detection](Failure-Detection-and-Retries).
-- An **uncaptured** stream is not piped through cronstable: the child process
+- A **captured** stream is read line-by-line by cronstable. Each line is decoded
+  as UTF-8, re-emitted to cronstable's own stdout/stderr with a configurable
+  prefix, and retained in memory subject to `saveLimit`, so it can be included
+  in [reports](Reporting) and exposed to
+  [failure detection](Failure-Detection-and-Retries).
+- An **uncaptured** stream is not piped through cronstable. The child process
   inherits cronstable's own stdout/stderr file descriptors, so its output passes
   through directly. Such output is *not* retained, *not* prefixed, and *not*
   available to reporters or to the `producesStdout`/`producesStderr` failure
   checks.
 
-Whether a captured stream is re-emitted to cronstable's stdout or stderr depends on
-the original stream, not on which stream was captured: captured stdout lines are
-written to cronstable's stdout, captured stderr lines to cronstable's stderr.
+Whether a captured stream is re-emitted to cronstable's stdout or stderr depends
+on the original stream, not on which stream was captured. Captured stdout lines
+are written to cronstable's stdout, and captured stderr lines to cronstable's
+stderr.
 
 ## Options
 
-These options are per-job and may also be set in a `defaults` block (see
-[Includes, Defaults, and Multi-File Config](Includes-and-Defaults)). All are
+These options are per-job, and you may also set them in a `defaults` block (see
+[includes, defaults, and multi-file config](Includes-and-Defaults)). All are
 optional (`Opt(...)` in the schema). Types and defaults are taken from the
 strictyaml schema and `DEFAULT_CONFIG`.
 
@@ -37,10 +39,10 @@ strictyaml schema and `DEFAULT_CONFIG`.
 | `captureStdout` | boolean | `false` | Capture the job's standard output: read, prefix, re-emit to cronstable's stdout, and retain for reports/failure checks. |
 | `captureStderr` | boolean | `true` | Capture the job's standard error: read, prefix, re-emit to cronstable's stderr, and retain for reports/failure checks. |
 | `streamPrefix` | string | `"[{job_name} {stream_name}] "` | Format string prepended to each re-emitted captured line. Supports `{job_name}` and `{stream_name}`. Set to `""` to disable. |
-| `saveLimit` | integer | `4096` | Maximum number of lines retained per captured stream for reporting. Must be `>= 0`; `0` retains nothing but still counts discarded lines. |
-| `maxLineLength` | integer | `16777216` (16 MiB) | Maximum length, in bytes, of a single line the underlying asyncio reader will buffer. Must be `> 0`. Lines exceeding it are skipped with a warning. |
+| `saveLimit` | integer | `4096` | Maximum lines retained per captured stream for reporting. Must be `>= 0`. `0` retains nothing but still counts discarded lines. |
+| `maxLineLength` | integer | `16777216` (16 MiB) | Maximum bytes the asyncio reader buffers per line. Must be `> 0`. Lines exceeding it are skipped with a warning. |
 
-`saveLimit` and `maxLineLength` are validated at config load time: a non-integer
+`saveLimit` and `maxLineLength` are validated at config load time. A non-integer
 fails the strictyaml schema, and `saveLimit < 0` or `maxLineLength <= 0` raises
 a `ConfigError`.
 
@@ -51,7 +53,7 @@ connected to a pipe (`asyncio.subprocess.PIPE`) and starts a `StreamReader` task
 that loops over `readline()`. For each line:
 
 1. The raw bytes are decoded with `"utf-8"` and `errors="replace"`, so a job
-   that emits non-UTF-8 bytes does not crash the reader; invalid sequences
+   that emits non-UTF-8 bytes does not crash the reader. Invalid sequences
    become the Unicode replacement character.
 2. The decoded line, with `streamPrefix` formatted and prepended, is written to
    cronstable's own stdout (for stdout lines) or stderr (for stderr lines) and
@@ -59,7 +61,7 @@ that loops over `readline()`. For each line:
 3. The (unprefixed) line is retained according to `saveLimit`.
 
 If a stream is not captured, no pipe is created for it and no `StreamReader` is
-started; the child inherits cronstable's corresponding file descriptor.
+started. The child inherits cronstable's corresponding file descriptor.
 
 ### Encoding of re-emitted lines
 
@@ -105,15 +107,15 @@ jobs:
     streamPrefix: ""
 ```
 
-Note the trailing space in the default prefix; a custom prefix is concatenated
-directly with the line, so include your own separator if you want one.
+The default prefix ends with a space. If you want a separator, include it in
+the prefix; a custom prefix is concatenated directly with the line.
 
 ## saveLimit and discarded-line accounting
 
 `saveLimit` bounds how many lines per captured stream are retained for reporting.
-The `StreamReader` does not keep the most recent N lines; it keeps the **first
+The `StreamReader` does not keep the most recent `N` lines. It keeps the **first
 half and the last half**, so both the beginning and the end of long output
-survive while the middle is dropped:
+survive although the middle is dropped:
 
 - The first `saveLimit // 2` lines are stored in a top buffer.
 - After the top buffer is full, subsequent lines go into a bottom buffer holding
@@ -134,16 +136,16 @@ discards occurred and when the bottom buffer is non-empty.
 
 `saveLimit` may be set to `0`. With `saveLimit: 0`, no
 lines are retained at all: every line is counted as discarded. The lines are
-still decoded and re-emitted with their prefix as usual; only the in-memory
+still decoded and re-emitted with their prefix as usual. Only the in-memory
 retention for reports is suppressed. The discard count is preserved, which
-matters for failure detection (below).
+matters for failure detection (described later).
 
 ## maxLineLength
 
 `maxLineLength` (default 16 MiB) is passed as the `limit` to the asyncio stream
-reader when either stream is captured. It bounds how many bytes the reader will
-buffer for a single line. If a line exceeds this limit, `readline()` raises a
-`ValueError`, which the `StreamReader` catches: it logs a warning
+reader when either stream is captured. It bounds how many bytes the reader
+buffers for a single line. If a line exceeds this limit, `readline()` raises a
+`ValueError`, which the `StreamReader` catches. The reader logs a warning
 
 ```
 job <name>: ignored a very long line
@@ -155,12 +157,14 @@ re-emitted, and is **not** counted as a discarded line.
 ## Interaction with failure detection
 
 The `producesStdout` and `producesStderr` checks in `failsWhen` (see
-[Failure Detection and Retries](Failure-Detection-and-Retries)) consider a
+[failure detection and retries](Failure-Detection-and-Retries)) consider a
 stream non-empty if it has **either** retained output **or** a non-zero discard
-count. Consequently, output that was produced but discarded (including all
-output when `saveLimit: 0`) still triggers these failure conditions. Lines
-skipped because they exceeded `maxLineLength` are not counted as discards and
-therefore do not, on their own, satisfy these checks.
+count.
+
+Consequently, output that was produced but discarded (including all output when
+`saveLimit: 0`) still triggers these failure conditions. Lines skipped because
+they exceeded `maxLineLength` are not counted as discards and therefore do not,
+on their own, satisfy these checks.
 
 Because these checks operate only on captured streams, `producesStdout` has no
 effect unless `captureStdout` is enabled, and `producesStderr` has no effect
