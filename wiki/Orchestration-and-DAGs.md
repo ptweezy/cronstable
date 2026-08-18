@@ -1,25 +1,27 @@
 # Orchestration and DAGs
 
-cronstable schedules independent jobs. A **DAG** (the optional `dags:` section)
-adds the other axis: a durable, dependency-ordered **workflow** of tasks, run
-on a schedule, that survives restarts and coordinates across a fleet exactly
-the way the rest of [Durable State](Durable-State) does. It is a small
-orchestration engine built entirely on the pieces that already exist -- there
-is **no new coordination service, no new backend, no client library**:
+cronstable schedules independent jobs. A **DAG** (directed acyclic graph) in
+the optional `dags:` section adds the other axis: a durable,
+dependency-ordered **workflow** of tasks, run on a schedule, that survives
+restarts and coordinates across a fleet exactly the way the rest of
+[durable state](Durable-State) does. It is a small orchestration engine built
+entirely on the pieces that already exist. There is **no new coordination
+service, no new backend, no client library**:
 
 - a **dag_run** (one execution of a DAG) is a single mutable *document* in the
   [state store](Durable-State), holding every task's state;
-- a **task** is an ordinary job invocation -- the same command/shell/env/
+- a **task** is an ordinary job invocation: the same command/shell/env/
   timeout machinery, launched the same way, with the same
   [loopback state endpoint](Durable-State#job-facing-state) injected,
   so a task can call `cronstable xcom|artifact|state|lock|...`;
-- **cross-task data** (XCom) rides the artifact store, scoped per dag_run;
+- **cross-task data** (XCom, cross-communication) rides the artifact store,
+  scoped per dag_run;
 - the scheduler advances each run under a single **lease**, so across a fleet a
   task is never launched twice and a run is never double-advanced.
 
 > **Opt-in and store-backed.** DAGs require a `state` section with the loopback
 > endpoint (`state.jobApi.enabled`, on by default). Without `dags:` none of
-> this exists; adding it changes nothing about plain scheduled jobs.
+> this exists. Adding it leaves plain scheduled jobs unchanged.
 
 **On this page:** [A first DAG](#a-first-dag) ·
 [Tasks and dependencies](#tasks-and-dependencies) ·
@@ -52,51 +54,57 @@ dags:
 ```
 
 At 02:00 the daemon creates a dag_run and advances it: `extract` runs first,
-then `transform` (once `extract` succeeds), then `load`. Every transition is
+then `transform` (after `extract` succeeds), then `load`. Every transition is
 durable, so a restart resumes the run from exactly where it was.
 
 ## Tasks and dependencies
 
 Each task has an `id` (unique within the DAG) and, except for an approval gate,
-a `command` (the same string-or-list command a job takes). Edges are declared
-with `dependsOn:` -- a list of upstream task ids. The graph must be **acyclic**
-and every dependency must resolve; a cycle or a dangling edge is a config error
-at load, never a runtime hang.
+a `command` (the same string-or-list command a job takes). You declare edges
+with `dependsOn:`, a list of upstream task ids. The graph must be **acyclic**
+and every dependency must resolve. A cycle or a dangling edge is a
+configuration error at load, never a run that stops responding at runtime.
 
-A task's readiness is governed by its `triggerRule`:
+A task's `triggerRule` governs its readiness:
 
-| triggerRule | the task runs when… |
+| `triggerRule` | the task runs when… |
 | --- | --- |
-| `all_success` (default) | every upstream succeeded (an upstream failure makes it `upstream_failed`; an upstream skip cascades a `skipped`) |
+| `all_success` (default) | every upstream succeeded (an upstream failure makes it `upstream_failed`, and an upstream skip cascades a `skipped`) |
 | `all_done` | every upstream reached a terminal state, regardless of outcome |
 
 Per-task launch fields mirror a job: `shell`, `environment`, `captureStdout` /
 `captureStderr`, `executionTimeout`, `killTimeout`, `user` / `group`,
 `workingDirectory`, `priority`, `failsWhen`, run-scoped `secrets`,
-`monitorResources`, and the rest of the shared launch keys; the complete
-list, with types and defaults, is in the
-[configuration reference](Configuration-Reference#dags). Because a task **is**
-a job invocation, its launch fields inherit the file's
+`monitorResources`, and the rest of the shared launch keys. The
+[configuration reference](Configuration-Reference#dags) has the complete list,
+with types and defaults.
+
+Because a task **is** a job invocation, its launch fields inherit the file's
 [`defaults:` block](Includes-and-Defaults#the-defaults-section) the same way a
 job does: a global `shell`, `environment`, `monitorResources`, run-scoped
 `secrets`, or reporter block covers DAG tasks too, and the task's own value
-wins on any key it sets. A task's `onFailure` / `onSuccess` reporters (set
-per-task or inherited) fire on each of its runs, every failed attempt
-included; per-task the two hooks accept a `report` block only, since a task's
-retries come from the node's `retries` field, not a job-level
-`onFailure.retry` ladder (an inherited one is ignored for tasks). Only the
-**launch** fields inherit; the DAG-node
-fields that shape the graph (`dependsOn`, `triggerRule`, `retries`,
-`retryDelaySeconds`, `expand`, `onReject`, the poke settings) are never touched
-by a `defaults:` block. The DAG's own schedule frame is separate too: the
-synthetic trigger job that fires the DAG on schedule stays on the built-in
-defaults, so a global `onSuccess`/`onFailure` reporter does not alert on every
-DAG tick. A monitored task
-instance's sampled CPU time and peak RSS land in the `resources` object of
-its task record in the `dag_run` document, and in the task's statsd sink if
-one is configured; task instances do not appear in the per-job Prometheus
-families. Per-task **retries** are DAG-owned
-(independent of a job's `onFailure.retry`):
+wins on any key it sets.
+
+A task's `onFailure` / `onSuccess` reporters (set per-task or inherited) fire
+on each of its runs, every failed attempt included. Per-task the two hooks
+accept a `report` block only, because a task's retries come from the node's
+`retries` field, not a job-level `onFailure.retry` ladder (an inherited one is
+ignored for tasks).
+
+Only the **launch** fields inherit. The DAG-node fields that shape the graph
+(`dependsOn`, `triggerRule`, `retries`, `retryDelaySeconds`, `expand`,
+`onReject`, the poke settings) are never touched by a `defaults:` block.
+
+The DAG's own schedule frame is separate too: the synthetic trigger job that
+fires the DAG on schedule stays on the built-in defaults, so a global
+`onSuccess`/`onFailure` reporter does not alert on every DAG tick.
+
+A monitored task instance's sampled CPU time and peak resident set size (RSS)
+land in the `resources` object of its task record in the `dag_run` document,
+and in the task's statsd sink if one is configured. Task instances do not
+appear in the per-job Prometheus families.
+
+Per-task **retries** are DAG-owned (independent of a job's `onFailure.retry`):
 
 ```yaml
       - id: load
@@ -117,12 +125,13 @@ pending ─▶ upstream_failed   (an upstream failed, all_success)
 pending ─▶ skipped           (an upstream was skipped, all_success)
 ```
 
-A dag_run is `success` once every task is terminal and none failed; `failed`
-if any task ended `failed` or `upstream_failed`. `skipped` is not a failure.
+A dag_run is `success` after every task is terminal and none failed. It is
+`failed` if any task ended `failed` or `upstream_failed`. `skipped` is not a
+failure.
 
 ## XCom: passing data between tasks
 
-A task publishes a small output under a key; a downstream task reads it. XCom
+A task publishes a small output under a key. A downstream task reads it. XCom
 is a thin, task-keyed convention over the [artifact store](Durable-State),
 scoped to the dag_run, driven by the `cronstable xcom` CLI the daemon makes
 reachable in every task:
@@ -160,8 +169,8 @@ XCom list (Airflow's `.expand()`):
         command: "echo processing $CRONSTABLE_DAG_MAP_ITEM (#$CRONSTABLE_DAG_MAP_INDEX)"
 ```
 
-When `list-work` succeeds, the scheduler reads its `items` list and materialises
-`process#0`, `process#1`, `process#2`, each with its own state, retries and
+When `list-work` succeeds, the scheduler reads its `items` list and materializes
+`process#0`, `process#1`, `process#2`, each with its own state, retries, and
 XCom, and its item in `$CRONSTABLE_DAG_MAP_ITEM`. A downstream task that
 `dependsOn: [process]` waits for **all** the mapped instances (fan-in). An
 empty list resolves the mapped task to `success` immediately.
@@ -171,27 +180,31 @@ so a crash-resumed run reconstructs the identical set of mapped instances
 rather than re-deriving it from a possibly-changed upstream output.
 
 Because the expansion is permanent, the read that derives it is **strict**
-about store trouble. A store that cannot answer -- an I/O error or timeout on
-a shared mount, a record only a newer node's schema can read -- leaves the
-fan-out **unknown**: the task stays unexpanded and the scheduler retries the
-read on a later pass, regardless of
-[`onStoreUnavailable`](Durable-State#when-the-store-is-unavailable-onstoreunavailable)
-(this deliberately overrides the store's usual
-[skip-on-read-error](Durable-State#the-store-model) rule -- one blip must not
-freeze the task into a permanently empty, vacuously successful fan-out). The
-empty fan-out is reserved for a *definitive* answer: the upstream finished
-without publishing the key; the published value is not a usable JSON list
-(invalid JSON, not a list, or carrying a non-portable value); or the record
-survives but its payload blob is gone (`410` -- possible only through external
-interference with the store, such as a partial restore, since GC never sweeps
-a blob a surviving record references). A warning names each mapping-to-empty
-that indicates a problem.
+about store trouble. A store that cannot answer (an I/O error or timeout on a
+shared mount, a record only a newer node's schema can read) leaves the fan-out
+**unknown**: the task stays unexpanded and the scheduler retries the read on a
+later pass, regardless of
+[`onStoreUnavailable`](Durable-State#when-the-store-is-unavailable-onstoreunavailable).
+This deliberately overrides the store's usual
+[skip-on-read-error](Durable-State#the-store-model) rule: one blip must not
+freeze the task into a permanently empty, vacuously successful fan-out.
 
-A fan-out is capped at **1000 items**: a larger XCom list fails the mapped
-task with an explanatory reason instead of materialising the flood (its
-`all_success` downstream sees `upstream_failed`). A single scheduler pass
-also launches at most 32 instances at a time, so a large fan-out ramps up in
-bounded bursts rather than one subprocess stampede.
+The empty fan-out is reserved for a *definitive* answer:
+
+- the upstream finished without publishing the key;
+- the published value is not a usable JSON list (invalid JSON, not a list, or
+  carrying a non-portable value); or
+- the record survives but its payload blob is gone (`410`), possible only
+  through external interference with the store, such as a partial restore,
+  because GC never sweeps a blob a surviving record references.
+
+A warning names each mapping-to-empty that indicates a problem.
+
+A fan-out is capped at **1000 items**. A larger XCom list fails the mapped task
+with an explanatory reason instead of materializing that many instances (its
+`all_success` downstream sees `upstream_failed`). A single scheduler pass also
+launches at most 32 instances at a time, so a large fan-out ramps up in bounded
+bursts rather than one burst of subprocesses.
 
 ## Sensors
 
@@ -225,36 +238,39 @@ curl -X POST .../dags/nightly-etl/runs/<run_key>/tasks/publish-gate/decision \
      -d '{"decision": "approve", "by": "alice"}'
 ```
 
-`approve` succeeds the gate and the graph proceeds; `reject` fails it (or, with
+`approve` succeeds the gate and the graph proceeds. `reject` fails it (or, with
 `onReject: skip`, marks it `skipped`, cascading `skipped` to its `all_success`
 downstream). The decision (`by`, timestamp) is recorded durably.
 
-A gate that begins waiting can page you: configure the
+You can be paged when a gate begins waiting: configure the
 [`notify:` block](Reporting#daemon-event-notifications-notify) with the
-`approval_waiting` event to have cronstable fire a reporter (webhook, mail, …)
+`approval_waiting` event. The daemon then fires a reporter (webhook, mail, …)
 the first time each gate parks awaiting a decision. A whole DAG run reaching
 `failed` similarly fires the `dag_failure` event.
 
 ## Scheduling, catch-up, and backfill
 
-A scheduled DAG reuses the job [schedule grammar](Schedules-and-Timezones)
-with one restriction: the schedule must parse to a cron expression, so
-`@reboot` is rejected at config load (`DAG schedules must be cron
-expressions; @reboot is not supported for dags`), while `@daily` /
-`@hourly`-style aliases still work. It follows the
+A scheduled DAG reuses the job [schedule grammar](Schedules-and-Timezones) with
+one restriction: the schedule must parse to a cron expression, so `@reboot` is
+rejected at config load (`DAG schedules must be cron expressions; @reboot is
+not supported for dags`), although `@daily` / `@hourly`-style aliases still
+work.
+
+A scheduled DAG follows the
 [catch-up discipline](Durable-State#missed-run-catch-up): `onMissed`
 (`skip` / `run-once` / `run-all`) and `startingDeadlineSeconds` bound how many
 missed logical dates a restart replays, capped like a job's catch-up.
+
 `catchupJitterSeconds` spreads the replays, with the same checkpointed
-at-least-once resume the job engine has: the owed watermark goes into a
+at-least-once resume the job engine has. The owed watermark goes into a
 `catchup-dag/<dag>` stream (the twin of the job's `catchup/<job>`) before the
 jitter offset starts, so a restart during the offset resumes the backfill
 rather than losing it. A DAG with no `schedule` is manual-only.
 
-**Backfill** replays a DAG across a historical range on demand -- a deliberate
-operation that ignores the automatic deadline but is still bounded and
-idempotent (each date's run is create-if-absent, so re-running a backfill never
-duplicates runs):
+**Backfill** replays a DAG across a historical range on demand. It is a
+deliberate operation that ignores the automatic deadline but is still bounded
+and idempotent (each date's run is create-if-absent, so re-running a backfill
+never duplicates runs):
 
 ```bash
 curl -X POST .../dags/nightly-etl/backfill \
@@ -263,53 +279,62 @@ curl -X POST .../dags/nightly-etl/backfill \
 
 ## Crash-resume and the fleet
 
-The durable per-task state -- not memory -- is the source of truth. A dag_run
-is advanced only by the node holding that run's **advance lease** (a TTL lease
-on the shared store, renewed while the run is active), so across a fleet only
-one node ever advances a given run and a task never double-launches. The claim
-that flips a task `pending → running` is a single atomic compare-and-set on the
-run document, a correctness backstop underneath the lease.
+The durable per-task state, not memory, is the source of truth. A dag_run is
+advanced only by the node holding that run's **advance lease**, a
+time-to-live (TTL) lease on the shared store renewed while the run is active,
+so across a fleet only one node ever advances a given run and a task never
+double-launches. The claim that flips a task `pending → running` is a single
+atomic compare-and-set on the run document, a correctness backstop underneath
+the lease.
 
 If a node crashes, its lease lapses and a peer adopts the run, reconciling from
-the durable state: a task recorded `running` whose process is gone (a dead pid,
-or a foreign owner proven dead by the lease lapse) is retried if attempts
-remain, else failed; a sensor mid-poke is re-poked; an approval gate keeps
-waiting. This mirrors the job-level
+the durable state:
+
+- a task recorded `running` whose process is gone (a dead pid, or a foreign
+  owner proven dead by the lease lapse) is retried if attempts remain, else
+  failed;
+- a sensor mid-poke is re-poked;
+- an approval gate keeps waiting.
+
+This mirrors the job-level
 [crash reconciliation](Durable-State#in-flight-runs-and-crash-reconciliation)
-seam. Like every cronstable coordination primitive it is **at-least-once**,
-not exactly-once: a task whose process outlives a crashed daemon may run again
-on resume, so a task that must be exactly-once should guard its side effect
-with an [idempotency key](Durable-State#idempotency-keys).
+seam. Like every cronstable coordination primitive it is **at-least-once**, not
+exactly-once: a task whose process outlives a crashed daemon may run again on
+resume. A task that must be exactly-once should guard its side effect with an
+[idempotency key](Durable-State#idempotency-keys).
 
 ## Retention and GC
 
 A dag_run document is durable and, while its DAG is configured, is **not**
-swept by the record garbage collector. Instead each DAG keeps its newest
+swept by the record garbage collector (GC). Instead each DAG keeps its newest
 `retainRuns` **terminal** runs (default 50) and prunes the rest, along with
-their XCom, on a periodic DAG-owned pass. A DAG *removed from every config*
-ages out like a removed job: once it has been absent from every config and
-recent manifest for a full `state.gcGraceSeconds`, the daemon's
-[GC pass](Durable-State#garbage-collection-and-manifests) deletes its
-terminal run documents (an active run is never touched, so a re-added DAG
-resumes it) and its aged XCom streams. Artifact payload blobs are
-content-addressed; a blob any surviving record still references is never
-swept, so a retained run's XCom can never dangle -- only blobs no surviving
-record references, and older than the grace, are reclaimed.
+their XCom, on a periodic DAG-owned pass.
+
+A DAG *removed from every config* ages out like a removed job. After it has
+been absent from every config and recent manifest for a full
+`state.gcGraceSeconds`, the daemon's
+[GC pass](Durable-State#garbage-collection-and-manifests) deletes its terminal
+run documents (an active run is never touched, so a re-added DAG resumes it)
+and its aged XCom streams.
+
+Artifact payload blobs are content-addressed. A blob any surviving record still
+references is never swept, so a retained run's XCom can never dangle. Only
+blobs no surviving record references, and older than the grace, are reclaimed.
 
 ## Inspecting and controlling runs
 
 Over the [HTTP control API](HTTP-API#dag-endpoints):
 
-- `GET /dags` — the configured DAGs and their tasks
-- `GET /dags/{name}/runs` — recent runs and their per-task state counts
-- `GET /dags/{name}/runs/{run_key}` — one run's full document
-- `POST /dags/{name}/trigger` — start a manual run now
-- `POST /dags/{name}/backfill` — replay a date range
-- `POST /dags/{name}/runs/{run_key}/tasks/{taskkey}/decision` — approve/reject a gate
+- `GET /dags`: the configured DAGs and their tasks
+- `GET /dags/{name}/runs`: recent runs and their per-task state counts
+- `GET /dags/{name}/runs/{run_key}`: one run's full document
+- `POST /dags/{name}/trigger`: start a manual run now
+- `POST /dags/{name}/backfill`: replay a date range
+- `POST /dags/{name}/runs/{run_key}/tasks/{taskkey}/decision`: approve/reject a gate
 
-The [Web Dashboard](Web-Dashboard) drives the same endpoints from a DAG
-orchestration UI -- a DAG card and a per-DAG drawer (runs, tasks, graph, XCom,
-logs) with trigger, backfill, and approval decisions; its page documents that
+The [web dashboard](Web-Dashboard) drives the same endpoints from a DAG
+orchestration UI: a DAG card and a per-DAG drawer (runs, tasks, graph, XCom,
+logs) with trigger, backfill, and approval decisions. Its page documents that
 UI.
 
 See [example/dag/](https://github.com/ptweezy/cronstable/tree/main/example/dag)

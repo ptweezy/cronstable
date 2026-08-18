@@ -2,4 +2,4 @@ This wiki documents [cronstable](https://github.com/ptweezy/cronstable). See the
 
 cronstable is a fork of [gjcarneiro/yacron](https://github.com/gjcarneiro/yacron).
 
-cronstable™ and the cronstable logo are trademarks of Parker Loflin; the code is MIT-licensed (see [TRADEMARKS.md](https://github.com/ptweezy/cronstable/blob/main/TRADEMARKS.md) and [LICENSE](https://github.com/ptweezy/cronstable/blob/main/LICENSE)).
+cronstable™ and the cronstable logo are trademarks of Parker Loflin. The code is MIT-licensed. See [TRADEMARKS.md](https://github.com/ptweezy/cronstable/blob/main/TRADEMARKS.md) and [LICENSE](https://github.com/ptweezy/cronstable/blob/main/LICENSE).

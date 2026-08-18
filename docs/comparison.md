@@ -1,8 +1,8 @@
 # How cronstable compares
 
-**cronstable is the only cron-family scheduler with a built-in [MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)**. AI agents (Claude, Cursor, Copilot) can observe your cronstable state and act on them when you opt in. All alongside durable state, a real DAG engine, leader-elected clustering and a live dashboard, in a single hardened, dependency-free daemon.
+**cronstable is the only cron-family scheduler with a built-in [MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)**. AI agents (Claude, Cursor, and Copilot) can observe your cronstable state and, when you opt in, act on them. All of this sits alongside durable state, a real DAG engine, leader-elected clustering, and a live dashboard, in a single hardened, dependency-free daemon.
 
-**Legend:** ✅ native · 🟡 partial / limited · ➕ requires an add-on
+**Legend:** ✅ built-in · 🟡 partial / limited · ➕ requires an add-on
 
 | Capability | cronstable | yacron | supercronic | Ofelia | dkron | Cronicle | K8s CronJob | Airflow |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -15,7 +15,7 @@
 | Sub-minute (second-level) schedules | ✅ | — | ✅ | ✅ | ✅ | — | — | 🟡 |
 | Extended cron dialect (last-day · last-weekday · year) | ✅ | ✅ | ✅ | — | — | 🟡 | — | ✅ |
 | `@reboot` once per OS boot | ✅ | 🟡 | — | — | — | — | — | — |
-| Arbitrary per-job timezones | ✅ | ✅ | ✅ | 🟡 | ✅ | ✅ | ✅ | ✅ |
+| Arbitrary per-job time zones | ✅ | ✅ | ✅ | 🟡 | ✅ | ✅ | ✅ | ✅ |
 | Concurrency policy + execution/kill timeouts | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ |
 | Configurable failure conditions (stdout · stderr · exit) | ✅ | ✅ | — | — | 🟡 | 🟡 | 🟡 | 🟡 |
 | Retries with exponential backoff | ✅ | ✅ | — | — | 🟡 | 🟡 | ✅ | ✅ |
@@ -37,14 +37,14 @@
 | **🔹 Observability & control** | | | | | | | | |
 | Live web dashboard (tail · run · cancel) | ✅ | — | — | — | 🟡 | ✅ | ➕ | ✅ |
 | HTTP REST control API | ✅ | ✅ | — | — | ✅ | ✅ | ✅ | ✅ |
-| Native Prometheus / statsd metrics | ✅ | ✅ | ✅ | — | ✅ | — | ➕ | ✅ |
+| Built-in Prometheus / statsd metrics | ✅ | ✅ | ✅ | — | ✅ | — | ➕ | ✅ |
 | Per-job resource monitoring (CPU/peak mem) | ✅ | — | — | — | 🟡 | ✅ | ➕ | — |
 | Failure reporting (mail · Sentry · Slack) | ✅ | ✅ | 🟡 | ✅ | 🟡 | ✅ | ➕ | ✅ |
 | Secret redaction in archived output | ✅ | — | — | — | — | — | ➕ | 🟡 |
 | **🔹 Platform & deployment** | | | | | | | | |
-| Native Windows + macOS + Linux | ✅ | — | — | 🟡 | ✅ | 🟡 | — | — |
+| Runs natively on Windows, macOS, and Linux | ✅ | — | — | 🟡 | ✅ | 🟡 | — | — |
 | Self-contained multi-arch binaries | ✅ | 🟡 | ✅ | ✅ | ✅ | — | — | — |
 | Hardened containers (non-root · read-only · distroless) | ✅ | — | — | — | — | — | 🟡 | 🟡 |
 | Minimal runtime dependencies | ✅ | 🟡 | ✅ | ✅ | ✅ | — | — | — |
 | State store backup · restore · migrate | ✅ | — | — | — | 🟡 | 🟡 | 🟡 | 🟡 |
-| **Native features (of 35)** | **35** | **9** | **7** | **4** | **9** | **9** | **8** | **18** |
+| **Built-in features (of 35)** | **35** | **9** | **7** | **4** | **9** | **9** | **8** | **18** |

@@ -1,20 +1,21 @@
 # Installation
 
 This page covers every way to install cronstable: the published container image,
-`pip`, `pipx`, Homebrew, winget, and the self-contained PyInstaller binaries. It documents the
-Python and platform requirements, the runtime dependencies, the exact binary
-release assets, and the writable-and-executable temp-directory requirement that
-applies to the standalone binary only. cronstable runs natively on
-Windows in addition to Linux and macOS; see [Running on Windows](Running-on-Windows)
-for the Windows-specific details.
+`pip`, `pipx`, Homebrew, winget, and the self-contained PyInstaller binaries. It
+documents the Python and platform requirements, the runtime dependencies, the
+exact binary release assets, and the writable-and-executable temp-directory
+requirement that applies to the standalone binary only.
+
+Besides Linux and macOS, cronstable runs natively on Windows. For the
+Windows-specific details, see [running on Windows](Running-on-Windows).
 
 ## Requirements
 
 | Requirement | Value |
 | --- | --- |
-| Python (pip/pipx) | `>= 3.10`; 3.10, 3.11, 3.12, 3.13 and 3.14 are supported and tested (`requires-python = ">=3.10"`). For an older Python, use the standalone binary instead. |
-| Operating system | Linux, macOS, and Windows. OS-specific behavior is isolated in `cronstable/platform.py`; `grp`/`pwd` are only imported on POSIX. A few features differ on Windows; see [Running on Windows](Running-on-Windows). |
-| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), both the container image and the prebuilt binaries; the prebuilt binaries also cover `riscv64` (glibc and musl) and `armv6` (musl-only). macOS: `amd64` and `arm64` (prebuilt binaries). Windows: `amd64` (x64) and `arm64` (ARM64) (prebuilt binaries). |
+| Python (pip/pipx) | `>= 3.10` (`requires-python = ">=3.10"`). Versions 3.10, 3.11, 3.12, 3.13, and 3.14 are supported and tested. For an older Python, use the standalone binary instead. |
+| Operating system | Linux, macOS, and Windows. `cronstable/platform.py` isolates OS-specific behavior. `grp` and `pwd` are imported only on POSIX. A few features differ on Windows; see [running on Windows](Running-on-Windows). |
+| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), for both the container image and the prebuilt binaries. The prebuilt binaries also cover `riscv64` (glibc and musl) and `armv6` (musl-only). macOS: `amd64` and `arm64` (prebuilt binaries). Windows: `amd64` (x64) and `arm64` (ARM64) (prebuilt binaries). |
 
 Python is required only for the `pip`/`pipx` installs. The container image
 bundles its own interpreter, and the standalone binaries embed Python, so
@@ -36,7 +37,7 @@ Installing the `cronstable` distribution pulls in the following, taken from
 
 `tzdata` ships the IANA time-zone database so `zoneinfo` resolves time zones on
 minimal/slim images that do not include the system tz data. See
-[Schedules and Timezones](Schedules-and-Timezones).
+[schedules and time zones](Schedules-and-Timezones).
 
 ## Install methods at a glance
 
@@ -52,9 +53,9 @@ minimal/slim images that do not include the system tz data. See
 | winget | winget-pkgs (release binary) | Yes (embedded) | **Yes** |
 
 Only the standalone binary, including the copies Homebrew and winget install,
-self-extracts at startup and therefore needs a
-writable and executable temp directory (see
-[Standalone binary temp-directory requirement](#standalone-binary-temp-directory-requirement)).
+self-extracts at startup and therefore needs a writable and executable temp
+directory (see
+[standalone binary temp-directory requirement](#standalone-binary-temp-directory-requirement)).
 The image, the `pip`/`pipx` installs, and the Windows zip and MSI (whose
 files sit on disk beside `cronstable.exe`) run without self-extracting.
 
@@ -63,8 +64,8 @@ files sit on disk beside `cronstable.exe`) run without self-extracting.
 Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386`,
 `linux/arm/v7`, `linux/ppc64le`, `linux/s390x` and `linux/riscv64`) images are
 published on every release to two registries: the GitHub Container Registry
-(`ghcr.io/ptweezy/cronstable`) and Docker Hub (`docker.io/ptweezy/cronstable`). The
-images are identical; pull from whichever you prefer. Mount your crontab
+(`ghcr.io/ptweezy/cronstable`) and Docker Hub (`docker.io/ptweezy/cronstable`).
+The images are identical, so pull from whichever you prefer. Mount your crontab
 and run:
 
 ```shell
@@ -73,12 +74,14 @@ docker run --rm \
   ghcr.io/ptweezy/cronstable:latest
 ```
 
-The image runs as the non-root user `65534:65534` and its entrypoint is
-`cronstable` with default arguments `-c /etc/cronstable.d`, so it reads configuration
-from `/etc/cronstable.d` unless you override the arguments. For production, pin a
-specific version instead of `latest` (e.g. `ghcr.io/ptweezy/cronstable:1.0.4`).
+The image runs as the non-root user `65534:65534`. Its entrypoint is
+`cronstable` with default arguments `-c /etc/cronstable.d`, so it reads
+configuration from `/etc/cronstable.d` unless you override the arguments. For
+production, pin a specific version instead of `latest` (for example,
+`ghcr.io/ptweezy/cronstable:1.0.4`).
 
-To bake configuration into your own image, base it on the published image:
+To include your configuration in your own image, base it on the published
+image:
 
 ```dockerfile
 FROM ghcr.io/ptweezy/cronstable:latest
@@ -89,10 +92,10 @@ COPY cronstable.yaml /etc/cronstable.d/cronstable.yaml
 
 The image is built from `python:3.14-slim` (a multi-stage build that copies a
 self-contained venv into the runtime stage) and sets `PYTHONUNBUFFERED=1` and
-`PYTHONDONTWRITEBYTECODE=1`. It requires no writable paths at runtime. See
-[Production and Container Deployment](Production-Deployment) for the hardened
-Kubernetes/Docker setup (read-only root filesystem, dropped capabilities,
-`fsGroup`).
+`PYTHONDONTWRITEBYTECODE=1`. It requires no writable paths at runtime. For the
+hardened Kubernetes/Docker setup (read-only root filesystem, dropped
+capabilities, `fsGroup`), see
+[production and container deployment](Production-Deployment).
 
 ### Distro variants
 
@@ -100,8 +103,8 @@ The default `latest` (and `<version>`) image is built on **Debian** (slim). The
 same release is also published on several other bases, so you can match a
 specific one to your environment: a familiar userland, an image-provenance
 policy that mandates a particular vendor, or the smallest possible image. Each
-variant adds a `-<distro>` suffix to the tag (and the default Debian image is
-also available explicitly as `-debian`):
+variant adds a `-<distro>` suffix to the tag, and the default Debian image is
+also available explicitly as `-debian`:
 
 | Tag suffix | Base image | Python | Notes |
 | --- | --- | --- | --- |
@@ -121,17 +124,24 @@ docker run --rm \
   ghcr.io/ptweezy/cronstable:1.0.14-alpine
 ```
 
-cronstable is a pure-Python app that supports any Python >= 3.10, so behavior is
-identical across variants. Pick the base, not the interpreter version. The
-Debian default covers the most architectures; each variant covers the arches
-its base image publishes (Alpine matches Debian's full set; RHEL, Fedora,
-openSUSE and distroless cover `amd64`, `arm64`, `ppc64le` and `s390x`; Amazon
-Linux covers `amd64` and `arm64`). All variants share the same non-root,
-read-only-friendly hardening as the default image.
+Because cronstable is a pure-Python app that supports any Python >= 3.10,
+behavior is identical across variants. Pick the base, not the interpreter
+version.
+
+The Debian default covers the most architectures. Each variant covers the
+architectures its base image publishes:
+
+* Alpine matches Debian's full set.
+* RHEL, Fedora, openSUSE, and distroless cover `amd64`, `arm64`, `ppc64le` and
+  `s390x`.
+* Amazon Linux covers `amd64` and `arm64`.
+
+All variants share the same non-root, read-only-friendly hardening as the
+default image.
 
 ## Install using pip
 
-cronstable requires Python >= 3.10. Install it in a virtual environment:
+Python >= 3.10 is required. Install cronstable in a virtual environment:
 
 ```shell
 python3 -m venv cronstableenv
@@ -146,8 +156,8 @@ binary instead.
 If you plan to use the Kubernetes leadership backend with the optional native
 client library (`cluster.kubernetes.clientLibrary: native`), install the extra:
 `pip install "cronstable[kubernetes]"`. The default HTTP transport needs no extra
-dependency; see
-[Clustering and Leader Election](Clustering-and-Leader-Election).
+dependency. See
+[clustering and leader election](Clustering-and-Leader-Election).
 
 ## Install using pipx
 
@@ -171,8 +181,8 @@ brew install ptweezy/tap/cronstable
 ```
 
 This installs the self-contained release binary for your platform (signed and
-notarized on macOS; glibc `amd64`/`arm64` on Linux via Homebrew on Linux), so no
-Python is required. Upgrade later with `brew upgrade cronstable`.
+notarized on macOS; glibc `amd64`/`arm64` from Homebrew on Linux), so no Python
+is required. Upgrade later with `brew upgrade cronstable`.
 
 ## Install using winget
 
@@ -191,47 +201,48 @@ your system), so no Python is required. Upgrade later with
 
 A self-contained binary can be downloaded from
 <https://github.com/ptweezy/cronstable/releases>. Python is not required on the
-target system; it is embedded in the executable. Every release attaches the
-following assets, built natively on a matching runner:
+target system: the executable embeds it. Every release attaches the following
+assets, built natively on a matching runner:
 
 | Asset | Platform | libc / arch | Notes |
 | --- | --- | --- | --- |
-| `cronstable-linux-amd64` | Linux | glibc, x86_64 | Runs on any Linux with glibc 2.39 or newer (e.g. Ubuntu 24.04). |
+| `cronstable-linux-amd64` | Linux | glibc, x86_64 | Runs on any Linux with glibc 2.39 or newer, such as Ubuntu 24.04. |
 | `cronstable-linux-arm64` | Linux | glibc, arm64 | Runs on any Linux with glibc 2.39 or newer on arm64. |
-| `cronstable-linux-i686` | Linux | glibc, 32-bit x86 | 32-bit x86 (i686) for glibc-based systems. |
-| `cronstable-linux-armv7` | Linux | glibc, 32-bit ARM | 32-bit ARM (armv7, e.g. older Raspberry Pi) for glibc-based systems. |
-| `cronstable-linux-ppc64le` | Linux | glibc, ppc64le | 64-bit little-endian POWER (IBM POWER) for glibc-based systems. |
-| `cronstable-linux-s390x` | Linux | glibc, s390x | IBM Z (s390x, big-endian) for glibc-based systems. |
-| `cronstable-linux-riscv64` | Linux | glibc, riscv64 | 64-bit RISC-V for glibc-based systems. |
-| `cronstable-linux-amd64-musl` | Linux | musl, x86_64 | For Alpine and other musl-based systems. |
-| `cronstable-linux-arm64-musl` | Linux | musl, arm64 | For Alpine and other musl-based systems. |
-| `cronstable-linux-i686-musl` | Linux | musl, 32-bit x86 | 32-bit x86 (i686) for Alpine and other musl-based systems. |
-| `cronstable-linux-armv7-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv7) for Alpine and other musl-based systems. |
-| `cronstable-linux-ppc64le-musl` | Linux | musl, ppc64le | 64-bit little-endian POWER for Alpine and other musl-based systems. |
-| `cronstable-linux-s390x-musl` | Linux | musl, s390x | IBM Z (s390x) for Alpine and other musl-based systems. |
-| `cronstable-linux-riscv64-musl` | Linux | musl, riscv64 | 64-bit RISC-V for Alpine and other musl-based systems. |
-| `cronstable-linux-armv6-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv6, e.g. Raspberry Pi 1/Zero); musl-only, no glibc build. |
+| `cronstable-linux-i686` | Linux | glibc, 32-bit x86 | 32-bit x86 (i686) for glibc hosts. |
+| `cronstable-linux-armv7` | Linux | glibc, 32-bit ARM | 32-bit ARM (armv7, such as an older Raspberry Pi) for glibc hosts. |
+| `cronstable-linux-ppc64le` | Linux | glibc, ppc64le | 64-bit little-endian POWER (IBM POWER) for glibc hosts. |
+| `cronstable-linux-s390x` | Linux | glibc, s390x | IBM Z (s390x, big-endian) for glibc hosts. |
+| `cronstable-linux-riscv64` | Linux | glibc, riscv64 | 64-bit RISC-V for glibc hosts. |
+| `cronstable-linux-amd64-musl` | Linux | musl, x86_64 | For Alpine and other musl hosts. |
+| `cronstable-linux-arm64-musl` | Linux | musl, arm64 | For Alpine and other musl hosts. |
+| `cronstable-linux-i686-musl` | Linux | musl, 32-bit x86 | 32-bit x86 (i686) for Alpine and other musl hosts. |
+| `cronstable-linux-armv7-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv7) for Alpine and other musl hosts. |
+| `cronstable-linux-ppc64le-musl` | Linux | musl, ppc64le | 64-bit little-endian POWER for Alpine and other musl hosts. |
+| `cronstable-linux-s390x-musl` | Linux | musl, s390x | IBM Z (s390x) for Alpine and other musl hosts. |
+| `cronstable-linux-riscv64-musl` | Linux | musl, riscv64 | 64-bit RISC-V for Alpine and other musl hosts. |
+| `cronstable-linux-armv6-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv6, such as Raspberry Pi 1/Zero); musl-only, no glibc build. |
 | `cronstable-macos-arm64` | macOS | Apple Silicon (arm64) | Developer ID signed and notarized. |
 | `cronstable-macos-amd64` | macOS | Intel (x86_64) | Developer ID signed and notarized. |
-| `cronstable-windows-amd64.exe` | Windows | x64 (amd64) | Self-contained `.exe`; Python not required on the target. |
-| `cronstable-windows-arm64.exe` | Windows | ARM64 | Self-contained `.exe`; Python not required on the target. |
-| `cronstable-windows-amd64.zip` | Windows | x64 (amd64) | One-directory build (`cronstable\` folder holding `cronstable.exe` and `_internal\`); runs in place and can host the [Windows service](Windows-Service). |
-| `cronstable-windows-arm64.zip` | Windows | ARM64 | One-directory build; runs in place and can host the [Windows service](Windows-Service). |
-| `cronstable-windows-amd64.msi` | Windows | x64 (amd64) | Machine-wide installer; registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
-| `cronstable-windows-arm64.msi` | Windows | ARM64 | Machine-wide installer; registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
+| `cronstable-windows-amd64.exe` | Windows | x64 (amd64) | Self-contained `.exe`. The target needs no Python. |
+| `cronstable-windows-arm64.exe` | Windows | ARM64 | Self-contained `.exe`. The target needs no Python. |
+| `cronstable-windows-amd64.zip` | Windows | x64 (amd64) | One-directory build: a `cronstable\` folder with `cronstable.exe` and `_internal\`. Runs in place and can host the [Windows service](Windows-Service). |
+| `cronstable-windows-arm64.zip` | Windows | ARM64 | One-directory build. Runs in place and can host the [Windows service](Windows-Service). |
+| `cronstable-windows-amd64.msi` | Windows | x64 (amd64) | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
+| `cronstable-windows-arm64.msi` | Windows | ARM64 | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
 
-The glibc Linux builds target glibc 2.39 (the Ubuntu 24.04 runner's libc) and
-work on any Linux host with glibc 2.39 or newer on the matching CPU. The musl builds
-are built inside an Alpine container for musl/Alpine hosts.
-The `i686` and `armv7` builds and the `ppc64le` and `s390x`
-builds, both glibc and musl, extend the 64-bit `amd64`/`arm64`
-binaries to 32-bit x86, 32-bit ARM, POWER and IBM Z hosts; they build inside a
-container (`i686` natively on the x86-64 runner, the rest under QEMU emulation).
-The `riscv64` builds cover 64-bit RISC-V for both glibc and
-musl, and the musl-only `armv6` build extends to older 32-bit ARM (e.g.
-Raspberry Pi 1/Zero); there is no glibc `armv6` build. macOS builds cover both
-Apple Silicon and Intel. The Windows binaries are
-self-contained `.exe` files for x64 (`amd64`) and ARM64; like the other
+The glibc Linux builds target glibc 2.39, the Ubuntu 24.04 runner's libc, and
+work on any Linux host with glibc 2.39 or newer on the matching CPU. The musl
+builds are built inside an Alpine container for musl/Alpine hosts.
+
+The `i686`, `armv7`, `ppc64le` and `s390x` builds, both glibc and musl, extend
+the 64-bit `amd64`/`arm64` binaries to 32-bit x86, 32-bit ARM, POWER, and IBM Z
+hosts. They build inside a container: `i686` natively on the x86-64 runner, the
+rest under QEMU emulation. The `riscv64` builds cover 64-bit RISC-V for both
+glibc and musl. The musl-only `armv6` build extends to older 32-bit ARM, such as
+a Raspberry Pi 1 or Zero. There is no glibc `armv6` build.
+
+macOS builds cover both Apple Silicon and Intel. The Windows binaries are
+self-contained `.exe` files for x64 (`amd64`) and ARM64. Like the other
 binaries they embed Python, so Python is not required on the target.
 
 Download and run (glibc amd64 Linux shown; append `-musl` on Alpine, or use
@@ -252,21 +263,24 @@ on ARM64) and run it directly; no `chmod` is needed:
 ```
 
 The Windows binaries carry a version resource and are Authenticode-signed
-with Azure Artifact Signing. The first run of a browser-downloaded copy can
-still trip SmartScreen while the signing identity's reputation accrues:
-choose "More info", then "Run anyway", and verify the download against the
-release's `SHA256SUMS` if your policy calls for it. `winget install
-ptweezy.cronstable` installs the same binary through the Windows Package
-Manager. See [Running on Windows](Running-on-Windows) for the full
-Windows install and deployment story.
+with Azure Artifact Signing. While the signing identity's reputation accrues,
+the first run of a browser-downloaded copy can still be blocked by SmartScreen.
+Choose **More info**, then **Run anyway**. If your policy calls for it,
+verify the download against the release's `SHA256SUMS`.
+
+`winget install ptweezy.cronstable` installs the same binary through the Windows
+Package Manager. For the full Windows install and deployment details, see
+[running on Windows](Running-on-Windows).
 
 Windows releases also attach `cronstable-windows-amd64.zip` and
 `cronstable-windows-arm64.zip`, one-directory builds of the same program.
 Each extracts to a single `cronstable\` folder and is the download that can
 host the [Windows service](Windows-Service), which the one-file `.exe`
-cannot. Clear the Mark of the Web from the zip before extracting, so the
-extracted files do not each carry it; use an elevated PowerShell, since
-writing into `C:\Program Files` needs one:
+cannot.
+
+Clear the Mark of the Web from the zip before extracting, so the extracted
+files do not each carry it. Writing into `C:\Program Files` needs an elevated
+PowerShell, so use one:
 
 ```powershell
 Unblock-File .\cronstable-windows-amd64.zip
@@ -275,26 +289,26 @@ Expand-Archive .\cronstable-windows-amd64.zip -DestinationPath 'C:\Program Files
 ```
 
 For managed machine-wide deployment (GPO, Intune, SCCM) there is also an
-MSI per architecture; see [Windows MSI](Windows-MSI).
+MSI per architecture. See [Windows MSI](Windows-MSI).
 
 ### macOS signing and notarization
 
 The macOS binaries are Developer ID code-signed (hardened runtime)
 and notarized by Apple, so Gatekeeper accepts them and they run without first
-clearing the quarantine attribute; no `xattr -d com.apple.quarantine` step is
+clearing the quarantine attribute. No `xattr -d com.apple.quarantine` step is
 needed before first run.
 
 ### Standalone binary temp-directory requirement
 
-The standalone binary is a self-extracting PyInstaller executable: on each start it unpacks
-its embedded Python runtime into a temporary directory and loads shared
-libraries from there. It therefore needs a temporary directory that is both
-**writable and executable**. On an ordinary system the
-default `/tmp` already satisfies this, so no extra setup is required.
+The standalone binary is a self-extracting PyInstaller executable: on each start
+it unpacks its embedded Python runtime into a temporary directory and loads
+shared libraries from there. It therefore needs a temporary directory that is
+both **writable and executable**. On an ordinary system the default `/tmp`
+already satisfies this, so no extra setup is required.
 
 This matters only when you run the binary under a **read-only root filesystem**
 (for example, a hardened container). With the root filesystem read-only, `/tmp`
-is read-only too, and the binary aborts at startup: `Could not create temporary
+is read-only too, and the binary stops at startup: `Could not create temporary
 directory`, or `Error loading shared library …: Operation not permitted`. Give
 it a small writable *and executable* temp mount and it runs:
 
@@ -310,7 +324,7 @@ docker run --rm --read-only \
 Remedies:
 
 * **Docker**: mount an `rw,exec` tmpfs at `/tmp`. `--tmpfs` defaults to
-  `noexec`, which fails; pass `exec` explicitly as above.
+  `noexec`, which fails; pass `exec` explicitly, as shown earlier.
 * **Kubernetes**: mount an `emptyDir` at `/tmp` (writable and executable by
   default; use `medium: Memory` for a tmpfs).
 * **Any host**: point the binary at another writable, executable directory
@@ -319,36 +333,38 @@ Remedies:
 This requirement is unique to the standalone binary. The published container
 image and the `pip`/`pipx` installs run cronstable as a normal Python package with
 the interpreter on disk, so they never self-extract and need no writable temp
-directory. See [Production and Container Deployment](Production-Deployment).
+directory. See [production and container deployment](Production-Deployment).
 
 On Windows the self-extracting `.exe` uses the standard Windows temp directory
-(`%TEMP%`), which is writable and executable by default; the read-only-rootfs and
-`noexec` caveats above are Linux-container concerns only. The Windows zip and
-MSI installs keep their files on disk beside `cronstable.exe` and never
-unpack at startup, so this requirement does not apply to them at all.
+(`%TEMP%`), which is writable and executable by default. The preceding
+read-only-rootfs and `noexec` caveats are Linux-container concerns only. The
+Windows zip and MSI installs keep their files on disk beside `cronstable.exe`
+and never unpack at startup, so this requirement does not apply to them at all.
 
 ## After installation
 
-Start cronstable by giving it a configuration file or directory with `-c`; it
+Start cronstable by giving it a configuration file or directory with `-c`. It
 always runs in the foreground:
 
 ```shell
 cronstable -c /etc/cronstable.d
 ```
 
-The `-c` default is platform-specific: `/etc/cronstable.d` on POSIX; on Windows
-the machine-wide `%ProgramData%\cronstable` when that directory holds
-configuration, otherwise `%APPDATA%\cronstable`
-(e.g. `C:\Users\<you>\AppData\Roaming\cronstable`,
-falling back to the user profile `~` if `APPDATA` is unset). `cronstable init`
-writes a commented starter configuration into the default location. The
-default `shell` also differs: `/bin/sh` on POSIX, and on Windows an empty
-default that runs a string `command` through `%ComSpec%` (`cmd.exe`). On
-Windows, press Ctrl-C to stop cronstable gracefully; it finishes running jobs
-first, just as SIGTERM does on POSIX. Note that per-job `user`/`group`
-switching and `unix://` web listeners are not available on Windows; see
-[Running on Windows](Running-on-Windows) for the full details.
+The `-c` default is platform-specific. On POSIX it is `/etc/cronstable.d`. On
+Windows it is the machine-wide `%ProgramData%\cronstable` when that directory
+holds configuration, and otherwise `%APPDATA%\cronstable` (for example,
+`C:\Users\<you>\AppData\Roaming\cronstable`, falling back to the user profile
+`~` if `APPDATA` is unset). `cronstable init` writes a commented starter
+configuration into the default location.
 
-See [Command-Line Reference](CLI-Reference) for all flags, and
-[Configuration Reference](Configuration-Reference) for the config schema. For
-Windows-specific behavior, see [Running on Windows](Running-on-Windows).
+The default `shell` also differs: `/bin/sh` on POSIX, and on Windows an empty
+default that runs a string `command` through `%ComSpec%` (`cmd.exe`). On
+Windows, press Ctrl+C to stop cronstable gracefully. It finishes running jobs
+first, as `SIGTERM` does on POSIX.
+
+Per-job `user`/`group` switching and `unix://` web listeners are not available
+on Windows. For the full details, see [running on Windows](Running-on-Windows).
+
+See the [command-line reference](CLI-Reference) for all flags, and the
+[configuration reference](Configuration-Reference) for the configuration schema.
+For Windows-specific behavior, see [running on Windows](Running-on-Windows).
