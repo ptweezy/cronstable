@@ -28,22 +28,23 @@ alerting, durable state, orchestration, clustering, and a live dashboard.
 
 * "Crontab" is in YAML format, and cronstable reads classic crontab files
   as-is too (see [classic crontab files](#classic-crontab-files))
-* **Business-day schedules**: `LW` (the month's last weekday), `L-3` (three
-  days before month-end), `15W` (the weekday nearest the 15th), and `5#3`
-  (the third Friday) express payroll/billing-style cadences directly, and
-  Quartz day expressions largely paste straight in (see
+* **Business-day schedules**: `LW` is the month's last weekday, `L-3` is three
+  days before month-end, `15W` is the weekday nearest the 15th, and `5#3` is
+  the third Friday. These express payroll and billing cadences, and Quartz day
+  expressions largely paste straight in (see
   [business-day schedules](https://github.com/ptweezy/cronstable/wiki/Business-Day-Schedules))
-* Built-in **schedule linting**: cronstable loudly calls out dead schedules
-  that can never fire again (never silently dropped), and flags error-prone
+* Built-in **schedule linting**: cronstable reports dead schedules that can
+  never fire again instead of dropping them silently, and flags error-prone
   patterns (AND day semantics, uneven `*/n` steps, day-31-in-April, schedules
   that DST skips or repeats) at config load, in the dashboards, and over the
   API (see [schedule introspection](#schedule-introspection))
 * Arbitrary time zone support
-* **iCal calendar export**: subscribe any calendar app to `GET /calendar.ics`
-  (or one job's `/jobs/{name}/calendar.ics`), and the fleet's upcoming fires,
-  enumerated by the scheduler's own engine, land on the on-call engineer's
-  calendar. The dashboard draws the same data as a seven-day **week calendar**
-  (see [calendar export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export))
+* **iCal calendar export**: subscribe any calendar app to `GET /calendar.ics`,
+  or to one job's `/jobs/{name}/calendar.ics`, and the fleet's upcoming fires
+  appear on the on-call engineer's calendar. The scheduler's own engine
+  enumerates them, and the dashboard draws the same data as a seven-day week
+  calendar (see
+  [calendar export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export))
 
 ### Failure handling
 
