@@ -2,6 +2,10 @@
 
 ## 1.2.44
 
+- The default dashboard theme is now `standard`, the flat neutral one,
+  in place of `carolina`. The theme pickers and the `t` cycler in the
+  browser and the TUI lead with it, as does `--theme`, and a browser or
+  terminal that already remembers a theme keeps the one it has.
 - CI tooling updates
 - Documentation updates
 

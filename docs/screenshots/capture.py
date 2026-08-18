@@ -204,7 +204,8 @@ def fresh(page, theme=None, extra_prefs=None):
     """Reload the page with a given theme/pref set via localStorage."""
     prefs = {"boot": "false", "zen": "false"}
     # always pin the theme: a prior themed reload leaves its choice in
-    # localStorage, so "no theme" must mean the carolina default, not "keep"
+    # localStorage, and the committed docs images are carolina, so "no
+    # theme" here means carolina, not "keep"
     prefs["theme"] = json.dumps(theme or "carolina")
     if extra_prefs:
         prefs.update(extra_prefs)
@@ -330,7 +331,7 @@ def run_dashboard(shots_only):
             wants(f"dashboard-theme-{t}")
             for t in ("amber", "green", "modern", "carolina-light")
         ):
-            fresh(page)  # back to the default carolina
+            fresh(page)  # back to the pinned carolina baseline
 
         # ---- job drawer: live logs on the 5s heartbeat probe ----
         if wants("dashboard-logs"):
@@ -1274,7 +1275,7 @@ def shoot_themes(page, scene, themes, clip=None):
         results[scene] = "ok"
     else:
         results[scene] = "FAIL no frames"
-    # leave the board on the default theme for the next scene's staging
+    # leave the board on carolina for the next scene's staging
     set_theme_live(page, "carolina")
 
 

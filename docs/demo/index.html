@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="carolina">
+<html lang="en" data-theme="standard">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -1781,18 +1781,18 @@
         <span class="lab">Theme<small>dark or paper (light)</small></span>
         <select class="mini" id="setTheme">
           <optgroup label="dark">
+            <option value="standard">standard</option>
             <option value="carolina">carolina</option>
             <option value="amber">amber</option>
             <option value="green">green</option>
             <option value="modern">modern</option>
-            <option value="standard">standard</option>
           </optgroup>
           <optgroup label="paper">
+            <option value="standard-light">standard</option>
             <option value="carolina-light">carolina</option>
             <option value="amber-light">amber</option>
             <option value="green-light">green</option>
             <option value="modern-light">modern</option>
-            <option value="standard-light">standard</option>
           </optgroup>
         </select>
       </div>
@@ -6146,7 +6146,7 @@ var qrcode = function() {
 
   // ---- preferences ----
   const prefs = {
-    theme: "carolina", density: false, notify: false,
+    theme: "standard", density: false, notify: false,
     // accessibility: interface font (mono/sans), whole-UI zoom %, app-level
     // reduce-motion (ORed with the OS prefers-reduced-motion setting), and
     // color-vision remap (none/deutan/tritan)
@@ -10078,12 +10078,12 @@ var qrcode = function() {
   //  settings / theme / prefs application
   // ===================================================================
   // every theme is a hue x variant pair: "green" (dark) / "green-light" (paper)
-  const THEME_HUES = ["carolina", "amber", "green", "modern", "standard"];
+  const THEME_HUES = ["standard", "carolina", "amber", "green", "modern"];
   function themeParts(t) {
     const light = /-light$/.test(t);
     const hue = light ? t.slice(0, -6) : t;
     // self-heal a garbage stored pref (old builds, hand-edited localStorage)
-    return { hue: THEME_HUES.includes(hue) ? hue : "carolina", light };
+    return { hue: THEME_HUES.includes(hue) ? hue : "standard", light };
   }
   function applyTheme() {
     const p = themeParts(prefs.theme);
