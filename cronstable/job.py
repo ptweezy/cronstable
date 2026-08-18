@@ -96,6 +96,26 @@ def fixup_pyinstaller_env(env: dict[str, str]) -> None:
     if getattr(sys, "frozen", False) and not platform.IS_WINDOWS:
         for env_var in "LD_LIBRARY_PATH", "LIBPATH":
             env[env_var] = env.get(f"{env_var}_ORIG", "")
+    # The bootloader's process-linkage vars are a contract between a
+    # bootloader and its DIRECT child. Inherited through a job's shell, they
+    # make any frozen binary the job invokes (the cronstable CLI included)
+    # refuse to start: "parent process has different executable". Stripped
+    # before the config overlay, so an explicit `environment:` entry wins.
+    for key in [k for k in env if k.startswith("_PYI_")]:
+        del env[key]
+
+
+def pyinstaller_env_leaks() -> bool:
+    """Whether spawns need an explicit env just for the PyInstaller scrub.
+
+    True on a frozen build (loader paths to restore, ``_PYI_*`` linkage vars
+    to strip) and whenever ``_PYI_*`` arrived from a frozen ancestor; jobs
+    with no custom environment then still get a scrubbed copy of
+    :data:`os.environ` instead of inheriting the leak.
+    """
+    return getattr(sys, "frozen", False) or any(
+        k.startswith("_PYI_") for k in os.environ
+    )
 
 
 def loggable_spawn_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -1024,6 +1044,9 @@ class ShellReporter(Reporter):
                 "1" if len(std_out_str_safe) != len(std_out_str) else "0"
             ),
         }
+        # Reporter commands launch frozen binaries too (the cronstable CLI
+        # among them), so they get the same PyInstaller scrub as jobs.
+        fixup_pyinstaller_env(env)
         # resource accounting, when the run was monitored; empty otherwise so
         # the reporter command can test for presence.
         usage = job.resource_usage
@@ -2282,7 +2305,8 @@ class RunningJob:
             else:
                 create = asyncio.create_subprocess_shell
                 cmd = [config.command]
-        if config.environment or self.extra_env:
+        custom_env = bool(config.environment or self.extra_env)
+        if custom_env or pyinstaller_env_leaks():
             env = dict(os.environ)
             fixup_pyinstaller_env(env)
             for envvar in config.environment:
@@ -2292,7 +2316,11 @@ class RunningJob:
             # reach the state API (CRONSTABLE_* is reserved for cronstable's
             # use).
             env.update(self.extra_env)
-            self.env = env
+            if custom_env:
+                # self.env feeds the report templates' `environment` var; a
+                # job with no custom environment keeps rendering None there
+                # even when the scrub forces an explicit child env.
+                self.env = env
             kwargs["env"] = env
         if config.workingDirectory is not None:
             # The directory the child starts in.  Omitted rather than passed

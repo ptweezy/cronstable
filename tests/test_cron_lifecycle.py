@@ -2388,6 +2388,83 @@ async def test_run_reloads_changed_config(tmp_path, monkeypatch, run_cron):
     assert cron.job_set_id() != id1
 
 
+@pytest.mark.asyncio
+async def test_signal_reload_wakes_the_loop_and_forces_reparse(
+    tmp_path, monkeypatch, run_cron
+):
+    # SIGHUP's two promises, end to end. (1) Immediate: with the loop
+    # parked on a long sleep, signal_reload must reload now rather than at
+    # the next housekeeping minute -- the sleep parks on the reload event
+    # as well as the stop event. (2) Forced: the reparse happens even when
+    # the change escapes the stat fingerprint (a fromFile credential
+    # rewritten in place) -- proven by freezing the signature, so only a
+    # forced reload can pick up the on-disk edit.
+    monkeypatch.setattr(
+        "cronstable.cron.next_sleep_interval", lambda *a: 60.0
+    )
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_V1)
+    cron = cronstable.cron.Cron(str(cfg))
+    frozen = cron._config_sig
+    monkeypatch.setattr(cron, "_config_signature", lambda files: frozen)
+    task = run_cron(cron)
+    await _wait_until(lambda: cron._logged_job_set_id is not None)
+    cfg.write_text(_RELOAD_V2)
+    cron.signal_reload()
+    await _wait_until(lambda: set(cron.cron_jobs) == {"alpha", "gamma"})
+    cron.signal_shutdown()
+    await asyncio.wait_for(task, timeout=5)
+
+
+_RELOAD_SUB_V1 = """
+jobs:
+  - name: alpha
+    command: echo alpha
+    schedule: "5 0 0 * * * *"
+"""
+
+_RELOAD_SUB_V2 = """
+jobs:
+  - name: alpha
+    command: echo alpha
+    schedule: "5 0 0 * * * *"
+  - name: gamma
+    command: echo gamma
+    schedule: "5 0 0 * * * *"
+"""
+
+
+@pytest.mark.asyncio
+async def test_signal_reload_is_immediate_in_subminute_mode(
+    tmp_path, monkeypatch, run_cron
+):
+    # The minute-forge half of signal_reload, pinned in the one mode it is
+    # load-bearing: with a seconds-bearing schedule the run loop only
+    # housekeeps when the minute turns, so with the clock frozen
+    # mid-minute an immediate SIGHUP reload happens ONLY because
+    # signal_reload clears _last_housekeeping_minute.
+    frozen_now = datetime.datetime(
+        2026, 8, 16, 12, 0, 30, tzinfo=datetime.timezone.utc
+    )
+    monkeypatch.setattr("cronstable.cron.get_now", lambda tz: frozen_now)
+    monkeypatch.setattr(
+        "cronstable.cron.next_sleep_interval", lambda *a: 60.0
+    )
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_SUB_V1)
+    cron = cronstable.cron.Cron(str(cfg))
+    assert cron._wakes_subminute()
+    frozen = cron._config_sig
+    monkeypatch.setattr(cron, "_config_signature", lambda files: frozen)
+    task = run_cron(cron)
+    await _wait_until(lambda: cron._logged_job_set_id is not None)
+    cfg.write_text(_RELOAD_SUB_V2)
+    cron.signal_reload()
+    await _wait_until(lambda: set(cron.cron_jobs) == {"alpha", "gamma"})
+    cron.signal_shutdown()
+    await asyncio.wait_for(task, timeout=5)
+
+
 _RETRY_DRAIN_JOB = (
     "jobs:\n  - name: test\n"
     + yaml_command(cmd_print(out="x", code=2))

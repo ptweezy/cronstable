@@ -4,13 +4,12 @@ Almost everything in this directory is ordinary product documentation: dashboard
 screenshots, diagrams, and comparison images. Those carry the same MIT License as
 the rest of the repository (see [LICENSE](../../LICENSE)).
 
-Five files do not. The rendered brand artwork is excluded from the MIT grant:
+Four files do not. The rendered brand artwork is excluded from the MIT grant:
 
 | File | What it is |
 | --- | --- |
 | `logo-balance.gif`, `logo-balance.webp` | the animated wordmark, dark |
 | `logo-balance-light.gif`, `logo-balance-light.webp` | the animated wordmark, light |
-| `social-preview.png` | the repository social card |
 
 These may be reproduced **unmodified** when referring to cronstable itself: write
 about the project, link to it, illustrate a post about it. Every other right,

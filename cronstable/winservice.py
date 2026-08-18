@@ -77,11 +77,13 @@ SERVICE_RUNNING = 4
 
 SERVICE_ACCEPT_STOP = 0x0001
 SERVICE_ACCEPT_SHUTDOWN = 0x0004
+SERVICE_ACCEPT_PARAMCHANGE = 0x0008
 SERVICE_ACCEPT_PRESHUTDOWN = 0x0100
 
 SERVICE_CONTROL_STOP = 1
 SERVICE_CONTROL_INTERROGATE = 4
 SERVICE_CONTROL_SHUTDOWN = 5
+SERVICE_CONTROL_PARAMCHANGE = 6
 SERVICE_CONTROL_PRESHUTDOWN = 0x0F
 
 SERVICE_AUTO_START = 2
@@ -94,6 +96,7 @@ SERVICE_QUERY_STATUS = 0x0004
 SERVICE_CHANGE_CONFIG = 0x0002
 SERVICE_START = 0x0010
 SERVICE_STOP = 0x0020
+SERVICE_PAUSE_CONTINUE = 0x0040
 DELETE = 0x00010000
 
 SERVICE_CONFIG_DESCRIPTION = 1
@@ -109,7 +112,9 @@ NO_ERROR = 0
 ERROR_ACCESS_DENIED = 5
 ERROR_CALL_NOT_IMPLEMENTED = 120
 ERROR_SERVICE_SPECIFIC_ERROR = 1066
+ERROR_INVALID_SERVICE_CONTROL = 1052
 ERROR_SERVICE_ALREADY_RUNNING = 1056
+ERROR_SERVICE_CANNOT_ACCEPT_CTRL = 1061
 ERROR_SERVICE_DOES_NOT_EXIST = 1060
 ERROR_SERVICE_NOT_ACTIVE = 1062
 ERROR_FAILED_SERVICE_CONTROLLER_CONNECT = 1063
@@ -273,14 +278,21 @@ def image_path(argv: Sequence[str]) -> str:
 def control_action(control: int) -> str:
     """What an SCM control code means to this host.
 
-    ``stop`` for STOP, SHUTDOWN and PRESHUTDOWN, ``report`` for INTERROGATE,
-    ``unhandled`` otherwise.
+    ``stop`` for STOP, SHUTDOWN and PRESHUTDOWN, ``reload`` for
+    PARAMCHANGE, ``report`` for INTERROGATE, ``unhandled`` otherwise.
 
     Accepting PRESHUTDOWN is the reason the handler is registered in its
     extended form.  A plain shutdown control gives a service only
     ``WaitToKillServiceTimeout``, five seconds by default, while preshutdown
     grants the much longer preshutdown timeout.  A scheduler that drains
     running jobs on the way out wants the second one.
+
+    PARAMCHANGE is the SCM's "your parameters changed" notification, and
+    this host reads it as the reload verb SIGHUP is on POSIX: the same
+    forced reparse, reachable as ``cronstable service reload`` or ``sc
+    control <name> paramchange``.  Without it, Windows would have no way
+    to demand a reload the stat fingerprint cannot justify (a credential
+    file rewritten in place).
     """
     if control in (
         SERVICE_CONTROL_STOP,
@@ -288,6 +300,8 @@ def control_action(control: int) -> str:
         SERVICE_CONTROL_PRESHUTDOWN,
     ):
         return "stop"
+    if control == SERVICE_CONTROL_PARAMCHANGE:
+        return "reload"
     if control == SERVICE_CONTROL_INTERROGATE:
         return "report"
     return "unhandled"
@@ -300,12 +314,15 @@ def accepted_controls(state: int) -> int:
     refuse a stop request during startup with "the service cannot accept
     control messages at this time", and that removes the whole class of race
     where a stop arrives before the event loop it would signal exists.
-    Accepting STOP while pending looks harmless and creates it.
+    Accepting STOP while pending looks harmless and creates it.  The same
+    gate covers PARAMCHANGE: advertised only here, a reload can never
+    arrive before the loop it would wake exists.
     """
     if state == SERVICE_RUNNING:
         return (
             SERVICE_ACCEPT_STOP
             | SERVICE_ACCEPT_SHUTDOWN
+            | SERVICE_ACCEPT_PARAMCHANGE
             | SERVICE_ACCEPT_PRESHUTDOWN
         )
     return 0
@@ -453,6 +470,16 @@ _ERROR_SENTENCES = {
     ),
     ERROR_SERVICE_ALREADY_RUNNING: "the service is already running",
     ERROR_SERVICE_NOT_ACTIVE: "the service is not running",
+    ERROR_INVALID_SERVICE_CONTROL: (
+        "the running service does not accept that control. A service "
+        "started from an older cronstable keeps running the old binary; "
+        "restart it (`cronstable service stop`, then `start`) to run "
+        "the current one"
+    ),
+    ERROR_SERVICE_CANNOT_ACCEPT_CTRL: (
+        "the service is starting or stopping and takes no controls "
+        "until it settles. Retry in a moment"
+    ),
 }
 
 
@@ -913,8 +940,21 @@ class WinApi:
             advapi32.CloseServiceHandle(manager)
 
     def control_service(  # pragma: no cover (windows)
-        self, name: str, control: int
+        self,
+        name: str,
+        control: int,
+        *,
+        access: int = SERVICE_STOP,
+        action: str = "stop the service",
     ) -> None:
+        """Send ``control``, over a handle carrying ``access``.
+
+        ControlService checks a per-control access right on the handle
+        (SERVICE_STOP for a stop, SERVICE_PAUSE_CONTINUE for
+        PARAMCHANGE), so the caller names the right along with the
+        control; a mismatched pair is refused as access denied even from
+        an elevated prompt.
+        """
         import ctypes
         from ctypes import wintypes
 
@@ -930,14 +970,14 @@ class WinApi:
             ]
 
         advapi32, manager, service = self._open_service(
-            name, SC_MANAGER_CONNECT, SERVICE_STOP, "stop the service"
+            name, SC_MANAGER_CONNECT, access, action
         )
         try:
             status = SERVICE_STATUS()
             if not advapi32.ControlService(
                 service, control, ctypes.byref(status)
             ):
-                self._fail("stop the service")
+                self._fail(action)
         finally:
             advapi32.CloseServiceHandle(service)
             advapi32.CloseServiceHandle(manager)
@@ -1063,8 +1103,8 @@ class ServiceHost:
     :meth:`_service_main`, which reports status, builds the scheduler and
     runs the event loop.  Another SCM thread delivers each control to
     :meth:`_control`, which never does the work itself: it hands the stop
-    onto the loop thread and returns at once, because a control handler that
-    blocks is a service the SCM reports as hung.
+    or the reload onto the loop thread and returns at once, because a
+    control handler that blocks is a service the SCM reports as hung.
     """
 
     def __init__(
@@ -1237,6 +1277,21 @@ class ServiceHost:
             if action == "unhandled":
                 return ERROR_CALL_NOT_IMPLEMENTED
             if action == "report":
+                return NO_ERROR
+            if action == "reload":
+                # No state transition: PARAMCHANGE leaves the service
+                # RUNNING, and the mask only advertises it in that state,
+                # so the loop exists by the time one can arrive. The
+                # guard covers a stop draining the loop away under it.
+                loop, cron = self._loop, self._cron
+                if loop is not None and cron is not None:
+                    try:
+                        loop.call_soon_threadsafe(
+                            cron.signal_reload,
+                            "service control PARAMCHANGE",
+                        )
+                    except RuntimeError:
+                        pass
                 return NO_ERROR
             self._checkpoint = 1
             self._report(
@@ -1506,6 +1561,28 @@ def stop(args: Any, api: WinApi) -> int:
     return 0
 
 
+def reload(args: Any, api: WinApi) -> int:
+    """Ask the running service to reload its configuration now.
+
+    The Windows spelling of SIGHUP: PARAMCHANGE reaches the host's
+    control handler, which posts the same forced reparse onto the loop
+    (`sc control <name> paramchange` sends the identical control).
+    Nothing is waited for; the reload is the loop thread's next act.
+    """
+    try:
+        api.control_service(
+            args.name,
+            SERVICE_CONTROL_PARAMCHANGE,
+            access=SERVICE_PAUSE_CONTINUE,
+            action="reload the service",
+        )
+    except ServiceError as ex:
+        print(str(ex), file=sys.stderr)
+        return 1
+    print("asked service {} to reload its configuration".format(args.name))
+    return 0
+
+
 def status(args: Any, api: WinApi) -> int:
     try:
         fields = api.query_status(args.name)
@@ -1558,6 +1635,7 @@ _ACTIONS: dict[str, Callable[[Any, WinApi], int]] = {
     "remove": remove,
     "start": start,
     "stop": stop,
+    "reload": reload,
     "status": status,
 }
 
@@ -1589,7 +1667,7 @@ def dispatch(
     if action is None:
         return _fail(
             "cronstable service: name an action "
-            "(install, remove, start, stop, status)."
+            "(install, remove, start, stop, reload, status)."
         )
     if api is None:
         api = WinApi()

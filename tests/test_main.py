@@ -28,6 +28,9 @@ class FakeCron:
     def signal_shutdown(self):
         pass
 
+    def signal_reload(self):
+        pass
+
 
 def test_good_config(monkeypatch):
     loop = asyncio.new_event_loop()
@@ -458,6 +461,9 @@ def test_main_loop_builds_and_closes_its_own_loop(monkeypatch):
         def signal_shutdown(self):
             pass
 
+        def signal_reload(self):
+            pass
+
     def fake_new_event_loop():
         loop = asyncio.new_event_loop()
         built.append(loop)
@@ -518,6 +524,9 @@ def test_run_and_shutdown_wiring(monkeypatch):
         def signal_shutdown(self):
             pass
 
+        def signal_reload(self):
+            pass
+
     monkeypatch.setattr("cronstable.cron.Cron", RunCron)
     monkeypatch.setattr(sys, "argv", ["cronstable", "-c", "config.yaml"])
     loop = asyncio.new_event_loop()
@@ -536,6 +545,13 @@ def test_run_daemon_installs_shutdown_handlers_by_default(monkeypatch):
         "install_shutdown_handlers",
         lambda loop, callback: installed.append(callback) or (lambda: None),
     )
+    reload_installed = []
+    monkeypatch.setattr(
+        main.platform,
+        "install_reload_handler",
+        lambda loop, callback: reload_installed.append(callback)
+        or (lambda: None),
+    )
 
     class _Cron:
         # the real Cron sets this in __init__; _run_daemon reads it
@@ -547,6 +563,9 @@ def test_run_daemon_installs_shutdown_handlers_by_default(monkeypatch):
         def signal_shutdown(self):
             pass
 
+        def signal_reload(self):
+            pass
+
     cron = _Cron()
     loop = asyncio.new_event_loop()
     try:
@@ -554,6 +573,7 @@ def test_run_daemon_installs_shutdown_handlers_by_default(monkeypatch):
     finally:
         loop.close()
     assert installed == [cron.signal_shutdown]
+    assert reload_installed == [cron.signal_reload]
 
 
 def test_run_daemon_can_skip_the_shutdown_handlers(monkeypatch):
@@ -566,6 +586,9 @@ def test_run_daemon_can_skip_the_shutdown_handlers(monkeypatch):
         raise AssertionError("must not be reached")
 
     monkeypatch.setattr(main.platform, "install_shutdown_handlers", _refuse)
+    # the same opt-out gates the reload handler: off the main thread,
+    # add_signal_handler would refuse it identically.
+    monkeypatch.setattr(main.platform, "install_reload_handler", _refuse)
 
     class _Cron:
         # the real Cron sets this in __init__; _run_daemon reads it

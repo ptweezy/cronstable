@@ -1309,11 +1309,18 @@ The two failure modes are distinct:
 - A recognised token that lacks the scope a route needs is **`403 Forbidden`**,
   with a body naming the token label and the missing scope.
 
-To **revoke** a device, delete its `authTokens` entry and reload
-(`SIGHUP`/`cronstable reload`): the web app is rebuilt against the current
-config, so the dropped token stops working immediately while the others keep
-their sessions. The `label` is only an identifier for humans and log/error
-messages; matching is by the secret.
+To **revoke** a device, delete its `authTokens` entry, or rewrite the
+secret file a `fromFile` entry names -- token source files are
+fingerprinted like TLS certificates, so an in-place rewrite counts. The
+daemon notices either change on its next housekeeping pass (within a
+minute) and rebuilds the web app against the current config, so the
+dropped token stops working while the others keep their sessions. To
+apply the change immediately instead of waiting for the pass, send
+`SIGHUP` (POSIX) or run `cronstable service reload` (the [Windows
+service](Windows-Service)); a Windows console run has no reload signal
+and rides the housekeeping pass.
+The `label` is only an identifier for humans and log/error messages;
+matching is by the secret.
 
 > The scalar `authToken` is an all-scopes token; `authTokens` only adds
 > narrower credentials beside it. These transport scopes are unrelated to the
