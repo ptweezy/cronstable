@@ -1,0 +1,109 @@
+name: Sign with Azure Artifact Signing
+description: >-
+  Authenticode-sign one folder, retrying the whole call when an attempt
+  fails.
+
+# A composite action because a `uses:` step cannot be wrapped in a shell
+# loop, so .github/scripts/retry.sh is no help; here a step can be marked
+# non-fatal and the next one gated on its outcome.
+#
+# What flakes is the setup, not the signing service: the action installs
+# its module from the PowerShell gallery on every call, and a gallery
+# blip exits 1 before a single byte is signed. Re-signing is safe either
+# way, since signtool replaces a signature rather than stacking one.
+#
+# The digest and timestamp inputs live here because they are the same at
+# every call site and a missing timestamp dies with the leaf certificate
+# Artifact Signing rotates within days.
+
+inputs:
+  label:
+    description: What is being signed, for the retry log lines.
+    required: true
+  endpoint:
+    description: Artifact Signing endpoint URI.
+    required: true
+  signing-account-name:
+    description: Artifact Signing account name.
+    required: true
+  certificate-profile-name:
+    description: Certificate profile within that account.
+    required: true
+  files-folder:
+    description: Absolute path of the folder to sign, never recursed.
+    required: true
+  files-folder-filter:
+    description: Extension to sign within that folder (exe, msi).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Sign ${{ inputs.label }}
+      id: sign1
+      continue-on-error: true
+      uses: azure/artifact-signing-action@v2.0.0
+      with:
+        endpoint: ${{ inputs.endpoint }}
+        signing-account-name: ${{ inputs.signing-account-name }}
+        certificate-profile-name: ${{ inputs.certificate-profile-name }}
+        files-folder: ${{ inputs.files-folder }}
+        files-folder-filter: ${{ inputs.files-folder-filter }}
+        files-folder-recurse: false
+        file-digest: SHA256
+        timestamp-rfc3161: http://timestamp.acs.microsoft.com
+        timestamp-digest: SHA256
+
+    - name: Back off before retrying ${{ inputs.label }}
+      if: steps.sign1.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "::warning::signing ${{ inputs.label }}: attempt 1 of 3 failed; retrying in 20s"
+        sleep 20
+
+    - name: Sign ${{ inputs.label }} (retry)
+      id: sign2
+      if: steps.sign1.outcome == 'failure'
+      continue-on-error: true
+      uses: azure/artifact-signing-action@v2.0.0
+      with:
+        endpoint: ${{ inputs.endpoint }}
+        signing-account-name: ${{ inputs.signing-account-name }}
+        certificate-profile-name: ${{ inputs.certificate-profile-name }}
+        files-folder: ${{ inputs.files-folder }}
+        files-folder-filter: ${{ inputs.files-folder-filter }}
+        files-folder-recurse: false
+        file-digest: SHA256
+        timestamp-rfc3161: http://timestamp.acs.microsoft.com
+        timestamp-digest: SHA256
+
+    - name: Back off before the last attempt at ${{ inputs.label }}
+      if: steps.sign2.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "::warning::signing ${{ inputs.label }}: attempt 2 of 3 failed; retrying in 60s"
+        sleep 60
+
+    # No continue-on-error: the last attempt owns the failure, so an
+    # exhausted ladder still fails the release rather than shipping
+    # unsigned bytes under a green check.
+    - name: Sign ${{ inputs.label }} (last attempt)
+      id: sign3
+      if: steps.sign2.outcome == 'failure'
+      uses: azure/artifact-signing-action@v2.0.0
+      with:
+        endpoint: ${{ inputs.endpoint }}
+        signing-account-name: ${{ inputs.signing-account-name }}
+        certificate-profile-name: ${{ inputs.certificate-profile-name }}
+        files-folder: ${{ inputs.files-folder }}
+        files-folder-filter: ${{ inputs.files-folder-filter }}
+        files-folder-recurse: false
+        file-digest: SHA256
+        timestamp-rfc3161: http://timestamp.acs.microsoft.com
+        timestamp-digest: SHA256
+
+    - name: Report the recovered ${{ inputs.label }} signature
+      if: steps.sign1.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "::notice::signing ${{ inputs.label }}: recovered after a retry"

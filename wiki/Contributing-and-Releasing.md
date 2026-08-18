@@ -164,7 +164,7 @@ On a release, the `sign-windows` job Authenticode-signs the Windows assets with 
 
 The job runs on the x64 runner because the signing client does not support Windows ARM runners; Authenticode is architecture-agnostic, so one runner signs both arches. It signs the one-file exes and each zip's inner `cronstable.exe`, re-zips, rebuilds both MSIs from the signed payload with the same shared build script the gate used (`.github/scripts/build_msi.sh`), signs those, verifies every signature, and installs and uninstalls the signed amd64 MSI for real. The `release` job then overlays the signed set before `SHA256SUMS`, so the sums, the Release assets and the winget manifests describe the signed bytes. Every signature carries an RFC 3161 timestamp because Artifact Signing rotates its leaf certificates within days. `tests/test_ci_fences.py` pins the wiring.
 
-With the secrets present, a signing failure fails the release. To ship unsigned in an emergency (say an Azure outage on release day), remove one of the six secrets and re-run.
+With the secrets present, a signing failure that survives three attempts fails the release. To ship unsigned in an emergency (say an Azure outage on release day), remove one of the six secrets and re-run.
 
 ### Release notes
 

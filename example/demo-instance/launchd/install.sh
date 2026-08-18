@@ -19,6 +19,11 @@
 # (see OPERATOR_TOKEN_FILE below); override to rotate:
 #   CRONSTABLE_DEMO_OPERATOR_TOKEN=new-value ./install.sh
 #
+# The daemon defaults to the `cronstable` on PATH. Point CRONSTABLE_BIN at
+# another build (a venv's bin/cronstable) to deploy that one; the agent runs
+# it, and jobs resolve the bare `cronstable` name to the same build:
+#   CRONSTABLE_BIN=/path/to/venv/bin/cronstable ./install.sh
+#
 set -euo pipefail
 
 TUNNEL_NAME="${1:-cronstable-demo}"
@@ -29,8 +34,40 @@ die() { printf 'install.sh: %s\n' "$1" >&2; exit 1; }
 
 [ "$(uname -s)" = "Darwin" ] || die "launchd agents are macOS only"
 command -v brew        >/dev/null || die "Homebrew not found"
-command -v cronstable  >/dev/null || die "cronstable not on PATH (brew install cronstable)"
 command -v cloudflared >/dev/null || die "cloudflared not on PATH (brew install cloudflared)"
+
+# Which cronstable serves the board: CRONSTABLE_BIN, else the one on PATH.
+if [ -n "${CRONSTABLE_BIN:-}" ]; then
+    [ -x "$CRONSTABLE_BIN" ] || die "CRONSTABLE_BIN=$CRONSTABLE_BIN is not an executable"
+    # made absolute: it goes verbatim into the plist, and launchd resolves
+    # nothing.
+    CRONSTABLE="$(cd "$(dirname "$CRONSTABLE_BIN")" && pwd)/$(basename "$CRONSTABLE_BIN")"
+else
+    command -v cronstable >/dev/null || die "cronstable not on PATH (brew install cronstable, or set CRONSTABLE_BIN)"
+    CRONSTABLE="$(command -v cronstable)"
+fi
+CRONSTABLE_DIR="$(dirname "$CRONSTABLE")"
+
+# This board runs on jobs that shell out to the cronstable CLI (state,
+# cursor, lock, xcom, secret). A PyInstaller build older than 1.2.43 leaks
+# its bootloader's _PYI_* variables into job environments, and the CLI a job
+# invokes then refuses to start ("parent process has different executable")
+# while the job still exits 0: every one of those features fails silently.
+# 1.2.43 scrubs the leak and a source install never had it, so refuse
+# exactly the frozen-and-older combination rather than stand up a dark
+# board. The _PYI_ marker exists only inside PyInstaller bootloaders; a venv
+# entry script cannot match it.
+FIRST_SCRUBBED=1.2.43
+if grep -aq _PYI_ "$CRONSTABLE" 2>/dev/null; then
+    # `|| true`: under set -e a binary whose --version fails (or prints no
+    # x.y.z) would otherwise abort the script here wordlessly; an empty
+    # version must fall through to the refusal below instead.
+    CRONSTABLE_VERSION="$("$CRONSTABLE" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+    if [ -z "$CRONSTABLE_VERSION" ] || \
+       [ "$(printf '%s\n' "$FIRST_SCRUBBED" "$CRONSTABLE_VERSION" | sort -V | head -1)" != "$FIRST_SCRUBBED" ]; then
+        die "frozen cronstable ${CRONSTABLE_VERSION:-of unknown version} predates the $FIRST_SCRUBBED PyInstaller env scrub; its jobs cannot invoke the cronstable CLI, so this board fails silently. Upgrade it, or install from source into a venv and set CRONSTABLE_BIN (see ../README.md)"
+    fi
+fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_CONFIG="$HERE/../cronstable.yaml"
@@ -124,7 +161,7 @@ cp "$SRC_CRONTAB" "$ETC_DIR/legacy.crontab"
 
 CRONSTABLE_DEMO_VIEW_TOKEN="$VIEW_TOKEN" \
 CRONSTABLE_DEMO_OPERATOR_TOKEN="$OPERATOR_TOKEN" \
-  cronstable -c "$ETC_DIR/cronstable.yaml" --validate-config >/dev/null \
+  "$CRONSTABLE" -c "$ETC_DIR/cronstable.yaml" --validate-config >/dev/null \
   || die "derived config failed validation"
 
 # This is cloudflared's global default config path; preserve anything a
@@ -166,7 +203,7 @@ cat > "$AGENT_DIR/com.cronstable.demo.plist" <<EOF
     <string>com.cronstable.demo</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$PREFIX/bin/cronstable</string>
+        <string>$CRONSTABLE</string>
         <string>-c</string>
         <string>$ETC_DIR/cronstable.yaml</string>
     </array>
@@ -183,9 +220,11 @@ cat > "$AGENT_DIR/com.cronstable.demo.plist" <<EOF
         <string>$OPERATOR_TOKEN_XML</string>
         <!-- launchd hands out a minimal PATH, and several jobs and DAG tasks
              shell out to the cronstable CLI (xcom, state, cursor, lock,
-             secret, artifact) and to python3. -->
+             secret, artifact) and to python3. The deployed binary's own
+             directory leads, so those bare cronstable calls resolve to the
+             exact build launchd runs. -->
         <key>PATH</key>
-        <string>$PREFIX/bin:$PREFIX/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>$CRONSTABLE_DIR:$PREFIX/bin:$PREFIX/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>WorkingDirectory</key>
     <string>$PREFIX/var/cronstable-demo</string>
@@ -292,6 +331,7 @@ mutate="$(curl -fsS -o /dev/null -w '%{http_code}' -m 5 \
 [ "$mutate" = "403" ] || die "anonymous POST /jobs/heartbeat/start answered $mutate, expected 403"
 
 printf '\ninstalled:\n'
+printf '  daemon   %s\n' "$CRONSTABLE"
 printf '  config   %s\n' "$ETC_DIR/cronstable.yaml"
 printf '  crontab  %s\n' "$ETC_DIR/legacy.crontab"
 printf '  state    %s\n' "$STATE_DIR"

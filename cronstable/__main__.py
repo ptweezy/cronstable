@@ -811,9 +811,18 @@ def _run_daemon(cron, loop=None, *, shutdown_handlers: bool = True) -> None:
             if shutdown_handlers
             else (lambda: None)
         )
+        # SIGHUP -> reload now (POSIX; a no-op install on Windows). Same
+        # gate as the shutdown handlers: winservice runs this off the main
+        # thread, where add_signal_handler refuses.
+        remove_reload_handler = (
+            platform.install_reload_handler(loop, cron.signal_reload)
+            if shutdown_handlers
+            else (lambda: None)
+        )
         try:
             loop.run_until_complete(cron.run())
         finally:
+            remove_reload_handler()
             remove_shutdown_handlers()
     finally:
         if owned:
