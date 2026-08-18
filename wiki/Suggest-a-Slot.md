@@ -1,6 +1,6 @@
-# Suggest a Slot
+# Suggest a slot
 
-Where should the next job go? cronstable answers from the fleet's real fires: it walks every enabled schedule over the next 24 hours (the same enumeration behind [Schedule Pressure](Schedule-Pressure)) and recommends the least-loaded slot.
+Where should the next job go? The answer comes from the fleet's real fires: cronstable walks every enabled schedule over the next 24 hours (the same enumeration behind [schedule pressure](Schedule-Pressure)) and recommends the least-loaded slot.
 
 ```
 GET /schedule/suggest?period=hourly
@@ -25,14 +25,18 @@ GET /schedule/suggest?period=daily&tz=Europe/London
 }
 ```
 
-The choice is deterministic, so the same fleet always gets the same answer: least fires first, ties broken toward the slot circularly farthest from the busiest one, then toward the earliest slot. That tie-break is why an idle fleet is told `:30`, not `:00`: the outside world stampedes at the top of the hour even when your fleet does not. `busiest` is included for contrast, `alternatives` are the two runners-up, and `hash_hint` names the [`H` spelling](Hashed-Schedules) that would keep future jobs spreading themselves without anyone consulting this endpoint again.
+The choice is deterministic, so the same fleet always gets the same answer: fewest fires first. Ties break toward the slot circularly farthest from the busiest one, then toward the earliest slot. That tie-break is why an idle fleet gets `:30`, not `:00`: the outside world crowds the top of the hour even when your fleet does not.
 
-The same analyzer backs the `cron_suggest_slot` [MCP tool](MCP), so an agent asked to "add a cleanup job" can pick a schedule that does not pile onto the herd.
+`busiest` is included for contrast. `alternatives` are the two runners-up. `hash_hint` names the [`H` spelling](Hashed-Schedules) that would keep future jobs spreading themselves without anyone consulting this endpoint again.
+
+The same analyzer backs the `cron_suggest_slot` [Model Context Protocol (MCP) tool](MCP), so an agent asked to "add a cleanup job" can pick a schedule that does not add to a crowded slot.
 
 ## In the dashboards
 
-The [web dashboard](Web-Dashboard)'s schedule-pressure card has "suggest an hourly slot" and "suggest a daily slot" buttons; the suggested expression is a chip you click to copy. The [terminal dashboard](Terminal-Dashboard)'s pressure overlay shows both suggestions inline, computed locally from the same shared analyzer.
+The [web dashboard](Web-Dashboard)'s schedule-pressure card has **suggest an hourly slot** and **suggest a daily slot** buttons. The suggested expression is a chip you click to copy. The [terminal dashboard](Terminal-Dashboard)'s pressure overlay shows both suggestions inline, computed locally from the same shared analyzer.
 
 ## Suggest versus H
 
-Both solve the same collision problem from different ends. A suggested slot is explicit: the schedule reads as a concrete minute, at the cost of being a point-in-time answer that no one re-balances later. An [`H` hashed slot](Hashed-Schedules) is self-maintaining: every job spreads itself, at the cost of the minute living in the hash rather than the config text. New fleets tend to standardize on `H`; established fleets use suggest to place jobs that must keep an explicit, reviewable schedule.
+Both solve the same collision problem from different ends. A suggested slot is explicit: the schedule reads as a concrete minute. The cost is a point-in-time answer that no one re-balances later. An [`H` hashed slot](Hashed-Schedules) is self-maintaining: every job spreads itself. The cost is the minute living in the hash rather than the configuration file.
+
+New fleets tend to standardize on `H`. Established fleets use suggest to place jobs that must keep an explicit, reviewable schedule.
