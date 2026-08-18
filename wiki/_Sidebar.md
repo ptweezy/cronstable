@@ -1,4 +1,4 @@
-### [cronstable Wiki](Home)
+### [cronstable wiki](Home)
 
 - **Getting Started**
   - [Installation](Installation)

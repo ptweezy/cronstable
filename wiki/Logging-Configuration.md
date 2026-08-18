@@ -1,11 +1,11 @@
-# Logging Configuration
+# Logging configuration
 
 This page documents how cronstable produces its own diagnostic log output: the
-default behavior driven by `-l/--log-level`, and the optional `logging:` config
-section that applies a full Python `logging.config` dictionary schema. It does
-not cover capturing a job's stdout/stderr (see
-[Output Capturing](Output-Capturing)), nor sending notifications on
-job success/failure (see [Reporting](Reporting)).
+default behavior driven by `-l/--log-level`, and the optional `logging:`
+configuration section that applies a full Python `logging.config` dictionary
+schema. It does not cover capturing a job's stdout/stderr (see
+[output capturing](Output-Capturing)) or sending notifications on job
+success/failure (see [reporting](Reporting)).
 
 ## Default logging (no `logging:` section)
 
@@ -23,19 +23,19 @@ with the standard library default format
 
 `-l/--log-level` is upper-cased and resolved against the standard level names
 (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`, plus the `logging` module's
-aliases such as `WARN`); an unknown value exits `2` as a usage error. See
-[Command-Line Reference](CLI-Reference) for the full CLI.
+aliases such as `WARN`). An unknown value exits `2` as a usage error. See
+[command-line reference](CLI-Reference) for the full CLI.
 
-This default applies whether or not the run later loads a `logging:` section:
-`basicConfig` always runs first, and a `logging:` section (if present) is applied
-afterwards during the scheduler loop, overriding it.
+This default applies whether or not the run later loads a `logging:` section.
+`basicConfig` always runs first. If a `logging:` section is present, it is
+applied afterwards during the scheduler loop, overriding the default.
 
 ## The `logging:` section
 
 The `logging:` section is a Python `logging.config` *dictionary schema*
-(the same structure accepted by `logging.config.dictConfig`). cronstable validates
-its top-level shape with strictyaml and then hands the whole dictionary to
-`logging.config.dictConfig`.
+(the same structure accepted by `logging.config.dictConfig`). cronstable
+validates its top-level shape with strictyaml and then hands the whole
+dictionary to `logging.config.dictConfig`.
 
 ```yaml
 logging:
@@ -57,8 +57,8 @@ logging:
       - console
 ```
 
-The example above (taken from `README.md`) displays each log line with an
-embedded timestamp, routing all root-logger output to stdout via a `simple`
+The preceding example, from `README.md`, displays each log line with an
+embedded timestamp and routes all root-logger output to stdout with a `simple`
 formatter.
 
 > The ability to configure yacron's own logging was added in yacron 0.19.0
@@ -67,42 +67,42 @@ formatter.
 
 ### Top-level keys
 
-strictyaml only validates the *top-level* keys of the `logging:` map (and the
-types of `version`, `incremental`, and `disable_existing_loggers`). The contents
-of `formatters`, `filters`, `handlers`, `loggers`, and `root` are accepted as
-arbitrary YAML (strictyaml `Any`) and are validated only later by
-`dictConfig`. An error inside one of those nested mappings is therefore not
-caught at config-parse time; it surfaces when `dictConfig` runs (see
-[Reload and error handling](#reload-and-error-handling)).
+The strictyaml schema validates only the *top-level* keys of the `logging:`
+map, and the types of `version`, `incremental`, and `disable_existing_loggers`.
+It accepts the contents of `formatters`, `filters`, `handlers`, `loggers`, and
+`root` as arbitrary YAML (strictyaml `Any`), and `dictConfig` validates them
+only later. An error inside one of those nested mappings is therefore not
+caught at config-parse time. It surfaces when `dictConfig` runs (see
+[reload and error handling](#reload-and-error-handling)).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `version` | int | (required) | dictConfig schema version. Must be present. The only value `logging.config.dictConfig` currently accepts is `1`. |
-| `incremental` | bool | optional (dictConfig default `false`) | If `true`, the configuration is interpreted incrementally: existing loggers/handlers are kept and only handler/logger *levels* and `propagate` flags are adjusted; `formatters`/`filters` and handler creation are ignored. See the dictConfig docs. |
-| `disable_existing_loggers` | bool | optional (dictConfig default `true`) | If `true` (the dictConfig default), loggers that exist at the time `dictConfig` runs but are not named in this config are disabled. The README example sets this to `false` so previously-created loggers (e.g. `cronstable`) keep working. Ignored when `incremental` is `true`. |
-| `formatters` | mapping | optional | Named formatter definitions (`format`, `datefmt`, etc.), as in dictConfig. Contents unvalidated by strictyaml. |
+| `version` | int | (required) | dictConfig schema version. Must be present. `logging.config.dictConfig` currently accepts only `1`. |
+| `incremental` | bool | optional (dictConfig default `false`) | If `true`, `dictConfig` interprets the configuration incrementally: it keeps existing loggers/handlers, adjusts only their *levels* and `propagate` flags, and ignores `formatters`/`filters` and handler creation. See the dictConfig docs. |
+| `disable_existing_loggers` | bool | optional (dictConfig default `true`) | If `true` (the dictConfig default), `dictConfig` disables loggers that exist when it runs but are not named in this configuration. The README example sets this to `false` so previously created loggers, such as `cronstable`, keep working. Ignored when `incremental` is `true`. |
+| `formatters` | mapping | optional | Named formatter definitions (`format`, `datefmt`, and other keys), as in dictConfig. Contents unvalidated by strictyaml. |
 | `filters` | mapping | optional | Named filter definitions, as in dictConfig. Contents unvalidated by strictyaml. |
-| `handlers` | mapping | optional | Named handler definitions (`class`, `level`, `formatter`, `stream`, etc.). Contents unvalidated by strictyaml. |
+| `handlers` | mapping | optional | Named handler definitions (`class`, `level`, `formatter`, `stream`, and other keys). Contents unvalidated by strictyaml. |
 | `loggers` | mapping | optional | Per-logger configuration (`level`, `handlers`, `propagate`). Contents unvalidated by strictyaml. |
 | `root` | mapping | optional | Configuration of the root logger (`level`, `handlers`). Contents unvalidated by strictyaml. |
 
 The defaults shown for `incremental` and `disable_existing_loggers` are the
-defaults of `logging.config.dictConfig` itself; they are *not* defined in
-cronstable's `DEFAULT_CONFIG`. cronstable supplies no values for any logging key; what
-you write is passed through verbatim. Only `version` is required by the schema;
-all other keys are optional (strictyaml `Opt(...)`).
+defaults of `logging.config.dictConfig` itself. They are *not* defined in
+cronstable's `DEFAULT_CONFIG`. cronstable supplies no values for any logging
+key; what you write passes through verbatim. The schema requires only
+`version`; all other keys are optional (strictyaml `Opt(...)`).
 
 ### Logger names used by cronstable
 
-cronstable emits log records under these logger names. Target them in `loggers:` to
-tune their levels independently, or rely on `root:` to catch them all:
+cronstable emits log records under these logger names. Target them in `loggers:`
+to tune their levels independently, or rely on `root:` to catch them all:
 
 | Logger | Source module | Emits |
 | --- | --- | --- |
 | `cronstable` | `cron.py`, `job.py` | Scheduler lifecycle, job start/spawn/exit, retries, web server start/stop, shutdown, and most operational messages. |
-| `cronstable.config` | `config.py` | Configuration parsing diagnostics (e.g. the converted schedule string at `DEBUG`). |
-| `statsd` | `statsd.py` | statsd metric-writer diagnostics. See [Metrics with statsd](Metrics-with-Statsd). |
-| `prometheus` | `prometheus.py` | Prometheus `/metrics` endpoint diagnostics (e.g. a cluster-backend read failing during a scrape). See [Metrics with Prometheus](Metrics-with-Prometheus). |
+| `cronstable.config` | `config.py` | Configuration parsing diagnostics, such as the converted schedule string at `DEBUG`. |
+| `statsd` | `statsd.py` | statsd metric-writer diagnostics. See [metrics with statsd](Metrics-with-Statsd). |
+| `prometheus` | `prometheus.py` | Prometheus `/metrics` endpoint diagnostics, such as a cluster-backend read failing during a scrape. See [metrics with Prometheus](Metrics-with-Prometheus). |
 
 Because `cronstable.config` is a child of `cronstable`, configuring the `cronstable`
 logger affects it too (subject to `propagate`). The `statsd` logger is a
@@ -110,31 +110,33 @@ separate top-level logger.
 
 ## Reload and error handling
 
-cronstable re-reads its configuration on every scheduler tick (roughly once per
-minute; see [Architecture and Internals](Architecture-and-Internals)). The
+The daemon re-reads its configuration on every scheduler tick (roughly once per
+minute; see [architecture and internals](Architecture-and-Internals)). The
 `logging:` section participates in this reload with specific rules, implemented
 in `cron.py`:
 
-- The logging config is applied via `logging.config.dictConfig`.
+- The logging configuration is applied with `logging.config.dictConfig`.
 - It is **only re-applied when it changes.** The scheduler keeps the
-  last-successfully-applied logging dictionary and compares the freshly-loaded
-  one against it; if they are equal, `dictConfig` is not called again.
+  last successfully applied logging dictionary and compares the freshly loaded
+  one against it. If they are equal, the scheduler does not call `dictConfig`
+  again.
 - It is **only marked as applied on success.** If `dictConfig` raises, the
-  scheduler logs an error (`Error while configuring logging: ...`, pointing at
-  the dictConfig schema documentation, and including the offending config) and
-  does **not** record it as applied.
+  scheduler logs an error (`Error while configuring logging: ...`, which points
+  at the dictConfig schema documentation and includes the offending
+  configuration) and does **not** record it as applied.
 - Consequently, a `logging:` section that was **broken and then fixed** is
-  picked up on the next reload **without restarting cronstable**, because the
-  broken version was never marked applied, the corrected version still counts as
+  picked up on the next reload **without restarting cronstable**. The broken
+  version was never marked applied, so the corrected version still counts as
   "changed" and is retried.
 
 This behavior (re-apply on change, mark applied only on success) was
 introduced as a fix so a logging section fixed after an error, or changed at
 runtime, is picked up without a restart.
 
-If the loaded config has no `logging:` section, `dictConfig` is never called and
-whatever logging configuration is currently in effect (the startup `basicConfig`,
-or a previously-applied `logging:` section) remains active.
+If the loaded configuration has no `logging:` section, the scheduler never calls
+`dictConfig`, and whatever logging configuration is currently in effect (the
+startup `basicConfig`, or a previously-applied `logging:` section) remains
+active.
 
 ## One logging block per configuration
 
@@ -147,7 +149,7 @@ At most **one** `logging:` block may exist across an entire configuration:
   `ConfigError("Multiple 'logging' configurations found: first in <file>, now
   in <file>")`.
 
-See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults) for how
+See [includes, defaults, and multi-file config](Includes-and-Defaults) for how
 files in a directory are aggregated and for the matching rule that applies to the
 `web:` block.
 
@@ -156,8 +158,9 @@ files in a directory are aggregated and for the matching rule that applies to th
 - The `logging:` section configures **cronstable's own** logging only. It has no
   effect on how a job's captured output is stored or reported.
 - Validating the configuration with `-v/--validate-config` checks the top-level
-  schema of the `logging:` section but does **not** call `dictConfig`, so a
-  nested error (e.g. an unknown handler class) is not detected by validation; it
-  only surfaces when the daemon actually applies the config.
+  schema of the `logging:` section but does **not** call `dictConfig`. A nested
+  error, such as an unknown handler class, is therefore not detected by
+  validation. It surfaces only when the daemon actually applies the
+  configuration.
 - For the complete configuration schema, see
-  [Configuration Reference](Configuration-Reference).
+  [configuration reference](Configuration-Reference).
