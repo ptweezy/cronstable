@@ -317,36 +317,36 @@ MSI](https://github.com/ptweezy/cronstable/wiki/Windows-MSI) wiki page).
 
 ## Running on Windows
 
-cronstable runs natively on Windows (x64 and ARM64), in addition to Linux and
-macOS. Install it with `pip install cronstable`, or download the self-contained
-`cronstable-windows-amd64.exe` / `cronstable-windows-arm64.exe`, the
-one-directory `cronstable-windows-<arch>.zip` (the shape that can host the
-Windows service), or the machine-wide `cronstable-windows-<arch>.msi` from
-the [releases page](https://github.com/ptweezy/cronstable/releases) (no
-Python required for any of them). Everything else, like the YAML crontab,
-scheduling, reporting, retries, the HTTP API and the
+cronstable runs natively on Windows (x64 and ARM64). Install it with
+`pip install cronstable`, or take one of the builds on the
+[releases page](https://github.com/ptweezy/cronstable/releases), none of which
+need Python: the self-contained `cronstable-windows-amd64.exe` /
+`cronstable-windows-arm64.exe`, the one-directory
+`cronstable-windows-<arch>.zip` (the shape that can host the Windows service),
+or the machine-wide `cronstable-windows-<arch>.msi`. Everything else, like the
+YAML crontab, scheduling, reporting, retries, the HTTP API and the
 [web dashboard](#web-dashboard), works the same as on POSIX. A few platform
 details differ:
 
-* **Default config location.** When `-c` is omitted, cronstable looks in the
+* **Default config location.** Without `-c`, cronstable looks in the
   machine-wide `%ProgramData%\cronstable` (the Windows analog of
-  `/etc/cronstable.d`) whenever that directory holds configuration, and
-  otherwise in the per-user `%APPDATA%\cronstable`
-  (for example, `C:\Users\you\AppData\Roaming\cronstable`). `cronstable init` writes a
-  commented starter configuration into the default location, and `-c` points
-  anywhere:
+  `/etc/cronstable.d`) whenever that directory holds configuration, and in the
+  per-user `%APPDATA%\cronstable` otherwise (for example,
+  `C:\Users\you\AppData\Roaming\cronstable`). `cronstable init` writes a
+  commented starter configuration into whichever one applies, and `-c`
+  overrides the choice with any path:
 
   ```shell
   cronstable -c C:\path\to\cronstable.yaml
   ```
 
 * **Default shell.** A string `command` with no explicit `shell` runs through
-  the native command processor (`%ComSpec%`, that is, `cmd.exe`), mirroring the
-  `/bin/sh` default on POSIX. `shell: cmd` and `shell: powershell` both work
-  as written (cronstable gives cmd.exe the `/c` invocation and quoting it
-  expects, and every other shell `-c`). For PowerShell, or any other
-  interpreter, set `shell:` or pass
-  `command` as a list (which bypasses the shell entirely):
+  the native command processor (`%ComSpec%`, that is, `cmd.exe`), which fills
+  the same role `/bin/sh` fills on POSIX. `shell: cmd` and `shell: powershell`
+  both work as written: cronstable gives cmd.exe the `/c` invocation and
+  quoting it expects, and every other shell `-c`. For PowerShell, or any other
+  interpreter, set `shell:` or pass `command` as a list, which bypasses the
+  shell entirely:
 
   ```yaml
   jobs:
@@ -359,11 +359,11 @@ details differ:
       captureStdout: true
   ```
 
-* **Graceful shutdown.** Press `Ctrl-C` to stop cronstable. It shuts down
-  after the currently running jobs finish, just as `SIGTERM` does on POSIX
-  (each job runs in its own console process group, so the keystroke never
-  reaches the jobs themselves). Closing the console window and OS shutdown
-  trigger the same drain on the OS's few seconds of grace.
+* **Graceful shutdown.** Press `Ctrl-C` to stop cronstable. It shuts down once
+  the running jobs finish, the same as `SIGTERM` on POSIX. Each job runs in its
+  own console process group, so the keystroke never reaches the jobs
+  themselves. Closing the console window and shutting the machine down drain
+  the same way, within the few seconds of grace the OS allows.
 
   The authenticated `POST /shutdown` route stops a console-less daemon, and
   stops the Windows service cleanly, without tripping its recovery actions.
@@ -372,13 +372,13 @@ details differ:
 
 * **Running unattended, as a real Windows service.** `cronstable service
   install -c C:\ProgramData\cronstable` registers the scheduler with the
-  Service Control Manager, so it starts at boot, runs whether or not anyone
-  is logged on, appears in `services.msc`, and gets Windows' own recovery
-  actions. Stopping it drains running jobs first, and the SCM is told the
-  stop is still in progress for as long as that takes. `cronstable service
-  reload` makes it reparse the configuration immediately, the forced reload
-  `SIGHUP` performs on POSIX. It is a ctypes shim over advapi32, so it adds no
-  dependency.
+  Service Control Manager, so it starts at boot, runs whether or not anyone is
+  logged on, appears in `services.msc`, and gets Windows' own recovery
+  actions. Stopping it drains the running jobs first, and it keeps telling the
+  SCM the stop is still in progress for as long as that takes. `cronstable
+  service reload` makes it reparse the configuration immediately, the forced
+  reload that `SIGHUP` triggers on POSIX. The whole thing is a ctypes shim over
+  advapi32, so it adds no dependency.
 
   The published one-file `.exe` cannot host a service, because its bootloader
   runs the program in a child process the SCM never sees. The `install`
@@ -389,19 +389,19 @@ details differ:
   [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows).
 
 * **Migrating from Task Scheduler.** `cronstable import-taskscheduler
-  tasks.xml -o jobs.yaml` converts an estate's exports into cronstable jobs,
-  mapping time, calendar and boot triggers, `Exec` actions, working
+  tasks.xml -o jobs.yaml` converts an estate's exports into cronstable jobs.
+  It maps time, calendar and boot triggers, `Exec` actions, working
   directories, execution time limits, instance policy and priority. It is a
-  one-shot converter, not a loader, because exporting a task does not
-  unregister it. It lists everything it cannot carry across with a reason
-  rather than dropping it, and on a whole-machine export that list is long:
+  one-shot converter rather than a loader, because exporting a task does not
+  unregister it. It lists everything it cannot carry across, with the reason,
+  instead of dropping it, and on a whole-machine export that list is long:
   most registered tasks on a stock Windows install are COM-handler or
   event-driven internals rather than schedules. See
   [Importing from Task Scheduler](https://github.com/ptweezy/cronstable/wiki/Importing-Task-Scheduler).
 
-* **Not supported on Windows.** Per-job `user`/`group` switching (there is no
-  `setuid`/`setgid` equivalent) is rejected with a clear configuration error,
-  and `unix://` web listeners are skipped with a warning. Use an `http://`
+* **Not supported on Windows.** Per-job `user`/`group` switching has no
+  `setuid`/`setgid` equivalent, so cronstable rejects it with a configuration
+  error, and it skips `unix://` web listeners with a warning. Use an `http://`
   listener instead.
 
 ## Production container deployment
@@ -518,8 +518,8 @@ counters, artifacts, and quarantine.
 
 ### Themes, readability, and accessibility
 
-**Ten themes**: **carolina** (the default, Carolina blue),
-**amber** and **green**, and flat **modern** and **standard** looks, each in
+**Ten themes**: **standard** (the default, a flat neutral charcoal),
+**carolina** (Carolina blue), **amber**, **green**, and flat **modern**, each in
 a dark and a light (paper) variant. Cycle hues with `t`, flip
 light/dark with `T`:
 

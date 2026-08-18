@@ -41,7 +41,7 @@ For fonts missing the status glyphs, use `--ascii`.
 | `--url URL` | Daemon web listener (default `http://127.0.0.1:8080`). |
 | `--token TOKEN` | Bearer token for `web.authToken`-protected daemons. |
 | `--token-env VAR` | Environment variable to read the token from when `--token` is absent (default `CRONSTABLE_WEB_TOKEN`). |
-| `--theme NAME` | Start on a theme (`carolina`, `amber`, `green`, `modern`, `standard`, each also as `NAME-light`). The choice persists. |
+| `--theme NAME` | Start on a theme (`standard`, `carolina`, `amber`, `green`, `modern`, each also as `NAME-light`). The choice persists (default: remembered, else `standard`). |
 | `--tv` | Start on the wallboard, like opening the page at `#tv`. |
 | `--job NAME` | Open a job's drawer at startup, like `#job/NAME`. |
 | `--poll SECONDS` | Refresh interval. `0` pauses (default: remembered, else 3). |
@@ -161,10 +161,10 @@ pendulum wordmark.
 
 ## Themes and accessibility
 
-The same five hues as the web page: **carolina** (default), **amber**
-and **green**, flat **modern** and **standard**. Each has a dark and a
-light (paper) variant. `t` cycles hues and `T` flips the variant,
-exactly as in the browser.
+The same five hues as the web page: **standard** (default, flat
+neutral), **carolina**, **amber** and **green**, and flat **modern**.
+Each has a dark and a light (paper) variant. `t` cycles hues and `T`
+flips the variant, exactly as in the browser.
 
 The **color-vision** remaps (red-green and blue-yellow) re-ink the
 status colors with the same shape-differs-too guarantee, and `--ascii`
