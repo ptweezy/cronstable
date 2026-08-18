@@ -61,9 +61,9 @@ alerting, durable state, orchestration, clustering, and a live dashboard.
   [Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
   and [LAN Discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)
   wiki pages)
-* **Per-job SLA monitoring**: an `sla:` block declares thresholds for the runs
-  that did not happen: too long without a success, a due slot that never
-  started, a run exceeding its runtime bound. A breach fires a dedicated
+* **Per-job SLA monitoring**: an `sla:` block declares thresholds for late and
+  missing runs: too long without a success, a due slot that never started, a
+  run exceeding its runtime bound. A breach fires a dedicated
   `onLate` reporting hook once (mail, Sentry, shell, webhook), gauges and
   counters land in the metrics, and the dashboards badge the job **OVERDUE**
   (see [late-run detection](#late-run-detection-sla-monitoring) and the
@@ -74,8 +74,8 @@ alerting, durable state, orchestration, clustering, and a live dashboard.
 
 * **Opt-in durable state**: point a single `state:` config block at a local
   directory (or an Amazon S3 Files / EFS mount to share it fleet-wide) and jobs
-  gain durability across restarts: missed-run catch-up after downtime and
-  retries that survive a daemon restart. The daemon hands the same store to
+  gain durability: missed-run catch-up after downtime, and retries that
+  survive a daemon restart. The daemon hands the same store to
   the jobs themselves over a loopback endpoint, so a job command can use
   durable key/value, an ETL cursor/watermark, a fleet-wide mutex or semaphore,
   idempotency keys, a shared artifact store, and run-scoped secrets with
@@ -102,8 +102,8 @@ alerting, durable state, orchestration, clustering, and a live dashboard.
   read per-job run history on demand
 * **Runtime pause/resume**: pause any job's scheduled fires for a bounded
   window (an hour by default, thirty days at most) over the API, the
-  dashboards, or MCP, without touching the config. Skipped slots are recorded
-  visibly, pending retries defer, catch-up does not replay the window, and
+  dashboards, or MCP, without touching the config. cronstable records each
+  skipped slot, pending retries defer, catch-up does not replay the window, and
   with a `state:` store the pause survives restarts and every node honors it
   (see [pausing jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs))
 * **Built-in TLS on the listeners**: `web.listen` accepts `https://` addresses
@@ -119,15 +119,15 @@ alerting, durable state, orchestration, clustering, and a live dashboard.
   [serving the API over TLS](#serving-the-api-over-tls) and
   [listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS))
 * Optional **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)** for
-  AI agents. An agent can **observe** cronstable, **author and debug
-  schedules** with the daemon's own engine (validate or explain an expression,
-  explain field by field why a job did not run at a timestamp), and **control**
-  it when you opt in.
+  AI agents. An agent can observe cronstable and author or debug schedules
+  with the daemon's own engine: validate or explain an expression, or explain
+  field by field why a job did not run at a timestamp. It can also control the
+  daemon when you opt in.
 
   The server is read-only by default and exposes tools, resources, and triage
   prompts covering jobs, DAGs, the cluster/fleet, metrics, and durable state.
-  It is served at `POST /mcp` on the web listeners and through a
-  `cronstable mcp` stdio bridge, and is written in pure Python with no new
+  cronstable serves it at `POST /mcp` on the web listeners and through a
+  `cronstable mcp` stdio bridge, and it is written in pure Python with no new
   dependencies
 * Built-in **Prometheus metrics** at `/metrics` (plus per-job statsd push
   metrics), covering run outcomes, durations, retries, schedules, and cluster
@@ -142,10 +142,10 @@ alerting, durable state, orchestration, clustering, and a live dashboard.
 * A **job-set id**: an order-independent fingerprint of every job's effective
   configuration, so replicas deployed from the same config can confirm they
   hold an identical set of jobs (see [job-set id](#job-set-id))
-* **Opt-in clustering and leader election**: optionally have instances confirm
-  over mutual TLS that a configured set of peers is running the same job set, and
-  **elect a leader** so several replicas can run from one config without
-  double-running jobs (see
+* **Opt-in clustering and leader election**: instances confirm over mutual TLS
+  that a configured set of peers is running the same job set, and elect a
+  leader so several replicas can run from one config without double-running
+  jobs (see
   [clustering and leader election](#clustering-and-leader-election))
 
 ### Deployment
