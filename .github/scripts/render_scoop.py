@@ -6,7 +6,7 @@ Scoop is a pull channel: the manifest lives in the ScoopInstaller/Extras bucket
 and its Excavator bot re-reads `checkver` and `autoupdate` every four hours,
 bumping version and hashes on its own from the SHA256SUMS asset this release
 already publishes.  So this file exists to be submitted ONCE; after that it
-maintains itself, which is the property worth having here -- the push channels
+maintains itself, which is the property worth having here: the push channels
 (Homebrew tap, winget) each broke on their own when a release was withdrawn.
 
 Rendering it from SHA256SUMS rather than checking a copy into the tree keeps it

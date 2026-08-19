@@ -2,6 +2,78 @@
 
 ## 1.2.44
 
+- The 64-bit glibc Linux binaries require glibc 2.17, down from 2.38. That
+  covers every glibc distribution still in production, including RHEL, Alma
+  and Rocky 7 onward, Amazon Linux 2 and 2023, SLES 12 onward, Debian 8
+  onward and Ubuntu 14.04 onward, where before only Ubuntu 24.04 and newer
+  could start the binary at all. The `amd64`, `arm64`, `ppc64le` and `s390x`
+  builds move into manylinux2014 containers and freeze a
+  python-build-standalone interpreter, which is what sets the number; the
+  container matters as much as the interpreter, because pip picks wheels
+  against the running glibc. `armv7` moves to `manylinux_2_31_armv7l` and
+  requires glibc 2.31, which reaches Raspberry Pi OS bullseye, Debian 11 and
+  Ubuntu 20.04; `i686` moves to Debian bookworm and requires 2.36.
+- Every glibc binary lane now proves its libc requirement from the frozen
+  bytes. `.github/scripts/elf_floor.py` unpacks the one-file bundle, parses
+  `.gnu.version_r` across the bootloader and all of its embedded shared
+  libraries, and fails the job when the highest `GLIBC_x.y` exceeds the floor
+  that lane declares. Nothing else can see this: the smoke test runs on a
+  libc newer than the binary needs, so a dependency publishing a
+  higher-tagged wheel used to raise the requirement with CI green throughout.
+  The same step rejects an interpreter built with an executable stack, which
+  ships fine and then fails at run time on SELinux-hardened hosts.
+- Every container base image is pinned to an explicit distro release. The
+  musl builds are built on Alpine 3.23 and require musl 1.2.5, which is
+  Alpine 3.20 and later; the floating `python:3.14-alpine` tag had walked
+  from Alpine 3.19 to 3.24 and taken the requirement with it.
+- The MIPS lane builds against a `snapshot.debian.org` slice of Debian
+  bookworm rather than the live archive. Bookworm's LTS phase covers neither
+  mips64el nor mipsel, its security index already lists neither, and the
+  bullseye mipsel index is gone entirely, so the live index will disappear on
+  an unannounced date.
+- Releases now attach `cronstable-linux-loong64` and
+  `cronstable-linux-loong64-musl`, LoongArch binaries for glibc and musl
+  hosts. Both are compiled from source under emulation, PyInstaller's
+  bootloader included, since PyPI publishes no LoongArch wheels. They target
+  the new-world ABI that upstream Debian and Alpine use; hardware running an
+  old-world distribution such as Loongnix, Kylin or UOS is a different,
+  incompatible ABI.
+- Releases now attach `cronstable-openbsd-amd64`, `cronstable-netbsd-amd64`
+  and `cronstable-illumos-amd64`. Each is built in a hardware-accelerated
+  virtual machine of that system, since no runner offers one and PyInstaller
+  cannot cross-compile. The OpenBSD binary targets OpenBSD 7.9, which offers
+  no cross-release ABI guarantee, so a new asset follows each release; it
+  ships without `orjson`, because OpenBSD's Rust predates that package's
+  minimum. The illumos binary is built on OmniOS r151054 LTS and runs
+  anywhere the illumos ABI does, including OpenIndiana and SmartOS zones.
+- Releases now attach `.deb` and `.rpm` packages for `amd64`, `arm64`,
+  `i686`, `armv7`, `ppc64le`, `s390x` and `riscv64`. Each installs the
+  release binary as `/usr/bin/cronstable` alongside a systemd unit, a starter
+  configuration in `/etc/cronstable.d`, and a `cronstable` service account,
+  and declares the glibc version its binary needs, so a host too old for it
+  refuses the install instead of failing at first run. The service is left
+  stopped and disabled: the shipped configuration schedules no jobs, so
+  starting it is `systemctl enable --now cronstable` once you have edited the
+  file. Removing a package leaves `/etc/cronstable.d` and
+  `/var/lib/cronstable` behind.
+- cronstable ships a systemd unit, `packaging/systemd/cronstable.service`.
+  It runs as the `cronstable` user, reloads the configuration on `SIGHUP`
+  through `systemctl reload`, and lets cronstable drain its own running jobs
+  on stop rather than having systemd signal them directly.
+- Releases now attach `cronstable.json`, the Scoop manifest for the release,
+  rendered from the published `SHA256SUMS`. Submitted once to
+  `ScoopInstaller/Extras`, it self-updates from that same file every four
+  hours, so `scoop install cronstable` tracks releases with nothing pushed
+  from here.
+- The repository is a Nix flake. `nix run github:ptweezy/cronstable` and
+  `nix profile install github:ptweezy/cronstable` build cronstable from
+  source against nixpkgs' Python and dependency set, needing no writable
+  temp directory at startup. A `nix flake check` job keeps it evaluating.
+- The installation documentation states outright that a `-musl` binary is not
+  a fallback for a glibc host that is too old. It names
+  `/lib/ld-musl-<arch>.so.1` as its interpreter, so a glibc kernel finds
+  nothing and the shell prints `not found`, which reads like a corrupt
+  download rather than the wrong-libc error it is.
 - Releases now attach `cronstable-linux-mips64le`, a 64-bit little-endian
   MIPS binary for glibc hosts such as Loongson and Cavium Octeon
   machines. It is built in an emulated Debian bookworm container, the

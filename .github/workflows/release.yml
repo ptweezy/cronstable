@@ -526,7 +526,7 @@ jobs:
   #
   # The floor a binary carries is the highest GLIBC_x.y symbol version anything
   # in the bundle asks for, and that is set by where the interpreter, OpenSSL,
-  # libstdc++ and every installed wheel were built -- not by the bootloader,
+  # libstdc++ and every installed wheel were built, not by the bootloader,
   # which comes from a manylinux2014 wheel and only needs GLIBC_2.14. Building
   # on the runner put the floor at GLIBC_2.38, which excludes RHEL/Alma/Rocky 8
   # and 9, Amazon Linux 2023, SLES 15, Debian 12 and Ubuntu 22.04 LTS. Building
