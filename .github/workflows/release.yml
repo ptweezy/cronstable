@@ -1151,6 +1151,12 @@ jobs:
               # env scrub it proves is shared Python code, identical everywhere.
               /v/bin/python /src/.github/scripts/assert_arch.py \
                 dist/cronstable ${{ matrix.archspec }}
+              # And the glibc floor, which no functional test can see: the
+              # smoke ran on the same libc the bundle was built against, so a
+              # dependency that starts asking for a newer symbol version would
+              # ship a binary that no longer starts on bookworm-era hardware,
+              # with CI green throughout.
+              /v/bin/python /src/.github/scripts/elf_floor.py dist/cronstable --max-glibc 2.36 --no-exec-stack
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
             '
       - uses: actions/upload-artifact@v7.0.1
