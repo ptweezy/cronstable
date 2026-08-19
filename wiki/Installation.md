@@ -211,8 +211,8 @@ scoop bucket add extras
 scoop install cronstable
 ```
 
-This installs the same self-contained `.exe` the release publishes, picked to
-match your architecture. Upgrade later with `scoop update cronstable`.
+This installs the same self-contained `.exe` the release publishes, for
+whichever architecture you are on. Upgrade later with `scoop update cronstable`.
 
 ## Install using a .deb or .rpm package
 
@@ -274,17 +274,16 @@ to name a specific asset when you want one other than the default.
 
 ## Install using Nix
 
-The repository is a flake, so no packaging step stands between a commit and an
-install:
+The repository is a flake, so it installs straight from the source tree:
 
 ```shell
 nix run github:ptweezy/cronstable -- --version
 nix profile install github:ptweezy/cronstable
 ```
 
-This builds cronstable from source against nixpkgs' Python and dependency set,
-rather than unpacking a release binary, so it needs no writable temp directory
-at startup and works on any system nixpkgs supports.
+This builds cronstable against nixpkgs' Python and dependency set rather than
+unpacking a release binary, so it needs no writable temp directory at startup.
+The flake covers Linux and macOS on x86_64 and aarch64.
 
 ## Install using a binary
 
@@ -339,16 +338,16 @@ whether it starts is the oldest glibc or musl it accepts. Each build declares
 that number, and CI re-derives it from the frozen bytes on every release, so the
 table above is measured rather than estimated.
 
-`amd64`, `arm64`, `ppc64le` and `s390x` need **glibc 2.17**, which reaches every
+`amd64`, `arm64`, `ppc64le` and `s390x` need glibc 2.17, which reaches every
 glibc distribution still in production, including the RHEL family from 7 onward
 and Amazon Linux 2. They are built inside manylinux2014 containers against a
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
-interpreter, which is where that number comes from. `armv7` needs **glibc
-2.31**, `i686` **2.36**, and `riscv64` and `loong64` **2.41**, each set by the
-oldest base image carrying a working toolchain for that architecture.
+interpreter, which is where that number comes from. `armv7` needs glibc 2.31,
+`i686` needs 2.36, and `riscv64` and `loong64` need 2.41, each set by the oldest
+base image carrying a working toolchain for that architecture.
 
-The musl builds need **musl 1.2.5 or newer**, which is Alpine 3.20 and later.
-They are built inside an Alpine container pinned to one Alpine release, so the
+The musl builds need musl 1.2.5 or newer, which is Alpine 3.20 and later. They
+are built inside an Alpine container pinned to one Alpine release, so the
 requirement moves only when that pin does.
 
 **The `-musl` builds are not a fallback for an older glibc host.** They are
