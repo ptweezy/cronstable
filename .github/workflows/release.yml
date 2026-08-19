@@ -1212,13 +1212,17 @@ jobs:
               # ship a binary that no longer starts on bookworm-era hardware,
               # with CI green throughout.
               # No --no-exec-stack on this row, unlike every other glibc lane.
-              # Debian's mips64el port carries an executable stack everywhere:
-              # the kernel FPU emulator runs FP branch delay slots out of line
-              # on the user stack, so glibc is configured for it and every
-              # object inherits it. All 62 images here declare it, Debian's own
-              # libcrypto and libpython included, so the check can never pass.
-              # Debian settled it for bookworm in #1022787, and lintian
-              # disables its own executable-stack tag on MIPS.
+              # NOTE: no apostrophes anywhere below, comments included. This
+              # whole script is the argument of a single-quoted sh -euc, so
+              # one would close the quote and strand the rest.
+              # The Debian mips64el port carries an executable stack
+              # everywhere: the kernel FPU emulator runs FP branch delay slots
+              # out of line on the user stack, so glibc is configured for it
+              # and every object inherits it. All 62 images here declare it,
+              # including the libcrypto and libpython that Debian itself
+              # ships, so the check can never pass. Debian settled it for
+              # bookworm in #1022787, and lintian disables the same tag on
+              # MIPS.
               /v/bin/python /src/.github/scripts/elf_floor.py dist/cronstable --max-glibc 2.36
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
             '
