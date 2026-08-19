@@ -2,6 +2,21 @@
 
 ## 1.2.44
 
+- Releases now attach `cronstable-linux-mips64le`, a 64-bit little-endian
+  MIPS binary for glibc hosts such as Loongson and Cavium Octeon
+  machines. It is built in an emulated Debian bookworm container, the
+  last Debian suite carrying that port, against the Python 3.11 packaged
+  there. No MIPS wheels are published for anything, so the whole
+  dependency stack and the PyInstaller bootloader are compiled from
+  source; `uvloop`, `pynacl` and `zeroconf` all build, while `orjson`
+  does not, and that binary uses the standard library JSON encoder.
+  There is no musl MIPS build, because Alpine has no MIPS port.
+- Every Windows, FreeBSD and MIPS binary now goes through one shared
+  architecture check, `.github/scripts/assert_arch.py`, which reads the
+  PE machine field or the ELF class, endianness and machine rather than
+  parsing the output of `file`. All three ELF fields are compared
+  together, since `EM_MIPS` alone does not separate 64-bit little-endian
+  MIPS from the 32-bit and big-endian variants.
 - Releases now attach FreeBSD binaries, `cronstable-freebsd-amd64` and
   `cronstable-freebsd-arm64`, for FreeBSD 14 and 15 hosts such as
   TrueNAS, pfSense and OPNsense. PyInstaller cannot cross-compile and no

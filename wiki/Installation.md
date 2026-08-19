@@ -213,6 +213,7 @@ assets, each built for its own platform and architecture:
 | `cronstable-linux-ppc64le` | Linux | glibc, ppc64le | 64-bit little-endian POWER (IBM POWER) for glibc hosts. |
 | `cronstable-linux-s390x` | Linux | glibc, s390x | IBM Z (s390x, big-endian) for glibc hosts. |
 | `cronstable-linux-riscv64` | Linux | glibc, riscv64 | 64-bit RISC-V for glibc hosts. |
+| `cronstable-linux-mips64le` | Linux | glibc, mips64el | 64-bit little-endian MIPS, such as Loongson and Cavium Octeon hardware. |
 | `cronstable-linux-amd64-musl` | Linux | musl, x86_64 | For Alpine and other musl hosts. |
 | `cronstable-linux-arm64-musl` | Linux | musl, arm64 | For Alpine and other musl hosts. |
 | `cronstable-linux-i686-musl` | Linux | musl, 32-bit x86 | 32-bit x86 (i686) for Alpine and other musl hosts. |
@@ -245,6 +246,13 @@ hosts. They build inside a container: `i686` natively on the x86-64 runner, the
 rest under QEMU emulation. The `riscv64` builds cover 64-bit RISC-V for both
 glibc and musl. The musl-only `armv6` build extends to older 32-bit ARM, such as
 a Raspberry Pi 1 or Zero. There is no glibc `armv6` build.
+
+The `mips64le` build covers 64-bit little-endian MIPS on glibc hosts. It is
+built in an emulated Debian bookworm container, the last Debian suite that
+carries this port. Everything in it is compiled from source, because no MIPS
+wheels are published. `orjson` is the one piece that does not build there, so
+that binary uses the standard library JSON encoder. There is no musl MIPS
+build, because Alpine has no MIPS port.
 
 macOS builds cover both Apple Silicon and Intel.
 

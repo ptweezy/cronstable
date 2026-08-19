@@ -793,6 +793,124 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Self-contained MIPS binaries. Its own job rather than a `binaries-container`
+  # row because every assumption that job makes is different here: there is no
+  # mips variant of the `python:3.14-*` images, so the base is Debian itself and
+  # Python comes from apt (3.11, the newest packaged for this port; the project
+  # floor is 3.10). Bookworm also marks its interpreter externally managed
+  # (PEP 668), so the build installs into a venv instead of the interpreter pip
+  # that lane uses.
+  #
+  # Debian bookworm is the last suite carrying mips64el, and its Docker
+  # per-architecture repository is still rebuilt monthly. The multi-arch
+  # `library/debian` manifest list does NOT include mips64el; only the per-arch
+  # `mips64le/debian` repository does, which is why the pull below is spelled
+  # out rather than going through pull_base.
+  #
+  # Everything compiles from source here, PyInstaller included: no mips wheel
+  # exists on PyPI for anything, and PyInstaller builds its own bootloader onto
+  # its `mips` machine tag. That is deliberate. Build time is not the constraint
+  # on this lane, and the binary it produces is smaller than the amd64 one.
+  binaries-mips:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: mips64le
+            platform: linux/mips64le
+            image: mips64le/debian:bookworm-slim
+            # 64-bit, little-endian, EM_MIPS. All three are asserted together
+            # because e_machine alone is not an architecture: EM_MIPS covers
+            # 32-bit and big-endian MIPS too.
+            archspec: elf:2:1:8
+    runs-on: ubuntu-24.04
+    # Emulated MIPS compiles the whole dependency stack plus a bootloader.
+    # Generous on purpose; a row still going at this point is wedged, not slow.
+    timeout-minutes: 300
+    steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
+      - uses: actions/checkout@v7.0.1
+      # Deliberately NO pip cache, unlike binaries-container. The Actions cache
+      # is one 10 GB pool per repository and is already over it, so a new writer
+      # would evict caches the other lanes depend on to buy time this lane does
+      # not need.
+      - uses: docker/setup-qemu-action@v4.2.0
+      - name: Pull the build image
+        run: |
+          set -euo pipefail
+          . .github/scripts/retry.sh
+          # NOT pull_base: that helper rewrites the image into the `library/`
+          # namespace for its mirror failover, and this is a per-architecture
+          # repository the mirrors do not carry. Plain retried pull instead.
+          retry 5 docker pull --platform ${{ matrix.platform }} ${{ matrix.image }}
+      - name: Build binary (${{ matrix.arch }} container)
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e PIP_RETRIES -e PIP_TIMEOUT \
+            -v "$PWD:/src" -w /src \
+            ${{ matrix.image }} sh -euc '
+              # The checkout is mounted at /src, so the runner-side retry helper
+              # is reachable in here too. apt does not retry hard enough on its
+              # own and a failed index fetch is a hard job failure.
+              . /src/.github/scripts/retry.sh
+              export DEBIAN_FRONTEND=noninteractive
+              # Python plus a C toolchain: aiohttp, psutil and the extras below
+              # are all source builds, and so is the PyInstaller bootloader.
+              retry 5 apt-get -o Acquire::Retries=5 -qq update
+              retry 5 apt-get -o Acquire::Retries=5 -qq install -y --no-install-recommends \
+                python3 python3-venv python3-dev build-essential zlib1g-dev libffi-dev pkg-config
+              python3 -VV
+              python3 -m venv /v
+              retry 5 /v/bin/pip install --upgrade pip setuptools wheel
+              # install_extra.sh / install_orjson.sh read these.
+              PIP=/v/bin/pip
+              PY=/v/bin/python
+              export PIP PY
+              # Not wrapped in retry: with no mips wheel on PyPI this COMPILES
+              # the bootloader, and retry.sh is for network operations only.
+              # Retrying a deterministic compile failure just multiplies it.
+              /v/bin/pip install pyinstaller==6.22.1   # pin matches the other binary jobs
+              /v/bin/pip install .                     # bakes the pinned version into cronstable/version.py
+              # Extras ride the container lane policy set: best-effort for the
+              # compiled ones, hard only for pure-Python zeroconf. uvloop and
+              # pynacl both build and verify here. orjson does not: it is Rust,
+              # and mips64el has neither a rustup host toolchain nor a distro
+              # rustc past the orjson MSRV, so RUST_SETUP stays unset and the
+              # script falls back to the stdlib json encoder (cronstable/_json),
+              # which is byte-compatible.
+              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+              sh pyinstaller/install_orjson.sh
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+              /v/bin/pyinstaller pyinstaller/cronstable.spec
+              dist/cronstable --version          # smoke test: fails the job if the bundle is broken
+              # Whenever the build env kept pynacl, the frozen binary must reach
+              # it (and zeroconf) too: the push-plus-bonjour config validates
+              # only when both import inside the bundle.
+              if /v/bin/python -c "import nacl" 2>/dev/null; then
+                dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+              fi
+              # cli_job_smoke.sh is deliberately not run here: it needs a
+              # daemon, loopback HTTP and curl, and this row is emulated. The
+              # env scrub it proves is shared Python code, identical everywhere.
+              /v/bin/python /src/.github/scripts/assert_arch.py \
+                dist/cronstable ${{ matrix.archspec }}
+              mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
+            '
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-linux-${{ matrix.arch }}
+          path: dist/cronstable-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
   # Self-contained macOS binaries. The shipped pair is macOS 15 (arm64 + amd64),
   # signed + notarized on a release. macOS 26 (Tahoe) is built too for early
   # OS-version breakage signal, but it is CI-ONLY: continue-on-error so a flaky
@@ -1105,22 +1223,10 @@ jobs:
             # rather than grepping `file`, whose prose differs between
             # versions and across arches.
             case "${{ matrix.arch }}" in
-              amd64) want=62 ;;    # EM_X86_64
-              arm64) want=183 ;;   # EM_AARCH64
+              amd64) spec=elf:2:1:62 ;;    # 64-bit LE, EM_X86_64
+              arm64) spec=elf:2:1:183 ;;   # 64-bit LE, EM_AARCH64
             esac
-            venv/bin/python -c '
-            import struct, sys
-            path, want = sys.argv[1], int(sys.argv[2])
-            with open(path, "rb") as fobj:
-                head = fobj.read(20)
-            if head[:4] != b"\x7fELF":
-                sys.exit("{}: not an ELF image".format(path))
-            machine = struct.unpack_from("<H", head, 0x12)[0]
-            if machine != want:
-                sys.exit("{}: ELF e_machine {}, expected {}".format(
-                    path, machine, want))
-            print("{}: ELF e_machine {}".format(path, machine))
-            ' dist/cronstable "$want"
+            venv/bin/python .github/scripts/assert_arch.py dist/cronstable "$spec"
             mv dist/cronstable "dist/cronstable-freebsd-${{ matrix.arch }}"
             # Keep the copyback to the artifact: the venv and PyInstaller's
             # work tree are hundreds of megabytes of rsync the host has no
@@ -1251,24 +1357,11 @@ jobs:
           # Machine field rather than grepping `file`, whose prose differs
           # between versions and across these three arches.
           case "${{ matrix.arch }}" in
-            amd64) want=8664 ;;   # IMAGE_FILE_MACHINE_AMD64
-            arm64) want=aa64 ;;   # IMAGE_FILE_MACHINE_ARM64
-            i686)  want=014c ;;   # IMAGE_FILE_MACHINE_I386
+            amd64) spec=pe:8664 ;;   # IMAGE_FILE_MACHINE_AMD64
+            arm64) spec=pe:aa64 ;;   # IMAGE_FILE_MACHINE_ARM64
+            i686)  spec=pe:014c ;;   # IMAGE_FILE_MACHINE_I386
           esac
-          uv run python -c '
-          import struct, sys
-          path, want = sys.argv[1], int(sys.argv[2], 16)
-          with open(path, "rb") as fobj:
-              blob = fobj.read()
-          off = struct.unpack_from("<I", blob, 0x3c)[0]
-          if blob[off:off + 4] != b"PE\x00\x00":
-              sys.exit("{}: not a PE image".format(path))
-          machine = struct.unpack_from("<H", blob, off + 4)[0]
-          if machine != want:
-              sys.exit("{}: COFF machine 0x{:04x}, expected 0x{:04x}".format(
-                  path, machine, want))
-          print("{}: COFF machine 0x{:04x}".format(path, machine))
-          ' dist/cronstable.exe "$want"
+          uv run python .github/scripts/assert_arch.py dist/cronstable.exe "$spec"
           mv dist/cronstable.exe "dist/cronstable-windows-${{ matrix.arch }}.exe"
       - uses: actions/upload-artifact@v7.0.1
         with:
@@ -2019,6 +2112,7 @@ jobs:
       - dist
       - binaries
       - binaries-container
+      - binaries-mips
       - binaries-macos
       - binaries-freebsd
       - binaries-windows
@@ -2118,6 +2212,7 @@ jobs:
              binaries/cronstable-linux-i686 binaries/cronstable-linux-armv7 \
              binaries/cronstable-linux-ppc64le binaries/cronstable-linux-s390x \
              binaries/cronstable-linux-riscv64 \
+             binaries/cronstable-linux-mips64le \
              binaries/cronstable-linux-amd64-musl binaries/cronstable-linux-arm64-musl \
              binaries/cronstable-linux-i686-musl binaries/cronstable-linux-armv7-musl \
              binaries/cronstable-linux-ppc64le-musl binaries/cronstable-linux-s390x-musl \
@@ -2230,6 +2325,7 @@ jobs:
             binaries/cronstable-linux-ppc64le
             binaries/cronstable-linux-s390x
             binaries/cronstable-linux-riscv64
+            binaries/cronstable-linux-mips64le
             binaries/cronstable-linux-amd64-musl
             binaries/cronstable-linux-arm64-musl
             binaries/cronstable-linux-i686-musl

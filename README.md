@@ -285,7 +285,8 @@ Upgrade later with `brew upgrade cronstable` or
 Alternatively, download a self-contained binary from GitHub:
 <https://github.com/ptweezy/cronstable/releases>. Every release attaches
 binaries for Linux (glibc and musl builds for `amd64`, `arm64`, `i686`,
-`armv7`, `ppc64le`, `s390x` and `riscv64`, plus a musl-only `armv6`), macOS
+`armv7`, `ppc64le`, `s390x` and `riscv64`, plus a musl-only `armv6` and a
+glibc-only `mips64le`), macOS
 (`amd64` and `arm64`, signed and notarized by Apple), FreeBSD (`amd64` and
 `arm64`) and Windows (`amd64`, `arm64` and `i686`). Python is not required on
 the target system. It is embedded in the executable:

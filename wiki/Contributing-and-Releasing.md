@@ -191,6 +191,7 @@ The GitHub Release (`softprops/action-gh-release@v3`) attaches:
 - `dist/*.whl`, `dist/*.tar.gz`
 - `cronstable-linux-{amd64,arm64,i686,armv7,ppc64le,s390x,riscv64}` (glibc)
 - the same seven arches with a `-musl` suffix, such as `cronstable-linux-amd64-musl` … `cronstable-linux-riscv64-musl`, **plus** `cronstable-linux-armv6-musl` (armv6 is musl-only)
+- `cronstable-linux-mips64le` (glibc only; built on Debian bookworm under emulation, Python 3.11, no `orjson`)
 - `cronstable-macos-amd64`, `cronstable-macos-arm64`
 - `cronstable-freebsd-amd64`, `cronstable-freebsd-arm64` (built in a FreeBSD 14 VM; arm64 under full-system emulation)
 - `cronstable-windows-amd64.exe`, `cronstable-windows-arm64.exe`, `cronstable-windows-i686.exe`
