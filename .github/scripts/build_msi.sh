@@ -9,7 +9,7 @@
 #
 #     sh .github/scripts/build_msi.sh <arch> <version> <payload> <out> [bump-patch]
 #
-#     arch      amd64 | arm64 (the release asset spelling)
+#     arch      amd64 | arm64 | i686 (the release asset spelling)
 #     version   full version; a setuptools_scm dev/local suffix is
 #               stripped here (ProductVersion must be numeric X.Y.Z)
 #     payload   the PyInstaller one-directory build (dist/cronstable)
@@ -51,9 +51,16 @@ if [ "${5:-}" = "bump-patch" ]; then
   msiver="${msiver%.*}.$((${msiver##*.} + 1))"
 fi
 
+# i686 builds an x86 package. On a 64-bit host Windows Installer then
+# redirects it to "Program Files (x86)" and the WOW6432Node registry view;
+# on a 32-bit host, the only place this artifact is needed, both resolve to
+# the plain paths. The .wxs needs no arch conditionals for that: it uses
+# ProgramFiles6432Folder, and its RegistrySearch reads back through the same
+# view its RegistryValue wrote.
 case "$arch" in
   amd64) wixarch=x64 ;;
   arm64) wixarch=arm64 ;;
+  i686)  wixarch=x86 ;;
   *) echo "build_msi.sh: unknown arch '$arch'" >&2; exit 2 ;;
 esac
 

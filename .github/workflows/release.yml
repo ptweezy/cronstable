@@ -1281,6 +1281,7 @@ jobs:
       - name: Smoke-test MSI (install, verify, uninstall)
         env:
           ARCH: ${{ matrix.arch }}
+          PFSUFFIX: ${{ matrix.pfsuffix }}
         run: |
           set -euo pipefail
           . .github/scripts/msi_smoke.sh
@@ -1316,6 +1317,8 @@ jobs:
         env:
           VERSION: ${{ needs.version.outputs.new }}
           ARCH: ${{ matrix.arch }}
+          PFSUFFIX: ${{ matrix.pfsuffix }}
+          REGFLAG: ${{ matrix.regflag }}
         run: |
           set -euo pipefail
           . .github/scripts/msi_smoke.sh
@@ -1341,7 +1344,10 @@ jobs:
           # The probe found the remembered directory: the start
           # component's marker exists and the service reaches RUNNING
           # (the config in $cfg already passed --validate-config).
-          MSYS2_ARG_CONV_EXCL='*' reg query 'HKLM\SOFTWARE\cronstable' /v ServiceStartedByMsi
+          # REGFLAG picks the view the package actually wrote: a 32-bit
+          # package on this 64-bit host lands under WOW6432Node, and an
+          # unqualified query would miss it and read as a broken probe.
+          MSYS2_ARG_CONV_EXCL='*' reg query 'HKLM\SOFTWARE\cronstable' /v ServiceStartedByMsi "$REGFLAG"
           for _ in $(seq 1 15); do
             sc query cronstable | grep -q 'RUNNING' && break
             sleep 2
@@ -1353,7 +1359,7 @@ jobs:
           # handler posts the reparse onto the loop, whose log line
           # lands in the bootstrap log (smoke-push.yaml has no logging:
           # section to replace it).
-          "/c/Program Files/cronstable/cronstable.exe" service reload
+          "/c/Program Files${PFSUFFIX}/cronstable/cronstable.exe" service reload
           for _ in $(seq 1 15); do
             grep -q 'service control PARAMCHANGE' "$cfg/logs/cronstable-service.log" 2>/dev/null && break
             sleep 1
@@ -1718,14 +1724,15 @@ jobs:
   # cannot sign its own build, and keeping id-token: write out of the
   # build lanes means their third-party build code can never mint a
   # signing token. Authenticode is architecture-agnostic; one runner
-  # signs both arches' PEs.
+  # signs every arch's PEs.
   #
   # The payload exe must be signed before it is packaged, so this job
-  # unzips both zips, signs, re-zips, rebuilds both MSIs from the signed
+  # unzips each zip, signs, re-zips, rebuilds every MSI from the signed
   # tree with the same pinned WiX, and signs those. The signed amd64 MSI
   # gets a real msiexec round trip here; the arm64 MSI cannot execute on
-  # this runner, and binaries-windows' native smoke already proved the
-  # .wxs semantics this same run on the unsigned twin.
+  # this runner and the i686 one installs to a redirected directory that
+  # is not the path this step asserts, and binaries-windows' native smoke
+  # already proved the .wxs semantics this same run on each unsigned twin.
   #
   # Missing secrets warn and the release ships unsigned, the macOS
   # lane's rule. A signing failure with the secrets present fails the
@@ -1802,12 +1809,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out exes
-          for arch in amd64 arm64; do
+          for arch in amd64 arm64 i686; do
             python -c "import zipfile; zipfile.ZipFile('signdir/cronstable-windows-${arch}.zip').extractall('work/${arch}')"
             test -f "work/${arch}/cronstable/cronstable.exe"
             cp "signdir/cronstable-windows-${arch}.exe" exes/
           done
-      # Three PE signing calls: the staged one-file exes, then each
+      # Four PE signing calls: the staged one-file exes, then each
       # payload's root exe. The filter with recursion off keeps the
       # third-party DLLs under _internal out of our signature. Every
       # call goes through the local action, which retries a failed
@@ -1846,6 +1853,16 @@ jobs:
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
           files-folder: ${{ github.workspace }}\work\arm64\cronstable
           files-folder-filter: exe
+      - name: Sign the i686 payload exe
+        if: steps.decide.outputs.signed == 'true'
+        uses: ./.github/actions/sign-artifacts
+        with:
+          label: the i686 payload exe
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\work\i686\cronstable
+          files-folder-filter: exe
       - name: Re-zip the signed payloads
         if: steps.decide.outputs.signed == 'true'
         run: |
@@ -1853,7 +1870,7 @@ jobs:
           # Same shape the build lane produced: a single top-level
           # cronstable/ folder, so extracting into C:\Program Files
           # yields the documented path.
-          for arch in amd64 arm64; do
+          for arch in amd64 arm64 i686; do
             python -c "import shutil; shutil.make_archive('out/cronstable-windows-${arch}', 'zip', root_dir='work/${arch}', base_dir='cronstable')"
             cp "exes/cronstable-windows-${arch}.exe" out/
           done
@@ -1868,7 +1885,7 @@ jobs:
           # cannot drift from the MSI the gate's msiexec smoke proved.
           # -arch is metadata, so this x64 runner builds the arm64
           # package too.
-          for arch in amd64 arm64; do
+          for arch in amd64 arm64 i686; do
             sh .github/scripts/build_msi.sh "$arch" "$VERSION" \
               "work/${arch}/cronstable" "out/cronstable-windows-${arch}.msi"
           done
@@ -1895,8 +1912,8 @@ jobs:
         run: |
           $files = @(Get-ChildItem out -File | Where-Object Extension -ne '.zip') +
                    @(Get-ChildItem work\*\cronstable\*.exe -File)
-          if ($files.Count -lt 6) {
-            throw "expected at least 6 signed files (2 exes, 2 MSIs, 2 payload exes), found $($files.Count)"
+          if ($files.Count -lt 9) {
+            throw "expected at least 9 signed files (3 exes, 3 MSIs, 3 payload exes), found $($files.Count)"
           }
           foreach ($f in $files) {
             $sig = Get-AuthenticodeSignature $f.FullName
@@ -1934,10 +1951,13 @@ jobs:
           path: |
             out/cronstable-windows-amd64.exe
             out/cronstable-windows-arm64.exe
+            out/cronstable-windows-i686.exe
             out/cronstable-windows-amd64.zip
             out/cronstable-windows-arm64.zip
+            out/cronstable-windows-i686.zip
             out/cronstable-windows-amd64.msi
             out/cronstable-windows-arm64.msi
+            out/cronstable-windows-i686.msi
           if-no-files-found: error
           retention-days: 7
 
@@ -1951,6 +1971,7 @@ jobs:
       - binaries
       - binaries-container
       - binaries-macos
+      - binaries-freebsd
       - binaries-windows
       - sign-windows
       - docker
@@ -2053,9 +2074,13 @@ jobs:
              binaries/cronstable-linux-ppc64le-musl binaries/cronstable-linux-s390x-musl \
              binaries/cronstable-linux-riscv64-musl binaries/cronstable-linux-armv6-musl \
              binaries/cronstable-macos-amd64 binaries/cronstable-macos-arm64 \
+             binaries/cronstable-freebsd-amd64 binaries/cronstable-freebsd-arm64 \
              binaries/cronstable-windows-amd64.exe binaries/cronstable-windows-arm64.exe \
+             binaries/cronstable-windows-i686.exe \
              binaries/cronstable-windows-amd64.zip binaries/cronstable-windows-arm64.zip \
+             binaries/cronstable-windows-i686.zip \
              binaries/cronstable-windows-amd64.msi binaries/cronstable-windows-arm64.msi \
+             binaries/cronstable-windows-i686.msi \
              "$work"/
           ( cd "$work" && sha256sum -- * ) > SHA256SUMS
           cat SHA256SUMS
@@ -2166,12 +2191,17 @@ jobs:
             binaries/cronstable-linux-armv6-musl
             binaries/cronstable-macos-amd64
             binaries/cronstable-macos-arm64
+            binaries/cronstable-freebsd-amd64
+            binaries/cronstable-freebsd-arm64
             binaries/cronstable-windows-amd64.exe
             binaries/cronstable-windows-arm64.exe
+            binaries/cronstable-windows-i686.exe
             binaries/cronstable-windows-amd64.zip
             binaries/cronstable-windows-arm64.zip
+            binaries/cronstable-windows-i686.zip
             binaries/cronstable-windows-amd64.msi
             binaries/cronstable-windows-arm64.msi
+            binaries/cronstable-windows-i686.msi
 
   # Build + push the multi-arch container images at the just-released version.
   # Runs after `release` (so the tag it checks out exists) and is thus gated on
