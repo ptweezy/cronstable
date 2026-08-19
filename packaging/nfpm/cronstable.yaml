@@ -1,0 +1,31 @@
+# cronstable configuration, installed by the .deb and .rpm packages.
+#
+# The package marks this file as configuration, so your edits survive an
+# upgrade. Everything cronstable does is driven from here: see
+# https://github.com/ptweezy/cronstable/wiki/Configuration-Reference for the
+# full set of sections, and `cronstable --validate-config` to check a change
+# before restarting the service.
+#
+# Every file in /etc/cronstable.d is read and merged, so job definitions can
+# live in their own files beside this one.
+
+# The durable store. With a path set, run history, in-flight run records,
+# restart-surviving retries and @reboot bookkeeping all persist across a
+# restart. systemd creates and owns this directory (StateDirectory=cronstable).
+state:
+  path: /var/lib/cronstable
+
+# The dashboard and HTTP API, off until you give it a listener:
+#
+# web:
+#   listen:
+#     - http://127.0.0.1:8080
+
+# Jobs. Uncomment to schedule one; `schedule` takes cron syntax, the named
+# forms (@hourly, @reboot), or a mapping of fields.
+#
+# jobs:
+#   - name: heartbeat
+#     command: date
+#     schedule: '*/5 * * * *'
+#     captureStderr: true
