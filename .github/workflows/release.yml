@@ -615,9 +615,15 @@ jobs:
             pysha: 'fc000e5c8651aaa81113aa55868300ebb9debff71d6d96b2a841f589d5057668'
             floor: '2.31'
             archspec: elf:1:1:40    # 32-bit, little-endian, EM_ARM
+            # Hard-float, and nothing in the bundle may need above ARMv7.
+            armgate: '--arm-float hard --max-arm-arch v7 --max-arm-fp 4'
             nacl: soft
-            # rustup publishes rust-std for armv7 but no HOST toolchain, so
-            # there is no Rust to source-build orjson with on this row.
+            # No Rust here, which is a cost decision rather than a limitation:
+            # rustup does publish host tools for armv7-unknown-linux-gnueabihf
+            # (the soft-float gnueabi triple is the one that lacks them), but
+            # building a Rust toolchain's worth of orjson under QEMU costs more
+            # than orjson buys. It is best-effort on every lane by design, and
+            # the stdlib fallback (cronstable/_json) is byte-compatible.
             rust: '0'
             native: '0'
     runs-on: ${{ matrix.runner }}
@@ -726,9 +732,9 @@ jobs:
               sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
               # Bundle orjson (the `speedups` extra): a wheel on amd64/arm64,
               # else a Rust source build behind RUST_SETUP. armv7 passes no
-              # RUST_SETUP: rustup publishes rust-std but no HOST toolchain for
-              # armv7-unknown-linux-gnueabihf, so that row falls back to the
-              # stdlib json encoder (cronstable/_json), which is byte-compatible.
+              # RUST_SETUP by choice (see the matrix comment), so that row falls
+              # back to the stdlib json encoder (cronstable/_json), which is
+              # byte-compatible.
               RUST_SETUP=""
               if [ "${{ matrix.rust }}" = "1" ]; then
                 RUST_SETUP="$RUST_SETUP_CMD"
@@ -773,7 +779,7 @@ jobs:
               # additionally catches an interpreter built with an executable
               # stack, which dies on SELinux-hardened hosts.
               $PY /src/.github/scripts/elf_floor.py dist/cronstable \
-                --max-glibc ${{ matrix.floor }} --no-exec-stack
+                --max-glibc ${{ matrix.floor }} --no-exec-stack ${{ matrix.armgate }}
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
             '
       # The container runs as root and pip creates its cache files via
@@ -861,8 +867,23 @@ jobs:
           - { arch: amd64, platform: linux/amd64, runner: ubuntu-24.04 }
           - { arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
           - { arch: i686, platform: linux/386, runner: ubuntu-24.04 }
-          - { arch: armv7, platform: linux/arm/v7, runner: ubuntu-24.04, qemu: true }
-          - { arch: armv6, platform: linux/arm/v6, runner: ubuntu-24.04, qemu: true }
+          # `armgate` is the ABI assertion elf_floor.py makes on 32-bit ARM,
+          # which no functional test can make for itself: the float ABI, and
+          # the newest instruction set anything in the bundle needs.
+          #
+          # `hostplat` is the fix for the ARMv6 wheel trap. Under QEMU an ARMv6
+          # container reports armv7l from uname, so pip cheerfully installs
+          # musllinux armv7l wheels (the whole aiohttp/multidict/yarl stack and
+          # every zeroconf Cython module publish them) whose object code uses
+          # ARMv7 instructions. The 1.2.41 armv6 binary shipped 27 such members
+          # and could not have run on a Raspberry Pi 1 at all, while passing
+          # every smoke test under emulation. _PYTHON_HOST_PLATFORM is
+          # sysconfig's cross-build hook: setting it makes pip generate armv6l
+          # tags, so those wheels stop being candidates and the C extensions
+          # compile in-container against Alpine's ARMv6 gcc instead. armgate
+          # then holds the result to it.
+          - { arch: armv7, platform: linux/arm/v7, runner: ubuntu-24.04, qemu: true, armgate: '--arm-float hard --max-arm-arch v7 --max-arm-fp 4' }
+          - { arch: armv6, platform: linux/arm/v6, runner: ubuntu-24.04, qemu: true, armgate: '--arm-float hard --max-arm-arch v6 --max-arm-fp 2', hostplat: linux-armv6l }
           - { arch: ppc64le, platform: linux/ppc64le, runner: ubuntu-24.04, qemu: true }
           - { arch: s390x, platform: linux/s390x, runner: ubuntu-24.04, qemu: true }
           - { arch: riscv64, platform: linux/riscv64, runner: ubuntu-24.04, qemu: true }
@@ -955,6 +976,13 @@ jobs:
               # i686 aiohttp stack; propcache on armv7). The full-wheel arches
               # leave the toolchain unused.
               ${{ matrix.toolchain }}
+              # See the hostplat comment in the matrix: this is what stops pip
+              # selecting armv7l wheels inside an ARMv6 container.
+              if [ -n "${{ matrix.hostplat }}" ]; then
+                _PYTHON_HOST_PLATFORM="${{ matrix.hostplat }}"
+                export _PYTHON_HOST_PLATFORM
+                python -c "import sysconfig; print(\"host platform:\", sysconfig.get_platform())"
+              fi
               pip install --upgrade pip
               pip install pyinstaller==6.22.1   # pin matches the other binary jobs
               pip install .                     # bakes the pinned version into cronstable/version.py
@@ -1011,8 +1039,12 @@ jobs:
               # green throughout. The musl rows set no floor and skip it: they
               # carry no GLIBC_ symbol versions, and their floor is held down
               # by the pinned Alpine tag instead.
+              gate=""
               if [ -n "${{ matrix.floor }}" ]; then
-                python /src/.github/scripts/elf_floor.py dist/cronstable --max-glibc ${{ matrix.floor }} --no-exec-stack
+                gate="--max-glibc ${{ matrix.floor }} --no-exec-stack"
+              fi
+              if [ -n "$gate" ] || [ -n "${{ matrix.armgate }}" ]; then
+                python /src/.github/scripts/elf_floor.py dist/cronstable $gate ${{ matrix.armgate }}
               fi
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
             '
@@ -1055,11 +1087,13 @@ jobs:
   # (PEP 668), so the build installs into a venv instead of the interpreter pip
   # that lane uses.
   #
-  # Debian bookworm is the last suite carrying mips64el, and its Docker
-  # per-architecture repository is still rebuilt monthly. The multi-arch
-  # `library/debian` manifest list does NOT include mips64el; only the per-arch
+  # Debian bookworm is the last suite carrying mips64el, and the multi-arch
+  # `library/debian` manifest list does NOT include it; only the per-arch
   # `mips64le/debian` repository does, which is why the pull below is spelled
-  # out rather than going through pull_base.
+  # out rather than going through pull_base. That repository is also frozen:
+  # mips64le was removed from the official-images definition for bookworm in
+  # August 2026, so the tag no longer moves and the base OS layer no longer
+  # gets patched. The archive pin below is the other half of the same story.
   #
   # Everything compiles from source here, PyInstaller included: no mips wheel
   # exists on PyPI for anything, and PyInstaller builds its own bootloader onto
@@ -1178,6 +1212,181 @@ jobs:
               # ship a binary that no longer starts on bookworm-era hardware,
               # with CI green throughout.
               /v/bin/python /src/.github/scripts/elf_floor.py dist/cronstable --max-glibc 2.36 --no-exec-stack
+              mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
+            '
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-linux-${{ matrix.arch }}
+          path: dist/cronstable-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # Self-contained binaries for the two legacy 32-bit ARM ABIs: glibc hard-float
+  # ARMv6 (Raspberry Pi 1, Zero, Zero W) and glibc soft-float armel (Kirkwood
+  # boxes: SheevaPlug, QNAP TS-x1x, D-Link DNS-320, Zyxel NSA325, Pogoplug).
+  #
+  # Its own job because neither base image comes from a family the other lanes
+  # know. Debian's armhf port is ARMv7, so `library/debian` and `python:3.14-*`
+  # cannot supply an ARMv6 base at all, and python-build-standalone publishes no
+  # ARMv6 target either. Python therefore comes from apt (3.11, the newest in
+  # bookworm; the project floor is 3.10), the same trade the MIPS lane makes.
+  #
+  # Everything compiles from source, PyInstaller included: PyPI publishes no
+  # ARMv6 or armel wheels.
+  #
+  # Two guards make these rows trustworthy, and both are load-bearing rather
+  # than decorative:
+  #
+  #   _PYTHON_HOST_PLATFORM is sysconfig's cross-build hook. Under QEMU these
+  #   containers report armv7l from uname, so without it pip installs armv7l
+  #   wheels whose object code the target CPUs cannot execute. Setting it makes
+  #   pip generate armv6l/armv5tel tags instead, so those wheels stop being
+  #   candidates and the C extensions compile in-container.
+  #
+  #   QEMU_CPU pins the emulated core to the real target (ARM1176 is the Pi 1,
+  #   ARM926 is Kirkwood), so an ARMv7 instruction that did sneak in faults
+  #   during the build rather than on a user's hardware. elf_floor.py then
+  #   asserts the float ABI and Tag_CPU_arch statically over the whole bundle.
+  binaries-arm-legacy:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: armv6
+            platform: linux/arm/v6
+            # Genuine linux/arm/v6 glibc (measured: config blob says
+            # architecture arm, variant v6), rebuilt weekly, apt tracks
+            # mirrordirector.raspbian.org with only the main component
+            # enabled. Every other candidate is ARMv7-only,
+            # musl-only, or years stale: dtcooper/raspberrypi-os is arm64 and
+            # arm/v7, arm32v6/debian does not exist, arm32v6/python is Alpine,
+            # and the balenalib armv6 images stopped in 2025.
+            #
+            # Pinned by tag rather than digest on purpose, unlike the armel row
+            # below: Raspbian's OpenSSL and zlib travel inside the frozen
+            # binary, so a base that keeps getting patched is worth more here
+            # than a byte-identical build. It is a personal namespace with no
+            # support promise, which is the cost of there being no official
+            # ARMv6 base at all.
+            image: tianon/raspbian:bookworm-slim
+            # ARM1176JZF-S, the Pi 1/Zero core: ARMv6KZ with VFPv2.
+            qemu_cpu: arm1176
+            hostplat: linux-armv6l
+            armgate: '--arm-float hard --max-arm-arch v6 --max-arm-fp 2'
+            floor: '2.36'
+          - arch: armel
+            platform: linux/arm/v5
+            # Pinned by digest on purpose: arm32v5 was dropped from the
+            # bookworm official-images stanza in August 2026, so this tag is
+            # frozen at its final build and will never be rebuilt. Neither will
+            # the OS layer be patched, because bookworm-security carries no
+            # armel component at all. That is the price of serving this
+            # hardware; the alternative is not shipping the row.
+            image: arm32v5/debian:bookworm-slim@sha256:cf9397e3198b2c002eb360586d341ba89154634198a26c578eb096b533b212cd
+            # ARM926EJ-S, the Kirkwood core: ARMv5TE, no VFP, so soft-float.
+            qemu_cpu: arm926
+            hostplat: linux-armv5tel
+            # Rewrite sources to bookworm main only. The image's default list
+            # includes bookworm-security, whose Release file dropped armel when
+            # bookworm entered LTS (its Architectures line is amd64 arm64 armhf
+            # i386 ppc64el), so apt spends the build warning about a component
+            # that cannot exist. main itself is alive and still serving armel;
+            # snapshot.debian.org has a frozen slice if that ever changes.
+            sources: 'deb http://deb.debian.org/debian bookworm main'
+            armgate: '--arm-float soft --max-arm-arch v5 --max-arm-fp 0'
+            floor: '2.36'
+    runs-on: ubuntu-24.04
+    # Emulating an ARM1176 while compiling the whole dependency stack plus a
+    # bootloader is slow even by this workflow's standards. Generous on purpose;
+    # a row still going at this point is wedged, not slow.
+    timeout-minutes: 360
+    steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
+      - uses: actions/checkout@v7.0.1
+      # Deliberately NO pip cache, like binaries-mips: the Actions cache is one
+      # 10 GB pool per repository and is already over it, so a new writer would
+      # evict caches the other lanes depend on.
+      - uses: docker/setup-qemu-action@v4.2.0
+      - name: Pull the build image
+        run: |
+          set -euo pipefail
+          . .github/scripts/retry.sh
+          # NOT pull_base: one image is third-party and the other is a
+          # per-architecture repository, and that helper's mirror failover
+          # rewrites both into Docker Hub's `library/` namespace.
+          retry 5 docker pull --platform ${{ matrix.platform }} ${{ matrix.image }}
+      - name: Build binary (${{ matrix.arch }})
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e PIP_RETRIES -e PIP_TIMEOUT \
+            -e QEMU_CPU=${{ matrix.qemu_cpu }} \
+            -e _PYTHON_HOST_PLATFORM=${{ matrix.hostplat }} \
+            -v "$PWD:/src" -w /src \
+            ${{ matrix.image }} sh -euc '
+              . /src/.github/scripts/retry.sh
+              export DEBIAN_FRONTEND=noninteractive
+              if [ -n "${{ matrix.sources }}" ]; then
+                echo "${{ matrix.sources }}" > /etc/apt/sources.list
+                rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
+              fi
+              # Python plus a C toolchain: every dependency here is a source
+              # build, and so is the PyInstaller bootloader.
+              retry 5 apt-get -o Acquire::Retries=5 -qq update
+              retry 5 apt-get -o Acquire::Retries=5 -qq install -y --no-install-recommends \
+                python3 python3-venv python3-dev build-essential zlib1g-dev libffi-dev pkg-config
+              python3 -VV
+              # Prove the two guards took effect before anything is installed
+              # against this interpreter. get_platform() is what pip derives its
+              # wheel tags from, so this line is the armv7-wheel fix, visible.
+              python3 -c "import sysconfig; print(\"wheel platform:\", sysconfig.get_platform())"
+              python3 -m venv /v
+              retry 5 /v/bin/pip install --upgrade pip setuptools wheel
+              # install_extra.sh / install_orjson.sh read these.
+              PIP=/v/bin/pip
+              PY=/v/bin/python
+              export PIP PY
+              # Not wrapped in retry: with no wheel on PyPI for either ABI this
+              # COMPILES the bootloader, and retry.sh is for network operations
+              # only. Retrying a deterministic compile failure multiplies it.
+              /v/bin/pip install pyinstaller==6.22.1   # pin matches the other binary jobs
+              /v/bin/pip install .                     # bakes the pinned version into cronstable/version.py
+              # Extras ride the container lane policy set: best-effort for the
+              # compiled ones, hard only for zeroconf, whose Cython modules are
+              # optional (its build swallows a failed extension build and the
+              # pure-Python implementation is equivalent). orjson is Rust and
+              # rustup publishes no host toolchain for either ABI, so
+              # RUST_SETUP stays unset and the binary uses the stdlib json
+              # encoder (cronstable/_json), which is byte-compatible.
+              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+              sh pyinstaller/install_orjson.sh
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+              /v/bin/pyinstaller pyinstaller/cronstable.spec
+              # Smoke test on the emulated target core, so an instruction the
+              # real hardware lacks faults here.
+              dist/cronstable --version
+              # Whenever the build env kept pynacl, the frozen binary must reach
+              # it (and zeroconf) too: the push-plus-bonjour config validates
+              # only when both import inside the bundle.
+              if /v/bin/python -c "import nacl" 2>/dev/null; then
+                dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+              fi
+              # cli_job_smoke.sh is deliberately not run here: it needs a
+              # daemon, loopback HTTP and curl, and this row is emulated. The
+              # env scrub it proves is shared Python code, identical everywhere.
+              #
+              # 32-bit, little-endian, EM_ARM. e_machine cannot tell the two ABIs
+              # apart, which is what the float-ABI half of the gate below is for.
+              /v/bin/python /src/.github/scripts/assert_arch.py dist/cronstable elf:1:1:40
+              /v/bin/python /src/.github/scripts/elf_floor.py dist/cronstable \
+                --max-glibc ${{ matrix.floor }} --no-exec-stack ${{ matrix.armgate }}
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
             '
       - uses: actions/upload-artifact@v7.0.1
@@ -2803,6 +3012,7 @@ jobs:
       - binaries
       - binaries-container
       - binaries-mips
+      - binaries-arm-legacy
       - binaries-loong64
       - binaries-macos
       - binaries-freebsd
@@ -2913,15 +3123,32 @@ jobs:
           cp dist/*.whl dist/*.tar.gz \
              binaries/cronstable-linux-amd64 binaries/cronstable-linux-arm64 \
              binaries/cronstable-linux-i686 binaries/cronstable-linux-armv7 \
+             binaries/cronstable-linux-armv6 binaries/cronstable-linux-armel \
              binaries/cronstable-linux-ppc64le binaries/cronstable-linux-s390x \
-             binaries/cronstable-linux-riscv64 \
-             binaries/cronstable-linux-mips64le              binaries/cronstable-linux-loong64 binaries/cronstable-linux-loong64-musl \
+             binaries/cronstable-linux-riscv64 binaries/cronstable-linux-loong64 \
+             binaries/cronstable-linux-mips64le \
              binaries/cronstable-linux-amd64-musl binaries/cronstable-linux-arm64-musl \
              binaries/cronstable-linux-i686-musl binaries/cronstable-linux-armv7-musl \
+             binaries/cronstable-linux-armv6-musl binaries/cronstable-linux-loong64-musl \
              binaries/cronstable-linux-ppc64le-musl binaries/cronstable-linux-s390x-musl \
-             binaries/cronstable-linux-riscv64-musl binaries/cronstable-linux-armv6-musl \
+             binaries/cronstable-linux-riscv64-musl \
+             binaries/cronstable-linux-amd64.deb binaries/cronstable-linux-arm64.deb \
+             binaries/cronstable-linux-i686.deb binaries/cronstable-linux-armv7.deb \
+             binaries/cronstable-linux-ppc64le.deb binaries/cronstable-linux-s390x.deb \
+             binaries/cronstable-linux-riscv64.deb \
+             binaries/cronstable-linux-amd64.rpm binaries/cronstable-linux-arm64.rpm \
+             binaries/cronstable-linux-i686.rpm binaries/cronstable-linux-armv7.rpm \
+             binaries/cronstable-linux-ppc64le.rpm binaries/cronstable-linux-s390x.rpm \
+             binaries/cronstable-linux-riscv64.rpm \
+             binaries/cronstable-linux-amd64.apk binaries/cronstable-linux-arm64.apk \
+             binaries/cronstable-linux-i686.apk binaries/cronstable-linux-armv7.apk \
+             binaries/cronstable-linux-armv6.apk binaries/cronstable-linux-ppc64le.apk \
+             binaries/cronstable-linux-s390x.apk binaries/cronstable-linux-riscv64.apk binaries/cronstable-linux-loong64.apk \
              binaries/cronstable-macos-amd64 binaries/cronstable-macos-arm64 \
-             binaries/cronstable-freebsd-amd64 binaries/cronstable-freebsd-arm64              binaries/cronstable-openbsd-amd64 binaries/cronstable-netbsd-amd64              binaries/cronstable-illumos-amd64              binaries/cronstable-linux-amd64.deb binaries/cronstable-linux-arm64.deb              binaries/cronstable-linux-i686.deb binaries/cronstable-linux-armv7.deb              binaries/cronstable-linux-ppc64le.deb binaries/cronstable-linux-s390x.deb              binaries/cronstable-linux-riscv64.deb              binaries/cronstable-linux-amd64.rpm binaries/cronstable-linux-arm64.rpm              binaries/cronstable-linux-i686.rpm binaries/cronstable-linux-armv7.rpm              binaries/cronstable-linux-ppc64le.rpm binaries/cronstable-linux-s390x.rpm              binaries/cronstable-linux-riscv64.rpm \
+             binaries/cronstable-freebsd-amd64 binaries/cronstable-freebsd-arm64 \
+             binaries/cronstable-freebsd-amd64.pkg binaries/cronstable-freebsd-arm64.pkg \
+             binaries/cronstable-openbsd-amd64 binaries/cronstable-netbsd-amd64 \
+             binaries/cronstable-illumos-amd64 \
              binaries/cronstable-windows-amd64.exe binaries/cronstable-windows-arm64.exe \
              binaries/cronstable-windows-i686.exe \
              binaries/cronstable-windows-amd64.zip binaries/cronstable-windows-arm64.zip \
@@ -3039,27 +3266,22 @@ jobs:
             binaries/cronstable-linux-arm64
             binaries/cronstable-linux-i686
             binaries/cronstable-linux-armv7
+            binaries/cronstable-linux-armv6
+            binaries/cronstable-linux-armel
             binaries/cronstable-linux-ppc64le
             binaries/cronstable-linux-s390x
             binaries/cronstable-linux-riscv64
-            binaries/cronstable-linux-mips64le
             binaries/cronstable-linux-loong64
-            binaries/cronstable-linux-loong64-musl
+            binaries/cronstable-linux-mips64le
             binaries/cronstable-linux-amd64-musl
             binaries/cronstable-linux-arm64-musl
             binaries/cronstable-linux-i686-musl
             binaries/cronstable-linux-armv7-musl
+            binaries/cronstable-linux-armv6-musl
+            binaries/cronstable-linux-loong64-musl
             binaries/cronstable-linux-ppc64le-musl
             binaries/cronstable-linux-s390x-musl
             binaries/cronstable-linux-riscv64-musl
-            binaries/cronstable-linux-armv6-musl
-            binaries/cronstable-macos-amd64
-            binaries/cronstable-macos-arm64
-            binaries/cronstable-freebsd-amd64
-            binaries/cronstable-freebsd-arm64
-            binaries/cronstable-openbsd-amd64
-            binaries/cronstable-netbsd-amd64
-            binaries/cronstable-illumos-amd64
             binaries/cronstable-linux-amd64.deb
             binaries/cronstable-linux-arm64.deb
             binaries/cronstable-linux-i686.deb
@@ -3074,6 +3296,24 @@ jobs:
             binaries/cronstable-linux-ppc64le.rpm
             binaries/cronstable-linux-s390x.rpm
             binaries/cronstable-linux-riscv64.rpm
+            binaries/cronstable-linux-amd64.apk
+            binaries/cronstable-linux-arm64.apk
+            binaries/cronstable-linux-i686.apk
+            binaries/cronstable-linux-armv7.apk
+            binaries/cronstable-linux-armv6.apk
+            binaries/cronstable-linux-ppc64le.apk
+            binaries/cronstable-linux-s390x.apk
+            binaries/cronstable-linux-riscv64.apk
+            binaries/cronstable-linux-loong64.apk
+            binaries/cronstable-macos-amd64
+            binaries/cronstable-macos-arm64
+            binaries/cronstable-freebsd-amd64
+            binaries/cronstable-freebsd-arm64
+            binaries/cronstable-freebsd-amd64.pkg
+            binaries/cronstable-freebsd-arm64.pkg
+            binaries/cronstable-openbsd-amd64
+            binaries/cronstable-netbsd-amd64
+            binaries/cronstable-illumos-amd64
             binaries/cronstable-windows-amd64.exe
             binaries/cronstable-windows-arm64.exe
             binaries/cronstable-windows-i686.exe

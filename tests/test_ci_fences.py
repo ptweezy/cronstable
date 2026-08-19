@@ -30,6 +30,10 @@ def _workflow():
         return YAML(typ="safe").load(fobj.read())
 
 
+def _yaml_load(text):
+    return YAML(typ="safe").load(text)
+
+
 def _tox_job():
     return _workflow()["jobs"]["tox"]
 
@@ -523,4 +527,75 @@ def test_package_dependencies_declare_the_floor_the_lane_enforces():
     assert not mismatched, (
         "packaged floor != the floor the build lane declares and elf_floor.py "
         "enforces, as {arch: (packaged, lane)}: {}".format(mismatched)
+    )
+
+
+def test_every_32_bit_arm_row_asserts_its_abi():
+    # On 32-bit ARM the glibc version is only half the ABI, and the other half
+    # is invisible to every functional test: the float ABI, and the newest
+    # instruction set anything in the bundle needs.  The 1.2.41 armv6 binary
+    # shipped 27 members of ARMv7 object code, because under QEMU an ARMv6
+    # container reports armv7l from uname and pip installed armv7l wheels; it
+    # passed every smoke test and could not have run on the Raspberry Pi 1 the
+    # row exists for.  elf_floor.py's --arm-float/--max-arm-arch checks are what
+    # catch that, so no ARM row may ship without them.
+    arm = {"armv5", "armv6", "armv7", "armel"}
+    missing = []
+    for name, job in _workflow()["jobs"].items():
+        for entry in (
+            job.get("strategy", {}).get("matrix", {}).get("include", []) or []
+        ):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("arch") in arm and not entry.get("armgate"):
+                missing.append((name, entry["arch"]))
+    assert not missing, (
+        "these 32-bit ARM rows declare no armgate, so nothing checks their "
+        "float ABI or instruction set: {}".format(sorted(missing))
+    )
+
+
+def test_nfpm_recipes_avoid_the_broken_tree_content_type():
+    # nfpm 2.47.0 emits a GNU base-256 tar mode header for `type: tree`
+    # entries, which apk-tools rejects outright (nfpm issue #1112; the fix
+    # landed upstream after that release and is in no released version).  The
+    # current recipes use explicit src/dst entries only, so they are unaffected,
+    # and one future `type: tree` edit would silently produce an Alpine package
+    # that cannot be installed.
+    for name in ("nfpm.yaml", "apk.yaml"):
+        path = os.path.join(ROOT, "packaging", "nfpm", name)
+        with open(path, encoding="utf-8") as fobj:
+            body = fobj.read()
+        assert "type: tree" not in body, (
+            "{} uses `type: tree`, which the pinned nfpm packages in a form "
+            "apk-tools rejects".format(name)
+        )
+
+
+def test_apk_packages_are_built_from_the_musl_binaries():
+    # nfpm never inspects what it packages, so an .apk built from the glibc
+    # manylinux binary installs cleanly on Alpine and then fails at exec, with
+    # nothing in the build able to notice.  The apk loop must therefore read the
+    # -musl artifacts, and its recipe must not carry a glibc dependency.
+    script = os.path.join(ROOT, ".github", "scripts", "build_packages.sh")
+    with open(script, encoding="utf-8") as fobj:
+        body = fobj.read()
+    apk_loop = body.split("while read -r arch alpine_arch")[-1]
+    assert "cronstable-linux-$arch-musl" in apk_loop, (
+        "the apk loop no longer reads the musl binaries"
+    )
+    assert "cronstable-linux-$arch-musl" not in body.split(
+        "while read -r arch alpine_arch"
+    )[0], "the deb/rpm loop reads a musl binary"
+    # And the recipe must declare no libc dependency: a musl binary carries its
+    # own requirement, and a glibc floor here would be both wrong and untested.
+    with open(
+        os.path.join(ROOT, "packaging", "nfpm", "apk.yaml"), encoding="utf-8"
+    ) as fobj:
+        recipe = _yaml_load(fobj.read())
+    assert not recipe.get("depends"), (
+        "the apk recipe declares dependencies: {}".format(recipe.get("depends"))
+    )
+    assert not recipe.get("overrides"), (
+        "the apk recipe carries format overrides it cannot use"
     )

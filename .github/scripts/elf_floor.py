@@ -1,4 +1,4 @@
-"""Assert the glibc floor of a frozen PyInstaller binary, from the bytes.
+"""Assert the ABI floor of a frozen PyInstaller binary, from the bytes.
 
 The floor a binary actually carries is an emergent property of the build
 environment: it is the highest ``GLIBC_x.y`` symbol version any member of the
@@ -9,7 +9,8 @@ throughout, because the smoke test runs on a runner whose glibc is newer than
 anything the binary needs.
 
     python .github/scripts/elf_floor.py dist/cronstable --max-glibc 2.17
-    python .github/scripts/elf_floor.py dist/cronstable --max-glibc 2.31 --no-exec-stack
+    python .github/scripts/elf_floor.py dist/cronstable --no-exec-stack \
+        --max-glibc 2.31
 
 The binary is a one-file build, so the bundled shared libraries live inside its
 appended CArchive rather than on disk.  This reads the archive directly: locate
@@ -24,6 +25,26 @@ segment is executable.  A libpython built with an executable stack ships fine
 and then dies at runtime on an SELinux-hardened host, which is the audience a
 low floor exists to reach (python-build-standalone shipped exactly that in its
 20260320 release).
+
+    python .github/scripts/elf_floor.py dist/cronstable --max-glibc 2.36 \
+        --arm-float hard --max-arm-arch v6
+
+On 32-bit ARM the glibc version is only half the story, and the other half is
+invisible to every functional test:
+
+``--arm-float`` compares each member's ``EF_ARM_ABI_FLOAT_HARD`` /
+``_SOFT`` flag against the ABI the lane claims.  A hard-float binary shipped
+under a soft-float name (or the reverse) names an interpreter the host does not
+have, and the failure reads like a corrupt download.
+
+``--max-arm-arch`` reads ``Tag_CPU_arch`` out of each member's
+``.ARM.attributes`` and fails when anything needs a newer instruction set than
+the lane targets.  This is the ARMv6 trap: under QEMU an ARMv6 container
+reports ``armv7l`` from ``uname``, so pip installs ``musllinux`` and
+``manylinux2014`` ``armv7l`` wheels whose object code uses ARMv7 instructions.
+Every smoke test passes under emulation, and the binary then dies with SIGILL
+on the Raspberry Pi 1 it was built for.  Nothing else in the pipeline can see
+that.
 
 Exits nonzero with the offending member and version named, so a failure says
 which dependency raised the floor rather than only that it moved.
@@ -44,8 +65,51 @@ TOC_ENTRY_FORMAT = "!IIIIBc"
 TOC_ENTRY_LENGTH = struct.calcsize(TOC_ENTRY_FORMAT)
 
 SHT_GNU_VERNEED = 0x6FFFFFFE
+SHT_ARM_ATTRIBUTES = 0x70000003
 PT_GNU_STACK = 0x6474E551
 PF_X = 0x1
+
+EM_ARM = 40
+EF_ARM_ABI_FLOAT_SOFT = 0x200
+EF_ARM_ABI_FLOAT_HARD = 0x400
+
+# Tag_CPU_arch, the .ARM.attributes tag that says which instruction set an
+# object needs (ARM ABI addenda, section 2.3.3).  The numbering is not a
+# ladder: 10 is ARMv7 while 11 and 12 are the ARMv6 microcontroller profiles
+# that come after it, so a "<= n" comparison is the wrong shape and this is a
+# named set per target instead.
+ARM_CPU_ARCH_TAG = 6
+# Tag_FP_arch, the floating-point unit an object needs.  A separate failure
+# mode from the integer ISA and a monotonic ladder, unlike Tag_CPU_arch: an
+# object can declare Tag_CPU_arch v6 and still contain VFPv3 code, which faults
+# on the VFPv2 unit in an ARM1176.  Measured on the shipped 1.2.41 binaries: the
+# healthy ARMv6 members are (CPU_arch v6KZ, FP_arch VFPv2) and every
+# contaminated one is (v7, VFPv3-D16).
+ARM_FP_ARCH_TAG = 10
+ARM_FP_ARCH_NAMES = {
+    0: "none", 1: "VFPv1", 2: "VFPv2", 3: "VFPv3", 4: "VFPv3-D16",
+    5: "VFPv4", 6: "VFPv4-D16", 7: "FP-ARMv8-D16", 8: "FP-ARMv8",
+}
+# Tags whose value is a NUL-terminated string rather than a ULEB128, which the
+# attribute walk has to know in order to stay in sync.  Tag_compatibility (32)
+# is a ULEB128 followed by a string, so it needs both.
+ARM_STRING_TAGS = frozenset({4, 5, 65, 67})
+ARM_ULEB_THEN_STRING_TAGS = frozenset({32})
+ARM_CPU_ARCH_NAMES = {
+    0: "pre-v4", 1: "v4", 2: "v4T", 3: "v5T", 4: "v5TE", 5: "v5TEJ",
+    6: "v6", 7: "v6KZ", 8: "v6T2", 9: "v6K", 10: "v7", 11: "v6-M",
+    12: "v6S-M", 13: "v7E-M", 14: "v8-A", 15: "v8-R", 16: "v8-M.baseline",
+    17: "v8-M.mainline", 18: "v8.1-A", 19: "v8.2-A", 20: "v8.3-A",
+    21: "v8.1-M.mainline", 22: "v9-A",
+}
+# What each lane accepts.  v6 covers the Raspberry Pi 1/Zero (ARM1176JZF-S,
+# an ARMv6KZ part), so v6/v6KZ/v6K pass and v6T2 does not: Thumb-2 is absent
+# from ARM1176.  v5 is the armel target (soft-float Kirkwood hardware).
+ARM_ARCH_ALLOWED = {
+    "v5": {0, 1, 2, 3, 4, 5},
+    "v6": {0, 1, 2, 3, 4, 5, 6, 7, 9},
+    "v7": {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+}
 
 
 def carchive_members(blob):
@@ -137,6 +201,94 @@ class Elf:
             return struct.unpack_from(self.end + "Q", self.blob, off + 0x18)[0]
         return struct.unpack_from(self.end + "I", self.blob, off + 0x10)[0]
 
+    def machine(self):
+        return struct.unpack_from(self.end + "H", self.blob, 0x12)[0]
+
+    def flags(self):
+        """e_flags, which on ARM carries the float ABI of the whole object."""
+        return struct.unpack_from(self.end + "I", self.blob, 0x30 if self.is64 else 0x24)[0]
+
+    def float_abi(self):
+        """'hard', 'soft', or None when the object declares neither.
+
+        Only meaningful on EM_ARM.  Objects with no floating point at all
+        (a handful of small extension modules) set neither bit, and those are
+        loadable either way, so they report None rather than a mismatch.
+        """
+        if self.machine() != EM_ARM:
+            return None
+        flags = self.flags()
+        if flags & EF_ARM_ABI_FLOAT_HARD:
+            return "hard"
+        if flags & EF_ARM_ABI_FLOAT_SOFT:
+            return "soft"
+        return None
+
+    def arm_attributes(self):
+        """The aeabi build attributes as {tag: value}, or {} when absent.
+
+        Layout (ARM ABI addenda 2.2): a format byte 'A', then subsections of
+        uint32 length plus a NUL-terminated vendor name; inside the "aeabi"
+        vendor, sub-subsections of a ULEB128 tag plus a uint32 length, and
+        inside Tag_File (1), a stream of ULEB128 tag/value pairs.  Most values
+        are ULEB128 and a few are strings, so every tag has to be decoded in
+        order: skipping one with the wrong width desynchronizes the rest of the
+        stream and yields plausible nonsense.
+
+        The linker MAX-merges these over all input objects, which is what makes
+        them usable as a gate: one vendored blob compiled for a newer core
+        raises the whole library's declaration.
+        """
+        found = {}
+        for index, sh_type, sh_offset, _link, _info in self.sections():
+            if sh_type != SHT_ARM_ATTRIBUTES:
+                continue
+            size = self._section_size(index)
+            blob = self.blob[sh_offset:sh_offset + size]
+            if blob[:1] != b"A":
+                continue
+            pos = 1
+            while pos + 4 <= len(blob):
+                (length,) = struct.unpack_from(self.end + "I", blob, pos)
+                if length < 4 or pos + length > len(blob):
+                    break
+                vendor_end = blob.index(b"\0", pos + 4)
+                if blob[pos + 4:vendor_end] == b"aeabi":
+                    found.update(self._aeabi_tags(blob[vendor_end + 1:pos + length]))
+                pos += length
+        return found
+
+    def _aeabi_tags(self, blob):
+        out = {}
+        pos = 0
+        while pos + 4 < len(blob):
+            tag, pos = _uleb(blob, pos)
+            (length,) = struct.unpack_from(self.end + "I", blob, pos)
+            body_end = pos - _uleb_len(tag) + length
+            pos += 4
+            if tag != 1:
+                # Tag_Section and Tag_Symbol carry per-section overrides that
+                # nothing here needs.
+                pos = body_end
+                continue
+            while pos < min(body_end, len(blob)):
+                attr, pos = _uleb(blob, pos)
+                if attr in ARM_ULEB_THEN_STRING_TAGS:
+                    _flag, pos = _uleb(blob, pos)
+                    pos = blob.index(b"\0", pos) + 1
+                elif attr in ARM_STRING_TAGS:
+                    pos = blob.index(b"\0", pos) + 1
+                else:
+                    out[attr], pos = _uleb(blob, pos)
+            pos = body_end
+        return out
+
+    def _section_size(self, index):
+        off = self.shoff + index * self.shentsize
+        if self.is64:
+            return struct.unpack_from(self.end + "Q", self.blob, off + 0x20)[0]
+        return struct.unpack_from(self.end + "I", self.blob, off + 0x14)[0]
+
     def exec_stack(self):
         """True when the image declares an executable stack."""
         for p_type, p_flags in self.program_headers():
@@ -180,6 +332,37 @@ class Elf:
         return self.blob[offset:end].decode("utf-8", "replace")
 
 
+def _uleb(blob, pos):
+    """(value, new_pos) for the ULEB128 at pos."""
+    value = 0
+    shift = 0
+    while pos < len(blob):
+        byte = blob[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            break
+        shift += 7
+    return value, pos
+
+
+def _uleb_len(value):
+    """How many bytes the ULEB128 encoding of value occupies."""
+    count = 1
+    while value >= 0x80:
+        value >>= 7
+        count += 1
+    return count
+
+
+def _names(items, limit=12):
+    """A sorted, capped join, so one bad wheel does not print 90 file names."""
+    items = sorted(items)
+    if len(items) <= limit:
+        return ", ".join(items)
+    return "{} and {} more".format(", ".join(items[:limit]), len(items) - limit)
+
+
 def glibc_version(symbol):
     """(2, 17) for "GLIBC_2.17"; None for anything else.
 
@@ -211,15 +394,45 @@ def main(argv=None):
     parser.add_argument(
         "--max-glibc",
         type=parse_floor,
-        required=True,
-        help="the floor this lane declares, e.g. 2.17",
+        help="the floor this lane declares, e.g. 2.17. Optional: the musl lanes "
+             "carry no GLIBC_ symbol versions at all, and pass the ARM checks "
+             "alone",
     )
     parser.add_argument(
         "--no-exec-stack",
         action="store_true",
         help="also fail when any bundled image declares an executable stack",
     )
+    parser.add_argument(
+        "--arm-float",
+        choices=("hard", "soft"),
+        help="the ARM float ABI this lane claims; fails on any member that "
+             "declares the other one",
+    )
+    parser.add_argument(
+        "--max-arm-arch",
+        choices=sorted(ARM_ARCH_ALLOWED),
+        help="the newest ARM instruction set this lane targets; fails on any "
+             "member whose Tag_CPU_arch is outside it",
+    )
+    parser.add_argument(
+        "--max-arm-fp",
+        type=int,
+        help="the newest floating-point unit this lane targets, as a "
+             "Tag_FP_arch value (0 none, 2 VFPv2, 4 VFPv3-D16); fails on any "
+             "member that needs a newer one",
+    )
     args = parser.parse_args(argv)
+    if not (
+        args.max_glibc
+        or args.arm_float
+        or args.max_arm_arch
+        or args.max_arm_fp is not None
+    ):
+        parser.error(
+            "nothing to check: pass --max-glibc, --arm-float, --max-arm-arch "
+            "or --max-arm-fp"
+        )
 
     with open(args.binary, "rb") as handle:
         blob = handle.read()
@@ -240,10 +453,35 @@ def main(argv=None):
     worst = (0,)
     contributors = []
     exec_stack = []
+    wrong_float = []
+    too_new = []
+    too_much_fp = []
+    arm_seen = {}
+    fp_seen = {}
     for name, data in images:
         image = Elf(data)
         if args.no_exec_stack and image.exec_stack():
             exec_stack.append(name)
+        if args.arm_float:
+            abi = image.float_abi()
+            if abi is not None and abi != args.arm_float:
+                wrong_float.append("{} ({})".format(name, abi))
+        if args.max_arm_arch or args.max_arm_fp is not None:
+            attrs = image.arm_attributes()
+            cpu = attrs.get(ARM_CPU_ARCH_TAG)
+            if args.max_arm_arch and cpu is not None:
+                arm_seen[name] = cpu
+                if cpu not in ARM_ARCH_ALLOWED[args.max_arm_arch]:
+                    too_new.append(
+                        "{} ({})".format(name, ARM_CPU_ARCH_NAMES.get(cpu, cpu))
+                    )
+            fp = attrs.get(ARM_FP_ARCH_TAG)
+            if args.max_arm_fp is not None and fp is not None:
+                fp_seen[name] = fp
+                if fp > args.max_arm_fp:
+                    too_much_fp.append(
+                        "{} ({})".format(name, ARM_FP_ARCH_NAMES.get(fp, fp))
+                    )
         highest = (0,)
         for symbol in image.needed_versions():
             version = glibc_version(symbol)
@@ -256,24 +494,48 @@ def main(argv=None):
         elif highest == worst:
             contributors.append(name)
 
-    print(
-        "{}: {} ELF images, max GLIBC_{} from {}".format(
-            args.binary,
-            len(images),
-            show(worst),
-            ", ".join(sorted(contributors)[:8]) or "nothing",
+    if worst == (0,):
+        # A musl bundle imports no versioned glibc symbols at all, so there is
+        # no floor to report and "max GLIBC_0 from nothing" is only noise.
+        print("{}: {} ELF images, no glibc symbol versions".format(
+            args.binary, len(images)))
+    else:
+        print(
+            "{}: {} ELF images, max GLIBC_{} from {}".format(
+                args.binary, len(images), show(worst), _names(contributors, 8)
+            )
         )
-    )
+
+    if args.max_arm_arch:
+        highest = max(arm_seen.values()) if arm_seen else None
+        print(
+            "{}: {} of {} images declare Tag_CPU_arch, highest {}".format(
+                args.binary,
+                len(arm_seen),
+                len(images),
+                ARM_CPU_ARCH_NAMES.get(highest, highest),
+            )
+        )
+    if args.max_arm_fp is not None:
+        highest_fp = max(fp_seen.values()) if fp_seen else None
+        print(
+            "{}: {} of {} images declare Tag_FP_arch, highest {}".format(
+                args.binary,
+                len(fp_seen),
+                len(images),
+                ARM_FP_ARCH_NAMES.get(highest_fp, highest_fp),
+            )
+        )
 
     failed = False
-    if worst > args.max_glibc:
+    if args.max_glibc and worst > args.max_glibc:
         print(
             "::error::{}: requires GLIBC_{}, above the declared floor GLIBC_{}; "
             "raised by {}".format(
                 args.binary,
                 show(worst),
                 show(args.max_glibc),
-                ", ".join(sorted(contributors)),
+                _names(contributors),
             ),
             file=sys.stderr,
         )
@@ -282,7 +544,36 @@ def main(argv=None):
         print(
             "::error::{}: executable stack declared by {}; this fails at runtime "
             "on SELinux-hardened hosts".format(
-                args.binary, ", ".join(sorted(exec_stack))
+                args.binary, _names(exec_stack)
+            ),
+            file=sys.stderr,
+        )
+        failed = True
+    if wrong_float:
+        print(
+            "::error::{}: this lane ships a {}-float binary, but these members "
+            "declare the other ABI: {}".format(
+                args.binary, args.arm_float, _names(wrong_float)
+            ),
+            file=sys.stderr,
+        )
+        failed = True
+    if too_new:
+        print(
+            "::error::{}: these members need a newer instruction set than {}, so "
+            "the binary would SIGILL on the hardware this lane targets: {}".format(
+                args.binary, args.max_arm_arch, _names(too_new)
+            ),
+            file=sys.stderr,
+        )
+        failed = True
+    if too_much_fp:
+        print(
+            "::error::{}: these members need a newer FPU than {}, which faults on "
+            "the hardware this lane targets: {}".format(
+                args.binary,
+                ARM_FP_ARCH_NAMES.get(args.max_arm_fp, args.max_arm_fp),
+                _names(too_much_fp),
             ),
             file=sys.stderr,
         )
