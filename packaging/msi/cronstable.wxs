@@ -1,7 +1,7 @@
 <!-- cronstable MSI (WiX v6). Built by .github/scripts/build_msi.sh (the
      one build recipe both release.yml jobs invoke), which runs:
 
-       wix build packaging/msi/cronstable.wxs -arch x64|arm64
+       wix build packaging/msi/cronstable.wxs -arch x64|arm64|x86
          -d Version=X.Y.Z -d Payload=ABS\PATH\TO\dist\cronstable
          -ext WixToolset.Util.wixext -sw1149
          -o dist/cronstable-windows-ARCH.msi
