@@ -8,8 +8,11 @@ grows an Owner column and flips the page into its fluid (wide) layout, and
 clipping. To refresh them after a UI change:
 
 1. **Boot the grand tour** (builds the image from the working tree, so your
-   local `cronstable/web/index.html` is what gets photographed), then give it
-   10-15 minutes of uptime so sparklines and history fill in:
+   local `cronstable/web/index.html` is what gets photographed), then let it
+   run before you shoot. Ten to fifteen minutes fills the trend sparklines,
+   but the activity heatmap and the run-history tab read against a 24-hour
+   window, so leave the fleet up overnight (about 18 hours) for a board as
+   dense as the committed set:
 
    ```shell
    docker compose -f example/grand-tour/docker-compose.yml up --build -d
@@ -104,7 +107,7 @@ python docs/screenshots/build_reel.py reel                  # just the hero
 
 `build_reel.py` keeps the files small by treating each held screen as one
 long-duration frame and **cutting hard** between screens (a cut costs zero
-frames). The hero reel stays in **one style throughout** — the light carolina
+frames). The hero reel stays in **one style throughout** — the light standard
 theme, terminal monospace — and gets its variety from the different screens it
 tours. The theme + font showcase is the theme row, which cuts through the
 overview under all ten themes, each in both the monospace and the readable

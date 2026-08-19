@@ -162,7 +162,7 @@ pendulum wordmark.
 ## Themes and accessibility
 
 The same five hues as the web page: **standard** (default, flat
-neutral), **carolina**, **amber** and **green**, and flat **modern**.
+neutral), **carolina**, **amber**, **green**, and flat **modern**.
 Each has a dark and a light (paper) variant. `t` cycles hues and `T`
 flips the variant, exactly as in the browser.
 
