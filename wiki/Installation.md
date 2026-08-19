@@ -1,8 +1,8 @@
 # Installation
 
 This page covers every way to install cronstable: the published container image,
-`pip`, `pipx`, Homebrew, winget, Scoop, `.deb` and `.rpm` packages, Nix, `ubi`
-and `mise`, and the self-contained PyInstaller binaries. It
+`pip`, `pipx`, Homebrew, winget, Scoop, `.deb`, `.rpm`, `.apk` and FreeBSD
+packages, Nix, `ubi` and `mise`, and the self-contained PyInstaller binaries. It
 documents the Python and platform requirements, the runtime dependencies, the
 exact binary release assets, and the writable-and-executable temp-directory
 requirement that applies to the standalone binary only.
@@ -16,7 +16,7 @@ Windows-specific details, see [running on Windows](Running-on-Windows).
 | --- | --- |
 | Python (pip/pipx) | `>= 3.10` (`requires-python = ">=3.10"`). Versions 3.10, 3.11, 3.12, 3.13, and 3.14 are supported and tested. For an older Python, use the standalone binary instead. |
 | Operating system | Linux, macOS, and Windows. `cronstable/platform.py` isolates OS-specific behavior. `grp` and `pwd` are imported only on POSIX. A few features differ on Windows; see [running on Windows](Running-on-Windows). |
-| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), for both the container image and the prebuilt binaries. The prebuilt binaries also cover `riscv64` and `loong64` (LoongArch) in both libcs, `mips64le` (glibc) and `armv6` (musl). macOS: `amd64` and `arm64`. Windows: `amd64` (x64), `arm64` (ARM64) and `i686`. Also FreeBSD (`amd64`, `arm64`), OpenBSD, NetBSD and illumos (`amd64`). |
+| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), for both the container image and the prebuilt binaries. The prebuilt binaries also cover `armv6` and `riscv64` and `loong64` (LoongArch) in both libcs, plus `mips64le` and `armel` (glibc). macOS: `amd64` and `arm64`. Windows: `amd64` (x64), `arm64` (ARM64) and `i686`. Also FreeBSD (`amd64`, `arm64`), OpenBSD, NetBSD and illumos (`amd64`). |
 
 Python is required only for the `pip`/`pipx` installs. The container image
 bundles its own interpreter, and the standalone binaries embed Python, so
@@ -54,6 +54,8 @@ minimal/slim images that do not include the system tz data. See
 | winget | winget-pkgs (release binary) | Yes (embedded) | **Yes** |
 | Scoop | ScoopInstaller/Extras (release binary) | Yes (embedded) | **Yes** |
 | `.deb` / `.rpm` | GitHub Releases | Yes (embedded) | **Yes** |
+| `.apk` (Alpine) | GitHub Releases | Yes (embedded) | **Yes** |
+| `.pkg` (FreeBSD) | GitHub Releases | Yes (embedded) | **Yes** |
 | `ubi` / `mise` | GitHub Releases | Yes (embedded) | **Yes** |
 | Nix | this flake | No (uses nixpkgs Python) | No |
 
@@ -255,6 +257,76 @@ place; delete them by hand when you mean to drop the schedule and its history.
 Both formats are vendor packages built from the release binary. They are not in
 Debian or Fedora proper and carry no distribution changelog or copyright file.
 
+## Install using an Alpine package
+
+Releases attach an `.apk` for every architecture the musl builds cover. It
+installs the binary, an OpenRC service and a starter configuration:
+
+| Path | Contents |
+| --- | --- |
+| `/usr/bin/cronstable` | The binary, linked against musl. |
+| `/etc/init.d/cronstable` | The OpenRC service, running as the `cronstable` user. |
+| `/etc/conf.d/cronstable` | Service settings: config directory, user, state directory, stop timeout. |
+| `/etc/cronstable.d/cronstable.yaml` | Starter configuration. |
+| `/var/lib/cronstable` | The durable store, created by the service on first start. |
+
+```shell
+curl -fsSLO https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64.apk
+apk add --allow-untrusted ./cronstable-linux-amd64.apk
+```
+
+`--allow-untrusted` is required: these packages are not signed with a key in
+`/etc/apk/keys`, so apk declines them otherwise. Verify the download against the
+release's `SHA256SUMS` if your policy calls for it.
+
+Installing creates the `cronstable` service account and leaves the service
+stopped, because the shipped configuration schedules no jobs and no Alpine
+package enables its own service. Edit the configuration, then:
+
+```shell
+rc-update add cronstable default
+rc-service cronstable start
+rc-service cronstable status
+```
+
+`rc-service cronstable reload` reparses the configuration in place without
+interrupting running jobs. The service runs under `supervise-daemon`, so a crash
+is restarted, and stopping it gives cronstable two minutes to drain its running
+jobs before they are killed (`cronstable_retry` in `/etc/conf.d/cronstable`).
+
+Most Alpine users run the [container image](#run-with-docker) instead, which is
+built on the same musl base.
+
+## Install using a FreeBSD package
+
+Releases attach a `.pkg` for amd64 and arm64, built by FreeBSD's own `pkg` in a
+FreeBSD 14 virtual machine and installed there as part of the build:
+
+| Path | Contents |
+| --- | --- |
+| `/usr/local/bin/cronstable` | The binary. |
+| `/usr/local/etc/rc.d/cronstable` | The `rc.d` script, running the daemon under `daemon(8)` as the `cronstable` user. |
+| `/usr/local/etc/cronstable.d/cronstable.yaml` | Starter configuration, installed from a `.sample` so your edits survive an upgrade. |
+| `/var/db/cronstable` | The durable store, created by the `rc.d` script on first start. |
+
+```shell
+fetch https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-freebsd-amd64.pkg
+pkg add cronstable-freebsd-amd64.pkg
+```
+
+`pkg add` of a local file needs no repository. Installing creates the
+`cronstable` user and leaves the service disabled:
+
+```shell
+sysrc cronstable_enable=YES
+service cronstable start
+service cronstable status
+```
+
+`service cronstable reload` sends `SIGHUP` to reparse the configuration in
+place. Settings live in `/etc/rc.conf`: `cronstable_config`, `cronstable_user`,
+`cronstable_statedir` and `cronstable_flags`.
+
 ## Install using ubi or mise
 
 [`ubi`](https://github.com/houseabsolute/ubi) installs release binaries straight
@@ -297,7 +369,9 @@ assets, each built for its own platform and architecture:
 | `cronstable-linux-amd64` | Linux | glibc, x86_64 | glibc 2.17 or newer: RHEL, Alma and Rocky 7 onward, Debian 8 onward, Ubuntu 14.04 onward, Amazon Linux 2 and 2023, SLES 12 onward. |
 | `cronstable-linux-arm64` | Linux | glibc, arm64 | glibc 2.17 or newer on arm64. |
 | `cronstable-linux-i686` | Linux | glibc, 32-bit x86 | 32-bit x86 (i686), glibc 2.36 or newer: Debian 12 i386 onward. |
-| `cronstable-linux-armv7` | Linux | glibc, 32-bit ARM | 32-bit ARM (armv7), glibc 2.31 or newer: Raspberry Pi OS bullseye, Debian 11, Ubuntu 20.04 onward. |
+| `cronstable-linux-armv7` | Linux | glibc, 32-bit ARM | 32-bit ARM (armv7), glibc 2.31 or newer: Raspberry Pi OS bullseye, Debian 11, Ubuntu 20.04 onward. Raspberry Pi 2 and newer. |
+| `cronstable-linux-armv6` | Linux | glibc, 32-bit ARM | ARMv6 hard-float, glibc 2.36 or newer: the Raspberry Pi 1, Zero and Zero W running Raspberry Pi OS. |
+| `cronstable-linux-armel` | Linux | glibc, 32-bit ARM | ARMv5 soft-float (Debian armel), glibc 2.36 or newer: Kirkwood devices such as the SheevaPlug, QNAP TS-x1x, D-Link DNS-320, Zyxel NSA325 and Pogoplug. |
 | `cronstable-linux-ppc64le` | Linux | glibc, ppc64le | 64-bit little-endian POWER (IBM POWER), glibc 2.17 or newer. |
 | `cronstable-linux-s390x` | Linux | glibc, s390x | IBM Z (s390x, big-endian), glibc 2.17 or newer. |
 | `cronstable-linux-riscv64` | Linux | glibc, riscv64 | 64-bit RISC-V, glibc 2.41 or newer: Debian 13 onward. |
@@ -310,14 +384,16 @@ assets, each built for its own platform and architecture:
 | `cronstable-linux-ppc64le-musl` | Linux | musl, ppc64le | 64-bit little-endian POWER for Alpine and other musl hosts. |
 | `cronstable-linux-s390x-musl` | Linux | musl, s390x | IBM Z (s390x) for Alpine and other musl hosts. |
 | `cronstable-linux-riscv64-musl` | Linux | musl, riscv64 | 64-bit RISC-V for Alpine and other musl hosts. |
-| `cronstable-linux-armv6-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv6, such as Raspberry Pi 1/Zero); musl-only, no glibc build. |
+| `cronstable-linux-armv6-musl` | Linux | musl, 32-bit ARM | ARMv6 hard-float for Alpine on that hardware. On Raspberry Pi OS use the glibc `armv6` build instead. |
 | `cronstable-linux-loong64-musl` | Linux | musl, loongarch64 | LoongArch for Alpine and other musl hosts. New-world ABI only. |
 | `cronstable-linux-<arch>.deb` | Linux | glibc | Debian package for `amd64`, `arm64`, `i686`, `armv7`, `ppc64le`, `s390x` and `riscv64`. Installs the binary, a systemd unit and `/etc/cronstable.d`. |
 | `cronstable-linux-<arch>.rpm` | Linux | glibc | RPM package for the same seven architectures, with the same contents. |
+| `cronstable-linux-<arch>.apk` | Linux | musl | Alpine package for `amd64`, `arm64`, `i686`, `armv7`, `armv6`, `ppc64le`, `s390x`, `riscv64` and `loong64`. Installs the binary, an OpenRC service and `/etc/cronstable.d`. |
 | `cronstable-macos-arm64` | macOS | Apple Silicon (arm64) | Developer ID signed and notarized. |
 | `cronstable-macos-amd64` | macOS | Intel (x86_64) | Developer ID signed and notarized. |
 | `cronstable-freebsd-amd64` | FreeBSD | x86_64 | For FreeBSD 14 and 15 hosts, including TrueNAS, pfSense and OPNsense. |
 | `cronstable-freebsd-arm64` | FreeBSD | arm64 | For FreeBSD 14 and 15 hosts on arm64. |
+| `cronstable-freebsd-<arch>.pkg` | FreeBSD | amd64, arm64 | FreeBSD package. Installs the binary, an `rc.d` script and `/usr/local/etc/cronstable.d`. |
 | `cronstable-openbsd-amd64` | OpenBSD | x86_64 | For OpenBSD 7.9. OpenBSD gives no cross-release ABI guarantee, so this asset tracks one release. |
 | `cronstable-netbsd-amd64` | NetBSD | x86_64 | For NetBSD 11.0. |
 | `cronstable-illumos-amd64` | illumos | x86_64 | Built on OmniOS r151054 LTS; the illumos ABI is shared, so it also runs on OpenIndiana and in SmartOS zones. |
@@ -342,13 +418,28 @@ table above is measured rather than estimated.
 glibc distribution still in production, including the RHEL family from 7 onward
 and Amazon Linux 2. They are built inside manylinux2014 containers against a
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
-interpreter, which is where that number comes from. `armv7` needs glibc 2.31,
-`i686` needs 2.36, and `riscv64` and `loong64` need 2.41, each set by the oldest
-base image carrying a working toolchain for that architecture.
+interpreter, which is where that number comes from. `armv7` needs glibc 2.31;
+`i686`, `armv6`, `armel` and `mips64le` need 2.36; `riscv64` and `loong64` need
+2.41. Each is set by the oldest base image carrying a working toolchain for that
+architecture.
+
+On 32-bit ARM the glibc version is only half the requirement, because there are
+three incompatible ABIs. `armv7` is hard-float ARMv7 and covers the Raspberry Pi
+2 and newer plus Debian's own armhf port. `armv6` is hard-float ARMv6, which is
+what the Raspberry Pi 1, Zero and Zero W need: their ARM1176 core has neither
+ARMv7 instructions nor a VFPv3 unit, so an armv7 binary faults on them. `armel`
+is soft-float ARMv5 for Kirkwood hardware, which has no floating-point unit at
+all. CI asserts all three from the frozen bytes, per bundled object, so a binary
+cannot ship under the wrong one.
 
 The musl builds need musl 1.2.5 or newer, which is Alpine 3.20 and later. They
 are built inside an Alpine container pinned to one Alpine release, so the
 requirement moves only when that pin does.
+
+Raspberry Pi OS is glibc, so the binary for a Pi is always one of the glibc
+builds: `cronstable-linux-armv6` on a Pi 1, Zero or Zero W, `armv7` on a 32-bit
+install of anything newer, and `arm64` on a 64-bit install, which is the default
+on a Pi 3 and later. The `-musl` ARM builds are for Alpine on that hardware.
 
 **The `-musl` builds are not a fallback for an older glibc host.** They are
 dynamically linked against musl and name `/lib/ld-musl-<arch>.so.1` as their
@@ -379,6 +470,12 @@ The `loong64` builds cover LoongArch for both libcs, compiled from source under
 emulation. They target the new-world ABI that upstream Debian and Alpine use.
 Hardware running an old-world distribution (Loongnix, Kylin, UOS) is a different
 ABI, and these binaries do not run there.
+
+The glibc `armv6` and `armel` builds compile from source too, on Raspbian
+bookworm and Debian bookworm armel respectively, against the Python 3.11 those
+suites package. Both run under an emulator pinned to the real target core, an
+ARM1176 for `armv6` and an ARM926 for `armel`, so an instruction the hardware
+lacks faults during the build rather than on a user's machine.
 
 macOS builds cover both Apple Silicon and Intel.
 

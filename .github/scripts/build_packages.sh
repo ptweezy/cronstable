@@ -1,28 +1,35 @@
 #!/usr/bin/env bash
-# Build the .deb and .rpm packages from the Linux binaries the gate produced.
+# Build the .deb, .rpm and .apk packages from the Linux binaries the gate built.
 #
 #     bash .github/scripts/build_packages.sh <version> <binaries-dir>
 #
 # Packaging is metadata plus a payload nfpm never executes, so every
 # architecture builds here on the amd64 runner with no emulation, in about a
-# second for the whole set. The recipe is packaging/nfpm/nfpm.yaml; this script
-# only supplies the per-architecture variables and checks the result.
+# second for the whole set. The recipes are packaging/nfpm/nfpm.yaml (deb, rpm)
+# and packaging/nfpm/apk.yaml (Alpine); this script only supplies the
+# per-architecture variables and checks the result.
 #
-# Three things that fail OPEN and are therefore asserted rather than assumed:
+# Four things that fail OPEN and are therefore asserted rather than assumed:
 #
-#  1. The architecture NAME. nfpm's Debian translation table has no `i686` or
-#     `armv7` key and passes unknown values straight through, so `arch: i686`
-#     yields `Architecture: i686`, which is not a Debian architecture. The
-#     package builds, uploads and installs nowhere. The names below are nfpm's
-#     (386, arm7), and the control file is read back to prove the translation.
+#  1. The architecture NAME. nfpm's translation tables have no `i686` or `armv7`
+#     key and pass unknown values straight through, so `arch: i686` yields
+#     `Architecture: i686`, which is not a Debian architecture. The package
+#     builds, uploads and installs nowhere. Every package is read back and its
+#     recorded architecture compared against what this table expects.
 #
-#  2. The glibc floor. It is a property of the frozen bytes, not of the base
+#  2. The libc the payload was built against. nfpm never inspects the binary, so
+#     an .apk built from a glibc binary installs cleanly on Alpine and then
+#     fails at exec. The two tables below name different source files for that
+#     reason: the deb/rpm rows take `cronstable-linux-<arch>` and the apk rows
+#     take `cronstable-linux-<arch>-musl`.
+#
+#  3. The glibc floor. It is a property of the frozen bytes, not of the base
 #     image the binary was built in, and the two disagree: five rows build on a
 #     glibc far newer than the binary ends up needing. These floors are the ones
 #     the build jobs declare and elf_floor.py enforces against the bytes;
 #     tests/test_ci_fences.py holds the two lists to each other.
 #
-#  3. The output NAME. tests/test_ci_fences.py asserts the SHA256SUMS cp list
+#  4. The output NAME. tests/test_ci_fences.py asserts the SHA256SUMS cp list
 #     and the release files: list name the same set, and a version-bearing
 #     package name would be a different literal token in each. Version-less
 #     names also keep the download URLs stable across releases.
@@ -45,6 +52,28 @@ s390x   s390x   s390x   2.17
 riscv64 riscv64 riscv64 2.41
 "
 
+# arch | Alpine architecture, which is also what is passed to nfpm as its
+# `arch`. Alpine's names are given directly rather than through nfpm's Go-arch
+# keys: unknown values pass through untranslated, so this states the answer
+# instead of relying on a lookup that has no key for armhf and would emit
+# `armv6`, which is not an Alpine architecture at all.
+#
+# There is no armel row: Alpine has no armv5 port at all, so that .apk would be
+# a well-formed package for an architecture that does not exist. Every other musl
+# binary the gate builds gets one, loong64 included, since Alpine has shipped a
+# loongarch64 port since 3.21.
+APK_ROWS="
+amd64   x86_64
+arm64   aarch64
+i686    x86
+armv7   armv7
+armv6   armhf
+ppc64le ppc64le
+s390x   s390x
+riscv64 riscv64
+loong64 loongarch64
+"
+
 here="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 . "$here/retry.sh"
@@ -60,6 +89,28 @@ echo "${NFPM_SHA256}  ${tarball}" | sha256sum -c -
 tar -xzf "$tarball" -C "$work" nfpm
 NFPM="$work/nfpm"
 "$NFPM" --version
+
+# Read the architecture back out of an .apk. There is no dpkg-deb equivalent, so
+# this reads .PKGINFO out of the control segment directly: an apk is
+# concatenated gzip members, and the control tar (which holds .PKGINFO) comes
+# first, so the first archive in the stream is the one to look in.
+apk_arch() {
+    python3 - "$1" <<'PY'
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "r:gz") as archive:
+    for member in archive:
+        if member.name != ".PKGINFO":
+            continue
+        body = archive.extractfile(member).read().decode("utf-8", "replace")
+        for line in body.splitlines():
+            if line.startswith("arch = "):
+                print(line.split("=", 1)[1].strip())
+                raise SystemExit(0)
+raise SystemExit("no arch in .PKGINFO")
+PY
+}
 
 while read -r arch nfpm_arch deb_arch floor; do
     [ -n "$arch" ] || continue
@@ -95,3 +146,25 @@ while read -r arch nfpm_arch deb_arch floor; do
 # Fed by redirection rather than a pipe: a pipeline would run the loop in a
 # subshell, where a failed assertion cannot take the script down reliably.
 done <<< "$ROWS"
+
+while read -r arch alpine_arch; do
+    [ -n "$arch" ] || continue
+    binary="$BINARIES/cronstable-linux-$arch-musl"
+    if [ ! -f "$binary" ]; then
+        echo "::error::build_packages: $binary is missing" >&2
+        exit 1
+    fi
+    export PKG_VERSION="$VERSION"
+    export PKG_ARCH="$alpine_arch"
+    export PKG_BINARY="$binary"
+
+    apk="$BINARIES/cronstable-linux-$arch.apk"
+    "$NFPM" package -f packaging/nfpm/apk.yaml -p apk -t "$apk"
+
+    got="$(apk_arch "$apk")"
+    if [ "$got" != "$alpine_arch" ]; then
+        echo "::error::build_packages: $apk records arch $got, expected $alpine_arch" >&2
+        exit 1
+    fi
+    echo "packaged $arch: $apk ($got, musl)"
+done <<< "$APK_ROWS"

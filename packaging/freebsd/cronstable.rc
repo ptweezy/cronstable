@@ -1,0 +1,73 @@
+#!/bin/sh
+#
+# PROVIDE: cronstable
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+#
+# rc.d script for the FreeBSD package, installed as
+# /usr/local/etc/rc.d/cronstable. Enable it with
+#
+#     sysrc cronstable_enable=YES
+#     service cronstable start
+#
+# Knobs, all settable in /etc/rc.conf:
+#
+#     cronstable_enable     NO by default; the package never starts anything
+#     cronstable_config     -c argument, default /usr/local/etc/cronstable.d
+#     cronstable_user       account the daemon runs as, default cronstable
+#     cronstable_statedir   durable store, default /var/db/cronstable
+#     cronstable_flags      extra arguments appended to the command line
+
+. /etc/rc.subr
+
+name=cronstable
+rcvar=cronstable_enable
+desc="cronstable job scheduler"
+
+load_rc_config $name
+
+: ${cronstable_enable:="NO"}
+: ${cronstable_config:="/usr/local/etc/cronstable.d"}
+: ${cronstable_user:="cronstable"}
+: ${cronstable_statedir:="/var/db/cronstable"}
+
+# cronstable runs in the foreground, so daemon(8) does the backgrounding, the
+# privilege drop, the syslog redirect and the restart-on-crash.
+#
+# pidfile holds daemon(8)'s own pid (-P) and procname names daemon(8) to match,
+# because that is the process rc.subr must signal: with -r in play, signalling
+# the child instead would just make the supervisor start a new one. daemon(8)
+# forwards the stop signal to cronstable, which is what lets it drain its
+# running jobs rather than having them killed underneath it.
+pidfile="/var/run/${name}.pid"
+cpidfile="/var/run/${name}-child.pid"
+command="/usr/sbin/daemon"
+procname="/usr/sbin/daemon"
+command_args="-P ${pidfile} -p ${cpidfile} -r -f -S -T ${name} \
+	-u ${cronstable_user} /usr/local/bin/cronstable \
+	-c ${cronstable_config} ${cronstable_flags}"
+
+start_precmd="cronstable_precmd"
+
+# SIGHUP is the reload verb: reparse the configuration in place, without
+# dropping the schedule or interrupting running jobs. It goes to cronstable
+# itself, not to the supervisor.
+extra_commands="reload"
+reload_cmd="cronstable_reload"
+
+cronstable_precmd()
+{
+	install -d -o "${cronstable_user}" -g "${cronstable_user}" -m 0750 \
+		"${cronstable_statedir}"
+}
+
+cronstable_reload()
+{
+	if [ -r "${cpidfile}" ]; then
+		kill -HUP "$(cat "${cpidfile}")"
+	else
+		err 1 "${name} is not running"
+	fi
+}
+
+run_rc_command "$1"
