@@ -6,7 +6,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/cronstable.svg?logo=python&logoColor=ffd343&color=306998)](https://pypi.org/project/cronstable/)
 [![PyPI status](https://img.shields.io/pypi/status/cronstable.svg?color=2ea44f)](https://pypi.org/project/cronstable/)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-00bcd4)](https://github.com/ptweezy/cronstable/releases/latest)
-[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7%20%7C%20armv6%20%7C%20i686%20%7C%20ppc64le%20%7C%20s390x%20%7C%20riscv64-c2185b)](https://github.com/ptweezy/cronstable/releases/latest)
+[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7%20%7C%20armv6%20%7C%20i686%20%7C%20ppc64le%20%7C%20s390x%20%7C%20riscv64%20%7C%20loong64%20%7C%20mips64le%20%7C%20armel-c2185b)](https://github.com/ptweezy/cronstable/releases/latest)
 [![CI](https://github.com/ptweezy/cronstable/actions/workflows/release.yml/badge.svg)](https://github.com/ptweezy/cronstable/actions/workflows/release.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/ptweezy/cronstable?logo=codecov&logoColor=white&color=f01f7a)](https://codecov.io/gh/ptweezy/cronstable)
 [![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fcronstable-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/cronstable/pkgs/container/cronstable)
@@ -285,11 +285,13 @@ Upgrade later with `brew upgrade cronstable` or
 Alternatively, download a self-contained binary from GitHub:
 <https://github.com/ptweezy/cronstable/releases>. Every release attaches
 binaries for Linux (glibc and musl builds for `amd64`, `arm64`, `i686`,
-`armv7`, `ppc64le`, `s390x` and `riscv64`, plus a musl-only `armv6` and a
-glibc-only `mips64le`), macOS
-(`amd64` and `arm64`, signed and notarized by Apple), FreeBSD (`amd64` and
-`arm64`) and Windows (`amd64`, `arm64` and `i686`). Python is not required on
-the target system. It is embedded in the executable:
+`armv7`, `armv6`, `ppc64le`, `s390x`, `riscv64` and `loong64`, plus a glibc-only
+`mips64le` and `armel`), macOS (`amd64` and `arm64`, signed and notarized by
+Apple), FreeBSD (`amd64` and `arm64`), OpenBSD, NetBSD, illumos (`amd64`) and
+Windows (`amd64`, `arm64` and `i686`), plus `.deb`, `.rpm`, Alpine `.apk` and
+FreeBSD `.pkg` packages. The 64-bit glibc builds need only glibc 2.17, so they
+run on everything from RHEL 7 onward. Python is not required on the target
+system. It is embedded in the executable:
 
 ```shell
 # pick the asset for your OS and architecture (glibc amd64 Linux shown; append
