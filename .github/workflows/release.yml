@@ -975,6 +975,7 @@ jobs:
             # so the speedups extra is worth attempting.
             pkgs: python314 rust gmake pkgconf libsodium
             orjson: '1'
+            cflags: -I/usr/local/include
           - arch: arm64
             vmarch: aarch64
             # Full-system QEMU. orjson is a Rust extension whose own build
@@ -987,6 +988,7 @@ jobs:
             # the win that actually matters for a scheduler.
             pkgs: python314 gmake pkgconf libsodium
             orjson: '0'
+            cflags: -I/usr/local/include -include sys/cdefs.h
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -1031,7 +1033,26 @@ jobs:
             PY="venv/bin/python"
             export PIP PY
 
-            retry 5 venv/bin/pip install pyinstaller==6.22.1  # pin matches the other binary jobs
+            # Every dependency here is a source build, so the whole run needs
+            # FreeBSD's pkg prefix on the search paths: the base clang does
+            # not look in /usr/local on its own, and pynacl against the pkg
+            # libsodium fails on a missing sodium.h without it. On aarch64 the
+            # matrix adds a force-include of <sys/cdefs.h>: the base
+            # <machine/ieeefp.h> there spells __BEGIN_DECLS/__END_DECLS without
+            # including the header that defines them, so every translation unit
+            # pulling it in fails to compile. PyInstaller's bootloader is one,
+            # which is what took the arm64 lane down. The amd64 x86 header does
+            # not use those macros, so that row needs no workaround.
+            CFLAGS="${{ matrix.cflags }}"
+            LDFLAGS="-L/usr/local/lib"
+            export CFLAGS LDFLAGS
+
+            # Deliberately NOT wrapped in retry: no FreeBSD wheel exists, so
+            # this COMPILES the bootloader rather than downloading one, and
+            # retry.sh's contract is network operations only. Retrying a
+            # deterministic compile failure five times turned one 70s error
+            # into a 17-minute job.
+            venv/bin/pip install pyinstaller==6.22.1  # pin matches the other binary jobs
             venv/bin/pip install .                # bakes the pinned version into cronstable/version.py
 
             # Bundle uvloop (the `speedups` extra): no FreeBSD wheel exists,
@@ -1051,12 +1072,12 @@ jobs:
               echo "orjson: skipped on this lane; using stdlib json"
             fi
             # Bundle pynacl (the `push` extra). SODIUM_INSTALL=system links
-            # the pkg libsodium instead of running PyNaCl's bundled
-            # autotools build, whose thousands of tiny configure spawns are
-            # what actually hurts under emulation. Soft, like the container
-            # lane: a build that fails the sealed-box round trip is
-            # uninstalled, so push fails closed rather than shipping a
-            # miscompiled libsodium.
+            # the pkg libsodium, found through the CFLAGS/LDFLAGS exported
+            # above, instead of running PyNaCl's bundled autotools build,
+            # whose thousands of tiny configure spawns are what actually
+            # hurts under emulation. Soft, like the container lane: a build
+            # that fails the sealed-box round trip is uninstalled, so push
+            # fails closed rather than shipping a miscompiled libsodium.
             SODIUM_INSTALL=system \
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
             # Bundle zeroconf (the `discovery` extra): pure Python with
