@@ -1117,10 +1117,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # pyarch is setup-python's `architecture`. It is EMPTY on the two
+          # native rows on purpose: the action falls back to the runner's
+          # own arch when the input is blank, so leaving it unset is exactly
+          # today's behavior, while i686 asks for the 32-bit interpreter on
+          # the same x64 runner.
+          #
+          # pfsuffix and regflag exist because a 32-bit MSI is redirected on
+          # a 64-bit host: it installs under "Program Files (x86)" and its
+          # registry components land in the WOW6432Node view. Both
+          # redirections are self-consistent (the .wxs uses
+          # ProgramFiles6432Folder and its RegistrySearch reads back through
+          # the same view), and on a genuinely 32-bit host -- the only place
+          # this artifact is needed -- they resolve to the plain paths. The
+          # smoke assertions below therefore have to follow the host, not
+          # the target.
           - arch: amd64
             runner: windows-latest
+            pyarch: ''
+            pfsuffix: ''
+            regflag: /reg:64
           - arch: arm64
             runner: windows-11-arm
+            pyarch: ''
+            pfsuffix: ''
+            regflag: /reg:64
+          - arch: i686
+            runner: windows-latest
+            pyarch: x86
+            pfsuffix: ' (x86)'
+            regflag: /reg:32
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -1131,8 +1157,10 @@ jobs:
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
+        id: py
         with:
           python-version: '3.14'
+          architecture: ${{ matrix.pyarch }}
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           version: "0.12.5"
@@ -1145,9 +1173,13 @@ jobs:
           CRONSTABLE_BUNDLE: both
         run: |
           set -euo pipefail
-          # Runner-native (uv ships a win_arm64 build too); install into a
-          # throwaway uv venv and freeze from it with `uv run`.
-          uv venv --python 3.14
+          # Freeze from a throwaway uv venv built on the EXACT interpreter
+          # setup-python just installed. Spelling the path rather than
+          # `--python 3.14` is what keeps the i686 row honest: uv resolves a
+          # bare version against everything it can discover, and the x64
+          # 3.14 also present on that runner would satisfy it, silently
+          # producing a 64-bit build under a 32-bit name.
+          uv venv --python "${{ steps.py.outputs.python-path }}"
           uv pip install pyinstaller==6.22.1  # pin matches the Linux/macOS jobs
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle orjson (the `speedups` extra) for the durable-state / cluster
@@ -1177,6 +1209,17 @@ jobs:
           # on the KV side effect: proves the daemon's PyInstaller env scrub
           # against the real bootloader (see the script header).
           bash .github/scripts/cli_job_smoke.sh dist/cronstable.exe
+          # Assert the PE is the arch this row claims. The i686 row builds on
+          # the same x64 runner as amd64, where a 64-bit interpreter would
+          # pass every smoke above and still ship under the 32-bit name; the
+          # macOS lane guards the Rosetta version of this. `file` ships with
+          # git bash.
+          case "${{ matrix.arch }}" in
+            amd64) want='PE32+ executable (console) x86-64' ;;
+            arm64) want='PE32+ executable (console) Aarch64' ;;
+            i686)  want='PE32 executable (console) Intel 80386' ;;
+          esac
+          file dist/cronstable.exe | grep -qF "$want"
           mv dist/cronstable.exe "dist/cronstable-windows-${{ matrix.arch }}.exe"
       - uses: actions/upload-artifact@v7.0.1
         with:
@@ -1244,19 +1287,21 @@ jobs:
           msi_install "dist/cronstable-windows-${ARCH}.msi" msi-install.log
           # Registered, stopped, and the ImagePath is the exact quoted
           # command line winservice.host_argv/image_path would write.
+          # PFSUFFIX is empty on the 64-bit rows and " (x86)" on i686, whose
+          # package the 64-bit host redirects; see the matrix.
           sc query cronstable | grep -q 'STOPPED'
-          sc qc cronstable | grep -F '"C:\Program Files\cronstable\cronstable.exe" -l INFO service run --name cronstable -c "C:\ProgramData\cronstable"'
+          sc qc cronstable | grep -F "\"C:\\Program Files${PFSUFFIX}\\cronstable\\cronstable.exe\" -l INFO service run --name cronstable -c \"C:\\ProgramData\\cronstable\""
           # The recovery actions the Util custom action configured.
           sc qfailure cronstable | grep -qi 'RESTART'
           # The installed exe runs from Program Files.
-          "/c/Program Files/cronstable/cronstable.exe" --version
+          "/c/Program Files${PFSUFFIX}/cronstable/cronstable.exe" --version
           msi_uninstall "dist/cronstable-windows-${ARCH}.msi" msi-uninstall.log
           # Service and files are gone.
           if sc query cronstable >/dev/null 2>&1; then
             echo "service still registered after uninstall" >&2
             exit 1
           fi
-          test ! -e "/c/Program Files/cronstable/cronstable.exe"
+          test ! -e "/c/Program Files${PFSUFFIX}/cronstable/cronstable.exe"
       # A real major-upgrade round trip; the fresh-install smoke above
       # exercises none of the upgrade choreography. Install with a
       # CUSTOM config directory, upgrade to a patch-bumped twin without
