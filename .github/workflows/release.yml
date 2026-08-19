@@ -1212,14 +1212,28 @@ jobs:
           # Assert the PE is the arch this row claims. The i686 row builds on
           # the same x64 runner as amd64, where a 64-bit interpreter would
           # pass every smoke above and still ship under the 32-bit name; the
-          # macOS lane guards the Rosetta version of this. `file` ships with
-          # git bash.
+          # macOS lane guards the Rosetta version of this. Read the COFF
+          # Machine field rather than grepping `file`, whose prose differs
+          # between versions and across these three arches.
           case "${{ matrix.arch }}" in
-            amd64) want='PE32+ executable (console) x86-64' ;;
-            arm64) want='PE32+ executable (console) Aarch64' ;;
-            i686)  want='PE32 executable (console) Intel 80386' ;;
+            amd64) want=8664 ;;   # IMAGE_FILE_MACHINE_AMD64
+            arm64) want=aa64 ;;   # IMAGE_FILE_MACHINE_ARM64
+            i686)  want=014c ;;   # IMAGE_FILE_MACHINE_I386
           esac
-          file dist/cronstable.exe | grep -qF "$want"
+          uv run python -c '
+          import struct, sys
+          path, want = sys.argv[1], int(sys.argv[2], 16)
+          with open(path, "rb") as fobj:
+              blob = fobj.read()
+          off = struct.unpack_from("<I", blob, 0x3c)[0]
+          if blob[off:off + 4] != b"PE\x00\x00":
+              sys.exit("{}: not a PE image".format(path))
+          machine = struct.unpack_from("<H", blob, off + 4)[0]
+          if machine != want:
+              sys.exit("{}: COFF machine 0x{:04x}, expected 0x{:04x}".format(
+                  path, machine, want))
+          print("{}: COFF machine 0x{:04x}".format(path, machine))
+          ' dist/cronstable.exe "$want"
           mv dist/cronstable.exe "dist/cronstable-windows-${{ matrix.arch }}.exe"
       - uses: actions/upload-artifact@v7.0.1
         with:
