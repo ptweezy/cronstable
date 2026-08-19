@@ -638,7 +638,7 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 
 The settings panel (and the command palette) expose:
 
-- **Ten themes**: **standard** (the default, a flat neutral charcoal), **carolina** (Carolina blue), **amber**, and **green**, plus flat **modern**, each in a dark and a light (paper) variant. Light variants are dark ink on tinted paper; **standard**'s light variant is plain white with saturated color. Cycle hues with `t`; flip light/dark with `T`.
+- **Ten themes**: **standard** (the default, a flat neutral charcoal), **carolina** (Carolina blue), **amber**, **green**, and flat **modern**, each in a dark and a light (paper) variant. Light variants are dark ink on tinted paper; **standard**'s light variant is plain white with saturated color. Cycle hues with `t`; flip light/dark with `T`.
 - A **color vision** mode that remaps the status, cluster-peer, and log-ANSI colors for **red-green** (deuteranopia/protanopia) or **blue-yellow** (tritanopia) color blindness, on both the dark and paper palettes. The remapped pairs were chosen with a dichromacy simulation, so every meaningful pair (ok/fail, fail/pending, agreed/drifted, …) stays clearly apart, and every status glyph differs by shape in every mode.
 - **Compact density** for tighter rows.
 - An **interface font** choice: the terminal monospace (default) or a proportional sans-serif that is easier to read at length. Log output, cron expressions, and keycaps stay monospace either way, and numerals stay tabular so clocks don't jitter.
@@ -669,13 +669,17 @@ warns when it holds every scope; give a phone a scoped `web.authTokens` entry
 instead. For the pairing flow this feeds, see
 [push notifications](Push-Notifications).
 
-| Amber | Green |
+| Carolina | Amber |
 | :---: | :---: |
-| [![The dashboard in the amber theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) |
+| [![The dashboard in the carolina theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina.png) | [![The dashboard in the amber theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) |
 
-| Flat modern theme | Carolina, on paper (light) |
+| Green | Flat modern |
 | :---: | :---: |
-| [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina-light.png) |
+| [![The dashboard in the green theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) | [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png) |
+
+| Standard, on paper (light) |
+| :---: |
+| [![The dashboard in the standard light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-standard-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-standard-light.png) |
 
 ## The pendulum wordmark
 

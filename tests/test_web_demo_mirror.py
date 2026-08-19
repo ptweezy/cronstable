@@ -19,7 +19,7 @@ import importlib.util
 import os
 import re
 
-from cronstable._cliargs import THEME_HUES
+from cronstable._cliargs import DEFAULT_THEME_HUE, THEME_HUES
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB = os.path.join(ROOT, "cronstable", "web", "index.html")
@@ -401,6 +401,34 @@ def test_dashboard_theme_hues_match_the_cli_list():
         "the dashboard's THEME_HUES %r has drifted from "
         "cronstable._cliargs.THEME_HUES %r" % (web_hues, list(THEME_HUES))
     )
+
+
+def test_dashboard_default_theme_matches_the_cli_default():
+    """The dashboard's three default-hue literals equal DEFAULT_THEME_HUE.
+
+    The default hue is spelled out three times in the page (the <html>
+    attribute the browser paints before any script runs, the prefs object,
+    and themeParts()'s self-heal fallback) and once in Python. Nothing links
+    them, so a changed DEFAULT_THEME_HUE otherwise leaves first paint, a
+    fresh profile, and a garbage stored pref on the old hue. The demo page
+    inherits all three through the mirror rebuild.
+    """
+    web = _read(WEB)
+    sites = {
+        "<html data-theme>": r'<html[^>]*\sdata-theme="([^"]*)"',
+        "prefs.theme": r'const prefs = \{\s*theme: "([^"]*)"',
+        "themeParts fallback": (
+            r'THEME_HUES\.includes\(hue\) \? hue : "([^"]*)"'
+        ),
+    }
+    for label, pattern in sites.items():
+        m = re.search(pattern, web)
+        assert m, "%s default-theme literal not found in %s" % (label, WEB)
+        assert m.group(1) == DEFAULT_THEME_HUE, (
+            "the dashboard's %s default %r has drifted from "
+            "cronstable._cliargs.DEFAULT_THEME_HUE %r"
+            % (label, m.group(1), DEFAULT_THEME_HUE)
+        )
 
 
 def test_demo_mirror_has_no_crlf():
