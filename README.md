@@ -159,8 +159,8 @@ alerting, durable state, orchestration, clustering, and a live dashboard.
   [production container deployment](#production-container-deployment))
 * **Prebuilt for practically everything.** Multi-architecture images on GHCR
   and Docker Hub, plus self-contained binaries for Linux (glibc and musl),
-  macOS (signed and notarized), and Windows, so Python on the host is
-  optional (see [installation](#installation))
+  macOS (signed and notarized), FreeBSD, and Windows, so Python on the host
+  is optional (see [installation](#installation))
 
 [![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](#web-dashboard)
 
@@ -286,9 +286,9 @@ Alternatively, download a self-contained binary from GitHub:
 <https://github.com/ptweezy/cronstable/releases>. Every release attaches
 binaries for Linux (glibc and musl builds for `amd64`, `arm64`, `i686`,
 `armv7`, `ppc64le`, `s390x` and `riscv64`, plus a musl-only `armv6`), macOS
-(`amd64` and `arm64`, signed and notarized by Apple) and Windows (`amd64` and
-`arm64`). Python is not required on the target system. It is embedded in the
-executable:
+(`amd64` and `arm64`, signed and notarized by Apple), FreeBSD (`amd64` and
+`arm64`) and Windows (`amd64`, `arm64` and `i686`). Python is not required on
+the target system. It is embedded in the executable:
 
 ```shell
 # pick the asset for your OS and architecture (glibc amd64 Linux shown; append
@@ -317,11 +317,12 @@ MSI](https://github.com/ptweezy/cronstable/wiki/Windows-MSI) wiki page).
 
 ## Running on Windows
 
-cronstable runs natively on Windows (x64 and ARM64). Install it with
-`pip install cronstable`, or take one of the builds on the
+cronstable runs natively on Windows (x64, ARM64 and 32-bit x86). Install it
+with `pip install cronstable`, or take one of the builds on the
 [releases page](https://github.com/ptweezy/cronstable/releases), none of which
 need Python: the self-contained `cronstable-windows-amd64.exe` /
-`cronstable-windows-arm64.exe`, the one-directory
+`cronstable-windows-arm64.exe` / `cronstable-windows-i686.exe`, the
+one-directory
 `cronstable-windows-<arch>.zip` (the shape that can host the Windows service),
 or the machine-wide `cronstable-windows-<arch>.msi`. Everything else, like the
 YAML crontab, scheduling, reporting, retries, the HTTP API and the
