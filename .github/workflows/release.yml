@@ -1080,12 +1080,26 @@ jobs:
             #
             # Assert the binary is the arch this row claims: a VM that came
             # up on the wrong image would otherwise pass every smoke above
-            # and ship a mislabelled asset.
+            # and ship a mislabelled asset. Read the ELF e_machine field
+            # rather than grepping `file`, whose prose differs between
+            # versions and across arches.
             case "${{ matrix.arch }}" in
-              amd64) want=x86-64 ;;
-              arm64) want=aarch64 ;;
+              amd64) want=62 ;;    # EM_X86_64
+              arm64) want=183 ;;   # EM_AARCH64
             esac
-            file dist/cronstable | grep -q "$want"
+            venv/bin/python -c '
+            import struct, sys
+            path, want = sys.argv[1], int(sys.argv[2])
+            with open(path, "rb") as fobj:
+                head = fobj.read(20)
+            if head[:4] != b"\x7fELF":
+                sys.exit("{}: not an ELF image".format(path))
+            machine = struct.unpack_from("<H", head, 0x12)[0]
+            if machine != want:
+                sys.exit("{}: ELF e_machine {}, expected {}".format(
+                    path, machine, want))
+            print("{}: ELF e_machine {}".format(path, machine))
+            ' dist/cronstable "$want"
             mv dist/cronstable "dist/cronstable-freebsd-${{ matrix.arch }}"
             # Keep the copyback to the artifact: the venv and PyInstaller's
             # work tree are hundreds of megabytes of rsync the host has no
