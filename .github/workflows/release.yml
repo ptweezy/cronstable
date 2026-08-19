@@ -946,6 +946,158 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Self-contained FreeBSD binaries (amd64, arm64). PyInstaller is not a
+  # cross-compiler and GitHub hosts no FreeBSD runner, so both rows build
+  # inside a real FreeBSD VM booted on the Ubuntu runner: amd64 runs on the
+  # host's own architecture, arm64 under full-system QEMU. The host stays
+  # x86_64 for both rows (the action's own guidance: an arm64 runner is
+  # slower at this than an x86_64 one emulating).
+  #
+  # PyPI publishes no FreeBSD wheels for anything, so every compiled
+  # dependency here is a source build, PyInstaller's own bootloader
+  # included. The extras therefore ride the CONTAINER lane's policy set
+  # rather than the native lanes': best-effort for the compiled ones
+  # (verify_extra.py drops a miscompiled build and the binary falls back),
+  # hard only for pure-Python zeroconf.
+  #
+  # timeout-minutes caps a runaway emulated row well below the 6h default:
+  # the native row lands in well under an hour, and a row that has not
+  # finished in three is wedged, not slow.
+  binaries-freebsd:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            vmarch: x86_64
+            # Host-native. A Rust orjson source build costs minutes here,
+            # so the speedups extra is worth attempting.
+            pkgs: python314 rust gmake pkgconf libsodium
+            orjson: '1'
+          - arch: arm64
+            vmarch: aarch64
+            # Full-system QEMU. orjson is a Rust extension whose own build
+            # backend (maturin) has no FreeBSD wheel either, so installing
+            # it here means compiling a Rust toolchain's worth of code
+            # inside an emulated guest. It is best-effort on every lane by
+            # design, so this row skips it outright and the binary uses the
+            # stdlib json fallback (cronstable/_json). uvloop stays: it is
+            # a plain C build against bundled libuv, and the event loop is
+            # the win that actually matters for a scheduler.
+            pkgs: python314 gmake pkgconf libsodium
+            orjson: '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
+      - uses: actions/checkout@v7.0.1
+      - name: Build binary (FreeBSD ${{ matrix.vmarch }})
+        uses: vmactions/freebsd-vm@v1.5.3
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        with:
+          release: '14.3'
+          arch: ${{ matrix.vmarch }}
+          # 4 vCPU is the hosted runner's full allotment; the extra memory
+          # over the action's 6144 default is for the C/Rust source builds.
+          cpu: 4
+          mem: 8192
+          # rsync the guest's workspace back so dist/ reaches the host for
+          # the upload step below.
+          copyback: true
+          # Only NAMED host variables cross into the guest.
+          envs: 'SETUPTOOLS_SCM_PRETEND_VERSION'
+          prepare: |
+            pkg install -y ${{ matrix.pkgs }}
+          run: |
+            set -eu
+            . .github/scripts/retry.sh
+
+            # FreeBSD's lang/python314 is configured --without-ensurepip
+            # (see its port Makefile), so a venv comes up with no pip at
+            # all and the usual `python -m venv` line silently yields an
+            # unusable environment. Bootstrap pip explicitly; `fetch` is in
+            # the base system, and only the network hop is retried.
+            python3.14 -m venv --without-pip venv
+            retry 5 fetch -o get-pip.py https://bootstrap.pypa.io/get-pip.py
+            venv/bin/python get-pip.py
+
+            # install_extra.sh / install_orjson.sh read these; the venv has
+            # no activate step in a non-interactive sh.
+            PIP="venv/bin/pip"
+            PY="venv/bin/python"
+            export PIP PY
+
+            retry 5 venv/bin/pip install pyinstaller==6.22.1  # pin matches the other binary jobs
+            venv/bin/pip install .                # bakes the pinned version into cronstable/version.py
+
+            # Bundle uvloop (the `speedups` extra): no FreeBSD wheel exists,
+            # so this is always a source build against bundled libuv. The
+            # shared script has verify_extra.py prove the result runs a loop
+            # and uninstalls it otherwise, so a miscompiled uvloop is never
+            # frozen in and the binary cleanly falls back to asyncio.
+            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+            # Bundle orjson (the `speedups` extra) where this lane attempts
+            # it; see the matrix comment for why the emulated row does not.
+            # Rust comes from pkg (1.96+, past orjson's MSRV), so the
+            # script's rustup ladder is never needed and RUST_SETUP stays
+            # unset.
+            if [ "${{ matrix.orjson }}" = "1" ]; then
+              sh pyinstaller/install_orjson.sh
+            else
+              echo "orjson: skipped on this lane; using stdlib json"
+            fi
+            # Bundle pynacl (the `push` extra). SODIUM_INSTALL=system links
+            # the pkg libsodium instead of running PyNaCl's bundled
+            # autotools build, whose thousands of tiny configure spawns are
+            # what actually hurts under emulation. Soft, like the container
+            # lane: a build that fails the sealed-box round trip is
+            # uninstalled, so push fails closed rather than shipping a
+            # miscompiled libsodium.
+            SODIUM_INSTALL=system \
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+            # Bundle zeroconf (the `discovery` extra): pure Python with
+            # optional speedups, so a HARD install even here. LGPL-2.1; the
+            # in-binary notice, Release source archive and public build
+            # recipe are the compliance kit (see LICENSING.md).
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+
+            venv/bin/pyinstaller pyinstaller/cronstable.spec
+            dist/cronstable --version           # smoke test: fails the job if the bundle is broken
+            # Whenever the build env kept pynacl, the frozen binary must
+            # reach it (and zeroconf) too: the push-plus-bonjour config
+            # validates only when both import inside the bundle.
+            if venv/bin/python -c "import nacl" 2>/dev/null; then
+              dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+            fi
+            # cli_job_smoke.sh is deliberately not run here: it needs bash,
+            # curl and a live daemon, none of which this lean VM carries,
+            # and one row is emulated. The env scrub it proves is shared
+            # Python code, identical on every lane.
+            #
+            # Assert the binary is the arch this row claims: a VM that came
+            # up on the wrong image would otherwise pass every smoke above
+            # and ship a mislabelled asset.
+            case "${{ matrix.arch }}" in
+              amd64) want=x86-64 ;;
+              arm64) want=aarch64 ;;
+            esac
+            file dist/cronstable | grep -q "$want"
+            mv dist/cronstable "dist/cronstable-freebsd-${{ matrix.arch }}"
+            # Keep the copyback to the artifact: the venv and PyInstaller's
+            # work tree are hundreds of megabytes of rsync the host has no
+            # use for.
+            rm -rf venv build get-pip.py
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-freebsd-${{ matrix.arch }}
+          path: dist/cronstable-freebsd-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
   # Self-contained Windows binaries: amd64 on the hosted runner, arm64 on the
   # windows-11-arm runner. Any C-extension dep lacking a win_arm64 wheel (parts
   # of the aiohttp stack, ruamel.yaml.clib) compiles from sdist via the runner's
