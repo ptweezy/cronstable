@@ -144,6 +144,7 @@ SERVICE_DESCRIPTION = (
 ONEDIR_RELEASE_ASSETS = (
     "cronstable-windows-amd64.zip",
     "cronstable-windows-arm64.zip",
+    "cronstable-windows-i686.zip",
 )
 
 #: How often the pending-state pumper reports progress, and the wait hint it
@@ -1415,13 +1416,15 @@ def install(args: Any, api: WinApi) -> int:
             "Windows service. Its bootloader unpacks itself and runs the "
             "program in a child process, so the process the Service "
             "Control Manager starts never registers, and the start fails "
-            "on the SCM's timeout. Download the one-directory build "
-            "({} on the releases page), extract it, and run `cronstable "
-            "service install` from its cronstable.exe; or install the "
-            ".msi, which registers the service itself; or install "
-            "cronstable with pip or pipx; or keep using the schtasks "
-            "recipe in the Windows documentation.".format(
-                " or ".join(ONEDIR_RELEASE_ASSETS)
+            "on the SCM's timeout. Download the one-directory build for "
+            "your architecture ({}, or {} on the releases page), extract "
+            "it, and run `cronstable service install` from its "
+            "cronstable.exe; or install the .msi, which registers the "
+            "service itself; or install cronstable with pip or pipx; or "
+            "keep using the schtasks recipe in the Windows "
+            "documentation.".format(
+                ", ".join(ONEDIR_RELEASE_ASSETS[:-1]),
+                ONEDIR_RELEASE_ASSETS[-1],
             )
         )
     config = getattr(args, "config", None)
