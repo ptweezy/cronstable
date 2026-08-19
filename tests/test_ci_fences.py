@@ -445,3 +445,80 @@ def test_signing_retries_repeat_the_same_call():
     for step in attempts[1:]:
         assert step["uses"] == attempts[0]["uses"], step.get("name")
         assert step["with"] == attempts[0]["with"], step.get("name")
+
+
+def _matrix_images():
+    """(job, image) for every container base image the matrices name."""
+    out = []
+    for name, job in _workflow()["jobs"].items():
+        for entry in (
+            job.get("strategy", {}).get("matrix", {}).get("include", []) or []
+        ):
+            if "image" in entry:
+                out.append((name, entry["image"]))
+    return out
+
+
+def test_every_container_base_image_is_pinned_to_a_distro_release():
+    # The libc floor of a container-built binary is a property of the base
+    # image, so a floating tag makes it drift on its own: `python:3.14-alpine`
+    # walked from Alpine 3.19 to 3.24 and took the musl floor from 1.2.4 to
+    # 1.2.6 with it, with CI green throughout because the smoke test runs on
+    # the same image that raised it.  Every base must therefore name a distro
+    # release, not just a Python version.
+    floating = []
+    for job, image in _matrix_images():
+        _, _, tag = image.rpartition(":")
+        if tag == image or tag in ("latest", ""):
+            floating.append((job, image))
+            continue
+        if image.startswith("python:") and not re.search(
+            r"(alpine\d+\.\d+|slim-[a-z]+)$", tag
+        ):
+            floating.append((job, image))
+    assert not floating, (
+        "these base images float, so the libc floor moves without an edit: "
+        "{}".format(sorted(floating))
+    )
+
+
+def _declared_floors():
+    """arch -> the glibc floor its build lane declares."""
+    floors = {}
+    for job in _workflow()["jobs"].values():
+        for entry in (
+            job.get("strategy", {}).get("matrix", {}).get("include", []) or []
+        ):
+            if entry.get("floor") and entry.get("arch"):
+                floors[entry["arch"]] = str(entry["floor"])
+    return floors
+
+
+def test_package_dependencies_declare_the_floor_the_lane_enforces():
+    # The .deb/.rpm `libc6 >= X` dependency is the only thing that stops a
+    # package installing on a host the binary cannot start on, and it is
+    # spelled in a second place: build_packages.sh's table.  elf_floor.py
+    # enforces the workflow's number against the actual bytes, so if the two
+    # disagree the packages promise something nothing checks.
+    script = os.path.join(ROOT, ".github", "scripts", "build_packages.sh")
+    with open(script, encoding="utf-8") as fobj:
+        body = fobj.read()
+    rows = re.search(r'ROWS="\n(.*?)\n"', body, re.S)
+    assert rows, "build_packages.sh no longer carries a ROWS table"
+    packaged = {}
+    for line in rows.group(1).splitlines():
+        fields = line.split()
+        if len(fields) == 4:
+            packaged[fields[0]] = fields[3]
+    assert packaged, "the ROWS table parsed to nothing"
+
+    declared = _declared_floors()
+    mismatched = {
+        arch: (floor, declared.get(arch))
+        for arch, floor in packaged.items()
+        if declared.get(arch) != floor
+    }
+    assert not mismatched, (
+        "packaged floor != the floor the build lane declares and elf_floor.py "
+        "enforces, as {arch: (packaged, lane)}: {}".format(mismatched)
+    )

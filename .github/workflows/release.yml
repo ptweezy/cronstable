@@ -498,6 +498,29 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # `nix flake check`: evaluate flake.nix and build cronstable from nixpkgs'
+  # Python and dependency set. `nix run github:ptweezy/cronstable` works off
+  # this file, and it is the prerequisite artifact for a later nixpkgs
+  # submission, so it needs a gate that notices when it stops evaluating.
+  #
+  # CI-ONLY, like the macOS 26 row: continue-on-error, and the release does not
+  # wait on it. Everything it builds comes from a nixpkgs branch that moves
+  # outside this repository, so a red here is information about nixpkgs, not a
+  # reason to hold a release that ships no Nix artifact.
+  nix:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # --print-build-logs so a dependency that fails to build says why in the
+      # job log instead of only naming the derivation.
+      - run: nix flake check --print-build-logs
+
   # Self-contained glibc PyInstaller binaries, one per architecture, built
   # inside a manylinux image against a python-build-standalone interpreter.
   #
@@ -2882,6 +2905,19 @@ jobs:
           ( cd "$work" && sha256sum -- * ) > SHA256SUMS
           cat SHA256SUMS
 
+      # The Scoop manifest for this release, rendered from the SHA256SUMS just
+      # written. Scoop is a PULL channel: once this file is in the
+      # ScoopInstaller/Extras bucket, its Excavator bot re-reads checkver and
+      # autoupdate every four hours and bumps the manifest from the same
+      # SHA256SUMS asset, so nothing here has to push anything ever again.
+      # Attaching it rather than committing it keeps the hashes honest.
+      - name: Render the Scoop manifest
+        run: |
+          set -euo pipefail
+          mkdir -p scoop
+          python3 .github/scripts/render_scoop.py "${{ needs.version.outputs.new }}" SHA256SUMS scoop/cronstable.json
+          cat scoop/cronstable.json
+
       # The perf gate's output for THIS run: the markdown summary the notes
       # append, the merged raw results for the record, and the chart (kept in
       # this artifact only, never attached to the Release).
@@ -2965,6 +3001,7 @@ jobs:
           # workflow artifact.
           files: |
             SHA256SUMS
+            scoop/cronstable.json
             perf/perf-summary.md
             perf/perf-results.json
             third-party/THIRD-PARTY-NOTICES.txt
