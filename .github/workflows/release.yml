@@ -661,8 +661,10 @@ jobs:
           # Passed through the environment rather than spliced into the
           # single-quoted script below, which admits no quote characters.
           # CentOS 7 carries curl; the distro rustc predates orjson's MSRV by
-          # years, so a current stable comes from rustup.
-          RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+          # years, so a current stable comes from rustup. No curl-level retry
+          # flags: that curl is 7.29 and rejects --retry-connrefused as a
+          # usage error, and retry.sh already wraps the call.
+          RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
         run: |
           set -euo pipefail
           docker run --rm --platform ${{ matrix.platform }} \
