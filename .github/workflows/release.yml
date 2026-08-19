@@ -698,6 +698,18 @@ jobs:
               PATH=/opt/pbs/bin:$PATH
               LD_LIBRARY_PATH=/opt/pbs/lib
               export PATH LD_LIBRARY_PATH
+              # python-build-standalone bakes the toolchain it was built with
+              # into sysconfig (CC=/usr/bin/<triple>-gcc), and that path does
+              # not exist in this image, so every source build dies with "No
+              # such file or directory" before it compiles a line. It bites the
+              # emulated rows hardest, where psutil, uvloop and pynacl all
+              # build from sdist. Point the build tools at the image toolchain,
+              # which is the one producing GLIBC_2.17 objects anyway.
+              CC=gcc
+              CXX=g++
+              AR=ar
+              LDSHARED="gcc -shared"
+              export CC CXX AR LDSHARED
               # install_extra.sh / install_orjson.sh read these; nothing on the
               # image PATH is the right interpreter, so both are absolute.
               PIP="/opt/pbs/bin/python3 -m pip"
