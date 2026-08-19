@@ -1211,7 +1211,15 @@ jobs:
               # dependency that starts asking for a newer symbol version would
               # ship a binary that no longer starts on bookworm-era hardware,
               # with CI green throughout.
-              /v/bin/python /src/.github/scripts/elf_floor.py dist/cronstable --max-glibc 2.36 --no-exec-stack
+              # No --no-exec-stack on this row, unlike every other glibc lane.
+              # Debian's mips64el port carries an executable stack everywhere:
+              # the kernel FPU emulator runs FP branch delay slots out of line
+              # on the user stack, so glibc is configured for it and every
+              # object inherits it. All 62 images here declare it, Debian's own
+              # libcrypto and libpython included, so the check can never pass.
+              # Debian settled it for bookworm in #1022787, and lintian
+              # disables its own executable-stack tag on MIPS.
+              /v/bin/python /src/.github/scripts/elf_floor.py dist/cronstable --max-glibc 2.36
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
             '
       - uses: actions/upload-artifact@v7.0.1
