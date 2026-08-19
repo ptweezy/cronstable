@@ -2,6 +2,22 @@
 
 ## 1.2.45
 
+- Calendar apps subscribe to the `.ics` feeds with a feed key rather than a
+  bearer token. A calendar client cannot send an `Authorization` header, so the
+  credential has to ride the URL, where a third-party calendar service stores
+  it, syncs it onto every device on the account, and every proxy on the path
+  logs it. The key is an HMAC of a fixed context string under a configured
+  token, so it opens the `.ics` routes and nothing else and the token behind it
+  cannot be recovered from it. It needs no storage and no rotation of its own:
+  rotating that token invalidates every subscribe URL minted from it, and each
+  token has its own key. `GET /whoami` reports the caller's as `calendarFeed`,
+  and the dashboard builds both the week card's fleet link and each drawer's
+  per-job link from it.
+- A bearer token in a `?token=` query parameter on the `.ics` paths must grant
+  `view` and nothing more. A token holding `control` or `approve`, the
+  all-scopes `web.authToken` included, answers `403` there and names the feed
+  key as the way through. Subscribing with the scalar token used to hand a
+  calendar service the whole control API.
 - Releases now attach `cronstable-linux-armv6`, a glibc ARMv6 hard-float
   binary, which is what a Raspberry Pi 1, Zero or Zero W running Raspberry Pi OS
   actually needs. Until now the only ARMv6 build was musl, and Raspberry Pi OS

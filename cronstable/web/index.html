@@ -1535,7 +1535,7 @@
 
   <div class="card weekcal" id="weekCard" style="display:none">
     <div class="card-label"><span>┌─ week calendar</span><span class="grow"></span>
-      <a class="icslink" id="icsLink" href="/calendar.ics" title="Subscribe to these fires as an iCal feed (.ics)">⤓ .ics feed</a>
+      <a class="icslink" id="icsLink" href="/calendar.ics" title="Subscribe to these fires as an iCal feed (.ics). The URL carries a read-only feed key, not your token.">⤓ .ics feed</a>
       <span class="faint" id="weekMeta"></span>
     </div>
     <div class="weekcal-body" id="weekBody"></div>
@@ -6787,11 +6787,18 @@ var qrcode = function() {
     state.week.frequent = frequent;
     state.week.bounds = bounds;
   }
+  // The subscribe URL carries the derived feed key from /whoami, never the
+  // bearer token: it gets pasted into third-party calendar services, and the
+  // key authorizes the .ics feeds alone. An open or anonymous-view daemon
+  // reports none and the feeds are served bare.
+  function icsQuery() {
+    const f = state.auth && state.auth.calendarFeed;
+    return f ? "?feed=" + encodeURIComponent(f) : "";
+  }
   function updateIcsLink() {
     const a = $("icsLink");
     if (!a) return;
-    const t = token();
-    a.href = "/calendar.ics" + (t ? "?token=" + encodeURIComponent(t) : "");
+    a.href = "/calendar.ics" + icsQuery();
   }
   function renderWeek() {
     const card = $("weekCard");
@@ -8425,15 +8432,14 @@ var qrcode = function() {
     // (e.g. "31 of February") — say so instead of a confident-but-wrong prose.
     const impossible = parsed.type === "fields" && !runs.length;
     const desc = impossible ? "This schedule can never occur (impossible date)." : describeCron(schedOf(job));
-    const t = token();
     const icsHref = "/jobs/" + encodeURIComponent(name) + "/calendar.ics" +
-      (t ? "?token=" + encodeURIComponent(t) : "");
+      icsQuery();
     let html =
       '<p class="sched-desc">' + esc(desc) + "</p>" +
       '<div class="sched-sub">schedule <span class="chip">' + esc(job.schedule) + "</span>" +
       (job.schedule_resolved ? ' <span class="faint">(H resolves to</span> <span class="chip">' + esc(job.schedule_resolved) + '</span><span class="faint">)</span>' : "") +
       ' · times shown in <b>' + esc(frame === "LOCAL" ? "local" : frame) + "</b>" +
-      ' · <a class="icslink" href="' + escAttr(icsHref) + '" title="Subscribe to this job\'s fires as an iCal feed">⤓ .ics</a></div>';
+      ' · <a class="icslink" href="' + escAttr(icsHref) + '" title="Subscribe to this job\'s fires as an iCal feed. The URL carries a read-only feed key, not your token.">⤓ .ics</a></div>';
 
     // foot-gun advisories: self-overlap, thundering-herd collisions, DST
     const warns = scheduleWarnings(job);
@@ -10845,6 +10851,8 @@ var qrcode = function() {
       } catch (_) { /* a 401 already opened the token modal; keep prior scopes */ }
       updateAuthBtn();
       applyScopeChrome();
+      // the .ics links read state.auth.calendarFeed
+      updateIcsLink();
     });
   }
   function applyScopeChrome() {

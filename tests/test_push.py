@@ -40,6 +40,7 @@ from cronstable.cron import (
     WEB_TOKEN_REQUEST_KEY,
     Cron,
     _WebToken,
+    calendar_feed_key,
 )
 from cronstable.fingerprint import canonical_job
 from cronstable.job import (
@@ -2118,11 +2119,13 @@ async def test_whoami_with_and_without_token():
         "scopes": ["view"],
         "allScopes": False,
         "pairLinkBase": "https://relay.cronstable.com/pair",
+        "calendarFeed": calendar_feed_key(b"t"),
     }
     body = json.loads((await cron._web_whoami(_Req())).body)
     assert body["authenticated"] is False
     assert body["allScopes"] is True
     assert body["scopes"] == sorted(["view", "control", "approve"])
+    assert body["calendarFeed"] is None
 
 
 async def test_whoami_reports_an_anonymous_grant():
@@ -2139,6 +2142,8 @@ async def test_whoami_reports_an_anonymous_grant():
         "scopes": ["view"],
         "allScopes": False,
         "pairLinkBase": "https://relay.cronstable.com/pair",
+        # no token of its own: the feeds are served bare
+        "calendarFeed": None,
     }
 
 
