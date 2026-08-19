@@ -23,7 +23,7 @@
   The same step rejects an interpreter built with an executable stack, which
   ships fine and then fails at run time on SELinux-hardened hosts.
 - Every container base image is pinned to an explicit distro release. The
-  musl builds are built on Alpine 3.23 and require musl 1.2.5, which is
+  musl binaries are built on Alpine 3.23 and require musl 1.2.5, which is
   Alpine 3.20 and later; the floating `python:3.14-alpine` tag had walked
   from Alpine 3.19 to 3.24 and taken the requirement with it.
 - The MIPS lane builds against a `snapshot.debian.org` slice of Debian
