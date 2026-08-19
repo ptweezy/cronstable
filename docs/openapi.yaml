@@ -898,6 +898,7 @@ paths:
       operationId: getCalendar
       security:
         - bearerAuth: []
+        - icsFeed: []
         - icsToken: []
         - {}
       parameters:
@@ -912,6 +913,7 @@ paths:
           in: query
           description: Legacy alias of `limit` (read when `limit` is absent).
           schema: { type: integer }
+        - $ref: "#/components/parameters/IcsFeed"
         - $ref: "#/components/parameters/IcsToken"
       responses:
         "200":
@@ -920,6 +922,7 @@ paths:
             text/calendar:
               schema: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
 
   /jobs/{name}/calendar.ics:
     get:
@@ -928,6 +931,7 @@ paths:
       operationId: getJobCalendar
       security:
         - bearerAuth: []
+        - icsFeed: []
         - icsToken: []
         - {}
       parameters:
@@ -943,6 +947,7 @@ paths:
           in: query
           description: Legacy alias of `limit` (read when `limit` is absent).
           schema: { type: integer }
+        - $ref: "#/components/parameters/IcsFeed"
         - $ref: "#/components/parameters/IcsToken"
       responses:
         "200":
@@ -951,6 +956,7 @@ paths:
             text/calendar:
               schema: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /state:
@@ -1390,15 +1396,32 @@ components:
         credential at all (`web.anonymousScopes`, `view` only), in which case
         the same scope table decides the request and an uncovered operation
         answers 403; presenting a wrong token is still 401.
+    icsFeed:
+      type: apiKey
+      in: query
+      name: feed
+      description: >-
+        The derived calendar feed key as a `?feed=` query parameter, the way
+        a calendar client subscribes: HMAC-SHA256 of a fixed context string
+        under a configured token, hex, first 32 characters. `GET /whoami`
+        reports the caller's own as `calendarFeed`, and the dashboard builds
+        its `.ics` links from it. The key authorizes the `.ics` calendar
+        routes and nothing else, reveals nothing about the token behind it,
+        and stops working when that token rotates. Accepted only on the
+        `.ics` routes; every other route refuses it.
     icsToken:
       type: apiKey
       in: query
       name: token
       description: >-
-        Any configured token (`web.authToken` or a `web.authTokens` entry
-        holding `view`) as a `?token=` query parameter. Accepted only on the
-        `.ics` calendar routes (calendar clients cannot send a bearer header);
-        every other route refuses query tokens.
+        A `web.authTokens` entry holding `view` and nothing more, as a
+        `?token=` query parameter. Accepted only on the `.ics` calendar
+        routes (calendar clients cannot send a bearer header); every other
+        route refuses query tokens. A token granting `control` or `approve`,
+        the all-scopes `web.authToken` included, is refused here with `403`:
+        a subscribe URL is stored by third-party calendar services and
+        written into proxy logs, so it may carry read-only authority only.
+        Prefer `icsFeed`, which is not a bearer token at all.
 
   parameters:
     JobName:
@@ -1431,11 +1454,21 @@ components:
       required: false
       description: A prior `ETag`; a match yields 304.
       schema: { type: string }
+    IcsFeed:
+      name: feed
+      in: query
+      required: false
+      description: >-
+        The derived feed key (`GET /whoami` -> `calendarFeed`), for calendar
+        clients that cannot send a bearer header.
+      schema: { type: string }
     IcsToken:
       name: token
       in: query
       required: false
-      description: The auth token, for calendar clients that cannot send a bearer header.
+      description: >-
+        A view-only auth token, for calendar clients that cannot send a
+        bearer header. Anything more privileged is refused with 403.
       schema: { type: string }
     DeviceId:
       name: id
@@ -1547,7 +1580,16 @@ components:
             the origin of `push.relay.url` plus `/pair` (embedded
             credentials dropped), or the hosted relay's landing while no
             `push:` section is applied.
-      required: [authenticated, scopes, allScopes, pairLinkBase]
+        calendarFeed:
+          type: string
+          nullable: true
+          description: >-
+            The caller's calendar feed key, which subscribes a calendar app
+            to the `.ics` routes as `?feed=` and authorizes nothing else
+            (see the `icsFeed` security scheme). Null for a caller holding
+            no token of its own, since an open or anonymous-view daemon
+            serves the feeds bare.
+      required: [authenticated, scopes, allScopes, pairLinkBase, calendarFeed]
 
     PushDevice:
       type: object

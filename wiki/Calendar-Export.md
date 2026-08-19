@@ -40,19 +40,41 @@ Disabled jobs and `@reboot` jobs never become events (neither has upcoming sched
 
 Deliberately absent: command lines, environment, and output. Calendar feeds end up on phones and third-party calendar services, far outside the daemon's [redaction](Output-Capturing) reach, so the feed carries scheduling facts only.
 
-## Authentication for calendar clients
+## The feed key
 
-With [`web.authToken`](HTTP-API) unset, the feeds are as open as the rest of the read API. With a token set, calendar apps are a special case: they cannot attach an `Authorization` header. For exactly the `.ics` paths, the token may go in a `token` query parameter instead, the same secret-address model calendar services use:
+With [`web.authToken`](HTTP-API) unset, the feeds are as open as the rest of the read API. With a token set, calendar apps are a special case: they cannot attach an `Authorization` header, so the credential has to travel in the URL, where a third-party calendar service stores it, syncs it to every device on the account, and every proxy on the path logs it.
+
+The credential for that job is the feed key: an HMAC of a fixed context string under your token, which authorizes the `.ics` routes and nothing else. Read it from [`GET /whoami`](HTTP-API#get-whoami) as `calendarFeed`, or let the dashboard's `.ics` links carry it for you.
 
 ```console
-curl "http://localhost:8080/calendar.ics?token=s3cret"
+curl -H "Authorization: Bearer s3cret" http://localhost:8080/whoami
+{"authenticated": true, ..., "calendarFeed": "6f1c0a94d2b7e35810ff4c2a9d6b7e01"}
+
+curl "http://localhost:8080/calendar.ics?feed=6f1c0a94d2b7e35810ff4c2a9d6b7e01"
 ```
 
-Subscribe with that full URL. Every other API path still requires the bearer header, keeping the token out of URLs, logs, and referrers there. A wrong or missing query token is a `401` like any other auth failure. Treat the subscribe URL as the secret it contains: anyone holding it can read the fleet's schedule until the token rotates.
+Subscribe with that second URL. Whoever holds it reads the schedule feeds and can do nothing else: not start a job, not pause one, not reach any other route. The derivation is one-way, so a leaked subscribe URL also reveals nothing about the token behind it. A wrong or missing feed key is a `401` like any other auth failure.
+
+Nothing about the key needs storing or rotating on its own. The daemon derives it per request from the tokens you already configured, each token has its own, and rotating a token invalidates every subscribe URL minted from that one while leaving the rest subscribed.
+
+Every other API path still requires the bearer header, which keeps credentials out of URLs, logs, and referrers where a header suffices. The daemon's own access log writes `feed=***` rather than the live value, since calendar apps poll hourly or faster.
+
+A `token` query parameter also opens the `.ics` paths, for a token holding `view` and nothing more:
+
+```yaml
+web:
+  authTokens:
+    - value: s3cret-readonly
+      scopes:
+        - view
+      label: calendar
+```
+
+Anything more privileged, the all-scopes `web.authToken` included, answers `403` there and names the feed key as the way through.
 
 ## Subscribing
 
-Any calendar app that adds a calendar "from URL" works: paste the feed URL (with `?token=` when auth is on). Google Calendar, Apple Calendar, Outlook, and Thunderbird all poll subscribed feeds on their own cadence (typically hours; the feed's refresh hints suggest one hour). The feed regenerates on every request, so a fetched copy is always current as of the fetch.
+Any calendar app that adds a calendar "from URL" works: paste the feed URL (with `?feed=` when auth is on). Google Calendar, Apple Calendar, Outlook, and Thunderbird all poll subscribed feeds on their own cadence (typically hours; the feed's refresh hints suggest one hour). The feed regenerates on every request, so a fetched copy is always current as of the fetch.
 
 ## The week calendar in the dashboard
 
@@ -61,7 +83,7 @@ The `◫ week` toolbar button opens a seven-day grid of the same enumeration, st
 - Fires are computed in each job's own frame and **placed by your browser's local time** (the grid needs one display frame, and you think in yours). The dashed line is now.
 - Each chip is one fire, hue-keyed to its job. Chips sharing a quarter-hour split the column instead of stacking. Today's already-fired chips render dimmed. Clicking a chip opens the job's drawer on its **Schedule** tab.
 - **High-frequency jobs stay out of the grid.** A job firing more than about eight times a day summarizes into the **background hum** strip below the grid, where its cadence reads better than hundreds of sliver chips would. The strip chips open the same drawer.
-- The card header links the fleet `.ics` feed, and each job's drawer **Schedule** tab links its per-job feed, both token-aware.
+- The card header links the fleet `.ics` feed, and each job's drawer **Schedule** tab links its per-job feed. Both carry the feed key, so the URL you copy out of the dashboard is safe to hand to a calendar service.
 
 The view is a persisted preference like the other dashboard panels, and appears in the command palette as "Toggle week calendar". The [terminal dashboard](Terminal-Dashboard) carries the same panel under the same palette command: a day-by-hour fire grid, the agenda, and the hum strip, rendered in UTC.
 

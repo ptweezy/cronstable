@@ -31,6 +31,7 @@ from cronstable.cron import (
     _effective_web_scopes,
     _required_web_scope,
     _WebToken,
+    calendar_feed_key,
 )
 from tests._configs import DISABLED_JOB as _DISABLED_JOB
 
@@ -275,10 +276,32 @@ async def test_matching_scope_post_reaches_the_handler(
 
 
 async def test_scoped_view_token_on_ics_query():
-    # a view (or control, via implication) token may ride ?token= on .ics.
+    # a view-ONLY token may still ride ?token= on .ics: read-only is the
+    # bar a URL credential has to clear, and a dedicated one predates the
+    # feed key.
     mw = Cron._make_auth_middleware(_table(("viewtok", ["view"], "phone")))
     assert (
         await _run(mw, _ScopedReq("/calendar.ics", query={"token": "viewtok"}))
+        == "ok"
+    )
+
+
+async def test_control_token_on_ics_query_is_403():
+    # `control` implies `view`, but it is not read-only: in a URL it would
+    # hand a calendar service the ability to start and pause jobs.
+    mw = Cron._make_auth_middleware(_table(("ctltok", ["control"], "ci")))
+    with pytest.raises(web.HTTPForbidden) as excinfo:
+        await _run(mw, _ScopedReq("/calendar.ics", query={"token": "ctltok"}))
+    assert "'ci'" in excinfo.value.text
+    # the derived feed key is how that token subscribes instead
+    assert (
+        await _run(
+            mw,
+            _ScopedReq(
+                "/calendar.ics",
+                query={"feed": calendar_feed_key(b"ctltok")},
+            ),
+        )
         == "ok"
     )
 
@@ -287,6 +310,31 @@ async def test_scoped_wrong_token_on_ics_query_is_401():
     mw = Cron._make_auth_middleware(_table(("viewtok", ["view"], "phone")))
     with pytest.raises(web.HTTPUnauthorized):
         await _run(mw, _ScopedReq("/calendar.ics", query={"token": "wrong"}))
+
+
+async def test_feed_key_files_a_view_only_token():
+    # a handler reading WEB_TOKEN_REQUEST_KEY must not see the control
+    # authority of the token behind a subscribe URL.
+    mw = Cron._make_auth_middleware(_table(("ctltok", ["control"], "ci")))
+    req = _ScopedReq(
+        "/calendar.ics", query={"feed": calendar_feed_key(b"ctltok")}
+    )
+    assert await _run(mw, req) == "ok"
+    filed = req.store[WEB_TOKEN_REQUEST_KEY]
+    assert filed.label == "ci"
+    assert filed.scopes == frozenset({"view"})
+
+
+async def test_each_token_gets_its_own_feed_key():
+    # feed keys are per token, so revoking one token revokes exactly the
+    # subscriptions minted from it.
+    mw = Cron._make_auth_middleware(
+        _table(("viewtok", ["view"], "phone"), ("ctltok", ["control"], "ci"))
+    )
+    keys = {calendar_feed_key(b"viewtok"), calendar_feed_key(b"ctltok")}
+    assert len(keys) == 2
+    for key in keys:
+        assert await _run(mw, _ScopedReq("/calendar.ics", query={"feed": key}))
 
 
 async def test_multiple_tokens_each_match_own_scope():
@@ -537,10 +585,14 @@ async def test_anonymous_view_serves_a_bare_calendar_feed():
 
 
 async def test_anonymous_view_still_401s_a_wrong_calendar_query_token():
-    # the ?token= carve-out is a presented credential like any other.
+    # the ?token=/?feed= carve-out is a presented credential like any other.
     with pytest.raises(web.HTTPUnauthorized):
         await _run(
             _anon_mw(), _ScopedReq("/calendar.ics", query={"token": "nope"})
+        )
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run(
+            _anon_mw(), _ScopedReq("/calendar.ics", query={"feed": "nope"})
         )
 
 
@@ -554,6 +606,13 @@ async def test_anonymous_view_treats_a_query_token_as_presented_anywhere():
     # carve-out is scoped to the calendar routes by path.
     with pytest.raises(web.HTTPUnauthorized):
         await _run(_anon_mw(), _ScopedReq("/jobs", query={"token": "viewtok"}))
+    # ...and a real feed key is a presented credential off the .ics routes
+    # too, rather than a request that quietly falls through to anonymous.
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run(
+            _anon_mw(),
+            _ScopedReq("/jobs", query={"feed": calendar_feed_key(b"viewtok")}),
+        )
 
 
 async def test_anonymous_view_unmatched_route_reaches_routing():
@@ -772,6 +831,7 @@ async def test_anonymous_view_end_to_end(caplog):
                     "scopes": ["view"],
                     "allScopes": False,
                     "pairLinkBase": "https://relay.cronstable.com/pair",
+                    "calendarFeed": None,
                 }
             # ...but cannot act, on any of the three mutating gates
             async with session.post(base + "/jobs/test/start") as resp:
@@ -807,6 +867,19 @@ async def test_anonymous_view_end_to_end(caplog):
                 body = await resp.json()
                 assert body["authenticated"] is True
                 assert body["label"] == "phone"
+                # the subscribe credential the dashboard puts in .ics links
+                assert body["calendarFeed"] == calendar_feed_key(b"viewtok")
+            # ...and it opens the feed over the wire, with no header at all
+            async with session.get(
+                base + "/calendar.ics",
+                params={"feed": calendar_feed_key(b"viewtok")},
+            ) as resp:
+                assert resp.status == 200
+                assert resp.content_type == "text/calendar"
+            async with session.get(
+                base + "/calendar.ics", params={"feed": "wrong"}
+            ) as resp:
+                assert resp.status == 401
             async with session.post(
                 base + "/jobs/test/start", headers=_bearer("ctltok")
             ) as resp:
@@ -821,8 +894,8 @@ async def test_anonymous_view_end_to_end(caplog):
 
 
 # --------------------------------------------------------------------------
-# the .ics carve-out puts the token in the URL, so it must stay out of the
-# access log (cron._access_log_class)
+# the .ics carve-out puts a credential in the URL, so it must stay out of
+# the access log (cron._access_log_class)
 # --------------------------------------------------------------------------
 
 
@@ -835,6 +908,12 @@ def test_redact_query_token():
     assert redact("/calendar.ics?alarm=10&token=s3cr3t") == (
         "/calendar.ics?alarm=10&token=***"
     )
+    # the derived feed key is a credential too, and the one the dashboard
+    # actually mints
+    assert redact("/calendar.ics?feed=deadbeef") == "/calendar.ics?feed=***"
+    assert redact("/jobs/j/calendar.ics?days=30&feed=deadbeef") == (
+        "/jobs/j/calendar.ics?days=30&feed=***"
+    )
     # nothing to redact: left byte for byte alone
     assert redact("/status") == "/status"
     assert redact("/status?x=1") == "/status?x=1"
@@ -842,6 +921,7 @@ def test_redact_query_token():
     # in "token" is a different parameter
     assert redact("/calendar.ics?token") == "/calendar.ics?token"
     assert redact("/x?pushToken=abc") == "/x?pushToken=abc"
+    assert redact("/x?feedback=abc") == "/x?feedback=abc"
 
 
 class _LoggedRequest:

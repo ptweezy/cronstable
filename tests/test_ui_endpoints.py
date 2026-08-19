@@ -26,6 +26,7 @@ from cronstable.cron import (
     _http_for_action_error,
     _job_run_info_from_dict,
     _run_stats,
+    calendar_feed_key,
 )
 from cronstable.job import JobOutputStream, JobRetryState
 from cronstable.resources import ResourceUsage
@@ -1026,8 +1027,9 @@ async def _run_auth(middleware, request):
     return await middleware(request, handler)
 
 
-async def test_auth_middleware_accepts_query_token_on_ics_only():
+async def test_auth_middleware_accepts_a_feed_key_on_ics_only():
     mw = Cron._make_auth_middleware("sekrit", frozenset())
+    feed = calendar_feed_key(b"sekrit")
     # the normal path: bearer header
     assert (
         await _run_auth(
@@ -1036,33 +1038,73 @@ async def test_auth_middleware_accepts_query_token_on_ics_only():
         )
         == "ok"
     )
-    # calendar clients: ?token= on .ics paths
+    # calendar clients: ?feed= on .ics paths
     assert (
         await _run_auth(
-            mw, _AuthReq("/calendar.ics", query={"token": "sekrit"})
+            mw, _AuthReq("/calendar.ics", query={"feed": feed})
         )
         == "ok"
     )
+    assert (
+        await _run_auth(
+            mw, _AuthReq("/jobs/backup/calendar.ics", query={"feed": feed})
+        )
+        == "ok"
+    )
+    # a wrong or missing feed key still refuses
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run_auth(
+            mw, _AuthReq("/calendar.ics", query={"feed": "wrong"})
+        )
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run_auth(mw, _AuthReq("/calendar.ics"))
+    # the carve-out is for .ics ONLY: a feed key on an API path refuses,
+    # keeping credentials out of URLs everywhere else
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run_auth(mw, _AuthReq("/jobs", query={"feed": feed}))
+
+
+async def test_feed_key_is_not_the_token_and_the_token_is_not_the_key():
+    # the whole point of the derivation: what gets pasted into a calendar
+    # service opens the feeds and nothing else, and the token it came from
+    # is not recoverable from it (nor usable in its place).
+    mw = Cron._make_auth_middleware("sekrit", frozenset())
+    feed = calendar_feed_key(b"sekrit")
+    assert feed != "sekrit"
+    assert len(feed) == 32
+    # the feed key is not a bearer token
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run_auth(
+            mw,
+            _AuthReq("/jobs", headers={"Authorization": "Bearer " + feed}),
+        )
+    # ...and it does not authorize a mutating route even on an .ics-ish path
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run_auth(
+            mw, _AuthReq("/jobs/x/start", method="POST", query={"feed": feed})
+        )
+
+
+async def test_all_scopes_token_may_not_ride_the_url():
+    # the scalar web.authToken is all-scopes; in a subscribe URL it would
+    # hand a calendar service the control API, so it is refused there with
+    # a reason naming the feed key.
+    mw = Cron._make_auth_middleware("sekrit", frozenset())
+    with pytest.raises(web.HTTPForbidden) as excinfo:
+        await _run_auth(
+            mw, _AuthReq("/calendar.ics", query={"token": "sekrit"})
+        )
+    assert "calendarFeed" in excinfo.value.text
+    # the same token still works as a bearer header on the same route
     assert (
         await _run_auth(
             mw,
             _AuthReq(
-                "/jobs/backup/calendar.ics", query={"token": "sekrit"}
+                "/calendar.ics", headers={"Authorization": "Bearer sekrit"}
             ),
         )
         == "ok"
     )
-    # a wrong or missing query token still refuses
-    with pytest.raises(web.HTTPUnauthorized):
-        await _run_auth(
-            mw, _AuthReq("/calendar.ics", query={"token": "wrong"})
-        )
-    with pytest.raises(web.HTTPUnauthorized):
-        await _run_auth(mw, _AuthReq("/calendar.ics"))
-    # the carve-out is for .ics ONLY: query tokens on API paths refuse,
-    # keeping tokens out of URLs everywhere else
-    with pytest.raises(web.HTTPUnauthorized):
-        await _run_auth(mw, _AuthReq("/jobs", query={"token": "sekrit"}))
 
 
 # ===========================================================================

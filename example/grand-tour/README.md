@@ -240,9 +240,11 @@ their own:
     ```
 
     With `web.authToken` on, calendar apps cannot send a bearer header, so the
-    `.ics` routes (only) also accept the token in the URL, the same
-    secret-address model calendar services use:
-    `curl "http://localhost:8080/calendar.ics?token=s3cret"`. The dashboard's
+    `.ics` routes (only) also read a `feed` key from the URL: a derivation of
+    your token that opens the calendar feeds and nothing else, reported by
+    `GET /whoami` as `calendarFeed`. Subscribe with
+    `curl "http://localhost:8080/calendar.ics?feed=<calendarFeed>"`.
+    The dashboard's
     **◫ week** button draws the same data as a 7-day calendar: the
     business-day jobs (`LW`, `L-3`, `15W`, `5#3`) land where the engine
     says, and the per-minute hum is summarized below the grid instead of

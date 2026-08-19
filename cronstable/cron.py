@@ -487,6 +487,85 @@ class _WebToken(NamedTuple):
     label: str
 
 
+#: Domain separator mixed into every derived calendar feed key, so the
+#: value can never collide with an HMAC this codebase computes for another
+#: purpose. Changing it invalidates every subscribed feed URL.
+_CALENDAR_FEED_CONTEXT = b"cronstable calendar feed v1"
+
+#: Hex characters kept from the feed HMAC: 32 nibbles = 128 bits, past any
+#: practical guessing of a URL that third-party calendar services store.
+_CALENDAR_FEED_LENGTH = 32
+
+
+def calendar_feed_key(token_bytes: bytes) -> str:
+    """The feed key that authorizes the ``.ics`` routes for one token.
+
+    A calendar client cannot send an Authorization header, so a subscribe
+    URL carries its credential in the query string, where calendar services
+    store it and proxies log it. A bearer token there would hand all of
+    that whatever the token can do (for the scalar ``web.authToken``, the
+    whole control API), so this HMAC goes instead: it opens the calendar
+    feeds only, reveals nothing about the token behind it, and needs no
+    storage or rotation of its own.
+    """
+    return hmac.new(
+        token_bytes, _CALENDAR_FEED_CONTEXT, hashlib.sha256
+    ).hexdigest()[:_CALENDAR_FEED_LENGTH]
+
+
+async def _serve_calendar_feed(request, handler, presented, tokens, feeds):
+    """Serve an ``.ics`` route against a derived feed key.
+
+    The token the key derives from is filed narrowed to ``view``: a handler
+    reading WEB_TOKEN_REQUEST_KEY must not see the control authority of the
+    token behind a subscribe URL. Matched with no early return, like the
+    bearer table scan it parallels.
+    """
+    matched: Optional[_WebToken] = None
+    for entry, feed_key in zip(tokens, feeds, strict=True):
+        if hmac.compare_digest(presented, feed_key):
+            matched = entry
+    if matched is None:
+        # reasonless by design: see the 401 note in the auth middleware.
+        raise web.HTTPUnauthorized()
+    request[WEB_TOKEN_REQUEST_KEY] = matched._replace(
+        scopes=frozenset({"view"})
+    )
+    return await handler(request)
+
+
+async def _serve_anonymous(request, handler, anonymous_scopes):
+    """Serve a credential-less request against ``web.anonymousScopes``.
+
+    Reached only when nothing was presented at all, so every exit here is a
+    403 with a reason: there is no credential to keep an attacker guessing
+    about.
+    """
+    resource = getattr(request.match_info.route, "resource", None)
+    canonical = getattr(resource, "canonical", None)
+    required = _required_web_scope(request)
+    if (
+        required in anonymous_scopes
+        and canonical not in _WEB_ANONYMOUS_EXCLUDED
+    ):
+        request[WEB_ANON_REQUEST_KEY] = anonymous_scopes
+        return await handler(request)
+    if canonical in _WEB_ANONYMOUS_EXCLUDED:
+        raise _api_error(
+            web.HTTPForbidden,
+            "the device registry is not served anonymously; present a "
+            "bearer token with the {!r} scope".format(required),
+        )
+    raise _api_error(
+        web.HTTPForbidden,
+        "anonymous access to this daemon grants only the {} scope; this "
+        "endpoint requires {!r}; present a bearer token".format(
+            " and ".join(repr(s) for s in sorted(anonymous_scopes)),
+            required,
+        ),
+    )
+
+
 def _accepts_json(request: "web.Request") -> bool:
     """Whether the ``Accept`` header explicitly names ``application/json``.
 
@@ -1782,16 +1861,22 @@ def schedule_slot(
 _ACCESS_LOG_CLASS: Optional[type] = None
 
 
-def _redact_query_token(path_qs: str) -> str:
-    """``path_qs`` with any ``token`` query value replaced by ``***``.
+#: Query parameters the access log scrubs: both carry a live credential
+#: on the calendar-feed paths (see :func:`_redact_query_token`).
+_REDACTED_QUERY_KEYS = frozenset({"token", "feed"})
 
-    The auth middleware lets the web bearer token ride a ``token`` query
-    parameter on the calendar-feed paths alone, because a calendar client
-    cannot attach an Authorization header, and the dashboard mints exactly
-    that URL for an operator to subscribe with.  aiohttp's access log
-    renders ``request.path_qs``, so without this every poll of the feed
-    (calendar apps refresh on their own cadence, hourly or faster) would
-    write a live token into the log at INFO.
+
+def _redact_query_token(path_qs: str) -> str:
+    """``path_qs`` with any ``feed`` or ``token`` query value replaced by
+    ``***``.
+
+    The auth middleware lets a calendar credential ride the query string
+    on the calendar-feed paths alone, because a calendar client cannot
+    attach an Authorization header: ``feed`` carries the derived feed key
+    the dashboard mints, ``token`` a view-scoped bearer token.  aiohttp's
+    access log renders ``request.path_qs``, so without this every poll of
+    the feed (calendar apps refresh on their own cadence, hourly or
+    faster) would write a live credential into the log at INFO.
     """
     path, sep, query = path_qs.partition("?")
     if not sep:
@@ -1799,7 +1884,9 @@ def _redact_query_token(path_qs: str) -> str:
     parts = []
     for item in query.split("&"):
         key, eq, _ = item.partition("=")
-        parts.append("token=***" if eq and key == "token" else item)
+        parts.append(
+            key + "=***" if eq and key in _REDACTED_QUERY_KEYS else item
+        )
     return path + sep + "&".join(parts)
 
 
@@ -3475,7 +3562,9 @@ class Cron:
         web.anonymousScopes is also unauthenticated, but reports the
         granted scope set under the reserved label ``anonymous`` with
         ``allScopes`` false, the discriminator clients key on. Every
-        shape carries ``pairLinkBase``, the pairing QR's deep-link base.
+        shape carries ``pairLinkBase``, the pairing QR's deep-link base,
+        and ``calendarFeed``, the derived key that subscribes a calendar
+        app to the ``.ics`` feeds (null when the caller holds no token).
         """
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         anon = request.get(WEB_ANON_REQUEST_KEY)
@@ -3501,6 +3590,15 @@ class Cron:
                 "allScopes": matched.scopes == _WEB_ALL_SCOPES,
             }
         payload["pairLinkBase"] = self._web_pair_link_base()
+        # The calendar subscribe credential for this caller's token, which
+        # the dashboard turns into the .ics links. Absent for a caller with
+        # no token of its own: an open or anonymous-view daemon serves the
+        # feeds bare, so there is nothing to carry.
+        payload["calendarFeed"] = (
+            calendar_feed_key(matched.token_bytes)
+            if matched is not None
+            else None
+        )
         return _json_response(payload, headers=self._web_headers())
 
     def _web_pair_link_base(self) -> str:
@@ -8164,6 +8262,11 @@ class Cron:
                 _WebToken(tokens.encode("utf-8"), _WEB_ALL_SCOPES, "authToken")
             ]
         token_table = list(tokens)
+        # derived once per web start, in the same order as token_table, so
+        # the per-request match is a constant-time walk like the token one
+        feed_table = [
+            calendar_feed_key(entry.token_bytes) for entry in token_table
+        ]
 
         @web.middleware
         async def auth_middleware(request, handler):
@@ -8181,59 +8284,45 @@ class Cron:
             header = request.headers.get("Authorization", "")
             # The anonymous grant (web.anonymousScopes) is strictly for
             # requests presenting no credential of any kind: no
-            # Authorization header and no `token` query parameter. A
-            # presented-but-unknown token still 401s below rather than
+            # Authorization header and neither calendar query parameter. A
+            # presented-but-unknown credential still 401s below rather than
             # degrading to anonymous, so 401 keeps meaning "credentials
-            # were presented and are invalid". `?token=` counts as a
-            # credential on every path, including the ones that would
-            # ignore it, so that a caller whose stale token is refused
-            # elsewhere finds it refused here too. The branch runs before
-            # any compare_digest, which keeps the constant-time table
-            # scan separate from the anonymous decision.
+            # were presented and are invalid". `?token=`/`?feed=` count as
+            # credentials on every path, including the ones that would
+            # ignore them, so that a caller whose stale credential is
+            # refused elsewhere finds it refused here too. The branch runs
+            # before any compare_digest, which keeps the constant-time
+            # table scan separate from the anonymous decision.
             if (
                 anonymous_scopes
                 and not header
                 and not request.query.get("token", "")
+                and not request.query.get("feed", "")
             ):
-                resource = getattr(request.match_info.route, "resource", None)
-                canonical = getattr(resource, "canonical", None)
-                required = _required_web_scope(request)
-                if (
-                    required in anonymous_scopes
-                    and canonical not in _WEB_ANONYMOUS_EXCLUDED
-                ):
-                    request[WEB_ANON_REQUEST_KEY] = anonymous_scopes
-                    return await handler(request)
-                if canonical in _WEB_ANONYMOUS_EXCLUDED:
-                    raise _api_error(
-                        web.HTTPForbidden,
-                        "the device registry is not served anonymously; "
-                        "present a bearer token with the {!r} "
-                        "scope".format(required),
-                    )
-                raise _api_error(
-                    web.HTTPForbidden,
-                    "anonymous access to this daemon grants only the "
-                    "{} scope; this endpoint requires {!r}; present a "
-                    "bearer token".format(
-                        " and ".join(
-                            repr(s) for s in sorted(anonymous_scopes)
-                        ),
-                        required,
-                    ),
+                return await _serve_anonymous(
+                    request, handler, anonymous_scopes
                 )
             scheme, _, presented = header.partition(" ")
+            # set when `presented` came from the URL rather than the header;
+            # such a credential is held to the view-only rule below.
+            query_credential = False
             # RFC 7235: the auth scheme is case-insensitive (Bearer/bearer).
             # Compare only the token, in constant time, to avoid leaking it via
             # timing (the scheme is not secret).
             if scheme.lower() != "bearer":
                 # Calendar clients cannot attach a bearer header, so only
-                # the calendar-feed paths accept the token as a `token`
-                # query parameter (access log redacts it, see
-                # _access_log_class). Matched precisely so no future route
-                # gains URL-token auth by accident.
+                # the calendar-feed paths accept a credential in the query
+                # string (access log redacts both, see _access_log_class).
+                # Matched precisely so no future route gains URL auth by
+                # accident.
                 if request.path.endswith("/calendar.ics"):
+                    feed = request.query.get("feed", "")
+                    if feed:
+                        return await _serve_calendar_feed(
+                            request, handler, feed, token_table, feed_table
+                        )
                     presented = request.query.get("token", "")
+                    query_credential = True
                 else:
                     # Deliberately reasonless, and the ONE class the
                     # bare-raise guard allowlists (see
@@ -8271,6 +8360,23 @@ class Cron:
             if matched is None:
                 # reasonless by design: see the 401 note above.
                 raise web.HTTPUnauthorized()
+            # A bearer token presented in the URL is held to read-only:
+            # a subscribe URL is stored by third-party calendar services,
+            # synced onto phones and written into proxy logs, and the
+            # scalar web.authToken would hand all of that the control API.
+            # The reason names the way out, matching the scope 403 below,
+            # which likewise confirms a valid credential to whoever already
+            # holds it.
+            if query_credential and matched.scopes != frozenset({"view"}):
+                raise _api_error(
+                    web.HTTPForbidden,
+                    "token {!r} grants more than {!r} and may not ride the "
+                    "URL; subscribe with the feed key the dashboard shows "
+                    "(GET /whoami reports it as calendarFeed), or mint a "
+                    "view-only token under web.authTokens".format(
+                        matched.label, "view"
+                    ),
+                )
             # Full-scope tokens skip the per-route scope lookup. A scoped
             # token lacking the route's required scope is 403, distinct
             # from the 401 for an unrecognised token.

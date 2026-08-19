@@ -339,11 +339,12 @@ alias, read when `limit` is absent) are clamped rather than erroring.
 Disabled and `@reboot` jobs carry no events. An unknown job name on the
 per-job route is a `404`.
 
-With [`web.authToken`](#authentication) set, the `.ics`
-paths (only) also accept the token as a `token` query parameter, because
-calendar clients cannot send a bearer header. For the full event anatomy,
-privacy rationale, and subscription notes, see
-[calendar export](Calendar-Export).
+With [`web.authToken`](#authentication) set, the `.ics` paths (only) also
+accept a `feed` query parameter, because calendar clients cannot send a
+bearer header: it carries the derived feed key from
+[`GET /whoami`](#get-whoami), which opens the calendar feeds and nothing
+else. For the full event anatomy, privacy rationale, and subscription
+notes, see [calendar export](Calendar-Export).
 
 ```shell
 curl "http://localhost:8080/calendar.ics?days=30"
@@ -972,26 +973,30 @@ empty `stream` parameter is a `400`; a stateless install is a `404`
 ### `GET /whoami`
 
 Describes the bearer token that authenticated this request, as
-`{authenticated, label, scopes, allScopes, pairLinkBase}`: its `label`, the
-scopes it grants (with the implied `view` expanded), whether it is an
-all-scopes token, and the base URL of the pairing QR's deep link (the
+`{authenticated, label, scopes, allScopes, pairLinkBase, calendarFeed}`: its
+`label`, the scopes it grants (with the implied `view` expanded), whether it
+is an all-scopes token, the base URL of the pairing QR's deep link (the
 origin of `push.relay.url` plus `/pair`, the hosted landing while no
-`push:` section is applied).
+`push:` section is applied), and the token's
+[calendar feed key](Calendar-Export).
 
 A companion app uses it to show what it may do. The dashboard uses it to warn
 when its pairing QR would hand a phone the all-scopes token (see
-[push notifications](Push-Notifications)). Requires the `view` scope.
+[push notifications](Push-Notifications)), and to build the `.ics` links it
+offers. Requires the `view` scope.
 
 When no token is configured there is no auth middleware and no token to
 describe: `authenticated` is `false`, `label` is `null`, `scopes` lists every
-scope, and `allScopes` is `true` (every scope is effectively granted).
+scope, `allScopes` is `true` (every scope is effectively granted), and
+`calendarFeed` is `null` because the feeds are served bare.
 
 A credential-less request served through
 [`web.anonymousScopes`](#public-read-only-access-webanonymousscopes) is the
 third shape: `authenticated` is `false`, `label` is `"anonymous"` (a
 reserved label config load refuses for real tokens), `scopes` lists the
-granted set, and `allScopes` is `false`. Branch on `allScopes`, because the
-open daemon described earlier shares `authenticated: false`.
+granted set, `allScopes` is `false`, and `calendarFeed` is `null`. Branch on
+`allScopes`, because the open daemon described earlier shares
+`authenticated: false`.
 
 ### `GET /push/devices`
 
@@ -1234,11 +1239,17 @@ which is how a public read-only board is served. A wrong token is still
 Without either, every route stays gated.
 
 One built-in carve-out: paths ending in `.ics` (the
-[calendar feeds](Calendar-Export)) also accept the same token as a `token`
-query parameter, compared in the same constant time, because calendar
-clients subscribing to a feed cannot attach a bearer header. Every other
-path refuses query tokens, keeping the token out of URLs, access logs, and
-referrers where a header suffices.
+[calendar feeds](Calendar-Export)) also accept a credential in the query
+string, compared in the same constant time, because calendar clients
+subscribing to a feed cannot attach a bearer header. The credential to use
+there is the **feed key**, an HMAC of a fixed context string under the
+token, which [`GET /whoami`](#get-whoami) reports as `calendarFeed`: it
+opens the calendar feeds and nothing else, and the token behind it cannot
+be recovered from it. A `token` query parameter also works, but only for a
+token holding `view` and nothing more; anything more privileged, the
+all-scopes `web.authToken` included, is `403` there. Every other path
+refuses both, keeping credentials out of URLs, access logs, and referrers
+where a header suffices.
 
 ```yaml
 web:
