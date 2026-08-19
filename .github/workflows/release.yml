@@ -682,6 +682,13 @@ jobs:
               # user, so without the chown every pip call logs "The cache has
               # been disabled" and the persisted cache stores nothing.
               mkdir -p /src/.pip-cache && chown -R root:root /src/.pip-cache
+              # The checkout belongs to the runner user and this container is
+              # root, so git calls the bind mount dubiously owned and refuses to
+              # read it. setuptools_scm shells out to git for its file finder
+              # during `pip install .` and treats that refusal as fatal, so the
+              # build dies before it starts. The other container lanes never hit
+              # this because their images carry no git at all; manylinux does.
+              git config --global --add safe.directory /src
               # The interpreter this lane freezes: shared libpython, GLIBC_2.17,
               # pinned by digest. The image ships its own CPythons at
               # /opt/python, but manylinux configures them --disable-shared and
