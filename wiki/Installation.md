@@ -202,7 +202,7 @@ your system), so no Python is required. Upgrade later with
 A self-contained binary can be downloaded from
 <https://github.com/ptweezy/cronstable/releases>. Python is not required on the
 target system: the executable embeds it. Every release attaches the following
-assets, built natively on a matching runner:
+assets, each built for its own platform and architecture:
 
 | Asset | Platform | libc / arch | Notes |
 | --- | --- | --- | --- |
@@ -223,12 +223,17 @@ assets, built natively on a matching runner:
 | `cronstable-linux-armv6-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv6, such as Raspberry Pi 1/Zero); musl-only, no glibc build. |
 | `cronstable-macos-arm64` | macOS | Apple Silicon (arm64) | Developer ID signed and notarized. |
 | `cronstable-macos-amd64` | macOS | Intel (x86_64) | Developer ID signed and notarized. |
+| `cronstable-freebsd-amd64` | FreeBSD | x86_64 | For FreeBSD 14 and 15 hosts, including TrueNAS, pfSense and OPNsense. |
+| `cronstable-freebsd-arm64` | FreeBSD | arm64 | For FreeBSD 14 and 15 hosts on arm64. |
 | `cronstable-windows-amd64.exe` | Windows | x64 (amd64) | Self-contained `.exe`. The target needs no Python. |
 | `cronstable-windows-arm64.exe` | Windows | ARM64 | Self-contained `.exe`. The target needs no Python. |
+| `cronstable-windows-i686.exe` | Windows | 32-bit x86 | Self-contained `.exe` for 32-bit Windows. |
 | `cronstable-windows-amd64.zip` | Windows | x64 (amd64) | One-directory build: a `cronstable\` folder with `cronstable.exe` and `_internal\`. Runs in place and can host the [Windows service](Windows-Service). |
 | `cronstable-windows-arm64.zip` | Windows | ARM64 | One-directory build. Runs in place and can host the [Windows service](Windows-Service). |
+| `cronstable-windows-i686.zip` | Windows | 32-bit x86 | One-directory build. Runs in place and can host the [Windows service](Windows-Service). |
 | `cronstable-windows-amd64.msi` | Windows | x64 (amd64) | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
 | `cronstable-windows-arm64.msi` | Windows | ARM64 | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
+| `cronstable-windows-i686.msi` | Windows | 32-bit x86 | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
 
 The glibc Linux builds target glibc 2.39, the Ubuntu 24.04 runner's libc, and
 work on any Linux host with glibc 2.39 or newer on the matching CPU. The musl
@@ -241,12 +246,21 @@ rest under QEMU emulation. The `riscv64` builds cover 64-bit RISC-V for both
 glibc and musl. The musl-only `armv6` build extends to older 32-bit ARM, such as
 a Raspberry Pi 1 or Zero. There is no glibc `armv6` build.
 
-macOS builds cover both Apple Silicon and Intel. The Windows binaries are
-self-contained `.exe` files for x64 (`amd64`) and ARM64. Like the other
-binaries they embed Python, so Python is not required on the target.
+macOS builds cover both Apple Silicon and Intel.
+
+The FreeBSD builds cover amd64 and arm64 and run on FreeBSD 14 and 15
+hosts, including appliance systems such as TrueNAS, pfSense and OPNsense.
+They are built in a FreeBSD 14 virtual machine. PyPI publishes no FreeBSD
+wheels, so the optional speedups are compiled from source; the arm64 build
+ships without `orjson` and uses the standard library JSON encoder.
+
+The Windows binaries are self-contained `.exe` files for x64 (`amd64`),
+ARM64, and 32-bit x86 (`i686`). Like the other binaries they embed Python,
+so Python is not required on the target. Use `i686` only on a 32-bit
+Windows install; on 64-bit Windows, choose `amd64` or `arm64`.
 
 Download and run (glibc amd64 Linux shown; append `-musl` on Alpine, or use
-`cronstable-macos-<arch>` on a Mac):
+`cronstable-macos-<arch>` on a Mac or `cronstable-freebsd-<arch>` on FreeBSD):
 
 ```shell
 curl -fsSL -o cronstable \
@@ -255,8 +269,9 @@ chmod +x cronstable
 ./cronstable --version
 ```
 
-On Windows, download `cronstable-windows-amd64.exe` (or `cronstable-windows-arm64.exe`
-on ARM64) and run it directly; no `chmod` is needed:
+On Windows, download `cronstable-windows-amd64.exe` (or
+`cronstable-windows-arm64.exe` on ARM64, or `cronstable-windows-i686.exe` on
+32-bit Windows) and run it directly; no `chmod` is needed:
 
 ```powershell
 .\cronstable-windows-amd64.exe --version
@@ -272,8 +287,9 @@ verify the download against the release's `SHA256SUMS`.
 Package Manager. For the full Windows install and deployment details, see
 [running on Windows](Running-on-Windows).
 
-Windows releases also attach `cronstable-windows-amd64.zip` and
-`cronstable-windows-arm64.zip`, one-directory builds of the same program.
+Windows releases also attach `cronstable-windows-amd64.zip`,
+`cronstable-windows-arm64.zip` and `cronstable-windows-i686.zip`,
+one-directory builds of the same program.
 Each extracts to a single `cronstable\` folder and is the download that can
 host the [Windows service](Windows-Service), which the one-file `.exe`
 cannot.

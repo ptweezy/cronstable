@@ -7,7 +7,8 @@ pattern, and the few cases that require a writable path. The published Docker
 image is Linux-only. See [installation](Installation) for the package/binary
 install methods and the [HTTP control API](HTTP-API) for the optional web
 interface. For native Windows deployment with the
-`cronstable-windows-amd64.exe` / `cronstable-windows-arm64.exe` binaries, see
+`cronstable-windows-amd64.exe` / `cronstable-windows-arm64.exe` /
+`cronstable-windows-i686.exe` binaries, see
 [running on Windows](Running-on-Windows).
 
 ## Why cronstable fits a locked-down pod

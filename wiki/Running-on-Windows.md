@@ -16,19 +16,22 @@ same on every platform.
 
 ## Supported platforms and architectures
 
-cronstable supports Windows on two CPU architectures: `amd64` (x64) and `arm64`
-(ARM64). You can install it as a normal Python package or as a
-self-contained executable.
+cronstable supports Windows on three CPU architectures: `amd64` (x64),
+`arm64` (ARM64), and `i686` (32-bit x86). You can install it as a normal
+Python package or as a self-contained executable. Use `i686` only on a
+32-bit Windows install; on 64-bit Windows, choose `amd64` or `arm64`.
 
 | Architecture | pip / pipx | Standalone binary | Zip (one-directory) | MSI |
 | --- | --- | --- | --- | --- |
 | `amd64` (x64) | `pip install cronstable` | `cronstable-windows-amd64.exe` | `cronstable-windows-amd64.zip` | `cronstable-windows-amd64.msi` |
 | `arm64` (ARM64) | `pip install cronstable` | `cronstable-windows-arm64.exe` | `cronstable-windows-arm64.zip` | `cronstable-windows-arm64.msi` |
+| `i686` (32-bit x86) | `pip install cronstable` | `cronstable-windows-i686.exe` | `cronstable-windows-i686.zip` | `cronstable-windows-i686.msi` |
 
 The test suite runs on Windows (both x64 and ARM64) in CI on every commit. A
 small set of POSIX-only tests is skipped there, each with a stated reason: the
 tests for per-job user/group switching, privilege drop, POSIX signal delivery,
-and POSIX file modes. Every release builds both Windows binaries. See
+and POSIX file modes. Every release builds all three Windows architectures.
+See
 [contributing and releasing](Contributing-and-Releasing) for the build and
 release workflow.
 
@@ -39,7 +42,9 @@ There are five ways to install cronstable on Windows.
 ### MSI (machine-wide, hosts the service)
 
 Every release attaches an MSI per architecture. It installs to
-`C:\Program Files\cronstable`, registers the
+`C:\Program Files\cronstable` (the 32-bit `i686` package installs to
+`C:\Program Files (x86)\cronstable` when run on 64-bit Windows), registers
+the
 [Windows service](Windows-Service), and puts the install directory on the
 system `PATH`. It is the path for managed deployment through GPO, Intune, or
 SCCM:
@@ -80,8 +85,9 @@ cronstable --version
 
 Every release attaches self-contained executables on the
 [releases page](https://github.com/ptweezy/cronstable/releases):
-`cronstable-windows-amd64.exe` (x64) and `cronstable-windows-arm64.exe`
-(ARM64). Python is **not** required on the target system, because the
+`cronstable-windows-amd64.exe` (x64), `cronstable-windows-arm64.exe`
+(ARM64), and `cronstable-windows-i686.exe` (32-bit x86). Python is **not**
+required on the target system, because the
 executable embeds the interpreter. Download the asset for your architecture,
 then run it:
 
@@ -90,7 +96,8 @@ cronstable-windows-amd64.exe --version
 ```
 
 The binaries are built natively on Windows runners (the ARM64 binary on a
-`windows-11-arm` runner). As on every platform, the standalone binary is a
+`windows-11-arm` runner, the 32-bit binary against a 32-bit interpreter on
+the x64 runner). As on every platform, the standalone binary is a
 self-extracting executable. For the writable-and-executable temp-directory
 detail, which matters only under unusual locked-down filesystems, see
 [installation](Installation).
@@ -109,8 +116,9 @@ per-release hash rules.
 
 ### One-directory zip (hosts the service)
 
-`cronstable-windows-amd64.zip` and `cronstable-windows-arm64.zip` hold the
-same program as the standalone binary in a one-directory layout: a single
+`cronstable-windows-amd64.zip`, `cronstable-windows-arm64.zip` and
+`cronstable-windows-i686.zip` hold the same program as the standalone binary
+in a one-directory layout: a single
 `cronstable\` folder with `cronstable.exe` beside an `_internal\` directory,
 running in place with no self-extraction. This is the download that can host
 the [Windows service](Windows-Service). The one-file `.exe` cannot, and

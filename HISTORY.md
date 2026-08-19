@@ -2,6 +2,24 @@
 
 ## 1.2.44
 
+- Releases now attach FreeBSD binaries, `cronstable-freebsd-amd64` and
+  `cronstable-freebsd-arm64`, for FreeBSD 14 and 15 hosts such as
+  TrueNAS, pfSense and OPNsense. PyInstaller cannot cross-compile and no
+  runner offers FreeBSD, so both are built in a FreeBSD 14 virtual
+  machine, amd64 with hardware acceleration and arm64 under full-system
+  emulation. PyPI publishes no FreeBSD wheels, so every compiled
+  dependency is built from source there; the arm64 build ships without
+  `orjson` and uses the standard library JSON encoder.
+- Windows releases now cover 32-bit x86 alongside x64 and ARM64, in all
+  three shapes: `cronstable-windows-i686.exe`,
+  `cronstable-windows-i686.zip` and `cronstable-windows-i686.msi`. The
+  32-bit package installs to `C:\Program Files (x86)\cronstable` when it
+  is run on 64-bit Windows, and to `C:\Program Files\cronstable` on a
+  32-bit host. Use it only where Windows itself is 32-bit.
+- Every Windows and FreeBSD binary is now checked against its declared
+  architecture before it is packaged, by reading the PE machine field or
+  the ELF `e_machine` field. A build that resolved the wrong interpreter
+  can no longer ship under another architecture's name.
 - The default dashboard theme is now `standard`, the flat neutral one,
   in place of `carolina`. The theme pickers and the `t` cycler in the
   browser and the TUI lead with it, as does `--theme`, and a browser or

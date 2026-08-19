@@ -192,9 +192,10 @@ The GitHub Release (`softprops/action-gh-release@v3`) attaches:
 - `cronstable-linux-{amd64,arm64,i686,armv7,ppc64le,s390x,riscv64}` (glibc)
 - the same seven arches with a `-musl` suffix, such as `cronstable-linux-amd64-musl` … `cronstable-linux-riscv64-musl`, **plus** `cronstable-linux-armv6-musl` (armv6 is musl-only)
 - `cronstable-macos-amd64`, `cronstable-macos-arm64`
-- `cronstable-windows-amd64.exe`, `cronstable-windows-arm64.exe`
-- `cronstable-windows-amd64.zip`, `cronstable-windows-arm64.zip` (one-directory builds, the shape that hosts the [Windows service](Windows-Service))
-- `cronstable-windows-amd64.msi`, `cronstable-windows-arm64.msi` (machine-wide installers; see [Windows MSI](Windows-MSI))
+- `cronstable-freebsd-amd64`, `cronstable-freebsd-arm64` (built in a FreeBSD 14 VM; arm64 under full-system emulation)
+- `cronstable-windows-amd64.exe`, `cronstable-windows-arm64.exe`, `cronstable-windows-i686.exe`
+- `cronstable-windows-amd64.zip`, `cronstable-windows-arm64.zip`, `cronstable-windows-i686.zip` (one-directory builds, the shape that hosts the [Windows service](Windows-Service))
+- `cronstable-windows-amd64.msi`, `cronstable-windows-arm64.msi`, `cronstable-windows-i686.msi` (machine-wide installers; see [Windows MSI](Windows-MSI))
 - `perf-summary.md`, `perf-results.json`: the performance comparison against the previous release (see [performance benchmarks](Performance-Benchmarks); the diff chart `perf-chart.svg` ships in the run's `perf-report` artifact)
 
 The download-artifact pattern `cronstable-*` must stay broad enough to match all of them: a too-narrow pattern silently drops artifacts it misses rather than erroring.
