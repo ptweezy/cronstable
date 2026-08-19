@@ -454,7 +454,7 @@ def _matrix_images():
         for entry in (
             job.get("strategy", {}).get("matrix", {}).get("include", []) or []
         ):
-            if "image" in entry:
+            if isinstance(entry, dict) and "image" in entry:
                 out.append((name, entry["image"]))
     return out
 
@@ -489,6 +489,8 @@ def _declared_floors():
         for entry in (
             job.get("strategy", {}).get("matrix", {}).get("include", []) or []
         ):
+            if not isinstance(entry, dict):
+                continue
             if entry.get("floor") and entry.get("arch"):
                 floors[entry["arch"]] = str(entry["floor"])
     return floors
