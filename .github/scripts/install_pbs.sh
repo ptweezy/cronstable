@@ -31,9 +31,11 @@ here=$(dirname "$0")
 
 tarball=/tmp/pbs-python.tar.gz
 # Only the network hop is retried; an unpack or a digest mismatch is
-# deterministic and retrying it just multiplies the failure.
-retry 5 curl --proto =https --tlsv1.2 -fsSL --retry 5 --retry-connrefused \
-    --retry-delay 5 -o "$tarball" "$url"
+# deterministic and retrying it just multiplies the failure. retry.sh is the
+# whole retry story here: manylinux2014 is CentOS 7, whose curl 7.29 rejects
+# --retry-connrefused outright, and a flag it does not know is a hard usage
+# error rather than a download attempt.
+retry 5 curl --proto =https --tlsv1.2 -fsSL -o "$tarball" "$url"
 echo "$sha  $tarball" | sha256sum -c -
 
 # The archive roots at python/, so strip that component and land bin/, lib/
