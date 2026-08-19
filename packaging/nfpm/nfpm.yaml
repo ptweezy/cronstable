@@ -1,0 +1,61 @@
+# nfpm recipe for the .deb and .rpm packages, one invocation per architecture
+# and format. .github/scripts/build_packages.sh drives it and sets every
+# variable below; nothing here is architecture-specific except through them.
+#
+#   PKG_VERSION  the release version, e.g. 1.2.44
+#   PKG_ARCH     nfpm's architecture name (amd64, arm64, 386, arm7, ...)
+#   PKG_GLIBC    the glibc floor that architecture's binary actually carries,
+#                measured from the frozen bytes rather than read off the base
+#                image, because the two disagree
+#   PKG_BINARY   path to the built binary for that architecture
+#
+# Packaging is metadata plus payload: nfpm never executes the binary, so every
+# architecture builds on the amd64 runner with no emulation.
+name: cronstable
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+section: admin
+priority: optional
+maintainer: Parker Loflin <parker@cronstable.dev>
+description: |
+  Cron daemon with a schedule model you can inspect.
+  cronstable runs scheduled jobs from a declarative configuration and answers
+  questions cron cannot: what runs next, why a job did not run, which schedules
+  collide, and what happened on the last run. It has a dashboard, an HTTP API,
+  durable run history, dependency graphs, clustering and reporting.
+vendor: Parker Loflin
+homepage: https://github.com/ptweezy/cronstable
+license: MIT
+
+contents:
+  - src: ${PKG_BINARY}
+    dst: /usr/bin/cronstable
+    file_info:
+      mode: 0755
+  - src: ./packaging/systemd/cronstable.service
+    dst: /usr/lib/systemd/system/cronstable.service
+    file_info:
+      mode: 0644
+  - src: ./packaging/nfpm/cronstable.yaml
+    dst: /etc/cronstable.d/cronstable.yaml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+# The floor is the highest GLIBC symbol version anything inside the binary asks
+# for, which is what decides whether it starts at all. rpm generates no
+# automatic Requires from a payload nfpm never inspects, so without this the
+# package installs cleanly and the mismatch surfaces as a startup failure.
+overrides:
+  deb:
+    depends:
+      - libc6 (>= ${PKG_GLIBC})
+  rpm:
+    depends:
+      - glibc >= ${PKG_GLIBC}
+
+scripts:
+  postinstall: ./packaging/nfpm/postinstall.sh
+  preremove: ./packaging/nfpm/preremove.sh
+  postremove: ./packaging/nfpm/postremove.sh
