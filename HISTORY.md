@@ -26,9 +26,6 @@
   terminal that already remembers a theme keeps the one it has.
 - CI tooling updates
 - Documentation updates
-
-## 1.2.43
-
 - The state-backed `@reboot` once-per-boot dedupe now works on macOS and
   the BSDs: with no `/proc` to read, the boot instant comes from the
   kernel's own `kern.boottime` record (via psutil, already a core
@@ -85,9 +82,6 @@
   (`... || true`) exited 0 while writing nothing. The release binary
   lanes run this shape against each built binary and assert the durable
   write rather than the exit status.
-
-## 1.2.42
-
 - The dashboard's "Pair a device" QR encodes a deep link: a phone-camera
   scan opens the companion app, or a landing page with install pointers
   when the app is missing, with the pairing payload riding in the URL
