@@ -1,0 +1,73 @@
+# nfpm recipe for the Alpine .apk, one invocation per architecture.
+# .github/scripts/build_packages.sh drives it and sets every variable below.
+#
+#   PKG_VERSION  the release version, e.g. 1.2.44
+#   PKG_ARCH     Alpine's own architecture name (x86_64, aarch64, x86, armv7,
+#                armhf, ppc64le, s390x, riscv64), passed straight through
+#   PKG_BINARY   path to the MUSL binary for that architecture
+#
+# Separate from nfpm.yaml rather than an override, and for two reasons that both
+# ship broken packages if ignored:
+#
+#   The payload is the musl binary, not the glibc one. nfpm never inspects what
+#   it packages, so an .apk built from the manylinux glibc build installs
+#   perfectly on Alpine and then fails at exec.
+#
+#   The service is OpenRC, not systemd, and the maintainer scripts are busybox
+#   ash: groupadd and useradd do not exist on Alpine.
+#
+# There is no `depends` here. The glibc packages declare a libc6/glibc floor
+# because that is what decides whether their binary starts; a musl binary
+# carries its own musl requirement, which the pinned Alpine build base holds
+# down instead.
+name: cronstable
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+maintainer: Parker Loflin <parker@cronstable.dev>
+description: |
+  Cron daemon with a schedule model you can inspect.
+  cronstable runs scheduled jobs from a declarative configuration and answers
+  questions cron cannot: what runs next, why a job did not run, which schedules
+  collide, and what happened on the last run. It has a dashboard, an HTTP API,
+  durable run history, dependency graphs, clustering and reporting.
+homepage: https://github.com/ptweezy/cronstable
+license: MIT
+
+contents:
+  - src: ${PKG_BINARY}
+    dst: /usr/bin/cronstable
+    file_info:
+      mode: 0755
+  - src: ./packaging/alpine/cronstable.initd
+    dst: /etc/init.d/cronstable
+    file_info:
+      mode: 0755
+  - src: ./packaging/alpine/cronstable.confd
+    dst: /etc/conf.d/cronstable
+    file_info:
+      mode: 0644
+  # nfpm's apk writer has no conffile concept, so this degrades to a plain file
+  # and the protection comes from apk-tools instead: it keeps a locally modified
+  # file and writes the incoming one alongside as .apk-new.
+  - src: ./packaging/nfpm/cronstable.yaml
+    dst: /etc/cronstable.d/cronstable.yaml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+scripts:
+  preinstall: ./packaging/nfpm/preinstall-apk.sh
+  postinstall: ./packaging/nfpm/postinstall-apk.sh
+  preremove: ./packaging/nfpm/preremove-apk.sh
+  postremove: ./packaging/nfpm/postremove-apk.sh
+
+# apk has separate upgrade hooks and runs those INSTEAD of the install ones on an
+# upgrade, so without these an upgrade would run no script at all: the service
+# would keep running the old binary and a machine that somehow lost the service
+# account would never get it back. nfpm writes .pre-upgrade/.post-upgrade only
+# from these apk-specific fields, never from the generic ones above.
+apk:
+  scripts:
+    preupgrade: ./packaging/nfpm/preinstall-apk.sh
+    postupgrade: ./packaging/nfpm/postinstall-apk.sh
