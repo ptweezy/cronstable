@@ -1306,7 +1306,23 @@ jobs:
             # that cannot exist. main itself is alive and still serving armel;
             # snapshot.debian.org has a frozen slice if that ever changes.
             sources: 'deb http://deb.debian.org/debian bookworm main'
-            armgate: '--arm-float soft --max-arm-arch v5 --max-arm-fp 0'
+            # libatomic is the only member exempted from the v5 ceiling.
+            # Debian armel libatomic1 declares Tag_CPU_arch v7 because the
+            # linker MAX-merges that tag over every input object, and the
+            # library contains ldrex and dmb implementations built for v7
+            # alongside v5 ones. A v5 core reaches none of them. All 68 IFUNC
+            # resolvers, the load-time constructor, and all 51 fallback
+            # implementations contain only ARMv5TE instructions, and each of
+            # the 440 instructions for newer cores belongs to a variant that
+            # the resolver selects only when the HWCAP byte reports that the
+            # processor supports it. On this hardware, the library uses the
+            # __kuser_cmpxchg kernel helper instead. libcrypto links against
+            # libatomic, which is how it enters the bundle. elf_floor.py
+            # applies the exemption only when the member dispatches through
+            # IFUNC, so a plain v7 build substituted later still fails this
+            # row.
+            armgate: '--arm-float soft --max-arm-arch v5 --max-arm-fp 0
+              --arm-arch-except libatomic.so.1'
             floor: '2.36'
     runs-on: ubuntu-24.04
     # Emulating an ARM1176 while compiling the whole dependency stack plus a

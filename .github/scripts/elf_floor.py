@@ -46,6 +46,28 @@ Every smoke test passes under emulation, and the binary then dies with SIGILL
 on the Raspberry Pi 1 it was built for.  Nothing else in the pipeline can see
 that.
 
+``--arm-arch-except`` exempts a named member from that ceiling.  It covers one
+specific false positive: a library that selects an implementation through an
+indirect function (IFUNC) resolver.
+
+The linker MAX-merges ``Tag_CPU_arch`` over every input object.  The tag
+therefore records the newest core that any code in the file was built for, not
+the core that the file requires at run time.  For most libraries, these two
+values match.  For an IFUNC library, they differ by design, because the library
+contains several implementations of each function and selects one at load time
+based on the processor that is present.
+
+Debian armel ``libatomic1`` is such a library.  It declares v7, but each of its
+resolvers contains only ARMv5TE instructions, and its ``ldrex`` and ``dmb``
+code belongs to the variants that a v5 core never selects.  On a v5 core, the
+library uses the ``__kuser_cmpxchg`` kernel helper instead.  ``libcrypto``
+links against ``libatomic1``, which is how the library enters the armel bundle.
+
+The exemption applies only to a member that contains an IFUNC resolver.  If you
+name a member that contains none, the check reports an error.  The flag
+therefore cannot suppress a failure for a library that is built for the wrong
+core.
+
 Exits nonzero with the offending member and version named, so a failure says
 which dependency raised the floor rather than only that it moved.
 """
@@ -66,6 +88,11 @@ TOC_ENTRY_LENGTH = struct.calcsize(TOC_ENTRY_FORMAT)
 
 SHT_GNU_VERNEED = 0x6FFFFFFE
 SHT_ARM_ATTRIBUTES = 0x70000003
+SHT_DYNSYM = 11
+# STT_GNU_IFUNC marks a symbol that resolves through a function that the
+# loader runs at load time.  That function selects an implementation for the
+# processor that is present.
+STT_GNU_IFUNC = 10
 PT_GNU_STACK = 0x6474E551
 PF_X = 0x1
 
@@ -289,6 +316,40 @@ class Elf:
             return struct.unpack_from(self.end + "Q", self.blob, off + 0x20)[0]
         return struct.unpack_from(self.end + "I", self.blob, off + 0x14)[0]
 
+    def has_ifunc(self):
+        """Reports whether any dynamic symbol uses an IFUNC resolver.
+
+        An IFUNC symbol does not name an implementation.  It names a resolver
+        function.  The loader calls that resolver, and the resolver returns the
+        address of the implementation to use on the processor that is present.
+        A library of this kind contains code for cores that it never executes.
+        This design is the one case in which a build attribute legitimately
+        differs from what the library requires at run time.
+
+        This method reports only that IFUNC dispatch is present.  It does not
+        verify that every instruction for a newer core belongs to a dispatched
+        variant.  The result therefore qualifies an exemption that you name
+        explicitly, rather than granting one on its own.
+        """
+        entry = 24 if self.is64 else 16
+        # st_info, whose low nibble is the symbol type, moves between the
+        # 32- and 64-bit layouts.
+        info_at = 4 if self.is64 else 12
+        for index, sh_type, sh_offset, _sh_link, _sh_info in self.sections():
+            if sh_type != SHT_DYNSYM:
+                continue
+            # Bound the walk to the bytes that are present, so that a section
+            # header that points past the end of the image yields no symbols
+            # instead of raising an error.  This bound is not general
+            # protection against truncation: an image short enough to truncate
+            # the section header table already raises an error in sections(),
+            # as it does for every other check in this file.
+            end = min(sh_offset + self._section_size(index), len(self.blob))
+            for pos in range(sh_offset, end - entry + 1, entry):
+                if self.blob[pos + info_at] & 0xF == STT_GNU_IFUNC:
+                    return True
+        return False
+
     def exec_stack(self):
         """True when the image declares an executable stack."""
         for p_type, p_flags in self.program_headers():
@@ -416,6 +477,16 @@ def main(argv=None):
              "member whose Tag_CPU_arch is outside it",
     )
     parser.add_argument(
+        "--arm-arch-except",
+        action="append",
+        default=[],
+        metavar="MEMBER",
+        help="exempt this bundled member from --max-arm-arch, named as it "
+             "appears in the archive; repeatable. Applies only to a member "
+             "that dispatches through an IFUNC resolver, and reports an error "
+             "for a member that does not",
+    )
+    parser.add_argument(
         "--max-arm-fp",
         type=int,
         help="the newest floating-point unit this lane targets, as a "
@@ -455,6 +526,8 @@ def main(argv=None):
     exec_stack = []
     wrong_float = []
     too_new = []
+    exempted = []
+    exempt_denied = []
     too_much_fp = []
     arm_seen = {}
     fp_seen = {}
@@ -472,9 +545,18 @@ def main(argv=None):
             if args.max_arm_arch and cpu is not None:
                 arm_seen[name] = cpu
                 if cpu not in ARM_ARCH_ALLOWED[args.max_arm_arch]:
-                    too_new.append(
-                        "{} ({})".format(name, ARM_CPU_ARCH_NAMES.get(cpu, cpu))
+                    shown = "{} ({})".format(
+                        name, ARM_CPU_ARCH_NAMES.get(cpu, cpu)
                     )
+                    if name not in args.arm_arch_except:
+                        too_new.append(shown)
+                    elif image.has_ifunc():
+                        exempted.append(shown)
+                    else:
+                        # The member is named, but it dispatches nothing, so
+                        # the attribute describes a real requirement and the
+                        # exemption does not apply.
+                        exempt_denied.append(shown)
             fp = attrs.get(ARM_FP_ARCH_TAG)
             if args.max_arm_fp is not None and fp is not None:
                 fp_seen[name] = fp
@@ -514,6 +596,16 @@ def main(argv=None):
                 len(arm_seen),
                 len(images),
                 ARM_CPU_ARCH_NAMES.get(highest, highest),
+            )
+        )
+    if exempted:
+        # Print this line on every run, not only on failure.  An exemption
+        # that the log never mentions is one that nobody reviews when the
+        # member is next rebuilt.
+        print(
+            "{}: these members exceed the {} ceiling but dispatch through "
+            "IFUNC, so --arm-arch-except exempts them: {}".format(
+                args.binary, args.max_arm_arch, _names(exempted)
             )
         )
     if args.max_arm_fp is not None:
@@ -563,6 +655,16 @@ def main(argv=None):
             "::error::{}: these members need a newer instruction set than {}, so "
             "the binary would SIGILL on the hardware this lane targets: {}".format(
                 args.binary, args.max_arm_arch, _names(too_new)
+            ),
+            file=sys.stderr,
+        )
+        failed = True
+    if exempt_denied:
+        print(
+            "::error::{}: --arm-arch-except names these members, but they "
+            "contain no IFUNC resolver. Nothing selects an implementation at "
+            "run time, so the {} ceiling applies to them: {}".format(
+                args.binary, args.max_arm_arch, _names(exempt_denied)
             ),
             file=sys.stderr,
         )
