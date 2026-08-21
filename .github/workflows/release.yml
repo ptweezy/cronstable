@@ -2470,7 +2470,7 @@ jobs:
       # local `docker build .` does, and that uses the builder's own git).
       - uses: actions/checkout@v7.0.1
       - uses: docker/setup-qemu-action@v4.2.0
-      - uses: docker/setup-buildx-action@v4.2.0
+      - uses: docker/setup-buildx-action@v4.3.0
       - name: Build image (build-only gate)
         uses: docker/build-push-action@v7.3.0
         with:
@@ -3438,7 +3438,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - uses: docker/setup-qemu-action@v4.2.0
-      - uses: docker/setup-buildx-action@v4.2.0
+      - uses: docker/setup-buildx-action@v4.3.0
 
       - name: Build and push
         uses: docker/build-push-action@v7.3.0
