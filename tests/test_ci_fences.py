@@ -30,6 +30,10 @@ def _workflow():
         return YAML(typ="safe").load(fobj.read())
 
 
+def _yaml_load(text):
+    return YAML(typ="safe").load(text)
+
+
 def _tox_job():
     return _workflow()["jobs"]["tox"]
 
@@ -368,18 +372,230 @@ def test_refusal_message_assets_are_release_assets():
         )
 
 
+def _sign_action():
+    path = os.path.join(ROOT, ".github", "actions", "sign-artifacts", "action.yml")
+    with open(path, encoding="utf-8") as fobj:
+        return YAML(typ="safe").load(fobj.read())
+
+
+def _sign_attempts():
+    """The signing calls inside the local retrying action, in order."""
+    return [
+        step
+        for step in _sign_action()["runs"]["steps"]
+        if "artifact-signing-action" in str(step.get("uses", ""))
+    ]
+
+
 def test_every_signing_step_carries_a_timestamp():
     # Artifact Signing rotates its leaf certificates within days and
     # the signing action does not timestamp by default, so an
-    # untimestamped signature dies with its certificate. Every signing
-    # step must pin both timestamp inputs.
-    steps = [
-        step
-        for step in _workflow()["jobs"][SIGN_JOB]["steps"]
-        if "artifact-signing-action" in str(step.get("uses", ""))
-    ]
-    assert steps, "no signing steps found: the detector went stale"
-    for step in steps:
+    # untimestamped signature dies with its certificate. Every attempt
+    # must pin both timestamp inputs.
+    attempts = _sign_attempts()
+    assert attempts, "no signing steps found: the detector went stale"
+    for step in attempts:
         with_block = step.get("with") or {}
         assert with_block.get("timestamp-rfc3161"), step.get("name")
         assert with_block.get("timestamp-digest"), step.get("name")
+
+
+def test_signing_goes_through_the_retrying_action():
+    # A call site that reaches for the vendor action directly gets no
+    # retry, so one gallery blip fails the release again.
+    for step in _workflow()["jobs"][SIGN_JOB]["steps"]:
+        assert "artifact-signing-action" not in str(step.get("uses", "")), (
+            "{}: signs outside the retrying local action".format(
+                step.get("name")
+            )
+        )
+    call_sites = [
+        step
+        for step in _workflow()["jobs"][SIGN_JOB]["steps"]
+        if str(step.get("uses", "")) == "./.github/actions/sign-artifacts"
+    ]
+    assert call_sites, "no signing call sites: the detector went stale"
+
+
+def test_signing_retries_a_transient_failure():
+    # The vendor action reinstalls its module from the PowerShell
+    # gallery on every call, and a gallery blip fails the step before a
+    # byte is signed (a 2026-08-17 release run died on "Unable to find
+    # repository 'PSGallery'" and a plain re-run signed fine). So the
+    # ladder must keep more than one attempt, every attempt but the
+    # last must be non-fatal, and the last must NOT be: an exhausted
+    # ladder has to fail the release rather than ship unsigned bytes
+    # under a green check.
+    attempts = _sign_attempts()
+    assert len(attempts) > 1, "the signing retry ladder lost its retries"
+    for step in attempts[:-1]:
+        assert step.get("continue-on-error") is True, step.get("name")
+    assert not attempts[-1].get("continue-on-error"), (
+        "the last signing attempt swallows its own failure, so an "
+        "exhausted ladder would ship unsigned"
+    )
+    # Each retry runs only when the attempt before it failed, so a
+    # first attempt that signs costs nothing.
+    for previous, step in zip(attempts, attempts[1:]):
+        gate = "steps.{}.outcome".format(previous["id"])
+        assert gate in str(step.get("if", "")), step.get("name")
+
+
+def test_signing_retries_repeat_the_same_call():
+    # One call written three times: a `with` or a version that drifts
+    # between attempts means the retry signs on terms the first attempt
+    # was never given.
+    attempts = _sign_attempts()
+    for step in attempts[1:]:
+        assert step["uses"] == attempts[0]["uses"], step.get("name")
+        assert step["with"] == attempts[0]["with"], step.get("name")
+
+
+def _matrix_images():
+    """(job, image) for every container base image the matrices name."""
+    out = []
+    for name, job in _workflow()["jobs"].items():
+        for entry in (
+            job.get("strategy", {}).get("matrix", {}).get("include", []) or []
+        ):
+            if isinstance(entry, dict) and "image" in entry:
+                out.append((name, entry["image"]))
+    return out
+
+
+def test_every_container_base_image_is_pinned_to_a_distro_release():
+    # The libc floor of a container-built binary is a property of the base
+    # image, so a floating tag makes it drift on its own: `python:3.14-alpine`
+    # walked from Alpine 3.19 to 3.24 and took the musl floor from 1.2.4 to
+    # 1.2.6 with it, with CI green throughout because the smoke test runs on
+    # the same image that raised it.  Every base must therefore name a distro
+    # release, not just a Python version.
+    floating = []
+    for job, image in _matrix_images():
+        _, _, tag = image.rpartition(":")
+        if tag == image or tag in ("latest", ""):
+            floating.append((job, image))
+            continue
+        if image.startswith("python:") and not re.search(
+            r"(alpine\d+\.\d+|slim-[a-z]+)$", tag
+        ):
+            floating.append((job, image))
+    assert not floating, (
+        "these base images float, so the libc floor moves without an edit: "
+        "{}".format(sorted(floating))
+    )
+
+
+def _declared_floors():
+    """arch -> the glibc floor its build lane declares."""
+    floors = {}
+    for job in _workflow()["jobs"].values():
+        for entry in (
+            job.get("strategy", {}).get("matrix", {}).get("include", []) or []
+        ):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("floor") and entry.get("arch"):
+                floors[entry["arch"]] = str(entry["floor"])
+    return floors
+
+
+def test_package_dependencies_declare_the_floor_the_lane_enforces():
+    # The .deb/.rpm `libc6 >= X` dependency is the only thing that stops a
+    # package installing on a host the binary cannot start on, and it is
+    # spelled in a second place: build_packages.sh's table.  elf_floor.py
+    # enforces the workflow's number against the actual bytes, so if the two
+    # disagree the packages promise something nothing checks.
+    script = os.path.join(ROOT, ".github", "scripts", "build_packages.sh")
+    with open(script, encoding="utf-8") as fobj:
+        body = fobj.read()
+    rows = re.search(r'ROWS="\n(.*?)\n"', body, re.S)
+    assert rows, "build_packages.sh no longer carries a ROWS table"
+    packaged = {}
+    for line in rows.group(1).splitlines():
+        fields = line.split()
+        if len(fields) == 4:
+            packaged[fields[0]] = fields[3]
+    assert packaged, "the ROWS table parsed to nothing"
+
+    declared = _declared_floors()
+    mismatched = {
+        arch: (floor, declared.get(arch))
+        for arch, floor in packaged.items()
+        if declared.get(arch) != floor
+    }
+    assert not mismatched, (
+        "packaged floor != the floor the build lane declares and elf_floor.py "
+        "enforces, as {arch: (packaged, lane)}: {}".format(mismatched)
+    )
+
+
+def test_every_32_bit_arm_row_asserts_its_abi():
+    # On 32-bit ARM the glibc version is only half the ABI, and the other half
+    # is invisible to every functional test: the float ABI, and the newest
+    # instruction set anything in the bundle needs.  The 1.2.41 armv6 binary
+    # shipped 27 members of ARMv7 object code, because under QEMU an ARMv6
+    # container reports armv7l from uname and pip installed armv7l wheels; it
+    # passed every smoke test and could not have run on the Raspberry Pi 1 the
+    # row exists for.  elf_floor.py's --arm-float/--max-arm-arch checks are what
+    # catch that, so no ARM row may ship without them.
+    arm = {"armv5", "armv6", "armv7", "armel"}
+    missing = []
+    for name, job in _workflow()["jobs"].items():
+        for entry in (
+            job.get("strategy", {}).get("matrix", {}).get("include", []) or []
+        ):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("arch") in arm and not entry.get("armgate"):
+                missing.append((name, entry["arch"]))
+    assert not missing, (
+        "these 32-bit ARM rows declare no armgate, so nothing checks their "
+        "float ABI or instruction set: {}".format(sorted(missing))
+    )
+
+
+def test_nfpm_recipes_avoid_the_broken_tree_content_type():
+    # nfpm 2.47.0 emits a GNU base-256 tar mode header for `type: tree`
+    # entries, which apk-tools rejects outright (nfpm issue #1112; the fix
+    # landed upstream after that release and is in no released version).  The
+    # current recipes use explicit src/dst entries only, so they are unaffected,
+    # and one future `type: tree` edit would silently produce an Alpine package
+    # that cannot be installed.
+    for name in ("nfpm.yaml", "apk.yaml"):
+        path = os.path.join(ROOT, "packaging", "nfpm", name)
+        with open(path, encoding="utf-8") as fobj:
+            body = fobj.read()
+        assert "type: tree" not in body, (
+            "{} uses `type: tree`, which the pinned nfpm packages in a form "
+            "apk-tools rejects".format(name)
+        )
+
+
+def test_apk_packages_are_built_from_the_musl_binaries():
+    # nfpm never inspects what it packages, so an .apk built from the glibc
+    # manylinux binary installs cleanly on Alpine and then fails at exec, with
+    # nothing in the build able to notice.  The apk loop must therefore read the
+    # -musl artifacts, and its recipe must not carry a glibc dependency.
+    script = os.path.join(ROOT, ".github", "scripts", "build_packages.sh")
+    with open(script, encoding="utf-8") as fobj:
+        body = fobj.read()
+    apk_loop = body.split("while read -r arch alpine_arch")[-1]
+    assert "cronstable-linux-$arch-musl" in apk_loop, (
+        "the apk loop no longer reads the musl binaries"
+    )
+    assert "cronstable-linux-$arch-musl" not in body.split(
+        "while read -r arch alpine_arch"
+    )[0], "the deb/rpm loop reads a musl binary"
+    # And the recipe must declare no libc dependency: a musl binary carries its
+    # own requirement, and a glibc floor here would be both wrong and untested.
+    with open(
+        os.path.join(ROOT, "packaging", "nfpm", "apk.yaml"), encoding="utf-8"
+    ) as fobj:
+        recipe = _yaml_load(fobj.read())
+    assert not recipe.get("depends"), (
+        "the apk recipe declares dependencies: {}".format(recipe.get("depends"))
+    )
+    assert not recipe.get("overrides"), (
+        "the apk recipe carries format overrides it cannot use"
+    )

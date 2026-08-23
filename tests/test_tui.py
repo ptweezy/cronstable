@@ -581,13 +581,13 @@ def test_theme_lookup_and_cvd():
     deutan = Theme("carolina", light=False, cvd="deutan")
     assert deutan.colors["ok"] != dark.colors["ok"]
     # unknown hue falls back rather than raising
-    assert Theme("nope", light=False).hue == "carolina"
+    assert Theme("nope", light=False).hue == "standard"
 
 
 def test_prefs_roundtrip(tmp_path):
     path = str(tmp_path / "tui.json")
     prefs = load_prefs(path)  # missing file -> defaults
-    assert prefs["theme"] == "carolina"
+    assert prefs["theme"] == "standard"
     prefs["theme"] = "amber"
     prefs["poll_ms"] = 5000
     save_prefs(prefs, path)
@@ -597,11 +597,11 @@ def test_prefs_roundtrip(tmp_path):
     # corrupt file -> defaults, no raise
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("{nope")
-    assert load_prefs(path)["theme"] == "carolina"
+    assert load_prefs(path)["theme"] == "standard"
     # a bad stored theme falls back
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({"theme": "plaid"}, fh)
-    assert load_prefs(path)["theme"] == "carolina"
+    assert load_prefs(path)["theme"] == "standard"
 
 
 def test_help_overlay_carries_the_web_table():
@@ -1407,13 +1407,13 @@ async def test_theme_cycling_persists(tmp_path):
     try:
         app = await h.start(tmp_path)
         await _wait_for(lambda: len(app.jobs) == 1)
-        assert app.theme.hue == "carolina"
+        assert app.theme.hue == "standard"
         h.keys.send("t")
-        await _wait_for(lambda: app.theme.hue == "amber")
+        await _wait_for(lambda: app.theme.hue == "carolina")
         h.keys.send("T")
         await _wait_for(lambda: app.theme.light)
         saved = load_prefs(str(tmp_path / "prefs.json"))
-        assert saved["theme"] == "amber"
+        assert saved["theme"] == "carolina"
         assert saved["light"] is True
     finally:
         await h.stop()

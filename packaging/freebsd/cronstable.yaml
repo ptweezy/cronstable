@@ -1,0 +1,32 @@
+# cronstable configuration, installed by the FreeBSD package.
+#
+# The package marks this file as configuration, so your edits survive an
+# upgrade. Everything cronstable does is driven from here: see
+# https://github.com/ptweezy/cronstable/wiki/Configuration-Reference for the
+# full set of sections, and `cronstable --validate-config` to check a change
+# before restarting the service.
+#
+# Every file in /usr/local/etc/cronstable.d is read and merged, so job
+# definitions can live in their own files beside this one.
+
+# The durable store. With a path set, run history, in-flight run records,
+# restart-surviving retries and @reboot bookkeeping all persist across a
+# restart. The rc.d script creates this directory and gives it to the service
+# user before starting the daemon.
+state:
+  path: /var/db/cronstable
+
+# The dashboard and HTTP API, off until you give it a listener:
+#
+# web:
+#   listen:
+#     - http://127.0.0.1:8080
+
+# Jobs. Uncomment to schedule one; `schedule` takes cron syntax, the named
+# forms (@hourly, @reboot), or a mapping of fields.
+#
+# jobs:
+#   - name: heartbeat
+#     command: date
+#     schedule: '*/5 * * * *'
+#     captureStderr: true

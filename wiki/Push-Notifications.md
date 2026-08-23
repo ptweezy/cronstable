@@ -1,19 +1,19 @@
-# Push Notifications
+# Push notifications
 
 cronstable can deliver job and daemon alerts as end-to-end encrypted push
-notifications to paired devices, through a hosted relay, via a fifth
-reporter named `push` that sits beside the mail, Sentry, shell, and webhook
-reporters (see [Reporting](Reporting)). The point is a page on a phone with
-none of the usual trust cost: no third-party service ever reads the alert.
+notifications to paired devices, through a hosted relay, using a fifth
+reporter named `push` beside the mail, Sentry, shell, and webhook reporters
+(see [reporting](Reporting)). The point is a page on a phone with none of
+the usual trust cost: no third-party service ever reads the alert.
 
-The encryption model in two sentences: the daemon seals each alert to every
-paired device's X25519 public key (a libsodium sealed box, X25519 +
-XSalsa20-Poly1305), so only that device's private key, generated on the
-phone and never leaving it, can open the payload. The relay that forwards
-alerts to the platform push service (APNs) sees only a device token, a
-ciphertext, an opaque coalescing hash (keyed with a per-installation salt
-the relay never sees), a priority, and an event flag, never job names,
-hostnames, or log lines.
+The encryption model: the daemon seals each alert to every paired device's
+X25519 public key, in a libsodium sealed box (X25519 + XSalsa20-Poly1305),
+so only that device's private key can open the payload. That key is
+generated on the phone and never leaves it. The relay forwards alerts to the
+platform push service (APNs), and sees only a device token, a ciphertext, an
+opaque coalescing hash (keyed with a per-installation salt the relay never
+sees), a priority, and an event flag, never job names, hostnames, or log
+lines.
 
 ## Enabling push
 
@@ -24,9 +24,9 @@ pip install "cronstable[push]"
 ```
 
 (The extra is PyNaCl, which bundles libsodium. The release binaries bundle
-it per architecture; a lane that cannot build it ships without the extra,
-and a config that asks for push then refuses to start with an error saying
-so.)
+it per architecture. A lane that cannot build it ships without the extra,
+and the daemon then refuses to start with a config that asks for push,
+reporting an error that says so.)
 
 Then configure the daemon-global `push:` section, which says where alerts
 go and where device pairings are stored:
@@ -39,21 +39,21 @@ push:
   devicesFile: /var/lib/cronstable/devices.json
 ```
 
-`https://relay.cronstable.com/` is the hosted relay; its full source is
+`https://relay.cronstable.com/` is the hosted relay. Its full source is
 published at
 [ptweezy/cronstable-relay](https://github.com/ptweezy/cronstable-relay)
 (MIT), including its delivery policy (per-device coalescing, flap
-suppression, rate limits) and self-hosting instructions. Because alerts
-are sealed before they leave the daemon, pointing at the hosted relay
-trusts it with routing metadata only, never content.
+suppression, rate limits) and self-hosting instructions. Because alerts are
+sealed before they leave the daemon, pointing at the hosted relay trusts it
+with routing metadata only, never content.
 
-`devicesFile` is only needed on a stateless install; with a
+`devicesFile` is needed only on a stateless install. With a
 [`state:`](Durable-State) section the registry rides the durable store
-instead (see [Where pairings are stored](#where-pairings-are-stored)).
+instead (see [where pairings are stored](#where-pairings-are-stored)).
 
 The section alone sends nothing. Each job hook (or the daemon-level
 `notify:` block) opts in through the report schema, exactly like the other
-reporters. A typical setup pushes on every failure via the file's
+reporters. A typical setup pushes on every failure through the file's
 `defaults:`:
 
 ```yaml
@@ -85,34 +85,35 @@ and under `notify.report`:
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | bool (Opt) | `false` | Opt this hook into the push channel. Enabling it anywhere requires the daemon-global `push:` section (a `ConfigError` otherwise). |
-| `priority` | `time-sensitive` or `passive` (Opt) | `time-sensitive` | Relayed to APNs as the interruption level: `time-sensitive` breaks through scheduled summaries, `passive` does not. |
-| `includeLogTail` | bool (Opt) | `true` | Carry the last captured output lines (stderr when captured, else stdout, up to 40 lines) inside the sealed payload, trimmed oldest-first to fit the size cap. |
+| `priority` | `time-sensitive` or `passive` (Opt) | `time-sensitive` | Relayed to APNs as the interruption level. `time-sensitive` breaks through scheduled summaries; `passive` does not. |
+| `includeLogTail` | bool (Opt) | `true` | Carry the last captured output lines (stderr when captured, otherwise stdout, up to 40 lines) inside the sealed payload, trimmed oldest-first to fit the size cap. |
 
 ### The `push:` section
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `relay.url` | str (required) | none | The relay endpoint alerts are POSTed to. Must be an http(s) URL; the daemon never posts ciphertext anywhere the config did not spell out. |
-| `relay.timeout` | float (Opt) | `10` | Total timeout, in seconds, for each relay request. Must be greater than 0. Device POSTs go out together, so this is also the worst case a whole fan-out adds to a report, whatever the fleet size. |
-| `devicesFile` | str (Opt) | unset | Path of a local JSON file holding the paired-device registry. Required when no `state:` section is configured; when set, it is used even if a `state:` section exists. |
-| `allowUnauthenticated` | bool (Opt) | `false` | Serve the `/push/devices` pairing endpoints on a routable (non-loopback, non-socket) listener even with no `web.authToken`. Fail-closed default: with no token the web app has no auth middleware at all, so a `push:` section alongside a routable listener raises a `ConfigError` at load. An `https://` listener with `web.tls.clientCa` set is exempt without this flag (mutual TLS authenticates the caller); plain `https://` is not. Set true only when the endpoints are protected by other means (an mTLS-terminating proxy, a network policy). |
+| `relay.url` | str (required) | none | The relay endpoint the daemon POSTs alerts to. Must be an http(s) URL. The daemon never posts ciphertext anywhere the config did not spell out. |
+| `relay.timeout` | float (Opt) | `10` | Total timeout in seconds for each relay request. Must be greater than 0. Device POSTs go out together, so this is also the worst case a whole fan-out adds to a report, whatever the fleet size. |
+| `devicesFile` | str (Opt) | unset | Path of a local JSON file holding the paired-device registry. Required when no `state:` section is configured. When set, the daemon uses it even with a `state:` section. |
+| `allowUnauthenticated` | bool (Opt) | `false` | Serve the `/push/devices` pairing endpoints on a routable (non-loopback, non-socket) listener even with no `web.authToken`. The default fails closed: with no token the web app has no auth middleware at all, so a `push:` section alongside a routable listener raises a `ConfigError` at load. An `https://` listener with `web.tls.clientCa` set is exempt without this flag (mutual TLS authenticates the caller). Plain `https://` is not exempt. Set true only when the endpoints are protected by other means (an mTLS-terminating proxy, a network policy). |
 
 ## Pairing devices
 
 Pairing registers a device's public key and platform push token with the
-daemon. The dashboard has a "Pair a device" panel (in the command palette
-and in settings) whose QR encodes a pairing link: the
+daemon. The dashboard has a **Pair a device** panel, in the command palette
+and in settings. Its QR encodes a pairing link: the
 `{v: 1, name, url, token}` payload, base64url-encoded into the fragment of
-the relay origin's `/pair` route, so a phone-camera scan deep-links into
-the companion app (or lands on install pointers when the app is missing).
-The panel shows the same payload as a copyable JSON string, the app's
-in-app scanner accepts both forms, and either way the app completes the
-pairing by calling `POST /push/devices` with the scanned token. The link
-format is specified in the relay protocol's
+the relay origin's `/pair` route, so a phone-camera scan deep-links into the
+companion app, or lands on install pointers when the app is missing.
+
+The panel shows the same payload as a copyable JSON string, and the app's
+in-app scanner accepts both forms. Either way the app completes the pairing
+by calling `POST /push/devices` with the scanned token. The relay protocol
+specifies the link format in its
 ["Pairing links" section](https://github.com/ptweezy/cronstable/blob/main/docs/relay-protocol.md#pairing-links).
-The panel warns when the token it would embed is the all-scopes one;
-give a phone a scoped
-[`web.authTokens`](HTTP-API#scoped-tokens-webauthtokens) entry instead.
+The panel warns when the token it would embed is the all-scopes one. Give a
+phone a scoped [`web.authTokens`](HTTP-API#scoped-tokens-webauthtokens)
+entry instead.
 
 [![The Pair a device panel: a QR code deep-linking the connection payload into the companion app, the payload as a copyable JSON string, and the all-scopes token warning](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
 
@@ -140,22 +141,24 @@ $ curl -X POST http://127.0.0.1:8080/push/devices \
 }
 ```
 
-`publicKey` must be base64 decoding to the length its `suite` requires
-(32 bytes for the default `x25519`) and be usable: an all-zero or
-low-order X25519 key that libsodium refuses to seal to is rejected at
-pairing, not on the first alert. `suite` is optional and defaults to
-`x25519`; a suite this daemon cannot seal to is refused at pairing rather
-than stored as a record whose every alert would fail. `name`,
-`platform`, and `pushToken` are bounded strings. Validation
-failures are a `400` naming the field. Re-pairing the same public key
-(push tokens rotate; phones get renamed) answers `200` with
-`created: false` and updates `name`/`platform`/`pushToken` in place,
-keeping the record's `id` and `createdAt` so revocation references stay
-stable. `createdBy` records the label of the bearer token that performed
-the pairing.
+`publicKey` must be base64 decoding to the length its `suite` requires (32
+bytes for the default `x25519`) and be a usable key for that suite. At
+pairing, rather than on the first alert, the daemon rejects an all-zero or
+low-order X25519 key that libsodium refuses to seal to. `suite` is optional
+and defaults to `x25519`.
+The daemon refuses a pairing that names a suite it cannot seal to, rather
+than storing a record whose every alert would fail. `name`, `platform`, and
+`pushToken` are bounded strings. Validation failures are a `400` naming the
+field.
+
+Re-pairing the same public key (push tokens rotate; phones get renamed)
+answers `200` with `created: false` and updates `name`/`platform`/`pushToken`
+in place, keeping the record's `id` and `createdAt` so revocation references
+stay stable. `createdBy` records the label of the bearer token that
+performed the pairing.
 
 List pairings (`view` scope; push tokens are redacted to their trailing six
-characters, public keys are returned whole):
+characters, and public keys are returned whole):
 
 ```shell
 $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/push/devices
@@ -179,96 +182,102 @@ $ curl -X DELETE -H "Authorization: Bearer s3cr3t" \
 {"revoked": "f1e2d3c4b5a69788"}
 ```
 
-Revoking the pairing stops future alerts to that device; to also revoke its
-API access, drop its `web.authTokens` entry and reload. Endpoint details
-are on the [HTTP API page](HTTP-API#get-pushdevices).
+Revoking the pairing stops future alerts to that device. To also revoke its
+API access, drop its `web.authTokens` entry and reload. Endpoint details are
+in the [HTTP control API](HTTP-API#get-pushdevices).
 
 ### Pair over a trusted transport, then compare fingerprints
 
 Pairing endpoints sit behind the web API's bearer token whenever one is
 configured, and the daemon refuses to start a `push:` section on a routable
-listener that has none (see [Failure behavior](#failure-behavior)), so an
-ungated pairing endpoint can only exist on loopback or a unix socket. Three
-things still travel during pairing that are worth protecting: the QR
-payload embeds a bearer token; an app-absent camera scan loads the relay
-host's landing page with that payload in the URL fragment, readable by the
-page's script (the in-app scanner and the copyable JSON involve no third
-party); and the pairing POST carries the device public key
-that every future alert is sealed to. On a transport an attacker can read
-or rewrite (plaintext HTTP across a shared network), the token can be
-stolen and, worse, the key can be substituted: alerts would then seal to
-the attacker's key. So pair over HTTPS
-([`web.tls`](HTTP-API#serving-over-tls-webtls) or a TLS-terminating
-proxy), over loopback (an SSH tunnel to the daemon host), or on a network
-you trust. With [`web.bonjour`](LAN-Discovery) on, the daemon also
-advertises its URL to the local network; the advert carries no secrets,
-but it does make the daemon easier to find, which is one more reason
-pairing belongs on a trusted network.
+listener that has none (see [failure behavior](#failure-behavior)). An
+ungated pairing endpoint can therefore exist only on loopback or a unix
+socket.
 
-Key substitution is detectable after the fact, and the check takes ten
-seconds: the pairing response and the device listing carry a
-`fingerprint` (the first 12 hex characters of SHA-256 over the raw key
-bytes, grouped for reading aloud), and the companion app displays the same
-fingerprint for the key it generated. Compare them. If they differ, the
-daemon stored a key that is not your phone's: revoke the device and pair
-again over a trusted transport.
+Three things still travel during pairing that are worth protecting:
+
+- The QR payload embeds a bearer token.
+- An app-absent camera scan loads the relay host's landing page with that
+  payload in the URL fragment, readable by the page's script. The in-app
+  scanner and the copyable JSON involve no third party.
+- The pairing POST carries the device public key that every future alert is
+  sealed to.
+
+On a transport an attacker can read or rewrite (plaintext HTTP across a
+shared network), the token can be stolen and, worse, the key can be
+substituted: alerts would then seal to the attacker's key. So pair over
+HTTPS ([`web.tls`](Listener-TLS#the-webtls-block) or a TLS-terminating
+proxy), over loopback (an SSH tunnel to the daemon host), or on a network
+you trust.
+
+With [`web.bonjour`](LAN-Discovery) on, the daemon also advertises its URL
+to the local network. The advert carries no secrets, but it does make the
+daemon easier to find, which is one more reason pairing belongs on a trusted
+network.
+
+Key substitution is detectable after the fact, and the check takes 10
+seconds. The pairing response and the device listing carry a `fingerprint`
+(the first 12 hex characters of SHA-256 over the raw key bytes, grouped for
+reading aloud), and the companion app displays the same fingerprint for the
+key it generated. Compare them. If they differ, the daemon stored a key that
+is not your phone's: revoke the device and pair again over a trusted
+transport.
 
 ## Where pairings are stored
 
-The registry has two homes; exactly one is in effect:
+The registry has two homes, and exactly one is in effect:
 
 - **The durable state store** (when a [`state:`](Durable-State) section is
   configured and `devicesFile` is not set): one document per device, so
   pairing and revocation are per-key atomic operations, and every node
   sharing the store sees the same registry. Whichever node fires a report
-  pushes to the same device set. The documents are never swept by state
-  garbage collection: a pairing lives until it is explicitly revoked.
+  pushes to the same device set. State garbage collection never sweeps the
+  documents: a pairing lives until it is explicitly revoked.
 - **`push.devicesFile`** (required on stateless installs): a single local
   JSON file, written atomically (a uniquely named temp file plus a rename)
   and created with owner-only permissions where the platform honors them.
-  A file that fails to parse refuses writes rather than overwriting
-  possibly recoverable pairings, and a temp file left beside it by a write
-  that never finished is swept by a later one. Reads and writes run on a
-  private worker thread, are bounded at 10 seconds, and are serialized
-  process-wide per file path, so a registry on a hung mount degrades
-  pairing (the endpoints answer `503`) without stalling the scheduler or
-  process shutdown.
+  - If the file fails to parse, the daemon refuses writes rather than
+    overwriting possibly recoverable pairings, and a later write sweeps a
+    temp file that an unfinished write left beside it.
+  - Reads and writes run on a private worker thread, are bounded at 10
+    seconds, and are serialized process-wide per file path. A registry on an
+    unresponsive mount therefore degrades pairing (the endpoints answer
+    `503`) without stalling the scheduler or process shutdown.
 
 Both homes also hold the installation's collapse salt: the `collapseSalt`
-key in `devicesFile`, or a `pushmeta` document in the state store. It is
-the secret that keys the coalescing hash sent to the relay, created on
-first use; every node sharing a registry derives the same hash for the
-same alert, and the relay never sees the salt itself.
+key in `devicesFile`, or a `pushmeta` document in the state store. It is the
+secret that keys the coalescing hash sent to the relay, created on first
+use. Every node sharing a registry derives the same hash for the same alert,
+and the relay never sees the salt itself.
 
 The reporting path reads an in-memory mirror of the registry, refreshed at
 most every 60 seconds, so a slow or briefly unavailable store can never
-stall a report fan-out; a pairing made on another node becomes effective
-within that window. A read that fails is remembered for about 5 seconds,
-so a burst of alerts against an unreachable store costs one attempt
-between them rather than one each. The pairing endpoints always read and
-write the store directly.
+stall a report fan-out. A pairing made on another node becomes effective
+within that window. The daemon remembers a failed read for about 5 seconds,
+so a burst of alerts against an unreachable store costs one attempt between
+them rather than one each. The pairing endpoints always read and write the
+store directly.
 
 ## Size limits and what an alert contains
 
 The sealed plaintext is a compact JSON document: `v`, `kind` (`success`,
-`failure`, `sla`, `event`, or `test`), `name`, `success`, `host`, and `ts`,
-plus the run context that is known (`run_id`, `schedule`, `started_at`,
-`exit_code`, `fail_reason`), the log tail on job alerts (when
+`failure`, `sla`, `event`, or `test`), `name`, `success`, `host`, and `ts`.
+It also carries the run context that is known (`run_id`, `schedule`,
+`started_at`, `exit_code`, `fail_reason`), the log tail on job alerts (when
 `includeLogTail` is on and output was captured), the `event` / `subject` /
-`message` fields on daemon events, and the breach fields on SLA alerts.
-The full field-by-field schema is in the
+`message` fields on daemon events, and the breach fields on SLA alerts. The
+full field-by-field schema is in the
 [relay protocol document](https://github.com/ptweezy/cronstable/blob/main/docs/relay-protocol.md).
 
 APNs rejects notifications over 4096 bytes, so the daemon caps the sealed,
-base64-encoded ciphertext at 3800 characters: the cap is 4096 minus the
-189 bytes the relay's own APNs envelope measures at, minus a 107-byte
-reserve for future protocol fields. Each device's payload is fitted to
-its own suite budget (2802 bytes of plaintext under `x25519`), so a
-device paired under a wider-ciphertext suite is trimmed harder without
-costing the devices beside it any log lines. An oversized payload is
-trimmed in order: log-tail
-lines oldest-first (the newest lines carry the failure), then long
-free-text fields halved (never below 64 characters), then the optional
+base64-encoded ciphertext at 3800 characters: 4096 minus the 189 bytes of the
+relay's own APNs envelope, minus a 107-byte reserve for future protocol
+fields. The daemon fits each device's payload to that device's own suite
+budget (2802 bytes of plaintext under `x25519`), so a device paired under a
+wider-ciphertext suite is trimmed harder without costing the devices beside
+it any log lines. It trims an oversized payload in order: log-tail lines
+oldest-first (the newest lines carry the failure), then long free-text
+fields halved (never below 64 characters), then the optional
 context fields dropped. The alert's identity (`name`, `kind`, `host`) is
 never trimmed. There is no per-job template: the companion app renders the
 decrypted fields itself.
@@ -290,23 +299,26 @@ runtime degradations:
   `push.relay.timeout`;
 - a `push:` section on a daemon whose web API listens on a routable
   address with no `web.authToken`/`web.authTokens`. Pairing is a mutating
-  endpoint and a token is what installs the auth middleware at all, so
-  without one anything that can reach the listener can pair its own key
-  and keep receiving alerts. Give the web API a token, keep `web.listen`
-  on loopback or a unix socket, set `web.tls.clientCa`, or set
+  endpoint, and a token is what installs the auth middleware at all, so
+  without one anything that can reach the listener can pair its own key and
+  keep receiving alerts. Give the web API a token, keep `web.listen` on
+  loopback or a unix socket, set `web.tls.clientCa`, or set
   `push.allowUnauthenticated: true`.
 
-At runtime, delivery is deliberately non-fatal: a sealing failure or relay
-outage is logged per device and never raised into the reporting path, so a
-relay outage can never look like a reporting crash or affect the other
-reporters. The devices are POSTed to concurrently, so an unreachable relay
-delays a report by one `relay.timeout` rather than one per device, and
-therefore does not hold up retry arming or a graceful shutdown by the sum.
-An alert fired with no device paired is dropped with a warning naming the
-pairing endpoint. When the registry store is unavailable, whether
-unreachable or holding a document this build cannot read, report fan-outs
-fall back to the last-known device set and say so, and the pairing
-endpoints answer `503` per request.
+At runtime, delivery is deliberately non-fatal. The daemon logs a sealing
+failure or relay outage per device and never raises it into the reporting
+path, so a relay outage can never look like a reporting crash or affect the
+other reporters.
+
+The daemon POSTs to the devices concurrently, so an unreachable relay delays
+a report by one `relay.timeout` rather than one per device, and therefore
+does not hold up retry arming or a graceful shutdown by the sum. An alert
+fired with no device paired is dropped with a warning naming the pairing
+endpoint.
+
+When the registry store is unavailable, whether unreachable or holding a
+document this build cannot read, report fan-outs fall back to the last-known
+device set and say so, and the pairing endpoints answer `503` per request.
 
 ## Relay protocol
 
@@ -317,10 +329,10 @@ be published; that file is the contract any implementation must satisfy.
 
 The trust model: the relay is not a trusted party. It receives ciphertext
 and routing metadata only (device token, coalescing hash, priority, event
-flag), owns deduplication, rate limiting, and flap suppression (coalescing
-on the hash without learning what it hashes; the hash is keyed with the
-per-installation salt, so it stays opaque even for guessable job names),
-and forwards to APNs with `mutable-content` set so the app decrypts and
+flag), and owns deduplication, rate limiting, and flap suppression,
+coalescing on the hash without learning what it hashes. The per-installation
+salt keys that hash, so the hash stays opaque even for guessable job names.
+It forwards to APNs with `mutable-content` set so the app decrypts and
 renders the notification on the device.
 
 ## Related pages

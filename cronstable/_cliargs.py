@@ -48,8 +48,10 @@ MCP_DEFAULT_PROTOCOL_VERSION = "2025-11-25"
 MCP_DEFAULT_TIMEOUT = 30.0
 
 # The web dashboard's five theme hues, mirrored by the TUI (same t / T
-# cycling); each also has a -light variant, appended below.
-THEME_HUES = ["carolina", "amber", "green", "modern", "standard"]
+# cycling); each also has a -light variant, appended below. The default
+# hue leads the list, and both cyclers walk it in this order.
+DEFAULT_THEME_HUE = "standard"
+THEME_HUES = ["standard", "carolina", "amber", "green", "modern"]
 
 
 def _add_scope_flags(parser: argparse.ArgumentParser) -> None:
