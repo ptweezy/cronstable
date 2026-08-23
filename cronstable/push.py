@@ -104,11 +104,21 @@ _CIPHERTEXT_FRAME = (
     APNS_PAYLOAD_MAX - RELAY_ENVELOPE_BYTES - RELAY_ENVELOPE_RESERVE
 )
 
-#: The largest base64 ciphertext a daemon will hand the relay: the frame
-#: above rounded down to a readable, quotable 3800.  Both sides hard-code
-#: it (the relay's MAX_CIPHERTEXT_CHARS) because it is part of
-#: docs/relay-protocol.md, not a negotiated value.
-CIPHERTEXT_B64_MAX = _CIPHERTEXT_FRAME // 100 * 100
+#: The largest base64 ciphertext a daemon hands the relay.  The reserve
+#: above is sized so this lands on a round, quotable 3800: both sides
+#: hard-code that number (the relay's MAX_CIPHERTEXT_CHARS) because it is
+#: part of docs/relay-protocol.md, not a negotiated value, and the tests
+#: pin it.
+CIPHERTEXT_B64_MAX = _CIPHERTEXT_FRAME
+
+#: The smallest ciphertext cap a conforming relay enforces
+#: (docs/relay-protocol.md, "Relay and daemon versions").  Self-hosted
+#: relays are part of the design, each enforces the cap it was built
+#: with, and a relay answering 400 to a ciphertext over this floor is one
+#: that has yet to be updated.  ``PushService._send_to_device`` re-fits
+#: that alert to the floor and posts it once more: a page trimmed harder
+#: still reaches the phone, where a bounced one does not.
+CIPHERTEXT_B64_FLOOR = 3000
 
 #: Sealing suites.  ``suite`` names the public-key algorithm a paired
 #: device registered under; it rides in the pairing record, the relay
@@ -186,25 +196,26 @@ def suite_or_error(name: Optional[str]) -> _Suite:
     return suite
 
 
-def max_plaintext_bytes(suite: str = DEFAULT_SUITE) -> int:
-    """The largest plaintext whose sealed, base64 form fits the cap.
+def max_plaintext_bytes(
+    suite: str = DEFAULT_SUITE, cap: int = CIPHERTEXT_B64_MAX
+) -> int:
+    """The largest plaintext whose sealed, base64 form fits ``cap``.
 
     Suite-dependent: X-Wing's ciphertext is 1088 bytes wider than a sealed
     box's, so a device paired under it has that much less room for log
     lines.  The fan-out fits each device's payload to its own suite rather
     than to the narrowest one present, so a v1 device keeps its full tail
     while a v2 device sits beside it.
+
+    ``cap`` is the base64 ciphertext cap to fit under; the fallback post to
+    a relay enforcing :data:`CIPHERTEXT_B64_FLOOR` passes that.
     """
-    return CIPHERTEXT_B64_MAX // 4 * 3 - suite_or_error(suite).overhead
+    return cap // 4 * 3 - suite_or_error(suite).overhead
 
 
 #: The X25519 budget, kept as a module constant because it is the one the
 #: shipped daemon actually seals under and the tests quote it directly.
 MAX_PLAINTEXT_BYTES = max_plaintext_bytes(SUITE_X25519)
-
-#: X25519 public keys are exactly 32 bytes.  Kept for anything importing
-#: it; code that has a suite in hand reads its ``public_key_bytes``.
-DEVICE_PUBLIC_KEY_BYTES = SUITES[SUITE_X25519].public_key_bytes
 
 #: Durable-state document namespace holding one document per paired
 #: device, keyed by device id.  Documents are never swept by state GC,
@@ -1213,6 +1224,10 @@ class PushService:
         # that trade.
         self._collapse_salt: Optional[str] = None
         self._local_salt = secrets.token_hex(16)
+        # Set once the relay has answered 400 to a ciphertext over
+        # CIPHERTEXT_B64_FLOOR, so the "relay is behind" warning is one
+        # line per process rather than one per large alert.
+        self._floor_cap_logged = False
 
     async def start(self) -> None:
         """Warm the device mirror; never fatal (the store may be down)."""
@@ -1504,7 +1519,9 @@ class PushService:
         return results
 
     @staticmethod
-    def _fit_for(payload: dict[str, Any], suite: str) -> bytes:
+    def _fit_for(
+        payload: dict[str, Any], suite: str, cap: int = CIPHERTEXT_B64_MAX
+    ) -> bytes:
         """This device's copy of the alert, trimmed to its suite budget.
 
         A private copy per device, because :func:`fit_payload` trims in
@@ -1519,7 +1536,7 @@ class PushService:
         tail = private.get("log_tail")
         if isinstance(tail, list):
             private["log_tail"] = list(tail)
-        return fit_payload(private, max_plaintext_bytes(suite))
+        return fit_payload(private, max_plaintext_bytes(suite, cap))
 
     async def _send_to_device(
         self,
@@ -1531,12 +1548,6 @@ class PushService:
         is_event: bool,
     ) -> dict[str, Any]:
         """Seal and POST one alert; the outcome, never an exception."""
-        # Re-imported per call rather than shared from the caller: past the
-        # first send this is a sys.modules hit, which is nothing next to the
-        # HTTPS POST below, and it keeps the except clause's ClientError
-        # resolvable without a module-scope aiohttp.
-        import aiohttp
-
         outcome: dict[str, Any] = {
             "device": device.get("id"),
             "status": None,
@@ -1561,6 +1572,47 @@ class PushService:
             # without either having to infer the algorithm from a length.
             "suite": suite,
         }
+        await self._post_envelope(session, body, outcome)
+        if not _relay_caps_below_ours(outcome, len(ciphertext)):
+            return outcome
+        # The relay enforces a smaller cap than this daemon fits to: one
+        # that has yet to be updated, in front of a daemon that has been.
+        # One more post, fitted to the floor every conforming relay
+        # accepts.  The alert loses log lines; the phone is still paged.
+        if not self._floor_cap_logged:
+            self._floor_cap_logged = True
+            logger.warning(
+                "push: the relay caps ciphertexts at %d characters; "
+                "re-fitting alerts to that (update the relay to lift it)",
+                CIPHERTEXT_B64_FLOOR,
+            )
+        try:
+            plaintext = self._fit_for(payload, suite, CIPHERTEXT_B64_FLOOR)
+            body["ciphertext"] = seal_to_device(
+                device["publicKey"], plaintext, suite
+            )
+        except PushError as exc:
+            outcome["error"] = "{}; re-fitting to {} failed: {}".format(
+                outcome["error"], CIPHERTEXT_B64_FLOOR, exc
+            )
+            return outcome
+        await self._post_envelope(session, body, outcome)
+        return outcome
+
+    async def _post_envelope(
+        self,
+        session: "aiohttp.ClientSession",
+        body: dict[str, Any],
+        outcome: dict[str, Any],
+    ) -> None:
+        """POST one envelope, recording status and error on ``outcome``."""
+        # Re-imported per call rather than shared from the caller: past the
+        # first send this is a sys.modules hit, which is nothing next to the
+        # HTTPS POST below, and it keeps the except clause's ClientError
+        # resolvable without a module-scope aiohttp.
+        import aiohttp
+
+        outcome["error"] = None
         try:
             async with session.post(self.relay_url, json=body) as resp:
                 outcome["status"] = resp.status
@@ -1574,7 +1626,22 @@ class PushService:
             outcome["error"] = _redact_userinfo_in(
                 "relay unreachable: {}".format(exc), self.relay_url
             )
-        return outcome
+
+
+def _relay_caps_below_ours(
+    outcome: dict[str, Any], ciphertext_chars: int
+) -> bool:
+    """Whether a relay's 400 says the ciphertext is over ITS cap.
+
+    Only a ciphertext over :data:`CIPHERTEXT_B64_FLOOR` qualifies: one
+    already under the floor that a relay still refuses is that relay's
+    bug, and a second post fitted to the floor would change nothing.
+    """
+    return (
+        outcome.get("status") == 400
+        and ciphertext_chars > CIPHERTEXT_B64_FLOOR
+        and "ciphertext" in (outcome.get("error") or "")
+    )
 
 
 _service: Optional[PushService] = None

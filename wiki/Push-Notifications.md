@@ -279,7 +279,11 @@ it any log lines. It trims an oversized payload in order: log-tail lines
 oldest-first (the newest lines carry the failure), then long free-text
 fields halved (never below 64 characters), then the optional
 context fields dropped. The alert's identity (`name`, `kind`, `host`) is
-never trimmed. There is no per-job template: the companion app renders the
+never trimmed. A relay that enforces the 3000-character floor (the smallest
+cap the relay protocol allows) answers a larger ciphertext with a 400. The
+daemon then re-fits that alert to the floor, posts it again, and logs once
+that the relay is behind, so the page lands with fewer log lines instead of
+bouncing. There is no per-job template: the companion app renders the
 decrypted fields itself.
 
 ## Failure behavior

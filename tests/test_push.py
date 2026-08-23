@@ -156,6 +156,29 @@ class _BarrierRelayServer(_RelayServer):
         return web.json_response({"ok": True})
 
 
+class _FloorCapRelayServer(_RelayServer):
+    """A relay enforcing the protocol's 3000-character floor cap.
+
+    The relay a daemon fitting to CIPHERTEXT_B64_MAX meets when it is
+    released ahead of the relay it posts to.
+    """
+
+    async def _handle(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        self.requests.append(body)
+        if len(body["ciphertext"]) > push.CIPHERTEXT_B64_FLOOR:
+            return web.json_response(
+                {
+                    "v": 1,
+                    "error": "ciphertext exceeds {} characters".format(
+                        push.CIPHERTEXT_B64_FLOOR
+                    ),
+                },
+                status=400,
+            )
+        return web.json_response({"v": 1, "outcome": "forwarded"}, status=202)
+
+
 class _UndecodableRelayServer(_RelayServer):
     """A relay whose error body is not the utf-8 its header claims."""
 
@@ -552,6 +575,10 @@ def test_ciphertext_cap_fits_the_apns_frame_with_its_reserve():
     )
     # And the reserve is real slack, not a rounding artifact.
     assert push.RELAY_ENVELOPE_RESERVE > 0
+    # relay-protocol.md quotes both numbers verbatim; the reserve is sized
+    # so the cap lands exactly on the quoted one.
+    assert push.CIPHERTEXT_B64_MAX == 3800
+    assert push.CIPHERTEXT_B64_FLOOR < push.CIPHERTEXT_B64_MAX
 
 
 def test_suite_budgets_track_their_sealing_overhead():
@@ -636,19 +663,17 @@ def test_pairing_checks_key_length_against_its_own_suite():
     with pytest.raises(push.PushError) as excinfo:
         push.validate_public_key(short, push.SUITE_XWING)
     assert "1216" in str(excinfo.value)
-    assert "suite must be a string" in str(
-        pytest.raises(
-            push.PushError,
-            push.validate_pairing,
+    with pytest.raises(push.PushError) as excinfo:
+        push.validate_pairing(
             {
                 "name": "p",
                 "platform": "ios",
                 "pushToken": "t",
                 "publicKey": short,
                 "suite": 7,
-            },
-        ).value
-    )
+            }
+        )
+    assert "suite must be a string" in str(excinfo.value)
 
 
 @requires_pynacl
@@ -1203,6 +1228,71 @@ async def test_collapse_id_comes_from_the_persistent_salt(tmp_path):
         assert first["collapseId"] == push.collapse_id(
             opened, doc["collapseSalt"]
         )
+
+
+def _alert_over_the_floor() -> dict[str, Any]:
+    # Sealed under x25519 this fits CIPHERTEXT_B64_MAX only after trimming,
+    # and what survives is still well over CIPHERTEXT_B64_FLOOR: the shape
+    # a relay enforcing the floor answers 400 to.
+    return {
+        "v": 1,
+        "kind": "failure",
+        "name": "etl",
+        "host": "node-a",
+        "log_tail": ["line {} ".format(i) * 8 for i in range(40)],
+    }
+
+
+@requires_pynacl
+async def test_send_refits_to_a_relay_enforcing_the_floor_cap(
+    tmp_path, caplog
+):
+    # A daemon released ahead of its relay must not bounce the alerts
+    # carrying the most log tail -- the failures -- on the channel whose
+    # job is to page someone.  Fitted to the floor, the page still lands.
+    private, public_b64 = _device_keypair()
+    async with _FloorCapRelayServer() as relay:
+        service, _ = await _paired_service(tmp_path, relay.url, public_b64)
+        payload = _alert_over_the_floor()
+        outcomes = await service._send_payload(
+            payload, priority="time-sensitive"
+        )
+        # a second alert: the warning is once per process, the re-fit is
+        # per alert
+        await service._send_payload(
+            _alert_over_the_floor(), priority="time-sensitive"
+        )
+    first, second, third, fourth = relay.requests
+    assert len(first["ciphertext"]) > push.CIPHERTEXT_B64_FLOOR
+    assert len(second["ciphertext"]) <= push.CIPHERTEXT_B64_FLOOR
+    assert len(fourth["ciphertext"]) <= push.CIPHERTEXT_B64_FLOOR
+    assert outcomes[0]["status"] == 202
+    assert outcomes[0]["error"] is None
+    # Same alert, same id: the relay coalesces the two posts as one.
+    assert first["collapseId"] == second["collapseId"]
+    opened = _open_sealed(private, second["ciphertext"])
+    assert opened["name"] == "etl"
+    # Trimmed oldest-first like any other fit: the newest line survives.
+    assert opened["log_tail"][-1] == payload["log_tail"][-1]
+    assert len(opened["log_tail"]) < len(payload["log_tail"])
+    warnings = [
+        r for r in caplog.records if "caps ciphertexts" in r.message
+    ]
+    assert len(warnings) == 1
+
+
+@requires_pynacl
+async def test_send_does_not_refit_for_a_400_that_is_not_about_size(tmp_path):
+    # Any other 400 (a malformed token, a bad collapse id) is final: a
+    # second post fitted smaller would change nothing.
+    _, public_b64 = _device_keypair()
+    async with _RelayServer(status=400) as relay:
+        service, _ = await _paired_service(tmp_path, relay.url, public_b64)
+        outcomes = await service._send_payload(
+            _alert_over_the_floor(), priority="passive"
+        )
+    assert len(relay.requests) == 1
+    assert outcomes[0]["status"] == 400
 
 
 async def test_send_report_with_no_devices_logs_and_returns(tmp_path, caplog):

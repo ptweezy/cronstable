@@ -1105,8 +1105,8 @@ paths:
       operationId: pairPushDevice
       x-required-scope: control
       description: >-
-        Register a device (X25519 public key + platform push token) for
-        encrypted alerts. Pairing is keyed on the public key: the same key
+        Register a device (public key, its sealing suite, and platform push
+        token) for encrypted alerts. Pairing is keyed on the public key: the same key
         pairing again updates its record in place (push tokens rotate,
         phones get renamed) and keeps its id and createdAt, so revocation
         references stay stable.

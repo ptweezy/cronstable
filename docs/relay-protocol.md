@@ -117,6 +117,13 @@ sealed to the device either way, and a relay that does not recognize a
 suite should still forward it. Relays MUST NOT reject an envelope for
 carrying an unknown suite.
 
+A suite identifier is 1 to 16 characters from `[a-z0-9-]` and starts with a
+letter or digit. A relay answers 400 to an envelope whose `suite` is outside
+that grammar, the same way it answers a malformed `collapseId`. The token
+lands in the APNs payload, so its length is part of the size budget below.
+The reserve absorbs the widest token the grammar allows, which costs 10
+bytes more than the measured `x25519`.
+
 ## Size budget
 
 APNs rejects notifications whose final JSON exceeds **4096 bytes**. That
@@ -143,6 +150,22 @@ What that leaves for plaintext, after each suite's sealing overhead:
 A daemon fits each device's payload to **that device's** suite budget, so
 a device paired under a wider-ciphertext suite is trimmed harder without
 costing the devices beside it any log lines.
+
+### Relay and daemon versions
+
+A relay enforces the cap it was built with, and a daemon fits alerts to the
+cap it was built with. Deploy the relay before you upgrade the daemons that
+post to it. A daemon that fits to 3800 in front of a relay that enforces a
+smaller cap gets a 400 for its largest alerts, which are the ones that carry
+a full log tail.
+
+The daemon recovers from that 400 instead of dropping the page. **3000
+characters is the floor**: the smallest cap a conforming relay enforces. A
+relay MUST accept every ciphertext up to the floor. When a daemon's
+ciphertext exceeds the floor and the relay answers 400 with an error that
+names `ciphertext`, the daemon re-fits that device's payload to the floor,
+posts the envelope again, and logs once per process that the relay is
+behind. The alert reaches the phone with fewer log lines.
 
 ## Responses
 
