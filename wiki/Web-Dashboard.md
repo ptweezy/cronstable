@@ -1,19 +1,19 @@
-# Web Dashboard
+# Web dashboard
 
 cronstable includes a **built-in web dashboard**: a single, self-contained HTML page
 (one inline `<script>`, inline styles, no external assets, no build step, and no
-database) served by the optional [HTTP Control API](HTTP-API). It turns the daemon
-into a live, keyboard-driven control room. Watch every job's status, tail its
-output as it runs, review run history, and preview upcoming schedules, all from a
-browser.
+database) served by the optional [HTTP control API](HTTP-API). It is a live,
+keyboard-driven control surface for the daemon: watch every job's status, tail
+its output as it runs, review run history, and preview upcoming schedules, all
+from a browser.
 
 [![The cronstable web dashboard, a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)
 
 ## Enabling and opening it
 
 The dashboard is part of the HTTP interface, so it appears as soon as you add a
-`web` section with at least one `http://` listener (see
-[HTTP Control API](HTTP-API) for the full configuration reference):
+`web` section with at least one `http://` listener (see the
+[HTTP control API](HTTP-API) for the full configuration reference):
 
 ```yaml
 web:
@@ -22,15 +22,15 @@ web:
 ```
 
 Open the listener's root path in a browser, <http://127.0.0.1:8080/> for the
-example above. The page is served at `/` on every `http://` listener and is
+preceding example. The page is served at `/` on every `http://` listener and is
 self-contained, so nothing else needs to be installed or hosted.
 
-The HTML document is returned with defense-in-depth security headers, including a
-strict `Content-Security-Policy` (`default-src 'self'`, `connect-src 'self'`,
+The HTML document is returned with defense-in-depth security headers, including
+a strict `Content-Security-Policy` (`default-src 'self'`, `connect-src 'self'`,
 `frame-ancestors 'none'`, anti-clickjacking `X-Frame-Options: DENY`, and
-`X-Content-Type-Options: nosniff`). Any header you set under `web.headers` is
-merged on top of these defaults, so you can relax or extend them deliberately
-(`Content-Type` excepted: the page is always `text/html`).
+`X-Content-Type-Options: nosniff`). The daemon merges any header you set under
+`web.headers` on top of these defaults, so you can relax or extend them
+deliberately (`Content-Type` excepted: the page is always `text/html`).
 
 To expose only the REST API and **not** the dashboard, set `ui: false`:
 
@@ -47,20 +47,19 @@ The landing page is a single sortable, filterable table of every configured job.
 
 The header carries the wordmark (whose `l` is a live
 [pendulum simulation](#the-pendulum-wordmark)), the daemon's version, the
-[job-set id](Job-Set-ID) as a short `#…` chip (hover it for the full id;
-click either chip to copy the value), a live UTC clock, a **node meter**, a
-**connection indicator** (`live` when the server is responding, `no signal`
-when polls are failing; hover it to see how long ago the last successful
-response arrived), and **summary pills** counting the total jobs and how many
-are running, failing, paused, and OK.
+[job-set id](Job-Set-ID) as a short `#…` chip, a live UTC clock, a **node
+meter**, a **connection indicator**, and **summary pills** counting the total
+jobs and how many are running, failing, paused, and OK. Hover the `#…` chip for
+the full id; click either chip to copy the value. The connection indicator reads
+`live` when the server is responding and `no signal` when polls are failing;
+hover it to see how long ago the last successful response arrived.
 
-The **node meter** shows this node's live CPU and memory bars (polled from
-[`GET /node`](HTTP-API#get-node); it stays hidden when the host can't be
-read). Clicking it toggles a **node resources** card charting the node's
-retained CPU and memory history from
-[`GET /node/history`](HTTP-API#get-nodehistory), sampled and bounded per
-[`web.nodeHistory`](Configuration-Reference#web); see
-[resource monitoring](Resource-Monitoring) for the sampling model.
+The **node meter** shows this node's live CPU and memory bars, polled from
+[`GET /node`](HTTP-API#get-node). It stays hidden when the host can't be read.
+Clicking it toggles a **node resources** card charting the node's retained CPU
+and memory history from [`GET /node/history`](HTTP-API#get-nodehistory), sampled
+and bounded per [`web.nodeHistory`](Configuration-Reference#web). For the
+sampling model, see [resource monitoring](Resource-Monitoring).
 
 Each row shows:
 
@@ -68,7 +67,7 @@ Each row shows:
 | --- | --- |
 | **Status** | The job's current health: one of **Running**, **Paused** (a [runtime pause](Pausing-Jobs), glyph `⏸`), **Failed**, **OK**, **Pending** (enabled but never run yet), **Cancelled**, or **Disabled** (`enabled: false`), each with a color and glyph. A job [late on an SLA check](Late-Run-Detection) additionally carries an **OVERDUE** badge, independent of its status. |
 | **Job** | The job `name` and its command. |
-| **Owner** | *(cluster only, under [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load))* the node that currently **owns** the job. The jobs owned by the node you're viewing are highlighted in the accent color, so you can see at a glance which work lands here; `EveryNode` jobs read **all nodes**, and a `Leader` job with no quorum reads **no quorum**. The column is hidden entirely outside spread mode. Sortable, so you can group jobs by node. |
+| **Owner** | *(cluster only, under [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load))* the node that currently **owns** the job. The dashboard highlights, in the accent color, the jobs owned by the node you're viewing, so you can see which work lands here. `EveryNode` jobs read **all nodes**, and a `Leader` job with no quorum reads **no quorum**. The column is hidden entirely outside spread mode. Sortable, so you can group jobs by node. |
 | **Schedule** | The raw schedule string; hover it for a plain-English reading. |
 | **Last run** | How long ago the last run finished (kept fresh every second) and an exit-code badge. |
 | **Took** | The last run's duration. |
@@ -85,8 +84,8 @@ The optional columns:
 | Column | What it shows |
 | --- | --- |
 | **Policy** | *(cluster only)* the job's [`clusterPolicy`](Clustering-and-Leader-Election#per-job-policy): `Leader`, `PreferLeader`, or `EveryNode`; hover for what the policy means. Standalone daemons show `—`. Sortable, to group jobs by policy. |
-| **TZ** | The schedule's reference frame: `UTC` (the default), the job's IANA `timezone` (e.g. `America/Los_Angeles`), or `local` (`utc: false`). Handy when a fleet mixes frames. |
-| **Next at** | The next run as a wall-clock time in *your browser's* timezone (`04:00`, `tom 04:00`, `Jul 12 04:00`), the absolute complement to **Next**'s countdown. |
+| **TZ** | The schedule's reference frame: `UTC` (the default), the job's IANA `timezone` (such as `America/Los_Angeles`), or `local` (`utc: false`). Useful when a fleet mixes frames. |
+| **Next at** | The next run as a wall-clock time in *your browser's* time zone (`04:00`, `tom 04:00`, `Jul 12 04:00`), the absolute complement to **Next**'s countdown. |
 | **Rate** | The success percentage over the recent runs the sparkline draws, colored green / amber / red, a numeric complement to **Trend**. |
 
 The toolbar above the table lets you:
@@ -101,11 +100,11 @@ The toolbar above the table lets you:
 A [paused](Pausing-Jobs) job shows the **Paused** status with a `⏸` chip
 naming the pause expiry and note, counts into its own summary pill and
 wallboard tile, and shows `—` in the **Next** column while its slots are
-being skipped. Pausing from the dashboard is one click (the row or drawer
-button, the palette, or the `p` key, which toggles pause/resume on the
-selected job) and takes the default one-hour window; the drawer's meta line
-shows "paused until ... by ...". Longer or annotated pauses go through the
-[HTTP API](HTTP-API#post-jobsnamepause).
+being skipped. Pausing from the dashboard is one click: the row or drawer
+button, the palette, or the `p` key, which toggles pause/resume on the selected
+job. A dashboard pause takes the default one-hour window, and the drawer's meta
+line shows "paused until ... by ...". For longer or annotated pauses, use the
+[pause endpoint](HTTP-API#post-jobsnamepause).
 
 A job whose [SLA check](Late-Run-Detection) is breached carries an
 **OVERDUE** badge on its row, drawer, and wallboard tile, independent of its
@@ -117,18 +116,19 @@ spells them out beside the badge.
 
 Clicking a job (or pressing `Enter` on the selected row) opens a detail drawer
 with four tabs: **Logs**, **History**, **Resources**, and **Schedule**. The
-drawer header repeats the job's status, schedule (with its plain-English
-reading), the running PID(s) — plus, for a running job with
-[resource monitoring](Resource-Monitoring) on, its live CPU and memory — and
-a one-click button to copy the command. When
-[leader election](Clustering-and-Leader-Election#per-job-policy) is enabled, the
-header also shows the job's active **`clusterPolicy`** (`Leader`,
+drawer header repeats the job's status, its schedule (with the plain-English
+reading), the running PID(s), and a one-click button to copy the command. For a
+running job with [resource monitoring](Resource-Monitoring) on, the header adds
+the job's live CPU and memory.
+
+When [leader election](Clustering-and-Leader-Election#per-job-policy) is
+enabled, the header also shows the job's active **`clusterPolicy`** (`Leader`,
 `PreferLeader`, or `EveryNode`), and under
 [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
-the node that currently **owns** the job (e.g. `cluster: Leader → cronstable-c`).
-Jobs are **deep-linkable**:
-opening a job updates the URL to `#job/<name>`, so you can bookmark or share a
-direct link to it.
+the node that currently **owns** the job (such as
+`cluster: Leader → cronstable-c`). Jobs are **deep-linkable**: opening a job
+updates the URL to `#job/<name>`, so you can bookmark or share a direct link to
+it.
 
 ### Logs: live output, in your browser
 
@@ -148,9 +148,9 @@ running job produces them. Features:
 
 Output is only available for the streams a job captures, so enable
 [`captureStdout` / `captureStderr`](Output-Capturing) on jobs whose output you
-want to watch here. (If neither is enabled, the pane says so rather than sitting
-empty.) The view is bounded to the most recent lines so a chatty job can't grow
-the tab without limit.
+want to watch here. If neither is enabled, the pane says so rather than staying
+empty. The view is bounded to the most recent lines, so a job with heavy output
+can't grow the tab without limit.
 
 ### History: outcomes and durations over time
 
@@ -163,8 +163,8 @@ The History tab summarizes the job's retained run history:
 - a **run table**: outcome, exit code, when it finished, how long it took, and a reason for any run that carries one (failed runs, and runs cancelled from the dashboard).
 
 History is held **in memory**, up to the most recent 50 runs per job, and
-normally resets when cronstable restarts — though with a
-[durable state store](Durable-State) configured it is rehydrated from the
+normally resets when cronstable restarts. With a
+[durable state store](Durable-State) configured, it is rehydrated from the
 durable run ledger on startup, so pre-restart runs appear immediately.
 Rehydrated runs carry outcomes, timings, and exit codes, not captured output:
 the Logs tab never replays output from before a restart.
@@ -172,10 +172,10 @@ the Logs tab never replays output from before a restart.
 ### Resources: CPU and memory, per run and live
 
 The Resources tab charts the CPU and memory of jobs that opted into
-[resource monitoring](Resource-Monitoring) (`monitorResources`). The data is
-fetched lazily from
-[`GET /jobs/{name}/resources`](HTTP-API#get-jobsnameresources) when the tab
-is opened, never on the poll loop:
+[resource monitoring](Resource-Monitoring) (`monitorResources`). The dashboard
+fetches the data lazily from
+[`GET /jobs/{name}/resources`](HTTP-API#get-jobsnameresources) when you open the
+tab, never on the poll loop:
 
 - **selector chips** switch between each currently-running **live** instance
   (with its PID) and the recent recorded runs (each with its outcome glyph
@@ -184,7 +184,7 @@ is opened, never on the poll loop:
   the sampled series the daemon records (downsampled server-side, so a run of
   any length stays chart-sized);
 - a summary line gives a recorded run's outcome, duration, total CPU time,
-  peak memory, and sample count — or, for a live instance, the sampling
+  peak memory, and sample count, or, for a live instance, the sampling
   interval and the CPU used so far;
 - with more than one recorded run, **trend strips** chart CPU time and peak
   memory per run (newest on the right, colored by outcome); clicking a bar
@@ -199,25 +199,24 @@ cell, and the drawer header repeats the live readings while the job runs.
 
 ### Schedule: in plain English, in the right timezone
 
-[![The schedule tab: a plain-English reading of the cron expression and a timezone-aware list of the next run times](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-schedule.png)
+[![The schedule tab: a plain-English reading of the cron expression and a time-zone-aware list of the next run times](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-schedule.png)
 
-The Schedule tab turns the cron expression into something you can read at a glance:
+The Schedule tab turns the cron expression into a plain-English reading:
 
-- a **plain-English description** (e.g. *"At 19:27, on Monday and Friday"*), understanding ranges, steps, lists, names, and the `@daily`/`@hourly`/`@reboot` macros;
-- a preview of the **next run times**, computed live in the browser and shown in the job's own [timezone](Schedules-and-Timezones) (UTC, server-local, or an arbitrary IANA zone such as `America/Los_Angeles`), each with a relative countdown;
+- a **plain-English description** (for example, *"At 19:27, on Monday and Friday"*), understanding ranges, steps, lists, names, and the `@daily`/`@hourly`/`@reboot` macros;
+- a preview of the **next run times**, computed live in the browser and shown in the job's own [time zone](Schedules-and-Timezones) (UTC, server-local, or an arbitrary IANA zone such as `America/Los_Angeles`), each with a relative countdown;
 - impossible schedules (such as the 31st of February) are detected and called out rather than described as if they will fire;
-- a key/value summary of whether the job is enabled, its timezone frame, a concurrency note, and its command.
+- a key/value summary of whether the job is enabled, its time zone frame, a concurrency note, and its command.
 
 ## DAG orchestration
 
 When a [`dags:`](Orchestration-and-DAGs) section is configured, a **`⧉ dags`**
-toolbar button appears (it stays hidden otherwise, like the cluster panel) and
-toggles the **DAG card** (also *Toggle DAGs card* in the command palette): one
-row per DAG with its latest run's state, its name and task count (a
-**fan-out** badge marks a DAG with mapped tasks), its schedule (hover for the
-plain-English reading; `manual` for an unscheduled DAG), a stacked bar of
-recent run outcomes, the total run count, and one-click **Run** / **Open**
-actions.
+toolbar button appears; it stays hidden otherwise, like the cluster panel. The
+button toggles the **DAG card** (also *Toggle DAGs card* in the command
+palette): one row per DAG with its latest run's state, its name and task count
+(a **fan-out** badge marks a DAG with mapped tasks), its schedule (hover for the
+plain-English reading; `manual` for an unscheduled DAG), a stacked bar of recent
+run outcomes, the total run count, and one-click **Run** / **Open** actions.
 
 **Open** (or clicking a row) opens the **DAG drawer**, with **Trigger** and
 **▦ Backfill** buttons in its header and five tabs:
@@ -228,38 +227,38 @@ actions.
   advances.
 - **Tasks**: per-task state, attempts, and timings. An
   [approval gate](Orchestration-and-DAGs#approval-gates) that is awaiting a
-  decision shows **✓ Approve** / **✕ Reject** buttons (the decision is
+  decision shows **✓ Approve** / **✕ Reject** buttons, and the decision is
   recorded as made by `dashboard`; a gate decided elsewhere in the meantime
-  answers "already decided"); a sensor shows its poke count and next poke; a
+  answers "already decided". A sensor shows its poke count and next poke, and a
   task awaiting retry shows when the next attempt is due.
 - **XCom**: the values the run's tasks published.
 - **Logs**: pick a task and tail a *running* instance's live output (the same
   SSE stream as the job drawer's Logs tab).
 
-**Trigger** (and the card's **Run** button) starts a manual run now via
-[`POST /dags/{name}/trigger`](HTTP-API#post-dagsnametrigger); in the drawer,
-the new run is selected as soon as it is created. **▦ Backfill** opens a
-from/to ISO date-range form wired to
-[`POST /dags/{name}/backfill`](HTTP-API#post-dagsnamebackfill); it is
-disabled for a manual-only DAG, whose missing schedule leaves no range to
-anchor. DAG runs are **deep-linkable** like jobs: the URL tracks
-`#dag/<name>` (and `#dag/<name>/<run_key>` with a run selected), so a run can
-be bookmarked or pasted into an incident channel.
+**Trigger** (and the card's **Run** button) starts a manual run now with
+[`POST /dags/{name}/trigger`](HTTP-API#post-dagsnametrigger). In the drawer, the
+new run is selected as soon as it is created. **▦ Backfill** opens a from/to ISO
+date-range form wired to
+[`POST /dags/{name}/backfill`](HTTP-API#post-dagsnamebackfill). It is disabled
+for a manual-only DAG, whose missing schedule leaves no range to anchor. DAG
+runs are **deep-linkable** like jobs: the URL tracks `#dag/<name>` (and
+`#dag/<name>/<run_key>` with a run selected), so you can bookmark a run or paste
+it into an incident channel.
 
-This section covers the dashboard surface only. DAG semantics — task types,
-run keys, retries, approval gates, and the `dags:` configuration — live on
-[Orchestration and DAGs](Orchestration-and-DAGs), and the endpoints on
-[HTTP Control API](HTTP-API#dag-endpoints).
+This section covers the dashboard surface only. DAG semantics (task types, run
+keys, retries, approval gates, and the `dags:` configuration) live on
+[orchestration and DAGs](Orchestration-and-DAGs), and the endpoints on the
+[HTTP control API](HTTP-API#dag-endpoints).
 
 ## Durable state inspector
 
 When a [durable state](Durable-State) backend is enabled, a **`⛁ state`**
-toolbar button appears (the page probes `GET /state` once at load to decide;
-without a backend the button never shows) and toggles the **durable state**
-card (also *Toggle state inspector* in the command palette). The card
-headlines the backend and topology (with a `shared-lock` chip where that
-applies), the store path, the total record count, and a quarantine count when
-present, then splits into sub-tabs built from what the store actually holds:
+toolbar button appears and toggles the **durable state** card (also *Toggle
+state inspector* in the command palette). The page probes `GET /state` once at
+load to decide; without a backend the button never shows. The card headlines the
+backend and topology (with a `shared-lock` chip where that applies), the store
+path, the total record count, and a quarantine count when present. It then
+splits into sub-tabs built from what the store holds:
 
 - **overview**: per-kind record and document counts, plus a per-operation
   table of counts, errors, and time spent;
@@ -268,14 +267,14 @@ present, then splits into sub-tabs built from what the store actually holds:
 - **locks**: active leases with holder, fencing token, and expiry;
 - **kv**, **cursor**, **idem**, **artifacts**, **runs**, **reboot**,
   **counters**: one tab per primitive present in the store, listing its
-  scopes with entry counts; **inspect** drills into a scope's entries via the
+  scopes with entry counts; **inspect** drills into a scope's entries with the
   [state inspector endpoints](HTTP-API#state-inspector-endpoints)
   (`GET /state/documents` / `GET /state/records`).
 
-The whole surface is **metadata-only**: record payloads, KV values, and
-archived output are never fetched (values render as a type and size). The
-card polls only while it is open — the inventory walk is not free — apart
-from the single startup probe that decides whether to offer the button.
+The whole surface is **metadata-only**: record payloads, KV values, and archived
+output are never fetched (values render as a type and size). Apart from the
+single startup probe that decides whether to offer the button, the card polls
+only while it is open, because the inventory walk is not free.
 
 ## Cluster panel
 
@@ -295,44 +294,52 @@ job list and renders:
 > [`example/zen-demo/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/main/example/zen-demo/docker-compose.yml)
 > runs a single deliberately calm node.
 
-- a **summary line** with this node's name (e.g. `cronstable-a`) and the agreement
-  tally (e.g. `cronstable-a · 2/2 agreed`); when
-  [leader election](Clustering-and-Leader-Election#leader-election)
-  is on, it also shows the live quorum count and this node's role: **leader**,
-  **follower** (with the current leader's name), or **no quorum** when the node
-  has stood down. Under [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
-  there is no single leader, so the role reads **spread (per-job owner)** while
-  quorate, or **spread (no quorum)** otherwise. Under spread the summary also
-  reports how many jobs **this** node owns (e.g. `… · owns 3`). When the cluster
-  is in **conflict** the role instead reads **standing down (conflict)**, because
-  the conflict fails `Leader` jobs closed regardless of who holds the lead, and
-  the summary appends a loud **`⚠ … — Leader jobs paused`** note naming the
-  cause, one of three: a **duplicate `nodeName`** (two peers advertising the same
-  name), a **cluster size mismatch** (peers declaring different cluster sizes,
-  e.g. mid-resize), or a **coordination policy mismatch** (a peer running a
-  different `distribution` / `elect_leader`). See
-  [Clustering and Leader Election](Clustering-and-Leader-Election) for what each
-  conflict means and how to clear it;
+- a **summary line** with this node's name and the agreement tally, such as
+  `cronstable-a` and `cronstable-a · 2/2 agreed`. When
+  [leader election](Clustering-and-Leader-Election#leader-election) is on, it
+  also shows the live quorum count and this node's role:
+  - **leader**, **follower** (with the current leader's name), or **no quorum**
+    when the node has stood down.
+  - under
+    [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
+    there is no single leader, so the role reads **spread (per-job owner)**
+    while quorate, or **spread (no quorum)** otherwise. Under spread the summary
+    also reports how many jobs **this** node owns (such as `… · owns 3`).
+  - when the cluster is in **conflict** the role instead reads **standing down
+    (conflict)**, because the conflict fails `Leader` jobs closed regardless of
+    who holds the lead. The summary appends a loud
+    **`⚠ … — Leader jobs paused`** note naming the cause, one of three; see
+    [clustering and leader election](Clustering-and-Leader-Election) for what
+    each one means and how to clear it:
+    - a **duplicate `nodeName`**: two peers advertising the same name.
+    - a **cluster size mismatch**: peers declaring different cluster sizes, such
+      as mid-resize.
+    - a **coordination policy mismatch**: a peer running a different
+      `distribution` / `elect_leader`.
 - a **per-peer table** with the on-screen headers **Peer** | **Node** | **Owns**
-  | **Status** | **Job set**, listing each peer's address, reported node name,
-  status, and the short form of its job-set id, with a coloured **status dot**:
-  green for `agreed`, amber for `syncing`, red for `drifted` / `untrusted` /
-  `conflict`, grey for `unreachable`, blue for `self`, and a faint-grey dot for a
-  peer that is `unknown` (configured but not yet contacted, so no status has come
-  back). The **Owns** column (counting how many jobs each node owns) is present
-  only under
+  | **Status** | **Job set**. It lists each peer's address, reported node name,
+  status, and the short form of its job-set id. The **Owns** column, counting
+  how many jobs each node owns, is present only under
   [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load),
-  so the whole job-to-node distribution is visible at a glance (it pairs with the
-  per-job **Owner** column in the job table above); outside spread it reads `—`.
+  so the whole job-to-node distribution is visible; it pairs with the per-job
+  **Owner** column in the job table earlier. Outside spread it reads `—`. Each
+  peer also carries a colored **status dot**:
+  - green for `agreed`.
+  - amber for `syncing`.
+  - red for `drifted` / `untrusted` / `conflict`.
+  - gray for `unreachable`.
+  - blue for `self`.
+  - faint gray for a peer that is `unknown`: configured but not yet contacted,
+    so no status has come back.
 
 Peers the node has listed as its own address (`self`) are excluded from the
 agreement tally. This makes it easy to watch a rolling deploy (`syncing` →
 `agreed`), spot drift, or watch leadership move when a node goes down.
 
-A **`▚ timeline`** button in the panel header toggles a per-peer **swimlane**: a
-lane per peer, coloured by status over time, that accumulates in the browser
-while the tab is open (so you can see a `syncing` → `agreed` convergence or a
-flapping peer as a stripe rather than a single instant). It charts the gossip
+A **`▚ timeline`** button in the panel header toggles a per-peer **swimlane**:
+one lane per peer, colored by status over time, that accumulates in the browser
+while the tab is open. You can read a `syncing` → `agreed` convergence or a
+flapping peer as a stripe rather than as a single instant. It charts the gossip
 peer set only, so it is hidden entirely for the lease backends.
 
 ### Fleet view: every node's runs in one pane
@@ -344,55 +351,58 @@ node made, so under
 [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
 a job that last ran on a peer shows nothing here. The **`⊞ fleet`** button in
 the cluster panel header opens the **fleet view**, a jobs × nodes matrix that
-closes that gap: one row per job (the union of every node's advertised jobs,
-so a mid-deploy peer's new job shows up too), one column per node, each cell
-that node's state for the job: **▶ running**, the last outcome with its age
-(`● ok 3m`, `✕ failure 12s`), `◌ off` for disabled-there, `◔` for never ran
-there, `—` for not configured there, and `·` when the node has reported no
-data at all. Hovering a cell reveals the exit code, finish time, duration, and
-next fire; clicking a job name opens its drawer. A **failing only** filter
-collapses the matrix to the rows that are red anywhere in the fleet, and under
-spread the cell belonging to each job's current owner carries an accent
-marker, so "who *should* run this next" and "who ran it last" sit side by
-side.
+closes that gap: one row per job, one column per node. The rows are the union of
+every node's advertised jobs, so a mid-deploy peer's new job shows up too. Each
+cell carries that node's state for the job: **▶ running**, the last outcome with
+its age (`● ok 3m`, `✕ failure 12s`), `◌ off` for disabled-there, `◔` for never
+ran there, `—` for not configured there, and `·` when the node has reported no
+data at all.
 
-The data arrives by piggyback, not fan-out: every node attaches a compact
+Hovering a cell reveals the exit code, finish time, duration, and next fire;
+clicking a job name opens its drawer. A **failing only** filter collapses the
+matrix to the rows that are red anywhere in the fleet. Under spread, the cell
+belonging to each job's current owner carries an accent marker, so "who *should*
+run this next" and "who ran it last" sit side by side.
+
+The data arrives by piggyback, not fan-out. Every node attaches a compact
 per-job summary (running / enabled / next fire / last run) to the mutual-TLS
 [`/peer` response](Clustering-and-Leader-Election#cluster-peer-attestation) it
 already serves, so each node absorbs the whole fleet's state through the peer
-polls it already makes, and the dashboard reads the merged result from
-[`GET /fleet`](HTTP-API#get-fleet) on its usual poll: no extra traffic
-towards the peers, and any node can serve the single pane of glass. The cost
-of that design is freshness: a peer column is up to one gossip `interval`
-stale (30 s by default), so every column header shows its node's status dot
-and data age (`live` for the serving node, `41s ago` for a peer). A briefly
-unreachable peer keeps its last-known cells with a growing age instead of
-going blank, and a node whose job set exceeds the gossip payload cap (512
-jobs) is flagged **partial**. Summaries are observability data only (they
-never influence election or run decisions), and like the swimlane, the view
-is gossip-only: lease backends carry no summaries, so the button is hidden
-there.
+polls it already makes. The dashboard reads the merged result from
+[`GET /fleet`](HTTP-API#get-fleet) on its usual poll: no extra traffic towards
+the peers, and any node can serve the whole-fleet view.
+
+The cost of that design is freshness. A peer column is up to one gossip
+`interval` stale (30 s by default), so every column header shows its node's
+status dot and data age (`live` for the serving node, `41s ago` for a peer). A
+briefly unreachable peer keeps its last-known cells with a growing age instead
+of going blank, and a node whose job set exceeds the gossip payload cap (512
+jobs) is flagged **partial**. Summaries are observability data only: they never
+influence election or run decisions. Like the swimlane, the view is gossip-only,
+because lease backends carry no summaries, so the button is hidden there.
 
 Separately from the in-panel summary, a cluster incident also raises the
-page-level **CLUSTER ALERT** bar at the top of the dashboard: a red incident
-banner shown whenever this node reports a cluster conflict (duplicate `nodeName`,
-size mismatch, or coordination policy mismatch) or has **lost quorum**, so the
-alert is visible without scrolling down to the panel. It names the cause and,
-under a lease backend, phrases quorum loss as the lease store being unreachable.
+page-level **CLUSTER ALERT** bar at the top of the dashboard. This red incident
+banner appears whenever this node reports a cluster conflict (duplicate
+`nodeName`, size mismatch, or coordination policy mismatch) or has **lost
+quorum**, so the alert is visible without scrolling down to the panel. It names
+the cause and, under a lease backend, phrases quorum loss as the lease store
+being unreachable.
 
-The bullets above describe the **gossip** backend. The
+The preceding bullets describe the **gossip** backend. The
 [lease backends](Clustering-and-Leader-Election#operating-the-lease-backends-kubernetes-and-etcd)
 (`kubernetes` / `etcd`) have no peer set, so the panel renders a different shape:
 a **role summary** (`node-name · backend · role`, where the role is **leader**,
 **follower (leader: …)**, **follower**, or **no quorum (store unreachable)**)
-followed by a **key/value lease-detail table**: no status dots, no agreement
-tally, no quorum count. The table renders every non-null key the backend reports,
-so beyond the lease/election name, the holder, the identity, and the expiry it
-also surfaces the kubernetes `namespace` or the etcd `leaseId` when present. There
-`no quorum` means *the lease store is unreachable from this node*, not "no
-majority". See
-[Clustering and Leader Election](Clustering-and-Leader-Election#observing-the-cluster)
-for the full `GET /cluster` field semantics.
+followed by a **key/value lease-detail table**, with no status dots, no
+agreement tally, and no quorum count.
+
+The table renders every non-null key the backend reports, so beyond the
+lease/election name, the holder, the identity, and the expiry it also surfaces
+the kubernetes `namespace` or the etcd `leaseId` when present. There, `no
+quorum` means *the lease store is unreachable from this node*, not "no
+majority". For the full `GET /cluster` field semantics, see
+[clustering and leader election](Clustering-and-Leader-Election#observing-the-cluster).
 
 ## Merged multi-tail
 
@@ -400,23 +410,23 @@ for the full `GET /cluster` field semantics.
 
 The **`≋ tail`** toolbar button opens the **multi-tail console**: several jobs'
 log streams merged into one live pane, each line prefixed with its job name in
-a stable identity colour, like tailing a set of pods. It is built for
-correlated incidents: the incident verdict bar and the mitigate console each
-carry a `≋ tail` button that opens it pre-loaded with the failing set, and the
-command palette offers a per-job **Tail: …** action plus **failing** /
-**running** presets.
+a stable identity color, like tailing a set of pods. It is built for correlated
+incidents. The incident verdict bar and the mitigate console each carry a
+`≋ tail` button that opens it pre-loaded with the failing set, and the command
+palette offers a per-job **Tail: …** action plus **failing** / **running**
+presets.
 
 - Add jobs with the **+ failing** / **+ running** presets or the add box
   (which autocompletes to the configured jobs); remove one from its chip.
   Clicking a chip or a line's job prefix jumps to that job's drawer.
 - The console holds at most **4 concurrent streams**. Browsers allow only ~6
   HTTP/1.1 connections per origin and every tailed job keeps one open, so the
-  cap leaves the dashboard's own polling room to breathe.
+  cap leaves room for the dashboard's own polling.
 - The daemon closes a job's log stream when the tailed run's output ends, so
-  the console **re-attaches automatically** for the job's next run (paced by
-  the refresh interval). Attaching replays the run's buffered output from the
-  start, so a re-attach that lands mid-run still shows the whole run, and runs
-  are delimited with an `── end of run output ──` marker.
+  the console **re-attaches automatically** for the job's next run, paced by the
+  refresh interval. Attaching replays the run's buffered output from the start,
+  so a re-attach that lands mid-run still shows the whole run. Runs are
+  delimited with an `── end of run output ──` marker.
 - The view offers **follow**, **wrap**, and **timestamps** toggles (shared
   with the drawer's Logs tab), a plain-text **search** with a live match
   count, one-click **download** of the merged view (lines prefixed `[job]`),
@@ -436,8 +446,8 @@ a correlation pass groups them by exit code and failure reason and headlines
 either `FLEET EVENT — N jobs failing, K share exit=… — likely one cause` or
 "likely independent", so the first thing you read is whether this is one
 incident or many. A cluster quorum, leadership, or conflict problem escalates
-the bar to the red **CLUSTER ALERT** severity described
-[above](#cluster-panel). The bar carries `▤ timeline`, `▸ mitigate`, and
+the bar to the red **CLUSTER ALERT** severity described earlier under
+[cluster panel](#cluster-panel). The bar carries `▤ timeline`, `▸ mitigate`, and
 `≋ tail` buttons scoped to the incident set.
 
 [![The incident timeline overlay: every job's most recent finished run, newest first, with failure reasons, exit codes, and durations](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)
@@ -446,18 +456,17 @@ The **incident timeline** (press `i`, or *Incident timeline* in the command
 palette) lists every job's most recent finished run, newest first, each with
 its relative time, outcome glyph, failure reason, exit code, and duration. A
 **failing only** filter narrows it, and the correlated blast-radius set from
-the verdict bar is highlighted, so you can read "what happened, in what order"
-at a glance.
+the verdict bar is highlighted, so you can read "what happened, in what order".
 
 The **mitigate console** (*Mitigate failing jobs* in the palette, or the
-verdict bar's `▸ mitigate` button) acts on the failing set in bulk: guarded
+verdict bar's `▸ mitigate` button) acts on the failing set in bulk. Guarded
 **start all** / **cancel all** actions fire the per-job
 [start/cancel endpoints](HTTP-API#post-jobsnamestart) staggered a few hundred
-milliseconds apart (gentle on the daemon), abortable mid-run, with a live
-per-job ✓/✕ result log and a final tally. It can also open a
-[multi-tail](#merged-multi-tail) of the set, and copy a ready-made **Markdown
-incident summary** (timestamp, host, version, cluster state, and a per-job
-table) for your incident channel or ticket.
+milliseconds apart (gentle on the daemon), with a live per-job ✓/✕ result log
+and a final tally; you can stop the sequence while it runs. The console can also
+open a [multi-tail](#merged-multi-tail) of the set, and copy a ready-made
+**Markdown incident summary** (timestamp, host, version, cluster state, and a
+per-job table) for your incident channel or ticket.
 
 ## Wallboard / TV mode
 
@@ -467,23 +476,23 @@ Press `w` (or *Wallboard / TV mode* in the palette, or open the page with a
 `#tv` hash) for a full-screen kiosk view built for a wall monitor: every job as
 a large tile, sorted worst-first (failing, then running, then the rest), plus a
 footer tally and a live UTC clock. Each tile leads with the fact a wall viewer
-actually glances for — a failing tile shows **when it failed and its exit
-code** (counting up live), a running tile shows **elapsed time** (turning amber
-once it runs well past its longest recent duration), and a healthy tile shows
-its next-fire countdown — with the status hue filling the whole tile, not just
-the glyph. When anything is failing, a full-width **verdict headline** distills
-scope and likely cause at TV scale (single job + exit code, correlated fleet
-event, or cluster alert — the same correlation verdict the dashboard's bar
-shows). Clicking a tile exits to that job's drawer; `Esc` or `w` exits.
+glances for. A failing tile shows **when it failed and its exit code** (counting
+up live), a running tile shows **elapsed time** (turning amber after it runs
+well past its longest recent duration), and a healthy tile shows its next-fire
+countdown, with the status hue filling the whole tile, not only the glyph.
 
-The grid also fits itself to the glass: a handful of jobs on a big screen get
-proportionally larger tiles and type, a crowded fleet scales full tiles down
+When anything is failing, a full-width **verdict headline** distills scope and
+likely cause at TV scale (single job + exit code, correlated fleet event, or
+cluster alert), the same correlation verdict the dashboard's bar shows. Clicking
+a tile exits to that job's drawer; `Esc` or `w` exits.
+
+The grid also fits itself to the screen: a handful of jobs on a big screen get
+proportionally larger tiles and type, and a crowded fleet scales full tiles down
 (names, glance lines and sparklines all kept) before stepping down to compact
-tiles — which keep the sparkline too whenever their rows have room for it —
-and if even that overflows, the healthiest tail is cut behind an explicit
-footer chip (`+22 offscreen · none failing`) — computed from what was
-actually cut, so the board never silently clips a failure behind a scrollbar
-nobody can reach.
+tiles, which keep the sparkline too whenever their rows have room for it. If
+even that overflows, the healthiest tail is cut behind an explicit footer chip
+(`+22 offscreen · none failing`), computed from what was cut, so the board never
+silently clips a failure behind a scrollbar nobody can reach.
 
 Because the normal header (and its connection indicator) is hidden, the
 wallboard judges its own freshness: if no successful poll lands for ~15 seconds
@@ -495,10 +504,11 @@ When everything is healthy and the wallboard has been idle for a while (30
 seconds by default; configurable in Settings), the **zen screensaver** drifts
 in: an `ALL SYSTEMS NOMINAL` field where every enabled job is a small dot that
 pulses as its real next-fire instant arrives, with a subtitle counting the jobs
-armed and naming the next one due. Any input wakes it. It deliberately refuses
-to show the all-green field on stale data (an unverified all-clear is `NO
-SIGNAL`, not nominal) and respects `prefers-reduced-motion`. The
-`example/zen-demo/docker-compose.yml` demo boots a single calm node to show it off.
+armed and naming the next one due. Any input wakes it. On stale data it does not
+show the all-green field: an unverified all-clear is `NO SIGNAL`, not nominal.
+It also respects `prefers-reduced-motion`. The
+`example/zen-demo/docker-compose.yml` demo boots a single calm node to
+demonstrate it.
 
 ## Next-fire radar
 
@@ -508,27 +518,27 @@ the next eight upcoming fires, each with a live countdown (hover one for the
 wall-clock time and the schedule's plain-English reading), above a
 **ten-minute track** on which every fire due inside the window drifts toward
 *now* as a mark. Clicking an entry or a mark opens that job's drawer, and the
-panel header counts everything upcoming. Fire times are computed in the
-browser by the same cron engine as the
+panel header counts everything upcoming. The browser computes fire times with
+the same cron engine as the
 [Schedule tab](#schedule-in-plain-english-in-the-right-timezone) and the
-[cron sandbox](#cron-sandbox); disabled jobs, and schedules the engine cannot
+[cron sandbox](#cron-sandbox). Disabled jobs, and schedules the engine cannot
 preview (such as `@reboot`), are omitted.
 
 ## Week calendar
 
 The **`◫ week`** toolbar button (or *Toggle week calendar* in the palette)
 opens a seven-day grid of upcoming fires, starting today: one hue-keyed chip
-per fire, placed at its **browser-local** wall time (fires are computed in
-each job's own frame by the client engine, then plotted in yours), with a
-dashed now-line in today's column. Chips sharing a quarter-hour split the
-column side by side, past fires today render dimmed, and clicking a chip
-opens the job's drawer on its
-[Schedule tab](#schedule-in-plain-english-in-the-right-timezone). Jobs that
-fire more than about eight times a day summarize into a **background hum**
-strip below the grid instead of flooding it with sliver chips. The card
+per fire, placed at its **browser-local** wall time (the client engine computes
+fires in each job's own frame, then plots them in yours), with a dashed now-line
+in today's column. Chips sharing a quarter-hour split the column side by side,
+past fires today render dimmed, and clicking a chip opens the job's drawer on
+its [Schedule tab](#schedule-in-plain-english-in-the-right-timezone).
+
+Jobs that fire more than about eight times a day summarize into a **background
+hum** strip below the grid instead of flooding it with sliver chips. The card
 header links the fleet's **iCal feed** (`⤓ .ics feed`), and each drawer's
-Schedule tab links the per-job feed, so the same data lands in a real
-calendar app; see [Calendar Export](Calendar-Export).
+Schedule tab links the per-job feed, so the same data lands in a real calendar
+app. See [calendar export](Calendar-Export).
 
 ## Activity heatmap
 
@@ -537,41 +547,42 @@ calendar app; see [Calendar Export](Calendar-Export).
 The **`▦ heat`** header button (or *Toggle activity heatmap* in the palette)
 adds a punchcard card: one row per job, 24 time buckets across a **6h / 24h /
 7d** window, each cell colored by the worst outcome in that bucket and shaded
-by run volume. Hover a cell for the bucket's tally (e.g. `3 ok / 1 fail`);
-click a cell or a job name to open that job. It is filled by one batched
-[`GET /activity`](HTTP-API#get-activity) fetch (falling back to per-job
-[run history](HTTP-API#get-jobsnameruns) fetches against an older daemon),
-so its horizon is bounded by the daemon's in-memory history.
+by run volume. Hover a cell for the bucket's tally (such as `3 ok / 1 fail`);
+click a cell or a job name to open that job. The dashboard fills the card with
+one batched [`GET /activity`](HTTP-API#get-activity) fetch, falling back to
+per-job [run history](HTTP-API#get-jobsnameruns) fetches against an older
+daemon, so the card's horizon is bounded by the daemon's in-memory history.
 
 ## Schedule pressure
 
 The **`▥ pressure`** header button (or *Toggle schedule pressure* in the
-palette) adds the forward-looking twin of the activity heatmap: instead of
-what DID run, it shows every fire the fleet WILL attempt over the next 24
+palette) adds the forward-looking counterpart of the activity heatmap: instead
+of what DID run, it shows every fire the fleet WILL attempt over the next 24
 hours, fetched from [`/schedule/pressure`](HTTP-API#get-schedulepressure)
-where the daemon enumerates each schedule with its own engine. The card
-draws the hour-by-minute collision grid (hot cells highlighted), the
-minute-of-hour histogram, the fleet's
+where the daemon enumerates each schedule with its own engine. The card draws
+the hour-by-minute collision grid (hot cells highlighted), the minute-of-hour
+histogram, the fleet's
 [duplicate-schedule groups](Duplicate-Schedule-Detection) as clickable job
-chips, and [suggest-a-slot](Suggest-a-Slot) buttons whose answer arrives as
-a copy-to-clipboard chip alongside the `H * * * *` hint. A selector switches
-the display zone between UTC and the browser's local zone; the data
-refreshes about once a minute. With the panel enabled, the
-[wallboard](#wallboard--tv-mode) shows a compact pressure strip above the
-tile grid, so the room sees the `:00` stampede before it happens. See
-[Schedule Pressure](Schedule-Pressure).
+chips, and [suggest-a-slot](Suggest-a-Slot) buttons whose answer arrives as a
+copy-to-clipboard chip alongside the `H * * * *` hint.
+
+A selector switches the display zone between UTC and the browser's local zone,
+and the data refreshes about once a minute. With the panel enabled, the
+[wallboard](#wallboard--tv-mode) shows a compact pressure strip above the tile
+grid, so the room sees the `:00` stampede before it happens. See
+[schedule pressure](Schedule-Pressure).
 
 ## Cron sandbox
 
 *Cron sandbox* in the palette opens a scratchpad for schedule expressions: type
 any 5-, 6-, or 7-field cron expression (including [second-level](Schedules-and-Timezones#second-level-schedules)
-schedules) or `@macro`, pick a timezone frame, and it validates the expression,
+schedules) or `@macro`, pick a time zone frame, and it validates the expression,
 describes it in plain English, breaks out the fields, and previews the
 **next 12 fire times** with wall-clock and relative labels (impossible
-schedules and `@reboot` are called out). It cross-references
-your live jobs to show which ones use the same schedule, and keeps a
-browser-local list of recent expressions. The same engine powers the
-dashboard's schedule advisories (overlap, thundering-herd, and DST warnings).
+schedules and `@reboot` are called out). It cross-references your live jobs to
+show which ones use the same schedule, and keeps a browser-local list of recent
+expressions. The same engine powers the dashboard's schedule advisories
+(overlap, thundering-herd, and DST warnings).
 
 ## Run ledger
 
@@ -627,16 +638,16 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 
 The settings panel (and the command palette) expose:
 
-- **Ten themes**: **carolina** (the default, Carolina blue), **amber** and **green**, plus flat **modern** and **standard** looks, each in a dark and a light (paper) variant — the light ones are dark ink on tinted paper, and **standard** is the plain white-and-saturated-color look. Cycle hues with `t`; flip light/dark with `T`.
-- A **color vision** mode that remaps the status, cluster-peer, and log-ANSI colors for **red-green** (deuteranopia/protanopia) or **blue-yellow** (tritanopia) color blindness, on both the dark and paper palettes. The remapped pairs were chosen with a dichromacy simulation so every meaningful pair (ok/fail, fail/pending, agreed/drifted, …) stays clearly apart, and every status glyph differs by shape as well, in every mode.
+- **Ten themes**: **standard** (the default, a flat neutral charcoal), **carolina** (Carolina blue), **amber**, **green**, and flat **modern**, each in a dark and a light (paper) variant. Light variants are dark ink on tinted paper; **standard**'s light variant is plain white with saturated color. Cycle hues with `t`; flip light/dark with `T`.
+- A **color vision** mode that remaps the status, cluster-peer, and log-ANSI colors for **red-green** (deuteranopia/protanopia) or **blue-yellow** (tritanopia) color blindness, on both the dark and paper palettes. The remapped pairs were chosen with a dichromacy simulation, so every meaningful pair (ok/fail, fail/pending, agreed/drifted, …) stays clearly apart, and every status glyph differs by shape in every mode.
 - **Compact density** for tighter rows.
-- An **interface font** choice: the terminal monospace (default) or a proportional sans-serif that is easier on the eyes for long reading. Log output, cron expressions, and keycaps stay monospace either way, and numerals stay tabular so the clocks don't jitter.
-- A **UI scale** of 100% / 110% / 125% / 140% that enlarges the whole dashboard — handy for wallboard TVs viewed from across the room, too.
-- A **reduce motion** switch that stops the spinners, pulsing status dots, and the boot self-test without touching your OS preference (`prefers-reduced-motion` is always honored regardless).
-- The **boot self-test**: a BIOS-style POST screen on load that probes the daemon, job set, cluster, and schedules for real while it types. It replays only after a 12-hour cooldown, any key dismisses it, and re-enabling the toggle clears the cooldown so the next load shows it.
-- **Desktop notifications** that fire when a job fails (after you grant the browser permission).
-- **Audible cues**: a short tick when a run succeeds and a buzz when one fails, at a selectable **cue volume** of 25% / 50% / 75% / 100%. A failure also arms a repeating **failure alarm** that sounds until acknowledged with `a` (which works on the wallboard too); the all-clear, or a fresh failure, re-arms it.
-- **Alarm escalation**: the wallboard reddens and the alarm quickens the longer a failure goes unacknowledged (the cue interval ramps from every 6 seconds down to roughly every 1.6 by the ten-minute mark); `a` silences it until the next failure.
+- An **interface font** choice: the terminal monospace (default) or a proportional sans-serif that is easier to read at length. Log output, cron expressions, and keycaps stay monospace either way, and numerals stay tabular so clocks don't jitter.
+- A **UI scale** of 100% / 110% / 125% / 140% that enlarges the whole dashboard, useful for wallboard TVs viewed from across the room.
+- A **reduce motion** switch that stops the spinners, pulsing status dots, and the boot self-test without touching your OS preference (`prefers-reduced-motion` is always honored).
+- The **boot self-test**: a BIOS-style POST screen on load that runs real probes against the daemon, job set, cluster, and schedules as it types. It replays only after a 12-hour cooldown, any key dismisses it, and re-enabling the toggle clears the cooldown so the next load shows it.
+- **Desktop notifications** that fire when a job fails, after you grant the browser permission.
+- **Audible cues**: a short tick when a run succeeds and a buzz when one fails, at a selectable **cue volume** of 25% / 50% / 75% / 100%. A failure also arms a repeating **failure alarm** that sounds until acknowledged with `a`, which works on the wallboard too; the all-clear, or a fresh failure, re-arms it.
+- **Alarm escalation**: the wallboard reddens and the alarm quickens the longer a failure goes unacknowledged. The cue interval ramps from every 6 seconds down to roughly every 1.6 by the ten-minute mark, and `a` silences it until the next failure.
 - A **refresh interval** of 1s / 2s / 3s / 5s / 10s, or paused.
 - The **zen screensaver** toggle and its idle delay, for the [wallboard](#wallboard--tv-mode).
 - The opt-in **[run ledger](#run-ledger)**, with its storage stats, export, and purge buttons.
@@ -649,22 +660,26 @@ comes back the way you left it.
 [![The Pair a device panel: a QR code deep-linking the connection payload into the companion app, the payload as a copyable JSON string, and the all-scopes token warning](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
 
 The settings sheet (and the command palette) also open the **Pair a device**
-panel: a QR encoding a pairing deep link (the `{v: 1, name, url, token}`
-payload rides in the link's fragment, so a phone-camera scan opens the
-companion app), plus the same JSON as a copyable string the in-app scanner
-also accepts. Either form hands the app the daemon's address and bearer
-token in one scan. The panel checks the stored token against
-[`GET /whoami`](HTTP-API#get-whoami) and warns when it holds every scope;
-give a phone a scoped `web.authTokens` entry instead. See
-[Push Notifications](Push-Notifications) for the pairing flow this feeds.
+panel: a QR encoding a pairing deep link. The `{v: 1, name, url, token}` payload
+rides in the link's fragment, so a phone-camera scan opens the companion app.
+The same JSON is also available as a copyable string the in-app scanner accepts.
+Either form hands the app the daemon's address and bearer token in one scan. The
+panel checks the stored token against [`GET /whoami`](HTTP-API#get-whoami) and
+warns when it holds every scope; give a phone a scoped `web.authTokens` entry
+instead. For the pairing flow this feeds, see
+[push notifications](Push-Notifications).
 
-| Amber | Green |
+| Carolina | Amber |
 | :---: | :---: |
-| [![The dashboard in the amber theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) |
+| [![The dashboard in the carolina theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina.png) | [![The dashboard in the amber theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) |
 
-| Flat modern theme | Carolina, on paper (light) |
+| Green | Flat modern |
 | :---: | :---: |
-| [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina-light.png) |
+| [![The dashboard in the green theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) | [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png) |
+
+| Standard, on paper (light) |
+| :---: |
+| [![The dashboard in the standard light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-standard-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-standard-light.png) |
 
 ## The pendulum wordmark
 
@@ -673,21 +688,22 @@ simulation**, not a canned animation: the page integrates the full nonlinear
 dynamics (RK4, 240 times a second) and balances the linkage with an LQR
 controller whose gains are computed at page load. It doubles as a status
 indicator. While the daemon is live the letter stands upright, riding out
-small disturbances; when the connection is lost the motor cuts, and it
-collapses out of the word and swings; when the signal returns, a planner
+small disturbances. When the connection is lost the motor cuts, and the letter
+collapses out of the word and swings. When the signal returns, a planner
 threads the swing back up into a balance catch that is verified by a
-closed-loop rollout before it is committed. Sweeping the pointer across the
-header brushes the linkage, and a right-click on the wordmark knocks it clean
-over to watch a full recovery (on a touch screen, a tap nudges it). Under
-reduced motion the mark parks in a still pose that stays honest about daemon
-state — upright when live, hanging when not — and without JavaScript the
-letter is simply printed.
+closed-loop rollout before it is committed.
+
+Sweeping the pointer across the header brushes the linkage, and right-clicking
+the wordmark knocks it clean over so you can watch a full recovery (on a touch
+screen, a tap nudges it). Under reduced motion the mark parks in a still pose
+that stays honest about daemon state, upright when live and hanging when not.
+Without JavaScript, the letter is printed.
 
 ## Tab title and favicon
 
 The browser tab is the dashboard's smallest display, and the one that stays
 visible after you switch away. The title leads with the worst current
-condition, so even a truncated tab reads at a glance:
+condition, so even a truncated tab stays readable:
 
 | Condition | Title |
 | :-- | :-- |
@@ -699,7 +715,7 @@ condition, so even a truncated tab reads at a glance:
 | Several jobs running | `3 running · cronstable`, then each run with its elapsed time |
 | All quiet | `14 ok · cronstable`, then `next: backup-db in 12m · cronstable` |
 
-When a state has more to say than one tab-width line, the title rotates
+When a state needs more than one tab-width line, the title rotates
 complete readouts every four seconds rather than scrolling characters. A
 fleet event cycles the failing count and then every failing job by name;
 several runs page through each job with its elapsed time; a cluster alert
@@ -737,16 +753,16 @@ token button at any time.
 ### Scope-aware chrome
 
 On load the dashboard asks [`GET /whoami`](HTTP-API#get-whoami) what it is
-allowed to do, and draws only the controls that scope covers. Holding
-every scope, or talking to a daemon with no authentication configured,
-shows the full interface.
+allowed to do, and draws only the controls that scope covers. With every scope,
+or against a daemon with no authentication configured, it draws the full
+interface.
 
-Without `control`, the dashboard omits the Run, Stop, Pause and Resume
-buttons, the DAG Trigger and Backfill buttons, "run failing" and the mitigate
+Without `control`, the dashboard omits the Run, Stop, Pause, and Resume
+buttons, the DAG Trigger and Backfill buttons, "run failing", and the mitigate
 console. The palette entries and the `r`/`x`/`p` shortcuts that reach those
 same actions go with them, so a read-only visitor is never offered a button
-that can only answer `403`. Without `approve`, a waiting gate is drawn as a
-state rather than as a pair of decision buttons.
+whose request can only fail with `403`. Without `approve`, the dashboard draws a
+waiting gate as a state rather than as a pair of decision buttons.
 
 The same rule covers a scoped `web.authTokens` entry and a
 [public read-only board](HTTP-API#public-read-only-access-webanonymousscopes).
@@ -756,7 +772,7 @@ re-probes `/whoami` and redraws.
 
 ## What it polls, and the data model
 
-The dashboard is a thin client over the [HTTP Control API](HTTP-API):
+The dashboard is a thin client over the [HTTP control API](HTTP-API):
 
 - it polls `GET /jobs` on the refresh interval for the overview (each job carries a compact tail of recent runs for the sparkline);
 - it polls `GET /cluster` on the same interval for the [cluster panel](#cluster-panel) (the panel stays hidden unless a cluster section is configured);
@@ -765,7 +781,7 @@ The dashboard is a thin client over the [HTTP Control API](HTTP-API):
 - the [state inspector](#durable-state-inspector) probes `GET /state` once at load (to decide whether to offer its button), polls it only while the card is open, and drills into scopes with `GET /state/documents` / `GET /state/records`;
 - the **node resources** card refetches `GET /node/history` while it is open;
 - opening a job's **History** tab fetches `GET /jobs/{name}/runs` (full retained history plus aggregate stats); the [activity heatmap](#activity-heatmap) fills from one batched [`GET /activity`](HTTP-API#get-activity) fetch and keeps the capped per-job loop as a fallback against an older daemon;
-- opening a job's **Resources** tab fetches `GET /jobs/{name}/resources` — lazily, never on the poll loop — and refetches it at the live view's selectable pace while the tab stays open;
+- opening a job's **Resources** tab fetches `GET /jobs/{name}/resources` lazily, never on the poll loop, and refetches it at the live view's selectable pace while the tab stays open;
 - opening the **Logs** tab opens the `GET /jobs/{name}/logs` SSE stream;
 - the [multi-tail console](#merged-multi-tail) opens up to four of those SSE streams at once (one per tailed job) and re-attaches them as runs come and go;
 - the [DAG drawer](#dag-orchestration) fetches `GET /dags/{name}/runs`, the selected run's document and XCom list, and a running task's log SSE stream; its buttons call `POST /dags/{name}/trigger`, `POST /dags/{name}/backfill`, and the approval decision endpoint;
@@ -779,20 +795,20 @@ read-only-root-filesystem deployment story. With a
 [durable state store](Durable-State) configured, run history survives
 restarts (rehydrated from the durable run ledger), and
 [`archiveOutput`](Durable-State#output-archival-and-secret-redaction) can
-persist captured output into the store — the Logs tab, though, only ever
-replays output buffered by the current process.
+persist captured output into the store. The Logs tab, though, only ever replays
+output buffered by the current process.
 
 ## See also
 
-- [Terminal Dashboard](Terminal-Dashboard): `cronstable tui`, this dashboard's TUI sibling — the same board and the same shortcuts, rendered in a terminal over the same API.
-- [MCP](MCP): the third frontend — the same daemon, for AI agents.
+- [Terminal Dashboard](Terminal-Dashboard): `cronstable tui`, this dashboard's TUI sibling, with the same board and the same shortcuts, rendered in a terminal over the same API.
+- [MCP](MCP): the third frontend (the same daemon, for AI agents).
 - [HTTP Control API](HTTP-API): the REST endpoints, configuration schema, authentication, and Unix-socket options the dashboard is built on.
 - [Pausing Jobs](Pausing-Jobs): the runtime pause behind the `⏸` chip and the `p` key.
 - [Late-Run Detection](Late-Run-Detection): the `sla:` monitor behind the OVERDUE badge.
 - [Clustering and Leader Election](Clustering-and-Leader-Election): the cluster panel, per-job `clusterPolicy`, and the `GET /cluster` view it polls.
 - [Orchestration and DAGs](Orchestration-and-DAGs): the `dags:` semantics behind the [DAG card and drawer](#dag-orchestration).
 - [Durable State](Durable-State): the store the [state inspector](#durable-state-inspector) inventories, and what rehydrates run history across restarts.
-- [resource monitoring](Resource-Monitoring): `monitorResources` and the node endpoints behind the [Resources tab](#resources-cpu-and-memory-per-run-and-live) and the header's node meter.
+- [Resource Monitoring](Resource-Monitoring): `monitorResources` and the node endpoints behind the [Resources tab](#resources-cpu-and-memory-per-run-and-live) and the header's node meter.
 - [Output Capturing](Output-Capturing): `captureStdout` / `captureStderr`, which control what the Logs tab can show.
-- [Schedules and Timezones](Schedules-and-Timezones): the schedule strings and timezones the Schedule tab explains and previews.
+- [Schedules and Timezones](Schedules-and-Timezones): the schedule strings and time zones the Schedule tab explains and previews.
 - [Production and Container Deployment](Production-Deployment): running the interface under a hardened, read-only-root-filesystem deployment.

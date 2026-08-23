@@ -727,11 +727,13 @@ def compute_view(
 #: a flat name->#rrggbb map; the painter turns them into SGR sequences.
 #: Same five hues and the same t / T cycling as the web page; the hue list
 #: itself lives in cronstable._cliargs (the --theme choices are built from
-#: it) and is re-exported here under its original name.
+#: it) and is re-exported here, with the default hue, under its original
+#: name.
 THEME_HUES = _cliargs.THEME_HUES
+DEFAULT_THEME_HUE = _cliargs.DEFAULT_THEME_HUE
 
 _P = {
-    # carolina: the default Carolina Blue
+    # carolina: Carolina Blue
     "carolina": {
         "bg": "#06131d",
         "fg": "#9ed3f5",
@@ -855,7 +857,7 @@ _P = {
         "warn": "#a05e00",
         "off": "#93a1ad",
     },
-    # plain white-and-saturated-color "standard"
+    # standard: the default; plain white-and-saturated-color
     "standard": {
         "bg": "#000000",
         "fg": "#c0c0c0",
@@ -903,11 +905,11 @@ class Theme:
     """One resolved theme: named colours -> ready-made SGR fragments."""
 
     def __init__(self, hue: str, light: bool, cvd: str = "none") -> None:
-        self.hue = hue if hue in THEME_HUES else THEME_HUES[0]
+        self.hue = hue if hue in THEME_HUES else DEFAULT_THEME_HUE
         self.light = light
         self.cvd = cvd if cvd in _CVD else "none"
         name = self.hue + ("-light" if light else "")
-        palette = dict(_P.get(name, _P["carolina"]))
+        palette = dict(_P.get(name, _P[DEFAULT_THEME_HUE]))
         palette.update(_CVD[self.cvd])
         self.colors = palette
         # SGR fragments precomputed once per theme: fg()/bg() run for every
@@ -1304,7 +1306,7 @@ def colour_runs(cells: list[tuple[str, str]]) -> list[tuple[str, str]]:
 # ===================================================================
 #: Defaults mirror the web page's prefs where they translate to a tty.
 PREF_DEFAULTS: dict[str, Any] = {
-    "theme": "carolina",  # hue
+    "theme": DEFAULT_THEME_HUE,  # hue
     "light": False,  # dark vs paper (light)
     "cvd": "none",  # colour-vision remap
     "poll_ms": DEFAULT_POLL_MS,

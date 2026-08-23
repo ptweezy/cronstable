@@ -1,13 +1,13 @@
 * cronstable version:
 * Python version:
-* Operating System:
+* Operating system:
 
 ### Description
 
 Describe what you were trying to get done.
-Tell us what happened, what went wrong, and what you expected to happen.
+Explain what happened, what went wrong, and what you expected to happen.
 
-### What I Did
+### What I did
 
 ```
 Paste the command(s) you ran and the output.

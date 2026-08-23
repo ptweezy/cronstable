@@ -1,5 +1,17 @@
 include LICENSE
+
+# setuptools_scm's git file finder seeds the sdist with every tracked file, so
+# a working note left at the repo root ships to PyPI: windows-roadmap.md
+# reached the 1.2.42 and 1.2.43 sdists that way. Deny root-level markdown and
+# add back only the documents this project publishes. test_packaging.py fences
+# both the deny rule and the add-backs.
+exclude *.md
 include README.md
+include HISTORY.md
+include CONTRIBUTING.md
+include LICENSING.md
+include SECURITY.md
+include TRADEMARKS.md
 
 recursive-include tests *
 recursive-include example *

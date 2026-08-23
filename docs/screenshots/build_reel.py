@@ -4,7 +4,7 @@ Reads the frames `capture.py showcase` dropped in ./reel/ and assembles two
 seamless loops:
 
 * `dashboard-reel.webp`  -- the hero tour, in ONE consistent style throughout
-  (the light carolina / paper theme, terminal monospace): the overview and the
+  (the light standard / paper theme, terminal monospace): the overview and the
   marquee screens (palette, live logs, a DAG graph, the cluster + fleet matrix,
   the wallboard and the incident timeline), plus an accessibility beat
   (colour-vision-safe palette, larger UI scale, the settings panel). No theme
@@ -64,11 +64,11 @@ THEME_FADE_N = 0
 # consecutive entries with the SAME scene (the overview theme sweep, and the
 # in-place theme flips on logs/dag/fleet/wallboard) hard-cut -- that is the
 # "same frame, different theme" beat. Scene *changes* get a short dissolve.
-# The final overview@carolina matches the first overview so the loop closes.
-# The hero reel stays in ONE style throughout -- the light carolina (paper)
+# The final overview frame matches the first one so the loop closes.
+# The hero reel stays in ONE style throughout -- the light standard (paper)
 # theme, terminal monospace -- and gets its variety from the different screens
 # it tours. The theme + font showcase lives in the theme row below, not here.
-HERO_THEME = "carolina-light"
+HERO_THEME = "standard-light"
 SEGMENTS = [
     ("overview", HERO_THEME, 2.2),          # hero: the live board
     ("palette", HERO_THEME, 1.3),           # command palette

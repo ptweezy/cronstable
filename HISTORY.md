@@ -1,7 +1,169 @@
 # History
 
-## 1.2.43
+## 1.2.45
 
+- Releases now attach `cronstable-linux-armv6`, a glibc ARMv6 hard-float
+  binary, which is what a Raspberry Pi 1, Zero or Zero W running Raspberry Pi OS
+  actually needs. Until now the only ARMv6 build was musl, and Raspberry Pi OS
+  is glibc: it names `/lib/ld-musl-armhf.so.1` as its interpreter, which no
+  Raspberry Pi OS package provides, so that hardware had no working binary at
+  all. The build compiles from source on Raspbian bookworm against the Python
+  3.11 it packages, because Debian's armhf port is ARMv7 and neither
+  `library/debian` nor python-build-standalone has an ARMv6 target.
+- Releases now attach `cronstable-linux-armel`, a glibc ARMv5 soft-float binary
+  for Kirkwood devices: the SheevaPlug, QNAP TS-x1x, D-Link DNS-320, Zyxel
+  NSA325 and Pogoplug. It is built on Debian bookworm armel, the last suite that
+  serves those machines, and that base is frozen: armel was dropped from
+  bookworm's security archive and from the official Debian images, so the OS
+  layer under this binary receives no further updates. The architecture is also
+  absent from Debian forky, so it has a fixed horizon.
+- Releases now attach Alpine packages, `cronstable-linux-<arch>.apk` for all
+  nine architectures the musl builds cover. Each installs the musl binary, an
+  OpenRC service running as the `cronstable` user, and a starter configuration
+  in `/etc/cronstable.d`. They are unsigned, so `apk add` needs
+  `--allow-untrusted`. Stopping the service gives cronstable two minutes to
+  drain its running jobs, since `supervise-daemon` would otherwise kill them
+  after five seconds.
+- Releases now attach FreeBSD packages, `cronstable-freebsd-amd64.pkg` and
+  `cronstable-freebsd-arm64.pkg`. Each installs the binary, an `rc.d` script
+  that runs the daemon under `daemon(8)` as the `cronstable` user, and a
+  configuration sample. They are built by FreeBSD's own `pkg create` inside the
+  virtual machine that produced the binary, and each one is installed, started
+  and removed there before it ships.
+- The `armv6` binary is ARMv6 code throughout, so it runs on the Raspberry Pi
+  1, Zero and Zero W it is built for. It previously carried 27 members of
+  ARMv7 object code: under emulation an ARMv6 container reports `armv7l` from
+  `uname`, so pip installed musl `armv7l` wheels for the whole
+  aiohttp/multidict/yarl/propcache/frozenlist stack and every `zeroconf`
+  Cython module, and those instructions do not exist on an ARM1176 core. The
+  lane now sets `_PYTHON_HOST_PLATFORM`, sysconfig's cross-build hook, so pip
+  generates `armv6l` tags and those wheels stop being candidates; the C
+  extensions compile in the container against its ARMv6 compiler instead.
+- Every 32-bit ARM binary now has its ABI asserted from the frozen bytes,
+  which is the check that would have caught the above. `elf_floor.py` reads
+  each bundled object's float ABI out of `e_flags`, and its `Tag_CPU_arch` and
+  `Tag_FP_arch` out of `.ARM.attributes`, then fails the job when a member
+  declares the wrong float ABI, needs a newer instruction set than the lane
+  targets, or needs a newer floating-point unit. None of it is visible to a
+  functional test: a smoke test under emulation runs ARMv7 instructions
+  perfectly well, and the fault only appears on the hardware. The ARMv6 lanes
+  also pin the emulated core to an ARM1176, so such an instruction faults
+  during the build. `tests/test_ci_fences.py` requires the assertion on every
+  ARM row.
+
+## 1.2.44
+
+- The 64-bit glibc Linux binaries require glibc 2.17, down from 2.38. That
+  covers every glibc distribution still in production, including RHEL, Alma
+  and Rocky 7 onward, Amazon Linux 2 and 2023, SLES 12 onward, Debian 8
+  onward and Ubuntu 14.04 onward, where before only Ubuntu 24.04 and newer
+  could start the binary at all. The `amd64`, `arm64`, `ppc64le` and `s390x`
+  builds move into manylinux2014 containers and freeze a
+  python-build-standalone interpreter, which is what sets the number; the
+  container matters as much as the interpreter, because pip picks wheels
+  against the running glibc. `armv7` moves to `manylinux_2_31_armv7l` and
+  requires glibc 2.31, which reaches Raspberry Pi OS bullseye, Debian 11 and
+  Ubuntu 20.04; `i686` moves to Debian bookworm and requires 2.36.
+- Every glibc binary lane now proves its libc requirement from the frozen
+  bytes. `.github/scripts/elf_floor.py` unpacks the one-file bundle, parses
+  `.gnu.version_r` across the bootloader and all of its embedded shared
+  libraries, and fails the job when the highest `GLIBC_x.y` exceeds the floor
+  that lane declares. Nothing else can see this: the smoke test runs on a
+  libc newer than the binary needs, so a dependency publishing a
+  higher-tagged wheel used to raise the requirement with CI green throughout.
+  The same step rejects an interpreter built with an executable stack, which
+  ships fine and then fails at run time on SELinux-hardened hosts.
+- Every container base image is pinned to an explicit distro release. The
+  musl binaries are built on Alpine 3.23 and require musl 1.2.5, which is
+  Alpine 3.20 and later; the floating `python:3.14-alpine` tag had walked
+  from Alpine 3.19 to 3.24 and taken the requirement with it.
+- The MIPS lane builds against a `snapshot.debian.org` slice of Debian
+  bookworm rather than the live archive. Bookworm's LTS phase covers neither
+  mips64el nor mipsel, its security index already lists neither, and the
+  bullseye mipsel index is gone entirely, so the live index will disappear on
+  an unannounced date.
+- Releases now attach `cronstable-linux-loong64` and
+  `cronstable-linux-loong64-musl`, LoongArch binaries for glibc and musl
+  hosts. Both are compiled from source under emulation, PyInstaller's
+  bootloader included, since PyPI publishes no LoongArch wheels. They target
+  the new-world ABI that upstream Debian and Alpine use; hardware running an
+  old-world distribution such as Loongnix, Kylin or UOS is a different,
+  incompatible ABI.
+- Releases now attach `cronstable-openbsd-amd64`, `cronstable-netbsd-amd64`
+  and `cronstable-illumos-amd64`. Each is built in a hardware-accelerated
+  virtual machine of that system, since no runner offers one and PyInstaller
+  cannot cross-compile. The OpenBSD binary targets OpenBSD 7.9, which offers
+  no cross-release ABI guarantee, so a new asset follows each release; it
+  ships without `orjson`, because OpenBSD's Rust predates that package's
+  minimum. The illumos binary is built on OmniOS r151054 LTS and runs
+  anywhere the illumos ABI does, including OpenIndiana and SmartOS zones.
+- Releases now attach `.deb` and `.rpm` packages for `amd64`, `arm64`,
+  `i686`, `armv7`, `ppc64le`, `s390x` and `riscv64`. Each installs the
+  release binary as `/usr/bin/cronstable` alongside a systemd unit, a starter
+  configuration in `/etc/cronstable.d`, and a `cronstable` service account,
+  and declares the glibc version its binary needs, so a host too old for it
+  refuses the install instead of failing at first run. The service is left
+  stopped and disabled: the shipped configuration schedules no jobs, so
+  starting it is `systemctl enable --now cronstable` once you have edited the
+  file. Removing a package leaves `/etc/cronstable.d` and
+  `/var/lib/cronstable` behind.
+- cronstable ships a systemd unit, `packaging/systemd/cronstable.service`.
+  It runs as the `cronstable` user, reloads the configuration on `SIGHUP`
+  through `systemctl reload`, and lets cronstable drain its own running jobs
+  on stop rather than having systemd signal them directly.
+- Releases now attach `cronstable.json`, the Scoop manifest for the release,
+  rendered from the published `SHA256SUMS`. Submitted once to
+  `ScoopInstaller/Extras`, it self-updates from that same file every four
+  hours, so `scoop install cronstable` tracks releases with nothing pushed
+  from here.
+- The repository is a Nix flake. `nix run github:ptweezy/cronstable` and
+  `nix profile install github:ptweezy/cronstable` build cronstable from
+  source against nixpkgs' Python and dependency set, needing no writable
+  temp directory at startup. A `nix flake check` job keeps it evaluating.
+- The installation documentation states outright that a `-musl` binary is not
+  a fallback for a glibc host that is too old. It names
+  `/lib/ld-musl-<arch>.so.1` as its interpreter, so a glibc kernel finds
+  nothing and the shell prints `not found`, which reads like a corrupt
+  download rather than the wrong-libc error it is.
+- Releases now attach `cronstable-linux-mips64le`, a 64-bit little-endian
+  MIPS binary for glibc hosts such as Loongson and Cavium Octeon
+  machines. It is built in an emulated Debian bookworm container, the
+  last Debian suite carrying that port, against the Python 3.11 packaged
+  there. No MIPS wheels are published for anything, so the whole
+  dependency stack and the PyInstaller bootloader are compiled from
+  source; `uvloop`, `pynacl` and `zeroconf` all build, while `orjson`
+  does not, and that binary uses the standard library JSON encoder.
+  There is no musl MIPS build, because Alpine has no MIPS port.
+- Every Windows, FreeBSD and MIPS binary now goes through one shared
+  architecture check, `.github/scripts/assert_arch.py`, which reads the
+  PE machine field or the ELF class, endianness and machine rather than
+  parsing the output of `file`. All three ELF fields are compared
+  together, since `EM_MIPS` alone does not separate 64-bit little-endian
+  MIPS from the 32-bit and big-endian variants.
+- Releases now attach FreeBSD binaries, `cronstable-freebsd-amd64` and
+  `cronstable-freebsd-arm64`, for FreeBSD 14 and 15 hosts such as
+  TrueNAS, pfSense and OPNsense. PyInstaller cannot cross-compile and no
+  runner offers FreeBSD, so both are built in a FreeBSD 14 virtual
+  machine, amd64 with hardware acceleration and arm64 under full-system
+  emulation. PyPI publishes no FreeBSD wheels, so every compiled
+  dependency is built from source there; the arm64 build ships without
+  `orjson` and uses the standard library JSON encoder.
+- Windows releases now cover 32-bit x86 alongside x64 and ARM64, in all
+  three shapes: `cronstable-windows-i686.exe`,
+  `cronstable-windows-i686.zip` and `cronstable-windows-i686.msi`. The
+  32-bit package installs to `C:\Program Files (x86)\cronstable` when it
+  is run on 64-bit Windows, and to `C:\Program Files\cronstable` on a
+  32-bit host. Use it only where Windows itself is 32-bit.
+- Every Windows and FreeBSD binary is now checked against its declared
+  architecture before it is packaged, by reading the PE machine field or
+  the ELF `e_machine` field. A build that resolved the wrong interpreter
+  can no longer ship under another architecture's name.
+- The default dashboard theme is now `standard`, the flat neutral one,
+  in place of `carolina`. The theme pickers and the `t` cycler in the
+  browser and the TUI lead with it, as does `--theme`, and a browser or
+  terminal that already remembers a theme keeps the one it has.
+- CI tooling updates
+- Documentation updates
 - The state-backed `@reboot` once-per-boot dedupe now works on macOS and
   the BSDs: with no `/proc` to read, the boot instant comes from the
   kernel's own `kern.boottime` record (via psutil, already a core
@@ -58,9 +220,6 @@
   (`... || true`) exited 0 while writing nothing. The release binary
   lanes run this shape against each built binary and assert the durable
   write rather than the exit status.
-
-## 1.2.42
-
 - The dashboard's "Pair a device" QR encodes a deep link: a phone-camera
   scan opens the companion app, or a landing page with install pointers
   when the app is missing, with the pairing payload riding in the URL

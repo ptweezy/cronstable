@@ -1,0 +1,42 @@
+[Unit]
+Description=cronstable job scheduler
+Documentation=https://github.com/ptweezy/cronstable/wiki
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=simple rather than Type=exec: exec needs systemd 240, and the glibc
+# floor these packages target reaches back to distributions carrying 219.
+Type=simple
+User=cronstable
+Group=cronstable
+ExecStart=/usr/bin/cronstable -c /etc/cronstable.d
+# SIGHUP is the reload verb: reparse the configuration in place, without
+# dropping the schedule or interrupting running jobs.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+# KillMode=mixed sends the stop signal to cronstable alone. The default would
+# signal every process in the cgroup, which means killing running jobs directly
+# instead of letting cronstable drain them: on SIGTERM it stops scheduling new
+# runs, waits for the ones in flight, and terminates them itself if they
+# overrun. TimeoutStopSec is the outer bound on that drain; raise it on a host
+# whose jobs legitimately run longer.
+KillMode=mixed
+TimeoutStopSec=90
+
+# /var/lib/cronstable, created on first start and owned by the service user.
+# It is the `state.path` the shipped configuration points at.
+StateDirectory=cronstable
+StateDirectoryMode=0750
+
+# Deliberately little sandboxing. cronstable's whole purpose is running the
+# commands an administrator schedules, so the usual ProtectSystem=strict,
+# PrivateTmp and NoNewPrivileges hardening restricts those jobs rather than the
+# scheduler, and does it invisibly: a job fails at run time with a permission
+# error that names nothing about systemd. Harden this unit with a drop-in once
+# you know what your jobs touch.
+
+[Install]
+WantedBy=multi-user.target

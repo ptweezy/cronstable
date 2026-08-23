@@ -946,7 +946,7 @@ def test_compare_without_baseline_records_first_release(tmp_path):
     proc = _run([COMPARE, "--current", cur, "--md", str(md)])
     assert proc.returncode == 0, proc.stdout
     text = md.read_text(encoding="utf-8")
-    assert "No previous release baseline" in text
+    assert "no previous release to compare against" in text
     assert "startup.version" in text
 
 

@@ -316,3 +316,61 @@ def test_docs_read_scan_catches_both_idioms_and_skips_lookalikes():
         "docs/o.yaml",
         "docs/demo/index.html",
     }
+
+
+def _manifest_root_markdown_includes(text):
+    """The root-level .md files MANIFEST.in adds back after the deny rule."""
+    names = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("include "):
+            path = line[len("include ") :].strip()
+            if path.endswith(".md") and "/" not in path:
+                names.append(path)
+    return names
+
+
+def test_manifest_denies_root_markdown_by_default():
+    # The sdist is seeded from git, so every tracked file at the repo root
+    # ships unless MANIFEST.in says otherwise.  A working note left there
+    # reaches PyPI without anyone deciding to publish it, which is how
+    # windows-roadmap.md rode along in the 1.2.42 and 1.2.43 sdists.  Drop
+    # this line and the next root-level note ships the same way.
+    with open(os.path.join(ROOT, "MANIFEST.in"), encoding="utf-8") as f:
+        lines = [line.strip() for line in f]
+    assert "exclude *.md" in lines, (
+        "MANIFEST.in no longer denies root-level markdown, so any .md file "
+        "committed at the repo root ships to PyPI in the sdist."
+    )
+
+
+def test_manifest_published_root_docs_still_exist():
+    # The deny rule makes an add-back load-bearing the same way a prune does:
+    # rename one of these and the sdist loses the document silently.
+    with open(os.path.join(ROOT, "MANIFEST.in"), encoding="utf-8") as f:
+        published = _manifest_root_markdown_includes(f.read())
+    assert published, (
+        "MANIFEST.in denies root-level markdown but adds nothing back, so "
+        "the sdist ships without README.md."
+    )
+    gone = [
+        name
+        for name in published
+        if not os.path.exists(os.path.join(ROOT, name))
+    ]
+    assert not gone, (
+        "MANIFEST.in adds these root documents back into the sdist but they "
+        "do not exist, so the sdist ships without them: %r" % (gone,)
+    )
+
+
+def test_manifest_root_markdown_scan_ignores_nested_includes():
+    # Fences the helper: only root-level .md add-backs are governed by the
+    # deny rule, so a docs/ include must not be counted as one.
+    manifest = (
+        "exclude *.md\n"
+        "include README.md\n"
+        "include docs/relay-protocol.md\n"
+        "include LICENSE\n"
+    )
+    assert _manifest_root_markdown_includes(manifest) == ["README.md"]

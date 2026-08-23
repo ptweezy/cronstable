@@ -1,0 +1,30 @@
+# Settings for /etc/init.d/cronstable.
+#
+# Never set any of these to an empty string. supervise-daemon emits its flags
+# on set-but-empty values too, and the flag then swallows the next token.
+
+# Directory of cronstable configuration files. Every file in it is read
+# and merged.
+cronstable_confdir="/etc/cronstable.d"
+
+# user[:group] the daemon runs as. The package creates this system account.
+cronstable_user="cronstable:cronstable"
+
+# Extra arguments appended to the command line, such as -v for debug logging.
+cronstable_opts=""
+
+# Durable store, and the combined stdout/stderr log. The init script creates
+# both and hands them to cronstable_user before starting the daemon; the store
+# must match the `state.path` in your configuration.
+cronstable_statedir="/var/lib/cronstable"
+cronstable_logfile="/var/log/cronstable.log"
+
+# Stop schedule. cronstable drains its running jobs on SIGTERM, so this is how
+# long that drain gets before the daemon is killed outright. Raise the first
+# number if your jobs run longer than two minutes.
+cronstable_retry="TERM/120/KILL/10"
+
+# Dependency overrides, for example:
+#rc_need="postgresql"
+# Or keep the service out of containers:
+#rc_keyword="-containers"

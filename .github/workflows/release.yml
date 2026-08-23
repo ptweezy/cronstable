@@ -533,10 +533,61 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Self-contained glibc PyInstaller binaries (amd64, arm64) on native runners
-  # (no QEMU). The per-arch `--version` smoke test catches a bad bundle here.
-  # These target glibc (the Ubuntu runner's libc); `binaries-container` covers
-  # Alpine/musl hosts and the remaining glibc arches.
+  # `nix flake check`: evaluate flake.nix and build cronstable from nixpkgs'
+  # Python and dependency set. `nix run github:ptweezy/cronstable` works off
+  # this file, and it is the prerequisite artifact for a later nixpkgs
+  # submission, so it needs a gate that notices when it stops evaluating.
+  #
+  # CI-ONLY, like the macOS 26 row: continue-on-error, and the release does not
+  # wait on it. Everything it builds comes from a nixpkgs branch that moves
+  # outside this repository, so a red here is information about nixpkgs, not a
+  # reason to hold a release that ships no Nix artifact.
+  nix:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # --print-build-logs so a dependency that fails to build says why in the
+      # job log instead of only naming the derivation.
+      - run: nix flake check --print-build-logs
+
+  # Self-contained glibc PyInstaller binaries, one per architecture, built
+  # inside a manylinux image against a python-build-standalone interpreter.
+  #
+  # The floor a binary carries is the highest GLIBC_x.y symbol version anything
+  # in the bundle asks for, and that is set by where the interpreter, OpenSSL,
+  # libstdc++ and every installed wheel were built, not by the bootloader,
+  # which comes from a manylinux2014 wheel and only needs GLIBC_2.14. Building
+  # on the runner put the floor at GLIBC_2.38, which excludes RHEL/Alma/Rocky 8
+  # and 9, Amazon Linux 2023, SLES 15, Debian 12 and Ubuntu 22.04 LTS. Building
+  # inside manylinux2014 (CentOS 7) with a python-build-standalone interpreter
+  # puts it at GLIBC_2.17 and reaches every glibc Linux still in production.
+  #
+  # The container is load-bearing rather than cosmetic: pip derives manylinux
+  # compatibility from the RUNNING glibc, so on a bare runner it selects the
+  # manylinux_2_34 wheels and pins the floor there whatever the interpreter was
+  # built against.
+  #
+  # The image's own /opt/python interpreters are unusable here: manylinux
+  # configures them --disable-shared, and PyInstaller hard-requires a shared
+  # libpython (PythonLibraryNotFoundError, no fallback). Hence install_pbs.sh.
+  #
+  # amd64 and arm64 build natively; armv7, ppc64le and s390x run under QEMU.
+  # armv7 has no manylinux2014 image, so it builds on manylinux_2_31_armv7l
+  # (Ubuntu 20.04) and declares GLIBC_2.31, which covers Raspberry Pi OS
+  # bullseye and Debian 11 armhf. Every row ends with elf_floor.py, which
+  # re-derives the floor from the frozen bytes and fails the job if a
+  # dependency raised it.
+  #
+  # The interpreter is the 3.15.0rc1 build from python-build-standalone's
+  # 20260814 release, pinned by URL and digest per row. That project
+  # publishes prerelease builds too, so once 3.15.0 ships on 2026-10-01 the
+  # swap is a new release date plus five new digests; move all five together.
   binaries:
     needs: version
     strategy:
@@ -545,77 +596,255 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-24.04
+            platform: linux/amd64
+            image: quay.io/pypa/manylinux2014_x86_64:2026.08.15-1
+            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.15.0rc1+20260814-x86_64-unknown-linux-gnu-install_only.tar.gz'
+            pysha: '7bc37490719fbe8272b61b7a8a24c90b44b1d5365a0d9e85aecb2375e48524ba'
+            floor: '2.17'
+            # 64-bit, little-endian, EM_X86_64.
+            archspec: elf:2:1:62
+            # A wheel always exists for pynacl here, so absence means a broken
+            # build rather than a missing wheel; the emulated rows source-build
+            # it and stay best-effort.
+            nacl: hard
+            rust: '1'
+            native: '1'
           - arch: arm64
             runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            image: quay.io/pypa/manylinux2014_aarch64:2026.08.15-1
+            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.15.0rc1+20260814-aarch64-unknown-linux-gnu-install_only.tar.gz'
+            pysha: '11b6b2a5c06499a35d93a27ba3cc9fc2093172fab8f67edc8abe11dc6a5d0514'
+            floor: '2.17'
+            archspec: elf:2:1:183   # 64-bit, little-endian, EM_AARCH64
+            nacl: hard
+            rust: '1'
+            native: '1'
+          - arch: ppc64le
+            runner: ubuntu-24.04
+            platform: linux/ppc64le
+            qemu: true
+            image: quay.io/pypa/manylinux2014_ppc64le:2026.08.15-1
+            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.15.0rc1+20260814-ppc64le-unknown-linux-gnu-install_only.tar.gz'
+            pysha: 'a085875ea794b9cca8c779c6bc79ef754e791ae72971fa91b7a61b27f0cf9bca'
+            floor: '2.17'
+            archspec: elf:2:1:21    # 64-bit, little-endian, EM_PPC64
+            nacl: soft
+            rust: '1'
+            native: '0'
+          - arch: s390x
+            runner: ubuntu-24.04
+            platform: linux/s390x
+            qemu: true
+            image: quay.io/pypa/manylinux2014_s390x:2026.08.15-1
+            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.15.0rc1+20260814-s390x-unknown-linux-gnu-install_only.tar.gz'
+            pysha: '2ac5bf679aca45ea4e1538737b669bcbe8be9101e981aaff85e4a51c2b60709f'
+            floor: '2.17'
+            archspec: elf:2:2:22    # 64-bit, BIG-endian, EM_S390
+            nacl: soft
+            rust: '1'
+            native: '0'
+          - arch: armv7
+            runner: ubuntu-24.04
+            platform: linux/arm/v7
+            qemu: true
+            # No manylinux2014 armv7l image exists; this one is Ubuntu 20.04,
+            # so the floor this row declares is 2.31 rather than 2.17.
+            image: quay.io/pypa/manylinux_2_31_armv7l:2026.08.15-1
+            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.15.0rc1+20260814-armv7-unknown-linux-gnueabihf-install_only.tar.gz'
+            pysha: '369682bdffc800b8698303a1aad2d1bf74bf58696922048bb31a8f3aa1b6f367'
+            floor: '2.31'
+            archspec: elf:1:1:40    # 32-bit, little-endian, EM_ARM
+            # Hard-float, and nothing in the bundle may need above ARMv7.
+            armgate: '--arm-float hard --max-arm-arch v7 --max-arm-fp 4'
+            nacl: soft
+            # No Rust here, which is a cost decision rather than a limitation:
+            # rustup does publish host tools for armv7-unknown-linux-gnueabihf
+            # (the soft-float gnueabi triple is the one that lacks them), but
+            # building a Rust toolchain's worth of orjson under QEMU costs more
+            # than orjson buys. It is best-effort on every lane by design, and
+            # the stdlib fallback (cronstable/_json) is byte-compatible.
+            rust: '0'
+            native: '0'
     runs-on: ${{ matrix.runner }}
+    # The emulated rows source-build uvloop, pynacl and psutil under QEMU, and
+    # on 3.15 every row adds aiohttp and its stack (no cp315 wheels yet).
+    # Generous on purpose; a row still going at this point is wedged, not slow.
+    timeout-minutes: 300
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
       # setuptools_scm never walks history here, and its git file-finder (which
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      # Same contract as binaries-container: persist the wheels pip BUILDS from
+      # sdists so the slow QEMU compiles happen once per dependency bump rather
+      # than on every push. Keyed on the image as well as the arch, because a
+      # wheel source-built against CentOS 7 and one built against any other
+      # base both carry the plain linux_<arch> tag and a shared cache could
+      # hand one row the other's build.
+      - name: Restore pip cache (QEMU-built wheels)
+        id: pip-cache
+        uses: actions/cache/restore@v6.1.0
         with:
-          python-version: '3.15'
-          allow-prereleases: true  # 3.15 is an rc until 2026-10-01
-      - uses: astral-sh/setup-uv@v10.0.1
-        with:
-          version: "0.12.5"
-      - name: Build binary
-        env:
-          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+          path: .pip-cache
+          key: pip-manylinux-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
+          restore-keys: |
+            pip-manylinux-${{ matrix.arch }}-
+      - if: ${{ matrix.qemu }}
+        uses: docker/setup-qemu-action@v4.2.0
+      # Pulled in its own retried step, like every other container lane, so a
+      # registry blip never re-runs the hour-long build below. NOT pull_base:
+      # that helper's mirror failover rewrites the image into the Docker Hub
+      # `library/` namespace, and these are quay.io images, which the mirrors
+      # do not carry.
+      - name: Pull the build image
         run: |
           set -euo pipefail
-          # Runner-native arch: install into a throwaway uv venv and freeze from
-          # it with `uv run` (uv discovers the setup-python 3.15). aiohttp has no
-          # cp315 wheel yet, so it compiles from sdist here. These runners have a
-          # toolchain, so the cost is build time.
-          uv venv --python 3.15
-          uv pip install pyinstaller==6.22.1  # pin matches pyinstaller/Dockerfile
-          uv pip install .                     # bakes the pinned version into cronstable/version.py
-          # Bundle uvloop (the `speedups` extra) so the binary runs the faster
-          # event loop. Install a wheel where one exists, else build it from
-          # sdist (ship uvloop as broadly as it compiles); a failed install
-          # falls back to asyncio. The shared script then has verify_extra.py
-          # prove the result actually runs a loop (a source build can
-          # miscompile under emulation) and uninstalls it if not, so a broken
-          # uvloop is never frozen in and the binary cleanly uses asyncio.
-          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
-          # Bundle orjson (the `speedups` extra) to accelerate the durable-state
-          # and cluster JSON paths; amd64/arm64 and macOS ship wheels (no Rust
-          # needed). The shared script round-trip-verifies it and drops a broken
-          # build, so the binary falls back to stdlib json (cronstable/_json).
-          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_orjson.sh
-          # Bundle pynacl (the `push` extra): abi3 wheels cover amd64/arm64,
-          # so on this lane absence means a broken build, never a missing
-          # wheel. Install and verify are HARD failures here: a soft-fail
-          # would let a transient index blip silently ship the advertised
-          # push channel disabled. verify_extra.py round-trips a real
-          # sealed box so a miscompiled libsodium also fails the job.
-          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
-          # Bundle zeroconf (the `discovery` extra) for web.bonjour. Pure
-          # Python with optional speedups, so the install works on every
-          # arch and is a HARD failure too. It is LGPL-2.1: the notice
-          # ships inside the binary (--third-party-licenses), the source
-          # archive is attached to the Release, and the public build
-          # recipe is the relink path. See LICENSING.md.
-          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
-          uv run pyinstaller pyinstaller/cronstable.spec
-          dist/cronstable --version            # smoke test: fails the job if the bundle is broken
-          # Prove the FROZEN bundle reaches PyNaCl and zeroconf too: a
-          # push-plus-bonjour config passes --validate-config only when
-          # both import inside the binary (both fail closed otherwise),
-          # catching an analysis or hiddenimport miss that --version
-          # cannot.
-          dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
-          # A job that shells out to the CLI, asserted on the KV side effect:
-          # proves the daemon's PyInstaller env scrub against the real
-          # bootloader, which no venv test reaches (see the script header).
-          bash .github/scripts/cli_job_smoke.sh dist/cronstable
-          mv dist/cronstable "dist/cronstable-linux-${{ matrix.arch }}"
+          . .github/scripts/retry.sh
+          retry 5 docker pull --platform ${{ matrix.platform }} ${{ matrix.image }}
+      - name: Build binary (manylinux ${{ matrix.arch }})
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+          # Passed through the environment rather than spliced into the
+          # single-quoted script below, which admits no quote characters.
+          # CentOS 7 carries curl; the distro rustc predates orjson's MSRV by
+          # years, so a current stable comes from rustup. No curl-level retry
+          # flags: that curl is 7.29 and rejects --retry-connrefused as a
+          # usage error, and retry.sh already wraps the call.
+          RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e PIP_RETRIES -e PIP_TIMEOUT \
+            -e PIP_CACHE_DIR=/src/.pip-cache \
+            -e RUST_SETUP_CMD \
+            -v "$PWD:/src" -w /src \
+            ${{ matrix.image }} sh -euc '
+              # The checkout is mounted at /src, so the runner-side retry helper
+              # is reachable in here too.
+              . /src/.github/scripts/retry.sh
+              # pip refuses a cache directory it does not own: this container
+              # runs as root while the bind-mounted workspace is the runner
+              # user, so without the chown every pip call logs "The cache has
+              # been disabled" and the persisted cache stores nothing.
+              mkdir -p /src/.pip-cache && chown -R root:root /src/.pip-cache
+              # The checkout belongs to the runner user and this container is
+              # root, so git calls the bind mount dubiously owned and refuses to
+              # read it. setuptools_scm shells out to git for its file finder
+              # during `pip install .` and treats that refusal as fatal, so the
+              # build dies before it starts. The other container lanes never hit
+              # this because their images carry no git at all; manylinux does.
+              git config --global --add safe.directory /src
+              # The interpreter this lane freezes: shared libpython, GLIBC_2.17,
+              # pinned by digest. The image ships its own CPythons at
+              # /opt/python, but manylinux configures them --disable-shared and
+              # PyInstaller cannot freeze from those.
+              sh /src/.github/scripts/install_pbs.sh \
+                "${{ matrix.pyurl }}" "${{ matrix.pysha }}" /opt/pbs
+              PATH=/opt/pbs/bin:$PATH
+              LD_LIBRARY_PATH=/opt/pbs/lib
+              export PATH LD_LIBRARY_PATH
+              # python-build-standalone bakes the toolchain it was built with
+              # into sysconfig (CC=/usr/bin/<triple>-gcc), and that path does
+              # not exist in this image, so every source build dies with "No
+              # such file or directory" before it compiles a line. It bites the
+              # emulated rows hardest, where psutil, uvloop and pynacl all
+              # build from sdist. Point the build tools at the image toolchain,
+              # which is the one producing GLIBC_2.17 objects anyway.
+              CC=gcc
+              CXX=g++
+              AR=ar
+              LDSHARED="gcc -shared"
+              export CC CXX AR LDSHARED
+              # install_extra.sh / install_orjson.sh read these; nothing on the
+              # image PATH is the right interpreter, so both are absolute.
+              PIP="/opt/pbs/bin/python3 -m pip"
+              PY=/opt/pbs/bin/python3
+              export PIP PY
+              $PIP install --upgrade pip
+              $PIP install pyinstaller==6.22.1  # pin matches the other binary jobs
+              $PIP install .                    # bakes the pinned version into cronstable/version.py
+              # Bundle uvloop (the `speedups` extra): a manylinux_2_17 wheel
+              # where one exists (none for cp315 yet), else a source build
+              # against the image toolchain.
+              # The shared script has verify_extra.py prove the result runs a
+              # loop (a source build can miscompile under QEMU) and uninstalls
+              # it otherwise, so the binary cleanly falls back to asyncio.
+              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+              # Bundle orjson (the `speedups` extra): a Rust source build behind
+              # RUST_SETUP, on amd64/arm64 too. orjson's cp315 wheels are tagged
+              # manylinux_2_39 (3.14's were 2_17), so pip inside this 2.17
+              # container rejects them on every arch. armv7 passes no
+              # RUST_SETUP by choice (see the matrix comment), so that row falls
+              # back to the stdlib json encoder (cronstable/_json), which is
+              # byte-compatible.
+              RUST_SETUP=""
+              if [ "${{ matrix.rust }}" = "1" ]; then
+                RUST_SETUP="$RUST_SETUP_CMD"
+              fi
+              RUST_SETUP="$RUST_SETUP" sh pyinstaller/install_orjson.sh
+              # Bundle pynacl (the `push` extra). hard where an abi3 wheel
+              # always exists, soft where it source-builds: a build that fails
+              # the sealed-box round trip is uninstalled, so push fails closed
+              # rather than shipping a miscompiled libsodium.
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" ${{ matrix.nacl }} "push extra not bundled"
+              # Bundle zeroconf (the `discovery` extra): pure Python with
+              # optional speedups, so a HARD install on every row. LGPL-2.1;
+              # the in-binary notice, Release source archive and public build
+              # recipe are the compliance kit (see LICENSING.md).
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+              pyinstaller pyinstaller/cronstable.spec
+              dist/cronstable --version          # smoke test, on CentOS 7 itself
+              # Whenever the build env kept pynacl, the frozen binary must
+              # reach it (and zeroconf) too: the push-plus-bonjour config
+              # validates only when both import inside the bundle.
+              if $PY -c "import nacl" 2>/dev/null; then
+                dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+              fi
+              # A job that shells out to the CLI, asserted on the KV side
+              # effect: proves the daemon PyInstaller env scrub against the
+              # real bootloader, which no venv test reaches. Native rows only;
+              # it needs a live daemon and loopback HTTP, and the rest of this
+              # matrix is emulated. The scrub it proves is shared Python code,
+              # identical on every lane.
+              if [ "${{ matrix.native }}" = "1" ]; then
+                bash /src/.github/scripts/cli_job_smoke.sh dist/cronstable
+              fi
+              # Assert the binary is the architecture this row claims: an image
+              # that resolved to the wrong platform passes every smoke above and
+              # ships a mislabelled asset.
+              $PY /src/.github/scripts/assert_arch.py dist/cronstable ${{ matrix.archspec }}
+              # And assert the FLOOR, which no functional test can see: the
+              # smoke ran on a glibc newer than the binary needs, so a
+              # dependency that starts publishing a higher-tagged wheel would
+              # ship a binary that no longer starts on the hosts this lane
+              # exists to serve, with CI green throughout. --no-exec-stack
+              # additionally catches an interpreter built with an executable
+              # stack, which dies on SELinux-hardened hosts.
+              $PY /src/.github/scripts/elf_floor.py dist/cronstable \
+                --max-glibc ${{ matrix.floor }} --no-exec-stack ${{ matrix.armgate }}
+              mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
+            '
+      # The container runs as root and pip creates its cache files via
+      # tempfile (mode 0600), so without this the runner-user tar in
+      # actions/cache's save step cannot read them.
+      - name: Make the pip cache readable by the cache save
+        run: |
+          set -euo pipefail
+          if [ -d .pip-cache ]; then
+            sudo chown -R "$(id -u):$(id -g)" .pip-cache
+          fi
+      # Branch-gated like every other cache writer: the Actions cache is ONE
+      # 10 GB pool per repository and is already over it, so writing from every
+      # branch would evict the layer cache the docker job depends on. Other
+      # branches still RESTORE what main stored.
+      - name: Save pip cache (trunk only)
+        if: ${{ steps.pip-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .pip-cache
+          key: pip-manylinux-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-linux-${{ matrix.arch }}
@@ -626,17 +855,26 @@ jobs:
   # Self-contained container-built Linux binaries, one per arch x libc pair.
   # PyInstaller is not a cross-compiler and the runners are glibc, so every
   # row builds inside `docker run --platform` (checkout + upload stay on the
-  # host). musl rows build on python:3.15-rc-alpine and ship with a `-musl`
-  # suffix for Alpine/musl hosts; glibc rows build on python:3.15-rc-slim and
-  # cover the arches the native `binaries` job has no runner for. amd64,
+  # host). The musl rows cover every architecture Alpine has a port for and
+  # ship with a `-musl` suffix; the two glibc rows here are the ones the
+  # manylinux `binaries` job cannot serve (see the per-arch includes). amd64,
   # arm64 and i686 execute natively; armv7, armv6, ppc64le, s390x and
   # riscv64 run under QEMU. armv6 is musl-only (Debian/glibc ships no
-  # arm32v6); glibc amd64/arm64 are the native job above. Same pyinstaller
-  # pin and `--version` smoke test as that job; the per-libc bits (base
-  # image, package-manager commands, artifact suffix) ride the matrix.
+  # arm32v6). Same pyinstaller pin and `--version` smoke test as that job;
+  # the per-libc bits (base image, package-manager commands, artifact suffix)
+  # ride the matrix.
   #
-  # Both bases are -rc- tags. They stop being updated when 3.15.0 ships on
-  # 2026-10-01, so swap them to the plain python:3.15-alpine / -slim tags then.
+  # Every base image is pinned to an EXPLICIT distro tag. A floating tag makes
+  # the libc floor an emergent property of whatever the tag resolves to that
+  # week: `python:3.14-alpine` moved from Alpine 3.19 to 3.24 on its own and
+  # took the musl floor from 1.2.4 to 1.2.6 with it, silently. 3.23 is the
+  # newest Alpine still on musl 1.2.5, so it is the pin. tests/test_ci_fences.py
+  # holds the images to a dated tag.
+  #
+  # The Python half of every tag is -rc- (python:3.15-rc-alpine3.23 and
+  # python:3.15-rc-slim-{bookworm,trixie}). Those tags stop being updated when
+  # 3.15.0 ships on 2026-10-01, so swap them to python:3.15-alpine3.23 and
+  # python:3.15-slim-* then; the distro half stays.
   binaries-container:
     needs: version
     strategy:
@@ -645,22 +883,30 @@ jobs:
         libc: [musl, glibc]
         arch: [amd64, arm64, i686, armv7, armv6, ppc64le, s390x, riscv64]
         exclude:
-          # glibc amd64/arm64 build natively in `binaries`; armv6 is musl-only
+          # These five glibc rows build in the manylinux `binaries` job, which
+          # reaches GLIBC_2.17 (2.31 on armv7) instead of this lane's Debian
+          # floor; armv6 is musl-only (Debian ships no arm32v6).
           - { libc: glibc, arch: amd64 }
           - { libc: glibc, arch: arm64 }
+          - { libc: glibc, arch: armv7 }
+          - { libc: glibc, arch: ppc64le }
+          - { libc: glibc, arch: s390x }
           - { libc: glibc, arch: armv6 }
         include:
           # per-libc: base image, artifact suffix, and the package-manager
           # commands the build script splices in (no quote characters in any
           # of them; they are injected into a single-quoted sh -c script)
           - libc: musl
-            image: python:3.15-rc-alpine
+            image: python:3.15-rc-alpine3.23
             suffix: -musl
             toolchain: 'retry 5 apk add --no-cache build-base libffi-dev zlib-dev'
             nacl_tools: 'retry 3 apk add --no-cache libffi-dev make >/dev/null 2>&1 || true'
             rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache curl && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
           - libc: glibc
-            image: python:3.15-rc-slim
+            # Overridden per row below: the two remaining glibc rows sit on
+            # different Debian suites, because bookworm has no riscv64 port
+            # and trixie's glibc is three years newer than i686 hosts need.
+            image: python:3.15-rc-slim-trixie
             suffix: ''
             toolchain: 'retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev'
             nacl_tools: 'retry 3 apt-get -o Acquire::Retries=5 install -y --no-install-recommends libffi-dev make >/dev/null 2>&1 || true'
@@ -670,11 +916,37 @@ jobs:
           - { arch: amd64, platform: linux/amd64, runner: ubuntu-24.04 }
           - { arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
           - { arch: i686, platform: linux/386, runner: ubuntu-24.04 }
-          - { arch: armv7, platform: linux/arm/v7, runner: ubuntu-24.04, qemu: true }
-          - { arch: armv6, platform: linux/arm/v6, runner: ubuntu-24.04, qemu: true }
+          # `armgate` is the ABI assertion elf_floor.py makes on 32-bit ARM,
+          # which no functional test can make for itself: the float ABI, and
+          # the newest instruction set anything in the bundle needs.
+          #
+          # `hostplat` is the fix for the ARMv6 wheel trap. Under QEMU an ARMv6
+          # container reports armv7l from uname, so pip cheerfully installs
+          # musllinux armv7l wheels (the whole aiohttp/multidict/yarl stack and
+          # every zeroconf Cython module publish them) whose object code uses
+          # ARMv7 instructions. The 1.2.41 armv6 binary shipped 27 such members
+          # and could not have run on a Raspberry Pi 1 at all, while passing
+          # every smoke test under emulation. _PYTHON_HOST_PLATFORM is
+          # sysconfig's cross-build hook: setting it makes pip generate armv6l
+          # tags, so those wheels stop being candidates and the C extensions
+          # compile in-container against Alpine's ARMv6 gcc instead. armgate
+          # then holds the result to it.
+          - { arch: armv7, platform: linux/arm/v7, runner: ubuntu-24.04, qemu: true, armgate: '--arm-float hard --max-arm-arch v7 --max-arm-fp 4' }
+          - { arch: armv6, platform: linux/arm/v6, runner: ubuntu-24.04, qemu: true, armgate: '--arm-float hard --max-arm-arch v6 --max-arm-fp 2', hostplat: linux-armv6l }
           - { arch: ppc64le, platform: linux/ppc64le, runner: ubuntu-24.04, qemu: true }
           - { arch: s390x, platform: linux/s390x, runner: ubuntu-24.04, qemu: true }
           - { arch: riscv64, platform: linux/riscv64, runner: ubuntu-24.04, qemu: true }
+          # per-libc-and-arch, so these land on the two glibc rows only and
+          # leave the musl rows of the same arches alone. `floor` is the glibc
+          # version elf_floor.py holds the frozen bundle to; the musl rows set
+          # none and skip that gate (they carry no GLIBC_ symbol versions).
+          # i686 goes to bookworm, whose glibc 2.36 is what Debian 12 i386
+          # actually ships; python-build-standalone publishes no i686 Linux
+          # target, so the manylinux route the other arches take is closed
+          # here. riscv64 stays on trixie, the first Debian release with the
+          # port at all.
+          - { libc: glibc, arch: i686, image: python:3.15-rc-slim-bookworm, floor: '2.36' }
+          - { libc: glibc, arch: riscv64, image: python:3.15-rc-slim-trixie, floor: '2.41' }
     runs-on: ${{ matrix.runner }}
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
@@ -755,6 +1027,13 @@ jobs:
               # arch yet, so even the otherwise-full-wheel arches compile it
               # here (under QEMU on ppc64le/s390x/riscv64, which runs long).
               ${{ matrix.toolchain }}
+              # See the hostplat comment in the matrix: this is what stops pip
+              # selecting armv7l wheels inside an ARMv6 container.
+              if [ -n "${{ matrix.hostplat }}" ]; then
+                _PYTHON_HOST_PLATFORM="${{ matrix.hostplat }}"
+                export _PYTHON_HOST_PLATFORM
+                python -c "import sysconfig; print(\"host platform:\", sysconfig.get_platform())"
+              fi
               pip install --upgrade pip
               pip install pyinstaller==6.22.1   # pin matches the other binary jobs
               pip install .                     # bakes the pinned version into cronstable/version.py
@@ -803,6 +1082,21 @@ jobs:
               # lanes only: it needs a daemon, loopback HTTP and curl, and
               # most of these rows run under QEMU. The scrub it proves is
               # shared Python code, identical on every lane.
+              # Assert the glibc FLOOR on the rows that declare one, which no
+              # functional test can see: the smoke ran on the same libc the
+              # bundle was built against, so a dependency that starts
+              # publishing a higher-tagged wheel would ship a binary that no
+              # longer starts on the hosts this row exists to serve, with CI
+              # green throughout. The musl rows set no floor and skip it: they
+              # carry no GLIBC_ symbol versions, and their floor is held down
+              # by the pinned Alpine tag instead.
+              gate=""
+              if [ -n "${{ matrix.floor }}" ]; then
+                gate="--max-glibc ${{ matrix.floor }} --no-exec-stack"
+              fi
+              if [ -n "$gate" ] || [ -n "${{ matrix.armgate }}" ]; then
+                python /src/.github/scripts/elf_floor.py dist/cronstable $gate ${{ matrix.armgate }}
+              fi
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
             '
       # The container runs as root and pip creates its cache files via
@@ -833,6 +1127,477 @@ jobs:
         with:
           name: cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
           path: dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # Self-contained MIPS binaries. Its own job rather than a `binaries-container`
+  # row because every assumption that job makes is different here: there is no
+  # mips variant of the `python:3.14-*` images, so the base is Debian itself and
+  # Python comes from apt (3.11, the newest packaged for this port; the project
+  # floor is 3.10). Bookworm also marks its interpreter externally managed
+  # (PEP 668), so the build installs into a venv instead of the interpreter pip
+  # that lane uses.
+  #
+  # Debian bookworm is the last suite carrying mips64el, and the multi-arch
+  # `library/debian` manifest list does NOT include it; only the per-arch
+  # `mips64le/debian` repository does, which is why the pull below is spelled
+  # out rather than going through pull_base. That repository is also frozen:
+  # mips64le was removed from the official-images definition for bookworm in
+  # August 2026, so the tag no longer moves and the base OS layer no longer
+  # gets patched. The archive pin below is the other half of the same story.
+  #
+  # Everything compiles from source here, PyInstaller included: no mips wheel
+  # exists on PyPI for anything, and PyInstaller builds its own bootloader onto
+  # its `mips` machine tag. That is deliberate. Build time is not the constraint
+  # on this lane, and the binary it produces is smaller than the amd64 one.
+  binaries-mips:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: mips64le
+            platform: linux/mips64le
+            image: mips64le/debian:bookworm-slim
+            # 64-bit, little-endian, EM_MIPS. All three are asserted together
+            # because e_machine alone is not an architecture: EM_MIPS covers
+            # 32-bit and big-endian MIPS too.
+            archspec: elf:2:1:8
+    runs-on: ubuntu-24.04
+    # Emulated MIPS compiles the whole dependency stack plus a bootloader.
+    # Generous on purpose; a row still going at this point is wedged, not slow.
+    timeout-minutes: 300
+    steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
+      - uses: actions/checkout@v7.0.1
+      # Deliberately NO pip cache, unlike binaries-container. The Actions cache
+      # is one 10 GB pool per repository and is already over it, so a new writer
+      # would evict caches the other lanes depend on to buy time this lane does
+      # not need.
+      - uses: docker/setup-qemu-action@v4.2.0
+      - name: Pull the build image
+        run: |
+          set -euo pipefail
+          . .github/scripts/retry.sh
+          # NOT pull_base: that helper rewrites the image into the `library/`
+          # namespace for its mirror failover, and this is a per-architecture
+          # repository the mirrors do not carry. Plain retried pull instead.
+          retry 5 docker pull --platform ${{ matrix.platform }} ${{ matrix.image }}
+      - name: Build binary (${{ matrix.arch }} container)
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e PIP_RETRIES -e PIP_TIMEOUT \
+            -v "$PWD:/src" -w /src \
+            ${{ matrix.image }} sh -euc '
+              # The checkout is mounted at /src, so the runner-side retry helper
+              # is reachable in here too. apt does not retry hard enough on its
+              # own and a failed index fetch is a hard job failure.
+              . /src/.github/scripts/retry.sh
+              export DEBIAN_FRONTEND=noninteractive
+              # Pin the archive to a snapshot slice rather than the live
+              # suite. Debian bookworm entered LTS on 2026-06-11 with LTS
+              # architectures i386, amd64, armhf, arm64 and ppc64el; mips64el
+              # is not among them, bookworm-security already publishes no
+              # mips64el index, and the precedent for what happens next is
+              # bullseye, whose binary-mipsel index is a 404 today. The index
+              # gets deleted on an unannounced date, which would red a release
+              # with no warning. snapshot.debian.org serves the same bytes
+              # from a frozen date, over plain HTTP so this slim image needs
+              # no ca-certificates, with a same-host redirect apt follows on
+              # its own. This freezes the row on an unpatched archive slice,
+              # which is a decision and not a fix: the alternative is to stop
+              # shipping the row. Recurring check:
+              #   curl -s https://deb.debian.org/debian/dists/bookworm/Release | grep ^Architectures
+              echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260715T000000Z/ bookworm main" > /etc/apt/sources.list
+              rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
+              # Python plus a C toolchain: aiohttp, psutil and the extras below
+              # are all source builds, and so is the PyInstaller bootloader.
+              retry 5 apt-get -o Acquire::Retries=5 -qq update
+              retry 5 apt-get -o Acquire::Retries=5 -qq install -y --no-install-recommends \
+                python3 python3-venv python3-dev build-essential zlib1g-dev libffi-dev pkg-config
+              python3 -VV
+              python3 -m venv /v
+              retry 5 /v/bin/pip install --upgrade pip setuptools wheel
+              # install_extra.sh / install_orjson.sh read these.
+              PIP=/v/bin/pip
+              PY=/v/bin/python
+              export PIP PY
+              # Not wrapped in retry: with no mips wheel on PyPI this COMPILES
+              # the bootloader, and retry.sh is for network operations only.
+              # Retrying a deterministic compile failure just multiplies it.
+              /v/bin/pip install pyinstaller==6.22.1   # pin matches the other binary jobs
+              /v/bin/pip install .                     # bakes the pinned version into cronstable/version.py
+              # Extras ride the container lane policy set: best-effort for the
+              # compiled ones, hard only for pure-Python zeroconf. uvloop and
+              # pynacl both build and verify here. orjson does not: it is Rust,
+              # and mips64el has neither a rustup host toolchain nor a distro
+              # rustc past the orjson MSRV, so RUST_SETUP stays unset and the
+              # script falls back to the stdlib json encoder (cronstable/_json),
+              # which is byte-compatible.
+              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+              sh pyinstaller/install_orjson.sh
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+              /v/bin/pyinstaller pyinstaller/cronstable.spec
+              dist/cronstable --version          # smoke test: fails the job if the bundle is broken
+              # Whenever the build env kept pynacl, the frozen binary must reach
+              # it (and zeroconf) too: the push-plus-bonjour config validates
+              # only when both import inside the bundle.
+              if /v/bin/python -c "import nacl" 2>/dev/null; then
+                dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+              fi
+              # cli_job_smoke.sh is deliberately not run here: it needs a
+              # daemon, loopback HTTP and curl, and this row is emulated. The
+              # env scrub it proves is shared Python code, identical everywhere.
+              /v/bin/python /src/.github/scripts/assert_arch.py \
+                dist/cronstable ${{ matrix.archspec }}
+              # And the glibc floor, which no functional test can see: the
+              # smoke ran on the same libc the bundle was built against, so a
+              # dependency that starts asking for a newer symbol version would
+              # ship a binary that no longer starts on bookworm-era hardware,
+              # with CI green throughout.
+              # No --no-exec-stack on this row, unlike every other glibc lane.
+              # NOTE: no apostrophes anywhere below, comments included. This
+              # whole script is the argument of a single-quoted sh -euc, so
+              # one would close the quote and strand the rest.
+              # The Debian mips64el port carries an executable stack
+              # everywhere: the kernel FPU emulator runs FP branch delay slots
+              # out of line on the user stack, so glibc is configured for it
+              # and every object inherits it. All 62 images here declare it,
+              # including the libcrypto and libpython that Debian itself
+              # ships, so the check can never pass. Debian settled it for
+              # bookworm in #1022787, and lintian disables the same tag on
+              # MIPS.
+              /v/bin/python /src/.github/scripts/elf_floor.py dist/cronstable --max-glibc 2.36
+              mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
+            '
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-linux-${{ matrix.arch }}
+          path: dist/cronstable-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # Self-contained binaries for the two legacy 32-bit ARM ABIs: glibc hard-float
+  # ARMv6 (Raspberry Pi 1, Zero, Zero W) and glibc soft-float armel (Kirkwood
+  # boxes: SheevaPlug, QNAP TS-x1x, D-Link DNS-320, Zyxel NSA325, Pogoplug).
+  #
+  # Its own job because neither base image comes from a family the other lanes
+  # know. Debian's armhf port is ARMv7, so `library/debian` and `python:3.14-*`
+  # cannot supply an ARMv6 base at all, and python-build-standalone publishes no
+  # ARMv6 target either. Python therefore comes from apt (3.11, the newest in
+  # bookworm; the project floor is 3.10), the same trade the MIPS lane makes.
+  #
+  # Everything compiles from source, PyInstaller included: PyPI publishes no
+  # ARMv6 or armel wheels.
+  #
+  # Two guards make these rows trustworthy, and both are load-bearing rather
+  # than decorative:
+  #
+  #   _PYTHON_HOST_PLATFORM is sysconfig's cross-build hook. Under QEMU these
+  #   containers report armv7l from uname, so without it pip installs armv7l
+  #   wheels whose object code the target CPUs cannot execute. Setting it makes
+  #   pip generate armv6l/armv5tel tags instead, so those wheels stop being
+  #   candidates and the C extensions compile in-container.
+  #
+  #   QEMU_CPU pins the emulated core to the real target (ARM1176 is the Pi 1,
+  #   ARM926 is Kirkwood), so an ARMv7 instruction that did sneak in faults
+  #   during the build rather than on a user's hardware. elf_floor.py then
+  #   asserts the float ABI and Tag_CPU_arch statically over the whole bundle.
+  binaries-arm-legacy:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: armv6
+            platform: linux/arm/v6
+            # Genuine linux/arm/v6 glibc (measured: config blob says
+            # architecture arm, variant v6), rebuilt weekly, apt tracks
+            # mirrordirector.raspbian.org with only the main component
+            # enabled. Every other candidate is ARMv7-only,
+            # musl-only, or years stale: dtcooper/raspberrypi-os is arm64 and
+            # arm/v7, arm32v6/debian does not exist, arm32v6/python is Alpine,
+            # and the balenalib armv6 images stopped in 2025.
+            #
+            # Pinned by tag rather than digest on purpose, unlike the armel row
+            # below: Raspbian's OpenSSL and zlib travel inside the frozen
+            # binary, so a base that keeps getting patched is worth more here
+            # than a byte-identical build. It is a personal namespace with no
+            # support promise, which is the cost of there being no official
+            # ARMv6 base at all.
+            image: tianon/raspbian:bookworm-slim
+            # ARM1176JZF-S, the Pi 1/Zero core: ARMv6KZ with VFPv2.
+            qemu_cpu: arm1176
+            hostplat: linux-armv6l
+            armgate: '--arm-float hard --max-arm-arch v6 --max-arm-fp 2'
+            floor: '2.36'
+          - arch: armel
+            platform: linux/arm/v5
+            # Pinned by digest on purpose: arm32v5 was dropped from the
+            # bookworm official-images stanza in August 2026, so this tag is
+            # frozen at its final build and will never be rebuilt. Neither will
+            # the OS layer be patched, because bookworm-security carries no
+            # armel component at all. That is the price of serving this
+            # hardware; the alternative is not shipping the row.
+            image: arm32v5/debian:bookworm-slim@sha256:cf9397e3198b2c002eb360586d341ba89154634198a26c578eb096b533b212cd
+            # ARM926EJ-S, the Kirkwood core: ARMv5TE, no VFP, so soft-float.
+            qemu_cpu: arm926
+            hostplat: linux-armv5tel
+            # Rewrite sources to bookworm main only. The image's default list
+            # includes bookworm-security, whose Release file dropped armel when
+            # bookworm entered LTS (its Architectures line is amd64 arm64 armhf
+            # i386 ppc64el), so apt spends the build warning about a component
+            # that cannot exist. main itself is alive and still serving armel;
+            # snapshot.debian.org has a frozen slice if that ever changes.
+            sources: 'deb http://deb.debian.org/debian bookworm main'
+            # libatomic is the only member exempted from the v5 ceiling.
+            # Debian armel libatomic1 declares Tag_CPU_arch v7 because the
+            # linker MAX-merges that tag over every input object, and the
+            # library contains ldrex and dmb implementations built for v7
+            # alongside v5 ones. A v5 core reaches none of them. All 68 IFUNC
+            # resolvers, the load-time constructor, and all 51 fallback
+            # implementations contain only ARMv5TE instructions, and each of
+            # the 440 instructions for newer cores belongs to a variant that
+            # the resolver selects only when the HWCAP byte reports that the
+            # processor supports it. On this hardware, the library uses the
+            # __kuser_cmpxchg kernel helper instead. libcrypto links against
+            # libatomic, which is how it enters the bundle. elf_floor.py
+            # applies the exemption only when the member dispatches through
+            # IFUNC, so a plain v7 build substituted later still fails this
+            # row.
+            armgate: '--arm-float soft --max-arm-arch v5 --max-arm-fp 0
+              --arm-arch-except libatomic.so.1'
+            floor: '2.36'
+    runs-on: ubuntu-24.04
+    # Emulating an ARM1176 while compiling the whole dependency stack plus a
+    # bootloader is slow even by this workflow's standards. Generous on purpose;
+    # a row still going at this point is wedged, not slow.
+    timeout-minutes: 360
+    steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
+      - uses: actions/checkout@v7.0.1
+      # Deliberately NO pip cache, like binaries-mips: the Actions cache is one
+      # 10 GB pool per repository and is already over it, so a new writer would
+      # evict caches the other lanes depend on.
+      - uses: docker/setup-qemu-action@v4.2.0
+      - name: Pull the build image
+        run: |
+          set -euo pipefail
+          . .github/scripts/retry.sh
+          # NOT pull_base: one image is third-party and the other is a
+          # per-architecture repository, and that helper's mirror failover
+          # rewrites both into Docker Hub's `library/` namespace.
+          retry 5 docker pull --platform ${{ matrix.platform }} ${{ matrix.image }}
+      - name: Build binary (${{ matrix.arch }})
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e PIP_RETRIES -e PIP_TIMEOUT \
+            -e QEMU_CPU=${{ matrix.qemu_cpu }} \
+            -e _PYTHON_HOST_PLATFORM=${{ matrix.hostplat }} \
+            -v "$PWD:/src" -w /src \
+            ${{ matrix.image }} sh -euc '
+              . /src/.github/scripts/retry.sh
+              export DEBIAN_FRONTEND=noninteractive
+              if [ -n "${{ matrix.sources }}" ]; then
+                echo "${{ matrix.sources }}" > /etc/apt/sources.list
+                rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
+              fi
+              # Python plus a C toolchain: every dependency here is a source
+              # build, and so is the PyInstaller bootloader.
+              retry 5 apt-get -o Acquire::Retries=5 -qq update
+              retry 5 apt-get -o Acquire::Retries=5 -qq install -y --no-install-recommends \
+                python3 python3-venv python3-dev build-essential zlib1g-dev libffi-dev pkg-config
+              python3 -VV
+              # Prove the two guards took effect before anything is installed
+              # against this interpreter. get_platform() is what pip derives its
+              # wheel tags from, so this line is the armv7-wheel fix, visible.
+              python3 -c "import sysconfig; print(\"wheel platform:\", sysconfig.get_platform())"
+              python3 -m venv /v
+              retry 5 /v/bin/pip install --upgrade pip setuptools wheel
+              # install_extra.sh / install_orjson.sh read these.
+              PIP=/v/bin/pip
+              PY=/v/bin/python
+              export PIP PY
+              # Not wrapped in retry: with no wheel on PyPI for either ABI this
+              # COMPILES the bootloader, and retry.sh is for network operations
+              # only. Retrying a deterministic compile failure multiplies it.
+              /v/bin/pip install pyinstaller==6.22.1   # pin matches the other binary jobs
+              /v/bin/pip install .                     # bakes the pinned version into cronstable/version.py
+              # Extras ride the container lane policy set: best-effort for the
+              # compiled ones, hard only for zeroconf, whose Cython modules are
+              # optional (its build swallows a failed extension build and the
+              # pure-Python implementation is equivalent). orjson is Rust and
+              # rustup publishes no host toolchain for either ABI, so
+              # RUST_SETUP stays unset and the binary uses the stdlib json
+              # encoder (cronstable/_json), which is byte-compatible.
+              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+              sh pyinstaller/install_orjson.sh
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+              /v/bin/pyinstaller pyinstaller/cronstable.spec
+              # Smoke test on the emulated target core, so an instruction the
+              # real hardware lacks faults here.
+              dist/cronstable --version
+              # Whenever the build env kept pynacl, the frozen binary must reach
+              # it (and zeroconf) too: the push-plus-bonjour config validates
+              # only when both import inside the bundle.
+              if /v/bin/python -c "import nacl" 2>/dev/null; then
+                dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+              fi
+              # cli_job_smoke.sh is deliberately not run here: it needs a
+              # daemon, loopback HTTP and curl, and this row is emulated. The
+              # env scrub it proves is shared Python code, identical everywhere.
+              #
+              # 32-bit, little-endian, EM_ARM. e_machine cannot tell the two ABIs
+              # apart, which is what the float-ABI half of the gate below is for.
+              /v/bin/python /src/.github/scripts/assert_arch.py dist/cronstable elf:1:1:40
+              /v/bin/python /src/.github/scripts/elf_floor.py dist/cronstable \
+                --max-glibc ${{ matrix.floor }} --no-exec-stack ${{ matrix.armgate }}
+              mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
+            '
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-linux-${{ matrix.arch }}
+          path: dist/cronstable-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # Self-contained LoongArch binaries, glibc and musl. Its own job rather than
+  # two binaries-container rows because neither base image comes from a family
+  # that job knows: `library/debian`, `library/alpine` and `python:3.14-*` have
+  # no loong64, so both bases are third-party (`pull_base` failover does not
+  # apply to either) and the musl row installs Python from apk rather than
+  # getting it from the image.
+  #
+  # Debian promoted loong64 to a full release architecture in sid and forky and
+  # Alpine has shipped it since 3.21, so the upstream ecosystem is there. The
+  # audience is new-world ABI hardware and upstream distros: the older
+  # institutional fleets (Loongnix, Kylin, UOS) run an old-world ABI that is
+  # binary-incompatible with these builds, and nothing here serves them.
+  #
+  # Everything compiles from source, PyInstaller included: PyPI publishes no
+  # loong64 wheels, so the bootloader is built onto its `loongarch` machine tag
+  # in both libc flavours.
+  binaries-loong64:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - libc: glibc
+            suffix: ''
+            # Built from the python.org tarball with --with-ensurepip, tracks
+            # Debian trixie, and is the only fresh line in that namespace: the
+            # sid-slim and forky-slim tags there share one digest from a
+            # snapshot.debian.org slice and have not moved since March.
+            image: ghcr.io/loong64/python:3.14-slim-trixie
+            toolchain: 'retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev curl ca-certificates'
+            rust_setup: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+            floor: '2.41'
+          - libc: musl
+            suffix: -musl
+            # `library/alpine` has no loong64 and the loongarch64/alpine
+            # namespace on Docker Hub is stale, so this is the third-party
+            # image that tracks the signed Alpine minirootfs.
+            image: ghcr.io/loong64/alpine:3.24.1
+            toolchain: 'retry 5 apk add --no-cache build-base libffi-dev zlib-dev python3 python3-dev py3-pip curl'
+            rust_setup: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+            floor: ''
+    runs-on: ubuntu-24.04
+    # Emulated LoongArch compiles the whole dependency stack plus a bootloader.
+    # Generous on purpose; a row still going at this point is wedged, not slow.
+    timeout-minutes: 300
+    steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
+      - uses: actions/checkout@v7.0.1
+      # Deliberately NO pip cache, like binaries-mips: the Actions cache is one
+      # 10 GB pool per repository and is already over it, so a new writer would
+      # evict caches the other lanes depend on.
+      #
+      # loong64 emulation is in the default binfmt install (tonistiigi/binfmt
+      # has carried it since 2024, under the containerd architecture name).
+      - uses: docker/setup-qemu-action@v4.2.0
+      - name: Pull the build image
+        run: |
+          set -euo pipefail
+          . .github/scripts/retry.sh
+          # NOT pull_base: that helper rewrites the image into Docker Hub's
+          # `library/` namespace for its mirror failover, and neither of these
+          # images lives there. Plain retried pull instead.
+          retry 5 docker pull --platform linux/loong64 ${{ matrix.image }}
+      - name: Build binary (loong64 ${{ matrix.libc }})
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/loong64 \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e PIP_RETRIES -e PIP_TIMEOUT \
+            -e PIP_BREAK_SYSTEM_PACKAGES=1 \
+            -v "$PWD:/src" -w /src \
+            ${{ matrix.image }} sh -euc '
+              . /src/.github/scripts/retry.sh
+              export DEBIAN_FRONTEND=noninteractive
+              # Per-libc toolchain. On the musl row this also installs Python
+              # itself: apk marks that interpreter externally managed (PEP
+              # 668), which PIP_BREAK_SYSTEM_PACKAGES answers without needing
+              # a venv the way the Debian-packaged interpreters do.
+              ${{ matrix.toolchain }}
+              python3 -VV
+              pip install --upgrade pip
+              # Not wrapped in retry: with no loong64 wheel on PyPI this
+              # COMPILES the bootloader, and retry.sh is for network
+              # operations only. Retrying a deterministic compile failure just
+              # multiplies it.
+              pip install pyinstaller==6.22.1   # pin matches the other binary jobs
+              pip install .                     # bakes the pinned version into cronstable/version.py
+              # Extras ride the container lane policy set: best-effort for the
+              # compiled ones, hard only for pure-Python zeroconf. Rust comes
+              # from rustup, which publishes loongarch64 host toolchains for
+              # both libcs; orjson soft-fails to the stdlib json encoder
+              # (cronstable/_json) if that build does not come off.
+              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+              RUST_SETUP="${{ matrix.rust_setup }}" sh pyinstaller/install_orjson.sh
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+              pyinstaller pyinstaller/cronstable.spec
+              dist/cronstable --version          # smoke test, emulated on its own libc
+              # Whenever the build env kept pynacl, the frozen binary must
+              # reach it (and zeroconf) too: the push-plus-bonjour config
+              # validates only when both import inside the bundle.
+              if python3 -c "import nacl" 2>/dev/null; then
+                dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+              fi
+              # cli_job_smoke.sh is deliberately not run here: it needs a
+              # daemon, loopback HTTP and curl, and this row is emulated. The
+              # env scrub it proves is shared Python code, identical everywhere.
+              #
+              # 64-bit, little-endian, EM_LOONGARCH.
+              python3 /src/.github/scripts/assert_arch.py dist/cronstable elf:2:1:258
+              if [ -n "${{ matrix.floor }}" ]; then
+                python3 /src/.github/scripts/elf_floor.py dist/cronstable --max-glibc ${{ matrix.floor }} --no-exec-stack
+              fi
+              mv dist/cronstable dist/cronstable-linux-loong64${{ matrix.suffix }}
+            '
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-linux-loong64${{ matrix.suffix }}
+          path: dist/cronstable-linux-loong64${{ matrix.suffix }}
           if-no-files-found: error
           retention-days: 7
 
@@ -991,11 +1756,474 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Self-contained Windows binaries: amd64 on the hosted runner, arm64 on the
-  # windows-11-arm runner. Any C-extension dep lacking a wheel (on 3.15 that is
-  # aiohttp and zeroconf on BOTH arches, plus ruamel.yaml.clib and the rest of
-  # the aiohttp stack on arm64) compiles from sdist via the runner's Visual
-  # Studio toolchain. Same pyinstaller pin + `--version` smoke test.
+  # Self-contained FreeBSD binaries (amd64, arm64). PyInstaller is not a
+  # cross-compiler and GitHub hosts no FreeBSD runner, so both rows build
+  # inside a real FreeBSD VM booted on the Ubuntu runner: amd64 runs on the
+  # host's own architecture, arm64 under full-system QEMU. The host stays
+  # x86_64 for both rows (the action's own guidance: an arm64 runner is
+  # slower at this than an x86_64 one emulating).
+  #
+  # PyPI publishes no FreeBSD wheels for anything, so every compiled
+  # dependency here is a source build, PyInstaller's own bootloader
+  # included. The extras therefore ride the CONTAINER lane's policy set
+  # rather than the native lanes': best-effort for the compiled ones
+  # (verify_extra.py drops a miscompiled build and the binary falls back),
+  # hard only for pure-Python zeroconf.
+  #
+  # timeout-minutes caps a runaway emulated row well below the 6h default:
+  # the native row lands in well under an hour, and a row that has not
+  # finished in three is wedged, not slow.
+  binaries-freebsd:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            vmarch: x86_64
+            # Host-native. A Rust orjson source build costs minutes here,
+            # so the speedups extra is worth attempting.
+            pkgs: python314 rust gmake pkgconf libsodium
+            orjson: '1'
+            cflags: -I/usr/local/include
+          - arch: arm64
+            vmarch: aarch64
+            # Full-system QEMU. orjson is a Rust extension whose own build
+            # backend (maturin) has no FreeBSD wheel either, so installing
+            # it here means compiling a Rust toolchain's worth of code
+            # inside an emulated guest. It is best-effort on every lane by
+            # design, so this row skips it outright and the binary uses the
+            # stdlib json fallback (cronstable/_json). uvloop stays: it is
+            # a plain C build against bundled libuv, and the event loop is
+            # the win that actually matters for a scheduler.
+            pkgs: python314 gmake pkgconf libsodium
+            orjson: '0'
+            cflags: -I/usr/local/include -include sys/cdefs.h
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
+      - uses: actions/checkout@v7.0.1
+      - name: Build binary (FreeBSD ${{ matrix.vmarch }})
+        uses: vmactions/freebsd-vm@v1.5.3
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        with:
+          release: '14.3'
+          arch: ${{ matrix.vmarch }}
+          # 4 vCPU is the hosted runner's full allotment; the extra memory
+          # over the action's 6144 default is for the C/Rust source builds.
+          cpu: 4
+          mem: 8192
+          # rsync the guest's workspace back so dist/ reaches the host for
+          # the upload step below.
+          copyback: true
+          # Only NAMED host variables cross into the guest.
+          envs: 'SETUPTOOLS_SCM_PRETEND_VERSION'
+          prepare: |
+            pkg install -y ${{ matrix.pkgs }}
+          run: |
+            set -eu
+            . .github/scripts/retry.sh
+
+            # FreeBSD's lang/python314 is configured --without-ensurepip
+            # (see its port Makefile), so a venv comes up with no pip at
+            # all and the usual `python -m venv` line silently yields an
+            # unusable environment. Bootstrap pip explicitly; `fetch` is in
+            # the base system, and only the network hop is retried.
+            python3.14 -m venv --without-pip venv
+            retry 5 fetch -o get-pip.py https://bootstrap.pypa.io/get-pip.py
+            venv/bin/python get-pip.py
+
+            # install_extra.sh / install_orjson.sh read these; the venv has
+            # no activate step in a non-interactive sh.
+            PIP="venv/bin/pip"
+            PY="venv/bin/python"
+            export PIP PY
+
+            # Every dependency here is a source build, so the whole run needs
+            # FreeBSD's pkg prefix on the search paths: the base clang does
+            # not look in /usr/local on its own, and pynacl against the pkg
+            # libsodium fails on a missing sodium.h without it. On aarch64 the
+            # matrix adds a force-include of <sys/cdefs.h>: the base
+            # <machine/ieeefp.h> there spells __BEGIN_DECLS/__END_DECLS without
+            # including the header that defines them, so every translation unit
+            # pulling it in fails to compile. PyInstaller's bootloader is one,
+            # which is what took the arm64 lane down. The amd64 x86 header does
+            # not use those macros, so that row needs no workaround.
+            CFLAGS="${{ matrix.cflags }}"
+            LDFLAGS="-L/usr/local/lib"
+            export CFLAGS LDFLAGS
+
+            # Deliberately NOT wrapped in retry: no FreeBSD wheel exists, so
+            # this COMPILES the bootloader rather than downloading one, and
+            # retry.sh's contract is network operations only. Retrying a
+            # deterministic compile failure five times turned one 70s error
+            # into a 17-minute job.
+            venv/bin/pip install pyinstaller==6.22.1  # pin matches the other binary jobs
+            venv/bin/pip install .                # bakes the pinned version into cronstable/version.py
+
+            # Bundle uvloop (the `speedups` extra): no FreeBSD wheel exists,
+            # so this is always a source build against bundled libuv. The
+            # shared script has verify_extra.py prove the result runs a loop
+            # and uninstalls it otherwise, so a miscompiled uvloop is never
+            # frozen in and the binary cleanly falls back to asyncio.
+            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+            # Bundle orjson (the `speedups` extra) where this lane attempts
+            # it; see the matrix comment for why the emulated row does not.
+            # Rust comes from pkg (1.96+, past orjson's MSRV), so the
+            # script's rustup ladder is never needed and RUST_SETUP stays
+            # unset.
+            if [ "${{ matrix.orjson }}" = "1" ]; then
+              sh pyinstaller/install_orjson.sh
+            else
+              echo "orjson: skipped on this lane; using stdlib json"
+            fi
+            # Bundle pynacl (the `push` extra). SODIUM_INSTALL=system links
+            # the pkg libsodium, found through the CFLAGS/LDFLAGS exported
+            # above, instead of running PyNaCl's bundled autotools build,
+            # whose thousands of tiny configure spawns are what actually
+            # hurts under emulation. Soft, like the container lane: a build
+            # that fails the sealed-box round trip is uninstalled, so push
+            # fails closed rather than shipping a miscompiled libsodium.
+            SODIUM_INSTALL=system \
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+            # Bundle zeroconf (the `discovery` extra): pure Python with
+            # optional speedups, so a HARD install even here. LGPL-2.1; the
+            # in-binary notice, Release source archive and public build
+            # recipe are the compliance kit (see LICENSING.md).
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+
+            venv/bin/pyinstaller pyinstaller/cronstable.spec
+            dist/cronstable --version           # smoke test: fails the job if the bundle is broken
+            # Whenever the build env kept pynacl, the frozen binary must
+            # reach it (and zeroconf) too: the push-plus-bonjour config
+            # validates only when both import inside the bundle.
+            if venv/bin/python -c "import nacl" 2>/dev/null; then
+              dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+            fi
+            # cli_job_smoke.sh is deliberately not run here: it needs bash,
+            # curl and a live daemon, none of which this lean VM carries,
+            # and one row is emulated. The env scrub it proves is shared
+            # Python code, identical on every lane.
+            #
+            # Assert the binary is the arch this row claims: a VM that came
+            # up on the wrong image would otherwise pass every smoke above
+            # and ship a mislabelled asset. Read the ELF e_machine field
+            # rather than grepping `file`, whose prose differs between
+            # versions and across arches.
+            case "${{ matrix.arch }}" in
+              amd64) spec=elf:2:1:62 ;;    # 64-bit LE, EM_X86_64
+              arm64) spec=elf:2:1:183 ;;   # 64-bit LE, EM_AARCH64
+            esac
+            venv/bin/python .github/scripts/assert_arch.py dist/cronstable "$spec"
+            mv dist/cronstable "dist/cronstable-freebsd-${{ matrix.arch }}"
+            # Keep the copyback to the artifact: the venv and PyInstaller's
+            # work tree are hundreds of megabytes of rsync the host has no
+            # use for.
+            rm -rf venv build get-pip.py
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-freebsd-${{ matrix.arch }}
+          path: dist/cronstable-freebsd-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # Self-contained OpenBSD binary, amd64. PyInstaller cannot cross-compile and
+  # no runner offers OpenBSD, so this builds in an OpenBSD 7.9 virtual machine
+  # on the Linux runner, KVM-accelerated (native x86_64, no emulation).
+  #
+  # PyInstaller 6.22.1 is the first release with OpenBSD in its own CI and with
+  # native OpenBSD detection fixed, which is why the pin the other lanes share
+  # is what makes this row possible at all.
+  #
+  # Three OpenBSD-specific limits are worth knowing before leaning on this
+  # binary: a setuid one-file build is disallowed outright, the parent-process
+  # anti-spoofing hardening is not implemented for OpenBSD, and the bootloader
+  # self-locates through argv[0] plus $PATH rather than a /proc path, which
+  # breaks under a supervisor that rewrites argv[0].
+  binaries-openbsd:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
+      - uses: actions/checkout@v7.0.1
+      - name: Build binary (OpenBSD 7.9 amd64)
+        uses: vmactions/openbsd-vm@v1.4.6
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        with:
+          # OpenBSD offers no cross-release ABI guarantee, so this pin is the
+          # release the binary runs on and needs bumping every six months.
+          release: '7.9'
+          cpu: 4
+          mem: 8192
+          # rsync the guest workspace back so dist/ reaches the host upload.
+          copyback: true
+          # Only NAMED host variables cross into the guest.
+          envs: 'SETUPTOOLS_SCM_PRETEND_VERSION'
+          prepare: |
+            pkg_add -I python%3.13 py3-pip libsodium py3-psutil py3-multidict py3-yarl py3-propcache py3-aiohappyeyeballs py3-jinja2 py3-uvloop
+          run: |
+            set -eu
+
+            # OpenBSD's python port installs an EXTERNALLY-MANAGED marker
+            # (PEP 668), so a bare pip install hard-errors. Upstream
+            # PyInstaller's own OpenBSD CI answers it the same way. Installing
+            # into the system interpreter rather than a venv is deliberate:
+            # the pkg_add'd C extensions above (psutil, uvloop and the aiohttp
+            # stack's compiled parts) live in its site-packages, and a plain
+            # venv would hide exactly what the pkg_add step exists to provide.
+            PIP_BREAK_SYSTEM_PACKAGES=1
+            export PIP_BREAK_SYSTEM_PACKAGES
+
+            # install_extra.sh / install_orjson.sh read these. The port
+            # installs python3.13 without a python3 symlink.
+            PIP="python3.13 -m pip"
+            PY="python3.13"
+            export PIP PY
+
+            # Deliberately NOT wrapped in retry: no OpenBSD wheel exists, so
+            # this COMPILES the bootloader rather than downloading one, and
+            # retry.sh's contract is network operations only.
+            $PIP install pyinstaller==6.22.1  # pin matches the other binary jobs
+            $PIP install .                    # bakes the pinned version into cronstable/version.py
+
+            # Bundle uvloop (the `speedups` extra): the pkg_add above already
+            # satisfies the floor, so this resolves without a source build.
+            # The shared script still round-trips it before freezing.
+            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+            # orjson is skipped on this lane: OpenBSD ships rust 1.94.1, below
+            # orjson's MSRV, so a source build cannot succeed and the packaged
+            # py3-orjson is below the floor pyproject spells. The binary uses
+            # the stdlib json encoder (cronstable/_json), which is
+            # byte-compatible.
+            echo "orjson: skipped on this lane; using stdlib json"
+            # Bundle pynacl (the `push` extra). SODIUM_INSTALL=system links the
+            # port libsodium instead of running PyNaCl's bundled autotools
+            # build. Soft, like every source-built lane: a build that fails the
+            # sealed-box round trip is uninstalled, so push fails closed rather
+            # than shipping a miscompiled libsodium.
+            CFLAGS="-I/usr/local/include"
+            LDFLAGS="-L/usr/local/lib"
+            export CFLAGS LDFLAGS
+            SODIUM_INSTALL=system \
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+            # Bundle zeroconf (the `discovery` extra): pure Python with
+            # optional speedups, so a HARD install here too. LGPL-2.1; the
+            # in-binary notice, Release source archive and public build recipe
+            # are the compliance kit (see LICENSING.md).
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+
+            pyinstaller pyinstaller/cronstable.spec
+            dist/cronstable --version           # smoke test: fails the job if the bundle is broken
+            # Whenever the build env kept pynacl, the frozen binary must reach
+            # it (and zeroconf) too: the push-plus-bonjour config validates
+            # only when both import inside the bundle.
+            if $PY -c "import nacl" 2>/dev/null; then
+              dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+            fi
+            # cli_job_smoke.sh is deliberately not run here: it needs bash,
+            # curl and a live daemon, none of which this lean VM carries. The
+            # env scrub it proves is shared Python code, identical everywhere.
+            #
+            # 64-bit, little-endian, EM_X86_64: a VM that came up on the wrong
+            # image would otherwise pass every smoke above and ship a
+            # mislabelled asset.
+            $PY .github/scripts/assert_arch.py dist/cronstable elf:2:1:62
+            mv dist/cronstable dist/cronstable-openbsd-amd64
+            # Keep the copyback to the artifact: PyInstaller's work tree is
+            # hundreds of megabytes of rsync the host has no use for.
+            rm -rf build
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-openbsd-amd64
+          path: dist/cronstable-openbsd-amd64
+          if-no-files-found: error
+          retention-days: 7
+
+  # Self-contained NetBSD binary, amd64, built in a NetBSD 11.0 virtual machine
+  # on the Linux runner (KVM-accelerated, no emulation).
+  #
+  # PyInstaller supports NetBSD in code without documenting it: compat.py
+  # defines is_netbsd and folds it into is_unix, and bindepend.py overrides
+  # ldd's output format for it, because NetBSD's default ldd output yields
+  # library names PyInstaller cannot parse.
+  binaries-netbsd:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
+      - uses: actions/checkout@v7.0.1
+      - name: Build binary (NetBSD 11.0 amd64)
+        uses: vmactions/netbsd-vm@v1.4.6
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        with:
+          release: '11.0'
+          cpu: 4
+          mem: 8192
+          copyback: true
+          envs: 'SETUPTOOLS_SCM_PRETEND_VERSION'
+          # pkgin is not in NetBSD base and is not on this image; pkg_add from
+          # base is the package manager here, with PKG_PATH already set.
+          prepare: |
+            /usr/sbin/pkg_add python313 libsodium py313-psutil py313-multidict py313-yarl py313-propcache py313-aiohappyeyeballs py313-jinja2 py313-uvloop py313-orjson
+          run: |
+            set -eu
+            . .github/scripts/retry.sh
+
+            # pkgsrc builds python313 --without-ensurepip, so a venv comes up
+            # with no pip at all. Bootstrap it explicitly; `ftp` is in base and
+            # speaks HTTP, and only the network hop is retried.
+            # --system-site-packages on purpose: the pkg_add'd C extensions
+            # above live in the system site-packages, and a plain venv would
+            # hide exactly what that step exists to provide.
+            python3.13 -m venv --system-site-packages --without-pip venv
+            retry 5 ftp -o get-pip.py https://bootstrap.pypa.io/get-pip.py
+            venv/bin/python get-pip.py
+
+            # install_extra.sh / install_orjson.sh read these; the venv has no
+            # activate step in a non-interactive sh.
+            PIP="venv/bin/pip"
+            PY="venv/bin/python"
+            export PIP PY
+
+            # pkgsrc installs under /usr/pkg, which the base compiler does not
+            # search on its own; every source build below needs it.
+            CFLAGS="-I/usr/pkg/include"
+            LDFLAGS="-L/usr/pkg/lib -Wl,-R/usr/pkg/lib"
+            export CFLAGS LDFLAGS
+
+            # Deliberately NOT wrapped in retry: no NetBSD wheel exists, so
+            # this COMPILES the bootloader rather than downloading one.
+            $PIP install pyinstaller==6.22.1  # pin matches the other binary jobs
+            $PIP install .                    # bakes the pinned version into cronstable/version.py
+
+            # uvloop and orjson both come from pkgsrc above, at versions past
+            # the floors these scripts spell, so neither needs a source build;
+            # the scripts still round-trip both before freezing.
+            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+            sh pyinstaller/install_orjson.sh
+            # Bundle pynacl (the `push` extra) against the pkgsrc libsodium
+            # rather than PyNaCl's bundled autotools build. Soft: a build that
+            # fails the sealed-box round trip is uninstalled, so push fails
+            # closed rather than shipping a miscompiled libsodium.
+            SODIUM_INSTALL=system \
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+            # Bundle zeroconf (the `discovery` extra): pure Python with
+            # optional speedups, so a HARD install. LGPL-2.1; see LICENSING.md.
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+
+            venv/bin/pyinstaller pyinstaller/cronstable.spec
+            dist/cronstable --version           # smoke test: fails the job if the bundle is broken
+            if $PY -c "import nacl" 2>/dev/null; then
+              dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+            fi
+            # 64-bit, little-endian, EM_X86_64.
+            $PY .github/scripts/assert_arch.py dist/cronstable elf:2:1:62
+            mv dist/cronstable dist/cronstable-netbsd-amd64
+            rm -rf venv build get-pip.py
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-netbsd-amd64
+          path: dist/cronstable-netbsd-amd64
+          if-no-files-found: error
+          retention-days: 7
+
+  # Self-contained illumos binary, amd64, built in an OmniOS r151054 LTS
+  # virtual machine (supported to 2028-05-01) on the Linux runner.
+  #
+  # ONE illumos binary, not one per distribution: OpenIndiana and SmartOS zones
+  # share the illumos ABI, and OmniOS is the build host with a shared
+  # libpython3.13.so and a bundled ensurepip, which is the pairing that usually
+  # fails on exotic platforms.
+  #
+  # PyInstaller has a real illumos path rather than an accidental one: the
+  # bootloader wscript carries a Solaris branch, compat.py folds is_solar into
+  # is_unix, and bindepend.py has its own ldd branch for it.
+  binaries-illumos:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
+      - uses: actions/checkout@v7.0.1
+      - name: Build binary (OmniOS r151054 amd64)
+        uses: vmactions/omnios-vm@v1.3.4
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        with:
+          release: 'r151054-build'
+          cpu: 4
+          mem: 8192
+          copyback: true
+          envs: 'SETUPTOOLS_SCM_PRETEND_VERSION'
+          prepare: |
+            pkg install runtime/python-313 developer/build-essential
+          run: |
+            set -eu
+
+            # OmniOS ships ensurepip's bundled wheel, so the venv comes up with
+            # a working pip and needs no get-pip.py hop. (Do not copy the
+            # FreeBSD lane's block here: it calls `fetch`, which does not exist
+            # on illumos.)
+            python3.13 -m venv venv
+
+            # install_extra.sh / install_orjson.sh read these.
+            PIP="venv/bin/pip"
+            PY="venv/bin/python"
+            export PIP PY
+
+            # Deliberately NOT wrapped in retry: no illumos wheel exists, so
+            # this COMPILES the bootloader rather than downloading one.
+            $PIP install pyinstaller==6.22.1  # pin matches the other binary jobs
+            $PIP install .                    # bakes the pinned version into cronstable/version.py
+
+            # Nothing is prebuilt for illumos, so every extra is a source build
+            # against the gcc14 toolchain installed above, and all of them are
+            # best-effort. orjson needs Rust and pynacl needs libsodium; both
+            # live in the OmniOS `extra` publisher rather than core, so neither
+            # is installed here and both fall back as designed: stdlib json
+            # (cronstable/_json) and push disabled.
+            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+            sh pyinstaller/install_orjson.sh
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+            # Bundle zeroconf (the `discovery` extra): pure Python with
+            # optional speedups, so a HARD install. LGPL-2.1; see LICENSING.md.
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+
+            venv/bin/pyinstaller pyinstaller/cronstable.spec
+            dist/cronstable --version           # smoke test: fails the job if the bundle is broken
+            if $PY -c "import nacl" 2>/dev/null; then
+              dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+            fi
+            # 64-bit, little-endian, EM_X86_64.
+            $PY .github/scripts/assert_arch.py dist/cronstable elf:2:1:62
+            mv dist/cronstable dist/cronstable-illumos-amd64
+            rm -rf venv build
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-illumos-amd64
+          path: dist/cronstable-illumos-amd64
+          if-no-files-found: error
+          retention-days: 7
+
+  # Self-contained Windows binaries: amd64 and i686 on the hosted runner, arm64
+  # on the windows-11-arm runner. Any C-extension dep lacking a wheel (on 3.15
+  # that is aiohttp and zeroconf on every arch, plus ruamel.yaml.clib and the
+  # rest of the aiohttp stack on arm64) compiles from sdist via the runner's
+  # Visual Studio toolchain. Same pyinstaller pin + `--version` smoke test.
   # Three assets per arch come out of here: the one-file
   # cronstable-windows-<arch>.exe, the one-directory cronstable-windows-<arch>.zip
   # (the shape that can host the Windows service; the one-file bootloader runs
@@ -1011,10 +2239,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # pyarch is setup-python's `architecture`. It is EMPTY on the two
+          # native rows on purpose: the action falls back to the runner's
+          # own arch when the input is blank, so leaving it unset is exactly
+          # today's behavior, while i686 asks for the 32-bit interpreter on
+          # the same x64 runner.
+          #
+          # pfsuffix and regflag exist because a 32-bit MSI is redirected on
+          # a 64-bit host: it installs under "Program Files (x86)" and its
+          # registry components land in the WOW6432Node view. Both
+          # redirections are self-consistent (the .wxs uses
+          # ProgramFiles6432Folder and its RegistrySearch reads back through
+          # the same view), and on a genuinely 32-bit host -- the only place
+          # this artifact is needed -- they resolve to the plain paths. The
+          # smoke assertions below therefore have to follow the host, not
+          # the target.
           - arch: amd64
             runner: windows-latest
+            pyarch: ''
+            pfsuffix: ''
+            regflag: /reg:64
           - arch: arm64
             runner: windows-11-arm
+            pyarch: ''
+            pfsuffix: ''
+            regflag: /reg:64
+          - arch: i686
+            runner: windows-latest
+            pyarch: x86
+            pfsuffix: ' (x86)'
+            regflag: /reg:32
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -1025,9 +2279,11 @@ jobs:
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
+        id: py
         with:
           python-version: '3.15'
           allow-prereleases: true  # 3.15 is an rc until 2026-10-01
+          architecture: ${{ matrix.pyarch }}
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           version: "0.12.5"
@@ -1040,8 +2296,12 @@ jobs:
           CRONSTABLE_BUNDLE: both
         run: |
           set -euo pipefail
-          # Runner-native (uv ships a win_arm64 build too); install into a
-          # throwaway uv venv and freeze from it with `uv run`.
+          # Freeze from a throwaway uv venv built on the EXACT interpreter
+          # setup-python just installed. Spelling the path rather than
+          # `--python 3.15` is what keeps the i686 row honest: uv resolves a
+          # bare version against everything it can discover, and any x64 3.15
+          # it finds or fetches would satisfy it, silently producing a 64-bit
+          # build under a 32-bit name.
           #
           # Neither aiohttp nor zeroconf publishes a cp315 wheel for any Windows
           # arch, so both compile from sdist against the runner's MSVC
@@ -1050,7 +2310,7 @@ jobs:
           # 3.15, and arm64 the most fragile row in it, since nothing in the
           # aiohttp stack has a win_arm64 wheel to fall back on. Read a red here
           # as upstream wheel lag before suspecting a cronstable defect.
-          uv venv --python 3.15
+          uv venv --python "${{ steps.py.outputs.python-path }}"
           uv pip install pyinstaller==6.22.1  # pin matches the Linux/macOS jobs
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle orjson (the `speedups` extra) for the durable-state / cluster
@@ -1080,6 +2340,18 @@ jobs:
           # on the KV side effect: proves the daemon's PyInstaller env scrub
           # against the real bootloader (see the script header).
           bash .github/scripts/cli_job_smoke.sh dist/cronstable.exe
+          # Assert the PE is the arch this row claims. The i686 row builds on
+          # the same x64 runner as amd64, where a 64-bit interpreter would
+          # pass every smoke above and still ship under the 32-bit name; the
+          # macOS lane guards the Rosetta version of this. Read the COFF
+          # Machine field rather than grepping `file`, whose prose differs
+          # between versions and across these three arches.
+          case "${{ matrix.arch }}" in
+            amd64) spec=pe:8664 ;;   # IMAGE_FILE_MACHINE_AMD64
+            arm64) spec=pe:aa64 ;;   # IMAGE_FILE_MACHINE_ARM64
+            i686)  spec=pe:014c ;;   # IMAGE_FILE_MACHINE_I386
+          esac
+          uv run python .github/scripts/assert_arch.py dist/cronstable.exe "$spec"
           mv dist/cronstable.exe "dist/cronstable-windows-${{ matrix.arch }}.exe"
       - uses: actions/upload-artifact@v7.0.1
         with:
@@ -1141,25 +2413,28 @@ jobs:
       - name: Smoke-test MSI (install, verify, uninstall)
         env:
           ARCH: ${{ matrix.arch }}
+          PFSUFFIX: ${{ matrix.pfsuffix }}
         run: |
           set -euo pipefail
           . .github/scripts/msi_smoke.sh
           msi_install "dist/cronstable-windows-${ARCH}.msi" msi-install.log
           # Registered, stopped, and the ImagePath is the exact quoted
           # command line winservice.host_argv/image_path would write.
+          # PFSUFFIX is empty on the 64-bit rows and " (x86)" on i686, whose
+          # package the 64-bit host redirects; see the matrix.
           sc query cronstable | grep -q 'STOPPED'
-          sc qc cronstable | grep -F '"C:\Program Files\cronstable\cronstable.exe" -l INFO service run --name cronstable -c "C:\ProgramData\cronstable"'
+          sc qc cronstable | grep -F "\"C:\\Program Files${PFSUFFIX}\\cronstable\\cronstable.exe\" -l INFO service run --name cronstable -c \"C:\\ProgramData\\cronstable\""
           # The recovery actions the Util custom action configured.
           sc qfailure cronstable | grep -qi 'RESTART'
           # The installed exe runs from Program Files.
-          "/c/Program Files/cronstable/cronstable.exe" --version
+          "/c/Program Files${PFSUFFIX}/cronstable/cronstable.exe" --version
           msi_uninstall "dist/cronstable-windows-${ARCH}.msi" msi-uninstall.log
           # Service and files are gone.
           if sc query cronstable >/dev/null 2>&1; then
             echo "service still registered after uninstall" >&2
             exit 1
           fi
-          test ! -e "/c/Program Files/cronstable/cronstable.exe"
+          test ! -e "/c/Program Files${PFSUFFIX}/cronstable/cronstable.exe"
       # A real major-upgrade round trip; the fresh-install smoke above
       # exercises none of the upgrade choreography. Install with a
       # CUSTOM config directory, upgrade to a patch-bumped twin without
@@ -1174,6 +2449,8 @@ jobs:
         env:
           VERSION: ${{ needs.version.outputs.new }}
           ARCH: ${{ matrix.arch }}
+          PFSUFFIX: ${{ matrix.pfsuffix }}
+          REGFLAG: ${{ matrix.regflag }}
         run: |
           set -euo pipefail
           . .github/scripts/msi_smoke.sh
@@ -1199,7 +2476,10 @@ jobs:
           # The probe found the remembered directory: the start
           # component's marker exists and the service reaches RUNNING
           # (the config in $cfg already passed --validate-config).
-          MSYS2_ARG_CONV_EXCL='*' reg query 'HKLM\SOFTWARE\cronstable' /v ServiceStartedByMsi
+          # REGFLAG picks the view the package actually wrote: a 32-bit
+          # package on this 64-bit host lands under WOW6432Node, and an
+          # unqualified query would miss it and read as a broken probe.
+          MSYS2_ARG_CONV_EXCL='*' reg query 'HKLM\SOFTWARE\cronstable' /v ServiceStartedByMsi "$REGFLAG"
           for _ in $(seq 1 15); do
             sc query cronstable | grep -q 'RUNNING' && break
             sleep 2
@@ -1211,7 +2491,7 @@ jobs:
           # handler posts the reparse onto the loop, whose log line
           # lands in the bootstrap log (smoke-push.yaml has no logging:
           # section to replace it).
-          "/c/Program Files/cronstable/cronstable.exe" service reload
+          "/c/Program Files${PFSUFFIX}/cronstable/cronstable.exe" service reload
           for _ in $(seq 1 15); do
             grep -q 'service control PARAMCHANGE' "$cfg/logs/cronstable-service.log" 2>/dev/null && break
             sleep 1
@@ -1253,7 +2533,7 @@ jobs:
       # local `docker build .` does, and that uses the builder's own git).
       - uses: actions/checkout@v7.0.1
       - uses: docker/setup-qemu-action@v4.2.0
-      - uses: docker/setup-buildx-action@v4.2.0
+      - uses: docker/setup-buildx-action@v4.3.0
       - name: Build image (build-only gate)
         uses: docker/build-push-action@v7.3.0
         with:
@@ -1576,14 +2856,15 @@ jobs:
   # cannot sign its own build, and keeping id-token: write out of the
   # build lanes means their third-party build code can never mint a
   # signing token. Authenticode is architecture-agnostic; one runner
-  # signs both arches' PEs.
+  # signs every arch's PEs.
   #
   # The payload exe must be signed before it is packaged, so this job
-  # unzips both zips, signs, re-zips, rebuilds both MSIs from the signed
+  # unzips each zip, signs, re-zips, rebuilds every MSI from the signed
   # tree with the same pinned WiX, and signs those. The signed amd64 MSI
   # gets a real msiexec round trip here; the arm64 MSI cannot execute on
-  # this runner, and binaries-windows' native smoke already proved the
-  # .wxs semantics this same run on the unsigned twin.
+  # this runner and the i686 one installs to a redirected directory that
+  # is not the path this step asserts, and binaries-windows' native smoke
+  # already proved the .wxs semantics this same run on each unsigned twin.
   #
   # Missing secrets warn and the release ships unsigned, the macOS
   # lane's rule. A signing failure with the secrets present fails the
@@ -1660,57 +2941,60 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out exes
-          for arch in amd64 arm64; do
+          for arch in amd64 arm64 i686; do
             python -c "import zipfile; zipfile.ZipFile('signdir/cronstable-windows-${arch}.zip').extractall('work/${arch}')"
             test -f "work/${arch}/cronstable/cronstable.exe"
             cp "signdir/cronstable-windows-${arch}.exe" exes/
           done
-      # Three PE signing calls: the staged one-file exes, then each
+      # Four PE signing calls: the staged one-file exes, then each
       # payload's root exe. The filter with recursion off keeps the
-      # third-party DLLs under _internal out of our signature. The
-      # timestamps are required: Artifact Signing rotates leaf
-      # certificates within days, and an untimestamped signature dies
-      # with its certificate (test_ci_fences pins the inputs on every
-      # signing step).
+      # third-party DLLs under _internal out of our signature. Every
+      # call goes through the local action, which retries a failed
+      # attempt twice: the signing action reinstalls its module from the
+      # PowerShell gallery on each call, and a gallery blip fails the
+      # step before anything is signed. That action also owns the digest
+      # and timestamp inputs (test_ci_fences pins both the ladder and
+      # the inputs).
       - name: Sign the one-file exes
         if: steps.decide.outputs.signed == 'true'
-        uses: azure/artifact-signing-action@v2.0.0
+        uses: ./.github/actions/sign-artifacts
         with:
+          label: the one-file exes
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
           files-folder: ${{ github.workspace }}\exes
           files-folder-filter: exe
-          files-folder-recurse: false
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
       - name: Sign the amd64 payload exe
         if: steps.decide.outputs.signed == 'true'
-        uses: azure/artifact-signing-action@v2.0.0
+        uses: ./.github/actions/sign-artifacts
         with:
+          label: the amd64 payload exe
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
           files-folder: ${{ github.workspace }}\work\amd64\cronstable
           files-folder-filter: exe
-          files-folder-recurse: false
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
       - name: Sign the arm64 payload exe
         if: steps.decide.outputs.signed == 'true'
-        uses: azure/artifact-signing-action@v2.0.0
+        uses: ./.github/actions/sign-artifacts
         with:
+          label: the arm64 payload exe
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
           files-folder: ${{ github.workspace }}\work\arm64\cronstable
           files-folder-filter: exe
-          files-folder-recurse: false
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
+      - name: Sign the i686 payload exe
+        if: steps.decide.outputs.signed == 'true'
+        uses: ./.github/actions/sign-artifacts
+        with:
+          label: the i686 payload exe
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\work\i686\cronstable
+          files-folder-filter: exe
       - name: Re-zip the signed payloads
         if: steps.decide.outputs.signed == 'true'
         run: |
@@ -1718,7 +3002,7 @@ jobs:
           # Same shape the build lane produced: a single top-level
           # cronstable/ folder, so extracting into C:\Program Files
           # yields the documented path.
-          for arch in amd64 arm64; do
+          for arch in amd64 arm64 i686; do
             python -c "import shutil; shutil.make_archive('out/cronstable-windows-${arch}', 'zip', root_dir='work/${arch}', base_dir='cronstable')"
             cp "exes/cronstable-windows-${arch}.exe" out/
           done
@@ -1733,23 +3017,20 @@ jobs:
           # cannot drift from the MSI the gate's msiexec smoke proved.
           # -arch is metadata, so this x64 runner builds the arm64
           # package too.
-          for arch in amd64 arm64; do
+          for arch in amd64 arm64 i686; do
             sh .github/scripts/build_msi.sh "$arch" "$VERSION" \
               "work/${arch}/cronstable" "out/cronstable-windows-${arch}.msi"
           done
       - name: Sign the MSIs
         if: steps.decide.outputs.signed == 'true'
-        uses: azure/artifact-signing-action@v2.0.0
+        uses: ./.github/actions/sign-artifacts
         with:
+          label: the MSIs
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
           files-folder: ${{ github.workspace }}\out
           files-folder-filter: msi
-          files-folder-recurse: false
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
       # The action can exit 0 having signed nothing (a filter typo), so
       # check the exact bytes being uploaded. The set is DERIVED, not
       # enumerated: everything in out/ except the zips, plus each
@@ -1763,8 +3044,8 @@ jobs:
         run: |
           $files = @(Get-ChildItem out -File | Where-Object Extension -ne '.zip') +
                    @(Get-ChildItem work\*\cronstable\*.exe -File)
-          if ($files.Count -lt 6) {
-            throw "expected at least 6 signed files (2 exes, 2 MSIs, 2 payload exes), found $($files.Count)"
+          if ($files.Count -lt 9) {
+            throw "expected at least 9 signed files (3 exes, 3 MSIs, 3 payload exes), found $($files.Count)"
           }
           foreach ($f in $files) {
             $sig = Get-AuthenticodeSignature $f.FullName
@@ -1802,10 +3083,13 @@ jobs:
           path: |
             out/cronstable-windows-amd64.exe
             out/cronstable-windows-arm64.exe
+            out/cronstable-windows-i686.exe
             out/cronstable-windows-amd64.zip
             out/cronstable-windows-arm64.zip
+            out/cronstable-windows-i686.zip
             out/cronstable-windows-amd64.msi
             out/cronstable-windows-arm64.msi
+            out/cronstable-windows-i686.msi
           if-no-files-found: error
           retention-days: 7
 
@@ -1818,7 +3102,14 @@ jobs:
       - dist
       - binaries
       - binaries-container
+      - binaries-mips
+      - binaries-arm-legacy
+      - binaries-loong64
       - binaries-macos
+      - binaries-freebsd
+      - binaries-openbsd
+      - binaries-netbsd
+      - binaries-illumos
       - binaries-windows
       - sign-windows
       - docker
@@ -1860,6 +3151,18 @@ jobs:
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # On a re-run the tag is already on the remote: skip it when it names
+          # HEAD, fail when it names another commit. ls-remote peels the annotated
+          # tag to its commit, which a shallow checkout cannot do locally.
+          existing="$(git ls-remote --tags origin "refs/tags/$NEW^{}" "refs/tags/$NEW" | tail -n1 | cut -f1)"
+          if [ -n "$existing" ]; then
+            if [ "$existing" = "$(git rev-parse HEAD)" ]; then
+              echo "tag $NEW already points at HEAD; skipping"
+              exit 0
+            fi
+            echo "::error::tag $NEW already exists at $existing, not HEAD $(git rev-parse HEAD)"
+            exit 1
+          fi
           git tag -a "$NEW" -m "Release $NEW"
           # The default GITHUB_TOKEN is the GitHub Actions *App*, and GitHub
           # forbids an App from pushing a ref that creates/updates any file under
@@ -1903,6 +3206,15 @@ jobs:
           name: signed-windows
           path: binaries
 
+      # Distro packages for the glibc Linux binaries, built from the exact
+      # bytes above (the signed-Windows overlay does not touch these). One
+      # second for the whole set: nfpm never executes the payload, so no
+      # emulation is involved and this needs no job of its own. It comes
+      # AFTER the overlay and BEFORE the hashing so SHA256SUMS and the
+      # Release describe the same files.
+      - name: Build .deb and .rpm packages
+        run: bash .github/scripts/build_packages.sh "${{ needs.version.outputs.new }}" binaries
+
       # One SHA256SUMS over the dist + every SHIPPED binary (bare filenames, so
       # `sha256sum -c` works from any directory). Enumerated explicitly -- a
       # `cronstable-*` glob would fold the CI-only macOS 26 binaries into the
@@ -1914,19 +3226,54 @@ jobs:
           cp dist/*.whl dist/*.tar.gz \
              binaries/cronstable-linux-amd64 binaries/cronstable-linux-arm64 \
              binaries/cronstable-linux-i686 binaries/cronstable-linux-armv7 \
+             binaries/cronstable-linux-armv6 binaries/cronstable-linux-armel \
              binaries/cronstable-linux-ppc64le binaries/cronstable-linux-s390x \
-             binaries/cronstable-linux-riscv64 \
+             binaries/cronstable-linux-riscv64 binaries/cronstable-linux-loong64 \
+             binaries/cronstable-linux-mips64le \
              binaries/cronstable-linux-amd64-musl binaries/cronstable-linux-arm64-musl \
              binaries/cronstable-linux-i686-musl binaries/cronstable-linux-armv7-musl \
+             binaries/cronstable-linux-armv6-musl binaries/cronstable-linux-loong64-musl \
              binaries/cronstable-linux-ppc64le-musl binaries/cronstable-linux-s390x-musl \
-             binaries/cronstable-linux-riscv64-musl binaries/cronstable-linux-armv6-musl \
+             binaries/cronstable-linux-riscv64-musl \
+             binaries/cronstable-linux-amd64.deb binaries/cronstable-linux-arm64.deb \
+             binaries/cronstable-linux-i686.deb binaries/cronstable-linux-armv7.deb \
+             binaries/cronstable-linux-ppc64le.deb binaries/cronstable-linux-s390x.deb \
+             binaries/cronstable-linux-riscv64.deb \
+             binaries/cronstable-linux-amd64.rpm binaries/cronstable-linux-arm64.rpm \
+             binaries/cronstable-linux-i686.rpm binaries/cronstable-linux-armv7.rpm \
+             binaries/cronstable-linux-ppc64le.rpm binaries/cronstable-linux-s390x.rpm \
+             binaries/cronstable-linux-riscv64.rpm \
+             binaries/cronstable-linux-amd64.apk binaries/cronstable-linux-arm64.apk \
+             binaries/cronstable-linux-i686.apk binaries/cronstable-linux-armv7.apk \
+             binaries/cronstable-linux-armv6.apk binaries/cronstable-linux-ppc64le.apk \
+             binaries/cronstable-linux-s390x.apk binaries/cronstable-linux-riscv64.apk binaries/cronstable-linux-loong64.apk \
              binaries/cronstable-macos-amd64 binaries/cronstable-macos-arm64 \
+             binaries/cronstable-freebsd-amd64 binaries/cronstable-freebsd-arm64 \
+             binaries/cronstable-freebsd-amd64.pkg binaries/cronstable-freebsd-arm64.pkg \
+             binaries/cronstable-openbsd-amd64 binaries/cronstable-netbsd-amd64 \
+             binaries/cronstable-illumos-amd64 \
              binaries/cronstable-windows-amd64.exe binaries/cronstable-windows-arm64.exe \
+             binaries/cronstable-windows-i686.exe \
              binaries/cronstable-windows-amd64.zip binaries/cronstable-windows-arm64.zip \
+             binaries/cronstable-windows-i686.zip \
              binaries/cronstable-windows-amd64.msi binaries/cronstable-windows-arm64.msi \
+             binaries/cronstable-windows-i686.msi \
              "$work"/
           ( cd "$work" && sha256sum -- * ) > SHA256SUMS
           cat SHA256SUMS
+
+      # The Scoop manifest for this release, rendered from the SHA256SUMS just
+      # written. Scoop is a PULL channel: once this file is in the
+      # ScoopInstaller/Extras bucket, its Excavator bot re-reads checkver and
+      # autoupdate every four hours and bumps the manifest from the same
+      # SHA256SUMS asset, so nothing here has to push anything ever again.
+      # Attaching it rather than committing it keeps the hashes honest.
+      - name: Render the Scoop manifest
+        run: |
+          set -euo pipefail
+          mkdir -p scoop
+          python3 .github/scripts/render_scoop.py "${{ needs.version.outputs.new }}" SHA256SUMS scoop/cronstable.json
+          cat scoop/cronstable.json
 
       # The perf gate's output for THIS run: the markdown summary the notes
       # append, the merged raw results for the record, and the chart (kept in
@@ -2011,6 +3358,7 @@ jobs:
           # workflow artifact.
           files: |
             SHA256SUMS
+            scoop/cronstable.json
             perf/perf-summary.md
             perf/perf-results.json
             third-party/THIRD-PARTY-NOTICES.txt
@@ -2021,25 +3369,63 @@ jobs:
             binaries/cronstable-linux-arm64
             binaries/cronstable-linux-i686
             binaries/cronstable-linux-armv7
+            binaries/cronstable-linux-armv6
+            binaries/cronstable-linux-armel
             binaries/cronstable-linux-ppc64le
             binaries/cronstable-linux-s390x
             binaries/cronstable-linux-riscv64
+            binaries/cronstable-linux-loong64
+            binaries/cronstable-linux-mips64le
             binaries/cronstable-linux-amd64-musl
             binaries/cronstable-linux-arm64-musl
             binaries/cronstable-linux-i686-musl
             binaries/cronstable-linux-armv7-musl
+            binaries/cronstable-linux-armv6-musl
+            binaries/cronstable-linux-loong64-musl
             binaries/cronstable-linux-ppc64le-musl
             binaries/cronstable-linux-s390x-musl
             binaries/cronstable-linux-riscv64-musl
-            binaries/cronstable-linux-armv6-musl
+            binaries/cronstable-linux-amd64.deb
+            binaries/cronstable-linux-arm64.deb
+            binaries/cronstable-linux-i686.deb
+            binaries/cronstable-linux-armv7.deb
+            binaries/cronstable-linux-ppc64le.deb
+            binaries/cronstable-linux-s390x.deb
+            binaries/cronstable-linux-riscv64.deb
+            binaries/cronstable-linux-amd64.rpm
+            binaries/cronstable-linux-arm64.rpm
+            binaries/cronstable-linux-i686.rpm
+            binaries/cronstable-linux-armv7.rpm
+            binaries/cronstable-linux-ppc64le.rpm
+            binaries/cronstable-linux-s390x.rpm
+            binaries/cronstable-linux-riscv64.rpm
+            binaries/cronstable-linux-amd64.apk
+            binaries/cronstable-linux-arm64.apk
+            binaries/cronstable-linux-i686.apk
+            binaries/cronstable-linux-armv7.apk
+            binaries/cronstable-linux-armv6.apk
+            binaries/cronstable-linux-ppc64le.apk
+            binaries/cronstable-linux-s390x.apk
+            binaries/cronstable-linux-riscv64.apk
+            binaries/cronstable-linux-loong64.apk
             binaries/cronstable-macos-amd64
             binaries/cronstable-macos-arm64
+            binaries/cronstable-freebsd-amd64
+            binaries/cronstable-freebsd-arm64
+            binaries/cronstable-freebsd-amd64.pkg
+            binaries/cronstable-freebsd-arm64.pkg
+            binaries/cronstable-openbsd-amd64
+            binaries/cronstable-netbsd-amd64
+            binaries/cronstable-illumos-amd64
             binaries/cronstable-windows-amd64.exe
             binaries/cronstable-windows-arm64.exe
+            binaries/cronstable-windows-i686.exe
             binaries/cronstable-windows-amd64.zip
             binaries/cronstable-windows-arm64.zip
+            binaries/cronstable-windows-i686.zip
             binaries/cronstable-windows-amd64.msi
             binaries/cronstable-windows-arm64.msi
+            binaries/cronstable-windows-i686.msi
 
   # Build + push the multi-arch container images at the just-released version.
   # Runs after `release` (so the tag it checks out exists) and is thus gated on
@@ -2127,7 +3513,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - uses: docker/setup-qemu-action@v4.2.0
-      - uses: docker/setup-buildx-action@v4.2.0
+      - uses: docker/setup-buildx-action@v4.3.0
 
       - name: Build and push
         uses: docker/build-push-action@v7.3.0

@@ -1,23 +1,25 @@
-# Includes, Defaults, and Multi-File Config
+# Includes, defaults, and multi-file config
 
 This page documents how cronstable loads configuration: the `-c` argument as a
 single file or a directory, the `defaults` section and its merge precedence, the
 `include` directive, and the special list-merge rules that govern how job
-settings inherit from defaults. All behavior here is implemented in
-`cronstable/config.py`.
+settings inherit from defaults. `cronstable/config.py` implements all of this
+behavior.
 
 ## Config loading entry points
 
-cronstable resolves the `-c`/`--config` argument (default `/etc/cronstable.d` on
-POSIX; on Windows `%ProgramData%\cronstable` when it holds configuration, else
-`%APPDATA%\cronstable`, falling back to `~` if APPDATA is unset; see
-[CLI Reference](CLI-Reference) and [Running on Windows](Running-on-Windows))
-through `parse_config(config_arg)`:
+The `-c`/`--config` argument defaults to `/etc/cronstable.d` on POSIX. On
+Windows it defaults to `%ProgramData%\cronstable` when that directory holds
+configuration, otherwise `%APPDATA%\cronstable`, falling back to `~` if
+`APPDATA` is unset. See the [CLI reference](CLI-Reference) and
+[running on Windows](Running-on-Windows).
 
-- If `config_arg` is a directory, it is loaded by `_parse_config_dir`
-  (directory mode, below).
-- Otherwise it is loaded as a single file by `parse_config_file`. `parse_config`
-  wraps that call in a `try/except OSError`, so a missing or unreadable file
+`parse_config(config_arg)` resolves the argument:
+
+- If `config_arg` is a directory, `_parse_config_dir` loads it (directory mode,
+  next section).
+- Otherwise `parse_config_file` loads it as a single file. `parse_config` wraps
+  that call in a `try/except OSError`, so a missing or unreadable file
   (`OSError`) is re-raised as a `ConfigError` and the CLI reports it cleanly
   rather than surfacing a bare `OSError`.
 
@@ -25,52 +27,55 @@ A single file is read as UTF-8, validated against `CONFIG_SCHEMA` with
 strictyaml, and parsed by `parse_config_string`. The top level accepts an empty
 document (`EmptyDict()`) or a mapping with the optional keys `defaults`, `jobs`,
 `web`, `include`, and `logging` (all `Opt(...)`, none is required). See the
-[Configuration Reference](Configuration-Reference) for the per-job and `web`
-schemas, and [Logging Configuration](Logging-Configuration) for the `logging`
+[configuration reference](Configuration-Reference) for the per-job and `web`
+schemas, and [logging configuration](Logging-Configuration) for the `logging`
 schema.
 
 ## Directory mode
 
 When `-c` points at a directory, `_parse_config_dir` enumerates the directory's
-entries with `os.scandir` and processes them in sorted filename order (sorting
+entries with `os.scandir` and processes them in sorted filename order. Sorting
 makes job ordering and "first config found" error messages deterministic rather
-than dependent on filesystem order).
+than dependent on filesystem order.
 
-For each entry, the name is split into base and extension:
+For each entry, `_parse_config_dir` splits the name into base and extension:
 
 - The entry is **skipped** if the first character of its base name is `_` or
-  `.`. This lets you keep shared include fragments (e.g. `_inc.yaml`) and dotted
-  files in the same directory without them being loaded as standalone configs.
+  `.`. This lets you keep shared include fragments (such as `_inc.yaml`) and
+  dotted files in the same directory without them being loaded as standalone
+  configs.
 - The entry is **skipped** unless its extension is `.yml` or `.yaml`, or its
   name marks it as a classic crontab (`*.crontab`, `*.cron`, or a file named
-  `crontab`; see [Classic Crontabs](Classic-Crontabs)).
+  `crontab`; see [classic crontabs](Classic-Crontabs)).
 
-Each remaining file is parsed independently with `parse_config_file`, then its
-results are **aggregated** across the directory:
+`parse_config_file` parses each remaining file independently, then its results
+are **aggregated** across the directory:
 
 | Aggregate | Behavior across files |
 | --- | --- |
 | `jobs` | Concatenated in sorted-filename order (`jobs.extend(...)`). |
-| `defaults` | Merged across files via `mergedicts` into a single directory-wide `job_defaults` (used only as the returned `job_defaults`; see the caveat below). |
+| `defaults` | Merged across files with `mergedicts` into a single directory-wide `job_defaults` (used only as the returned `job_defaults`; see the following caveat). |
 | `web` | At most one. A second file containing a `web` block raises `ConfigError("Multiple 'web' configurations found: first in <file>, now in <file>")`. |
 | `logging` | At most one. A second file containing a `logging` block raises `ConfigError("Multiple 'logging' configurations found: ...")`. |
 
-Per-file parse errors are collected (keyed by path) and, if any occurred,
+Per-file parse errors are collected, keyed by path. If any occurred, they are
 raised together as a single `ConfigError` whose message joins the individual
 errors with `\n---`. An empty directory, or one where every entry is skipped,
-yields an empty `CronstableConfig` (empty `jobs`, no `web`, empty `job_defaults`,
-no `logging`) rather than an error.
+yields an empty `CronstableConfig` (empty `jobs`, no `web`, empty
+`job_defaults`, no `logging`) rather than an error.
 
 ### Defaults are scoped per YAML file in directory mode
 
 This is the most important caveat of directory mode: **the `defaults` section in
 each file applies only to the jobs defined in that same file.** Each file is
-parsed by its own `parse_config_string` call, where that file's `defaults` are
-merged into its own jobs before the files are aggregated. The directory-wide
-`job_defaults` returned by `_parse_config_dir` is the merge of every file's
-defaults, but it is *not* applied retroactively to jobs that were already
-constructed in other files. To share defaults across files in a directory, put
-them in an include fragment and `include` it from each file (see below).
+parsed by its own `parse_config_string` call, which merges that file's
+`defaults` into its own jobs before the files are aggregated.
+
+The directory-wide `job_defaults` returned by `_parse_config_dir` is the merge of
+every file's defaults, but it is *not* applied retroactively to jobs that
+were already constructed in other files. To share defaults across files in a
+directory, put them in an include fragment and `include` it from each file (see
+the `include` directive later).
 
 ## The `defaults` section
 
@@ -96,39 +101,41 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-The `shell` field works on every OS; the `/bin/...` paths above are POSIX
-examples. On Windows you'd set e.g. `shell: powershell`, leave it empty to use
-cmd.exe (via %ComSpec%), or pass `command` as a list to bypass the shell
-entirely (see [Running on Windows](Running-on-Windows)).
+The `shell` field works on every OS; the preceding `/bin/...` paths are POSIX
+examples. On Windows, set `shell` to a shell such as `powershell`, leave it
+empty to use cmd.exe (through `%ComSpec%`), or pass `command` as a list to
+bypass the shell entirely (see [running on Windows](Running-on-Windows)).
 
 ### Defaults also cover DAG tasks
 
 A [DAG task](Orchestration-and-DAGs) is a job invocation, so its launch fields
-inherit the `defaults:` block just as a job's do: a global `shell`,
+inherit the `defaults:` block the same way a job's do. A global `shell`,
 `environment`, `env_file`, `workingDirectory`, `priority`,
 `captureStdout`/`captureStderr`, `monitorResources`, run-scoped `secrets`, or
 reporter (`onFailure`/`onSuccess`/…) block covers DAG tasks too, with the
-task's own value winning on any key it sets. The DAG-node fields that shape the
-graph (`dependsOn`, `triggerRule`, `retries`, `expand`, `onReject`, the poke
-settings) are graph structure, not launch config, and are never touched by
-`defaults:`. The DAG's synthetic schedule-trigger job (which runs a placeholder
-`true` on every tick) deliberately stays on the built-in
-defaults, so a global reporter fires per DAG **run**, not on every tick. As
-with jobs, in [directory mode](#directory-mode) and across
-[includes](#the-include-directive) a `defaults:` block reaches only the jobs
+task's own value winning on any key it sets.
+
+The DAG-node fields that shape the graph (`dependsOn`, `triggerRule`, `retries`,
+`expand`, `onReject`, the poke settings) are graph structure, not launch config,
+and are never touched by `defaults:`. The DAG's synthetic schedule-trigger job
+runs a placeholder `true` on every tick and deliberately stays on the built-in
+defaults, so a global reporter fires per DAG **run**, not on every tick.
+
+As with jobs, in [directory mode](#directory-mode) and across
+[includes](#the-include-directive), a `defaults:` block reaches only the jobs
 **and DAGs** defined in the same file.
 
 ### Merge precedence
 
-Within a single parsed file (`parse_config_string`), each job's effective
-configuration is built by successively merging with `mergedicts`, in this order
-(later wins):
+Within a single parsed file, `parse_config_string` builds each job's effective
+configuration by successively merging with `mergedicts`, in this order (later
+wins):
 
-1. `DEFAULT_CONFIG`: the built-in defaults (e.g. `shell: /bin/sh` on POSIX
-   (empty on Windows, which routes a string `command` through %ComSpec%/cmd.exe;
-   see [Running on Windows](Running-on-Windows)), `captureStderr: true`,
-   `utc: true`, `killTimeout: 30`; full list in the
-   [Configuration Reference](Configuration-Reference)).
+1. `DEFAULT_CONFIG`: the built-in defaults, such as `shell: /bin/sh` on POSIX,
+   `captureStderr: true`, `utc: true`, `killTimeout: 30`. On Windows,
+   `shell` is empty and a string `command` routes through `%ComSpec%`/cmd.exe;
+   see [running on Windows](Running-on-Windows). The
+   [configuration reference](Configuration-Reference) has the full list.
 2. **Included files' defaults**: the `defaults` blocks of any files named by
    this file's `include` directive, merged together in include order.
 3. **This file's `defaults` block.**
@@ -136,12 +143,13 @@ configuration is built by successively merging with `mergedicts`, in this order
 
 Each job dict is `mergedicts(defaults, config_job)`, where `defaults` is
 `mergedicts(mergedicts(DEFAULT_CONFIG, included_defaults), this_files_defaults)`.
-The resulting per-job dict is then passed to `JobConfig`, which validates it
-(numeric ranges, timezone, user/group). On Windows, user/group switching is
-unsupported: a job with `user` or `group` set raises a configuration error
-(`Job <name>: changing user/group is not supported on Windows`); see
-[Running on Windows](Running-on-Windows). The merged `defaults` (steps 1–3) is
-also returned as the file's `job_defaults`.
+`JobConfig` then validates the resulting per-job dict (numeric ranges,
+`timezone`, `user`/`group`).
+
+On Windows, user/group switching is unsupported: a job with `user` or `group`
+set raises a configuration error (`Job <name>: changing user/group is not
+supported on Windows`); see [running on Windows](Running-on-Windows). The merged
+`defaults` (steps 1–3) is also returned as the file's `job_defaults`.
 
 ## Merge semantics (`mergedicts`)
 
@@ -152,8 +160,8 @@ also returned as the file's `job_defaults`.
 | --- | --- |
 | Both values are mappings | Recurse (deep merge). |
 | `dict1` value is a mapping, `dict2` value is `None` | Keep `dict1`'s mapping (treat `None` as "not overridden"). |
-| Both values are lists, key is `environment` | **Merge by key** (see below). |
-| Both values are lists, key is `secrets` | **Merge by name** (see below). |
+| Both values are lists, key is `environment` | **Merge by key** (described later). |
+| Both values are lists, key is `secrets` | **Merge by name** (described later). |
 | Both values are lists, key is `fingerprint` | **Replace** with `dict2`'s list (no concatenation). |
 | Both values are lists, any other key | **Concatenate** (`v1 + v2`). |
 | Otherwise (scalars, type mismatch) | Take `dict2`'s value. |
@@ -163,12 +171,13 @@ also returned as the file's `job_defaults`.
 ### `environment` merges by key
 
 `environment` is a list of `{key, value}` mappings. When a job and a default
-both define `environment`, they are merged into a dictionary keyed by `key`
+both define `environment`, the two lists merge into a dictionary keyed by `key`
 (default entries first, then the job's), so a job's variable **overrides** the
 default with the same name instead of producing two list entries with the same
 key. This is a behavior change from yacron (which concatenated the lists,
-yielding duplicate-keyed entries). See [Commands and Environment](Commands-and-Environment)
-for `environment` and `env_file`.
+yielding duplicate-keyed entries). See
+[commands and environment](Commands-and-Environment) for `environment` and
+`env_file`.
 
 ```yaml
 defaults:
@@ -188,17 +197,17 @@ jobs:
         value: blah
 ```
 
-The job above runs with `FOO=xpto`, `BAR=bar`, `ZBR=blah`.
+The preceding job runs with `FOO=xpto`, `BAR=bar`, `ZBR=blah`.
 
 ### `secrets` merges by name
 
-Run-scoped `secrets` are a list of `{name, ...}` mappings and merge the same
-way `environment` does: entries are keyed by `name` (default entries first,
-then the job's), so a job's secret **overrides** a same-named default instead
-of staging two secrets under one name. The job's entry wins wholesale,
-including its `value`/`fromFile`/`fromEnvVar` source. See
-[Durable State](Durable-State#run-scoped-secrets) for what a secret block
-does and how a job reads one.
+Run-scoped `secrets` are a list of `{name, ...}` mappings and merge the same way
+`environment` does. Entries are keyed by `name` (default entries first, then
+the job's), so a job's secret **overrides** a same-named default instead of
+staging two secrets under one name. The job's entry wins wholesale, including
+its `value`/`fromFile`/`fromEnvVar` source. See
+[durable state](Durable-State#run-scoped-secrets) for what a secret block does
+and how a job reads one.
 
 ### `fingerprint` replaces, does not append
 
@@ -207,45 +216,48 @@ The Sentry `fingerprint` (a list of strings, default
 replace-not-append setting: a job or `defaults` block that supplies its own
 `fingerprint` overrides the default list entirely. Plain list concatenation
 would silently prepend the three default entries, making custom Sentry issue
-grouping impossible. See [Reporting](Reporting) for the Sentry reporter.
+grouping impossible. See [reporting](Reporting) for the Sentry reporter.
 
 `environment`, `secrets`, and `fingerprint` are the only exceptions; all
 other list-valued options concatenate.
 
 ## The `include` directive
 
-`include` is an optional list of file paths. Each path is resolved
-relative to the directory of the **including** file
-(`os.path.join(os.path.dirname(path), include)`). An include path is an
-ordinary string value, so it may itself use a `${VAR}` reference (e.g.
-`- ${ENVIRONMENT:-prod}.yaml`); each file is also expanded against the
-environment as it is parsed, so an included file resolves its own `${VAR}`
-references (see
-[Environment-Variable Interpolation](Environment-Variable-Interpolation)). An
-included file may be
-YAML or a [classic crontab](Classic-Crontabs) (same recognition rules as
-`-c`); note that crontab entries always carry the built-in defaults, so, like
-any included file's jobs, they do not pick up the including file's
-`defaults`. Included files are parsed recursively with `parse_config_file`,
-and their results are merged into the including file as follows:
+`include` is an optional list of file paths. Each path is resolved relative to
+the directory of the **including** file
+(`os.path.join(os.path.dirname(path), include)`).
+
+An include path is an ordinary string value, so it may itself use a `${VAR}`
+reference, such as `- ${ENVIRONMENT:-prod}.yaml`. Each file is also expanded
+against the environment as it is parsed, so an included file resolves its own
+`${VAR}` references (see
+[environment-variable interpolation](Environment-Variable-Interpolation)).
+
+An included file may be YAML or a [classic crontab](Classic-Crontabs) (same
+recognition rules as `-c`). Crontab entries always carry the built-in
+defaults, so, like any included file's jobs, they do not pick up the including
+file's `defaults`.
+
+Included files are parsed recursively with `parse_config_file`, and their
+results are merged into the including file as follows:
 
 - **Jobs** from included files are appended to this file's job list. Crucially,
-  these jobs arrive **already fully constructed** by the included file's own
+  they arrive **already fully constructed** by the included file's own
   `parse_config_string`, so they carry only **their own file's defaults** (and
   `DEFAULT_CONFIG`). A `defaults` block in the *including* file does **not**
-  retro-apply to jobs that came from an included file.
+  retro-apply to jobs from an included file.
 - **Defaults** from included files are merged together (in include order) into
-  `inc_defaults_merged`, which is folded into the merge precedence at step 2
-  above, i.e. included defaults affect only this file's **inline** jobs, not
-  the included files' own jobs.
-- **`web`** from an included file is adopted if this file has none; if both
+  `inc_defaults_merged`, which is folded into step 2 of the earlier merge
+  precedence. That is, included defaults affect only this file's
+  **inline** jobs, not the included files' own jobs.
+- **`web`** from an included file is adopted if this file has none. If both
   define `web`, parsing raises `ConfigError("multiple web configs")`.
-- **`logging`** from an included file is adopted if this file has none; if both
+- **`logging`** from an included file is adopted if this file has none. If both
   define `logging`, parsing raises `ConfigError("multiple logging configs")`.
 
-The intended use is to put common definitions (reporting defaults, shell,
-environment, etc.) in a fragment named so directory mode skips it (e.g. with a
-leading underscore), and `include` it from each real config file. For example:
+The intended use is to put common definitions (reporting defaults, `shell`, and
+`environment`) in a fragment named so directory mode skips it, for example with
+a leading underscore, and `include` it from each real config file. For example:
 
 `_inc.yaml` (skipped by directory mode; provides shared `defaults`, `web`, and
 `logging`):
@@ -284,10 +296,12 @@ also defined jobs, those jobs would carry `_inc.yaml`'s own defaults and would
 is threaded through the recursive include parse. A file that includes itself,
 directly or transitively, raises a clear
 `ConfigError("include cycle detected at <path>")` instead of recursing until a
-`RecursionError`. The `_seen` set is scoped to a single
-top-level `parse_config_file` call (it starts empty), so two independent files
-that both include a common fragment are **not** flagged as a cycle: diamond
-includes are allowed; only true cycles are rejected.
+`RecursionError`.
+
+The `_seen` set is scoped to a single top-level `parse_config_file` call and
+starts empty, so two independent files that both include a common fragment are
+**not** flagged as a cycle: diamond includes are allowed; only true
+cycles are rejected.
 
 In directory mode, `_seen` is *not* shared across the directory's files: each
 file in the directory is parsed with its own fresh cycle-detection state.

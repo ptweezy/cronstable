@@ -1,29 +1,29 @@
-# MCP Server (Model Context Protocol)
+# MCP server (Model Context Protocol)
 
 cronstable ships an optional [Model Context Protocol](https://modelcontextprotocol.io)
 server, so an AI agent (Claude Desktop / Code, Cursor, VS Code Copilot,
 ChatGPT connectors) can drive cronstable the way an operator drives the
-[dashboard](Web-Dashboard): **observe** every job, DAG, the cluster/fleet,
-metrics and the durable state store, and, when you opt in, **act** (run,
-cancel, [pause or resume](Pausing-Jobs) a job, trigger / backfill / approve
-a DAG).
+[dashboard](Web-Dashboard): **observe** every job, DAG (directed acyclic
+graph), the cluster/fleet, metrics, and the durable state store, and, when you
+opt in, **act** (run, cancel, [pause or resume](Pausing-Jobs) a job, trigger,
+backfill, or approve a DAG).
 
 It is served two ways from the same code:
 
 - **`POST /mcp`** on the existing [`web.listen`](HTTP-API) addresses, a
   stateless [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
   JSON-RPC endpoint that inherits the web API's `authToken` / unix-socket auth.
-- **`cronstable mcp`**, a featherweight **stdio bridge** that desktop clients
-  launch as a subprocess; it forwards frames to a running daemon's `/mcp`.
+- **`cronstable mcp`**, a small **stdio bridge** that desktop clients launch as
+  a subprocess. It forwards frames to a running daemon's `/mcp`.
 
-It is hand-rolled in pure Python with **no new dependencies** (the same
+It is hand-written in pure Python with **no new dependencies** (the same
 minimal-dependency stance as the rest of cronstable), targets MCP revision
-`2025-11-25`, and exposes **tools**, **resources** and **prompts**.
+`2025-11-25`, and exposes **tools**, **resources**, and **prompts**.
 
 ## Enabling it
 
 The server is **off by default**. Add an [`mcp`](Configuration-Reference#mcp)
-section (it rides the [`web`](HTTP-API) listeners, so a `web` section is
+section (it uses the [`web`](HTTP-API) listeners, so a `web` section is
 required):
 
 ```yaml
@@ -37,8 +37,8 @@ mcp:
   enabled: true
 ```
 
-That serves the **read-only** `observe` toolset. An agent can look but not
-touch. To let it act, opt into more toolsets and turn off `readOnly`:
+That serves the **read-only** `observe` toolset. An agent can read but not
+write. To let it act, opt into more toolsets and turn off `readOnly`:
 
 ```yaml
 mcp:
@@ -71,31 +71,31 @@ default) strips every mutating tool regardless of toolset.
 
 Mutating tools require an explicit `confirm: true` argument, carry honest
 `destructiveHint` annotations, and re-check the same authorization as the REST
-API. `cron_backfill_dag` defaults to `dry_run: true`. It previews the range
-and only executes on `dry_run: false` **and** `confirm: true`.
+API. `cron_backfill_dag` defaults to `dry_run: true`. It previews the range and
+executes only on `dry_run: false` **and** `confirm: true`.
 
-`cron_pause_job` takes `name` plus an optional `durationSeconds` and `note`
+`cron_pause_job` takes `name` plus an optional `durationSeconds` and `note`,
 and holds the job's scheduled fires for the window (one hour when
-`durationSeconds` is omitted); `cron_resume_job` takes `name` and ends the
+`durationSeconds` is omitted). `cron_resume_job` takes `name` and ends the
 pause. Both call the daemon's own pause path with the acting channel recorded
-as `mcp`, so a pause taken by an agent reads as such in the audit fields.
-The observe tools report the resulting `paused` and `sla` state on every job
-payload. Semantics: [Pausing Jobs](Pausing-Jobs) and
-[Late-Run Detection](Late-Run-Detection).
+as `mcp`, so a pause taken by an agent reads as such in the audit fields. The
+observe tools report the resulting `paused` and `sla` state on every job
+payload. Semantics: [pausing jobs](Pausing-Jobs) and
+[late-run detection](Late-Run-Detection).
 
 The three schedule-authoring tools make an agent a competent schedule
-**author**, not just a reader, with the daemon's own engine as the
-authority: `cron_validate_schedule` parses and lints any expression
-before it becomes a job (the engine's exact error with its dialect
-hints, [lint findings](Schedule-Linting), the first upcoming
-fire, and prospective [`H` slot](Hashed-Schedules) resolution via
-`seed`; the dialect includes the
-[business-day forms](Business-Day-Schedules) `L-n`, `nW`, `LW` and
-`d#n`), `cron_explain_schedule` adds the next N fires in a chosen zone
-so the agent can round-trip a plain-English description of a proposed
-schedule to you before it ships, and `cron_why_no_run` explains field by
-field why a job's schedule did or did not fire at a timestamp (see
-[Why Didn't It Run?](Why-No-Run)).
+**author**, not only a reader, with the daemon's own engine as the authority:
+
+- `cron_validate_schedule` parses and lints any expression before it becomes a
+  job: the engine's exact error with its dialect hints,
+  [lint findings](Schedule-Linting), the first upcoming fire, and prospective
+  [`H` slot](Hashed-Schedules) resolution with `seed`. The dialect includes the
+  [business-day forms](Business-Day-Schedules) `L-n`, `nW`, `LW` and `d#n`.
+- `cron_explain_schedule` adds the next N fires in a chosen zone, so the agent
+  can round-trip a plain-English description of a proposed schedule to you
+  before it ships.
+- `cron_why_no_run` explains field by field why a job's schedule did or did not
+  fire at a timestamp (see [why a job didn't run](Why-No-Run)).
 
 ### Resources (read-only context)
 
@@ -117,7 +117,7 @@ resources. Slash-command workflows that chain the read tools:
 - `why_did_dag_run_fail(dag, run_key)`: walk a failed DAG run (needs the
   `dags` toolset)
 - `blast_radius(target)`: scope what else is at risk
-- `fleet_health_summary()`: a wallboard-style digest
+- `fleet_health_summary()`: a wallboard-style summary
 - `backfill_plan(dag, from, to)`: reason about a backfill before running it
   (needs the `dags` toolset)
 
@@ -155,27 +155,28 @@ Point the client's MCP config at the stdio bridge. For Claude Desktop
 }
 ```
 
-Cursor uses `~/.cursor/mcp.json` (`mcpServers` wrapper); VS Code uses
+Cursor uses `~/.cursor/mcp.json` (`mcpServers` wrapper). VS Code uses
 `.vscode/mcp.json` (`servers` wrapper, with an explicit `type`). Remote
-Streamable-HTTP entries take a `url` and the `Authorization` header shown above.
+Streamable-HTTP entries take a `url` and the `Authorization` header shown
+earlier.
 
 ### The stdio bridge
 
 `cronstable mcp` reads newline-delimited JSON-RPC on stdin and forwards each
 frame to `<url>/mcp`, writing replies to stdout (only frames go to stdout; logs
-go to stderr). It needs a **reachable running daemon**, the right model for an
-ops tool. Flags:
+go to stderr). It needs a **reachable running daemon**, the right design for an
+operations tool. Flags:
 
 - `--url` (default `http://127.0.0.1:8080`): the daemon's web base URL
 - `--token` / `--token-env`: the bearer token (defaults to the
   `CRONSTABLE_WEB_TOKEN` env var if set)
-- `--protocol-version`: pin the `MCP-Protocol-Version` header the bridge
-  sends before `initialize` completes (default `2025-11-25`); once
-  `initialize` returns, the bridge adopts the server's negotiated version
+- `--protocol-version`: pin the `MCP-Protocol-Version` header the bridge sends
+  before `initialize` completes (default `2025-11-25`); after `initialize`
+  returns, the bridge adopts the server's negotiated version
 - `--timeout` (default `30.0`): per-request deadline, in seconds, for each
   forwarded frame
-- `--check`: handshake the endpoint (`initialize` + `tools/list`) and exit,
-  a quick "is it wired up?" test
+- `--check`: handshake the endpoint (`initialize` + `tools/list`) and exit, a
+  quick wiring check
 
 ```shell
 $ cronstable mcp --url http://127.0.0.1:8080 --token-env CRONSTABLE_WEB_TOKEN --check
@@ -184,30 +185,38 @@ mcp check: ok - protocol 2025-11-25, 29 tool(s) at http://127.0.0.1:8080/mcp
 
 ## Security
 
-The MCP surface fits cronstable's hardened posture and is safe by default:
+The MCP surface matches cronstable's hardening and is safe by default:
 
-- **Read-only by default.** `readOnly: true` strips every mutating tool; an
-  agent gets look-but-don't-touch access until you opt in.
+- **Read-only by default.** `readOnly: true` strips every mutating tool. Until
+  you opt in, an agent can read but not act.
+
 - **Inherits the web auth.** `/mcp` sits behind `web.authToken` exactly like
   the data routes. It is never public. If you enable `mcp` with **no** token
   on a routable (non-loopback, non-socket) listener, cronstable **fails
   closed**: it refuses to start (with no token there is no auth middleware at
-  all, so `/mcp` would be wide open). Restrict `web.listen` to loopback /
-  unix sockets, set `web.authToken`, set `web.tls.clientCa` so an `https://`
-  listener authenticates its callers by certificate (see
-  [Listener TLS](Listener-TLS)), or, only if the endpoint is protected by
-  other means (an mTLS-terminating proxy), set `mcp.allowUnauthenticated:
-  true`. A plain `https://` listener does not lift the gate: encryption is not
-  caller authentication.
+  all, so `/mcp` would be unauthenticated). Instead:
+
+  - Restrict `web.listen` to loopback or unix sockets.
+  - Set `web.authToken`.
+  - Set `web.tls.clientCa` so an `https://` listener authenticates its callers
+    by certificate (see [listener TLS](Listener-TLS)).
+  - Only if the endpoint is protected by other means (an mTLS (mutual TLS)
+    terminating proxy), set `mcp.allowUnauthenticated: true`.
+
+  A plain `https://` listener does not lift the gate: encryption is not caller
+  authentication.
+
 - **Origin + body defenses.** A present, non-allow-listed `Origin` is refused
-  `403` (DNS-rebinding defense; browser clients go on `mcp.allowedOrigins`),
-  and an oversized request body is refused `413`.
-- **Human-in-the-loop for writes.** Mutating tools require `confirm: true`,
-  backfills default to a dry-run preview, and every action re-checks the REST
+  `403` (a DNS-rebinding defense; browser clients go on `mcp.allowedOrigins`).
+  An oversized request body is refused `413`.
+
+- **Human-in-the-loop for writes.** Mutating tools require `confirm: true`.
+  Backfills default to a dry-run preview. Every action re-checks the REST
   authorization, including scope promotions: `cron_decide_gate` requires the
   presented token to hold the `approve` scope, exactly like the REST decision
   route. Tool annotations are honest hints. The real guards are the read-only
   default, the confirm gate, and server-side authorization.
+
 - **Redaction.** `cron_inspect_state` mirrors the dashboard's metadata-only
   stance: KV values become a size/type summary and secret **names** are shown
   without values.

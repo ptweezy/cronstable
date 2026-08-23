@@ -1,0 +1,60 @@
+#!/sbin/openrc-run
+# OpenRC service for the Alpine package, installed as /etc/init.d/cronstable.
+#
+#     rc-update add cronstable default
+#     rc-service cronstable start
+#
+# Settings live in /etc/conf.d/cronstable, which openrc-run sources before this
+# script body runs.
+
+supervisor=supervise-daemon
+
+name="cronstable"
+description="cronstable job scheduler"
+description_reload="reparse the configuration in place"
+
+# := rather than =, and never an empty string: supervise-daemon.sh interpolates
+# these with ${var+FLAG} (plus, not colon-plus), so a set-but-empty value still
+# emits the flag and the NEXT token becomes its argument, quietly corrupting the
+# command line.
+: ${cronstable_confdir:="/etc/cronstable.d"}
+: ${cronstable_user:="cronstable:cronstable"}
+: ${cronstable_statedir:="/var/lib/cronstable"}
+: ${cronstable_logfile:="/var/log/cronstable.log"}
+
+command="/usr/bin/cronstable"
+command_args="-c $cronstable_confdir $cronstable_opts"
+command_user="$cronstable_user"
+output_log="$cronstable_logfile"
+error_log="$cronstable_logfile"
+
+# cronstable drains its running jobs on SIGTERM: it stops scheduling, waits for
+# the ones in flight, then terminates them itself. supervise-daemon's default
+# stop schedule is TERM followed by KILL after five seconds, which would cut
+# that drain short, and `stopsig` is silently ignored under this supervisor, so
+# the window has to be bought here. Raise the first number if your jobs
+# legitimately run longer than two minutes.
+retry="${cronstable_retry:-TERM/120/KILL/10}"
+
+extra_started_commands="reload"
+
+depend() {
+	need localmount
+	use logger dns net
+	after firewall
+}
+
+start_pre() {
+	# Ownership is applied here rather than in the package, because adduser -S
+	# allocates the uid dynamically and apk cannot record it.
+	checkpath -d -m 0750 -o "$command_user" "$cronstable_statedir"
+	checkpath -f -m 0640 -o "$command_user" "$cronstable_logfile"
+}
+
+# SIGHUP is the reload verb: reparse the configuration without dropping the
+# schedule or interrupting running jobs.
+reload() {
+	ebegin "Reloading ${name}"
+	$supervisor "$RC_SVCNAME" --signal HUP
+	eend $?
+}

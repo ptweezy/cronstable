@@ -1,11 +1,11 @@
-# Environment-Variable Interpolation
+# Environment-variable interpolation
 
 cronstable expands `${VAR}` references in a configuration's **string values**
-against its own process environment when it loads the file. One config can then
-be deployed unchanged to several environments, with the per-environment pieces
-(a listen address, a state path, a timezone, a webhook URL) supplied as
-environment variables rather than templated in by a wrapper script. The
-expansion is implemented in `cronstable/config.py` and runs on every config
+against its own process environment when it loads the file. You can then deploy
+one config unchanged to several environments, with the per-environment pieces
+(a listen address, a state path, a time zone, a webhook URL) supplied as
+environment variables rather than by a wrapper script that templates them in.
+The expansion is implemented in `cronstable/config.py` and runs on every config
 load, including a hot reload.
 
 **On this page:**
@@ -21,12 +21,12 @@ load, including a hot reload.
 
 | Form | Meaning |
 | --- | --- |
-| `${VAR}` | The value of environment variable `VAR`. A variable that is set but empty expands to the empty string. An **unset** `VAR` is a load-time error (see [Unset variables](#unset-variables)). |
-| `${VAR:-default}` | The value of `VAR` when it is set and non-empty, otherwise the literal `default`. This mirrors the shell's `:-`: an unset **or** empty `VAR` yields `default`. The default runs to the closing `}` and may contain any character except `}`. |
+| `${VAR}` | The value of environment variable `VAR`. A set but empty variable expands to the empty string. An **unset** `VAR` is a load-time error (see [Unset variables](#unset-variables)). |
+| `${VAR:-default}` | The value of `VAR` when it is set and non-empty, otherwise the literal `default`. As in the shell's `:-`, an unset **or** empty `VAR` yields `default`. The default runs to the closing `}` and may contain any character except `}`. |
 | `$$` | A literal `$`. Use it to write a value that should contain a real dollar sign, or to keep a literal `${...}` (`$${VAR}` stays `${VAR}`). |
 
 A variable name is a letter or underscore followed by letters, digits, or
-underscores. Only these braced forms are recognized: a lone `$`, a bare
+underscores. Only these braced forms are recognized. A lone `$`, a bare
 `$VAR` without braces, and a malformed `${...}` (unclosed, or a name with
 unsupported characters) are all left exactly as written, so a value that never
 used the syntax is passed through verbatim.
@@ -50,14 +50,14 @@ jobs:
 ## What gets expanded
 
 Expansion runs **after** the document is validated against the schema, over the
-parsed values, so it applies to every field the schema accepts as a string in
-the `jobs`, `dags`, `web`, `state`, `cluster`, `mcp`, `defaults`, and `include`
-sections (the `logging` section is skipped, see below). A `${VAR}` may sit
-anywhere inside such a string.
+parsed values. It therefore applies to every field the schema accepts as a
+string in the `jobs`, `dags`, `web`, `state`, `cluster`, `mcp`, `defaults`, and
+`include` sections (the `logging` section is skipped, see the next section). A
+`${VAR}` may sit anywhere inside such a string.
 
 Because it runs post-validation, a numeric key cannot itself be a bare
-`${VAR}`: `smtpPort: ${PORT}` fails schema validation before expansion is ever
-reached, since `${PORT}` is not an integer. Put the variable inside a string
+`${VAR}`. `smtpPort: ${PORT}` fails schema validation before expansion is ever
+reached, because `${PORT}` is not an integer. Put the variable inside a string
 instead. A listen address carries its port inside a string
 (`"0.0.0.0:${PORT}"`), which is why the port can come from the environment.
 
@@ -65,7 +65,7 @@ Path-typed fields are strings, so they expand like any other. The one to watch
 is a job's [`workingDirectory`](Commands-and-Environment#workingdirectory),
 because the `command` beside it behaves the opposite way. The directory is
 expanded at load against the **daemon's** environment, then `~`-expanded and
-made absolute, while the command is handed to the runtime shell verbatim.
+made absolute. The command is handed to the runtime shell verbatim.
 `workingDirectory: ${JOB_ROOT}/importer` is settled once, at load;
 `command: cd ${JOB_ROOT}` is never touched.
 
@@ -80,8 +80,8 @@ expansion syntax rather than cronstable's.
 - a DAG task's `command` and `shell`,
 - a shell reporter's whole `report.shell` block (its `command` and `shell`).
 
-These are handed to a shell at run time, and their `${VAR}` is meant to be
-expanded by that shell against the **job's** environment (its
+These are handed to a shell at run time. That shell is meant to expand their
+`${VAR}` against the **job's** environment (its
 [`environment` / `env_file`](Commands-and-Environment) and staged
 [secrets](Durable-State)), which is assembled per run and is not the daemon's
 environment. So `command: echo ${HOME}` prints the home directory of the user
@@ -90,13 +90,13 @@ To use a load-time environment variable inside a command, set it as a job
 `environment` value (which does expand) and reference that from the command.
 
 **The whole `logging` section** is skipped, because it is passed to Python's
-[`logging.config`](Logging-Configuration) verbatim and a `$`-style formatter
+[`logging.config`](Logging-Configuration) verbatim, and a `$`-style formatter
 (`style: "$"`) legitimately writes `${asctime}` / `${message}` in its `format`
-string. Interpolating them would treat those as environment variables and fail
-an otherwise valid config to load, so cronstable leaves the section for
-`logging.config`. A log path that needs an environment variable can be supplied
-through the process environment that `logging.config` itself reads, or by
-templating the file outside cronstable.
+string. Interpolating those placeholders would treat them as environment
+variables and stop an otherwise valid config from loading, so cronstable
+leaves the section for `logging.config`. For a log path that needs an
+environment variable, supply the path through the process environment that
+`logging.config` itself reads, or template the file outside cronstable.
 
 ## Unset variables
 
@@ -110,16 +110,17 @@ to supply a fallback
 ```
 
 The failure happens at load, so [`cronstable --validate-config`](CLI-Reference)
-catches a missing variable in CI or a deploy check and exits non-zero before the
-scheduler ever starts. Supply a `:-default` for anything that has a sensible
-fallback, and leave it off for the variables a deployment must provide.
+catches a missing variable in continuous integration or a deploy check and exits
+non-zero before the scheduler ever starts. Supply a `:-default` for anything
+that has a sensible fallback, and leave it off for the variables a deployment
+must provide.
 
 ## Multi-file config
 
 Each file is expanded against the environment as it is parsed, so an
-[included](Includes-and-Defaults) file resolves its own `${VAR}` references.
-Because an `include:` entry is itself an ordinary string value, an include path
-can also be built from the environment:
+[included file](Includes-and-Defaults) resolves its own `${VAR}` references.
+Because an `include:` entry is itself an ordinary string value, you can also
+build an include path from the environment:
 
 ```yaml
 include:
@@ -127,20 +128,21 @@ include:
 ```
 
 The environment is read at load time. A running daemon reloads its config
-periodically and on the usual triggers, but the reload is skipped when no source
-file has changed on disk; a change to an environment variable alone does not
-have a file to notice, so restart (or touch the config) to pick it up.
+periodically and on the usual triggers, but it skips the reload when no source
+file has changed on disk. Changing an environment variable does not change a
+file on disk, so the daemon has nothing to detect. Restart (or touch the
+config) to pick it up.
 
 ## Effect on the job-set id
 
 The [job-set id](Job-Set-ID) is a fingerprint of the **effective** config, and
 expansion happens before that fingerprint is taken, so it hashes the expanded
-values. A config that interpolates environment variables into
-fingerprinted fields therefore produces a **different id per environment**: two
-deployments that resolve `${REGION}` to different values are, by design, running
-different job sets. Keep environment variables out of fingerprinted job fields
-if you need one id to compare across environments, or use them freely and expect
-the id to track the environment.
+values. A config that interpolates environment variables into fingerprinted
+fields therefore produces a **different id per environment**. Two deployments
+that resolve `${REGION}` to different values are, by design, running different
+job sets. If you need one id to compare across environments, keep environment
+variables out of fingerprinted job fields. Otherwise, use them freely and
+expect the id to track the environment.
 
 ## Worked example
 
@@ -167,8 +169,8 @@ jobs:
             value: ${ALERT_WEBHOOK}
 ```
 
-`STATE_DIR` and `ALERT_WEBHOOK` are required (an unset one fails
-`--validate-config`); `WEB_PORT` and `TZ` fall back to their defaults; and
+`STATE_DIR` and `ALERT_WEBHOOK` are required, and an unset one fails
+`--validate-config`. `WEB_PORT` and `TZ` fall back to their defaults.
 `$REGION` inside `command` is left for the job's shell to expand at run time.
 
 ## See also
