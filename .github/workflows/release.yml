@@ -3088,6 +3088,18 @@ jobs:
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # On a re-run the tag is already on the remote: skip it when it names
+          # HEAD, fail when it names another commit. ls-remote peels the annotated
+          # tag to its commit, which a shallow checkout cannot do locally.
+          existing="$(git ls-remote --tags origin "refs/tags/$NEW^{}" "refs/tags/$NEW" | tail -n1 | cut -f1)"
+          if [ -n "$existing" ]; then
+            if [ "$existing" = "$(git rev-parse HEAD)" ]; then
+              echo "tag $NEW already points at HEAD; skipping"
+              exit 0
+            fi
+            echo "::error::tag $NEW already exists at $existing, not HEAD $(git rev-parse HEAD)"
+            exit 1
+          fi
           git tag -a "$NEW" -m "Release $NEW"
           # The default GITHUB_TOKEN is the GitHub Actions *App*, and GitHub
           # forbids an App from pushing a ref that creates/updates any file under

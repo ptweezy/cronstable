@@ -31,6 +31,8 @@ license: MIT
 contents:
   - src: ${PKG_BINARY}
     dst: /usr/bin/cronstable
+    # nfpm expands ${VAR} in a contents entry only when it carries this flag.
+    expand: true
     file_info:
       mode: 0755
   - src: ./packaging/systemd/cronstable.service
