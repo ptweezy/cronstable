@@ -1,5 +1,43 @@
 # History
 
+## 1.2.46
+
+- The sealed push ciphertext is capped at 3800 base64 characters, derived
+  from a measurement: APNs' 4096-byte frame, minus the 189 bytes the relay's
+  own envelope costs (asserted by the relay's `tests/apns-size.spec.ts`
+  against the payload it builds), minus a 107-byte reserve for future
+  protocol fields. `test_ciphertext_cap_fits_the_apns_frame_with_its_reserve`
+  re-derives the arithmetic on the daemon side so neither side can drift
+  onto an estimate. Under `x25519` that leaves 2802 bytes of plaintext,
+  about 35 log-tail lines on a typical failure alert; the earlier
+  3000-character cap left 1202 bytes of the frame unused.
+- Push alerts name their sealing suite. `POST /push/devices` accepts an
+  optional `suite`, `GET /push/devices` reports one on every record, and the
+  relay envelope carries it, so the relay and the companion app read the
+  algorithm instead of inferring it from a key or ciphertext length.
+  `x25519` (libsodium sealed box) is the default, and an absent value reads
+  as `x25519` everywhere, so existing pairings and older apps keep working.
+  `xwing` (X-Wing: ML-KEM-768 + X25519) is registered with its key and
+  ciphertext sizes but is unsealable until PyNaCl exposes libsodium 1.0.22's
+  `crypto_kem_*`; the daemon refuses a pairing under it with a 400 instead
+  of storing a record whose every alert would fail. Public-key length is
+  checked against the named suite at pairing.
+- Payload fitting is per device: each device's copy of an alert is trimmed
+  to its own suite's plaintext budget, so a device paired under a
+  wider-ciphertext suite is trimmed harder without taking log lines from
+  the devices beside it. The collapse id is derived from the untrimmed
+  payload. It hashes `run_id`, which fitting drops as a last resort, so an
+  oversized alert previously coalesced under a different id than the same
+  alert reported by a node whose copy fit; per-device fitting would have
+  widened that to one id per suite.
+- A daemon posting to a relay that enforces a smaller cap recovers instead
+  of dropping the page. 3000 characters is the floor every conforming relay
+  accepts. When a ciphertext over the floor comes back 400 with an error
+  naming `ciphertext`, the daemon re-fits that device's payload to the
+  floor, posts once more, and warns once per process that the relay is
+  behind. The alert reaches the phone with fewer log lines. Deploy the relay
+  before the daemons that post to it.
+
 ## 1.2.45
 
 - Releases now attach `cronstable-linux-armv6`, a glibc ARMv6 hard-float

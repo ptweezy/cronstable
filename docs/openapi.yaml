@@ -1105,8 +1105,8 @@ paths:
       operationId: pairPushDevice
       x-required-scope: control
       description: >-
-        Register a device (X25519 public key + platform push token) for
-        encrypted alerts. Pairing is keyed on the public key: the same key
+        Register a device (public key, its sealing suite, and platform push
+        token) for encrypted alerts. Pairing is keyed on the public key: the same key
         pairing again updates its record in place (push tokens rotate,
         phones get renamed) and keeps its id and createdAt, so revocation
         references stay stable.
@@ -1121,7 +1121,18 @@ paths:
                 platform: { type: string, maxLength: 32 }
                 publicKey:
                   type: string
-                  description: The device X25519 public key, base64 (32 bytes).
+                  description: >-
+                    The device public key, base64. Its length must match
+                    the suite: 32 bytes for `x25519`.
+                suite:
+                  type: string
+                  description: >-
+                    Sealing suite the key belongs to. Optional; omitted
+                    means `x25519`. Known values: `x25519`
+                    (libsodium sealed box), `xwing` (X-Wing, ML-KEM-768 +
+                    X25519). A suite the daemon cannot seal to is
+                    refused at pairing rather than stored.
+                  default: x25519
                 pushToken: { type: string, maxLength: 512 }
               required: [name, platform, publicKey, pushToken]
       responses:
@@ -1558,7 +1569,12 @@ components:
         platform: { type: string }
         publicKey:
           type: string
-          description: The device X25519 public key, base64.
+          description: The device public key, base64.
+        suite:
+          type: string
+          description: >-
+            Sealing suite the key belongs to (`x25519`, `xwing`). Always
+            present; a record that names none reports `x25519`.
         fingerprint:
           type: string
           nullable: true
