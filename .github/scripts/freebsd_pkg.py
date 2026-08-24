@@ -20,6 +20,10 @@ Layout follows the ports convention rather than the Linux one: PREFIX is
 configuration ships as a ``.sample`` marked ``@sample`` in the plist, so pkg
 creates the real file on install and removes it on deinstall only when the
 administrator has not edited it.
+
+``@sample`` is defined by the ports tree (Keywords/sample.ucl), which the lean
+build VM does not carry, so a vendored copy ships in packaging/freebsd/Keywords
+and PLIST_KEYWORDS_DIR points pkg at it.
 """
 
 import json
@@ -132,6 +136,7 @@ def main(argv):
             "-v",
         ],
         check=True,
+        env=dict(os.environ, PLIST_KEYWORDS_DIR=os.path.join(PACKAGING, "Keywords")),
     )
     built = [name for name in os.listdir(outdir) if name.startswith("cronstable-")]
     if len(built) != 1:
