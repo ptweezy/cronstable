@@ -37,6 +37,34 @@
   floor, posts once more, and warns once per process that the relay is
   behind. The alert reaches the phone with fewer log lines. Deploy the relay
   before the daemons that post to it.
+- The terminal dashboard paints fewer bytes per frame. `Painter.style`
+  returns a plain foreground span as one concatenation, `cut_to_width`
+  slices ASCII runs between escapes instead of walking them character by
+  character, `scrub_non_sgr` and `sanitize_log_line` return printable text
+  before their regex passes, `panel_frame` builds its border spans once per
+  panel, and the jobs table shares one glyph table, one clock read and its
+  separator and marker spans across every row of a frame. The spark column
+  is styled once per poll rather than once per frame.
+- The log drawer with wrap on carries its row tally between frames: a frame
+  counts only the lines the buffer gained, a head trim at the 5000-line cap
+  drops the same number of leading entries, and the visible window is found
+  by bisection. A steady repaint of a full buffer measures 0.07 ms locally
+  against 0.77 ms.
+- The schedule tab parses the expression once per job and holds its
+  next-fire list until the first fire is due, then rebuilds the list from
+  the held parse. The history and resources tabs, the incident timeline
+  entries and the fleet matrix are built once per payload and sliced per
+  frame; a retheme rebuilds the two that carry ink.
+- The command palette ranks its rows once per query and payload, and typing
+  or pressing Esc does not rank at all. A palette frame over 2,000 jobs
+  measures 0.11 ms locally against 12.4 ms.
+- A release can override the performance gate. The manual run form has a
+  `perf` dropdown (`gate`, `accept`, `ignore`), and a pushed commit subject
+  that starts with `[perf:ignore]` does for everything what `[perf:accept]`
+  does for relative regressions: the comparison still runs and lands in the
+  release notes under a line naming the override, but a regression, a budget
+  breach, a dead gate or a failed perf job no longer holds the release. The
+  strongest request in a push wins.
 
 ## 1.2.45
 

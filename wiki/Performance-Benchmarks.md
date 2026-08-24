@@ -76,6 +76,18 @@ listed in the release notes, but it does not fail the gate. Only commit
 subjects are scanned, exactly like the `[release]` marker described in
 [contributing and releasing](Contributing-and-Releasing).
 
+## Overriding the gate
+
+`[perf:accept]` excuses relative regressions only. To publish regardless of
+what the perf job finds, start a pushed commit's subject with `[perf:ignore]`,
+or pick `ignore` in the `perf` dropdown of a manual run (which also offers
+`accept`). The comparison still runs and still lands in the release notes,
+under a heading that names the override, but nothing in it gates: relative
+regressions, absolute budget breaches and dead gates all become warnings, and
+a perf job that fails outright does not hold the release either. When a push
+carries both markers, or a marker and a dropdown choice, the strongest request
+wins: `ignore` over `accept` over the default.
+
 ## Running the suite yourself
 
 ```sh
