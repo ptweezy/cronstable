@@ -141,11 +141,15 @@ $ curl -X POST http://127.0.0.1:8080/push/devices \
 }
 ```
 
-`publicKey` must be base64 decoding to exactly 32 bytes and be a usable
-X25519 public key. At pairing, rather than on the first alert, the daemon
-rejects an all-zero or low-order key that libsodium refuses to seal to.
-`name`, `platform`, and `pushToken` are bounded strings. Validation failures
-are a `400` naming the field.
+`publicKey` must be base64 decoding to the length its `suite` requires (32
+bytes for the default `x25519`) and be a usable key for that suite. At
+pairing, rather than on the first alert, the daemon rejects an all-zero or
+low-order X25519 key that libsodium refuses to seal to. `suite` is optional
+and defaults to `x25519`.
+The daemon refuses a pairing that names a suite it cannot seal to, rather
+than storing a record whose every alert would fail. `name`, `platform`, and
+`pushToken` are bounded strings. Validation failures are a `400` naming the
+field.
 
 Re-pairing the same public key (push tokens rotate; phones get renamed)
 answers `200` with `created: false` and updates `name`/`platform`/`pushToken`
@@ -266,12 +270,20 @@ full field-by-field schema is in the
 [relay protocol document](https://github.com/ptweezy/cronstable/blob/main/docs/relay-protocol.md).
 
 APNs rejects notifications over 4096 bytes, so the daemon caps the sealed,
-base64-encoded ciphertext at 3000 characters, leaving the relay headroom
-for its own envelope. The daemon trims an oversized payload in order:
-log-tail lines oldest-first (the newest lines carry the failure), then long
-free-text fields halved (never below 64 characters), then the optional
+base64-encoded ciphertext at 3800 characters: 4096 minus the 189 bytes of the
+relay's own APNs envelope, minus a 107-byte reserve for future protocol
+fields. The daemon fits each device's payload to that device's own suite
+budget (2802 bytes of plaintext under `x25519`), so a device paired under a
+wider-ciphertext suite is trimmed harder without costing the devices beside
+it any log lines. It trims an oversized payload in order: log-tail lines
+oldest-first (the newest lines carry the failure), then long free-text
+fields halved (never below 64 characters), then the optional
 context fields dropped. The alert's identity (`name`, `kind`, `host`) is
-never trimmed. There is no per-job template: the companion app renders the
+never trimmed. A relay that enforces the 3000-character floor (the smallest
+cap the relay protocol allows) answers a larger ciphertext with a 400. The
+daemon then re-fits that alert to the floor, posts it again, and logs once
+that the relay is behind, so the page lands with fewer log lines instead of
+bouncing. There is no per-job template: the companion app renders the
 decrypted fields itself.
 
 ## Failure behavior
