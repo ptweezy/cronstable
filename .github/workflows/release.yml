@@ -1867,14 +1867,30 @@ jobs:
             esac
             venv/bin/python .github/scripts/assert_arch.py dist/cronstable "$spec"
             mv dist/cronstable "dist/cronstable-freebsd-${{ matrix.arch }}"
+            # Package with FreeBSD's own pkg(8), in the VM that targets the
+            # ABI the package declares; freebsd_pkg.py explains why fpm on
+            # the Linux runner is not equivalent. The system python3.14
+            # runs it: the script is stdlib-only and the venv is about to
+            # be discarded.
+            python3.14 .github/scripts/freebsd_pkg.py               "$SETUPTOOLS_SCM_PRETEND_VERSION"               "dist/cronstable-freebsd-${{ matrix.arch }}" dist/pkgout
+            # Install the package for real before it ships: this executes
+            # the embedded post-install (service account via pw) and proves
+            # the payload runs from its installed path.
+            pkg add dist/pkgout/cronstable-*.pkg
+            /usr/local/bin/cronstable --version
+            test -x /usr/local/etc/rc.d/cronstable
+            pw usershow cronstable >/dev/null
+            mv dist/pkgout/cronstable-*.pkg "dist/cronstable-freebsd-${{ matrix.arch }}.pkg"
             # Keep the copyback to the artifact: the venv and PyInstaller's
             # work tree are hundreds of megabytes of rsync the host has no
             # use for.
-            rm -rf venv build get-pip.py
+            rm -rf venv build get-pip.py freebsd-pkg-work dist/pkgout
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-freebsd-${{ matrix.arch }}
-          path: dist/cronstable-freebsd-${{ matrix.arch }}
+          path: |
+            dist/cronstable-freebsd-${{ matrix.arch }}
+            dist/cronstable-freebsd-${{ matrix.arch }}.pkg
           if-no-files-found: error
           retention-days: 7
 

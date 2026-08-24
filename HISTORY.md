@@ -1,6 +1,6 @@
 # History
 
-## 1.2.46
+## 1.2.47
 
 - The sealed push ciphertext is capped at 3800 base64 characters, derived
   from a measurement: APNs' 4096-byte frame, minus the 189 bytes the relay's
