@@ -175,9 +175,11 @@ python benchmarks/compare.py --baseline before.json --current after.json --md di
 ```
 
 To ship an intentional, measured regression, start a pushed commit's subject
-with `[perf:accept]` (subjects only, like the `[release]` marker). The full
-harness reference, including how to add a benchmark, is in
-[benchmarks/README.md](benchmarks/README.md).
+with `[perf:accept]` (subjects only, like the `[release]` marker). To publish
+regardless of what the perf job finds, use `[perf:ignore]` instead, or the
+`perf` dropdown of a manual run: the comparison still runs and is attached to
+the release, but nothing in it gates. The full harness reference, including
+how to add a benchmark, is in [benchmarks/README.md](benchmarks/README.md).
 
 ## Releasing
 
@@ -214,7 +216,9 @@ commit wins. (File contents like this document are never scanned; only commit
 subjects are.)
 
 You can also release manually without a marker: **Actions → release → Run
-workflow**, then pick the bump level from the dropdown.
+workflow**, then pick the bump level from the dropdown. The same form has a
+`perf` dropdown that overrides the perf gate: `accept` reports regressions
+without gating on them, `ignore` publishes whatever the perf job finds.
 
 ### What the pipeline does
 

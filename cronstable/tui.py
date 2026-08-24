@@ -41,6 +41,7 @@ utilities -> terminal engine -> API client -> views -> app -> CLI.
 
 import asyncio
 import base64
+import bisect
 import codecs
 import contextlib
 import datetime
@@ -2770,6 +2771,12 @@ INPUT_HOMES = {
 }
 
 
+#: payload types of the per-frame memo slots (see App.__init__)
+_TimelineEntry = tuple[str, Optional[str], str, Any, str, Any]
+_PaletteRow = tuple[str, str, Callable[[], Any]]
+_FleetMatrix = tuple[list[dict[str, Any]], int, int, int, list[str]]
+
+
 class App:
     """State + tasks + key dispatch for the TUI (the page's script tag).
 
@@ -2954,6 +2961,31 @@ class App:
         # resize or a timestamp toggle changes it and clears the memo)
         self._wrap_rows_cache: dict[str, int] = {}
         self._wrap_width = -1
+        # the wrapped buffer's per-entry start rows, carried between
+        # frames and extended by what the buffer gained (see _wrap_starts)
+        self._wrap_tally: Optional[tuple[Any, ...]] = None
+        # single-slot rendered bodies for the drawer's history and
+        # resources tabs, theme-inked like _press_body and cleared with it
+        self._history_body: Optional[tuple[Any, ...]] = None
+        self._res_body: Optional[tuple[Any, ...]] = None
+        # ink-free single-slot memos: the schedule tab's parsed facts, the
+        # palette's match list, the timeline entries, the fleet matrix
+        self._sched_facts: Optional[tuple[Any, ...]] = None
+        self._palette_memo: Optional[
+            tuple[
+                str,
+                list[dict[str, Any]],
+                list[dict[str, Any]],
+                bool,
+                list[_PaletteRow],
+            ]
+        ] = None
+        self._timeline_memo: Optional[
+            tuple[list[dict[str, Any]], bool, list[_TimelineEntry]]
+        ] = None
+        self._fleet_memo: Optional[
+            tuple[dict[str, Any], bool, _FleetMatrix]
+        ] = None
         # last inputs of _log_search_recompute, so a repaint with an
         # unchanged needle and buffer skips the full rescan
         self._log_search_state: Optional[
@@ -3833,6 +3865,22 @@ class App:
     ) -> list[tuple[str, Optional[str], str, Any, str, Any]]:
         raise NotImplementedError
 
+    def _timeline_cached(
+        self,
+    ) -> list[tuple[str, Optional[str], str, Any, str, Any]]:
+        """:meth:`timeline_entries` for the current payload and filter,
+        built once rather than per frame and per key: the entries are a
+        pure function of the two, and the slot pins the list it was
+        built from, so a recycled id cannot validate a stale entry."""
+        jobs = self.jobs
+        fail_only = self.timeline_fail_only
+        cached = self._timeline_memo
+        if cached is not None and cached[0] is jobs and cached[1] == fail_only:
+            return cached[2]
+        built = self.timeline_entries()
+        self._timeline_memo = (jobs, fail_only, built)
+        return built
+
     def _compose_drawer(
         self,
         paint: "Painter",
@@ -3964,6 +4012,8 @@ class AppActions(App):
         self._chrome_cache.clear()
         self._press_body = None
         self._week_body = None
+        self._history_body = None
+        self._res_body = None
         self.term.invalidate()
         self.mark()
 
@@ -4446,17 +4496,41 @@ class AppPalette(AppActions):
     def palette_matches(
         self,
     ) -> list[tuple[str, str, Callable[[], Any]]]:
+        """The ranked palette rows for the typed query.
+
+        One build serves the key handler and every frame the palette is
+        open: the rows are a pure function of the query, the two payload
+        lists (swapped wholesale per poll) and the glyph set, and each
+        action reads app state when invoked, not when built.  The slot
+        pins both lists, so a recycled id cannot validate a stale entry.
+        """
         query = self.inputs["palette"].strip()
-        scored = [
-            (fuzzy(query, label), (icon, label, action))
-            for icon, label, action in self.palette_commands()
-        ]
+        jobs, dags = self.jobs, self.dags
+        ascii_mode = bool(self.prefs["ascii"])
+        cached = self._palette_memo
+        if (
+            cached is not None
+            and cached[0] == query
+            and cached[1] is jobs
+            and cached[2] is dags
+            and cached[3] == ascii_mode
+        ):
+            return cached[4]
+        scored: list[tuple[int, tuple[str, str, Callable[[], Any]]]] = []
+        for icon, label, action in self.palette_commands():
+            score = fuzzy(query, label)
+            if score > 0:
+                scored.append((score, (icon, label, action)))
+        # nlargest is sorted(..., reverse=True)[:60]: descending score,
+        # ties in build order
         matches = [
             item
-            for score, item in sorted(scored, key=lambda pair: -pair[0])
-            if score > 0
+            for _score, item in heapq.nlargest(
+                60, scored, key=lambda pair: pair[0]
+            )
         ]
-        return matches[:60]
+        self._palette_memo = (query, jobs, dags, ascii_mode, matches)
+        return matches
 
     # small palette helpers -------------------------------------------
     def _toggle(self, name: str) -> None:
@@ -4605,12 +4679,12 @@ class AppKeys(AppPalette):
             self.set_wallboard(False)
 
     async def _palette_key(self, key: str) -> None:
-        matches = self.palette_matches()
         if key == "esc":
             self.close("palette")
             self.focus = None
             return
         if key == "down":
+            matches = self.palette_matches()
             self.palette_sel = min(
                 self.palette_sel + 1, max(0, len(matches) - 1)
             )
@@ -4619,6 +4693,7 @@ class AppKeys(AppPalette):
             self.palette_sel = max(0, self.palette_sel - 1)
             return
         if key == "enter":
+            matches = self.palette_matches()
             if matches:
                 idx = min(self.palette_sel, len(matches) - 1)
                 action = matches[idx][2]
@@ -4835,7 +4910,7 @@ class AppKeys(AppPalette):
         await self._input_key("token", key)
 
     async def _key_timeline(self, key: str) -> None:
-        entries = self.timeline_entries()
+        entries = self._timeline_cached()
         if key in ("j", "down"):
             self.timeline_sel = min(
                 max(0, len(entries) - 1), self.timeline_sel + 1
@@ -5998,6 +6073,16 @@ HELP_EXTRA_ROWS = [
 ]
 
 
+#: the fleet matrix's cell label per run outcome (see render_fleet)
+_FLEET_OUTCOME_LABEL = {
+    "success": "ok",
+    "failure": "fail",
+    "cancelled": "cancel",
+    "unknown": "lost",
+    "skipped": "skip",
+}
+
+
 class AppOverlays(AppRender):
     def render_overlay(
         self, paint: Painter, top: str, cols: int, lines: int
@@ -6203,7 +6288,7 @@ class AppOverlays(AppRender):
         self, paint: Painter, cols: int, lines: int
     ) -> list[str]:
         width = min(90, cols - 4)
-        entries = self.timeline_entries()
+        entries = self._timeline_cached()
         ascii_mode = bool(self.prefs["ascii"])
         body = []
         blast = set(self.incident_set)
@@ -6670,6 +6755,39 @@ class AppOverlays(AppRender):
         )
 
     # ---- fleet matrix ------------------------------------------------
+    def _fleet_matrix(
+        self, data: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], int, int, int, list[str]]:
+        """``(nodes, job count, failing count, running cells, row names)``
+        of the fleet payload under the current filter.
+
+        One walk of the node x job matrix answers every question the
+        header and the filter ask of it, once per payload rather than
+        per frame: ``_refresh_json`` swaps the payload wholesale, and
+        the slot pins the object it was built from.
+        """
+        fail_only = self.fleet_fail_only
+        cached = self._fleet_memo
+        if cached is not None and cached[0] is data and cached[1] == fail_only:
+            return cached[2]
+        nodes = [n for n in data.get("nodes", []) if isinstance(n, dict)]
+        names: set[str] = set()
+        failed: set[str] = set()
+        running_cells = 0
+        for node in nodes:
+            for job_name, cell in (node.get("jobs") or {}).items():
+                names.add(job_name)
+                if not cell:
+                    continue
+                if cell.get("running"):
+                    running_cells += 1
+                elif (cell.get("last") or {}).get("outcome") == "failure":
+                    failed.add(job_name)
+        rows = sorted(failed) if fail_only else sorted(names)
+        result = (nodes, len(names), len(failed), running_cells, rows)
+        self._fleet_memo = (data, fail_only, result)
+        return result
+
     def render_fleet(self, paint: Painter, cols: int, lines: int) -> list[str]:
         # no fixed cap: a 9-node matrix needs the room, and the per-node
         # cell width below already shrinks to fit what the terminal gives
@@ -6684,29 +6802,12 @@ class AppOverlays(AppRender):
                 )
             )
             return panel_frame(paint, "fleet", body, width, "esc close")
-        nodes = [n for n in data.get("nodes", []) if isinstance(n, dict)]
-        # one walk of the node x job matrix answers all three questions the
-        # header and the filter ask of it: which job names exist, which are
-        # failing somewhere, and how many cells are running.  Walking it
-        # per question re-read every cell three times, and four under the
-        # failing-only filter.
-        names: set[str] = set()
-        failed: set[str] = set()
-        running_cells = 0
-        for node in nodes:
-            for job_name, cell in (node.get("jobs") or {}).items():
-                names.add(job_name)
-                if not cell:
-                    continue
-                if cell.get("running"):
-                    running_cells += 1
-                elif (cell.get("last") or {}).get("outcome") == "failure":
-                    failed.add(job_name)
-        fail_count = len(failed)
-        rows = sorted(failed) if self.fleet_fail_only else sorted(names)
+        nodes, job_count, fail_count, running_cells, rows = self._fleet_matrix(
+            data
+        )
         summary = " %d nodes · %d jobs · %d running" % (
             len(nodes),
-            len(names),
+            job_count,
             running_cells,
         )
         if fail_count:
@@ -6732,8 +6833,9 @@ class AppOverlays(AppRender):
                 paint.style(pad_to(" " + truncate(job_name, 22), 24), "fg")
             ]
             for node in nodes:
-                cell = (node.get("jobs") or {}).get(job_name)
-                if node.get("jobs") is None:
+                jobs_map = node.get("jobs")
+                cell = (jobs_map or {}).get(job_name)
+                if jobs_map is None:
                     text, color = "·", "dim"
                 elif cell is None:
                     text, color = "—", "dim"
@@ -6745,13 +6847,7 @@ class AppOverlays(AppRender):
                 elif cell.get("last"):
                     outcome = str((cell["last"] or {}).get("outcome", ""))
                     key = outcome_key(outcome)
-                    label = {
-                        "success": "ok",
-                        "failure": "fail",
-                        "cancelled": "cancel",
-                        "unknown": "lost",
-                        "skipped": "skip",
-                    }.get(outcome, outcome[:6])
+                    label = _FLEET_OUTCOME_LABEL.get(outcome, outcome[:6])
                     text = "%s %s %s" % (
                         paint.glyph(key, ascii_mode),
                         label,
@@ -6775,7 +6871,7 @@ class AppOverlays(AppRender):
             body.append(
                 paint.style(
                     "  nothing failing — clear the filter (f)"
-                    if self.fleet_fail_only and names
+                    if self.fleet_fail_only and job_count
                     else "  no jobs advertised yet",
                     "dim",
                 )
@@ -7465,8 +7561,8 @@ class AppDrawers(AppOverlays):
         """Screen rows one buffered entry occupies with wrap on.
 
         Memoised per line for one content width, like :meth:`_ansi_line`
-        and for the same reason: the count is asked of every buffered
-        entry on every frame, and it is a pure function of the line.
+        and for the same reason: :meth:`_wrap_starts` asks it of every
+        entry the buffer gains, and it is a pure function of the line.
         """
         stream, line, _when = entry
         if stream == "meta":
@@ -7489,6 +7585,58 @@ class AppDrawers(AppOverlays):
             cache[line] = rows
         return rows
 
+    def _wrap_starts(
+        self, tail: "LogTail", content_width: int
+    ) -> tuple[list[int], int]:
+        """``(start row of every buffered entry, the row after the last)``
+        with wrap on, carried from the previous frame.
+
+        Each entry's row count is a pure function of its line, and the
+        buffer has one writer (:meth:`LogTail._run`) that only appends,
+        trims the head, or replaces the list, so a frame tallies only
+        what the buffer gained: appends extend the list, a head trim
+        (``LogTail.dropped`` moved) drops as many leading entries, and
+        anything else (a replaced list, a shorter one, a pane of another
+        width, a last entry that is not the one tallied) starts over.
+        Rows are numbered from the first tally, trimmed rows included,
+        so a trim never renumbers the survivors: the first entry's start
+        is the base the window math subtracts.
+        """
+        lines = tail.lines
+        dropped = tail.dropped
+        cached = self._wrap_tally
+        starts: list[int] = []
+        nxt = 0
+        if (
+            cached is not None
+            and cached[0] is lines
+            and cached[1] <= dropped
+            and cached[2] == content_width
+        ):
+            starts, nxt = cached[3], cached[4]
+            del starts[: dropped - cached[1]]
+            known = len(starts)
+            if known > len(lines) or (
+                known and lines[known - 1] is not cached[5]
+            ):
+                starts, nxt = [], 0
+        known = len(starts)
+        if known < len(lines):
+            wrap_rows = self._wrap_rows
+            append = starts.append
+            for entry in itertools.islice(lines, known, None):
+                append(nxt)
+                nxt += wrap_rows(entry, content_width)
+        self._wrap_tally = (
+            lines,
+            dropped,
+            content_width,
+            starts,
+            nxt,
+            lines[-1] if lines else None,
+        )
+        return starts, nxt
+
     def _wrapped_window(
         self,
         tail: "LogTail",
@@ -7501,15 +7649,15 @@ class AppDrawers(AppOverlays):
 
         A wrapped entry spans an unknown number of rows, so this branch
         cannot clamp its scroll from entry counts the way the unwrapped
-        one does.  It clamps from per-entry ROW counts instead (integer
-        work over the memoised plain text) and styles only the entries
-        the window touches: the buffer used to be rendered whole so that
-        forty rows could be sliced out of five thousand.
+        one does.  It clamps from per-entry ROW starts instead (the
+        carried tally of :meth:`_wrap_starts`), finds the entry holding
+        the window's first row by bisection, and styles only the entries
+        the window touches.
         """
-        counts = [
-            self._wrap_rows(entry, content_width) for entry in tail.lines
-        ]
-        body_rows = sum(counts)
+        starts, nxt = self._wrap_starts(tail, content_width)
+        lines = tail.lines
+        base = starts[0] if starts else nxt
+        body_rows = nxt - base
         total = body_rows + len(suffix)
         max_scroll = max(0, total - available)
         self.log_scroll = min(self.log_scroll, max_scroll)
@@ -7517,15 +7665,15 @@ class AppDrawers(AppOverlays):
         begin = max(0, end - available)
         window: list[str] = []
         first_row = min(begin, body_rows)
-        cursor = 0
-        for idx, count in enumerate(counts):
-            if cursor >= end:
-                break
-            if cursor + count > begin:
-                if not window:
-                    first_row = cursor
-                window.extend(render(*tail.lines[idx]))
-            cursor += count
+        if begin < body_rows:
+            # the entry holding row `begin`, then every later one that
+            # starts before `end`
+            idx = bisect.bisect_right(starts, begin + base) - 1
+            first_row = starts[idx] - base
+            count = len(starts)
+            while idx < count and starts[idx] - base < end:
+                window.extend(render(*lines[idx]))
+                idx += 1
         visible = window[begin - first_row : end - first_row]
         if end > body_rows:
             visible.extend(suffix[max(0, begin - body_rows) : end - body_rows])
@@ -7534,10 +7682,48 @@ class AppDrawers(AppOverlays):
     def _drawer_history(
         self, paint: Painter, width: int, body_lines: int
     ) -> list[str]:
-        rows: list[str] = []
         data = self.drawer_runs
         if data is None:
             return [paint.style("  loading run history…", "dim")]
+        # the stats block and every run row are a pure function of the
+        # payload (swapped wholesale by _load_drawer_runs), the width and
+        # the glyph set: built once, sliced per frame.  The slot pins the
+        # payload, so a recycled id cannot validate a stale entry; the
+        # rows carry theme ink, so _retheme() clears it.
+        ascii_mode = bool(self.prefs["ascii"])
+        cached = self._history_body
+        if (
+            cached is not None
+            and cached[0] is data
+            and cached[1] == width
+            and cached[2] == ascii_mode
+        ):
+            head, run_rows = cached[3], cached[4]
+        else:
+            head, run_rows = self._history_rows(paint, data, width, ascii_mode)
+            self._history_body = (data, width, ascii_mode, head, run_rows)
+        rows = list(head)
+        available = body_lines - len(rows)
+        self.panel_scroll = max(
+            0, min(self.panel_scroll, max(0, len(run_rows) - available))
+        )
+        rows.extend(
+            run_rows[self.panel_scroll : self.panel_scroll + available]
+        )
+        if not run_rows:
+            rows.append(paint.style("  no runs retained yet", "dim"))
+        return rows
+
+    def _history_rows(
+        self,
+        paint: Painter,
+        data: dict[str, Any],
+        width: int,
+        ascii_mode: bool,
+    ) -> tuple[list[str], list[str]]:
+        """``(stats rows, one row per run, newest first)`` of the
+        history tab."""
+        rows: list[str] = []
         stats = data.get("stats") or {}
         rate = stats.get("success_rate")
         rows.append(
@@ -7590,12 +7776,8 @@ class AppDrawers(AppOverlays):
             r.get("duration") for r in runs if r.get("duration") is not None
         ]
         top = max(durations) if durations else 0
-        ascii_mode = bool(self.prefs["ascii"])
-        available = body_lines - len(rows)
-        self.panel_scroll = max(
-            0, min(self.panel_scroll, max(0, len(runs) - available))
-        )
-        for run in runs[self.panel_scroll : self.panel_scroll + available]:
+        run_rows: list[str] = []
+        for run in runs:
             outcome = str(run.get("outcome", ""))
             key = outcome_key(outcome)
             color = OUTCOME_COLOR[key]
@@ -7621,7 +7803,7 @@ class AppDrawers(AppOverlays):
             resources = run.get("resources") or {}
             if resources.get("cpu_total_seconds") is not None:
                 detail += " · %.1fs cpu" % resources["cpu_total_seconds"]
-            rows.append(
+            run_rows.append(
                 " "
                 + paint.style(paint.glyph(key, ascii_mode), color)
                 + paint.style(" %s " % stamp, "fg")
@@ -7629,9 +7811,7 @@ class AppDrawers(AppOverlays):
                 + paint.style(pad_to(bar, bar_w + 1), color)
                 + paint.style(truncate(detail, max(0, width - 44)), "dim")
             )
-        if not runs:
-            rows.append(paint.style("  no runs retained yet", "dim"))
-        return rows
+        return rows, run_rows
 
     def _drawer_resources(
         self, paint: Painter, width: int, body_lines: int
@@ -7646,6 +7826,25 @@ class AppDrawers(AppOverlays):
                     "  (set monitorResources: true on the job)", "dim"
                 ),
             ]
+        # the live line, the column header and every run row are a pure
+        # function of the payload (swapped wholesale by
+        # _load_drawer_resources): built once, sliced per frame, cleared
+        # by _retheme() like _history_body
+        cached = self._res_body
+        if cached is not None and cached[0] is data:
+            head, run_rows = cached[1], cached[2]
+        else:
+            head, run_rows = self._resource_rows(paint, data)
+            self._res_body = (data, head, run_rows)
+        rows = list(head)
+        rows.extend(run_rows[: body_lines - len(head)])
+        return rows
+
+    def _resource_rows(
+        self, paint: Painter, data: dict[str, Any]
+    ) -> tuple[list[str], list[str]]:
+        """``(head rows, one row per run, newest first)`` of the
+        resources tab."""
         rows: list[str] = []
         live = data.get("live") or []
         if live:
@@ -7662,8 +7861,6 @@ class AppDrawers(AppOverlays):
                     bold=True,
                 )
             )
-        runs = list(reversed(data.get("runs") or []))
-        available = body_lines - len(rows) - 1
         rows.append(
             paint.style(
                 pad_to(" started", 18) + pad_to("cpu", 10) + "peak rss",
@@ -7671,7 +7868,8 @@ class AppDrawers(AppOverlays):
                 bold=True,
             )
         )
-        for run in runs[:available]:
+        run_rows: list[str] = []
+        for run in reversed(data.get("runs") or []):
             started = parse_iso(run.get("started_at"))
             stamp = (
                 datetime.datetime.fromtimestamp(started).strftime(
@@ -7681,7 +7879,7 @@ class AppDrawers(AppOverlays):
                 else "?"
             )
             usage = run.get("resources") or run
-            rows.append(
+            run_rows.append(
                 paint.style(pad_to(" " + stamp, 18), "fg")
                 + paint.style(
                     pad_to(
@@ -7691,7 +7889,7 @@ class AppDrawers(AppOverlays):
                 )
                 + paint.style(fmt_bytes(usage.get("max_rss_bytes")), "dim")
             )
-        return rows
+        return rows, run_rows
 
     def _drawer_schedule(
         self, paint: Painter, width: int, body_lines: int
@@ -7704,25 +7902,17 @@ class AppDrawers(AppOverlays):
         # payload carries it; hashing locally with the job's name is the
         # identical fallback (same salt) against an older daemon
         text = resolved or schedule
+        tz_name = job.get("timezone")
+        tz, described, fires = self._schedule_facts(text, name, tz_name)
         rows = [
             " " + paint.style(schedule, "accent", bold=True),
-            " " + paint.style(describe_cron(text, hash_key=name), "bright"),
+            " " + paint.style(described, "bright"),
         ]
         if resolved and resolved != schedule:
             rows.append(" " + paint.style("resolves to %s" % resolved, "dim"))
         rows.append(paint.style("", "fg"))
-        tz_name = job.get("timezone")
         frame = "UTC" if job.get("utc", True) or not tz_name else str(tz_name)
         rows.append(paint.style(" reference frame: %s" % frame, "dim"))
-        tz: datetime.tzinfo = datetime.timezone.utc
-        if tz_name:
-            try:
-                from zoneinfo import ZoneInfo
-
-                tz = ZoneInfo(str(tz_name))
-            except Exception:  # noqa: BLE001 - fall back to UTC
-                pass
-        fires = next_fires(text, 8, tz, hash_key=name)
         if fires:
             rows.append(paint.style("", "fg"))
             rows.append(paint.style(" next runs:", "dim"))
@@ -7763,6 +7953,53 @@ class AppDrawers(AppOverlays):
                 )
             )
         return rows
+
+    def _schedule_facts(
+        self, text: str, name: Optional[str], tz_name: Any
+    ) -> tuple[datetime.tzinfo, str, list[datetime.datetime]]:
+        """``(zone, prose, upcoming fires)`` for the schedule tab, parsed
+        once per ``(text, name, zone)`` rather than per frame.
+
+        The zone and the prose are pure functions of the inputs.  The
+        fire list is the engine's first eight occurrences strictly after
+        the moment it was built, so it is exact until its first entry is
+        due; it is rebuilt from the held parse then.  Both clocks are
+        read for "due" (the instant, and the zone's civil time the
+        engine compares in) so a fold hour cannot hold the list late.
+        """
+        cached = self._sched_facts
+        if (
+            cached is not None
+            and cached[0] == text
+            and cached[1] == name
+            and cached[2] == tz_name
+        ):
+            tab, tz, described, fires = cached[3:]
+            if fires and (
+                time.time() >= fires[0].timestamp()
+                or datetime.datetime.now(tz) >= fires[0]
+            ):
+                fires = next_fires(text, 8, tz, hash_key=name, tab=tab)
+                self._sched_facts = cached[:6] + (fires,)
+            return tz, described, fires
+        tz = datetime.timezone.utc
+        if tz_name:
+            try:
+                from zoneinfo import ZoneInfo
+
+                tz = ZoneInfo(str(tz_name))
+            except Exception:  # noqa: BLE001 - fall back to UTC
+                pass
+        # the parse next_fires would make; describe_cron takes it as its
+        # engine verdict and next_fires enumerates from it
+        try:
+            tab = CronTab(text.strip(), hash_key=name)
+        except (ValueError, KeyError):
+            tab = None
+        described = describe_cron(text, hash_key=name, tab=tab)
+        fires = next_fires(text, 8, tz, hash_key=name, tab=tab)
+        self._sched_facts = (text, name, tz_name, tab, tz, described, fires)
+        return tz, described, fires
 
     # ---- the DAG drawer ---------------------------------------------
     def render_dag_panel(

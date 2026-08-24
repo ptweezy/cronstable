@@ -161,6 +161,46 @@ def test_release_runs_are_never_cancelled():
     assert "'release'" in group and "'ci'" in group, group
 
 
+def test_perf_gate_override_is_resolved_once_and_honoured_everywhere():
+    # The override is resolved in ONE place (the decide step) and read in
+    # three that must agree: the perf job's continue-on-error, its compare
+    # flags, and the release job's tolerance of a report that never came.
+    # Let one drift and either a perf failure blocks a release the operator
+    # asked to ship, or a second scan lets a marker mean two things.
+    wf = _workflow()
+    inputs = (wf.get("on") or wf.get(True))["workflow_dispatch"]["inputs"]
+    perf_input = inputs["perf"]
+    assert perf_input["options"] == ["gate", "accept", "ignore"], perf_input
+    assert perf_input["default"] == "gate", perf_input
+
+    version = wf["jobs"]["version"]
+    assert version["outputs"]["perf"] == "${{ steps.d.outputs.perf }}"
+    decide = _named_steps(version)["Decide release"]
+    assert "INPUT_PERF" in decide["env"], "the decide step lost the input"
+    for marker in ("perf:accept", "perf:ignore"):
+        assert "'^\\[{}\\]'".format(marker) in decide["run"], marker
+    assert "perf_source=" in decide["run"]
+
+    perf = wf["jobs"]["perf"]
+    ignore = "needs.version.outputs.perf == 'ignore'"
+    assert ignore in str(perf["continue-on-error"]), perf.get(
+        "continue-on-error"
+    )
+    compare = _named_steps(perf)["Compare and gate"]
+    assert "PERF_MODE" in compare["env"], "the compare step lost the mode"
+    scan = "'^\\[perf:accept\\]'"
+    assert scan not in compare["run"], "a second marker scan"
+    assert '"$PERF_MODE" = "ignore"' in compare["run"]
+    assert '"$PERF_MODE" = "accept"' in compare["run"]
+    assert "Performance gate overridden" in compare["run"]
+
+    release = wf["jobs"]["release"]
+    steps = _named_steps(release)
+    download = steps["Download performance report"]
+    assert ignore in str(download.get("continue-on-error")), download
+    notes = steps["Build release notes from HISTORY.md"]
+    assert "if [ -f perf/perf-summary.md ]" in notes["run"], notes["run"]
+
 def test_every_browser_backed_test_module_is_fenced():
     # The enforcement step is the ONLY thing standing between a
     # browser-backed module and running nowhere: these all self-skip
