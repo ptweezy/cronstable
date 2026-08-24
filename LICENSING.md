@@ -1,21 +1,21 @@
 # Licensing
 
 This repository is **MIT-licensed by default**. The full text is in
-[LICENSE](LICENSE), and it applies to everything in the repository **except** a
+[LICENSE](LICENSE). It applies to everything in the repository **except** a
 directory that ships its own `LICENSE` file, which governs that directory
 instead.
 
 This file travels with the code: it is packaged (alongside
 [TRADEMARKS.md](TRADEMARKS.md)) into every wheel's `dist-info/licenses/`
-directory. Paths in this document are **repository paths**. A distribution will
+directory. Paths in this document are **repository paths**. A distribution does
 not contain most of them, because `pro/` and the `docs/` website tree are pruned
-from everything published (see `MANIFEST.in`); the paths still identify exactly
-which files each statement is about, and all of them can be inspected at
+from everything published (see `MANIFEST.in`). The paths still identify exactly
+which files each statement is about, and you can inspect all of them at
 <https://github.com/ptweezy/cronstable>.
 
 ## Why this file exists
 
-cronstable is planned to grow.
+This project is planned to grow.
 
 ## The rule
 
@@ -29,9 +29,9 @@ cronstable is planned to grow.
 
 | Path | License | Notes |
 | --- | --- | --- |
-| `/` core (`cronstable/`, docs, tests, CI, packaging, ...) | MIT | See [LICENSE](LICENSE). |
+| `/` core (`cronstable/`, docs, tests, CI, packaging, and other core files) | MIT | See [LICENSE](LICENSE). |
 | `pro/` | Proprietary | cronstable Pro (the `cronstable-pro` package). See [pro/LICENSE](pro/LICENSE). Not open source. |
-| rendered brand artwork under `docs/` | Reserved | The finished logo. See [Brand assets](#brand-assets) below. |
+| rendered brand artwork under `docs/` | Reserved | The finished logo. See [Brand assets](#brand-assets) later. |
 
 As more proprietary components are added, each gets its own `LICENSE` file under
 the same rule, and a row here. Proprietary directories are pruned from the public
@@ -42,12 +42,12 @@ MIT sdist (see `MANIFEST.in`), so they are never distributed through PyPI.
 One narrow set of files is **excluded from the MIT grant**: the rendered brand
 artwork. These sit in directories that are otherwise MIT (they share `docs/img/`
 with dozens of ordinary screenshots), so a directory-level `LICENSE` file would
-claim too much. They are listed by name instead, in three places that a reader
-can reach from wherever they start:
+claim too much. They are listed by name instead, in three places that you can
+reach from wherever you start:
 
 - [LICENSE](LICENSE) names the exclusion, so the operative grant is not silent
   about its own scope.
-- this section holds the authoritative list.
+- This section holds the authoritative list.
 - [docs/img/README.md](docs/img/README.md) repeats it next to the files.
 
 The list:
@@ -58,7 +58,7 @@ The list:
 | `docs/**/logo-balance-light.gif`, `docs/**/logo-balance-light.webp` | the animated wordmark, light |
 
 These are the finished logo, not source. They may be reproduced **unmodified**
-when referring to cronstable itself, which is the same latitude the nominative
+when referring to cronstable itself. That is the same latitude the nominative
 fair use section of [TRADEMARKS.md](TRADEMARKS.md) gives the name: write about
 the project, link to it, illustrate a post about it. Every other right,
 including the right to modify them or to adopt them as the identity of another
@@ -70,7 +70,7 @@ Two things this deliberately does **not** do:
   that draws the wordmark lives in `cronstable/web/index.html` and
   `docs/logo-lab.html`. Both are ordinary product source and stay MIT, so a fork
   keeps a working dashboard and is free to run, study, and modify the physics.
-  What a fork may not do is keep calling the result cronstable, and that is a
+  What a fork may not do is keep calling the result cronstable. That is a
   trademark question rather than a copyright one.
 - **It is not retroactive.** Anyone who already received these files under the
   MIT License keeps that grant for the copies they received. The reservation
@@ -81,7 +81,7 @@ Two things this deliberately does **not** do:
 - Proprietary code may **import** the MIT core; MIT permits proprietary software
   to build on it.
 - Do **not** copy MIT-licensed source *into* a proprietary directory. Importing
-  the core is fine; vendoring its source there would pull MIT-covered code (and
+  the core is fine. Vendoring its source there would pull MIT-covered code (and
   its attribution obligation) into a proprietary tree. Keep the boundary at the
   import level.
 - New files in a proprietary directory carry an SPDX header so the license is
@@ -91,23 +91,23 @@ Two things this deliberately does **not** do:
   # SPDX-License-Identifier: LicenseRef-cronstable-Proprietary
   ```
 
-  Core files rely on the root LICENSE and need no header; they may optionally
+  Core files rely on the root LICENSE and need no header. They may optionally
   carry `# SPDX-License-Identifier: MIT`.
 
 ## Third-party code and dependencies
 
-cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron) (MIT); the
-root LICENSE preserves yacron's copyright alongside cronstable's, as MIT
-requires.
+The cronstable project is a fork of
+[yacron](https://github.com/gjcarneiro/yacron) (MIT). The root LICENSE preserves
+yacron's copyright alongside cronstable's, as MIT requires.
 
 Runtime dependencies of the core install are permissive (MIT / BSD / Apache /
-PSF / MPL). A CI guard
-([.github/scripts/check_licenses.py](.github/scripts/check_licenses.py), run by the
-`licenses` job over the runtime plus every distributable extra) fails the build
-if a strong-copyleft (GPL / AGPL) or non-open source-available (SSPL / BUSL)
-dependency is ever introduced, so the permissive baseline cannot regress by
-accident. This matters because the shipped artifacts (the PyInstaller binaries
-and Docker images) bundle the whole dependency tree.
+PSF / MPL). The `licenses` CI job runs a guard,
+[.github/scripts/check_licenses.py](.github/scripts/check_licenses.py), over the
+runtime plus every distributable extra. If a dependency is ever introduced that
+is strong copyleft (GPL / AGPL) or source-available but not open source
+(SSPL / BUSL), the guard fails the build, so the permissive baseline cannot
+regress by accident. This matters because the shipped artifacts (the PyInstaller
+binaries and Docker images) bundle the whole dependency tree.
 
 One dependency is weak copyleft, bundled deliberately and with its
 obligations met explicitly:
@@ -115,21 +115,21 @@ obligations met explicitly:
 - **python-zeroconf** (the `discovery` extra, behind `web.bonjour`) is
   **LGPL-2.1-or-later** and is included, unmodified, in the standalone
   binaries, the Docker images, and the `discovery` pip extra. The LGPL permits
-  proprietary-or-MIT applications to bundle the library; in exchange the
-  recipient must get the license text, access to the library's source, and a
-  real way to use a modified build of the library. cronstable meets each one:
+  proprietary-or-MIT applications to bundle the library. In exchange, the
+  recipient must get the license text, source access, and a real way to use a
+  modified build of the library. The project meets each one:
 
   - **Notice + license text**: every artifact carries
     [`cronstable/licenses/THIRD-PARTY-NOTICES.txt`](cronstable/licenses/THIRD-PARTY-NOTICES.txt)
-    (the notice plus the full LGPL-2.1 text) as package data; any binary
+    (the notice plus the full LGPL-2.1 text) as package data. Any binary
     prints it with `cronstable --third-party-licenses`. Docker and pip
-    installs additionally keep zeroconf's own `COPYING` in its `dist-info`.
+    installs also keep zeroconf's own `COPYING` in its `dist-info`.
   - **Source access**: each GitHub Release attaches the python-zeroconf
-    source archive next to the binaries; it is also on
+    source archive next to the binaries. It is also on
     [PyPI](https://pypi.org/project/zeroconf/) and
     [GitHub](https://github.com/python-zeroconf/python-zeroconf).
-  - **Relink right**: cronstable is fully open source, and the binaries are
-    produced by a public recipe
+  - **Relink right**: cronstable is fully open source, and a public recipe
+    produces the binaries
     ([pyinstaller/cronstable.spec](pyinstaller/cronstable.spec) plus the
     `binaries*` jobs in
     [.github/workflows/release.yml](.github/workflows/release.yml)). To run
@@ -141,7 +141,7 @@ obligations met explicitly:
     debug such modifications.
 
   The `licenses` CI job reports zeroconf as weak copyleft (allowed) on every
-  run, keeping the choice visible; a strong-copyleft dependency would still
+  run, keeping the choice visible. A strong-copyleft dependency would still
   fail the gate.
 
 ## Trademarks

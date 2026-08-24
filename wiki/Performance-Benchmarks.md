@@ -1,11 +1,14 @@
-# Performance Benchmarks
+# Performance benchmarks
 
-Every commit is benchmarked, and every release is gated on the result.
-cronstable is meant to run comfortably on old and small machines, so the CI
+The CI pipeline benchmarks every commit and gates every release on the
+result.
+
+Because cronstable is meant to run comfortably on old and small machines, the
 pipeline measures the paths that determine that (process startup, schedule
 math at 100k-job scale, config parsing, DAG planning, durable-state I/O,
-JSON, redaction, calendar rendering, and memory footprint) and refuses to
-publish a release that regressed past a metric's declared limit.
+JSON, redaction, calendar rendering, and memory footprint). For the same
+reason, it refuses to publish a release that regressed past a metric's
+declared limit.
 
 ## What is measured
 
@@ -34,18 +37,20 @@ compared. Instead the `perf` job makes a paired measurement on one runner:
 1. The current commit is installed into one virtualenv, and the latest
    release tag into another.
 2. The suite runs against both, interleaved, for two rounds. The harness
-   itself always comes from the current checkout, so both sides execute
-   identical measurement code; a benchmark whose API the old release lacks
+   itself always comes from the current checkout, so both sides run
+   identical measurement code. A benchmark whose API the old release lacks
    is recorded as skipped for that side.
 3. `benchmarks/compare.py` merges each side's rounds (best-of-rounds for
    time, median for memory) and diffs the two.
 
 A metric fails its gate only when it slows down by more than its declared
 percentage limit (25% for most timing metrics, 15% for traced memory) AND by
-more than its absolute floor, so microsecond jitter on a tiny metric can
-never gate. On an ordinary commit or pull request the comparison only warns.
-On a release the gate is enforced: the publish jobs require `perf`, so a
-gated regression stops the release before anything ships.
+more than its absolute floor. Microsecond jitter on a tiny metric can
+therefore never gate.
+
+On an ordinary commit or pull request the comparison only warns. On a release
+the gate is enforced: the publish jobs require `perf`, so a gated regression
+stops the release before anything ships.
 
 ## The release report
 
@@ -61,7 +66,7 @@ row for every compared metric. It ships in the `perf-report` artifact on the
 workflow run, alongside the same two files, and stays there for 30 days.
 
 The first release after the suite was introduced records numbers without a
-comparison; every release after that diffs against the one before it.
+comparison. Every release after that diffs against the one before it.
 
 ## Accepting an intentional regression
 
@@ -69,7 +74,19 @@ A feature can be worth a measured cost. To ship one, start a pushed commit's
 subject line with `[perf:accept]`. The regression is still measured and
 listed in the release notes, but it does not fail the gate. Only commit
 subjects are scanned, exactly like the `[release]` marker described in
-[Contributing and Releasing](Contributing-and-Releasing).
+[contributing and releasing](Contributing-and-Releasing).
+
+## Overriding the gate
+
+`[perf:accept]` excuses relative regressions only. To publish regardless of
+what the perf job finds, start a pushed commit's subject with `[perf:ignore]`,
+or pick `ignore` in the `perf` dropdown of a manual run (which also offers
+`accept`). The comparison still runs and still lands in the release notes,
+under a heading that names the override, but nothing in it gates: relative
+regressions, absolute budget breaches and dead gates all become warnings, and
+a perf job that fails outright does not hold the release either. When a push
+carries both markers, or a marker and a dropdown choice, the strongest request
+wins: `ignore` over `accept` over the default.
 
 ## Running the suite yourself
 

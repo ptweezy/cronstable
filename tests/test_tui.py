@@ -581,13 +581,13 @@ def test_theme_lookup_and_cvd():
     deutan = Theme("carolina", light=False, cvd="deutan")
     assert deutan.colors["ok"] != dark.colors["ok"]
     # unknown hue falls back rather than raising
-    assert Theme("nope", light=False).hue == "carolina"
+    assert Theme("nope", light=False).hue == "standard"
 
 
 def test_prefs_roundtrip(tmp_path):
     path = str(tmp_path / "tui.json")
     prefs = load_prefs(path)  # missing file -> defaults
-    assert prefs["theme"] == "carolina"
+    assert prefs["theme"] == "standard"
     prefs["theme"] = "amber"
     prefs["poll_ms"] = 5000
     save_prefs(prefs, path)
@@ -597,11 +597,11 @@ def test_prefs_roundtrip(tmp_path):
     # corrupt file -> defaults, no raise
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("{nope")
-    assert load_prefs(path)["theme"] == "carolina"
+    assert load_prefs(path)["theme"] == "standard"
     # a bad stored theme falls back
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({"theme": "plaid"}, fh)
-    assert load_prefs(path)["theme"] == "carolina"
+    assert load_prefs(path)["theme"] == "standard"
 
 
 def test_help_overlay_carries_the_web_table():
@@ -1407,13 +1407,13 @@ async def test_theme_cycling_persists(tmp_path):
     try:
         app = await h.start(tmp_path)
         await _wait_for(lambda: len(app.jobs) == 1)
-        assert app.theme.hue == "carolina"
+        assert app.theme.hue == "standard"
         h.keys.send("t")
-        await _wait_for(lambda: app.theme.hue == "amber")
+        await _wait_for(lambda: app.theme.hue == "carolina")
         h.keys.send("T")
         await _wait_for(lambda: app.theme.light)
         saved = load_prefs(str(tmp_path / "prefs.json"))
-        assert saved["theme"] == "amber"
+        assert saved["theme"] == "carolina"
         assert saved["light"] is True
     finally:
         await h.stop()
@@ -4429,3 +4429,311 @@ def test_drawer_schedule_bad_timezone(tmp_path):
     app.drawer_job = "tz"
     body = _txt(app._drawer_schedule(paint, 70, 24))
     assert "reference frame" in body
+# ===================================================================
+#  Per-frame memos: the wrap tally, the schedule facts, the palette,
+#  the drawer bodies, the timeline entries and the fleet matrix
+# ===================================================================
+def _wrap_oracle(app, paint, width, body_lines, scrolls):
+    """Check the wrapped drawer at every scroll against a render of the
+    whole buffer: the window must be the slice the full walk gives."""
+    full = app._drawer_logs(paint, width, 10**6)[1:]
+    total, available = len(full), body_lines - 1
+    for scroll in scrolls:
+        clamped = min(scroll, max(0, total - available))
+        end = total - clamped
+        begin = max(0, end - available)
+        app.log_scroll = scroll
+        rows = app._drawer_logs(paint, width, body_lines)[1:]
+        assert rows == full[begin:end], scroll
+        assert app.log_scroll == clamped
+
+
+def test_wrapped_window_tally_is_incremental_and_exact(tmp_path, monkeypatch):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.wrap = True
+    width, body_lines = 60, 9
+    scrolls = (0, 1, 4, 13, 37, 10**9)
+    widths = (3, 40, 90, 200, 55, 61)
+
+    def entry(i):
+        stream = "stderr" if i % 5 == 0 else "stdout"
+        text = "%03d " % i + "x" * widths[i % len(widths)]
+        return (stream, text, 100.0 + i)
+
+    tail = _stub_tail(app, [entry(i) for i in range(60)])
+    tail.lines[10] = ("meta", "end of run output", 110.0)
+    tail.MAX_LINES = 70
+    app.log_tail = tail
+    _wrap_oracle(app, paint, width, body_lines, scrolls)
+    counted = []
+    real = app._wrap_rows
+    monkeypatch.setattr(
+        app, "_wrap_rows", lambda e, w: counted.append(e) or real(e, w)
+    )
+    # appends: only the new entries are counted
+    fresh = [entry(i) for i in range(60, 65)]
+    tail.lines.extend(fresh)
+    app.log_scroll = 0
+    app._drawer_logs(paint, width, body_lines)
+    assert counted == fresh
+    _wrap_oracle(app, paint, width, body_lines, scrolls)
+    # a head trim at the cap drops leading entries without a recount
+    counted.clear()
+    more = [entry(i) for i in range(65, 85)]
+    for item in more:
+        tail.lines.append(item)
+        tail._trim()
+    assert tail.dropped == 15 and len(tail.lines) == 70
+    app.log_scroll = 0
+    app._drawer_logs(paint, width, body_lines)
+    assert counted == more
+    _wrap_oracle(app, paint, width, body_lines, scrolls)
+    # a narrower pane (timestamps on) re-tallies everything
+    counted.clear()
+    app.timestamps = True
+    app.log_scroll = 0
+    app._drawer_logs(paint, width, body_lines)
+    assert counted == tail.lines
+    _wrap_oracle(app, paint, width, body_lines, scrolls)
+    # an entry swapped under the tally, and a replaced list, start over
+    counted.clear()
+    tail.lines[-1] = ("stdout", "swapped " + "y" * 120, 1.0)
+    app.log_scroll = 0
+    app._drawer_logs(paint, width, body_lines)
+    assert counted == tail.lines
+    _wrap_oracle(app, paint, width, body_lines, scrolls)
+    counted.clear()
+    tail.lines = list(tail.lines)
+    app.log_scroll = 0
+    app._drawer_logs(paint, width, body_lines)
+    assert counted == tail.lines
+    _wrap_oracle(app, paint, width, body_lines, scrolls)
+    # an emptied buffer paints the waiting hint at every scroll
+    tail.lines[:] = []
+    _wrap_oracle(app, paint, width, body_lines, scrolls)
+
+
+def test_drawer_schedule_parses_once_and_holds_the_fire_list(
+    tmp_path, monkeypatch
+):
+    from cronstable import croninfo
+
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    job = _job("held", schedule="*/5 * * * *", scheduled_in=None)
+    job["timezone"] = "Europe/Paris"
+    job["utc"] = False
+    job["schedule_findings"] = []
+    app.jobs = [job]
+    app.by_name = {"held": job}
+    app.drawer_job = "held"
+    parses = []
+    real = croninfo.CronTab
+
+    def counting(*args, **kwargs):
+        parses.append(args[0])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tui, "CronTab", counting)
+    monkeypatch.setattr(croninfo, "CronTab", counting)
+    first = app._drawer_schedule(paint, 70, 24)
+    assert parses == ["*/5 * * * *"]
+    assert "next runs:" in _txt(first)
+    assert app._drawer_schedule(paint, 70, 24) == first
+    assert parses == ["*/5 * * * *"]
+    # a due first fire rebuilds the list from the held parse
+    facts = app._sched_facts
+    fires = facts[6]
+    assert fires and fires[0].tzinfo is facts[4]
+    stale = [fires[0] - datetime.timedelta(minutes=5)] + fires[1:]
+    app._sched_facts = facts[:6] + (stale,)
+    app._drawer_schedule(paint, 70, 24)
+    refreshed = app._sched_facts[6]
+    assert refreshed != stale and refreshed[0] > stale[0]
+    assert parses == ["*/5 * * * *"]
+    # another job's text is its own parse
+    other = _job("other", schedule="0 6 * * *", scheduled_in=None)
+    other["schedule_findings"] = []  # else the lint fallback parses too
+    app.by_name = {"held": other}
+    app._drawer_schedule(paint, 70, 24)
+    assert parses == ["*/5 * * * *", "0 6 * * *"]
+
+
+def _rank_by_full_sort(app, query):
+    """The palette ranking as a full stable sort produces it: descending
+    score, ties in build order, the top sixty."""
+    scored = [
+        (tui.fuzzy(query, label), (icon, label))
+        for icon, label, _action in app.palette_commands()
+    ]
+    ranked = sorted(scored, key=lambda pair: -pair[0])
+    return [item for score, item in ranked if score > 0][:60]
+
+
+async def test_palette_matches_memo_and_esc_skips_the_ranking(
+    tmp_path, monkeypatch
+):
+    app = _bare_app(tmp_path)
+    app.jobs = [
+        _job("deploy", outcome="success"),
+        _job("backup", outcome="failure"),
+        _job("bench", running=True, scheduled_in=None),
+    ]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app.dags = [{"name": "pipe"}]
+    for query in ("", "dep", "back", "zzz", "tog"):
+        app.inputs["palette"] = query
+        ranked = app.palette_matches()
+        assert [r[:2] for r in ranked] == _rank_by_full_sort(app, query)
+        assert app.palette_matches() is ranked
+    app.inputs["palette"] = "dep"
+    held = app.palette_matches()
+    app.jobs = list(app.jobs)
+    swapped = app.palette_matches()
+    assert swapped is not held and [r[:2] for r in swapped] == [
+        r[:2] for r in held
+    ]
+    app.prefs["ascii"] = True
+    assert app.palette_matches() is not swapped
+    calls = []
+    monkeypatch.setattr(app, "palette_matches", lambda: calls.append(1) or [])
+    app.open("palette")
+    app.focus = "palette"
+    await app._palette_key("esc")
+    assert calls == [] and not app.is_open("palette")
+    await app._palette_key("x")
+    assert calls == []
+    await app._palette_key("down")
+    assert calls == [1]
+
+
+def test_drawer_history_and_resources_bodies_are_built_once(
+    tmp_path, monkeypatch
+):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    runs = [
+        {
+            "outcome": "success" if i % 3 else "failure",
+            "started_at": _iso_ago(60 * i),
+            "duration": float(i + 1),
+            "exit_code": 0 if i % 3 else 2,
+        }
+        for i in range(12)
+    ]
+    app.drawer_runs = {
+        "stats": {"total": 12, "success_rate": 0.66, "avg_duration": 6.0},
+        "runs": runs,
+    }
+    top = app._drawer_history(paint, 80, 8)
+    builds = []
+    real = app._history_rows
+    monkeypatch.setattr(
+        app, "_history_rows", lambda *a: builds.append(1) or real(*a)
+    )
+    assert app._drawer_history(paint, 80, 8) == top and builds == []
+    app.panel_scroll = 4
+    scrolled = app._drawer_history(paint, 80, 8)
+    assert builds == [] and scrolled != top and scrolled[:3] == top[:3]
+    assert app.panel_scroll == 4
+    app._history_body = None
+    assert app._drawer_history(paint, 80, 8) == scrolled and builds == [1]
+    # a new payload, another width and the glyph set each rebuild
+    app.drawer_runs = dict(app.drawer_runs)
+    app._drawer_history(paint, 80, 8)
+    app._drawer_history(paint, 90, 8)
+    app.prefs["ascii"] = True
+    app._drawer_history(paint, 90, 8)
+    app._drawer_history(paint, 90, 8)
+    assert builds == [1, 1, 1, 1]
+    # resources: the live line, the header and every run, then a slice
+    app.drawer_res = {
+        "monitored": True,
+        "live": [{"cpu_percent": 4.0, "rss_bytes": 1024}],
+        "runs": [
+            {
+                "started_at": _iso_ago(30 * i),
+                "resources": {"cpu_total_seconds": i, "max_rss_bytes": 512},
+            }
+            for i in range(6)
+        ],
+    }
+    full = app._drawer_resources(paint, 80, 20)
+    assert len(full) == 8
+    built = []
+    real_res = app._resource_rows
+    monkeypatch.setattr(
+        app, "_resource_rows", lambda *a: built.append(1) or real_res(*a)
+    )
+    assert app._drawer_resources(paint, 80, 20) == full and built == []
+    assert app._drawer_resources(paint, 80, 5) == full[:5] and built == []
+    app._res_body = None
+    assert app._drawer_resources(paint, 80, 5) == full[:5] and built == [1]
+    # both bodies carry ink, so a retheme drops them
+    app._retheme()
+    assert app._history_body is None and app._res_body is None
+
+
+async def test_timeline_entries_and_fleet_matrix_are_built_per_payload(
+    tmp_path, monkeypatch
+):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.jobs = [
+        _job("bad", outcome="failure", exit_code=1),
+        _job("good", outcome="success"),
+    ]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    builds = []
+    real = app.timeline_entries
+    monkeypatch.setattr(
+        app, "timeline_entries", lambda: builds.append(1) or real()
+    )
+    app.render_timeline(paint, 110, 30)
+    app.render_timeline(paint, 110, 30)
+    await app._key_timeline("j")
+    assert builds == [1]
+    app.timeline_fail_only = True
+    assert [e[0] for e in app._timeline_cached()] == ["bad"]
+    assert builds == [1, 1]
+    app.jobs = list(app.jobs)
+    app.render_timeline(paint, 110, 30)
+    assert builds == [1, 1, 1]
+    # fleet: one matrix walk per payload and filter
+    when = _iso_ago(30)
+    app.fleet = {
+        "enabled": True,
+        "nodes": [
+            {
+                "node_name": "a",
+                "self": True,
+                "jobs": {
+                    "bad": {
+                        "last": {"outcome": "failure", "finished_at": when}
+                    },
+                    "good": {"running": True},
+                },
+            },
+            {
+                "node_name": "b",
+                "jobs": {
+                    "bad": {
+                        "last": {"outcome": "success", "finished_at": when}
+                    }
+                },
+            },
+        ],
+    }
+    rows = app.render_fleet(paint, 110, 24)
+    assert "2 nodes · 2 jobs · 1 running · 1 failing" in _txt(rows)
+    memo = app._fleet_memo
+    assert memo[2][1:] == (2, 1, 1, ["bad", "good"])
+    app.render_fleet(paint, 110, 24)
+    assert app._fleet_memo is memo
+    app.fleet_fail_only = True
+    app.render_fleet(paint, 110, 24)
+    assert app._fleet_memo is not memo and app._fleet_memo[2][4] == ["bad"]
+    app.fleet = dict(app.fleet)
+    app.render_fleet(paint, 110, 24)
+    assert app._fleet_memo[0] is app.fleet

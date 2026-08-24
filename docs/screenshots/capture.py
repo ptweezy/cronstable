@@ -204,8 +204,8 @@ def fresh(page, theme=None, extra_prefs=None):
     """Reload the page with a given theme/pref set via localStorage."""
     prefs = {"boot": "false", "zen": "false"}
     # always pin the theme: a prior themed reload leaves its choice in
-    # localStorage, so "no theme" must mean the carolina default, not "keep"
-    prefs["theme"] = json.dumps(theme or "carolina")
+    # localStorage, so "no theme" must mean the standard default, not "keep"
+    prefs["theme"] = json.dumps(theme or "standard")
     if extra_prefs:
         prefs.update(extra_prefs)
     js = ";".join(
@@ -311,10 +311,11 @@ def run_dashboard(shots_only):
 
         # ---- theme variants on the same board ----
         for theme, fname in [
+            ("carolina", "dashboard-theme-carolina"),
             ("amber", "dashboard-theme-amber"),
             ("green", "dashboard-theme-green"),
             ("modern", "dashboard-theme-modern"),
-            ("carolina-light", "dashboard-theme-carolina-light"),
+            ("standard-light", "dashboard-theme-standard-light"),
         ]:
             if not wants(fname):
                 continue
@@ -328,9 +329,10 @@ def run_dashboard(shots_only):
                 results[fname] = f"FAIL {e}"
         if not ONLY or any(
             wants(f"dashboard-theme-{t}")
-            for t in ("amber", "green", "modern", "carolina-light")
+            for t in ("carolina", "amber", "green", "modern",
+                      "standard-light")
         ):
-            fresh(page)  # back to the default carolina
+            fresh(page)  # back to the standard default
 
         # ---- job drawer: live logs on the 5s heartbeat probe ----
         if wants("dashboard-logs"):
@@ -806,17 +808,18 @@ async def capture_all():  # noqa: C901 - one linear staging walk
 
     # ---- theme variants on the same board ----------------------------
     for hue, light, fname in [
+        ("carolina", False, "tui-theme-carolina"),
         ("amber", False, "tui-theme-amber"),
         ("green", False, "tui-theme-green"),
         ("modern", False, "tui-theme-modern"),
-        ("carolina", True, "tui-theme-carolina-light"),
+        ("standard", True, "tui-theme-standard-light"),
     ]:
         if not wants(fname):
             continue
         app.prefs["theme"], app.prefs["light"] = hue, light
         app._retheme()
         await snap(app, term, fname)
-    app.prefs["theme"], app.prefs["light"] = "carolina", False
+    app.prefs["theme"], app.prefs["light"] = "standard", False
     app._retheme()
 
     # ---- job drawer: live logs on the 5s heartbeat probe -------------
@@ -1023,20 +1026,26 @@ SGR = re.compile(r"\x1b\[([0-9;]*)m")
 ANSI_ANY = re.compile(
     r"\x1b(?:\[[0-9;:?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?)"
 )
-DEF_FG = "#9ed3f5"
+#: the standard (default) theme's ground, used by every shot that is not one
+#: of the named variants below: frame background, default ink, title-bar lift
+DEF_BG = "#000000"
+DEF_FG = "#c0c0c0"
+DEF_BAR = "#141414"
 
 #: per-theme page/window chrome behind the frame (theme -> bg of frame)
 _THEME_BG = {
+    "tui-theme-carolina": "#06131d",
     "tui-theme-amber": "#160d02",
     "tui-theme-green": "#03130a",
     "tui-theme-modern": "#101418",
-    "tui-theme-carolina-light": "#eef4f9",
+    "tui-theme-standard-light": "#ffffff",
 }
 _THEME_FG = {
+    "tui-theme-carolina": "#9ed3f5",
     "tui-theme-amber": "#f5c169",
     "tui-theme-green": "#7ee2a1",
     "tui-theme-modern": "#d7dde3",
-    "tui-theme-carolina-light": "#173751",
+    "tui-theme-standard-light": "#1f1f1f",
 }
 
 
@@ -1104,10 +1113,10 @@ def row_to_html(row, def_fg):
 
 
 def frame_html(name, rows):
-    term_bg = _THEME_BG.get(name, "#06131d")
+    term_bg = _THEME_BG.get(name, DEF_BG)
     def_fg = _THEME_FG.get(name, DEF_FG)
     body = "\n".join(row_to_html(r.rstrip(), def_fg) or "&nbsp;" for r in rows)
-    bar_bg = "#0a1a28" if name not in _THEME_BG else term_bg
+    bar_bg = DEF_BAR if name not in _THEME_BG else term_bg
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>
 html,body {{ margin:0; padding:24px; background:#101418; }}
 .term {{
@@ -1205,10 +1214,10 @@ def run_tui(shots_only):
 # all of them to drive the theme-row loop, other scenes take a tasteful subset
 ALL_THEMES = list(THEME_HUES) + [h + "-light" for h in THEME_HUES]
 
-# the hero reel stays in one theme throughout: the light carolina (paper)
+# the hero reel stays in one theme throughout: the light standard (paper)
 # look. Marquee scenes and the a11y beat are shot here in both fonts so the
 # reel can use either without another capture pass.
-HERO_THEME = "carolina-light"
+HERO_THEME = "standard-light"
 
 manifest = {}   # scene -> [theme, ...] actually captured
 
@@ -1252,7 +1261,7 @@ def set_select(page, sel_id, value):
 def reel_shot(page, name):
     page.screenshot(path=str(REEL / f"{name}.png"))
     manifest.setdefault(name.split("@")[0], []).append(
-        name.split("@")[1] if "@" in name else "carolina"
+        name.split("@")[1] if "@" in name else "standard"
     )
     results[name.split("@")[0]] = "ok"
     print(f"  [shot] {name}")
@@ -1275,14 +1284,14 @@ def shoot_themes(page, scene, themes, clip=None):
     else:
         results[scene] = "FAIL no frames"
     # leave the board on the default theme for the next scene's staging
-    set_theme_live(page, "carolina")
+    set_theme_live(page, "standard")
 
 
 def shoot_combo(page, scene, combos, clip=None):
     """Shoot the staged scene under a list of (theme, font) pairs, driving both
     the theme picker and the font select live so the frame stays pixel-stable.
     File names encode both axes: `<scene>@<theme>` (mono) or
-    `<scene>-sans@<theme>` (sans). Resets to carolina/mono afterwards."""
+    `<scene>-sans@<theme>` (sans). Resets to standard/mono afterwards."""
     got = []
     for theme, font in combos:
         try:
@@ -1297,7 +1306,7 @@ def shoot_combo(page, scene, combos, clip=None):
         except Exception as e:
             print(f"    {scene} {theme}/{font}: {e}")
     set_select(page, "setFont", "mono")
-    set_theme_live(page, "carolina")
+    set_theme_live(page, "standard")
     results[scene] = "ok" if got else "FAIL no frames"
 
 
@@ -1350,7 +1359,7 @@ def run_showcase(scenes_only):
         page.goto(BASE)
         wait_ready(page)
 
-        # ---- boot self-test (carolina only; capture mid-POST) ----
+        # ---- boot self-test (standard only; capture mid-POST) ----
         if wants("boot"):
             try:
                 page.evaluate(
@@ -1371,10 +1380,10 @@ def run_showcase(scenes_only):
                     "opacity:1!important}"
                 )
                 page.wait_for_timeout(150)
-                page.screenshot(path=str(REEL / "boot@carolina.png"))
-                manifest["boot"] = ["carolina"]
+                page.screenshot(path=str(REEL / "boot@standard.png"))
+                manifest["boot"] = ["standard"]
                 results["boot"] = "ok"
-                print("  [shot] boot@carolina")
+                print("  [shot] boot@standard")
             except Exception as e:
                 results["boot"] = f"FAIL {e}"
                 print(f"  boot shot failed: {e}")
@@ -1547,7 +1556,7 @@ def run_showcase(scenes_only):
             except Exception as e:
                 results["fleet"] = f"FAIL {e}"
 
-        # ---- accessibility beat, in the hero's carolina-light theme: the same
+        # ---- accessibility beat, in the hero's standard-light theme: the same
         # board made colour-blind safe (deuteranopia) and zoomed (125%), each
         # in both fonts so the reel can use either. ----
         if wants("a11y"):
@@ -1574,16 +1583,16 @@ def run_showcase(scenes_only):
                 set_select(page, "setScale", "100")
                 set_select(page, "setFont", "mono")
                 set_select(page, "setCvd", "none")
-                set_theme_live(page, "carolina")
+                set_theme_live(page, "standard")
                 page.wait_for_timeout(300)
             except Exception as e:
                 results["a11y"] = f"FAIL {e}"
                 set_select(page, "setScale", "100")
                 set_select(page, "setFont", "mono")
                 set_select(page, "setCvd", "none")
-                set_theme_live(page, "carolina")
+                set_theme_live(page, "standard")
 
-        # ---- settings panel (carolina-light), scrolled to the a11y controls ----
+        # ---- settings panel (standard-light), scrolled to the a11y controls ----
         if wants("settings-a11y"):
             try:
                 close_overlays(page)
@@ -1609,11 +1618,11 @@ def run_showcase(scenes_only):
                     reel_shot(page, f"{stem}@{HERO_THEME}")
                 set_select(page, "setFont", "mono")
                 close_overlays(page)
-                set_theme_live(page, "carolina")
+                set_theme_live(page, "standard")
             except Exception as e:
                 results["settings-a11y"] = f"FAIL {e}"
                 close_overlays(page)
-                set_theme_live(page, "carolina")
+                set_theme_live(page, "standard")
 
         # ---- LAST: stage the correlated multi-job failure (incident tools) ----
         need_incident = (

@@ -30,6 +30,10 @@ def _workflow():
         return YAML(typ="safe").load(fobj.read())
 
 
+def _yaml_load(text):
+    return YAML(typ="safe").load(text)
+
+
 def _tox_job():
     return _workflow()["jobs"]["tox"]
 
@@ -156,6 +160,46 @@ def test_release_runs_are_never_cancelled():
     # and it must split the group on that test, so check for both arms
     assert "'release'" in group and "'ci'" in group, group
 
+
+def test_perf_gate_override_is_resolved_once_and_honoured_everywhere():
+    # The override is resolved in ONE place (the decide step) and read in
+    # three that must agree: the perf job's continue-on-error, its compare
+    # flags, and the release job's tolerance of a report that never came.
+    # Let one drift and either a perf failure blocks a release the operator
+    # asked to ship, or a second scan lets a marker mean two things.
+    wf = _workflow()
+    inputs = (wf.get("on") or wf.get(True))["workflow_dispatch"]["inputs"]
+    perf_input = inputs["perf"]
+    assert perf_input["options"] == ["gate", "accept", "ignore"], perf_input
+    assert perf_input["default"] == "gate", perf_input
+
+    version = wf["jobs"]["version"]
+    assert version["outputs"]["perf"] == "${{ steps.d.outputs.perf }}"
+    decide = _named_steps(version)["Decide release"]
+    assert "INPUT_PERF" in decide["env"], "the decide step lost the input"
+    for marker in ("perf:accept", "perf:ignore"):
+        assert "'^\\[{}\\]'".format(marker) in decide["run"], marker
+    assert "perf_source=" in decide["run"]
+
+    perf = wf["jobs"]["perf"]
+    ignore = "needs.version.outputs.perf == 'ignore'"
+    assert ignore in str(perf["continue-on-error"]), perf.get(
+        "continue-on-error"
+    )
+    compare = _named_steps(perf)["Compare and gate"]
+    assert "PERF_MODE" in compare["env"], "the compare step lost the mode"
+    scan = "'^\\[perf:accept\\]'"
+    assert scan not in compare["run"], "a second marker scan"
+    assert '"$PERF_MODE" = "ignore"' in compare["run"]
+    assert '"$PERF_MODE" = "accept"' in compare["run"]
+    assert "Performance gate overridden" in compare["run"]
+
+    release = wf["jobs"]["release"]
+    steps = _named_steps(release)
+    download = steps["Download performance report"]
+    assert ignore in str(download.get("continue-on-error")), download
+    notes = steps["Build release notes from HISTORY.md"]
+    assert "if [ -f perf/perf-summary.md ]" in notes["run"], notes["run"]
 
 def test_every_browser_backed_test_module_is_fenced():
     # The enforcement step is the ONLY thing standing between a
@@ -445,3 +489,153 @@ def test_signing_retries_repeat_the_same_call():
     for step in attempts[1:]:
         assert step["uses"] == attempts[0]["uses"], step.get("name")
         assert step["with"] == attempts[0]["with"], step.get("name")
+
+
+def _matrix_images():
+    """(job, image) for every container base image the matrices name."""
+    out = []
+    for name, job in _workflow()["jobs"].items():
+        for entry in (
+            job.get("strategy", {}).get("matrix", {}).get("include", []) or []
+        ):
+            if isinstance(entry, dict) and "image" in entry:
+                out.append((name, entry["image"]))
+    return out
+
+
+def test_every_container_base_image_is_pinned_to_a_distro_release():
+    # The libc floor of a container-built binary is a property of the base
+    # image, so a floating tag makes it drift on its own: `python:3.14-alpine`
+    # walked from Alpine 3.19 to 3.24 and took the musl floor from 1.2.4 to
+    # 1.2.6 with it, with CI green throughout because the smoke test runs on
+    # the same image that raised it.  Every base must therefore name a distro
+    # release, not just a Python version.
+    floating = []
+    for job, image in _matrix_images():
+        _, _, tag = image.rpartition(":")
+        if tag == image or tag in ("latest", ""):
+            floating.append((job, image))
+            continue
+        if image.startswith("python:") and not re.search(
+            r"(alpine\d+\.\d+|slim-[a-z]+)$", tag
+        ):
+            floating.append((job, image))
+    assert not floating, (
+        "these base images float, so the libc floor moves without an edit: "
+        "{}".format(sorted(floating))
+    )
+
+
+def _declared_floors():
+    """arch -> the glibc floor its build lane declares."""
+    floors = {}
+    for job in _workflow()["jobs"].values():
+        for entry in (
+            job.get("strategy", {}).get("matrix", {}).get("include", []) or []
+        ):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("floor") and entry.get("arch"):
+                floors[entry["arch"]] = str(entry["floor"])
+    return floors
+
+
+def test_package_dependencies_declare_the_floor_the_lane_enforces():
+    # The .deb/.rpm `libc6 >= X` dependency is the only thing that stops a
+    # package installing on a host the binary cannot start on, and it is
+    # spelled in a second place: build_packages.sh's table.  elf_floor.py
+    # enforces the workflow's number against the actual bytes, so if the two
+    # disagree the packages promise something nothing checks.
+    script = os.path.join(ROOT, ".github", "scripts", "build_packages.sh")
+    with open(script, encoding="utf-8") as fobj:
+        body = fobj.read()
+    rows = re.search(r'ROWS="\n(.*?)\n"', body, re.S)
+    assert rows, "build_packages.sh no longer carries a ROWS table"
+    packaged = {}
+    for line in rows.group(1).splitlines():
+        fields = line.split()
+        if len(fields) == 4:
+            packaged[fields[0]] = fields[3]
+    assert packaged, "the ROWS table parsed to nothing"
+
+    declared = _declared_floors()
+    mismatched = {
+        arch: (floor, declared.get(arch))
+        for arch, floor in packaged.items()
+        if declared.get(arch) != floor
+    }
+    assert not mismatched, (
+        "packaged floor != the floor the build lane declares and elf_floor.py "
+        "enforces, as {arch: (packaged, lane)}: {}".format(mismatched)
+    )
+
+
+def test_every_32_bit_arm_row_asserts_its_abi():
+    # On 32-bit ARM the glibc version is only half the ABI, and the other half
+    # is invisible to every functional test: the float ABI, and the newest
+    # instruction set anything in the bundle needs.  The 1.2.41 armv6 binary
+    # shipped 27 members of ARMv7 object code, because under QEMU an ARMv6
+    # container reports armv7l from uname and pip installed armv7l wheels; it
+    # passed every smoke test and could not have run on the Raspberry Pi 1 the
+    # row exists for.  elf_floor.py's --arm-float/--max-arm-arch checks are what
+    # catch that, so no ARM row may ship without them.
+    arm = {"armv5", "armv6", "armv7", "armel"}
+    missing = []
+    for name, job in _workflow()["jobs"].items():
+        for entry in (
+            job.get("strategy", {}).get("matrix", {}).get("include", []) or []
+        ):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("arch") in arm and not entry.get("armgate"):
+                missing.append((name, entry["arch"]))
+    assert not missing, (
+        "these 32-bit ARM rows declare no armgate, so nothing checks their "
+        "float ABI or instruction set: {}".format(sorted(missing))
+    )
+
+
+def test_nfpm_recipes_avoid_the_broken_tree_content_type():
+    # nfpm 2.47.0 emits a GNU base-256 tar mode header for `type: tree`
+    # entries, which apk-tools rejects outright (nfpm issue #1112; the fix
+    # landed upstream after that release and is in no released version).  The
+    # current recipes use explicit src/dst entries only, so they are unaffected,
+    # and one future `type: tree` edit would silently produce an Alpine package
+    # that cannot be installed.
+    for name in ("nfpm.yaml", "apk.yaml"):
+        path = os.path.join(ROOT, "packaging", "nfpm", name)
+        with open(path, encoding="utf-8") as fobj:
+            body = fobj.read()
+        assert "type: tree" not in body, (
+            "{} uses `type: tree`, which the pinned nfpm packages in a form "
+            "apk-tools rejects".format(name)
+        )
+
+
+def test_apk_packages_are_built_from_the_musl_binaries():
+    # nfpm never inspects what it packages, so an .apk built from the glibc
+    # manylinux binary installs cleanly on Alpine and then fails at exec, with
+    # nothing in the build able to notice.  The apk loop must therefore read the
+    # -musl artifacts, and its recipe must not carry a glibc dependency.
+    script = os.path.join(ROOT, ".github", "scripts", "build_packages.sh")
+    with open(script, encoding="utf-8") as fobj:
+        body = fobj.read()
+    apk_loop = body.split("while read -r arch alpine_arch")[-1]
+    assert "cronstable-linux-$arch-musl" in apk_loop, (
+        "the apk loop no longer reads the musl binaries"
+    )
+    assert "cronstable-linux-$arch-musl" not in body.split(
+        "while read -r arch alpine_arch"
+    )[0], "the deb/rpm loop reads a musl binary"
+    # And the recipe must declare no libc dependency: a musl binary carries its
+    # own requirement, and a glibc floor here would be both wrong and untested.
+    with open(
+        os.path.join(ROOT, "packaging", "nfpm", "apk.yaml"), encoding="utf-8"
+    ) as fobj:
+        recipe = _yaml_load(fobj.read())
+    assert not recipe.get("depends"), (
+        "the apk recipe declares dependencies: {}".format(recipe.get("depends"))
+    )
+    assert not recipe.get("overrides"), (
+        "the apk recipe carries format overrides it cannot use"
+    )
