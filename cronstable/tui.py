@@ -988,6 +988,9 @@ def scrub_non_sgr(text: str) -> str:
     a frame; the painter's own SGR colours do.  The C1 range needs no
     ESC introducer, so it is dropped outright.
     """
+    if text.isprintable():
+        # ESC, C0 and C1 are all category Cc: nothing here to drop
+        return text
     if not text.isascii():
         text = _C1_RE.sub("", text)
     if "\x1b" not in text:
@@ -1149,6 +1152,9 @@ def sanitize_log_line(line: str) -> str:
                 kept = segment
                 break
         line = kept
+    if line.isprintable():
+        # tabs, C0 and C1 are all category Cc: nothing to expand or drop
+        return line
     return _CTRL_RE.sub("", line.replace("\t", "    "))
 
 
@@ -2519,16 +2525,37 @@ def cut_to_width(row: str, width: int) -> str:
             if match is not None:
                 idx = max(match.end(), idx + 1)
                 continue
-        if " " <= ch <= "~":
-            w = 1
+            end = idx + 1  # a bare ESC no pattern took: one cell, as before
         else:
-            memo = _char_w_get(ch)
-            w = _char_width_memo(ch) if memo is None else memo
-        if used + w > width:
-            break
-        out.append(ch)
-        used += w
-        idx += 1
+            end = row.find("\x1b", idx)
+            if end < 0:
+                end = row_len
+        # the plain-text run up to the next escape: every ASCII character
+        # (C0 included) is one cell, so an ASCII run is cut by slicing
+        # instead of a per-character walk
+        chunk = row[idx:end]
+        if chunk.isascii():
+            take = min(len(chunk), width - used)
+            out.append(chunk if take == len(chunk) else chunk[:take])
+            used += take
+            idx += take
+            continue
+        for ch in chunk:
+            if used >= width:
+                break  # a zero-width mark at the edge is cut, as before
+            if " " <= ch <= "~":
+                w = 1
+            else:
+                memo = _char_w_get(ch)
+                w = _char_width_memo(ch) if memo is None else memo
+            if used + w > width:
+                break
+            out.append(ch)
+            used += w
+            idx += 1
+        else:
+            continue
+        break
     out.append(" " * (width - used))
     out.append(RESET)
     return "".join(out)
@@ -2584,6 +2611,10 @@ class Painter:
     def __init__(self, theme: Theme) -> None:
         self.theme = theme
         self.bg = theme.bg("bg")
+        # style() is the per-span hot path: bind the theme's fragment
+        # lookup and the constant tail once per painter
+        self._fg = theme.fg
+        self._tail = RESET + self.bg
 
     def style(
         self,
@@ -2594,20 +2625,27 @@ class Painter:
         dim: bool = False,
         reverse: bool = False,
     ) -> str:
-        parts = [self.theme.fg(fg)]
-        if bg is not None:
-            parts.append(self.theme.bg(bg))
-        if bold:
-            parts.append(BOLD)
-        if dim:
-            parts.append(DIM_SGR)
-        if reverse:
-            parts.append(REVERSE)
-        parts.append(text)
-        parts.append(RESET)
+        head = self._fg(fg)
         if bg is None:
-            parts.append(self.bg)
-        return "".join(parts)
+            if not (bold or dim or reverse):
+                return head + text + self._tail
+            return (
+                head
+                + (BOLD if bold else "")
+                + (DIM_SGR if dim else "")
+                + (REVERSE if reverse else "")
+                + text
+                + self._tail
+            )
+        return (
+            head
+            + self.theme.bg(bg)
+            + (BOLD if bold else "")
+            + (DIM_SGR if dim else "")
+            + (REVERSE if reverse else "")
+            + text
+            + RESET
+        )
 
     def row(self, *spans: str) -> str:
         return self.bg + "".join(spans)
@@ -2661,15 +2699,11 @@ def panel_frame(
         "┌" + ("╴" + title + "╶").center(inner, "─") + "┐", "accent"
     )
     rows = [top]
+    lead = paint.style("│ ", "accent") + paint.bg
+    tail = paint.bg + paint.style(" │", "accent")
+    body_w = inner - 2
     for line in body:
-        line_cut = cut_to_width(line, inner - 2)
-        rows.append(
-            paint.style("│ ", "accent")
-            + paint.theme.bg("bg")
-            + line_cut
-            + paint.theme.bg("bg")
-            + paint.style(" │", "accent")
-        )
+        rows.append(lead + cut_to_width(line, body_w) + tail)
     if footer:
         rows.append(paint.style("├" + "─" * inner + "┤", "accent"))
         rows.append(
@@ -2902,6 +2936,11 @@ class App:
         # plain).  rewrite_sgr inks with the current theme, so the memo
         # is valid for one theme only; _retheme() clears it.
         self._ansi_cache: dict[str, tuple[str, str]] = {}
+        # styled spark spans per (job, width, ink); cleared by the poll
+        # fold and by _retheme() (see _spark_span)
+        self._spark_memo: dict[
+            tuple[Any, ...], tuple[dict[str, Any], str]
+        ] = {}
         # constant chrome rows (table header, footer hints), keyed by
         # their build inputs; inked with the current theme, so
         # _retheme() clears this too
@@ -3163,7 +3202,9 @@ class App:
         functions of the /jobs payload, whose row dicts are never mutated
         between polls (``self.jobs`` has a single writer, ``_poll_once``).
         Frames render at up to ~30 Hz during log floods, so the renderers
-        read these folds instead of re-walking every job per frame.
+        read these folds instead of re-walking every job per frame.  The
+        spark memo (:meth:`_spark_span`) is cleared here for the same
+        reason, so it rides on the same single-writer invariant.
 
         The column flags are ``(spread, monitored, overdue, paused)``.
         The OVERDUE badge and the "⏸ til HH:MM" cell want a wider column,
@@ -3189,6 +3230,7 @@ class App:
         self._health_keyed = keyed
         self._col_flags = (spread, monitored, overdue, paused)
         self._wb_shown = None
+        self._spark_memo.clear()
 
     async def _poll_once(self) -> None:
         try:
@@ -3918,6 +3960,7 @@ class AppActions(App):
         # memoised log lines, chrome rows and panel bodies carry the old
         # theme's SGR ink
         self._ansi_cache.clear()
+        self._spark_memo.clear()
         self._chrome_cache.clear()
         self._press_body = None
         self._week_body = None
@@ -5239,6 +5282,16 @@ def _zen_seed(name: str) -> tuple[int, int]:
 # ===================================================================
 #  the application: rendering, part 1 (base screen + wallboard)
 # ===================================================================
+#: per-frame constants shared by every table row (see render_table):
+#: (glyph table, wall clock, monotonic drift since the poll,
+#: (separator, selected separator), (marker, selected marker))
+_RowFrame = tuple[
+    dict[str, str], float, float, tuple[str, str], tuple[str, str]
+]
+#: bound on the spark memo while polling is off (nothing else clears it)
+_SPARK_MEMO_MAX = 4096
+
+
 class AppRender(AppKeys):
     def paint(self) -> None:
         cols, lines = self.term.size()
@@ -5503,10 +5556,24 @@ class AppRender(AppKeys):
             len(view), body_rows, self.sel, self.table_offset
         )
         visible = view[self.table_offset : self.table_offset + body_rows]
+        # per-frame constants the rows share: glyph table, one clock read
+        # for the ages and countdowns, and the two-state separator/marker
+        frame = (
+            GLYPH_ASCII if self.prefs["ascii"] else GLYPH,
+            time.time(),
+            time.monotonic() - self.fetched_mono,
+            (paint.style(" ", "fg"), paint.style(" ", "fg", bg="sel")),
+            (
+                paint.style(" ", "accent", bold=True),
+                paint.style("▎", "accent", bg="sel", bold=True),
+            ),
+        )
         for offset, job in enumerate(visible):
             idx = self.table_offset + offset
             rows.append(
-                self._job_row(paint, job, layout, cols, idx == self.sel, cut)
+                self._job_row(
+                    paint, job, layout, cols, idx == self.sel, cut, frame
+                )
             )
         if not view:
             hint = (
@@ -5529,17 +5596,18 @@ class AppRender(AppKeys):
         layout: list[tuple[str, int]],
         cols: int,
         selected: bool,
-        cut: Optional[int] = None,
+        cut: Optional[int],
+        frame: _RowFrame,
     ) -> str:
+        glyphs, now, drift, sep, marker = frame
         key, label = health(job)
-        ascii_mode = bool(self.prefs["ascii"])
         color = HEALTH_COLOR[key]
         last = job.get("last_run") or {}
         cells: list[str] = []
         bg = "sel" if selected else None
         for col, width in layout:
             if col == "status":
-                text = "%s %s" % (paint.glyph(key, ascii_mode), label)
+                text = "%s %s" % (glyphs.get(key, "?"), label)
                 overdue = sla_overdue(job)
                 cell = paint.style(
                     pad_to(text, width - 8 if overdue else width),
@@ -5581,7 +5649,7 @@ class AppRender(AppKeys):
                     cells.append(
                         paint.style(
                             pad_to(
-                                fmt_ago(last.get("finished_at"))
+                                fmt_ago(last.get("finished_at"), now)
                                 if last
                                 else "—",
                                 width,
@@ -5603,11 +5671,15 @@ class AppRender(AppKeys):
                         else None
                     )
                     text = "%s %s" % (
-                        paint.glyph("paused", ascii_mode),
+                        glyphs.get("paused", "?"),
                         fmt_til(until),
                     )
                 else:
-                    text = fmt_in(self.next_run_seconds(job))
+                    # next_run_seconds, with the frame's one clock read
+                    sched = job.get("scheduled_in")
+                    text = fmt_in(
+                        None if sched is None else float(sched) - drift
+                    )
                 cells.append(paint.style(pad_to(text, width), "fg", bg=bg))
             elif col == "dur":
                 cells.append(
@@ -5623,12 +5695,7 @@ class AppRender(AppKeys):
                     )
                 )
             elif col == "spark":
-                spark = "".join(
-                    paint.style(text, ck, bg=bg)
-                    for text, ck in colour_runs(
-                        spark_cells(job.get("history") or [], width - 1)
-                    )
-                )
+                spark = self._spark_span(paint, job, width - 1, bg)
                 pad_w = width - min(width - 1, len(job.get("history") or []))
                 cells.append(
                     spark + paint.style(" " * max(0, pad_w), "fg", bg=bg)
@@ -5661,11 +5728,35 @@ class AppRender(AppKeys):
                         bg=bg,
                     )
                 )
-        marker = paint.style(
-            "▎" if selected else " ", "accent", bg=bg, bold=True
-        )
-        row = marker + (paint.style(" ", "fg", bg=bg).join(cells))
+        row = marker[selected] + sep[selected].join(cells)
         return cut_to_width(paint.row(row), cols if cut is None else cut)
+
+    def _spark_span(
+        self,
+        paint: Painter,
+        job: dict[str, Any],
+        width: int,
+        bg: Optional[str],
+        dim: bool = False,
+    ) -> str:
+        """The styled spark bars for ``job``, memoised until the next poll.
+
+        The entry pins the row dict, so its id cannot be recycled.
+        """
+        key = (id(job), width, bg, dim)
+        hit = self._spark_memo.get(key)
+        if hit is not None:
+            return hit[1]
+        span = "".join(
+            paint.style(text, "dim" if dim else ck, bg=bg)
+            for text, ck in colour_runs(
+                spark_cells(job.get("history") or [], width)
+            )
+        )
+        if len(self._spark_memo) >= _SPARK_MEMO_MAX:
+            self._spark_memo.clear()
+        self._spark_memo[key] = (job, span)
+        return span
 
     def render_footer(
         self, paint: Painter, cols: int, cut: Optional[int] = None
@@ -5804,11 +5895,8 @@ class AppRender(AppKeys):
                         color if not dim_all else "dim",
                     )
                 )
-                spark_row = "  " + "".join(
-                    paint.style(text, "dim" if dim_all else ck)
-                    for text, ck in colour_runs(
-                        spark_cells(job.get("history") or [], tile_w - 4)
-                    )
+                spark_row = "  " + self._spark_span(
+                    paint, job, tile_w - 4, None, dim_all
                 )
                 pad_cells = (
                     tile_w - 2 - min(tile_w - 4, len(job.get("history") or []))
