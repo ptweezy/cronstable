@@ -103,6 +103,15 @@ the `[release]` marker. `[perf:accept]` excuses RELATIVE regressions only:
 an absolute-budget breach or a gate-integrity failure (below) each has its
 own ritual, a reviewed edit to the corresponding checked-in file.
 
+To publish regardless of what the perf job finds, start a pushed commit's
+subject with `[perf:ignore]`, or pick `ignore` for the `perf` input of a
+manual run (the same input offers `accept`). The comparison still runs and
+still lands in the release notes, headed by a line naming the override, but
+nothing in it gates: relative regressions, budget breaches and dead gates all
+downgrade to warnings, and the perf job itself may fail without holding the
+release. The strongest request in a push wins (`ignore` over `accept` over
+the default).
+
 ## Beyond the relative gate
 
 Four properties of the comparator itself, each added after the 2026-07
