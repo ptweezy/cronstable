@@ -65,6 +65,15 @@
   release notes under a line naming the override, but a regression, a budget
   breach, a dead gate or a failed perf job no longer holds the release. The
   strongest request in a push wins.
+- Every dashboard and TUI screenshot, the animated hero reel and theme row,
+  and the logo loops are re-shot on the `standard` default. The theme
+  stills show carolina, amber, green and modern dark plus standard light.
+- The dashboard's `exit N` badge stays on one line with its age in the
+  Last run column, and a closed job drawer casts no shadow onto the page
+  edge.
+- The TUI's schedule tab names the job's configured timezone as the
+  reference frame; the `utc` flag only applies when no timezone is set,
+  as in the daemon.
 
 ## 1.2.45
 

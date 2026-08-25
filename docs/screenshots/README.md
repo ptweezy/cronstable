@@ -18,6 +18,16 @@ clipping. To refresh them after a UI change:
    docker compose -f example/grand-tour/docker-compose.yml up --build -d
    ```
 
+   Under `distribution: spread` a node records only the runs it executes
+   itself after it seeds its in-memory history from the shared store at
+   startup, so meridian-a's board goes stale for the jobs other nodes own.
+   Restart just that node a few minutes before shooting and its board
+   carries the whole fleet's history:
+
+   ```shell
+   docker compose -f example/grand-tour/docker-compose.yml restart meridian-a
+   ```
+
 2. **Run the capture script** (needs `playwright` + its Chromium in the
    environment; shots land in a `shots/` directory next to the script). All
    the capture jobs live in one `capture.py` behind a target subcommand
@@ -36,10 +46,12 @@ clipping. To refresh them after a UI change:
 
 3. **The log-tail closeup** uses a separate one-job daemon whose job actually
    produces a colorful multi-line stream (the grand-tour jobs are terse
-   one-liners). Run it locally, then capture:
+   one-liners). Run it from the checkout, not an installed release (the
+   closeup photographs whichever dashboard that daemon bundles), then
+   capture:
 
    ```shell
-   cronstable -c docs/screenshots/logs-demo.yaml &
+   python -m cronstable -c docs/screenshots/logs-demo.yaml &
    python docs/screenshots/capture.py logs
    ```
 
@@ -68,7 +80,9 @@ clipping. To refresh them after a UI change:
    `cronstable.tui.TuiApp` is driven headless against meridian-a (a scripted
    key queue and an in-memory terminal stand in for the tty), and the
    captured ANSI frames are rasterized to PNG through Playwright's Chromium
-   at deviceScaleFactor 2, in a terminal-window card set in Cascadia Mono:
+   at deviceScaleFactor 2, in a terminal-window card set in Cascadia Mono
+   (glyphs that font lacks are measured and boxed to their cell, so a
+   fallback face cannot shift the rest of the row):
 
    ```shell
    python docs/screenshots/capture.py tui                 # everything
@@ -124,9 +138,15 @@ Notes:
   is nothing to preserve.
 * The scripts intercept `GET /version` and substitute the next release number
   so the header doesn't show a long `setuptools-scm` dev string.
-* Prefer capturing at a "quiet minute" of the grand tour's deterministic
-  failure calendar (see `example/grand-tour/README.md`) unless you *want* the
-  incident chrome in frame.
+* The clean shots wait for a quiet minute of the grand tour's deterministic
+  failure calendar by themselves (the `db-health-*` outage runs :15-:19 UTC;
+  see `example/grand-tour/README.md`). The web `dashboard` and `showcase`
+  targets do not wait *for* that window, so run their incident shots
+  (`dashboard-incident*`, `dashboard-wallboard`; `incident-timeline`,
+  `wallboard`) as a subset inside it; the `tui` target waits by itself.
+* `data-quality-gate` certifies green only on even UTC hours (its
+  `check-volume` task fails on odd ones), so shoot `dashboard-dag-graph`
+  and the reel's `dag-graph` scene in an even hour.
 * Screenshot prefs are seeded through `localStorage` (`cronstable.boot`,
   `cronstable.zen`, `cronstable.theme`, ...); the context needs `bypass_csp: true`
   (the page CSP has no `unsafe-eval`) and `reduced_motion: "no-preference"`

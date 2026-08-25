@@ -591,7 +591,7 @@ web page's: `j`/`k` move, `Enter` opens a job's drawer, `r` runs, `x`
 cancels, `/` filters, `Ctrl-K` opens the fuzzy command palette, and `?`
 lists everything.
 
-[![The cronstable TUI: a live 59-job board with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, cluster owner column, and the verdict bar correlating a staged failure](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)
+[![The cronstable TUI: a live 70-job board with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, cluster owner column, and the fleet verdict bar](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)
 
 Press `Enter` on any job for its drawer, the same three tabs as the
 web page, plus resources for monitored jobs:
@@ -602,7 +602,7 @@ web page, plus resources for monitored jobs:
 
 | Fuzzy command palette | Keyboard-first, with the web page's keys |
 | :---: | :---: |
-| [![The command palette fuzzy-matching "run": global actions plus per-job and per-DAG commands](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-palette.png) | [![The shortcut overlay: the web dashboard's shortcut table verbatim, with terminal extras grouped below](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-shortcuts.png) |
+| [![The command palette fuzzy-matching "run": global actions plus per-job commands](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-palette.png) | [![The shortcut overlay: the web dashboard's shortcut table verbatim, with terminal extras grouped below](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-shortcuts.png) |
 
 DAGs get the same drawer as the browser, and approval gates are decided
 with a keypress:
@@ -616,13 +616,13 @@ in the terminal too:
 
 | Cluster panel | Fleet view |
 | :---: | :---: |
-| [![The cluster panel: nine gossiping peers, all agreed, with per-node load and the lease detail](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-cluster.png) | [![The fleet view: a 59-job by 9-node matrix of live cells: ok, failing, and running with ages](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-fleet.png) |
+| [![The cluster panel: nine gossiping peers, all agreed, with per-node load and status](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-cluster.png) | [![The fleet view: a 70-job by 9-node matrix of live cells: ok, failing, and running with ages](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-fleet.png) |
 
 The same incident tools are here, from the timeline to the multi-tail:
 
 | Incident timeline | Merged multi-tail |
 | :---: | :---: |
-| [![The incident timeline: every job's most recent finish, newest first, with failure reasons, exit codes, and the blast-radius set flagged](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png) |
+| [![The incident timeline: every job's most recent finish, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png) |
 
 So are the wallboard, the heatmap, and the state inspector:
 

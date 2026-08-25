@@ -8,7 +8,7 @@ a browser is impractical. It is a client of the same
 extra to enable on the daemon: if the dashboard works, so does the
 terminal user interface (TUI).
 
-[![The cronstable TUI against a live 9-node fleet: 59 jobs with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, the cluster owner column, and the verdict bar](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)
+[![The cronstable TUI against a live 9-node fleet: 70 jobs with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, the cluster owner column, and the verdict bar](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)
 
 *(This screenshot, like the larger gallery in the README's Terminal
 dashboard section, is the real TUI driven against the running

@@ -598,7 +598,7 @@ anything back to the daemon.
 
 ## Command palette
 
-[![The command palette open, fuzzy-matching the query "run" to per-job run and log actions](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-palette.png)
+[![The command palette open, fuzzy-matching the query "orders" to per-job run and log actions](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-palette.png)
 
 Press `Ctrl-K` (or `⌘K`, or `Ctrl-P`) to open a **fuzzy command palette**. It
 searches both global actions (refresh, run all failing jobs, cycle theme, toggle

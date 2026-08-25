@@ -27,7 +27,9 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 import urllib.request
+from urllib.parse import urlsplit
 from functools import partial
 from io import BytesIO
 from pathlib import Path
@@ -52,7 +54,7 @@ REEL = HERE / "reel"                 # showcase frames for build_reel.py
 
 # clean release-style version for the header (the local build carries a long
 # setuptools-scm dev string; a release install shows a clean one like this)
-VERSION = "1.2.31"
+VERSION = "1.2.47"
 
 # what the pair-a-device shot's QR encodes as the bearer, shared by the
 # dashboard and showcase pair shots. The grand-tour fleet runs
@@ -70,6 +72,11 @@ WHOAMI_BODY = json.dumps(
 )
 
 ONLY: set = set()    # shot/scene subset from the CLI, set by the target runner
+# the shots that WANT the :15-:19 db-health outage in frame
+DASH_INCIDENT_SHOTS = ("dashboard-incident", "dashboard-incident-timeline",
+                       "dashboard-wallboard")
+SHOW_INCIDENT_SCENES = ("incident-timeline", "wallboard")
+TUI_INCIDENT_SHOTS = ("tui-incident", "tui-incident-timeline", "tui-wallboard")
 results: dict = {}
 
 
@@ -131,8 +138,66 @@ def close_overlays(page):
     for _ in range(3):
         page.keyboard.press("Escape")
         page.wait_for_timeout(150)
+    # Escape hands focus back to the button that opened the overlay,
+    # and its focus ring would land in the next frame
+    page.evaluate("document.activeElement && document.activeElement.blur()")
     page.evaluate("window.scrollTo(0, 0)")
     page.wait_for_timeout(200)
+
+
+def _burner_running(name):
+    jobs = api("GET", "/jobs") or []
+    jobs = jobs.get("jobs", jobs) if isinstance(jobs, dict) else jobs
+    return any(j.get("name") == name and j.get("running") for j in jobs)
+
+
+def wait_running(name, lo=4, hi=20, timeout=150):
+    """Idle until `name` IS running and the wall-clock second is in
+    [lo, hi]: the every-minute burners run :00-:30, so a hero frame shot
+    here carries their live cpu/mem chips (a manual start collides with
+    the scheduled run under concurrencyPolicy Forbid and is refused)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _burner_running(name) and lo <= int(time.time() % 60) <= hi:
+            return
+        time.sleep(1)
+
+
+async def wait_running_async(name, lo=4, hi=20, timeout=150):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _burner_running(name) and lo <= int(time.time() % 60) <= hi:
+            return
+        await asyncio.sleep(1)
+
+
+def wait_quiet_minute(incident_shots):
+    """The db-health-* jobs fail while the UTC minute is 15-19 and go green
+    on the :20 run, so clean frames wait for :21. Skipped when only the
+    incident shots are wanted."""
+    if ONLY and not (ONLY - set(incident_shots)):
+        return
+    while 15 <= int(time.time() // 60 % 60) <= 20:
+        now = time.time()
+        wait = (21 - int(now // 60 % 60)) * 60 - now % 60 + 1
+        print(f"    waiting {wait:.0f}s for a quiet minute (past :15-:19)")
+        time.sleep(wait)
+
+
+def wait_idle(name, lo=33, hi=52, timeout=150):
+    """Idle until `name` is not running AND the wall-clock second is in
+    [lo, hi]: the every-minute burner runs :00-:30 once its staged manual
+    run is over, so this lands a drawer shot in its idle half."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        jobs = api("GET", "/jobs") or []
+        jobs = jobs.get("jobs", jobs) if isinstance(jobs, dict) else jobs
+        running = any(
+            j.get("name") == name and j.get("running") for j in jobs
+        )
+        if not running and lo <= int(time.time() % 60) <= hi:
+            return
+        time.sleep(1)
 
 
 def set_sort(page, order="status"):
@@ -178,7 +243,9 @@ def scroll_card(page, sel):
     page.evaluate(
         """(sel) => {
             const el = document.querySelector(sel);
-            const y = el.getBoundingClientRect().top + window.scrollY - 66;
+            const hdr = document.querySelector('header');
+            const top = hdr ? hdr.getBoundingClientRect().bottom : 66;
+            const y = el.getBoundingClientRect().top + window.scrollY - top;
             window.scrollTo(0, Math.max(0, y));
         }""",
         sel,
@@ -195,6 +262,7 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
 #  target: dashboard (web stills off the grand-tour fleet)
 # ===================================================================
 def shot(page, name):
+    page.mouse.move(1, 1)  # off the rows: no hover tint in frame
     page.screenshot(path=str(SHOTS / f"{name}.png"))
     results[name] = "ok"
     print(f"  [shot] {name}")
@@ -231,6 +299,7 @@ def run_dashboard(shots_only):
     """
     global ONLY
     ONLY = set(shots_only)
+    wait_quiet_minute(DASH_INCIDENT_SHOTS)
     from playwright.sync_api import sync_playwright
 
     SHOTS.mkdir(exist_ok=True)
@@ -296,10 +365,9 @@ def run_dashboard(shots_only):
         # ---- stage the hero: one deliberate red + a guaranteed cpu-burner
         # ----
         api("POST", "/jobs/alert-selftest/start")  # fails instantly, by design
-        api(
-            "POST", "/jobs/risk-model-recompute/start"
-        )  # 30s CPU burn -> live cpu%
-        page.wait_for_timeout(7000)  # let a poll land
+        # the burner is scheduled every minute; shoot while it is in flight
+        wait_running("risk-model-recompute")
+        page.wait_for_timeout(1500)  # let a poll land
 
         if wants("dashboard-overview"):
             try:
@@ -351,6 +419,8 @@ def run_dashboard(shots_only):
         # ---- history + per-run cpu/peak-mem (monitorResources) ----
         if wants("dashboard-history"):
             try:
+                # the burner runs :00-:30 of every minute; catch it idle
+                wait_idle("risk-model-recompute")
                 open_job(page, "risk-model-recompute", tab="history")
                 page.wait_for_timeout(1500)
                 shot(page, "dashboard-history")
@@ -378,7 +448,7 @@ def run_dashboard(shots_only):
                 page.wait_for_selector(
                     "#paletteWrap.open, #paletteWrap.show", timeout=4000
                 )
-                page.fill("#paletteInput", "run")
+                page.fill("#paletteInput", "orders")
                 page.wait_for_timeout(600)
                 shot(page, "dashboard-palette")
                 close_overlays(page)
@@ -410,6 +480,7 @@ def run_dashboard(shots_only):
                     "#settingsWrap.open, #settingsWrap.show", timeout=4000
                 )
                 page.wait_for_timeout(400)
+                page.evaluate("document.activeElement && document.activeElement.blur()")
                 shot(page, "dashboard-settings")
                 close_overlays(page)
             except Exception as e:
@@ -562,8 +633,17 @@ def run_dashboard(shots_only):
         if wants("dashboard-state"):
             try:
                 fresh(page, extra_prefs={"stateInsp": "true"})
-                scroll_card(page, "#stateCard")
+                page.wait_for_selector("#stateCard", state="visible",
+                                       timeout=15000)
                 page.wait_for_timeout(2500)
+                # the body is a 46vh scroll box; open it up so the record
+                # kinds AND the op-latency table are both in frame
+                page.evaluate(
+                    "document.querySelector('#stateBody').style.maxHeight"
+                    " = 'none'"
+                )
+                scroll_card(page, "#stateCard")
+                page.wait_for_timeout(300)
                 shot(page, "dashboard-state")
                 fresh(page)  # back to defaults
             except Exception as e:
@@ -650,6 +730,7 @@ def run_dashboard(shots_only):
                         "#timelineWrap.open, #timelineWrap.show", timeout=4000
                     )
                     page.wait_for_timeout(600)
+                    page.evaluate("document.activeElement && document.activeElement.blur()")
                     shot(page, "dashboard-incident-timeline")
                     close_overlays(page)
             except Exception as e:
@@ -693,6 +774,14 @@ TUI_FRAMES: dict = {}
 # -------------------------------------------------------------------
 #  driving the app
 # -------------------------------------------------------------------
+def select_job(app, name):
+    """Put the list cursor on `name` (open_drawer never moves it)."""
+    for idx, job in enumerate(app.view):
+        if job.get("name") == name:
+            app.sel = idx
+            break
+
+
 async def wait_for(pred, timeout=30.0, what=""):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -706,7 +795,19 @@ async def wait_for(pred, timeout=30.0, what=""):
     return False
 
 
+async def mark_upright(app, timeout=20.0):
+    """Wait for the living mark (the wordmark's l) to stand still: a poke
+    or a missed poll can catch it mid-collapse ("cronstab_e")."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        glyph, _ink = app.mark_sim.frame()
+        if glyph == "l" and app.mark_sim.quiescent():
+            return
+        await asyncio.sleep(0.2)
+
+
 async def snap(app, term, name):
+    await mark_upright(app)
     """One clean frame: no toasts, freshly painted after our changes."""
     app.toasts = []
     app.version = VERSION
@@ -729,6 +830,7 @@ def reset(app):
     app.inputs["logsearch"] = ""
     app.focus = None
     app.timestamps = False
+    app.sel = 0
     app.recompute_view()
     app.mark()
 
@@ -740,8 +842,17 @@ async def capture_boot(prefs_file):
     prefs["poll_ms"] = 1000
     keys = ScriptedKeys()
     term = HeadlessTerm(COLS, LINES)
+
+    class _ReleaseVersionApi(Api):
+        # the POST types /version live; substitute the release number the
+        # way route_version does for the browser
+        async def get_text(self, path, timeout_s=10.0):
+            if path == "/version":
+                return VERSION
+            return await super().get_text(path, timeout_s)
+
     app = TuiApp(
-        Api(BASE, None),
+        _ReleaseVersionApi(BASE, None),
         term,
         keys,
         prefs,
@@ -796,8 +907,8 @@ async def capture_all():  # noqa: C901 - one linear staging walk
 
     # ---- hero: one deliberate red + a guaranteed cpu-burner ----------
     api("POST", "/jobs/alert-selftest/start")
-    api("POST", "/jobs/risk-model-recompute/start")
-    await asyncio.sleep(7)  # let a poll land, like the web capture
+    await wait_running_async("risk-model-recompute")
+    await asyncio.sleep(1.5)  # let a poll land, like the web capture
     app.sort_key = "status"
     app.recompute_view()
     if wants("tui-overview"):
@@ -825,6 +936,7 @@ async def capture_all():  # noqa: C901 - one linear staging walk
     # ---- job drawer: live logs on the 5s heartbeat probe -------------
     if wants("tui-logs"):
         reset(app)
+        select_job(app, "pulse-liveness")
         app.open_drawer("pulse-liveness", "logs")
         app.timestamps = True
         await wait_for(
@@ -840,6 +952,7 @@ async def capture_all():  # noqa: C901 - one linear staging walk
 
     # ---- history + per-run cpu/peak-mem (monitorResources) -----------
     if wants("tui-history"):
+        select_job(app, "risk-model-recompute")
         app.open_drawer("risk-model-recompute", "history")
         await wait_for(lambda: app.drawer_runs is not None, 15, "history")
         await snap(app, term, "tui-history")
@@ -1049,6 +1162,35 @@ _THEME_FG = {
 }
 
 
+#: glyph -> (cells, advance ratio) for characters the card's font falls
+#: back on: a fallback advance is not the TUI's cell count and shifts
+#: everything after it. Measured in the browser by render_pngs before any
+#: frame is rendered; the glyph is boxed at the TUI's width and shrunk to
+#: fit when its fallback face draws it wider.
+ODD_GLYPHS: dict = {}
+#: the regular-weight cell advance in CSS px, measured with ODD_GLYPHS
+CELL_PX: list = [0.0]
+
+
+def _cells(text):
+    if not ODD_GLYPHS:
+        return html.escape(text)
+    def box(c):
+        cells, ratio = ODD_GLYPHS[c]
+        # the box is sized in px from the regular cell so neither a bold
+        # span nor the shrink below can change it
+        width = f"width:{cells * CELL_PX[0]:.2f}px"
+        glyph = html.escape(c)
+        # a little overflow into the neighbouring cells reads better
+        # than a shrunken glyph; beyond that, scale it down to fit
+        fit = cells + 0.3
+        if ratio > fit:
+            glyph = f'<span style="font-size:{100 * fit / ratio:.0f}%">{glyph}</span>'
+        return f'<span class="g" style="{width}">{glyph}</span>'
+
+    return "".join(box(c) if c in ODD_GLYPHS else html.escape(c) for c in text)
+
+
 def row_to_html(row, def_fg):
     out = []
     fg, bg, bold, dim, rev = def_fg, None, False, False, False
@@ -1067,9 +1209,7 @@ def row_to_html(row, def_fg):
             style.append("font-weight:700")
         if dim:
             style.append("opacity:.62")
-        out.append(
-            f'<span style="{";".join(style)}">{html.escape(text)}</span>'
-        )
+        out.append(f'<span style="{";".join(style)}">{_cells(text)}</span>')
 
     for match in ANSI_ANY.finditer(row):
         emit(row[pos : match.start()])
@@ -1137,6 +1277,7 @@ pre {{
   font:13px/1.32 "Cascadia Mono", Consolas, monospace;
   font-variant-numeric: tabular-nums;
 }}
+.g {{ display:inline-block; text-align:center; }}
 </style></head><body>
 <div class="term"><div class="bar"><span class="dot"></span>
 <span class="dot"></span><span class="dot"></span>
@@ -1145,12 +1286,50 @@ pre {{
 </body></html>"""
 
 
+def measure_odd_glyphs(page):
+    """Advance of every non-ASCII glyph in the frames, in cells; the ones
+    that are not a whole cell come from a fallback face and get boxed."""
+    chars = sorted({
+        c for rows in TUI_FRAMES.values() for r in rows
+        for c in strip_ansi(r) if ord(c) > 126
+    })
+    if not chars:
+        return {}
+    page.set_content(frame_html("probe", [""]))
+    ratios = page.evaluate(
+        """(chars) => {
+            const pre = document.querySelector('pre');
+            const w = (s) => { const el = document.createElement('span');
+                el.textContent = s.repeat(8); pre.appendChild(el);
+                const r = el.getBoundingClientRect().width / 8; el.remove();
+                return r; };
+            const cell = w('0'); const out = {'\u0000': cell};
+            for (const c of chars) out[c] = w(c) / cell;
+            return out; }""",
+        chars,
+    )
+    CELL_PX[0] = ratios.pop("\u0000")
+    odd = {}
+    for c, ratio in ratios.items():
+        # the TUI's own cell count (tui.py display_width): F/W glyphs are 2
+        cells = 2 if unicodedata.east_asian_width(c) in ("F", "W") else 1
+        if abs(ratio - cells) > 0.04:
+            odd[c] = (cells, ratio)
+    return odd
+
+
 def render_pngs():
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        # grayscale antialiasing: LCD subpixel fringes colour cell seams
+        browser = p.chromium.launch(args=["--disable-lcd-text"])
         page = browser.new_context(device_scale_factor=2).new_page()
+        ODD_GLYPHS.update(measure_odd_glyphs(page))
+        if ODD_GLYPHS:
+            print("  [font] boxed glyphs: " + " ".join(
+                f"U+{ord(c):04X}({v[0]}ch, drawn {v[1]:.2f})"
+                for c, v in sorted(ODD_GLYPHS.items())))
         for name, rows in TUI_FRAMES.items():
             page.set_content(frame_html(name, rows))
             page.wait_for_timeout(120)
@@ -1185,6 +1364,7 @@ def run_tui(shots_only):
     global ONLY, PREF_DEFAULTS, Api, HeadlessTerm, ScriptedKeys, TuiApp
     global health, strip_ansi
     ONLY = set(shots_only)
+    wait_quiet_minute(TUI_INCIDENT_SHOTS)
     sys.path.insert(0, str(ROOT))
     from cronstable.tui import (  # noqa: E402
         PREF_DEFAULTS,
@@ -1259,6 +1439,7 @@ def set_select(page, sel_id, value):
 
 
 def reel_shot(page, name):
+    page.mouse.move(1, 1)
     page.screenshot(path=str(REEL / f"{name}.png"))
     manifest.setdefault(name.split("@")[0], []).append(
         name.split("@")[1] if "@" in name else "standard"
@@ -1273,6 +1454,7 @@ def shoot_themes(page, scene, themes, clip=None):
     for theme in themes:
         try:
             set_theme_live(page, theme)
+            page.mouse.move(1, 1)
             page.screenshot(path=str(REEL / f"{scene}@{theme}.png"), clip=clip)
             got.append(theme)
             print(f"  [shot] {scene}@{theme}")
@@ -1299,6 +1481,7 @@ def shoot_combo(page, scene, combos, clip=None):
             set_select(page, "setFont", font)
             page.wait_for_timeout(400)
             stem = scene if font == "mono" else f"{scene}-sans"
+            page.mouse.move(1, 1)
             page.screenshot(path=str(REEL / f"{stem}@{theme}.png"), clip=clip)
             manifest.setdefault(stem, []).append(theme)
             got.append((theme, font))
@@ -1332,6 +1515,7 @@ def run_showcase(scenes_only):
     """
     global ONLY
     ONLY = set(scenes_only)
+    wait_quiet_minute(SHOW_INCIDENT_SCENES)
     from playwright.sync_api import sync_playwright
 
     REEL.mkdir(exist_ok=True)
@@ -1396,17 +1580,43 @@ def run_showcase(scenes_only):
 
         # ---- stage the hero board: one deliberate red + a live cpu-burner ----
         api("POST", "/jobs/alert-selftest/start")       # fails instantly
-        api("POST", "/jobs/risk-model-recompute/start")  # 30s CPU burn
-        page.wait_for_timeout(7000)
+        wait_running("risk-model-recompute")  # the every-minute burner
+        page.wait_for_timeout(1500)
 
         # ---- overview: the marquee frame, shot under ALL ten themes ----
         if wants("overview"):
             close_overlays(page)
             set_sort(page)
-            shoot_themes(page, "overview", ALL_THEMES)   # mono, every theme
-            # ...and the same board in the readable sans font under every
-            # theme too, so the theme row can show BOTH axes (theme x font)
-            shoot_combo(page, "overview", [(t, "sans") for t in ALL_THEMES])
+            # serve one /jobs payload for the whole sweep so every frame
+            # shows the same rows (the live poll would move the staged
+            # burner in and out between themes)
+            frozen = {}   # path -> (content type, body)
+
+            def freeze_jobs(route):
+                path = urlsplit(route.request.url).path
+                if path not in frozen:
+                    hdrs = {k: v for k, v in route.request.headers.items()
+                            if k.lower() != "if-none-match"}
+                    resp = route.fetch(headers=hdrs)
+                    frozen[path] = (
+                        resp.headers.get("content-type", "application/json"),
+                        resp.body(),
+                    )
+                ct, body = frozen[path]
+                route.fulfill(status=200, content_type=ct, body=body)
+
+            def is_jobs(url):
+                return urlsplit(url).path in (
+                    "/jobs", "/status", "/cluster", "/node", "/fleet")
+
+            page.route(is_jobs, freeze_jobs)
+            try:
+                # every theme in mono then sans, in the order the theme row
+                # plays them, so relative times only move forward
+                shoot_combo(page, "overview",
+                            [(t, f) for t in ALL_THEMES for f in ("mono", "sans")])
+            finally:
+                page.unroute(is_jobs, freeze_jobs)
 
         # ---- command palette ----
         if wants("palette"):
@@ -1613,6 +1823,7 @@ def run_showcase(scenes_only):
                     pass
                 for font in ("mono", "sans"):
                     set_select(page, "setFont", font)
+                    page.evaluate("document.activeElement && document.activeElement.blur()")
                     page.wait_for_timeout(400)
                     stem = "settings-a11y" + ("-sans" if font == "sans" else "")
                     reel_shot(page, f"{stem}@{HERO_THEME}")
@@ -1646,6 +1857,7 @@ def run_showcase(scenes_only):
                     "#timelineWrap.open, #timelineWrap.show", timeout=4000
                 )
                 page.wait_for_timeout(600)
+                page.evaluate("document.activeElement && document.activeElement.blur()")
                 shoot_combo(page, "incident-timeline",
                             [(HERO_THEME, "mono"), (HERO_THEME, "sans")])
                 close_overlays(page)

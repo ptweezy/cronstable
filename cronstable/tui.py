@@ -7911,7 +7911,12 @@ class AppDrawers(AppOverlays):
         if resolved and resolved != schedule:
             rows.append(" " + paint.style("resolves to %s" % resolved, "dim"))
         rows.append(paint.style("", "fg"))
-        frame = "UTC" if job.get("utc", True) or not tz_name else str(tz_name)
+        # a configured timezone outranks the utc flag, as in the daemon
+        frame = (
+            str(tz_name)
+            if tz_name
+            else ("UTC" if job.get("utc", True) else "local")
+        )
         rows.append(paint.style(" reference frame: %s" % frame, "dim"))
         if fires:
             rows.append(paint.style("", "fg"))
