@@ -47,7 +47,9 @@ following occurrence) and runs in ``now``'s civil clock; an aware match
 resolves in its zone (``fold=0``) and the delay is true elapsed seconds
 across offset changes: a spring-forward gap label fires once at its
 shifted time, an ambiguous fall-back wall time on its first occurrence
-only.  ``test`` reads civil fields, ignoring microseconds.  ``prev``
+only.  ``LOCAL_ZONE`` is the host's local clock as a tzinfo, so a
+local-clock schedule takes that same aware path under the host's DST
+rules.  ``test`` reads civil fields, ignoring microseconds.  ``prev``
 mirrors into the past (floor 1970); ``occurrences`` iterates real
 instants, never yielding one twice.
 """
@@ -62,7 +64,7 @@ from typing import (
     Optional,
 )
 
-__all__ = ["CronTab", "expand_field"]
+__all__ = ["LOCAL_ZONE", "CronTab", "LocalZone", "expand_field"]
 
 _MACROS = {
     "@yearly": "0 0 1 1 *",
@@ -739,6 +741,103 @@ def _default_now(default_utc: bool) -> datetime.datetime:
     return datetime.datetime.now()
 
 
+def _host_civil(utc: datetime.datetime) -> datetime.datetime:
+    """The C library's reading of the aware UTC instant ``utc``: aware,
+    carrying that instant's fixed offset and zone name.  Raises outside
+    the library's time_t range (the MS CRT: 1970 to 3001)."""
+    return utc.astimezone()
+
+
+def _host_instant(civil: datetime.datetime) -> datetime.datetime:
+    """The aware UTC instant the C library resolves the naive label
+    ``civil`` to; ``civil.fold`` picks the reading of a gap or a repeat.
+    Raises as :func:`_host_civil` does (the resolution probes a day to
+    either side)."""
+    return civil.astimezone(_UTC)
+
+
+#: 2001..2028 holds every calendar layout (weekday of 1 January, length
+#: of February), so a proxy year keeps DST rules on the same dates.
+_PROXY_YEARS = {
+    (datetime.date(y, 1, 1).weekday(), _month_end(y, 2)): y
+    for y in range(2001, 2029)
+}
+
+
+def _proxy(dt: datetime.datetime) -> datetime.datetime:
+    """``dt`` moved to the proxy year that shares its calendar layout."""
+    year = dt.year
+    layout = (datetime.date(year, 1, 1).weekday(), _month_end(year, 2))
+    return dt.replace(year=_PROXY_YEARS[layout])
+
+
+def _local_civil(utc: datetime.datetime) -> datetime.datetime:
+    """:func:`_host_civil`, total over datetime's range: outside the
+    library's range the proxy year's offset applies."""
+    try:
+        return _host_civil(utc)
+    except (OSError, OverflowError, ValueError):
+        return utc.astimezone(_host_civil(_proxy(utc)).tzinfo)
+
+
+def _local_instant(civil: datetime.datetime) -> datetime.datetime:
+    """:func:`_host_instant`, total over datetime's range."""
+    try:
+        return _host_instant(civil)
+    except (OSError, OverflowError, ValueError):
+        proxy = _proxy(civil)
+        offset = proxy - _host_instant(proxy).replace(tzinfo=None)
+        return (civil - offset).replace(tzinfo=_UTC)
+
+
+class LocalZone(datetime.tzinfo):
+    """The host's local clock as a tzinfo.
+
+    Every offset is the C library's live answer (:func:`_local_civil`,
+    :func:`_local_instant`), so a local-clock schedule takes the same
+    aware path as a zoned one and follows the host's own DST rules;
+    ``fold`` reads as in PEP 495.  ``dst`` is unknown (None): the
+    library reports the whole offset, never its DST share.
+    """
+
+    def utcoffset(
+        self, dt: Optional[datetime.datetime]
+    ) -> Optional[datetime.timedelta]:
+        if dt is None:
+            return None
+        civil = dt.replace(tzinfo=None)
+        return civil - _local_instant(civil).replace(tzinfo=None)
+
+    def dst(
+        self, dt: Optional[datetime.datetime]
+    ) -> Optional[datetime.timedelta]:
+        return None
+
+    def tzname(self, dt: Optional[datetime.datetime]) -> Optional[str]:
+        if dt is None:
+            return "local"
+        # the name in force at the instant the label resolves to
+        return _local_civil(_local_instant(dt.replace(tzinfo=None))).tzname()
+
+    def fromutc(self, dt: datetime.datetime) -> datetime.datetime:
+        utc = dt.replace(tzinfo=_UTC)
+        civil = _local_civil(utc).replace(tzinfo=None, fold=0)
+        # the second leg of a repeated wall time is the instant its
+        # fold=0 reading does not give back
+        fold = 0 if _local_instant(civil) == utc else 1
+        return civil.replace(tzinfo=self, fold=fold)
+
+    def __repr__(self) -> str:
+        return "LocalZone()"
+
+    def __str__(self) -> str:
+        return "local"
+
+
+#: The one host-clock frame: every local-clock job and view shares it.
+LOCAL_ZONE = LocalZone()
+
+
 class CronTab:
     """One parsed cron expression; see the module docstring for the dialect.
 
@@ -1175,11 +1274,11 @@ class CronTab:
             # identity: the immutable offset cancels in the comparison AND
             # the subtraction, and _next_civil already answers strictly
             # after its seed, so the guard always passes and the retry
-            # loop provably runs once.  This is the DEFAULT aware call: a
-            # job without an explicit timezone is re-armed against
-            # ``after.astimezone()``, which is exactly a datetime.timezone.
-            # ``type(...) is`` keeps the precondition literal; CPython
-            # refuses to subclass datetime.timezone anyway.
+            # loop provably runs once.  UTC jobs arm through here; a
+            # local-clock job arms against LOCAL_ZONE, whose offset moves,
+            # and takes the aware path below.  ``type(...) is`` keeps the
+            # precondition literal; CPython refuses to subclass
+            # datetime.timezone anyway.
             civil = now.replace(tzinfo=None)
             target = self._next_civil(civil)
             if target is None:

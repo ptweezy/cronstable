@@ -378,8 +378,15 @@ How the evaluation works:
   it was computed from) is recorded before a backfill is scheduled and a
   `close` after it completes, in the job's `catchup/<job>` stream. A restart
   mid-backfill (or mid-jitter) resumes from the open checkpoint's watermark
-  instead of silently forfeiting the owed runs. The trade is at-least-once: a
-  crash between the last backfill launch and the `close` record replays.
+  instead of silently forfeiting the owed runs. A backfill that a pause or
+  a change of ownership stopped part-way leaves its checkpoint open, and
+  the next restart of the node that owns the job resumes it the same way.
+  An evaluation that owes nothing closes any checkpoint still open,
+  including the pin a pause leaves (see
+  [Pausing Jobs](Pausing-Jobs#what-a-pause-does)), so a later restart does
+  not resume it. The trade is at-least-once: a crash between the last
+  backfill launch and the `close` record replays, and the boot that resumes
+  a cycle recounts it from its watermark.
   Scheduled [DAGs](Orchestration-and-DAGs) keep the same discipline in their
   own `catchup-dag/<dag>` streams.
 * **Backfills are plain runs, minus the ladder.** Each backfilled launch

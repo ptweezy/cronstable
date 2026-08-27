@@ -287,6 +287,14 @@ double-launches. The claim that flips a task `pending → running` is a single
 atomic compare-and-set on the run document, a correctness backstop underneath
 the lease.
 
+The owner also keeps an in-memory record of every task instance it claimed
+and was handed to launch. A store write that lands after the owner's own
+timeout stopped waiting for it (a stalled disk or network mount) leaves the
+task claimed with nothing launched. On its next pass the owner recognizes
+that claim, because the record has no entry for it, releases the task back
+to `pending` (a sensor back to its idle shape between pokes) and re-claims it
+at once. Nothing ran, so the task's attempt count is unchanged.
+
 If a node crashes, its lease lapses and a peer adopts the run, reconciling from
 the durable state:
 

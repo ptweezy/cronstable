@@ -210,9 +210,23 @@ because `C:\` hands new subdirectories `Modify` for Authenticated Users.
 `cronstable init` therefore checks the directory it created. If any local
 account could write to it, `init` restricts it and reports the change: full
 control for LocalSystem and the local Administrators group, read and execute
-for everyone else, with inheritance from the parent severed. A per-user
+for everyone else, inheritance from the parent severed, and the directory
+handed to the Administrators group. The hand-over is what makes the
+restriction stick: Windows lets a directory's owner rewrite its permissions
+whatever they say, and `%ProgramData%` lets any local account create a
+directory and become its owner, so a directory that is merely restricted
+stays that account's to reopen. `init` also writes an `OWNER RIGHTS` entry that holds
+the owner to read, so the restriction holds even where the hand-over is
+refused. An unelevated prompt gets that outcome, and `init` then names the
+owner it could not change together with the fix. A per-user
 `%APPDATA%\cronstable` carries no such permission to begin with, so `init`
 leaves it alone.
+
+`init` refuses a machine-wide directory that already exists when another
+account owns it and the hand-over fails, and it refuses a junction or symbolic
+link standing at the path, because the scheduler reads whatever the link's
+target holds. Nothing is written in either case. Run `init` again from an
+elevated prompt, or remove the directory first.
 
 `init` deliberately leaves read in place. The boundary this defends is who may
 *write* a job. Removing read would stop an unelevated account from listing the
@@ -221,19 +235,25 @@ that account. If your configuration holds secrets inline rather than in
 [`fromFile`](Reporting#secrets) sources, tighten it further.
 
 For a directory that already exists, the daemon says so once at startup and
-prints the same fix:
+prints the same fix, and `cronstable service install` prints the same note.
+The finding names the account that can write, or the owner of a machine-wide
+directory when that owner is neither SYSTEM, Administrators nor
+TrustedInstaller, or a junction or symbolic link standing at the path:
 
 ```text
 C:\ProgramData\cronstable can be written by BUILTIN\Users, so any local
 account can add or change a job this daemon runs, and a service runs them
 as SYSTEM. Restrict it with: icacls "C:\ProgramData\cronstable"
 /inheritance:r /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F
+/grant *S-1-5-11:(OI)(CI)RX /grant *S-1-3-4:(OI)(CI)RX, then icacls
+"C:\ProgramData\cronstable" /setowner *S-1-5-32-544
 ```
 
 The recipe names SIDs rather than group names so it pastes unchanged on a
 localized install, where `BUILTIN\Administrators` is spelled in the local
-language. Add `/grant *S-1-5-11:(OI)(CI)(RX)` to keep read for everyone, which
-is what `init` does.
+language. `S-1-5-11` keeps read for Authenticated Users, `S-1-3-4` is
+`OWNER RIGHTS`, and `/setowner` is its own `icacls` command because `icacls`
+refuses it beside `/grant`. Both commands need an elevated prompt.
 
 ### "Configuration file not found" applies to this path
 
@@ -497,6 +517,14 @@ web:
     - http://127.0.0.1:8080
   authToken:
     fromFile: C:\ProgramData\cronstable\_token   # any secret source works
+```
+
+A file inside the config directory inherits its permissions, which keep read
+for Authenticated Users, so every local account can read a token kept there.
+Give the token file its own permissions:
+
+```shell
+icacls C:\ProgramData\cronstable\_token /inheritance:r /grant *S-1-5-18:F /grant *S-1-5-32-544:F
 ```
 
 ```shell

@@ -31,7 +31,7 @@ from tests._cron_helpers import (
     _sla_report_recorder,
     fixed_current_time,  # noqa: F401
 )
-from tests._helpers import _state_cfg, _wait_until
+from tests._helpers import _pin_host_zone, _state_cfg, _wait_until
 from tests.test_state import (
     _NOW,
     _count_launcher,
@@ -2904,7 +2904,7 @@ async def test_catchup_run_catch_up_nothing_owed_closes_cycle(tmp_path):
     calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
 
     async def zero(job, now):
-        return 0, "2026-07-01T10:00:00+00:00"
+        return 0, "2026-07-01T10:00:00+00:00", False
 
     cron._missed_occurrences = zero  # type: ignore[method-assign]
     await cron._run_catch_up(cron.cron_jobs["j"], 3, 0.0, _NOW)
@@ -2920,7 +2920,7 @@ async def test_catchup_run_catch_up_bails_when_idle_wait_signals_stop(tmp_path):
     calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
 
     async def two(job, now):
-        return 2, "wm"
+        return 2, "wm", False
 
     async def idle_false(name, *, max_wait=None):
         return False  # shutdown signalled while draining
@@ -2938,7 +2938,7 @@ async def test_catchup_run_catch_up_ownership_moves_mid_backfill(tmp_path):
     calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
 
     async def two(job, now):
-        return 2, "wm"
+        return 2, "wm", False
 
     async def idle_true(name, *, max_wait=None):
         return True
@@ -2963,7 +2963,7 @@ async def test_catchup_run_catch_up_paused_mid_backfill(tmp_path):
     calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
 
     async def two(job, now):
-        return 2, "wm"
+        return 2, "wm", False
 
     async def idle_true(name, *, max_wait=None):
         return True
@@ -2982,7 +2982,7 @@ async def test_catchup_run_catch_up_final_drain_signals_stop(tmp_path):
     calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
 
     async def one(job, now):
-        return 1, "wm"
+        return 1, "wm", False
 
     idle = {"n": 0}
 
@@ -3009,7 +3009,7 @@ async def test_catchup_run_catch_up_outer_error_never_kills_loop(
     calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
 
     async def two(job, now):
-        return 2, "wm"
+        return 2, "wm", False
 
     async def idle_boom(name, *, max_wait=None):
         raise RuntimeError("unexpected")
@@ -3379,3 +3379,87 @@ async def test_catchup_reboot_gate_write_timeout_recheck_reraises_cancelled(
     cron.state_backend.append_record = boom  # type: ignore[method-assign]
     with pytest.raises(asyncio.CancelledError):
         await cron._reboot_boot_gate(cron.cron_jobs["boot"])
+
+
+_LOCAL_NINE = """
+jobs:
+  - name: nine
+    command: echo hi
+    schedule: "0 9 * * *"
+    utc: false
+"""
+
+_LOCAL_DST_TWINS = "jobs:\n" + "".join(
+    '  - name: local{i}\n    command: echo hi\n    schedule: "{e}"\n'
+    "    utc: false\n"
+    '  - name: ny{i}\n    command: echo hi\n    schedule: "{e}"\n'
+    "    timezone: America/New_York\n".format(i=i, e=e)
+    for i, e in enumerate(
+        ("0 9 * * *", "30 2 * * *", "30 1 * * *", "*/30 * * * *", "0 * * * *")
+    )
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("day", [DT(2027, 3, 14), DT(2027, 11, 7)])
+async def test_local_clock_job_fires_once_at_nine_across_dst(monkeypatch, day):
+    # A utc: false job follows the host's DST rules: driven hourly across
+    # each 2027 US transition with the host clock pinned to New York and
+    # ZoneInfo as the oracle, it fires exactly once per day, at 09:00.
+    ny = _pin_host_zone(monkeypatch, "America/New_York")
+    start = (day - datetime.timedelta(days=2)).replace(hour=12, tzinfo=UTC)
+    holder = {"now": start}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_LOCAL_NINE)
+    launched = []
+
+    async def fake_launch(job):
+        launched.append(cronstable.cron.get_now(UTC).astimezone(ny))
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+    cron._ensure_seeded(cronstable.cron.get_now(UTC))
+    end = start + datetime.timedelta(days=4)
+    while holder["now"] <= end:
+        await cron.spawn_jobs(False, now=cronstable.cron.get_now(UTC))
+        holder["now"] += datetime.timedelta(hours=1)
+    assert [(w.date(), w.time()) for w in launched] == [
+        ((day + datetime.timedelta(days=n)).date(), datetime.time(9, 0))
+        for n in (-2, -1, 0, 1)
+    ]
+    # the transition day's fire sits on the new offset
+    assert launched[1].utcoffset() != launched[2].utcoffset()
+
+
+def test_compute_next_fire_local_frame_matches_zoneinfo_twin(monkeypatch):
+    # Hour by hour across both 2027 US transitions a local-clock job arms
+    # at the instant its America/New_York twin does, for hour-pinned, gap,
+    # fold and interval schedules alike.
+    _pin_host_zone(monkeypatch, "America/New_York")
+    cron = cronstable.cron.Cron(None, config_yaml=_LOCAL_DST_TWINS)
+    for day in (DT(2027, 3, 14, tzinfo=UTC), DT(2027, 11, 7, tzinfo=UTC)):
+        for hour in range(-24, 48):
+            after = day + datetime.timedelta(hours=hour)
+            for i in range(5):
+                local = cron._compute_next_fire(
+                    cron.cron_jobs["local%d" % i], after
+                )
+                twin = cron._compute_next_fire(
+                    cron.cron_jobs["ny%d" % i], after
+                )
+                assert local == twin, (i, after)
+
+
+def test_scheduled_in_fallback_frames_a_local_job_in_the_host_zone(
+    monkeypatch,
+):
+    # before the first pass seeds the index, the countdown walks the
+    # engine in LOCAL_ZONE, so a local-clock job counts real seconds
+    # across the spring transition (23h, as its New York twin does)
+    _pin_host_zone(monkeypatch, "America/New_York")
+    _set_now(monkeypatch, {"now": DT(2027, 3, 13, 14, 0, tzinfo=UTC)})
+    cron = cronstable.cron.Cron(None, config_yaml=_LOCAL_DST_TWINS)
+    assert "local0" not in cron._next_fire
+    local = cron._scheduled_in("local0", cron.cron_jobs["local0"], False)
+    twin = cron._scheduled_in("ny0", cron.cron_jobs["ny0"], False)
+    assert local == twin == 23 * 3600.0
+    assert not cron._schedule_never_fires("local0", cron.cron_jobs["local0"])

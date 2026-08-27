@@ -28,6 +28,7 @@ import pytest
 
 from cronstable import cronexpr
 from cronstable.cronexpr import CronTab
+from tests._helpers import _pin_host_zone
 
 UTC = datetime.timezone.utc
 
@@ -1041,3 +1042,148 @@ def test_field_cache_shares_values_between_tabs():
     for _ in range(2):
         with pytest.raises(ValueError, match="minute value 61"):
             CronTab("61 * * * *")
+
+
+# ---------------------------------------------------------------------------
+# LOCAL_ZONE: the host clock as a tzinfo
+# ---------------------------------------------------------------------------
+_LOCAL_DST_SCHEDULES = (
+    "0 9 * * *",
+    "30 2 * * *",
+    "30 1 * * *",
+    "*/30 * * * *",
+    "0 * * * *",
+)
+_LOCAL_DST_DAYS = (
+    ("America/New_York", datetime.date(2027, 3, 14)),
+    ("America/New_York", datetime.date(2027, 11, 7)),
+    ("Europe/Berlin", datetime.date(2027, 3, 28)),
+    ("Europe/Berlin", datetime.date(2027, 10, 31)),
+)
+
+
+def test_local_zone_reads_gap_and_fold_like_zoneinfo(monkeypatch):
+    # Pinned to New York, LOCAL_ZONE must agree with ZoneInfo on both
+    # readings of the spring gap and of the fall repeat, and fromutc must
+    # set fold on the second leg so the offset round-trips.
+    ny = _pin_host_zone(monkeypatch, "America/New_York")
+    zone = cronexpr.LOCAL_ZONE
+    for civil, fold in (
+        (datetime.datetime(2027, 3, 14, 2, 30), 0),
+        (datetime.datetime(2027, 3, 14, 2, 30), 1),
+        (datetime.datetime(2027, 11, 7, 1, 30), 0),
+        (datetime.datetime(2027, 11, 7, 1, 30), 1),
+        (datetime.datetime(2027, 7, 1, 12, 0), 0),
+    ):
+        mine = civil.replace(tzinfo=zone, fold=fold)
+        twin = civil.replace(tzinfo=ny, fold=fold)
+        assert mine.utcoffset() == twin.utcoffset(), (civil, fold)
+        assert mine.astimezone(UTC) == twin.astimezone(UTC), (civil, fold)
+        assert mine.tzname() == twin.astimezone(UTC).astimezone(ny).tzname()
+    for hour, fold in ((5, 0), (6, 1)):
+        when = datetime.datetime(2027, 11, 7, hour, 30, tzinfo=UTC)
+        local = when.astimezone(zone)
+        assert local.replace(tzinfo=None) == datetime.datetime(
+            2027, 11, 7, 1, 30
+        )
+        assert local.fold == fold
+        assert local.astimezone(UTC) == when
+    assert zone.utcoffset(None) is None
+    assert zone.dst(datetime.datetime(2027, 7, 1)) is None
+    assert zone.tzname(None) == "local"
+    assert str(zone) == "local"
+    assert repr(zone) == "LocalZone()"
+
+
+def test_local_zone_is_the_host_clock():
+    # unpinned: for one instant the host's own conversion and LOCAL_ZONE
+    # agree on label, offset and zone name, whatever zone the host is in
+    when = datetime.datetime(2027, 7, 1, 12, 0, tzinfo=UTC)
+    host = when.astimezone()
+    mine = when.astimezone(cronexpr.LOCAL_ZONE)
+    assert mine.replace(tzinfo=None) == host.replace(tzinfo=None)
+    assert mine.utcoffset() == host.utcoffset()
+    assert mine.tzname() == host.tzname()
+
+
+@pytest.mark.parametrize("zone_name, day", _LOCAL_DST_DAYS)
+@pytest.mark.parametrize("expr", _LOCAL_DST_SCHEDULES)
+def test_local_zone_next_and_occurrences_match_zoneinfo(
+    monkeypatch, zone_name, day, expr
+):
+    # Across the 2027 US and EU transitions a schedule framed in
+    # LOCAL_ZONE (pinned to the zone) fires at exactly the instants the
+    # explicit ZoneInfo frame does: a gap label once at its shifted time,
+    # a repeated label on the first leg only.
+    zone = _pin_host_zone(monkeypatch, zone_name)
+    ct = CronTab(expr)
+    start = datetime.datetime.combine(
+        day - datetime.timedelta(days=1), datetime.time(), tzinfo=UTC
+    )
+    end = start + datetime.timedelta(days=3)
+
+    def fires(tz):
+        out = []
+        for when in ct.occurrences(start.astimezone(tz)):
+            instant = when.astimezone(UTC)
+            if instant >= end:
+                break
+            out.append(instant)
+        return out
+
+    expected = fires(zone)
+    assert expected
+    assert fires(cronexpr.LOCAL_ZONE) == expected
+    for hour in range(72):
+        now = start + datetime.timedelta(hours=hour)
+        assert ct.next(now.astimezone(cronexpr.LOCAL_ZONE)) == ct.next(
+            now.astimezone(zone)
+        ), now
+
+
+def test_local_zone_is_total_outside_the_c_library_range(monkeypatch):
+    # Pinned to New York with the MS CRT's shape (a refusal before 1971
+    # and after 2999), a label or instant outside that range resolves by
+    # the proxy year sharing its calendar layout, so the rules land on
+    # the same dates: 1969 reads as 2025 (a repeat on 2 November), a leap
+    # day keeps its date, and datetime's own ceiling still overflows.
+    _pin_host_zone(monkeypatch, "America/New_York", years=(1971, 2999))
+    zone = cronexpr.LOCAL_ZONE
+    for civil, fold, hours in (
+        (datetime.datetime(1969, 6, 1, 0, 0), 0, -4),
+        (datetime.datetime(1970, 1, 1, 0, 0), 0, -5),
+        (datetime.datetime(1969, 11, 2, 1, 30), 0, -4),
+        (datetime.datetime(1969, 11, 2, 1, 30), 1, -5),
+        (datetime.datetime(1968, 2, 29, 12, 0), 0, -5),
+        (datetime.datetime(3500, 7, 1, 12, 0), 0, -4),
+    ):
+        offset = datetime.timedelta(hours=hours)
+        mine = civil.replace(tzinfo=zone, fold=fold)
+        assert mine.utcoffset() == offset, (civil, fold)
+        assert mine.astimezone(UTC) == (civil - offset).replace(tzinfo=UTC)
+    for when, label, fold in (
+        (
+            datetime.datetime(1960, 1, 1, 0, 0),
+            datetime.datetime(1959, 12, 31, 19, 0),
+            0,
+        ),
+        (
+            datetime.datetime(1969, 11, 2, 5, 30),
+            datetime.datetime(1969, 11, 2, 1, 30),
+            0,
+        ),
+        (
+            datetime.datetime(1969, 11, 2, 6, 30),
+            datetime.datetime(1969, 11, 2, 1, 30),
+            1,
+        ),
+    ):
+        local = when.replace(tzinfo=UTC).astimezone(zone)
+        assert local.replace(tzinfo=None) == label
+        assert local.fold == fold
+        assert local.astimezone(UTC) == when.replace(tzinfo=UTC)
+    assert zone.tzname(datetime.datetime(1969, 6, 1)) == "EDT"
+    with pytest.raises(OverflowError):
+        datetime.datetime(9999, 12, 31, 23, 59).replace(
+            tzinfo=zone
+        ).astimezone(UTC)

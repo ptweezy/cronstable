@@ -2389,7 +2389,7 @@ def test_view_dict_reports_conflict(no_tls):
 
 
 def test_manager_detects_cluster_size_divergence(no_tls):
-    # the headline split-brain: an agreeing peer declares a different cluster
+    # the headline split-brain: a reachable peer declares a different cluster
     # size N. Two nodes quorate under different Ns would each elect themselves
     # (two majorities of *different* Ns can be disjoint), so a size mismatch is
     # a first-class conflict, exactly like a duplicate nodeName.
@@ -2440,18 +2440,34 @@ def test_self_listing_does_not_inflate_size_or_conflict(no_tls):
     assert mgr.has_conflict() is False
 
 
-def test_manager_size_divergence_ignores_non_agreed_and_unknown(no_tls):
-    # only AGREED peers are size-checked: a peer on a different job set never
-    # joins our quorum (and a real resize keeps the job set unchanged), and a
-    # peer too old to report a size (None) is simply skipped -- neither is a
-    # false conflict.
-    mgr = _mgr(["b:1", "c:1"])
+def test_manager_size_divergence_counts_fresh_peers_skips_stale_and_unknown(
+    no_tls,
+):
+    # every peer with a fresh observation is size-checked, whatever its job
+    # set: a drifted peer declaring a different N is the resize rolled out
+    # together with a job change, where the two config generations never see
+    # each other AGREED yet each reaches quorum under its own N. A stale
+    # peer holds no fresh declaration and a peer too old to report a size
+    # (None) is skipped: neither is a conflict.
+    mgr = _mgr(["b:1", "c:1", "d:1"])
     pb = mgr.view.peers["b:1"]
     pb.status = STATUS_DRIFTED
     pb.node_name = "node-b"
-    pb.declared_size = 99  # different N, but drifted -> ignored
+    pb.declared_size = 99  # different N on another job set -> conflict
     _seed_agree(mgr, "c:1", "node-c")
     mgr.view.peers["c:1"].declared_size = None  # too old to report -> skipped
+    pd = mgr.view.peers["d:1"]
+    pd.status = STATUS_UNREACHABLE
+    pd.declared_size = 77  # left over from its last answer -> skipped
+    assert mgr.conflicting_sizes() == [99]
+    assert mgr.has_conflict() is True
+    # the drifted peer never joins the mutual set it is compared against
+    assert mgr._agreeing_peer_names() == ["node-c"]
+    # a mismatch still within driftAfter is a fresh answer too
+    pb.status = STATUS_SYNCING
+    assert mgr.conflicting_sizes() == [99]
+    # a benign self-listing declares nothing about another node
+    pb.status = STATUS_SELF
     assert mgr.conflicting_sizes() == []
     assert mgr.has_conflict() is False
 
@@ -2467,6 +2483,160 @@ def test_view_dict_reports_size_conflict(no_tls):
     assert view["conflict_names"] == []  # not a nodeName conflict
 
 
+# --- a resize rolled out together with a job change -----------------------
+#
+# Real ClusterManagers driven through whole gossip rounds. Node names are
+# single letters (the election picks min(name)), hosts are "<name>:1".
+
+
+def _roll(old_set, new_set, old_members, new_members, updated):
+    # managers mid-roll: a member in `updated`, or absent from the old
+    # config, runs the new config (new_members / new_set); the rest still
+    # run the old one.
+    nodes = {}
+    for name in new_members:
+        if name in old_members and name not in updated:
+            members, job_set = old_members, old_set
+        else:
+            members, job_set = new_members, new_set
+        nodes[name] = _mgr(
+            [f"{peer}:1" for peer in members if peer != name],
+            node=name,
+            job_set=job_set,
+            electLeader=True,
+        )
+    return nodes
+
+
+def _gossip_round(nodes, rnd):
+    # one poll round across the fleet: snapshot what every node serves on
+    # /peer, then feed each poller the fields _observe_peer records.
+    snap = {}
+    for name, mgr in nodes.items():
+        snap[name] = {
+            "job_set": mgr.get_job_set_id(),
+            "instance": mgr.instance_id,
+            "members": [
+                (p.node_name, p.instance_id, p.status == STATUS_AGREED)
+                for p in mgr.view.peers.values()
+                if p.node_name
+            ],
+            "size": mgr.cluster_size(),
+            "mutual": set(mgr._agreeing_peer_names()),
+            "vouched": set(mgr._eligible_candidates()),
+            "dist": mgr.distribution,
+            "elect": mgr._elect_leader,
+        }
+    for name, mgr in nodes.items():
+        for host in mgr.view.peers:
+            peer_name = host.rsplit(":", 1)[0]
+            served = snap[peer_name]
+            mgr.view.record_success(
+                host,
+                peer_name,
+                served["job_set"],
+                SCHEME_VERSION,
+                snap[name]["job_set"],
+                NOW + datetime.timedelta(seconds=rnd),
+                name,
+                peer_instance=served["instance"],
+                my_instance=mgr.instance_id,
+                peer_members=served["members"],
+                peer_ran_reboot_jobs=set(),
+                peer_size=served["size"],
+                peer_mutual_agreeing=served["mutual"],
+                peer_quorate_vouched=served["vouched"],
+                peer_distribution=served["dist"],
+                peer_elect_leader=served["elect"],
+            )
+        mgr._poll_rounds += 1
+
+
+def _leader_gate_open(nodes):
+    # the nodes whose Leader gate (Cron._cluster_allows) is open this round
+    from types import SimpleNamespace
+
+    import cronstable.cron
+
+    job = SimpleNamespace(name="nightly", clusterPolicy="Leader")
+    open_gates = []
+    for name, mgr in nodes.items():
+        cron = SimpleNamespace(
+            _elect_leader_configured=True, cluster_manager=mgr
+        )
+        if cronstable.cron.Cron._cluster_allows(cron, job):
+            open_gates.append(name)
+    return sorted(open_gates)
+
+
+def test_resize_with_job_change_fails_leader_closed_on_every_node(no_tls):
+    # the 3 -> 5 roll that also edits a job: d and e boot on the new config,
+    # then a restarts on it first. The old side {b, c} (N=3, quorum 2) and
+    # the new side {a, d, e} (N=5, quorum 3) run different job-set ids, so
+    # neither side sees the other AGREED, yet each is quorate under its own
+    # N and two majorities of different N are disjoint: the quorum arithmetic
+    # alone elects both a and b. Every fresh peer's declared N is compared,
+    # so the resize is a conflict on all five nodes from the first round and
+    # the Leader gate stays closed everywhere until the roll completes.
+    nodes = _roll("v1:old", "v1:new", "abc", "abcde", {"a"})
+    for rnd in range(4):
+        _gossip_round(nodes, rnd)
+        assert all(mgr.has_conflict() for mgr in nodes.values()), rnd
+        assert _leader_gate_open(nodes) == [], rnd
+    # each side names the other side's N; the election itself, blind to
+    # conflicts, would have seated a leader on both sides.
+    assert nodes["a"].conflicting_sizes() == [3]
+    assert nodes["b"].conflicting_sizes() == [5]
+    assert nodes["a"].leader_name() == "a"
+    assert nodes["b"].leader_name() == "b"
+    assert {p.status for p in nodes["a"].view.peers.values()} == {
+        STATUS_AGREED,
+        STATUS_DRIFTED,
+    }
+
+
+@pytest.mark.parametrize(
+    "members, updated",
+    [("abc", "a"), ("abc", "ab"), ("abcde", "ab"), ("abcde", "abc")],
+)
+def test_pure_job_change_roll_is_conflict_free_and_single_leader(
+    no_tls, members, updated
+):
+    # control: a rolling job change at a fixed N is the ordinary deploy, and
+    # every node declares the same N throughout, so comparing drifted peers
+    # raises no conflict at any step of the roll. Once the views have
+    # converged (_SETTLE_ROUNDS), exactly one node holds the Leader gate: the
+    # side with a majority under the one shared N.
+    from cronstable.cluster import _SETTLE_ROUNDS
+
+    nodes = _roll("v1:old", "v1:new", members, members, set(updated))
+    for rnd in range(4):
+        _gossip_round(nodes, rnd)
+        assert not any(mgr.has_conflict() for mgr in nodes.values()), rnd
+        if rnd + 1 >= _SETTLE_ROUNDS:
+            assert len(_leader_gate_open(nodes)) == 1, rnd
+
+
+def test_resize_by_one_with_job_change_is_never_double_led(no_tls):
+    # growing by one member: an old-N majority and a new-N majority always
+    # overlap (floor((k+1)/2) + floor(k/2) + 1 > k), so even bundled with a
+    # job change the election alone seats at most one leader: the new side
+    # {a, d} is 2 < quorum(4) = 3 while b leads the old side. The declared N
+    # still differs across the roll, so the conflict stands every Leader job
+    # down until the roll completes.
+    nodes = _roll("v1:old", "v1:new", "abc", "abcd", {"a"})
+    for rnd in range(4):
+        _gossip_round(nodes, rnd)
+    assert [mgr.leader_name() for mgr in nodes.values()] == [
+        None,
+        "b",
+        "b",
+        None,
+    ]
+    assert all(mgr.has_conflict() for mgr in nodes.values())
+    assert _leader_gate_open(nodes) == []
+
+
 # --- coordination-policy (distribution / electLeader) divergence ----------
 
 
@@ -2475,7 +2645,7 @@ def test_manager_detects_distribution_divergence(no_tls):
     # the same jobs but different distribution agree on the job-set id yet pick
     # DIFFERENT owners for a Leader job (single-leader elects min(live);
     # spread rendezvous-hashes per job), so one would double-run and the other
-    # drop it. A divergence among agreeing peers is a first-class conflict.
+    # drop it. A divergence among reachable peers is a first-class conflict.
     mgr = _mgr(["b:1", "c:1"])
     _seed_agree(mgr, "b:1", "node-b")
     _seed_agree(mgr, "c:1", "node-c")
@@ -2505,17 +2675,26 @@ def test_manager_detects_elect_leader_divergence(no_tls):
     assert mgr.has_conflict() is True
 
 
-def test_policy_divergence_ignores_non_agreed_and_unknown(no_tls):
-    # only AGREED peers that actually reported a value are compared: a drifted
-    # peer, or one too old to declare the fields, contributes no conflict.
-    mgr = _mgr(["b:1", "c:1"])
+def test_policy_divergence_counts_fresh_peers_skips_stale_and_unknown(
+    no_tls,
+):
+    # the same rule as for sizes: every peer with a fresh observation is
+    # compared, whatever its job set, while a stale peer's leftover
+    # declaration and a peer too old to declare the fields (None) are
+    # skipped.
+    mgr = _mgr(["b:1", "c:1", "d:1"])
     _seed_agree(mgr, "b:1", "node-b")
     pb = mgr.view.peers["b:1"]
-    pb.status = STATUS_DRIFTED  # different policy, but drifted -> ignored
+    pb.status = STATUS_DRIFTED  # different policy on another job set
     pb.declared_distribution = "spread"
     mgr.view.peers["c:1"].declared_distribution = None  # too old -> skipped
-    assert mgr.conflicting_policies() == []
-    assert mgr.has_conflict() is False
+    pd = mgr.view.peers["d:1"]
+    pd.status = STATUS_UNREACHABLE
+    pd.declared_elect_leader = True  # left over from its last answer
+    assert mgr.conflicting_policies() == [
+        "distribution 'spread' != 'single-leader'"
+    ]
+    assert mgr.has_conflict() is True
 
 
 def test_view_dict_reports_policy_conflict(no_tls):
@@ -3397,6 +3576,29 @@ def test_gossip_tls_loadable_valid_material(tmp_path):
     tls = _write_tls(tmp_path)
     cfg = _cfg(tls, "127.0.0.1:1", ["b:1"], "node-a")
     assert gossip_tls_loadable(cfg) is True
+
+
+def test_ssl_context_builders_refuse_a_blank_ca(tmp_path):
+    # an empty ca must raise ValueError (not OSError/SSLError, which the
+    # loadable dry-runs swallow); config load rejects it first, see
+    # test_config_backends. Uses stdlib ssl only.
+    from cronstable.cluster import (
+        build_client_ssl_context,
+        build_server_ssl_context,
+    )
+
+    tls = {
+        "ca": "",
+        "cert": str(tmp_path / "cert"),
+        "key": str(tmp_path / "key"),
+    }
+    with pytest.raises(ValueError, match="cluster.tls.ca is required"):
+        build_server_ssl_context(tls)
+    with pytest.raises(ValueError, match="requires a CA path"):
+        build_client_ssl_context(tls)
+    cfg = _cfg(tls, "127.0.0.1:1", ["b:1"], "node-a")
+    with pytest.raises(ValueError):
+        gossip_tls_loadable(cfg)
 
 
 def test_asymmetric_reachability_never_double_leads(no_tls):

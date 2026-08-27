@@ -222,6 +222,13 @@ mount cannot stall the scheduler pass.
 - The lease is held under a process-unique identity (log messages show the
   node's display name), so a restarted daemon can never adopt its
   predecessor's slot.
+- A `state`-section reload that keeps `path` and `deploymentId` rebuilds the
+  backend under the live run and keeps its slot lease and renewer (a changed
+  `slotTtlSeconds` applies from the next renew). A reload that moves the
+  store leaves the lease behind to lapse by TTL and logs `Job <name>: its
+  cluster concurrency slot stays in the previous state store while the run
+  continues here; a peer may launch it once that lease expires`; the next
+  launch claims in the new store.
 
 Manual starts through the [HTTP control API](HTTP-API) go through the same
 gate, consistent with the local behavior: a manual start was already subject
@@ -250,7 +257,12 @@ the holder to yield instead of canceling it directly:
    replaced (concurrencyPolicy: Replace, concurrencyScope: cluster);
    cancelling`. Its instances are then marked replaced (the same
    not-a-failure treatment as a local `Replace`: no reports, no retries) and
-   cancelled, and the finish path releases the slot.
+   cancelled in the background, and the finish path releases the slot. The
+   holder keeps renewing the lease while the old instance drains (up to
+   `killTimeout`), so the slot frees on release rather than by expiry. A
+   drain longer than about twice `slotTtlSeconds` outlasts the pursuit,
+   which then skips the launch (no-run over double-run), so raise
+   `slotTtlSeconds` for jobs with a large `killTimeout`.
 3. The requester waits in a **background pursuit task**, never inline on the
    scheduler pass: waiting a holder out takes up to two slot TTLs and would
    stall every other due job. When the slot frees, by release or TTL expiry,

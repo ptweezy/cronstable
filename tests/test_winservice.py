@@ -913,3 +913,26 @@ def test_query_status_of_a_service_every_windows_host_has():
 
 def WinApiUnderTest():
     return winservice.WinApi()
+
+
+def test_install_notes_a_directory_another_account_can_write(
+    monkeypatch, tmp_path, capsys
+):
+    # The same finding the daemon reports once at start, said at install
+    # time as well, where the operator is already at an elevated prompt.
+    # A note, never a refusal: the service reads the directory it was
+    # given.
+    monkeypatch.delattr(winservice.sys, "_MEIPASS", raising=False)
+    monkeypatch.setattr(platform, "DEFAULT_CONFIG_PATH", r"C:\elsewhere")
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.setattr(
+        platform,
+        "any_user_write_grantee",
+        lambda path: "its owner S-1-5-21-1-2-3-1001",
+    )
+    api = _RecordingInstallApi()
+    assert winservice.install(_args(config=str(tmp_path)), api) == 0
+    assert api.created is not None
+    err = capsys.readouterr().err
+    assert "can be written by its owner S-1-5-21-1-2-3-1001" in err
+    assert "/setowner *S-1-5-32-544" in err

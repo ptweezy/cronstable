@@ -1163,11 +1163,11 @@ def bench_schedule_reseed():
 def bench_schedule_pressure():
     """schedule_pressure at a scale where its declared gate is real.
 
-    Note on the timezone half of the round-2 finding: _local_tzinfo()
-    always returns a fixed-offset datetime.timezone, so a zone dependence
-    here is a docstring nit, not a determinism hazard -- and whatever
-    effect exists cancels between the two sides of a paired run on one
-    runner.
+    The entries sit on the host clock. _fire_cells walks them in a fixed
+    offset whenever the host offset is constant across the window and the
+    engine's look-back, so the timing is zone-independent on any window
+    without a DST transition, and a paired run on one runner sees the
+    same host zone on both sides.
     """
     try:
         from cronstable.croninfo import schedule_pressure

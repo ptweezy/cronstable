@@ -2616,7 +2616,9 @@ def _attach_observability(
     for key in ("nodeName", "interval", "driftAfter", "connectTimeout"):
         if obs.get(key) is not None:
             mesh_raw[key] = obs[key]
-    cfg["observabilityMesh"] = _build_gossip_cluster_config(mesh_raw)
+    cfg["observabilityMesh"] = _build_gossip_cluster_config(
+        mesh_raw, where="cluster.observability"
+    )
 
 
 def _build_state_config(raw: dict) -> StateConfig:
@@ -2812,9 +2814,30 @@ def _validate_job_api_tls(job_api: dict[str, Any], listen: Any) -> None:
             )
 
 
-def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
+def _require_gossip_tls_paths(tls: Mapping[str, Any], where: str) -> None:
+    """Every path in a gossip ``tls`` block must be a non-blank string.
+
+    The schema requires the keys only, and strictyaml maps a blank scalar
+    (what a template renders for an unset variable) to ``''``. An empty
+    ``ca`` reaches the context builders as "no client CA": the ``/peer``
+    listener would require no client certificate and the poller would trust
+    the system root store.
+    """
+    for key in ("ca", "cert", "key"):
+        if not str(tls.get(key) or "").strip():
+            raise ConfigError(
+                "{}.{} must be a non-empty path; a blank value would disable "
+                "peer authentication".format(where, key)
+            )
+
+
+def _build_gossip_cluster_config(
+    raw: dict, *, where: str = "cluster"
+) -> ClusterConfig:
     # Fill defaults over the raw (schema-validated) cluster block and validate
     # the numeric fields, mirroring _validate_numeric_ranges for jobs.
+    # ``where`` names the block in errors; the observability overlay builds
+    # its mesh through here too.
     cfg = _cluster_base(raw)
     _reject_foreign_store_blocks(cfg, "gossip")
     # listen/tls/peers are schema-optional now (so a lease backend need not
@@ -2824,6 +2847,7 @@ def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
             raise ConfigError(
                 "cluster.backend gossip requires cluster.{}".format(key)
             )
+    _require_gossip_tls_paths(cfg["tls"], where + ".tls")
     if cfg["interval"] <= 0:
         raise ConfigError("cluster.interval must be > 0")
     if cfg["driftAfter"] < 1:

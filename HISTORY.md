@@ -1,5 +1,110 @@
 # History
 
+## 1.2.49
+
+- A job on the host's local clock (`utc: false` with no `timezone`) fires by
+  the host's DST rules. The scheduler arms it in `LOCAL_ZONE`, a tzinfo
+  whose offsets come from the C library, so the engine resolves each civil
+  match as it does for an explicit zone: a daily 09:00 job fires once at
+  09:00 on both transition days, a wall time the clocks skip fires once at
+  the shifted time, and a repeated wall time fires on its first occurrence
+  only. Such a job used to be armed against the offset in force at arming,
+  so the first fire after a transition landed an hour off: an hour late in
+  spring, and in fall an hour early plus the correct fire, a duplicate run.
+  The heatmap, the pressure panel, the calendar feed, `/schedule/why`, the
+  startup countdown, the Prometheus next-run gauge and the TUI's agenda
+  share that frame, so every view shows the instants the scheduler fires. A
+  timestamp outside the C library's range (before 1970 on Windows) resolves
+  through the offset of a year with the same calendar layout.
+- The TUI's schedule tab computes a `utc: false` job's next-runs list on the
+  host clock it names as the reference frame, and lints a local-clock job
+  without a zone, as the daemon does.
+- A catch-up evaluation that finds nothing owed closes the job's open
+  checkpoint. A job that is paused when the boot evaluation reaches it pins
+  its pre-pause watermark under an `open` record in `catchup/<job>`; when
+  the pause lifted with no backlog that record stayed newest, so a later
+  restart hoisted the watermark back to the pin and replayed the ordinary
+  runs since as missed, one run under `run-once` and up to 100 serialized
+  runs under `run-all`. The close is written only when a pin exists, so a
+  plain boot appends nothing to the stream, and a pin that cannot be read,
+  or whose close is dropped, keeps the job pending for the next recheck.
+- The cluster `Replace` listener cancels the instances a peer's cancel
+  record names in the background and keeps renewing the slot lease while
+  they drain. A drain longer than the lease had left (the default
+  `killTimeout` of 30 against a `slotTtlSeconds` of 30 renewed every 10)
+  used to let the lease expire under the still running instance, so the
+  pursuing node launched beside it and the holder logged a takeover that
+  blamed a store outage. The pursuit's bound of twice `slotTtlSeconds` still
+  applies, so a job with a large `killTimeout` wants a larger
+  `slotTtlSeconds`.
+- A `state` section reload that keeps `path` and `deploymentId` keeps the
+  held cluster concurrency slots and their renewers across the backend
+  rebuild, and a changed `slotTtlSeconds` applies from the next renew. Any
+  other edit to the section (`maxRunsPerJob`, `gcGraceSeconds`, a job API
+  key) used to drop them, so the lease expired under the live run and a peer
+  could start a second instance of a `Forbid` job. A reload that moves the
+  store, or removes the section, leaves the lease behind to lapse by TTL and
+  logs a warning for each live cluster-scoped run whose fence stays in the
+  old store.
+- A DAG task whose claim write lands in the store after the owning node's
+  own write timeout gave up waiting on it is released (a plain task back to
+  pending, a sensor to its idle shape between pokes) on that node's next
+  advance and re-claimed at once, with its attempt count unchanged. The node
+  keeps a per-process record of every task instance it claimed and launched,
+  so a claim whose launch intents never reached it is recognized by its
+  absence there and logged as a warning naming the run and tasks. A release
+  write that fails is retried on the following advance while the pass still
+  launches every task it claimed. Such a task otherwise sat running under
+  the owner's process token with no subprocess for the daemon's lifetime,
+  its lease keeping peers out, and a restart then failed it as a crash
+  without it ever having run.
+- A blank path in a gossip `cluster.tls` block is a `ConfigError` at load.
+  The schema required the `ca`, `cert` and `key` keys but accepted a blank
+  scalar (what a template renders for an unset variable), and an empty `ca`
+  reached the SSL context builders as "no client CA": the `/peer` listener
+  then required no client certificate while the daemon logged that it was
+  serving mTLS, and the poller verified peers against the system root store.
+  `cronstable --validate-config` reports `cluster.tls.ca must be a non-empty
+  path; a blank value would disable peer authentication`; the observability
+  overlay mesh applies the same rule under `cluster.observability.tls`.
+  `build_server_ssl_context` and `tlsutil.build_mutual_client_ssl_context`
+  refuse an empty CA on their own with a `ValueError`, outside the
+  `OSError`/`SSLError` set the loadability dry runs swallow.
+- The cluster-size and coordination-policy conflict checks compare the
+  declared N and policy of every reachable peer, whatever job set it runs. A
+  resize rolled out together with a job change puts the old and new config
+  generations on different job-set ids, so the two sides see each other as
+  syncing or drifted while each still reaches a quorum under its own N.
+  Comparing only agreed peers let both sides elect a leader, and every
+  Leader job defined in both configs ran twice until the roll left one side
+  short of a quorum. Such a roll is a conflict on every node from the first
+  gossip round, and Leader jobs stand down until every member of the new
+  peer list declares the new N. A pure job change at a fixed N declares one
+  N everywhere and raises no conflict.
+- `cronstable init` hands a machine-wide configuration directory to the
+  Administrators group in the same call that writes its DACL, and that DACL
+  carries an OWNER RIGHTS entry that holds the directory's owner to read.
+  `%ProgramData%` lets any local account create a directory and become its
+  owner, and an owner holds WRITE_DAC whatever the DACL says, so a directory
+  that was only restricted stayed reopenable by whoever pre-created it with
+  a plain `icacls /grant`; with the entry in place that grant is refused.
+  Where the caller cannot assign the owner, which is what an unelevated
+  prompt gets, the DACL still goes on and `init` names the owner it could
+  not change together with the fix. `init` refuses a machine-wide directory
+  that already exists when another account owns it and the hand-over fails,
+  and it refuses a junction or symbolic link standing at the path, writing
+  nothing in either case.
+- The startup permission check reads the owner as well as the DACL. On a
+  path outside the caller's own profile it reports an owner other than
+  SYSTEM, Administrators or TrustedInstaller, unless an OWNER RIGHTS entry
+  limits that owner to read, and it reports a junction or symbolic link
+  standing at the path. The daemon's one-time warning and `cronstable
+  service install` both print the finding with the recipe, which gains the
+  OWNER RIGHTS grant and a second command, `icacls "<dir>" /setowner
+  *S-1-5-32-544`, because icacls refuses `/setowner` beside `/grant`. A
+  user's own configuration directory under their profile is never reported
+  for its owner.
+
 ## 1.2.48
 
 - Every dashboard and TUI screenshot, the animated hero reel and theme row,

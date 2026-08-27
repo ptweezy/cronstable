@@ -70,7 +70,7 @@ from typing import (
 )
 
 from cronstable import _cliargs
-from cronstable.cronexpr import CronTab
+from cronstable.cronexpr import LOCAL_ZONE, CronTab
 from cronstable.croninfo import (  # noqa: F401  (re-exported for tests/back-compat)
     Finding,
     ScheduleEntry,
@@ -7903,7 +7903,13 @@ class AppDrawers(AppOverlays):
         # identical fallback (same salt) against an older daemon
         text = resolved or schedule
         tz_name = job.get("timezone")
-        tz, described, fires = self._schedule_facts(text, name, tz_name)
+        # a configured timezone outranks the utc flag, as in the daemon
+        frame = (
+            str(tz_name)
+            if tz_name
+            else ("UTC" if job.get("utc", True) else "local")
+        )
+        tz, described, fires = self._schedule_facts(text, name, frame)
         rows = [
             " " + paint.style(schedule, "accent", bold=True),
             " " + paint.style(described, "bright"),
@@ -7911,12 +7917,6 @@ class AppDrawers(AppOverlays):
         if resolved and resolved != schedule:
             rows.append(" " + paint.style("resolves to %s" % resolved, "dim"))
         rows.append(paint.style("", "fg"))
-        # a configured timezone outranks the utc flag, as in the daemon
-        frame = (
-            str(tz_name)
-            if tz_name
-            else ("UTC" if job.get("utc", True) else "local")
-        )
         rows.append(paint.style(" reference frame: %s" % frame, "dim"))
         if fires:
             rows.append(paint.style("", "fg"))
@@ -7944,7 +7944,10 @@ class AppDrawers(AppOverlays):
                 if isinstance(f, dict)
             ]
         else:
-            findings = lint_schedule(text, timezone=tz, hash_key=name)
+            # the daemon lints a local-clock job with no zone; mirror it
+            findings = lint_schedule(
+                text, timezone=None if tz is LOCAL_ZONE else tz, hash_key=name
+            )
         if findings:
             rows.append(paint.style("", "fg"))
         rows.extend(finding_rows(findings, paint, width, 3))
@@ -7960,24 +7963,26 @@ class AppDrawers(AppOverlays):
         return rows
 
     def _schedule_facts(
-        self, text: str, name: Optional[str], tz_name: Any
+        self, text: str, name: Optional[str], frame: str
     ) -> tuple[datetime.tzinfo, str, list[datetime.datetime]]:
         """``(zone, prose, upcoming fires)`` for the schedule tab, parsed
-        once per ``(text, name, zone)`` rather than per frame.
+        once per ``(text, name, frame)`` rather than per paint.
 
-        The zone and the prose are pure functions of the inputs.  The
-        fire list is the engine's first eight occurrences strictly after
-        the moment it was built, so it is exact until its first entry is
-        due; it is rebuilt from the held parse then.  Both clocks are
-        read for "due" (the instant, and the zone's civil time the
-        engine compares in) so a fold hour cannot hold the list late.
+        ``frame`` is the reference-frame label: a zone name, ``UTC``, or
+        ``local`` for the host clock (LOCAL_ZONE, the scheduler's own
+        frame).  The zone and the prose are pure functions of the
+        inputs.  The fire list is the engine's first eight occurrences
+        strictly after the moment it was built, so it is exact until its
+        first entry is due; it is rebuilt from the held parse then.  Both
+        clocks are read for "due" (the instant, and the zone's civil time
+        the engine compares in) so a fold hour cannot hold the list late.
         """
         cached = self._sched_facts
         if (
             cached is not None
             and cached[0] == text
             and cached[1] == name
-            and cached[2] == tz_name
+            and cached[2] == frame
         ):
             tab, tz, described, fires = cached[3:]
             if fires and (
@@ -7988,11 +7993,13 @@ class AppDrawers(AppOverlays):
                 self._sched_facts = cached[:6] + (fires,)
             return tz, described, fires
         tz = datetime.timezone.utc
-        if tz_name:
+        if frame == "local":
+            tz = LOCAL_ZONE
+        elif frame != "UTC":
             try:
                 from zoneinfo import ZoneInfo
 
-                tz = ZoneInfo(str(tz_name))
+                tz = ZoneInfo(frame)
             except Exception:  # noqa: BLE001 - fall back to UTC
                 pass
         # the parse next_fires would make; describe_cron takes it as its
@@ -8003,7 +8010,7 @@ class AppDrawers(AppOverlays):
             tab = None
         described = describe_cron(text, hash_key=name, tab=tab)
         fires = next_fires(text, 8, tz, hash_key=name, tab=tab)
-        self._sched_facts = (text, name, tz_name, tab, tz, described, fires)
+        self._sched_facts = (text, name, frame, tab, tz, described, fires)
         return tz, described, fires
 
     # ---- the DAG drawer ---------------------------------------------

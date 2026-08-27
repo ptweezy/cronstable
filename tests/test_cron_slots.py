@@ -8,6 +8,7 @@ from tests._configs import job_yaml
 from tests._cron_helpers import (
     fixed_current_time,  # noqa: F401
 )
+from tests._helpers import _state_cfg
 
 # ---------------------------------------------------------------------------
 # Cluster concurrency slot leasing.
@@ -767,6 +768,200 @@ async def test_slotlease_slot_renewer_replace_request_cancels_instance(
     cron._slot_renewers["s"] = task
     await asyncio.wait_for(task, timeout=5)
     assert run.replaced is True and run.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_renewer_replace_cancel_runs_in_background(
+    monkeypatch, caplog
+):
+    # cancel() outlasts several renew periods, as a SIGTERM'd process
+    # draining towards killTimeout does; the renewer must keep renewing
+    # meanwhile, and the persisting cancel record must not re-signal.
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    mine = _slotlease_lease(holder=cron._slot_holder(), fence=5)
+    cron._slot_leases["s"] = mine
+    drained = asyncio.Event()
+
+    class _SlowRun:
+        def __init__(self):
+            self.replaced = False
+            self.cancel_calls = 0
+            self.config = cron.cron_jobs["s"]
+
+        async def cancel(self):
+            self.cancel_calls += 1
+            await drained.wait()
+
+    class _BrokenRun(_SlowRun):
+        async def cancel(self):
+            self.cancel_calls += 1
+            raise RuntimeError("signal failed")
+
+    class _CountingBackend(_SlotleaseRenewBackend):
+        renews = 0
+
+        async def renew_lease(self, lease, ttl):
+            self.renews += 1
+            return await super().renew_lease(lease, ttl)
+
+    slow, broken = _SlowRun(), _BrokenRun()
+    cron.running_jobs["s"] = [slow, broken]
+    backend = _CountingBackend(
+        cron,
+        # the cancel record is re-read every cycle; renewals keep landing
+        # until cycle 4 shows a takeover.
+        list_script=[[{"kind": "cancel", "fence": 5, "by": "peerZ"}]],
+        renew_script=[mine, mine, mine, None],
+        read_script=[
+            None,
+            None,
+            None,
+            _slotlease_lease(holder="peer#4", fence=8),
+        ],
+    )
+    cron.state_backend = backend
+    task = asyncio.create_task(cron._slot_renewer("s"))
+    cron._slot_renewers["s"] = task
+    while backend.renews < 2:
+        await _SLOTLEASE_REAL_SLEEP(0)
+    # two renewals landed with the slow cancel still pending
+    assert not drained.is_set()
+    assert slow.cancel_calls == 1 and broken.cancel_calls == 1
+    assert slow.replaced is True and broken.replaced is True
+    assert cron._replace_cancel_tasks
+    drained.set()
+    await asyncio.wait_for(task, timeout=5)
+    await asyncio.gather(
+        *list(cron._replace_cancel_tasks), return_exceptions=True
+    )
+    await _SLOTLEASE_REAL_SLEEP(0)
+    assert slow.cancel_calls == 1  # the record re-read each cycle is inert
+    assert not cron._replace_cancel_tasks
+    assert "cancelling the replaced instance failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_renewer_period_follows_slot_ttl(monkeypatch):
+    # a state-section reload lowers slotTtlSeconds under a kept renewer:
+    # the next period is a third of the new TTL.
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron._slot_ttl = 30.0
+    delays = []
+
+    async def _recording_sleep(delay, *args, **kwargs):
+        delays.append(delay)
+        cron._slot_ttl = 6.0
+        await _SLOTLEASE_REAL_SLEEP(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _recording_sleep)
+    mine = _slotlease_lease(holder=cron._slot_holder(), fence=5)
+    cron._slot_leases["s"] = mine
+    backend = _SlotleaseRenewBackend(
+        cron,
+        list_script=[[], []],
+        renew_script=[mine, None],
+        read_script=[None, _slotlease_lease(holder="peer#9", fence=9)],
+    )
+    cron.state_backend = backend
+    task = asyncio.create_task(cron._slot_renewer("s"))
+    cron._slot_renewers["s"] = task
+    await asyncio.wait_for(task, timeout=5)
+    assert delays == [10.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_renewer_waits_out_backend_gap(monkeypatch):
+    # between the old backend's stop() and the replacement's start() the
+    # renewer sees no backend; with the lease still held it idles that
+    # period out and renews through the replacement.
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron._slot_leases["s"] = _slotlease_lease(
+        holder=cron._slot_holder(), fence=5
+    )
+    backend = _SlotleaseRenewBackend(
+        cron,
+        list_script=[[]],
+        renew_script=[None],
+        read_script=[_slotlease_lease(holder="peer#9", fence=9)],
+    )
+    seen = []
+
+    async def _gap_sleep(delay, *args, **kwargs):
+        seen.append(cron.state_backend)
+        if len(seen) == 2:
+            cron.state_backend = backend
+        await _SLOTLEASE_REAL_SLEEP(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _gap_sleep)
+    assert cron.state_backend is None
+    task = asyncio.create_task(cron._slot_renewer("s"))
+    cron._slot_renewers["s"] = task
+    await asyncio.wait_for(task, timeout=5)
+    assert seen == [None, None]  # one idle period, then the takeover cycle
+    assert backend.n == 1
+    assert "s" not in cron._slot_leases
+
+
+@pytest.mark.asyncio
+async def test_slotlease_store_teardown_drops_idle_lease_quietly(
+    stateful_cron, caplog
+):
+    # the store-move warning names live runs only; an idle lease (a run
+    # between finish and release) is dropped without one.
+    cron = await stateful_cron(_SLOTLEASE_CLUSTER_FORBID)
+    cron._slot_leases["s"] = _slotlease_lease(
+        holder=cron._slot_holder(), fence=5
+    )
+    await cron.start_stop_state(None)
+    assert cron.state_backend is None
+    assert cron._slot_leases == {}
+    assert "stays in the previous state store" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("removed", [False, True])
+async def test_slotlease_store_change_while_down_drops_slots(
+    stateful_cron, slotlease_reaper, tmp_path, monkeypatch, caplog, removed
+):
+    # a same-store reload whose restart fails keeps the held slots for the
+    # retry; a move (or the section's removal) during that outage has no
+    # live backend to compare against and still drops them.
+    cron = await stateful_cron(_SLOTLEASE_CLUSTER_FORBID)
+    cron._slot_leases["s"] = _slotlease_lease(
+        holder=cron._slot_holder(), fence=5
+    )
+    renewer = asyncio.create_task(cron._slot_renewer("s"))
+    slotlease_reaper(renewer)
+    cron._slot_renewers["s"] = renewer
+    cron.running_jobs["s"] = [object()]  # a live run: the warning names it
+    real_make = cronstable.cron.make_state_backend
+
+    def _down(*args, **kwargs):
+        raise OSError("mount gone")
+
+    monkeypatch.setattr(cronstable.cron, "make_state_backend", _down)
+    await cron.start_stop_state(
+        _state_cfg(
+            "state:\n  path: {}\n  maxRunsPerJob: 200\n".format(tmp_path)
+        )
+    )
+    assert cron.state_backend is None
+    assert "s" in cron._slot_leases and not renewer.done()
+    assert "stays in the previous state store" not in caplog.text
+    monkeypatch.setattr(cronstable.cron, "make_state_backend", real_make)
+    target = (
+        None
+        if removed
+        else _state_cfg("state:\n  path: {}\n".format(tmp_path / "moved"))
+    )
+    await cron.start_stop_state(target)
+    assert (cron.state_backend is None) is removed
+    assert cron._slot_leases == {} and cron._slot_renewers == {}
+    await asyncio.sleep(0)
+    assert renewer.cancelled()
+    assert "stays in the previous state store" in caplog.text
+    await cron._stop_job_api()
 
 
 # --- release paths ---------------------------------------------------------

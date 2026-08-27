@@ -643,3 +643,195 @@ def test_nothing_is_said_when_the_config_is_not_writable(monkeypatch, caplog):
         main._warn_if_config_is_writable(r"C:\ProgramData\cronstable")
         main._warn_if_config_is_writable(None)
     assert caplog.text == ""
+
+
+def test_a_writable_config_warning_carries_the_owner_recipe(
+    monkeypatch, caplog
+):
+    # An owner other than SYSTEM or Administrators holds WRITE_DAC
+    # implicitly, so the DACL recipe alone cannot fix it: the remedy has
+    # to hand the directory over as well.
+    monkeypatch.setattr(
+        main.platform,
+        "any_user_write_grantee",
+        lambda path: "its owner S-1-5-21-1-2-3-1001",
+    )
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        main._warn_if_config_is_writable(r"C:\ProgramData\cronstable")
+    text = caplog.text
+    assert "can be written by its owner S-1-5-21-1-2-3-1001" in text
+    assert "/setowner *S-1-5-32-544" in text
+    assert "*S-1-3-4:(OI)(CI)RX" in text
+
+
+# --- init and a directory that already exists --------------------------------
+
+
+def _init(monkeypatch, target):
+    monkeypatch.setattr(sys, "argv", ["cronstable", "init", str(target)])
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop(_loop())
+    return exc.value.code
+
+
+def test_init_ignores_parked_names_in_an_existing_directory(
+    monkeypatch, tmp_path, capsys
+):
+    # a leading _ or . is how a config is parked; the loader skips those,
+    # so they do not make the directory a live setup
+    target = tmp_path / "confdir"
+    target.mkdir()
+    (target / "_parked.yaml").write_text("jobs: []\n")
+    (target / ".hidden.yaml").write_text("jobs: []\n")
+    (target / "notes.txt").write_text("not a config\n")
+    assert _init(monkeypatch, target) == 0
+    assert (target / "cronstable.yaml").is_file()
+    assert "already holds" not in capsys.readouterr().err
+
+
+def test_init_refuses_a_machine_wide_directory_it_cannot_re_own(
+    monkeypatch, tmp_path, capsys
+):
+    # The pre-created %ProgramData%\cronstable: a low-privilege account made
+    # it and owns it, and init could not hand it to Administrators (an
+    # unelevated prompt, or no WRITE_OWNER). Nothing is written, so a
+    # rerun from an elevated prompt is a plain rerun.
+    target = tmp_path / "confdir"
+    target.mkdir()
+    monkeypatch.setattr(
+        main.platform, "untrusted_owner", lambda path: "S-1-5-21-1-2-3-1001"
+    )
+    monkeypatch.setattr(main.platform, "harden_config_dir", lambda path: False)
+    assert _init(monkeypatch, target) == 1
+    err = capsys.readouterr().err
+    assert "owned by S-1-5-21-1-2-3-1001" in err
+    assert "/setowner *S-1-5-32-544" in err
+    assert not (target / "cronstable.yaml").exists()
+
+
+def test_init_refuses_when_the_owner_survives_the_hand_over(
+    monkeypatch, tmp_path, capsys
+):
+    # harden reports the DACL in place (the OWNER RIGHTS fallback arm) but
+    # the owner is unchanged: still a refusal, because the documented flow
+    # ends with Administrators owning the directory.
+    target = tmp_path / "confdir"
+    target.mkdir()
+    monkeypatch.setattr(
+        main.platform, "untrusted_owner", lambda path: "S-1-5-21-1-2-3-1001"
+    )
+    monkeypatch.setattr(main.platform, "harden_config_dir", lambda path: True)
+    assert _init(monkeypatch, target) == 1
+    assert "could not hand it to Administrators" in capsys.readouterr().err
+    assert not (target / "cronstable.yaml").exists()
+
+
+def test_init_adopts_a_directory_it_could_hand_to_administrators(
+    monkeypatch, tmp_path, capsys
+):
+    target = tmp_path / "confdir"
+    target.mkdir()
+    owners = iter(["S-1-5-21-1-2-3-1001"])  # before the hand-over, then none
+    monkeypatch.setattr(
+        main.platform, "untrusted_owner", lambda path: next(owners, None)
+    )
+    hardened = []
+    monkeypatch.setattr(
+        main.platform,
+        "harden_config_dir",
+        lambda path: hardened.append(path) or True,
+    )
+    assert _init(monkeypatch, target) == 0
+    out = capsys.readouterr().out
+    assert "handed {} to Administrators".format(target) in out
+    assert "owned by S-1-5-21-1-2-3-1001" in out
+    assert (target / "cronstable.yaml").is_file()
+    # hardened BEFORE the write, so the starter lands in a directory
+    # nobody else can reopen; the post-write pass found nothing left
+    assert hardened == [str(target)]
+
+
+def test_init_refuses_a_machine_wide_junction(monkeypatch, tmp_path, capsys):
+    # A junction at C:\ProgramData\cronstable pointing into an account's
+    # own profile: hardening the link protects nothing the loader reads.
+    target = tmp_path / "confdir"
+    target.mkdir()
+    monkeypatch.setattr(main.platform, "is_machine_wide", lambda path: True)
+    monkeypatch.setattr(main.platform, "is_reparse_point", lambda path: True)
+    assert _init(monkeypatch, target) == 1
+    err = capsys.readouterr().err
+    assert "junction or symbolic link" in err
+    assert "Replace it with a real directory" in err
+    assert not (target / "cronstable.yaml").exists()
+
+
+def test_init_leaves_a_user_scoped_link_and_owner_alone(
+    monkeypatch, tmp_path, capsys
+):
+    # Under the caller's own profile a symlinked configuration directory
+    # owned by that caller is the design, never a finding.
+    target = tmp_path / "confdir"
+    target.mkdir()
+    monkeypatch.setattr(main.platform, "is_machine_wide", lambda path: False)
+    monkeypatch.setattr(main.platform, "is_reparse_point", lambda path: True)
+    assert _init(monkeypatch, target) == 0
+    assert (target / "cronstable.yaml").is_file()
+    assert capsys.readouterr().err == ""
+
+
+def test_init_restricts_a_fresh_directory_and_says_so(
+    monkeypatch, tmp_path, capsys
+):
+    target = tmp_path / "confdir"
+    monkeypatch.setattr(
+        main.platform, "any_user_write_grantee", lambda path: r"BUILTIN\Users"
+    )
+    monkeypatch.setattr(main.platform, "harden_config_dir", lambda path: True)
+    monkeypatch.setattr(main.platform, "untrusted_owner", lambda path: None)
+    assert _init(monkeypatch, target) == 0
+    captured = capsys.readouterr()
+    restricted = (
+        "restricted {} so BUILTIN\\Users can no longer add a job there"
+    )
+    assert restricted.format(target) in captured.out
+    assert captured.err == ""
+
+
+def test_init_names_the_owner_it_could_not_change(
+    monkeypatch, tmp_path, capsys
+):
+    # init created the directory itself under %ProgramData% from an
+    # unelevated prompt: the DACL takes (OWNER RIGHTS holds the caller to
+    # read from here on) but Administrators could not be assigned, and the
+    # success line must not claim otherwise.
+    target = tmp_path / "confdir"
+    monkeypatch.setattr(
+        main.platform,
+        "any_user_write_grantee",
+        lambda path: "its owner S-1-5-21-1-2-3-1001",
+    )
+    monkeypatch.setattr(main.platform, "harden_config_dir", lambda path: True)
+    monkeypatch.setattr(
+        main.platform, "untrusted_owner", lambda path: "S-1-5-21-1-2-3-1001"
+    )
+    assert _init(monkeypatch, target) == 0
+    captured = capsys.readouterr()
+    assert "restricted {}".format(target) in captured.out
+    assert "stays owned by S-1-5-21-1-2-3-1001" in captured.err
+    assert "/setowner *S-1-5-32-544" in captured.err
+
+
+def test_init_prints_the_recipe_when_it_cannot_restrict(
+    monkeypatch, tmp_path, capsys
+):
+    target = tmp_path / "confdir"
+    monkeypatch.setattr(
+        main.platform, "any_user_write_grantee", lambda path: r"BUILTIN\Users"
+    )
+    monkeypatch.setattr(main.platform, "harden_config_dir", lambda path: False)
+    assert _init(monkeypatch, target) == 0
+    captured = capsys.readouterr()
+    assert "restricted" not in captured.out
+    assert "BUILTIN\\Users can write {}".format(target) in captured.err
+    assert "/inheritance:r" in captured.err
+    assert "/setowner *S-1-5-32-544" in captured.err

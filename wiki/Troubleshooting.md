@@ -577,7 +577,7 @@ automatically after the duplicate is renamed. See
 descriptors in `"conflicting_policies"` (and the umbrella `"conflict": true`), a
 banner appears in the dashboard cluster panel, and `Leader` jobs stand down.
 
-**Cause.** A quorate peer is advertising a different `distribution` or
+**Cause.** A reachable peer is advertising a different `distribution` or
 `elect_leader` setting than this node. Because those are cluster-wide coordination
 settings (not part of the job-set id, so they do not surface as drift), a mismatch
 would let nodes coordinate differently and double-run.

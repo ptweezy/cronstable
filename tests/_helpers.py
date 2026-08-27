@@ -13,12 +13,15 @@ the parameter differences are documented on the helper itself.
 import ast
 import asyncio
 import datetime
+import errno
 import json
 import os
 import socket
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from cronstable import cronexpr
 from cronstable.config import parse_config_string
 from cronstable.state import FilesystemStateBackend
 
@@ -28,6 +31,35 @@ _UTC = datetime.timezone.utc
 # tests/test_web_tls.py) pin the same NOW = 2026-01-01 UTC for cert
 # validity windows (not_valid_before NOW-1d, not_valid_after NOW+3650d).
 TLS_NOW = datetime.datetime(2026, 1, 1, tzinfo=_UTC)
+
+
+# --- the host clock ---------------------------------------------------------
+# LOCAL_ZONE reads the host's zone through cronexpr's two C-library seams;
+# pin them to a ZoneInfo so a local-clock test is deterministic on any host.
+# ``years`` gives the pinned library the MS CRT's shape: OSError outside it.
+
+
+def _pin_host_zone(monkeypatch, name, years=None):
+    zone = ZoneInfo(name)
+
+    def check(year):
+        if years is not None and not years[0] <= year <= years[1]:
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+    def civil(utc):
+        check(utc.year)
+        local = utc.astimezone(zone)
+        return local.replace(
+            tzinfo=datetime.timezone(local.utcoffset(), local.tzname())
+        )
+
+    def instant(civil):
+        check(civil.year)
+        return civil.replace(tzinfo=zone).astimezone(_UTC)
+
+    monkeypatch.setattr(cronexpr, "_host_civil", civil)
+    monkeypatch.setattr(cronexpr, "_host_instant", instant)
+    return zone
 
 
 # --- config parsing shims ---------------------------------------------------

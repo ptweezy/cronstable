@@ -122,8 +122,13 @@ def build_mutual_client_ssl_context(
     ``cert``/``key``, and pins the hostname.
 
     The strict mutual-TLS posture the cluster peer channel requires: every
-    field mandatory, verification and hostname checking always on.
+    field mandatory, verification and hostname checking always on. Raises
+    :exc:`ValueError` on an empty ``ca``.
     """
+    if not ca:
+        # create_default_context(cafile='') loads the system root store,
+        # widening the trust set from the one CA to every public root.
+        raise ValueError("a mutual-TLS client context requires a CA path")
     ctx = ssl.create_default_context(cafile=ca)
     ctx.load_cert_chain(cert, key)
     # create_default_context already sets check_hostname=True and

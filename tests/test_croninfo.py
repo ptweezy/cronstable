@@ -9,12 +9,18 @@ always pinned so the DST findings land on known transition dates.
 import datetime
 from zoneinfo import ZoneInfo
 
+from cronstable import croninfo
+from cronstable.cronexpr import LOCAL_ZONE
 from cronstable.croninfo import (
     Finding,
+    _fire_cells,
+    _local_tzinfo,
+    _walk_frame,
     describe_cron,
     lint_schedule,
     next_fires,
 )
+from tests._helpers import _pin_host_zone
 
 _UTC = datetime.timezone.utc
 _NY = ZoneInfo("America/New_York")
@@ -922,3 +928,72 @@ def test_describe_cron_prebuilt_tab_matches_the_reparse(expr):
     assert describe_cron(expr, hash_key="a-job", tab=hashed) == describe_cron(
         expr, hash_key="a-job"
     )
+
+
+def test_local_tzinfo_is_the_shared_host_zone(monkeypatch):
+    # every view frames a local-clock entry in LOCAL_ZONE, the scheduler's
+    # own frame, so a spring-gap label previews at its shifted time
+    assert _local_tzinfo() is LOCAL_ZONE
+    ny = _pin_host_zone(monkeypatch, "America/New_York")
+    start = datetime.datetime(2027, 3, 14, 5, 0, tzinfo=_UTC)
+    local = next_fires(
+        "30 2 * * *", 2, start=start.astimezone(_local_tzinfo())
+    )
+    twin = next_fires("30 2 * * *", 2, start=start.astimezone(ny))
+    assert [w.astimezone(_UTC) for w in local] == [
+        w.astimezone(_UTC) for w in twin
+    ]
+    assert local[0].replace(tzinfo=None) == datetime.datetime(
+        2027, 3, 14, 3, 30
+    )
+
+
+def test_walk_frame_is_a_fixed_offset_away_from_a_transition(monkeypatch):
+    # a window whose host offset is constant, the engine's 26h look-back
+    # included, walks on the fixed-offset path; a transition inside either
+    # keeps LOCAL_ZONE, and any other zone passes through untouched
+    _pin_host_zone(monkeypatch, "America/New_York")
+    two_days = datetime.timedelta(hours=48)
+    plain = datetime.datetime(2027, 6, 1, 12, 0, tzinfo=_UTC)
+    frame = _walk_frame(LOCAL_ZONE, plain, plain + two_days)
+    assert type(frame) is datetime.timezone
+    assert frame.utcoffset(None) == datetime.timedelta(hours=-4)
+    assert frame.tzname(None) == "EDT"
+    # the spring-forward (2027-03-14 07:00 UTC) inside the window
+    inside = datetime.datetime(2027, 3, 13, 12, 0, tzinfo=_UTC)
+    assert _walk_frame(LOCAL_ZONE, inside, inside + two_days) is LOCAL_ZONE
+    # five hours after it: inside the look-back, so the gap's shifted
+    # fires still walk aware
+    soon = datetime.datetime(2027, 3, 14, 12, 0, tzinfo=_UTC)
+    assert _walk_frame(LOCAL_ZONE, soon, soon + two_days) is LOCAL_ZONE
+    # thirty hours after it: clear of the look-back
+    later = datetime.datetime(2027, 3, 15, 13, 0, tzinfo=_UTC)
+    assert (
+        type(_walk_frame(LOCAL_ZONE, later, later + two_days))
+        is datetime.timezone
+    )
+    assert _walk_frame(_NY, plain, plain + two_days) is _NY
+
+
+def test_fire_cells_fixed_frame_matches_the_aware_walk(monkeypatch):
+    # the fixed-offset walk is a pure shortcut: on any window it takes, the
+    # grid, the cell names and the per-minute sets equal the aware walk's
+    _pin_host_zone(monkeypatch, "America/New_York")
+    entries = [
+        ScheduleEntry("gap", CronTab("30 2 * * *"), None),
+        ScheduleEntry("q", CronTab("*/20 * * * *"), None),
+        ScheduleEntry("z", CronTab("15 9 * * *"), _NY),
+    ]
+    for start in (
+        datetime.datetime(2027, 6, 1, 12, 0, tzinfo=_UTC),
+        datetime.datetime(2027, 3, 15, 13, 0, tzinfo=_UTC),
+    ):
+        end = start + datetime.timedelta(hours=48)
+        fast = _fire_cells(entries, start, 48, LOCAL_ZONE)
+        assert type(_walk_frame(LOCAL_ZONE, start, end)) is datetime.timezone
+        with monkeypatch.context() as m:
+            m.setattr(croninfo, "_walk_frame", lambda zone, s, e: zone)
+            aware = _fire_cells(entries, start, 48, LOCAL_ZONE)
+        assert fast == aware
+        # occurrences are strictly after start: 143 twenty-minute slots
+        assert sum(map(sum, fast[0])) == 2 + 143 + 2

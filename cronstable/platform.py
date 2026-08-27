@@ -26,9 +26,11 @@ from __future__ import annotations
 import contextlib
 import errno
 import logging
+import ntpath
 import os
 import re
 import signal
+import stat
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -1105,20 +1107,65 @@ def fsync_directory(path: str) -> None:
 #: ``FA``/``FRFX`` rather than ``GA``/``GRGX``: the generic forms are not
 #: mapped on this path and read back as six split ACEs carrying unmapped
 #: generic bits, which Windows' own tools cannot render as a permission.
-_CONFIG_DIR_SDDL = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;AU)"
+#:
+#: The OWNER RIGHTS ACE (``OW``, S-1-3-4) is what makes the DACL hold
+#: against the directory's owner.  An owner holds READ_CONTROL and
+#: WRITE_DAC implicitly, whatever the DACL says, and ``%ProgramData%``
+#: lets any local account create a directory and become its owner, so
+#: without this ACE the account that made the directory grants itself
+#: full control back with plain ``icacls``.  With the ACE present those
+#: implicit rights are replaced by what it grants, which is read.
+#: Measured: the owner's own ``icacls /grant`` is refused afterwards.
+_CONFIG_DIR_SDDL = (
+    "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;AU)(A;OICI;FRFX;;;OW)"
+)
+
+#: The owner :func:`harden_config_dir` assigns, BUILTIN\\Administrators.
+#: An elevated caller assigns it with no privilege, because its token lists
+#: the group as an eligible owner; an unelevated one is refused with
+#: ERROR_INVALID_OWNER.
+_CONFIG_DIR_OWNER_SID = "S-1-5-32-544"
+
+#: Owners a machine-wide configuration directory may have without being
+#: reported: LocalSystem, BUILTIN\\Administrators and TrustedInstaller,
+#: each as the SDDL converter spells it.  A directory under
+#: ``%ProgramData%`` owned by anyone else was created by an account that
+#: was not elevated, and that account keeps the implicit right to reopen
+#: it however its DACL is written.
+_TRUSTED_OWNERS = frozenset(
+    {
+        "SY",
+        "S-1-5-18",
+        "BA",
+        "S-1-5-32-544",
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+    }
+)
+
+#: What :func:`any_user_write_grantee` reports for a junction or symbolic
+#: link standing at a machine-wide path: the scheduler reads whatever the
+#: target holds, and the target belongs to whoever placed the link.
+_REPARSE_GRANTEE = (
+    "whoever placed the junction or symbolic link it resolves through "
+    "(replace it with a real directory)"
+)
 
 
 def config_dir_icacls_recipe(path: str) -> str:
-    """The paste-able icacls line for :data:`_CONFIG_DIR_SDDL`.
+    """The paste-able icacls commands for :data:`_CONFIG_DIR_SDDL`.
 
     Kept beside the SDDL so the printed advice cannot drift from what
     :func:`harden_config_dir` applies.  ``RX`` is the icacls spelling of
-    ``FRFX``; the AU grant stays for the reason given above.
+    ``FRFX``; the AU grant stays for the reason given above.  Two commands
+    because icacls refuses ``/setowner`` in the same invocation as
+    ``/grant``.
     """
     return (
-        'icacls "{}" /inheritance:r /grant *S-1-5-18:(OI)(CI)F '
+        'icacls "{0}" /inheritance:r /grant *S-1-5-18:(OI)(CI)F '
         "/grant *S-1-5-32-544:(OI)(CI)F "
-        "/grant *S-1-5-11:(OI)(CI)RX".format(path)
+        "/grant *S-1-5-11:(OI)(CI)RX "
+        "/grant *S-1-3-4:(OI)(CI)RX, "
+        'then icacls "{0}" /setowner *S-1-5-32-544'.format(path)
     )
 
 
@@ -1201,14 +1248,128 @@ def _sddl_rights_write(rights: str) -> bool:
     return bool(tokens & _WRITE_TOKENS)
 
 
+#: Rights an OWNER RIGHTS ACE may grant while still counting as read only:
+#: FILE_GENERIC_READ, FILE_GENERIC_EXECUTE and their generic forms.
+_OWNER_READ_TOKENS = frozenset({"FR", "FX", "GR", "GX"})
+_OWNER_READ_MASK = 0x001200A9 | 0x80000000 | 0x20000000
+
+#: ``FILE_ATTRIBUTE_REPARSE_POINT``, the bit ``os.lstat`` reports for a
+#: junction as well as a symbolic link; ``os.path.islink`` sees only the
+#: latter.
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _sddl_owner(sddl: str) -> Optional[str]:
+    """The ``O:`` principal of an SDDL string, alias or SID, or None."""
+    match = re.match(r"O:(.+?)(?=[GDS]:|$)", sddl)
+    return match.group(1) if match else None
+
+
+def _sddl_untrusted_owner(sddl: str) -> Optional[str]:
+    """The owner ``sddl`` names when a machine-wide path may not have it."""
+    owner = _sddl_owner(sddl)
+    return None if owner is None or owner in _TRUSTED_OWNERS else owner
+
+
+def _sddl_owner_neutralized(sddl: str) -> bool:
+    """Whether an OWNER RIGHTS ACE limits the owner to read.
+
+    The ACE replaces the owner's implicit READ_CONTROL and WRITE_DAC with
+    exactly what it grants, so only an allow ACE on the object itself that
+    grants nothing beyond read and execute counts.
+    """
+    for ace in re.findall(r"\(([^)]*)\)", sddl):
+        parts = ace.split(";")
+        if len(parts) < 6 or parts[0] != "A":
+            continue
+        if parts[5] not in ("OW", "S-1-3-4"):
+            continue
+        flags = parts[1]
+        if "IO" in {flags[i : i + 2] for i in range(0, len(flags) - 1, 2)}:
+            continue
+        rights = parts[2].strip()
+        if rights[:2].lower() == "0x":
+            try:
+                return not (int(rights, 16) & ~_OWNER_READ_MASK)
+            except ValueError:
+                return False
+        tokens = {rights[i : i + 2] for i in range(0, len(rights) - 1, 2)}
+        return bool(tokens) and tokens <= _OWNER_READ_TOKENS
+    return False
+
+
+def _security_finding(
+    sddl: Optional[str], *, machine_wide: bool, reparse: bool
+) -> Optional[str]:
+    """The first way ``sddl`` lets a non-administrator write, or None.
+
+    On a machine-wide path a reparse point and an untrusted owner come
+    first: both survive any DACL, so they are the finding the DACL rule
+    would otherwise hide behind a grant it does not report.  An absent
+    ``sddl`` means "cannot tell", which has to read as no finding.
+    """
+    if not sddl:
+        return None
+    if machine_wide:
+        if reparse:
+            return _REPARSE_GRANTEE
+        owner = _sddl_untrusted_owner(sddl)
+        if owner is not None and not _sddl_owner_neutralized(sddl):
+            return "its owner " + owner
+    return _sddl_write_grantee(sddl)
+
+
+def path_is_user_scoped(path: str, user_profile: Optional[str]) -> bool:
+    """Whether ``path`` lies under ``user_profile``, compared as Windows paths.
+
+    ntpath on every OS: a Windows path compared with os.path on a POSIX box
+    never matches, so the check would silently never fire.
+    """
+    if not path or not user_profile:
+        return False
+    resolved = ntpath.normcase(ntpath.normpath(path))
+    profile = ntpath.normcase(ntpath.normpath(user_profile))
+    return resolved == profile or resolved.startswith(profile + ntpath.sep)
+
+
+def is_machine_wide(path: str) -> bool:
+    """Whether a Windows ``path`` sits outside the caller's own profile.
+
+    The owner and reparse rules apply only there: a user's own
+    configuration directory is owned by that user by design.
+    """
+    return IS_WINDOWS and not path_is_user_scoped(
+        os.path.abspath(path), os.environ.get("USERPROFILE")
+    )
+
+
+def is_reparse_point(path: str) -> bool:
+    """Whether ``path`` itself is a junction or symbolic link."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    attributes = getattr(st, "st_file_attributes", 0)
+    return stat.S_ISLNK(st.st_mode) or bool(
+        attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
 def any_user_write_grantee(path: str) -> Optional[str]:
     """Who, other than an administrator, may write to ``path``.
 
     Returns the principal's familiar name, or ``None`` when nobody can and
-    on every non-Windows host.  Reads one DACL and asks one question of
-    it, so it is cheap enough to run at startup, and it answers for
-    directories created long before anything hardened them, which is the
-    case that matters: the hole is inherited rather than written.
+    on every non-Windows host.  Reads one security descriptor and asks one
+    question of it, so it is cheap enough to run at startup, and it
+    answers for directories created long before anything hardened them,
+    which is the case that matters: the hole is inherited rather than
+    written.
+
+    On a machine-wide path, one outside the caller's own profile, two more
+    things count: a junction or symbolic link standing at the path, and an
+    owner other than SYSTEM, Administrators or TrustedInstaller, unless an
+    OWNER RIGHTS ACE limits that owner to read.  An owner holds WRITE_DAC
+    implicitly, so the DACL alone cannot answer for one.
 
     Correct for a configuration FILE as well as a directory, and not by
     accident: FILE_ADD_FILE and FILE_WRITE_DATA are the same bit, as are
@@ -1221,12 +1382,34 @@ def any_user_write_grantee(path: str) -> Optional[str]:
     """
     if not IS_WINDOWS:  # pragma: no cover (posix) - no ACLs to read
         return None
-    sddl = _read_dacl_sddl(path)  # pragma: no cover (windows)
-    return _sddl_write_grantee(sddl) if sddl else None
+    return _security_finding(  # pragma: no cover (windows)
+        _read_security_sddl(path),
+        machine_wide=is_machine_wide(path),
+        reparse=is_reparse_point(path),
+    )
 
 
-def _read_dacl_sddl(path: str) -> Optional[str]:
-    """One directory's DACL as SDDL text, or ``None`` if it cannot be read."""
+def untrusted_owner(path: str) -> Optional[str]:
+    """The owner of a machine-wide ``path`` when it is not a trusted one.
+
+    Answers who holds the directory, which is what init has to change,
+    without regard to an OWNER RIGHTS ACE that blunts the hold.  None for
+    a user-scoped path, when the owner cannot be read, and on every
+    non-Windows host.
+    """
+    if not is_machine_wide(path):
+        return None
+    return _sddl_untrusted_owner(  # pragma: no cover (windows)
+        _read_security_sddl(path) or ""
+    )
+
+
+def _read_security_sddl(path: str) -> Optional[str]:
+    """One object's owner and DACL as SDDL text, or ``None`` if unreadable.
+
+    The text starts ``O:`` with the owner and carries the DACL after
+    ``D:``, which is what every reader above parses.
+    """
     if not IS_WINDOWS:  # pragma: no cover (posix) - Windows-only path
         return None
     try:  # pragma: no cover (windows) - measured live, not in the suite
@@ -1234,8 +1417,10 @@ def _read_dacl_sddl(path: str) -> Optional[str]:
         from ctypes import wintypes
 
         SE_FILE_OBJECT = 1
+        OWNER_SECURITY_INFORMATION = 0x00000001
         DACL_SECURITY_INFORMATION = 0x00000004
         SDDL_REVISION_1 = 1
+        wanted = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
 
         advapi32 = ctypes.windll.advapi32  # type: ignore[attr-defined]
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
@@ -1267,7 +1452,7 @@ def _read_dacl_sddl(path: str) -> Optional[str]:
         if advapi32.GetNamedSecurityInfoW(
             path,
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            wanted,
             None,
             None,
             ctypes.byref(dacl),
@@ -1281,7 +1466,7 @@ def _read_dacl_sddl(path: str) -> Optional[str]:
             if not convert(
                 descriptor,
                 SDDL_REVISION_1,
-                DACL_SECURITY_INFORMATION,
+                wanted,
                 ctypes.byref(text),
                 ctypes.byref(length),
             ):
@@ -1299,11 +1484,19 @@ def _read_dacl_sddl(path: str) -> Optional[str]:
 
 
 def harden_config_dir(path: str) -> bool:
-    """Give ``path`` a DACL only administrators and LocalSystem can write.
+    """Give ``path`` the hardened DACL, owned by Administrators where possible.
 
-    True when the directory now carries it, False when it could not be
-    applied and on every non-Windows host, where the mode the directory
-    was created with already answers the question.
+    True when the directory carries :data:`_CONFIG_DIR_SDDL` afterwards,
+    False when it could not be applied and on every non-Windows host,
+    where the mode the directory was created with already answers the
+    question.
+
+    Owner and DACL go in one call, which is all or nothing.  When the
+    owner assignment is refused (a caller that is not elevated, or one
+    holding WRITE_DAC without WRITE_OWNER) the DACL is written on its own
+    and still reads True: its OWNER RIGHTS ACE is what closes the hole an
+    untrusted owner leaves, and :func:`untrusted_owner` reports the owner
+    that stayed, for the caller that has to say so.
 
     Best-effort by contract: the caller has already written a working
     configuration, so a filesystem with no ACL support or a caller without
@@ -1316,9 +1509,13 @@ def harden_config_dir(path: str) -> bool:
         from ctypes import wintypes
 
         SE_FILE_OBJECT = 1
+        OWNER_SECURITY_INFORMATION = 0x00000001
         DACL_SECURITY_INFORMATION = 0x00000004
         PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
         SDDL_REVISION_1 = 1
+        protected = (
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+        )
 
         advapi32 = ctypes.windll.advapi32  # type: ignore[attr-defined]
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
@@ -1329,6 +1526,11 @@ def harden_config_dir(path: str) -> bool:
             wintypes.DWORD,
             ctypes.POINTER(ctypes.c_void_p),
             ctypes.POINTER(wintypes.ULONG),
+        ]
+        advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+        advapi32.ConvertStringSidToSidW.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.POINTER(ctypes.c_void_p),
         ]
         advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
         advapi32.GetSecurityDescriptorDacl.argtypes = [
@@ -1350,16 +1552,21 @@ def harden_config_dir(path: str) -> bool:
         kernel32.LocalFree.restype = wintypes.HLOCAL
         kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
 
+        owner = ctypes.c_void_p()
         descriptor = ctypes.c_void_p()
         size = wintypes.ULONG()
-        if not parse(
-            _CONFIG_DIR_SDDL,
-            SDDL_REVISION_1,
-            ctypes.byref(descriptor),
-            ctypes.byref(size),
-        ):
-            return False
         try:
+            if not advapi32.ConvertStringSidToSidW(
+                _CONFIG_DIR_OWNER_SID, ctypes.byref(owner)
+            ):
+                return False
+            if not parse(
+                _CONFIG_DIR_SDDL,
+                SDDL_REVISION_1,
+                ctypes.byref(descriptor),
+                ctypes.byref(size),
+            ):
+                return False
             present = wintypes.BOOL()
             dacl = ctypes.c_void_p()
             defaulted = wintypes.BOOL()
@@ -1382,18 +1589,30 @@ def harden_config_dir(path: str) -> bool:
             # DWORD, not BOOL: this returns a Win32 error code and does not
             # touch the thread's last error, so ERROR_ACCESS_DENIED (5)
             # would read as truthy success under the ctypes default.
+            if not advapi32.SetNamedSecurityInfoW(
+                path,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | protected,
+                owner,
+                None,
+                dacl,
+                None,
+            ):
+                return True
             return not advapi32.SetNamedSecurityInfoW(
                 path,
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
+                protected,
                 None,
                 None,
                 dacl,
                 None,
             )
         finally:
+            # LocalFree ignores NULL, so a converter that failed early
+            # leaves nothing to free and nothing to guard.
             kernel32.LocalFree(descriptor)
+            kernel32.LocalFree(owner)
     except Exception:  # noqa: BLE001 - the configuration is written already
         return False
 

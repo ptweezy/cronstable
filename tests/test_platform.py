@@ -4,6 +4,7 @@ import os
 import signal
 import sys
 import time
+import types
 
 import pytest
 from aiohttp import web
@@ -1116,3 +1117,408 @@ def test_the_hardened_dacl_keeps_read_and_removes_write():
     assert platform._sddl_write_grantee(platform._CONFIG_DIR_SDDL) is None
     assert "FRFX;;;AU" in platform._CONFIG_DIR_SDDL
     assert platform._CONFIG_DIR_SDDL.startswith("D:P")
+
+
+# ---------------------------------------------------------------------------
+# Ownership and reparse points, the two things a DACL cannot answer for.
+#
+# %ProgramData% lets any local account create a directory and become its
+# owner, and an owner holds WRITE_DAC implicitly, so a directory whose DACL
+# reads clean is still that account's to reopen. The strings below were
+# read off a real Windows 11 box with OWNER_SECURITY_INFORMATION requested.
+# ---------------------------------------------------------------------------
+
+_UNTRUSTED_OWNER = "S-1-5-21-3697022874-66892441-2793177575-1001"
+# A directory pre-created unelevated under %ProgramData%, then given the
+# DACL alone: clean ACEs, wrong owner.
+_OWNED_HARDENED = (
+    "O:" + _UNTRUSTED_OWNER + "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+    "(A;OICI;0x1200a9;;;AU)"
+)
+# The same directory as harden_config_dir leaves it when it cannot assign
+# the owner: OWNER RIGHTS read only holds that account to read.
+_OWNED_NEUTRALIZED = _OWNED_HARDENED + "(A;OICI;0x1200a9;;;OW)"
+
+
+def test_the_recipe_hands_the_directory_to_administrators():
+    recipe = platform.config_dir_icacls_recipe(r"C:\ProgramData\cronstable")
+    assert "/setowner *S-1-5-32-544" in recipe
+    assert "/grant *S-1-3-4:(OI)(CI)RX" in recipe
+    # two commands: icacls refuses /setowner in the same invocation as
+    # /grant (measured: "Invalid parameter", exit 87)
+    assert recipe.count('icacls "C:\\ProgramData\\cronstable"') == 2
+
+
+def test_the_hardened_dacl_holds_against_its_owner():
+    # OWNER RIGHTS read only, on the object itself, replaces the owner's
+    # implicit WRITE_DAC with read. Measured: the owner's own icacls
+    # /grant is refused afterwards.
+    assert "FRFX;;;OW" in platform._CONFIG_DIR_SDDL
+    assert platform._sddl_owner_neutralized(platform._CONFIG_DIR_SDDL)
+    assert platform._sddl_owner_neutralized(_OWNED_NEUTRALIZED)
+    # the OWNER RIGHTS ACE itself is no any-user grant
+    assert platform._sddl_write_grantee(_OWNED_NEUTRALIZED) is None
+
+
+@pytest.mark.parametrize(
+    "sddl, why",
+    [
+        pytest.param(_OWNED_HARDENED, "no OWNER RIGHTS ACE", id="absent"),
+        pytest.param("D:P(A;OICI;FA;;;OW)", "grants full control", id="fa"),
+        pytest.param(
+            "D:P(A;OICI;0x1301bf;;;OW)", "grants write bits", id="mask"
+        ),
+        pytest.param(
+            "D:P(A;OICIIO;FRFX;;;OW)", "inherit only, not the object", id="io"
+        ),
+        pytest.param("D:P(D;OICI;FRFX;;;OW)", "a deny, not an allow", id="d"),
+        pytest.param("D:P(A;OICI;0xzz;;;OW)", "unparseable mask", id="bad"),
+        pytest.param("D:P(A;OICI;;;;OW)", "grants nothing", id="empty"),
+        pytest.param("D:P(A;OICI;FRFX;;;AU)", "wrong principal", id="au"),
+    ],
+)
+def test_owner_rights_that_do_not_neutralize(sddl, why):
+    # erring toward "the owner still holds it" is the safe direction: it
+    # makes the daemon speak rather than stay silent
+    assert not platform._sddl_owner_neutralized(sddl)
+
+
+def test_owner_is_read_in_alias_and_sid_form():
+    assert platform._sddl_owner("O:BAD:P(A;;FA;;;SY)") == "BA"
+    assert platform._sddl_owner("O:SYG:SYD:P(A;;FA;;;SY)") == "SY"
+    assert platform._sddl_owner("O:DUD:P(A;;FA;;;SY)") == "DU"
+    assert (
+        platform._sddl_owner("O:" + _UNTRUSTED_OWNER + "D:PAI(A;;FA;;;SY)")
+        == _UNTRUSTED_OWNER
+    )
+    assert platform._sddl_owner("O:BA") == "BA"
+    assert platform._sddl_owner("D:P(A;;FA;;;SY)") is None
+    assert platform._sddl_owner("") is None
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        "SY",
+        "S-1-5-18",
+        "BA",
+        "S-1-5-32-544",
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+    ],
+)
+def test_trusted_owners_raise_no_alarm(owner):
+    # SYSTEM (an MSI install), Administrators (an elevated mkdir) and
+    # TrustedInstaller: the owners a correctly made machine-wide directory
+    # has, so none of them may cry wolf at every start.
+    sddl = "O:{}D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".format(owner)
+    assert platform._sddl_untrusted_owner(sddl) is None
+    assert (
+        platform._security_finding(sddl, machine_wide=True, reparse=False)
+        is None
+    )
+
+
+def test_an_untrusted_owner_is_a_finding_on_a_machine_wide_path():
+    assert platform._sddl_untrusted_owner(_OWNED_HARDENED) == _UNTRUSTED_OWNER
+    assert (
+        platform._security_finding(
+            _OWNED_HARDENED, machine_wide=True, reparse=False
+        )
+        == "its owner " + _UNTRUSTED_OWNER
+    )
+    # under the caller's own profile that owner is the design
+    assert (
+        platform._security_finding(
+            _OWNED_HARDENED, machine_wide=False, reparse=False
+        )
+        is None
+    )
+    # OWNER RIGHTS read only blunts the hold, so the daemon says nothing,
+    # while init still learns who holds the directory
+    assert (
+        platform._security_finding(
+            _OWNED_NEUTRALIZED, machine_wide=True, reparse=False
+        )
+        is None
+    )
+    assert (
+        platform._sddl_untrusted_owner(_OWNED_NEUTRALIZED) == _UNTRUSTED_OWNER
+    )
+
+
+def test_the_owner_rule_comes_before_the_dacl_rule():
+    # both hold on a directory freshly made under %ProgramData%; the owner
+    # is the one the DACL recipe alone cannot fix
+    sddl = "O:" + _UNTRUSTED_OWNER + _PROGRAMDATA_SDDL
+    assert (
+        platform._security_finding(sddl, machine_wide=True, reparse=False)
+        == "its owner " + _UNTRUSTED_OWNER
+    )
+    assert (
+        platform._security_finding(sddl, machine_wide=False, reparse=False)
+        == r"BUILTIN\Users"
+    )
+
+
+def test_a_reparse_point_is_a_finding_on_a_machine_wide_path():
+    clean = "O:BA" + _HARDENED_SDDL
+    finding = platform._security_finding(
+        clean, machine_wide=True, reparse=True
+    )
+    assert finding is not None
+    assert "junction or symbolic link" in finding
+    assert (
+        platform._security_finding(clean, machine_wide=False, reparse=True)
+        is None
+    )
+    # cannot tell is no finding, whatever else is known
+    assert (
+        platform._security_finding(None, machine_wide=True, reparse=True)
+        is None
+    )
+    assert (
+        platform._security_finding("", machine_wide=True, reparse=True) is None
+    )
+
+
+def test_path_is_user_scoped_compares_windows_paths():
+    assert platform.path_is_user_scoped(r"C:\Users\p\cfg", r"C:\Users\p")
+    assert platform.path_is_user_scoped(r"c:\users\P", r"C:\Users\p")
+    assert not platform.path_is_user_scoped(
+        r"C:\ProgramData\cs", r"C:\Users\p"
+    )
+    assert not platform.path_is_user_scoped(r"C:\Users\pa", r"C:\Users\p")
+    assert not platform.path_is_user_scoped("", r"C:\Users\p")
+    assert not platform.path_is_user_scoped(r"C:\x", None)
+
+
+def test_is_machine_wide_reads_the_profile(monkeypatch, tmp_path):
+    monkeypatch.setattr(platform, "IS_WINDOWS", True)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    assert not platform.is_machine_wide(str(tmp_path / "cronstable"))
+    elsewhere = str(tmp_path.parent / "elsewhere")
+    assert platform.is_machine_wide(elsewhere)
+    # no profile to be under
+    monkeypatch.delenv("USERPROFILE")
+    assert platform.is_machine_wide(str(tmp_path / "cronstable"))
+    # and never on POSIX, where the owner rule has no ACL to read
+    monkeypatch.setattr(platform, "IS_WINDOWS", False)
+    assert not platform.is_machine_wide(elsewhere)
+    assert platform.untrusted_owner(elsewhere) is None
+
+
+def _make_link(target, link):
+    # a junction on Windows, which needs no privilege; a symlink elsewhere
+    if platform.IS_WINDOWS:
+        import _winapi
+
+        _winapi.CreateJunction(target, link)
+    else:
+        os.symlink(target, link)
+
+
+def test_is_reparse_point_sees_links_and_nothing_else(tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert not platform.is_reparse_point(str(plain))
+    assert not platform.is_reparse_point(str(tmp_path / "missing"))
+    link = tmp_path / "link"
+    _make_link(str(plain), str(link))
+    assert platform.is_reparse_point(str(link))
+    assert os.path.isdir(str(link))  # what the loader would follow
+    assert not platform.is_reparse_point(str(plain))
+
+
+# --- the Windows arms, live and mocked --------------------------------------
+
+
+@pytest.mark.skipif(
+    not platform.IS_WINDOWS, reason="reads a real security descriptor"
+)
+def test_the_owner_and_reparse_rules_live(monkeypatch, tmp_path):
+    # tmp_path belongs to the test account. Under its own profile that is
+    # the design; with USERPROFILE pointed elsewhere the same directory
+    # reads as a machine-wide one, held by whoever the box says.
+    target = tmp_path / "confdir"
+    target.mkdir()
+    sddl = platform._read_security_sddl(str(target))
+    assert sddl is not None
+    assert sddl.startswith("O:")
+    assert "D:" in sddl
+    assert platform._read_security_sddl(str(tmp_path / "missing")) is None
+    assert platform.untrusted_owner(str(target)) is None
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "elsewhere"))
+    owner = platform._sddl_owner(sddl)
+    # an elevated runner creates it owned by Administrators; an unelevated
+    # account creates it owned by itself, which is the finding
+    if owner in platform._TRUSTED_OWNERS:
+        assert platform.untrusted_owner(str(target)) is None
+        assert platform.any_user_write_grantee(str(target)) is None
+    else:
+        assert platform.untrusted_owner(str(target)) == owner
+        finding = platform.any_user_write_grantee(str(target))
+        assert finding == "its owner " + owner
+    link = tmp_path / "link"
+    _make_link(str(target), str(link))
+    finding = platform.any_user_write_grantee(str(link))
+    assert finding is not None
+    assert "junction or symbolic link" in finding
+
+
+@pytest.mark.skipif(not platform.IS_WINDOWS, reason="writes a real DACL")
+def test_harden_config_dir_live_holds_against_the_caller(tmp_path):
+    # An EMPTY directory on purpose: afterwards an unelevated caller holds
+    # read only, and an empty directory is still removable through the
+    # parent's delete-child right, which is proved at the end.
+    target = tmp_path / "confdir"
+    target.mkdir()
+    assert platform.harden_config_dir(str(target)) is True
+    sddl = platform._read_security_sddl(str(target))
+    assert sddl is not None
+    assert "(A;OICI;FA;;;SY)" in sddl
+    assert "(A;OICI;FA;;;BA)" in sddl
+    assert platform._sddl_owner_neutralized(sddl)
+    assert platform._sddl_write_grantee(sddl) is None
+    if platform._sddl_owner(sddl) in platform._TRUSTED_OWNERS:
+        # elevated: Administrators own it and keep WRITE_DAC through their
+        # own grant, so a second pass is a no-op that succeeds
+        assert platform.harden_config_dir(str(target)) is True
+    else:
+        # unelevated: the owner assignment was refused and the DACL went
+        # on alone, and it holds against the very account that wrote it,
+        # which has lost WRITE_DAC to OWNER RIGHTS
+        assert platform.harden_config_dir(str(target)) is False
+    os.rmdir(str(target))
+    assert not target.exists()
+
+
+class _Call:
+    """A stand-in for one advapi32 entry point: records, then answers."""
+
+    def __init__(self, impl):
+        self.impl = impl
+        self.calls = []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return self.impl(*args)
+
+
+def _fake_windll(
+    *, sid_ok=True, parse_ok=True, dacl_present=True, set_results=(0,)
+):
+    results = list(set_results)
+
+    def convert_sid(text, out):
+        out._obj.value = 0x51D
+        return int(sid_ok)
+
+    def parse(sddl, revision, descriptor, size):
+        descriptor._obj.value = 0xDE5C
+        return int(parse_ok)
+
+    def get_dacl(descriptor, present, dacl, defaulted):
+        present._obj.value = int(dacl_present)
+        dacl._obj.value = 0xDAC1 if dacl_present else 0
+        return 1
+
+    def set_info(path, kind, flags, owner, group, dacl, sacl):
+        return results.pop(0)
+
+    advapi32 = types.SimpleNamespace(
+        ConvertStringSidToSidW=_Call(convert_sid),
+        ConvertStringSecurityDescriptorToSecurityDescriptorW=_Call(parse),
+        GetSecurityDescriptorDacl=_Call(get_dacl),
+        SetNamedSecurityInfoW=_Call(set_info),
+    )
+    kernel32 = types.SimpleNamespace(LocalFree=_Call(lambda handle: None))
+    return types.SimpleNamespace(advapi32=advapi32, kernel32=kernel32)
+
+
+_OWNER_INFO = 0x00000001
+_PROTECTED_DACL = 0x00000004 | 0x80000000
+
+
+@pytest.mark.skipif(
+    not platform.IS_WINDOWS, reason="mocks the Windows DLL loader"
+)
+def test_harden_config_dir_assigns_administrators_in_the_dacl_call(
+    monkeypatch,
+):
+    import ctypes
+
+    fake = _fake_windll()
+    monkeypatch.setattr(ctypes, "windll", fake)
+    assert platform.harden_config_dir(r"C:\ProgramData\cronstable") is True
+    (sid_call,) = fake.advapi32.ConvertStringSidToSidW.calls
+    assert sid_call[0] == "S-1-5-32-544"
+    (call,) = fake.advapi32.SetNamedSecurityInfoW.calls
+    path, kind, flags, owner, group, dacl, sacl = call
+    assert path == r"C:\ProgramData\cronstable"
+    assert kind == 1
+    # one call, owner and protected DACL together: all or nothing
+    assert flags == _OWNER_INFO | _PROTECTED_DACL
+    assert owner.value == 0x51D
+    assert dacl.value == 0xDAC1
+    assert group is None
+    assert sacl is None
+    freed = {c[0].value for c in fake.kernel32.LocalFree.calls}
+    assert freed == {0xDE5C, 0x51D}
+
+
+@pytest.mark.skipif(
+    not platform.IS_WINDOWS, reason="mocks the Windows DLL loader"
+)
+def test_harden_config_dir_falls_back_to_the_dacl_when_the_owner_is_refused(
+    monkeypatch,
+):
+    import ctypes
+
+    fake = _fake_windll(set_results=(1307, 0))  # ERROR_INVALID_OWNER
+    monkeypatch.setattr(ctypes, "windll", fake)
+    assert platform.harden_config_dir(r"C:\ProgramData\cronstable") is True
+    first, second = fake.advapi32.SetNamedSecurityInfoW.calls
+    assert first[2] == _OWNER_INFO | _PROTECTED_DACL
+    assert second[2] == _PROTECTED_DACL
+    assert second[3] is None  # no owner in the retry
+    assert second[5].value == 0xDAC1
+
+
+@pytest.mark.skipif(
+    not platform.IS_WINDOWS, reason="mocks the Windows DLL loader"
+)
+@pytest.mark.parametrize(
+    "kwargs, set_calls",
+    [
+        pytest.param({"set_results": (5, 5)}, 2, id="both-refused"),
+        pytest.param({"sid_ok": False}, 0, id="owner-sid"),
+        pytest.param({"parse_ok": False}, 0, id="sddl"),
+        pytest.param({"dacl_present": False}, 0, id="absent-dacl"),
+    ],
+)
+def test_harden_config_dir_reports_each_refusal(
+    monkeypatch, kwargs, set_calls
+):
+    import ctypes
+
+    fake = _fake_windll(**kwargs)
+    monkeypatch.setattr(ctypes, "windll", fake)
+    assert platform.harden_config_dir(r"C:\ProgramData\cronstable") is False
+    assert len(fake.advapi32.SetNamedSecurityInfoW.calls) == set_calls
+    # every allocation released, whichever step refused
+    assert len(fake.kernel32.LocalFree.calls) == 2
+
+
+@pytest.mark.skipif(
+    not platform.IS_WINDOWS, reason="mocks the Windows DLL loader"
+)
+def test_harden_config_dir_survives_a_ctypes_failure(monkeypatch):
+    import ctypes
+
+    def refuse(*args):
+        raise OSError("no advapi32")
+
+    fake = _fake_windll()
+    fake.advapi32.ConvertStringSidToSidW = _Call(refuse)
+    monkeypatch.setattr(ctypes, "windll", fake)
+    assert platform.harden_config_dir(r"C:\ProgramData\cronstable") is False

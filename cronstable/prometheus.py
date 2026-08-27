@@ -38,7 +38,7 @@ from typing import (
 )
 
 import cronstable.version
-from cronstable.cronexpr import CronTab
+from cronstable.cronexpr import LOCAL_ZONE, CronTab
 
 if TYPE_CHECKING:  # pragma: no cover -- import cycle guard, types only
     from cronstable.cron import Cron
@@ -1334,8 +1334,7 @@ class PrometheusMetrics:
                 # loop never ran. Compute the next fire directly so the gauge
                 # is still emitted (absent for disabled/@reboot jobs).
                 seconds = job_config.schedule.next(
-                    now=get_now(job_config.timezone),
-                    default_utc=job_config.utc,
+                    now=get_now(job_config.timezone or LOCAL_ZONE)
                 )
                 if seconds is not None:
                     next_run.add(

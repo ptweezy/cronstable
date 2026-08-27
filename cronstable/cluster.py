@@ -938,9 +938,16 @@ def build_server_ssl_context(tls: dict[str, str]) -> ssl.SSLContext:
     double-run.
 
     Shared with the web listeners via
-    :func:`cronstable.tlsutil.build_listener_ssl_context`; ``cluster.tls.ca``
-    is schema-required, so the CERT_REQUIRED arm always applies.
+    :func:`cronstable.tlsutil.build_listener_ssl_context`, where the client
+    CA is optional and its absence means no client authentication. Config
+    load rejects a blank ``cluster.tls.ca``; the guard here refuses one
+    from any other caller, so the CERT_REQUIRED arm always applies.
     """
+    if not tls.get("ca"):
+        # ValueError on purpose: outside the (OSError, SSLError) set the
+        # loadable dry-runs swallow, so an empty ca fails loudly rather than
+        # standing up an unauthenticated listener.
+        raise ValueError("cluster.tls.ca is required for the peer listener")
     return tlsutil.build_listener_ssl_context(
         tls["cert"], tls["key"], client_ca=tls["ca"]
     )
@@ -2603,61 +2610,77 @@ class ClusterManager(LeadershipBackend):
 
     # --- cluster-size (membership) divergence ----------------------------
 
+    def _declaring_peers(self) -> list[PeerState]:
+        """Peers whose last poll answered, whatever their job set.
+
+        A fresh /peer response carries the peer's own declared N and
+        policy; a stale status holds none, and SELF is this node.
+        """
+        return [
+            peer
+            for peer in self.view.peers.values()
+            if peer.status not in _STALE_STATUSES
+            and peer.status != STATUS_SELF
+        ]
+
     @_memoized_derived
     def conflicting_sizes(self) -> list[int]:
-        """Cluster sizes declared by agreeing peers that differ from ours.
+        """Cluster sizes declared by reachable peers that differ from ours.
 
         Safety rests on every node sharing one N ("two strict majorities
         cannot be disjoint" holds only for a single N), yet N is each
         node's own ``len(peers) + 1`` and the fingerprint ignores the peer
-        list, so two nodes mid-resize still see each other AGREED and each
-        reach quorum under its own N (split-brain). A divergent declared N
-        is therefore a first-class conflict: the ``Leader`` gate fails
-        closed until the cluster reconverges (see :meth:`has_conflict` /
-        :func:`cronstable.cron.Cron._cluster_allows`).
+        list, so two nodes mid-resize can still see each other AGREED and
+        each reach quorum under its own N (split-brain). A divergent
+        declared N is therefore a first-class conflict: the ``Leader``
+        gate fails closed until the cluster reconverges (see
+        :meth:`has_conflict` / :func:`cronstable.cron.Cron._cluster_allows`).
 
-        Only AGREED peers are compared: a differing N matters precisely for
-        members the quorum would count, and the divergence is observed
-        symmetrically. This catches every resize but NOT a same-N
-        membership swap; change membership one node at a time (module
-        docstring). Residual (pre-release version skew only): a build from
-        before the instance-id dedup declares raw ``len(peers)+1``, so a
-        multi-homed peer makes the two builds flag each other mid upgrade;
-        fail-closed and self-healing, accepted because it cannot survive a
-        release.
+        Every fresh peer is compared, whatever its job set
+        (:meth:`_declaring_peers`). A resize bundled with a job change puts
+        the two config generations on different job-set ids, so the old-N
+        and new-N sides see each other SYNCING or DRIFTED, never AGREED,
+        while each still reaches quorum under its own N; a reachable
+        peer's declared N is first-party evidence of a concurrent resize,
+        and a pure job-change roll declares one N everywhere. NOT caught: a
+        same-N membership swap; change membership one node at a time
+        (module docstring). Residual (pre-release version skew only): a
+        build from before the instance-id dedup declares raw
+        ``len(peers)+1``, so a multi-homed peer makes the two builds flag
+        each other mid upgrade; fail-closed and self-healing, accepted
+        because it cannot survive a release.
         """
         my_size = self._our_declarations()["declared_size"]
         return sorted(
             {
                 peer.declared_size
-                for peer in self.view.peers.values()
-                if peer.status == STATUS_AGREED
-                and _declares_divergent(peer.declared_size, my_size)
+                for peer in self._declaring_peers()
+                if _declares_divergent(peer.declared_size, my_size)
             }
         )
 
     @_memoized_derived
     def conflicting_policies(self) -> list[str]:
-        """Coordination-policy divergences declared by agreeing peers.
+        """Coordination-policy divergences declared by reachable peers.
 
         Safety assumes every node coordinates the same way: single-leader
         elects ``min(live)`` while ``spread`` picks per-job rendezvous
         owners, and a node with ``electLeader`` off runs everything
         ungated. Neither field is in the fingerprint, so divergent nodes
-        still see each other AGREED and would double-run or drop ``Leader``
+        can see each other AGREED and would double-run or drop ``Leader``
         jobs; a divergence is a first-class conflict and the gate fails
         closed (see :meth:`has_conflict` /
-        :func:`cronstable.cron.Cron._cluster_allows`). A peer too old to
-        declare contributes nothing. Returns sorted, de-duplicated
+        :func:`cronstable.cron.Cron._cluster_allows`). Every fresh peer is
+        compared, whatever its job set (:meth:`_declaring_peers`, the
+        same rule as :meth:`conflicting_sizes`); a peer too old to declare
+        contributes nothing. Returns sorted, de-duplicated
         ``"field theirs != ours"`` descriptors for the dashboard / view.
         """
         my_declarations = self._our_declarations()
         my_distribution = my_declarations["declared_distribution"]
         my_elect = my_declarations["declared_elect_leader"]
         conflicts: set[str] = set()
-        for peer in self.view.peers.values():
-            if peer.status != STATUS_AGREED:
-                continue
+        for peer in self._declaring_peers():
             if _declares_divergent(
                 peer.declared_distribution, my_distribution
             ):
@@ -2680,7 +2703,7 @@ class ClusterManager(LeadershipBackend):
         A duplicate ``nodeName`` (:meth:`conflict_names`), a cluster-size
         disagreement (:meth:`conflicting_sizes`), or a policy divergence
         (:meth:`conflicting_policies`): all three fail the ``Leader`` gate
-        closed. The size/policy gates fail closed on a SINGLE agreeing
+        closed. The size/policy gates fail closed on a SINGLE reachable
         peer's declaration (no corroboration), unlike the nodeName gate:
         a divergent size/policy is a first-party report about itself, and
         requiring corroboration would re-open the split-brain the gate
@@ -3094,11 +3117,11 @@ class ClusterManager(LeadershipBackend):
             ),
             # a duplicate nodeName (two nodes would each elect themselves)
             "conflict_names": conflicts,
-            # peers that agree on the job set but declare a different cluster
-            # size N (two nodes quorate under different Ns -> split-brain)
+            # reachable peers, whatever their job set, that declare a different
+            # cluster size N (nodes quorate under different Ns -> split-brain)
             "size_conflict": bool(size_conflicts),
             "conflicting_sizes": size_conflicts,
-            # agreeing peers running a different distribution / electLeader
+            # reachable peers running a different distribution / electLeader
             # (independent owner selectors -> double-run or lost-run)
             "policy_conflict": bool(policy_conflicts),
             "conflicting_policies": policy_conflicts,

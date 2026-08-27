@@ -49,8 +49,11 @@ from typing import (
 
 from cronstable.cronexpr import (
     _DOW_NAMES,
+    _GAP_PROBE,
     _MONTH_NAMES,
+    LOCAL_ZONE,
     CronTab,
+    LocalZone,
     _month_end,
     expand_field,
 )
@@ -1306,7 +1309,7 @@ _NAME_CAP = 10
 #: what a fire walk actually depends on: the resolved schedule text and
 #: the resolved zone.  Everything else about an entry (its name above
 #: all) only decides which bucket the walk's result lands in.
-_WalkKey = tuple[str, Optional[datetime.tzinfo]]
+_WalkKey = tuple[str, datetime.tzinfo]
 
 
 def _minute_tab(tab: CronTab) -> tuple[CronTab, int]:
@@ -1328,9 +1331,41 @@ def _minute_tab(tab: CronTab) -> tuple[CronTab, int]:
     return tab, 1
 
 
-def _local_tzinfo() -> Optional[datetime.tzinfo]:
-    """The daemon's own zone, for entries scheduled on the local clock."""
-    return datetime.datetime.now().astimezone().tzinfo
+def _local_tzinfo() -> datetime.tzinfo:
+    """The scheduler's frame for an entry on the local clock."""
+    return LOCAL_ZONE
+
+
+_FRAME_STEP = datetime.timedelta(hours=1)
+
+
+def _walk_frame(
+    zone: datetime.tzinfo, start: datetime.datetime, end: datetime.datetime
+) -> datetime.tzinfo:
+    """``zone`` for a fire walk over ``[start, end)``.
+
+    The host clock becomes a fixed offset when its offset is constant
+    from :data:`_GAP_PROBE` before ``start`` to ``end``: no gap or fold
+    can then touch the walk, so the engine's fixed-offset path answers
+    the same instants at a fraction of the cost.  Sampled hourly; a
+    transition changes the offset for months, never for under an hour.
+    """
+    if not isinstance(zone, LocalZone):
+        return zone
+    at = start - _GAP_PROBE
+    first = at.astimezone(zone)
+    offset = first.utcoffset()
+    while at <= end:
+        at += _FRAME_STEP
+        if at.astimezone(zone).utcoffset() != offset:
+            return zone
+    assert offset is not None
+    name = first.tzname()
+    return (
+        datetime.timezone(offset)
+        if name is None
+        else datetime.timezone(offset, name)
+    )
 
 
 def _fire_cells(
@@ -1360,7 +1395,8 @@ def _fire_cells(
     work and none of their answer.
     """
     end = start + datetime.timedelta(hours=hours)
-    local_tz = _local_tzinfo()
+    local_tz = _walk_frame(_local_tzinfo(), start, end)
+    tz = _walk_frame(tz, start, end)
     grid = [[0] * 60 for _ in range(24)]
     cell_jobs: dict[tuple[int, int], list[str]] = {}
     minute_jobs: list[set[str]] = [set() for _ in range(60)]

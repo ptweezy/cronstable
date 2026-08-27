@@ -19,6 +19,7 @@ tests._commands.
 
 import asyncio
 import datetime
+import time
 import types
 
 import pytest
@@ -83,6 +84,19 @@ jobs:
     + """
     schedule: "0 0 * * *"
     concurrencyPolicy: Replace
+    concurrencyScope: cluster
+"""
+)
+
+_FORBID_SLEEPER = (
+    """
+jobs:
+  - name: j
+"""
+    + yaml_command(cmd_sleep(30))
+    + """
+    schedule: "0 0 * * *"
+    concurrencyPolicy: Forbid
     concurrencyScope: cluster
 """
 )
@@ -348,6 +362,63 @@ async def test_replace_pursuit_cancels_and_relaunches(fleet_cron):
         lambda: bool(cron.running_jobs.get("j")), interval=0.05
     )
     rj = cron.running_jobs["j"][0]
+    await rj.wait()
+    await cron._handle_finished_job(rj)
+
+
+async def test_same_store_state_reload_keeps_the_slot_fence(
+    fleet_cron, tmp_path, caplog
+):
+    # a state-section edit that keeps path and deploymentId rebuilds the
+    # backend under the live run; the slot lease and its renewer survive
+    # the swap, so a peer is still refused a whole TTL later. Waits real
+    # seconds (the TTL floor is 5); the file's 0.05s cadence applies.
+    ttl = "  slotTtlSeconds: 5\n"
+    cron = await fleet_cron(_FORBID_SLEEPER, extra_state=ttl)
+    assert await cron.maybe_launch_job(cron.cron_jobs["j"]) is True
+    rj = cron.running_jobs["j"][0]
+    first_backend = cron.state_backend
+    lease = cron._slot_leases["j"]
+    renewer = cron._slot_renewers["j"]
+    edited = _state_cfg(
+        "state:\n  path: {}\n{}  maxRunsPerJob: 200\n".format(tmp_path, ttl)
+    )
+    assert edited != first_backend.config
+    await cron.start_stop_state(edited)
+    backend = cron.state_backend
+    assert backend is not None and backend is not first_backend
+    assert cron._slot_leases["j"].fence == lease.fence
+    assert cron._slot_renewers["j"] is renewer and not renewer.done()
+    # the kept renewer renews through the replacement backend ...
+    on_disk = None
+    for _ in range(200):
+        on_disk = await backend.read_lease("slots/j")
+        if on_disk is not None and on_disk.expires_at > lease.expires_at:
+            break
+        await asyncio.sleep(0.05)
+    assert on_disk is not None and on_disk.expires_at > lease.expires_at
+    assert on_disk.holder == cron._slot_holder()
+    # ... and once the pre-reload lease would have lapsed, a peer is refused
+    while time.time() <= lease.expires_at + 0.5:
+        await asyncio.sleep(0.1)
+    assert rj.proc.returncode is None
+    peer = await fleet_cron(_FORBID_SLEEPER, extra_state=ttl)
+    peer._state_host = "node-b"
+    assert await peer.maybe_launch_job(peer.cron_jobs["j"]) is False
+    assert "held by" in caplog.text
+    assert not peer.running_jobs.get("j")
+    # the control: a store move leaves the lease behind, its renewer and
+    # the fence go with it, and the live run is told so
+    moved = _state_cfg(
+        "state:\n  path: {}\n{}".format(tmp_path / "moved", ttl)
+    )
+    await cron.start_stop_state(moved)
+    assert "j" not in cron._slot_leases and "j" not in cron._slot_renewers
+    await asyncio.sleep(0)
+    assert renewer.cancelled()
+    assert "stays in the previous state store" in caplog.text
+    rj.cancelled = True
+    await rj.cancel()
     await rj.wait()
     await cron._handle_finished_job(rj)
 
