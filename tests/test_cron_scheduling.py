@@ -3449,6 +3449,79 @@ def test_compute_next_fire_local_frame_matches_zoneinfo_twin(monkeypatch):
                 assert local == twin, (i, after)
 
 
+def test_job_frame_and_next_delay_follow_the_timezone(monkeypatch):
+    # frame is the one spelling of which clock a job reads: its zone, UTC
+    # for a utc job, the host clock otherwise; next_delay answers in it
+    from cronstable.cronexpr import LOCAL_ZONE
+
+    _pin_host_zone(monkeypatch, "America/New_York")
+    cron = cronstable.cron.Cron(None, config_yaml=_LOCAL_DST_TWINS)
+    local, twin = cron.cron_jobs["local0"], cron.cron_jobs["ny0"]
+    assert local.frame is LOCAL_ZONE
+    assert str(twin.frame) == "America/New_York"
+    utc_job = cronstable.cron.Cron(
+        None,
+        config_yaml="jobs:\n  - name: u\n    command: x\n"
+        "    schedule: '0 9 * * *'\n",
+    ).cron_jobs["u"]
+    assert utc_job.frame is datetime.timezone.utc
+    after = datetime.datetime(2027, 6, 1, 12, 0, tzinfo=datetime.timezone.utc)
+    assert local.next_delay(after) == twin.next_delay(after)
+    assert local.next_delay(after) == local.schedule.next(
+        now=after.astimezone(LOCAL_ZONE)
+    )
+    assert utc_job.next_delay(after) == utc_job.schedule.next(
+        now=after.astimezone(datetime.timezone.utc)
+    )
+
+
+def test_compute_next_fire_takes_the_fixed_path_away_from_transitions(
+    monkeypatch,
+):
+    # a local-clock job arms on the fixed offset the host keeps around
+    # ``after``; inside a transition's reach it walks aware in LOCAL_ZONE
+    from cronstable.cronexpr import CronTab, LocalZone
+
+    _pin_host_zone(monkeypatch, "America/New_York")
+    cron = cronstable.cron.Cron(None, config_yaml=_LOCAL_DST_TWINS)
+    frames = []
+    real = CronTab.next
+
+    def recording(self, now=None, default_utc=False):
+        frames.append(type(now.tzinfo))
+        return real(self, now=now, default_utc=default_utc)
+
+    monkeypatch.setattr(CronTab, "next", recording)
+    job = cron.cron_jobs["local0"]
+    june = datetime.datetime(2027, 6, 1, 12, 0, tzinfo=datetime.timezone.utc)
+    assert cron._compute_next_fire(job, june) == june.replace(
+        hour=13, minute=0
+    )
+    assert frames == [datetime.timezone]
+    del frames[:]
+    soon = datetime.datetime(2027, 3, 14, 12, 0, tzinfo=datetime.timezone.utc)
+    cron._compute_next_fire(job, soon)
+    assert frames == [LocalZone]
+
+
+def test_local_clock_job_lints_dst_against_the_host(monkeypatch):
+    # the load-time lint reads a utc: false job in the frame the scheduler
+    # fires it in, so a wall time the host's clocks skip gets the same note
+    # a zoned job's does, naming the host clock; pinned to a zone without
+    # transitions, the same job lints clean
+    _pin_host_zone(monkeypatch, "America/New_York")
+    jobs = cronstable.cron.Cron(None, config_yaml=_LOCAL_DST_TWINS).cron_jobs
+    gap = {f.code: f for f in jobs["local1"].schedule_findings}
+    assert "dst-skipped-time" in gap
+    assert "the host's local time" in gap["dst-skipped-time"].message
+    twin = {f.code for f in jobs["ny1"].schedule_findings}
+    assert "dst-skipped-time" in twin
+    assert not [f for f in jobs["local0"].schedule_findings if "dst" in f.code]
+    _pin_host_zone(monkeypatch, "UTC")
+    jobs = cronstable.cron.Cron(None, config_yaml=_LOCAL_DST_TWINS).cron_jobs
+    assert not [f for f in jobs["local1"].schedule_findings if "dst" in f.code]
+
+
 def test_scheduled_in_fallback_frames_a_local_job_in_the_host_zone(
     monkeypatch,
 ):

@@ -3368,6 +3368,39 @@ def test_render_press_full_grid(tmp_path):
     assert "suggest" in body
 
 
+def test_week_walks_local_jobs_on_the_frame_the_host_keeps(
+    tmp_path, monkeypatch
+):
+    # the week calendar frames a utc: false job in the host clock, asks
+    # _walk_frame for the fixed offset the host keeps across the week, and
+    # lists exactly the instants the aware walk in LOCAL_ZONE lists
+    from cronstable.cronexpr import LOCAL_ZONE
+    from tests._helpers import _pin_host_zone
+
+    _pin_host_zone(monkeypatch, "America/New_York")
+    app = _bare_app(tmp_path)
+    local = _job("loc", schedule="30 2 * * *", scheduled_in=None)
+    local["utc"] = False
+    zoned = _job("z", schedule="15 9 * * *", scheduled_in=None)
+    app.jobs = [local, zoned]
+    app.by_name = {"loc": local, "z": zoned}
+    asked = []
+    real = tui._walk_frame
+
+    def recording(zone, start, end):
+        asked.append(zone)
+        return real(zone, start, end)
+
+    monkeypatch.setattr(tui, "_walk_frame", recording)
+    app._recompute_week()
+    assert asked == [LOCAL_ZONE]
+    fast = app.week
+    monkeypatch.setattr(tui, "_walk_frame", lambda zone, s, e: zone)
+    app._recompute_week()
+    assert app.week["items"] == fast["items"]
+    assert [name for _when, name in fast["items"]].count("loc") == 7
+
+
 def test_render_week_variants(tmp_path):
     app = _bare_app(tmp_path)
     paint = _paint(app)
@@ -4741,8 +4774,8 @@ async def test_timeline_entries_and_fleet_matrix_are_built_per_payload(
 
 def test_drawer_schedule_local_frame_uses_the_host_zone(tmp_path, monkeypatch):
     # a utc: false job with no timezone previews in LOCAL_ZONE, the
-    # daemon's own frame, and the local lint fallback passes no zone for
-    # it, as the daemon does
+    # daemon's own frame, and the local lint fallback lints it there too,
+    # as the daemon does
     from cronstable.cronexpr import LOCAL_ZONE
     from tests._helpers import _pin_host_zone
 
@@ -4768,7 +4801,7 @@ def test_drawer_schedule_local_frame_uses_the_host_zone(tmp_path, monkeypatch):
     facts = app._sched_facts
     assert facts[2] == "local" and facts[4] is LOCAL_ZONE
     assert facts[6] and all(w.tzinfo is LOCAL_ZONE for w in facts[6])
-    assert zones == [None]
+    assert zones == [LOCAL_ZONE]
     # a zoned job lints in its zone
     zoned = _job("ny", schedule="30 2 * * *", scheduled_in=None)
     zoned["timezone"] = "America/New_York"

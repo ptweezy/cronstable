@@ -188,8 +188,8 @@ def _run_init(args: Any) -> int:
     is refused with the reason, so re-running init is always safe. A
     machine-wide directory that already exists is adopted only once
     Administrators own it: one owned by another account that init cannot
-    re-own, or one that is a junction or symbolic link, is refused before
-    anything is written.
+    re-own, or one that is a junction or symbolic link, is refused with
+    nothing written and its permissions untouched.
     """
     # Precedence: the positional DIRECTORY, then a root-level -c/--config,
     # then the platform default. Honoring -c matters because the
@@ -255,13 +255,11 @@ def _init_refuse_existing(target: str) -> str | None:
 
     A machine-wide directory owned by an untrusted account is handed to
     Administrators here, before the write, so the starter lands in a
-    directory nobody else can reopen; when that hand-over fails the
-    refusal names the owner and the recipe.
+    directory nobody else can reopen; its DACL follows the write
+    (:func:`_init_restrict`). The hand-over is the owner alone, so a
+    refusal leaves the directory as it was found, and names the owner and
+    the recipe.
     """
-    # dispatch-time import, like the other subcommand branches: building the
-    # parser must stay import-light for every thin-client invocation.
-    from cronstable.crontabs import is_crontab_path
-
     if platform.is_machine_wide(target) and platform.is_reparse_point(target):
         return (
             "cronstable init: {} is a junction or symbolic link, and a "
@@ -270,18 +268,11 @@ def _init_refuse_existing(target: str) -> str | None:
             "then run init again.".format(target)
         )
     try:
-        names = sorted(os.listdir(target))
+        existing = platform.config_file_names(target)
     except OSError as ex:
         # an unreadable target must report like every other init
-        # failure, not traceback; the write below would fail anyway.
+        # failure, not traceback; the starter write would fail anyway.
         return "cronstable init: could not read {}: {}".format(target, ex)
-    existing = []
-    for name in names:
-        base, ext = os.path.splitext(name)
-        if not base or base[0] in {"_", "."}:
-            continue
-        if ext in {".yml", ".yaml"} or is_crontab_path(name):
-            existing.append(name)
     if existing:
         return (
             "cronstable init: {} already holds configuration ({}); "
@@ -292,13 +283,11 @@ def _init_refuse_existing(target: str) -> str | None:
     owner = platform.untrusted_owner(target)
     if owner is None:
         return None
-    if (
-        platform.harden_config_dir(target)
-        and platform.untrusted_owner(target) is None
-    ):
+    if platform.assign_config_dir_owner(target):
         print(
-            "handed {} to Administrators and restricted it; it was owned "
-            "by {}".format(target, owner)
+            "handed {} to Administrators; it was owned by {}".format(
+                target, owner
+            )
         )
         return None
     return (
@@ -330,12 +319,10 @@ def _init_restrict(target: str) -> None:
     grantee = platform.any_user_write_grantee(target)
     if grantee is None:
         return
-    recipe = platform.config_dir_icacls_recipe(target)
     if not platform.harden_config_dir(target):
         print(
-            "cronstable init: {} can write {}, so any local account "
-            "can add a job, and a service runs it as SYSTEM. "
-            "Restrict it with: {}".format(grantee, target, recipe),
+            "cronstable init: "
+            + platform.writable_config_advice(target, grantee),
             file=sys.stderr,
         )
         return
@@ -349,7 +336,9 @@ def _init_restrict(target: str) -> None:
         print(
             "cronstable init: {} stays owned by {}; OWNER RIGHTS holds that "
             "account to read, and an elevated prompt can hand it to "
-            "Administrators with: {}".format(target, owner, recipe),
+            "Administrators with: {}".format(
+                target, owner, platform.config_dir_icacls_recipe(target)
+            ),
             file=sys.stderr,
         )
 
@@ -656,12 +645,7 @@ def _warn_if_config_is_writable(config_arg: str | None) -> None:
     if grantee is None:
         return
     logging.getLogger("cronstable").warning(
-        "%s can be written by %s, so any local account can add or change "
-        "a job this daemon runs, and a service runs them as SYSTEM. "
-        "Restrict it with: %s",
-        config_arg,
-        grantee,
-        platform.config_dir_icacls_recipe(config_arg),
+        "%s", platform.writable_config_advice(config_arg, grantee)
     )
 
 

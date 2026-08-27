@@ -20,7 +20,7 @@ Each finding has a stable `code`, a `level`, and a one-line `message`. A `warnin
 | `dst-repeated-time` | note | The scheduled wall time occurs twice on a fall-back date. The run fires on the first occurrence only. |
 | `hashed-slot` | note | The schedule uses the [`H` hash form](Hashed-Schedules). The note names the exact expression it resolved to for this job, and states that renaming the job re-hashes the slot. |
 
-The DST rules need a named zone, so they run only for jobs with an explicit `timezone:`. A fixed-offset frame like UTC never transitions, and the linter does not scan the host's local clock. The rules are also skipped for schedules with unrestricted hours, which fire straight through a transition with nothing to call out.
+The DST rules run in the job's frame: its explicit `timezone:`, or the host's local clock for a `utc: false` job without one, where the notes name the host's own transitions and so depend on the machine running the lint. A fixed-offset frame like UTC never transitions. The rules are also skipped for schedules with unrestricted hours, which fire straight through a transition with nothing to call out.
 
 ## Where findings appear
 

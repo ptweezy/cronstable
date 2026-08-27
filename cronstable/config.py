@@ -40,7 +40,7 @@ from strictyaml import Optional as Opt
 from strictyaml.ruamel.error import YAMLError
 
 from cronstable import crontabs, dag, platform
-from cronstable.cronexpr import CronTab
+from cronstable.cronexpr import LOCAL_ZONE, CronTab
 from cronstable.croninfo import Finding, lint_schedule
 
 
@@ -1773,11 +1773,11 @@ class JobConfig:
         if not isinstance(tab, CronTab):
             return []
         if lint_cache is None:
-            return lint_schedule(timezone=self.timezone, tab=tab)
-        key = (str(tab), tab.resolved_source, self.timezone)
+            return lint_schedule(timezone=self.frame, tab=tab)
+        key = (str(tab), tab.resolved_source, self.frame)
         findings = lint_cache.get(key)
         if findings is None:
-            findings = lint_schedule(timezone=self.timezone, tab=tab)
+            findings = lint_schedule(timezone=self.frame, tab=tab)
             lint_cache[key] = findings
         # a copy, so every job owns its own list
         return list(findings)
@@ -1833,6 +1833,21 @@ class JobConfig:
         if self.utc:
             return datetime.timezone.utc
         return None
+
+    @property
+    def frame(self) -> datetime.tzinfo:
+        """The zone the schedule is read in: ``timezone``, or the host clock
+        (:data:`LOCAL_ZONE`) for a ``utc: false`` job without one."""
+        return self.timezone or LOCAL_ZONE
+
+    def next_delay(self, now_utc: datetime.datetime) -> Optional[float]:
+        """Seconds from the aware instant ``now_utc`` to the schedule's next
+        occurrence in :attr:`frame`; None when it never occurs again."""
+        tab = self.schedule
+        assert isinstance(tab, CronTab)
+        if self.timezone is None:
+            return tab.next_local(now_utc)
+        return tab.next(now=now_utc.astimezone(self.timezone))
 
     def _validate_secrets(self) -> None:
         """Reject secret blocks that name no source.

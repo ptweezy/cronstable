@@ -1104,15 +1104,13 @@ async def test_stale_sensor_poke_completion_retry_is_fenced(
 
 
 async def test_lost_claim_is_released_and_relaunched(tmp_path, dag_cron):
-    # regression: a claim RMW that LANDED but whose awaiter timed out (the
-    # worker thread finished the write after wait_for gave up) left the
-    # claimed task RUNNING under our own proc token with nothing launched:
-    # the LaunchIntents rode the abandoned result.  Reconcile trusts the
-    # token and the quiescence pre-scan keeps the document, so the run
-    # wedged for the daemon's lifetime, and a restart then failed the task
-    # as a crash without it ever having run.  The driver must recognize the
-    # claim it never received, release it, and re-claim it with no attempt
-    # spent.
+    # A claim RMW that LANDS while its awaiter has timed out (the worker
+    # thread finishes the write after wait_for gives up) leaves the claimed
+    # task RUNNING under our own proc token with nothing launched: the
+    # LaunchIntents ride the abandoned result.  Reconcile trusts the token
+    # and the quiescence pre-scan keeps the document, so nothing else would
+    # ever touch that entry.  The driver recognizes the claim it never
+    # received, releases it, and re-claims it with no attempt spent.
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
@@ -2094,6 +2092,116 @@ async def test_cancelled_launch_is_not_recorded_as_task_failure(
     assert entry.get("failReason") != "launch failed"
     assert entry.get("state") != dag.FAILED
     assert (body or {}).get("state") != dag.FAILED
+
+
+async def test_cancelled_launch_drops_its_registry_key_and_is_relaunched(
+    tmp_path, monkeypatch, dag_cron
+):
+    # A launch cancelled before its subprocess exists (a state-section
+    # reload while it waits behind the spawn gate) leaves the claim RUNNING
+    # under our token with nothing launched, the shape of a lost claim; its
+    # registry key goes with the cancel, so the next advance releases and
+    # re-claims it with no attempt spent.
+    from cronstable.job import RunningJob
+
+    yaml = (
+        "dags:\n  - name: cl\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await dag_cron(yaml)
+    _set_cmd(cron, "cl", "a", [_PY, "-c", "pass"])
+
+    async def cancelled(self):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(RunningJob, "start", cancelled)
+    run_key = None
+    try:
+        run_key = await cron._dag.trigger_run("cl")
+    except asyncio.CancelledError:
+        pass
+    monkeypatch.undo()
+    await _drain_pending(cron)
+    if run_key is None:
+        keys = list((await cron._dag.list_runs("cl", limit=10)) or [])
+        run_key = keys[0]["runKey"]
+    ref = ("cl", run_key)
+    body = await cron._dag.get_run("cl", run_key)
+    assert body["tasks"]["a"]["state"] == dag.RUNNING
+    assert body["tasks"]["a"]["proc"] == cron._proc_token
+    assert ref not in cron._dag._launched  # the key went with the cancel
+    await cron._dag.advance_one(ref)
+    await _drain_pending(cron)
+    assert ("a", 0, 0) in cron._dag._launched[ref]
+    body = await _drive(cron, "cl", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert body["tasks"]["a"]["attempt"] == 0
+
+
+async def test_cancel_after_the_spawn_keeps_the_registry_key(
+    tmp_path, monkeypatch, dag_cron
+):
+    # a cancel that lands once the subprocess exists is a live launch: its
+    # key stays, so the next advance leaves the claim alone
+    from cronstable.job import RunningJob
+
+    yaml = (
+        "dags:\n  - name: cl\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await dag_cron(yaml)
+    _set_cmd(cron, "cl", "a", [_PY, "-c", "pass"])
+    real_start = RunningJob.start
+    spawned = []
+
+    async def spawned_then_cancelled(self):
+        await real_start(self)
+        spawned.append(self)
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(RunningJob, "start", spawned_then_cancelled)
+    run_key = None
+    try:
+        run_key = await cron._dag.trigger_run("cl")
+    except asyncio.CancelledError:
+        pass
+    monkeypatch.undo()
+    await _drain_pending(cron)
+    if run_key is None:
+        keys = list((await cron._dag.list_runs("cl", limit=10)) or [])
+        run_key = keys[0]["runKey"]
+    assert ("a", 0, 0) in cron._dag._launched[("cl", run_key)]
+    (rj,) = spawned
+    await rj.wait()
+
+
+async def test_adopt_scan_prunes_the_registry_of_runs_finished_elsewhere(
+    tmp_path, dag_cron
+):
+    # a run this node launched tasks for and never advanced again (its
+    # lease lapsed and a peer finished it) keeps no registry entry once the
+    # adopt scan sees the store show it terminal, on the full pass and the
+    # keys-only pass alike; the GC's own delete drops it too
+    cron = await dag_cron(_LINEAR)
+    _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+    _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+    run_key = await cron._dag.trigger_run("lin")
+    body = await _drive(cron, "lin", run_key)
+    assert body["state"] == dag.SUCCESS
+    ref = ("lin", run_key)
+    d = cron._dag
+    assert ref not in d._launched
+    d._launched[ref] = {("a", 0, 0)}  # as if a peer finished the run
+    d._next_full_adopt = 0.0  # the full pass
+    await d._adopt_orphans()
+    assert ref not in d._launched
+    d._launched[ref] = {("a", 0, 0)}
+    d._next_full_adopt = float("inf")  # the keys-only pass
+    await d._adopt_orphans()
+    assert ref not in d._launched
+    d._launched[ref] = {("a", 0, 0)}
+    await d._delete_run(cron.state_backend, "lin", run_key, body.get("runId"))
+    assert ref not in d._launched
 
 
 async def test_advance_of_missing_document_releases_ownership(

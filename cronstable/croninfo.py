@@ -49,11 +49,11 @@ from typing import (
 
 from cronstable.cronexpr import (
     _DOW_NAMES,
-    _GAP_PROBE,
     _MONTH_NAMES,
     LOCAL_ZONE,
     CronTab,
     LocalZone,
+    _local_civil,
     _month_end,
     expand_field,
 )
@@ -891,20 +891,56 @@ def _offset_at(
     )
 
 
+class _HostZoneKey:
+    """What :data:`LOCAL_ZONE` keys the lint memos with: the host's current
+    zone name and offset.  The singleton itself would serve one host's
+    transitions to another once the host's zone changes, or a test pins a
+    different one; this key misses instead.
+    """
+
+    __slots__ = ("name", "offset")
+
+    def __init__(self) -> None:
+        civil = _local_civil(datetime.datetime.now(datetime.timezone.utc))
+        self.name = civil.tzname()
+        self.offset = civil.utcoffset()
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _HostZoneKey) and (
+            self.name,
+            self.offset,
+        ) == (other.name, other.offset)
+
+    def __hash__(self) -> int:
+        return hash((self.name, self.offset))
+
+
+_MemoZone = datetime.tzinfo | _HostZoneKey
+
+
+def _memo_key(timezone: datetime.tzinfo) -> _MemoZone:
+    return _HostZoneKey() if isinstance(timezone, LocalZone) else timezone
+
+
+def _memo_zone(key: _MemoZone) -> datetime.tzinfo:
+    return LOCAL_ZONE if isinstance(key, _HostZoneKey) else key
+
+
 @functools.lru_cache(maxsize=512)
-def _zone_transition_ordinals(
-    timezone: datetime.tzinfo, year: int
-) -> tuple[int, ...]:
+def _zone_transition_ordinals(key: _MemoZone, year: int) -> tuple[int, ...]:
     """Proleptic-Gregorian ordinals of every day in ``year`` whose 00:00
-    UTC offset differs from the previous day's, for ``timezone``.
+    UTC offset differs from the previous day's, for the zone ``key``
+    stands for (:func:`_memo_key`).
 
     This is exactly the step-function boundary detection :func:`_lint_dst`
     used to walk inline (``offset(d) != offset(d - 1 day)``), but computed
     once per (zone, year) and cached.  A calendar year has at most a
     handful of transitions, so the returned tuple is tiny; the cache is
     bounded and keyed on the ``ZoneInfo`` (hashable, and interned by the
-    ``zoneinfo`` module, so equal zones share an entry).
+    ``zoneinfo`` module, so equal zones share an entry) or on the host's
+    current zone for :data:`LOCAL_ZONE`.
     """
+    timezone = _memo_zone(key)
     one = datetime.timedelta(days=1)
     day = datetime.date(year, 1, 1)
     end = datetime.date(year, 12, 31)
@@ -932,19 +968,20 @@ def _zone_transitions_in_range(
     """
     first_year = datetime.date.fromordinal(lo + 1).year
     last_year = datetime.date.fromordinal(hi).year
+    key = _memo_key(timezone)
     out: list[int] = []
     for year in range(first_year, last_year + 1):
         try:
-            ordinals = _zone_transition_ordinals(timezone, year)
+            ordinals = _zone_transition_ordinals(key, year)
         except TypeError:  # unhashable tzinfo: skip the cache, still correct
-            ordinals = _zone_transition_ordinals.__wrapped__(timezone, year)
+            ordinals = _zone_transition_ordinals.__wrapped__(key, year)
         out.extend(d for d in ordinals if lo < d <= hi)
     out.sort()
     return out
 
 
 @functools.lru_cache(maxsize=4096)
-def _affected_hours(timezone: datetime.tzinfo, ordinal: int) -> frozenset[int]:
+def _affected_hours(key: _MemoZone, ordinal: int) -> frozenset[int]:
     """Hours of the civil date ``ordinal`` that a transition disturbs.
 
     The 48-probe scan (24 hours, on the hour and the half hour, for the
@@ -954,6 +991,7 @@ def _affected_hours(timezone: datetime.tzinfo, ordinal: int) -> frozenset[int]:
     parse shares one scan of a given transition date instead of repeating
     it per job.
     """
+    timezone = _memo_zone(key)
     day = datetime.date.fromordinal(ordinal)
     affected: set[int] = set()
     for hour in range(24):
@@ -971,15 +1009,20 @@ def _dst_finding(
     skips or repeats, as a Finding, or ``None`` when the schedule misses
     the anomalous window (or the day fields exclude the date)."""
     second = min(tab.seconds)
-    zone_name = str(timezone)
+    zone_name = (
+        "the host's local time"
+        if isinstance(timezone, LocalZone)
+        else str(timezone)
+    )
     minutes = sorted(tab.minutes)
+    key = _memo_key(timezone)
     for offset in (0, 1):
         day = first_day + datetime.timedelta(days=offset)
         ordinal = day.toordinal()
         try:
-            affected = _affected_hours(timezone, ordinal)
+            affected = _affected_hours(key, ordinal)
         except TypeError:  # unhashable tzinfo: skip the cache, still correct
-            affected = _affected_hours.__wrapped__(timezone, ordinal)
+            affected = _affected_hours.__wrapped__(key, ordinal)
         for hour in sorted(affected & tab.hours):
             for minute in minutes:
                 civil = datetime.datetime.combine(
@@ -1336,36 +1379,20 @@ def _local_tzinfo() -> datetime.tzinfo:
     return LOCAL_ZONE
 
 
-_FRAME_STEP = datetime.timedelta(hours=1)
-
-
 def _walk_frame(
     zone: datetime.tzinfo, start: datetime.datetime, end: datetime.datetime
 ) -> datetime.tzinfo:
     """``zone`` for a fire walk over ``[start, end)``.
 
-    The host clock becomes a fixed offset when its offset is constant
-    from :data:`_GAP_PROBE` before ``start`` to ``end``: no gap or fold
-    can then touch the walk, so the engine's fixed-offset path answers
-    the same instants at a fraction of the cost.  Sampled hourly; a
-    transition changes the offset for months, never for under an hour.
+    The host clock becomes the fixed offset :meth:`LocalZone.fixed_frame`
+    vouches for through ``end``: no gap or fold can then touch the walk,
+    so the engine's fixed-offset path answers the same instants at a
+    fraction of the cost.  Any other zone passes through.
     """
     if not isinstance(zone, LocalZone):
         return zone
-    at = start - _GAP_PROBE
-    first = at.astimezone(zone)
-    offset = first.utcoffset()
-    while at <= end:
-        at += _FRAME_STEP
-        if at.astimezone(zone).utcoffset() != offset:
-            return zone
-    assert offset is not None
-    name = first.tzname()
-    return (
-        datetime.timezone(offset)
-        if name is None
-        else datetime.timezone(offset, name)
-    )
+    fixed, good_to = zone.fixed_frame(start, until=end)
+    return zone if fixed is None or good_to < end else fixed
 
 
 def _fire_cells(

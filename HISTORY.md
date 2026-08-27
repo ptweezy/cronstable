@@ -15,19 +15,30 @@
   startup countdown, the Prometheus next-run gauge and the TUI's agenda
   share that frame, so every view shows the instants the scheduler fires. A
   timestamp outside the C library's range (before 1970 on Windows) resolves
-  through the offset of a year with the same calendar layout.
+  through the offset of a year with the same calendar layout. The schedule
+  lint reads a local-clock job in that frame too, so its DST notes name the
+  host's transitions as they name a zoned job's. Wherever the host offset is
+  one value across a computation's reach (the engine's look-back, the
+  answer, a walk's window), the scheduler's next-fire arithmetic, the
+  heatmap, the calendar feed and the TUI's week walk run on that fixed
+  offset, for the cost of a fixed-offset zone.
 - The TUI's schedule tab computes a `utc: false` job's next-runs list on the
   host clock it names as the reference frame, and lints a local-clock job
-  without a zone, as the daemon does.
+  in the host clock, as the daemon does.
 - A catch-up evaluation that finds nothing owed closes the job's open
-  checkpoint. A job that is paused when the boot evaluation reaches it pins
-  its pre-pause watermark under an `open` record in `catchup/<job>`; when
+  checkpoint, and so does one that sets a job aside for good (disabled,
+  `onMissed: skip`, or without a cron schedule) while a checkpoint from an
+  earlier boot is still open. A job that is paused when the boot
+  evaluation reaches it pins its pre-pause watermark under an `open`
+  record in `catchup/<job>`; when
   the pause lifted with no backlog that record stayed newest, so a later
   restart hoisted the watermark back to the pin and replayed the ordinary
   runs since as missed, one run under `run-once` and up to 100 serialized
-  runs under `run-all`. The close is written only when a pin exists, so a
-  plain boot appends nothing to the stream, and a pin that cannot be read,
-  or whose close is dropped, keeps the job pending for the next recheck.
+  runs under `run-all`. The close is written only when a pin exists (one
+  listing of the checkpoint streams tells the boot which jobs carry one),
+  so a plain boot appends nothing to the stream, and a pin that cannot be
+  read, or whose close is dropped, keeps the job pending for the next
+  recheck.
 - The cluster `Replace` listener cancels the instances a peer's cancel
   record names in the background and keeps renewing the slot lease while
   they drain. A drain longer than the lease had left (the default
@@ -37,9 +48,11 @@
   blamed a store outage. The pursuit's bound of twice `slotTtlSeconds` still
   applies, so a job with a large `killTimeout` wants a larger
   `slotTtlSeconds`.
-- A `state` section reload that keeps `path` and `deploymentId` keeps the
-  held cluster concurrency slots and their renewers across the backend
-  rebuild, and a changed `slotTtlSeconds` applies from the next renew. Any
+- A `state` section reload that names the same store (the same `path` and
+  `deploymentId` as the backend resolves them: a respelled path or an
+  explicit `deploymentId: default` is the same store) keeps the held cluster
+  concurrency slots and their renewers across the backend rebuild, and a
+  changed `slotTtlSeconds` applies from the next renew. Any
   other edit to the section (`maxRunsPerJob`, `gcGraceSeconds`, a job API
   key) used to drop them, so the lease expired under the live run and a peer
   could start a second instance of a `Forbid` job. A reload that moves the
@@ -54,10 +67,14 @@
   so a claim whose launch intents never reached it is recognized by its
   absence there and logged as a warning naming the run and tasks. A release
   write that fails is retried on the following advance while the pass still
-  launches every task it claimed. Such a task otherwise sat running under
-  the owner's process token with no subprocess for the daemon's lifetime,
-  its lease keeping peers out, and a restart then failed it as a crash
-  without it ever having run.
+  launches every task it claimed. A launch the daemon cancels before its
+  subprocess starts (a `state` section reload while the task waits behind
+  the spawn gate) is released the same way. The record forgets a run once
+  the store shows it finished or collected, whichever node finished it, so
+  a node handing runs to its peers holds nothing for them. Such a task
+  otherwise sat running under the owner's process token with no subprocess
+  for the daemon's lifetime, its lease keeping peers out, and a restart then
+  failed it as a crash without it ever having run.
 - A blank path in a gossip `cluster.tls` block is a `ConfigError` at load.
   The schema required the `ca`, `cert` and `key` keys but accepted a blank
   scalar (what a template renders for an unset variable), and an empty `ca`
@@ -82,28 +99,36 @@
   peer list declares the new N. A pure job change at a fixed N declares one
   N everywhere and raises no conflict.
 - `cronstable init` hands a machine-wide configuration directory to the
-  Administrators group in the same call that writes its DACL, and that DACL
-  carries an OWNER RIGHTS entry that holds the directory's owner to read.
-  `%ProgramData%` lets any local account create a directory and become its
-  owner, and an owner holds WRITE_DAC whatever the DACL says, so a directory
-  that was only restricted stayed reopenable by whoever pre-created it with
-  a plain `icacls /grant`; with the entry in place that grant is refused.
-  Where the caller cannot assign the owner, which is what an unelevated
-  prompt gets, the DACL still goes on and `init` names the owner it could
-  not change together with the fix. `init` refuses a machine-wide directory
-  that already exists when another account owns it and the hand-over fails,
-  and it refuses a junction or symbolic link standing at the path, writing
-  nothing in either case.
+  Administrators group and writes it a DACL that carries an OWNER RIGHTS
+  entry holding the directory's owner to read. `%ProgramData%` lets any
+  local account create a directory and become its owner, and an owner holds
+  WRITE_DAC whatever the DACL says, so a directory that was only restricted
+  stayed reopenable by whoever pre-created it with a plain `icacls /grant`;
+  with the entry in place that grant is refused. Where the caller cannot
+  assign the owner, which is what an unelevated prompt gets, the DACL still
+  goes on and `init` names the owner it could not change together with the
+  fix. An existing machine-wide directory is handed over before the starter
+  is written and given its DACL after it. `init` refuses such a directory
+  when another account owns it and the hand-over is refused, and it refuses
+  a junction or symbolic link standing at the path; in either case it
+  writes nothing and leaves the directory's permissions as they were. A
+  directory holding `JOBS.YAML` is a live setup: `init` judges names
+  case-folded, as the loader does.
 - The startup permission check reads the owner as well as the DACL. On a
-  path outside the caller's own profile it reports an owner other than
-  SYSTEM, Administrators or TrustedInstaller, unless an OWNER RIGHTS entry
-  limits that owner to read, and it reports a junction or symbolic link
-  standing at the path. The daemon's one-time warning and `cronstable
-  service install` both print the finding with the recipe, which gains the
-  OWNER RIGHTS grant and a second command, `icacls "<dir>" /setowner
-  *S-1-5-32-544`, because icacls refuses `/setowner` beside `/grant`. A
-  user's own configuration directory under their profile is never reported
-  for its owner.
+  path outside the user profiles (the service host's own profile holds no
+  user's directory, so for a service every profile counts as outside) it
+  reports an owner other than SYSTEM, Administrators or TrustedInstaller,
+  unless an OWNER RIGHTS entry limits that owner to read, and it reports a
+  junction or symbolic link standing at the path, whether or not the link's
+  target lets it read a descriptor, and it leaves alone a reparse point
+  that redirects nothing, such as a cloud-file placeholder. The daemon's
+  one-time warning, `cronstable service install` and `init` print one
+  wording of the finding with the recipe, which gains the OWNER RIGHTS
+  grant and a second command, `icacls "<dir>" /setowner *S-1-5-32-544`,
+  because icacls refuses `/setowner` beside `/grant`; a junction gets its
+  own sentence, since no permission on a link changes what its target
+  holds. A configuration directory under a user profile is never reported
+  for its owner by a user's own daemon or by `init`.
 
 ## 1.2.48
 

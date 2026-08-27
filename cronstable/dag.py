@@ -1323,6 +1323,11 @@ def _claim_task(
         entry["pokeCount"] = 0
         entry["firstPokeAt"] = now
         entry["nextPokeAt"] = None
+    else:
+        # a task retyped from a sensor may carry its poke count; the plain
+        # claim is poke 0, and the launch registry reads the entry
+        # (DagScheduler._repair_lost_claims)
+        entry.pop("pokeCount", None)
     result.launches.append(
         LaunchIntent(
             task_id=task.id,

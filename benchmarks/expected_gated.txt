@@ -80,6 +80,7 @@ schedule.lint_250_zoned
 schedule.next_fires_2k
 schedule.pressure_20k_48h
 schedule.reseed_100k
+schedule.reseed_local_20k
 schedule.suggest_slot_5k
 startup.import_config
 startup.import_cronexpr

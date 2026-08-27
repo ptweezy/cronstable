@@ -75,6 +75,7 @@ from cronstable.croninfo import (  # noqa: F401  (re-exported for tests/back-com
     Finding,
     ScheduleEntry,
     _local_tzinfo,
+    _walk_frame,
     describe_cron,
     duplicate_schedules,
     lint_schedule,
@@ -3697,7 +3698,6 @@ class App:
             now = datetime.datetime.now(datetime.timezone.utc)
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             end = start + datetime.timedelta(days=7)
-            local_tz = _local_tzinfo()
             grid = [[0] * 24 for _ in range(7)]
             items: list[tuple[datetime.datetime, str]] = []
             frequent: list[tuple[str, int, bool]] = []
@@ -3705,6 +3705,9 @@ class App:
             # lands in the window (occurrences() is strictly-after), the
             # same rule as the web panel
             probe = start - datetime.timedelta(seconds=1)
+            # the host clock walks on a fixed offset wherever the week and
+            # the engine's look-back hold no transition
+            local_tz = _walk_frame(_local_tzinfo(), probe, end)
             for entry in entries:
                 zone = entry.timezone or local_tz
                 fires: list[datetime.datetime] = []
@@ -7944,10 +7947,8 @@ class AppDrawers(AppOverlays):
                 if isinstance(f, dict)
             ]
         else:
-            # the daemon lints a local-clock job with no zone; mirror it
-            findings = lint_schedule(
-                text, timezone=None if tz is LOCAL_ZONE else tz, hash_key=name
-            )
+            # the daemon lints a local-clock job in the host clock; mirror it
+            findings = lint_schedule(text, timezone=tz, hash_key=name)
         if findings:
             rows.append(paint.style("", "fg"))
         rows.extend(finding_rows(findings, paint, width, 3))

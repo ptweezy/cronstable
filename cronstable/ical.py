@@ -35,7 +35,7 @@ from collections.abc import Sequence
 from typing import NamedTuple, Optional
 
 from cronstable.cronexpr import CronTab
-from cronstable.croninfo import _local_tzinfo, describe_cron
+from cronstable.croninfo import _local_tzinfo, _walk_frame, describe_cron
 
 __all__ = ["CalendarEntry", "render_calendar"]
 
@@ -173,7 +173,9 @@ def render_calendar(
         "REFRESH-INTERVAL;VALUE=DURATION:PT1H",
         "X-PUBLISHED-TTL:PT1H",
     ]
-    local_tz = _local_tzinfo()
+    # the host clock walks on a fixed offset wherever the window and the
+    # engine's look-back hold no transition (croninfo._walk_frame)
+    local_tz = _walk_frame(_local_tzinfo(), start, end_utc)
     for entry in entries:
         zone = entry.timezone or local_tz
         block = _block_seconds(entry.avg_duration)

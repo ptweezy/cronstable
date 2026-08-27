@@ -1278,11 +1278,75 @@ def bench_schedule_lint_zoned():
     return time.perf_counter() - t0
 
 
+#: A pass instant a week clear of the 2026 US transitions, so the host-clock
+#: seed below takes the fixed-offset path on any host zone; also the
+#: due-pass base further down.
+_DUE_BASE = datetime(2026, 3, 15, 12, 31, 0, tzinfo=timezone.utc)
+
+
+@bench(
+    "schedule.reseed_local_20k",
+    "schedule",
+    detail="_ensure_seeded over 20k host-clock (utc: false) jobs",
+    repeats=(3, 2, 1),
+)
+def bench_schedule_reseed_local():
+    """The seed pass over jobs framed in the host clock.
+
+    schedule.reseed_100k walks the engine on a UTC frame, the fixed-offset
+    path.  A ``utc: false`` job (what the Task Scheduler importer emits for
+    every task) arms through CronTab.next_local, whose fixed-offset shortcut
+    holds only while the host offset is provably constant across the
+    answer, so a regression on that path shows here and nowhere else.
+    """
+    Cron = _cron_cls()
+    if not hasattr(Cron, "_ensure_seeded"):
+        raise Skip("Cron._ensure_seeded not present")
+
+    def build():
+        try:
+            from cronstable.config import (
+                DEFAULT_CONFIG,
+                JobConfig,
+                mergedicts,
+            )
+        except ImportError as exc:
+            raise Skip("cronstable.config API unavailable: %r" % exc) from None
+        jobs = {}
+        for i in range(_n(20000)):
+            name = "local%05d" % i
+            jobs[name] = JobConfig(
+                mergedicts(
+                    DEFAULT_CONFIG,
+                    {
+                        "name": name,
+                        "command": "true",
+                        "schedule": "%d %d * * *" % (i % 60, (i * 7) % 24),
+                        "utc": False,
+                    },
+                )
+            )
+        return jobs
+
+    jobs = fixture("local_jobs_20k", build)
+    try:
+        cron = Cron(
+            None,
+            config_yaml="jobs:\n  - name: seed\n    command: 'x'\n"
+            "    schedule: '0 0 * * *'\n",
+        )
+    except TypeError as exc:
+        raise Skip("Cron signature changed: %r" % exc) from None
+    cron.cron_jobs = jobs
+    t0 = time.perf_counter()
+    cron._ensure_seeded(_DUE_BASE)
+    return time.perf_counter() - t0
+
+
 # The forever-loop's fire pass at marketed scale.  The fixture is the single
 # most expensive in the suite (~100k JobConfigs, built once per process), so
 # it sits LAST in the schedule group: the group boundary evicts it before the
 # dag group starts.
-_DUE_BASE = datetime(2026, 3, 15, 12, 31, 0, tzinfo=timezone.utc)
 
 
 def _due_pass_jobs():

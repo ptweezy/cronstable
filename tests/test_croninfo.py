@@ -207,6 +207,21 @@ def test_dst_notes_only_with_restricted_hours_and_a_real_zone():
     assert _codes("30 2 * * *", tz=_UTC) == []
 
 
+def test_dst_notes_cover_the_host_clock(monkeypatch):
+    # a local-clock job lints against the host's zone, the frame the
+    # scheduler fires it in, and names that frame rather than a zone
+    _pin_host_zone(monkeypatch, "America/New_York")
+    finding = _by_code("30 2 * * *", "dst-skipped-time", tz=LOCAL_ZONE)
+    assert "2027-03-14" in finding.message
+    assert "the host's local time" in finding.message
+    # the memos key on the host's current zone, so a host pinned
+    # elsewhere lints afresh instead of inheriting New York's transitions
+    _pin_host_zone(monkeypatch, "UTC")
+    assert _codes("30 2 * * *", tz=LOCAL_ZONE) == []
+    _pin_host_zone(monkeypatch, "America/New_York")
+    assert "dst-skipped-time" in _codes("30 2 * * *", tz=LOCAL_ZONE)
+
+
 def test_dst_notes_respect_the_day_fields():
     # 02:30 only on the 1st of the month: the 2027-03-14 gap never hits it,
     # and the 2026-11-01 fold is not a gap, so no skipped-time note appears

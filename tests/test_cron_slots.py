@@ -920,6 +920,41 @@ async def test_slotlease_store_teardown_drops_idle_lease_quietly(
 
 
 @pytest.mark.asyncio
+async def test_slotlease_respelled_same_store_keeps_slots(
+    stateful_cron, slotlease_reaper, tmp_path, caplog
+):
+    # the store's identity is what the backend resolves: an explicit
+    # ``deploymentId: default`` or a respelled path names the same store,
+    # so the held slot and its renewer keep across the rebuild; a real
+    # move still drops them
+    cron = await stateful_cron(_SLOTLEASE_CLUSTER_FORBID)
+    cron._slot_leases["s"] = _slotlease_lease(
+        holder=cron._slot_holder(), fence=5
+    )
+    renewer = asyncio.create_task(cron._slot_renewer("s"))
+    slotlease_reaper(renewer)
+    cron._slot_renewers["s"] = renewer
+    cron.running_jobs["s"] = [object()]
+    respelled = str(tmp_path) + "/."
+    for section in (
+        "state:\n  path: {}\n  deploymentId: default\n".format(tmp_path),
+        "state:\n  path: {}\n  maxRunsPerJob: 200\n".format(respelled),
+    ):
+        await cron.start_stop_state(_state_cfg(section))
+        assert cron.state_backend is not None
+        assert "s" in cron._slot_leases and not renewer.done()
+    assert "stays in the previous state store" not in caplog.text
+    await cron.start_stop_state(
+        _state_cfg("state:\n  path: {}\n".format(tmp_path / "moved"))
+    )
+    assert cron._slot_leases == {} and cron._slot_renewers == {}
+    await asyncio.sleep(0)
+    assert renewer.cancelled()
+    assert "stays in the previous state store" in caplog.text
+    await cron._stop_job_api()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("removed", [False, True])
 async def test_slotlease_store_change_while_down_drops_slots(
     stateful_cron, slotlease_reaper, tmp_path, monkeypatch, caplog, removed

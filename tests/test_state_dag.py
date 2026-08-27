@@ -1606,6 +1606,19 @@ def test_release_lost_claims_resets_plain_task_and_sensor():
     assert body["tasks"]["a"]["startedAt"] == 6.0
 
 
+def test_plain_claim_clears_a_stale_poke_count():
+    # a task retyped from a sensor keeps its poke count on the entry; the
+    # plain claim registers poke 0, so the entry must read 0 too, or the
+    # driver's launch registry would mistake the live launch for a lost
+    # claim and release it under its running subprocess
+    spec = _spec(TaskSpec("a", max_attempts=3))
+    body = _body(spec)
+    body["tasks"]["a"]["pokeCount"] = 1
+    body, res = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    assert [(li.taskkey, li.poke_number) for li in res.launches] == [("a", 0)]
+    assert "pokeCount" not in body["tasks"]["a"]
+
+
 def test_release_lost_claims_is_fenced():
     # only the exact claim (proc, attempt, poke) is undone; an entry that
     # moved since is left alone, and an all-fenced batch keeps the document.

@@ -222,8 +222,10 @@ mount cannot stall the scheduler pass.
 - The lease is held under a process-unique identity (log messages show the
   node's display name), so a restarted daemon can never adopt its
   predecessor's slot.
-- A `state`-section reload that keeps `path` and `deploymentId` rebuilds the
-  backend under the live run and keeps its slot lease and renewer (a changed
+- A `state`-section reload that names the same store (the same `path` and
+  `deploymentId` as the backend resolves them, so a respelled path or an
+  explicit `deploymentId: default` is the same store) rebuilds the backend
+  under the live run and keeps its slot lease and renewer (a changed
   `slotTtlSeconds` applies from the next renew). A reload that moves the
   store leaves the lease behind to lapse by TTL and logs `Job <name>: its
   cluster concurrency slot stays in the previous state store while the run

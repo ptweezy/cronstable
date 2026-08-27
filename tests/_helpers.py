@@ -59,6 +59,10 @@ def _pin_host_zone(monkeypatch, name, years=None):
 
     monkeypatch.setattr(cronexpr, "_host_civil", civil)
     monkeypatch.setattr(cronexpr, "_host_instant", instant)
+    # the fixed-offset frames LOCAL_ZONE keeps were sampled on the real
+    # host; the pinned zone starts with none, and the real ones return
+    # with the undo
+    monkeypatch.setattr(cronexpr.LOCAL_ZONE, "_frames", [])
     return zone
 
 

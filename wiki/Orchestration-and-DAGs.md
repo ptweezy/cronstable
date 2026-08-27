@@ -293,7 +293,11 @@ timeout stopped waiting for it (a stalled disk or network mount) leaves the
 task claimed with nothing launched. On its next pass the owner recognizes
 that claim, because the record has no entry for it, releases the task back
 to `pending` (a sensor back to its idle shape between pokes) and re-claims it
-at once. Nothing ran, so the task's attempt count is unchanged.
+at once. Nothing ran, so the task's attempt count is unchanged. A launch the
+owner cancels before its subprocess starts (a `state` section reload while
+the task waits behind the spawn gate) is released the same way. The record
+forgets a run once the store shows it finished or collected, whichever node
+finished it.
 
 If a node crashes, its lease lapses and a peer adopts the run, reconciling from
 the durable state:

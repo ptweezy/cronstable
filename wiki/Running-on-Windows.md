@@ -222,11 +222,13 @@ owner it could not change together with the fix. A per-user
 `%APPDATA%\cronstable` carries no such permission to begin with, so `init`
 leaves it alone.
 
-`init` refuses a machine-wide directory that already exists when another
-account owns it and the hand-over fails, and it refuses a junction or symbolic
-link standing at the path, because the scheduler reads whatever the link's
-target holds. Nothing is written in either case. Run `init` again from an
-elevated prompt, or remove the directory first.
+An existing machine-wide directory is handed to Administrators before the
+starter is written and restricted after it. `init` refuses such a directory
+when another account owns it and the hand-over fails, and it refuses a
+junction or symbolic link standing at the path, because the scheduler reads
+whatever the link's target holds. Nothing is written in either case, and the
+directory's permissions stay as they were. Run `init` again from an elevated
+prompt, or remove the directory first.
 
 `init` deliberately leaves read in place. The boundary this defends is who may
 *write* a job. Removing read would stop an unelevated account from listing the
@@ -238,16 +240,25 @@ For a directory that already exists, the daemon says so once at startup and
 prints the same fix, and `cronstable service install` prints the same note.
 The finding names the account that can write, or the owner of a machine-wide
 directory when that owner is neither SYSTEM, Administrators nor
-TrustedInstaller, or a junction or symbolic link standing at the path:
+TrustedInstaller:
 
 ```text
 C:\ProgramData\cronstable can be written by BUILTIN\Users, so any local
-account can add or change a job this daemon runs, and a service runs them
-as SYSTEM. Restrict it with: icacls "C:\ProgramData\cronstable"
-/inheritance:r /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F
+account can add or change a job, and a service runs them as SYSTEM.
+Restrict it with: icacls "C:\ProgramData\cronstable" /inheritance:r
+/grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F
 /grant *S-1-5-11:(OI)(CI)RX /grant *S-1-3-4:(OI)(CI)RX, then icacls
 "C:\ProgramData\cronstable" /setowner *S-1-5-32-544
 ```
+
+A junction or symbolic link standing at the path gets its own sentence, asking
+for a real directory in its place: no permission on a link changes what its
+target holds, and the finding stands whether or not that target lets the
+daemon read a descriptor. Other reparse points, such as a cloud-file
+placeholder, redirect nothing, and the check leaves them alone. A machine-wide
+path is one outside the user profiles. A service runs from a profile of its
+own under `system32`, so every user's directory counts as outside for it, and
+a service reading one is told who owns it.
 
 The recipe names SIDs rather than group names so it pastes unchanged on a
 localized install, where `BUILTIN\Administrators` is spelled in the local

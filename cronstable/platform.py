@@ -86,21 +86,31 @@ _CONFIG_EXTENSIONS = frozenset({".yml", ".yaml", ".crontab", ".cron"})
 _CONFIG_BASENAME = "crontab"
 
 
-def _holds_config(directory: str) -> bool:
-    """Whether ``directory`` contains a file the config loader would read."""
-    try:
-        names = os.listdir(directory)
-    except OSError:
-        return False
-    for name in names:
+def config_file_names(directory: str) -> list[str]:
+    """The files in ``directory`` the config loader would read, sorted.
+
+    Case-folded like the loader: Windows filesystems preserve case without
+    distinguishing it, so ``JOBS.YAML`` is a configuration file.  Raises
+    ``OSError`` when the directory cannot be listed.
+    """
+    found = []
+    for name in sorted(os.listdir(directory)):
         lowered = name.lower()
         base, ext = os.path.splitext(lowered)
         # leading _ or . is the loader's own "skip this file" convention
         if not base or base[0] in {"_", "."}:
             continue
         if ext in _CONFIG_EXTENSIONS or lowered == _CONFIG_BASENAME:
-            return True
-    return False
+            found.append(name)
+    return found
+
+
+def _holds_config(directory: str) -> bool:
+    """Whether ``directory`` contains a file the config loader would read."""
+    try:
+        return bool(config_file_names(directory))
+    except OSError:
+        return False
 
 
 def _windows_config_home(environ: Mapping[str, str]) -> str:
@@ -1126,6 +1136,14 @@ _CONFIG_DIR_SDDL = (
 #: ERROR_INVALID_OWNER.
 _CONFIG_DIR_OWNER_SID = "S-1-5-32-544"
 
+#: ``SE_OBJECT_TYPE`` and ``SECURITY_INFORMATION`` values the ACL readers
+#: and writers share, and the SDDL revision every converter takes.
+_SE_FILE_OBJECT = 1
+_OWNER_SECURITY_INFORMATION = 0x00000001
+_DACL_SECURITY_INFORMATION = 0x00000004
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_SDDL_REVISION_1 = 1
+
 #: Owners a machine-wide configuration directory may have without being
 #: reported: LocalSystem, BUILTIN\\Administrators and TrustedInstaller,
 #: each as the SDDL converter spells it.  A directory under
@@ -1146,8 +1164,7 @@ _TRUSTED_OWNERS = frozenset(
 #: link standing at a machine-wide path: the scheduler reads whatever the
 #: target holds, and the target belongs to whoever placed the link.
 _REPARSE_GRANTEE = (
-    "whoever placed the junction or symbolic link it resolves through "
-    "(replace it with a real directory)"
+    "whoever placed the junction or symbolic link standing at it"
 )
 
 
@@ -1166,6 +1183,26 @@ def config_dir_icacls_recipe(path: str) -> str:
         "/grant *S-1-5-11:(OI)(CI)RX "
         "/grant *S-1-3-4:(OI)(CI)RX, "
         'then icacls "{0}" /setowner *S-1-5-32-544'.format(path)
+    )
+
+
+def writable_config_advice(path: str, grantee: str) -> str:
+    """The sentence every surface prints for a writable ``path``: who can
+    write it, what that means, and the fix.  ``grantee`` is what
+    :func:`any_user_write_grantee` reported; a reparse point gets the
+    advice an ACL cannot give.
+    """
+    if grantee == _REPARSE_GRANTEE:
+        return (
+            "{} is a junction or symbolic link, so whoever placed it decides "
+            "what a scheduler reading it runs, and a service runs that as "
+            "SYSTEM. Replace it with a real directory.".format(path)
+        )
+    return (
+        "{} can be written by {}, so any local account can add or change a "
+        "job, and a service runs them as SYSTEM. Restrict it with: {}".format(
+            path, grantee, config_dir_icacls_recipe(path)
+        )
     )
 
 
@@ -1253,10 +1290,16 @@ def _sddl_rights_write(rights: str) -> bool:
 _OWNER_READ_TOKENS = frozenset({"FR", "FX", "GR", "GX"})
 _OWNER_READ_MASK = 0x001200A9 | 0x80000000 | 0x20000000
 
-#: ``FILE_ATTRIBUTE_REPARSE_POINT``, the bit ``os.lstat`` reports for a
-#: junction as well as a symbolic link; ``os.path.islink`` sees only the
-#: latter.
-_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+#: The reparse tags that send a path elsewhere: a symbolic link and a
+#: junction (``IO_REPARSE_TAG_MOUNT_POINT``).  ``os.path.islink`` sees only
+#: the former; a cloud-file placeholder or a deduplicated file carries a
+#: reparse tag too and sends nothing anywhere.
+_LINK_REPARSE_TAGS = frozenset(
+    {
+        getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C),
+        getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003),
+    }
+)
 
 
 def _sddl_owner(sddl: str) -> Optional[str]:
@@ -1305,14 +1348,16 @@ def _security_finding(
 
     On a machine-wide path a reparse point and an untrusted owner come
     first: both survive any DACL, so they are the finding the DACL rule
-    would otherwise hide behind a grant it does not report.  An absent
-    ``sddl`` means "cannot tell", which has to read as no finding.
+    would otherwise hide behind a grant it does not report.  A reparse
+    point needs no descriptor to be one (its target's may well be
+    unreadable); otherwise an absent ``sddl`` means "cannot tell", which
+    has to read as no finding.
     """
+    if machine_wide and reparse:
+        return _REPARSE_GRANTEE
     if not sddl:
         return None
     if machine_wide:
-        if reparse:
-            return _REPARSE_GRANTEE
         owner = _sddl_untrusted_owner(sddl)
         if owner is not None and not _sddl_owner_neutralized(sddl):
             return "its owner " + owner
@@ -1333,14 +1378,30 @@ def path_is_user_scoped(path: str, user_profile: Optional[str]) -> bool:
 
 
 def is_machine_wide(path: str) -> bool:
-    """Whether a Windows ``path`` sits outside the caller's own profile.
+    """Whether a Windows ``path`` sits outside every user profile.
 
-    The owner and reparse rules apply only there: a user's own
-    configuration directory is owned by that user by design.
+    The owner and reparse rules apply only there: a configuration
+    directory under a profile is owned by that profile's user by design,
+    whichever user runs the check.  The profiles live beside the caller's
+    own (the parent of ``%USERPROFILE%``), so for the service host, whose
+    profile sits under ``system32``, every user's directory is outside,
+    which is right for a service reading one.  A path is outside when
+    either its spelling or what it resolves to (a short name, a junction)
+    is: a machine-wide directory reached through a link into a profile
+    stays machine-wide.
     """
-    return IS_WINDOWS and not path_is_user_scoped(
-        os.path.abspath(path), os.environ.get("USERPROFILE")
-    )
+    if not IS_WINDOWS:
+        return False
+    profile = os.environ.get("USERPROFILE")
+    if not profile:
+        return True
+    root = ntpath.dirname(ntpath.normpath(profile))
+    spellings = {os.path.abspath(path)}
+    try:
+        spellings.add(os.path.realpath(path))
+    except (OSError, ValueError):
+        pass
+    return not all(path_is_user_scoped(p, root) for p in spellings)
 
 
 def is_reparse_point(path: str) -> bool:
@@ -1349,10 +1410,9 @@ def is_reparse_point(path: str) -> bool:
         st = os.lstat(path)
     except OSError:
         return False
-    attributes = getattr(st, "st_file_attributes", 0)
-    return stat.S_ISLNK(st.st_mode) or bool(
-        attributes & _FILE_ATTRIBUTE_REPARSE_POINT
-    )
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return getattr(st, "st_reparse_tag", 0) in _LINK_REPARSE_TAGS
 
 
 def any_user_write_grantee(path: str) -> Optional[str]:
@@ -1416,11 +1476,7 @@ def _read_security_sddl(path: str) -> Optional[str]:
         import ctypes
         from ctypes import wintypes
 
-        SE_FILE_OBJECT = 1
-        OWNER_SECURITY_INFORMATION = 0x00000001
-        DACL_SECURITY_INFORMATION = 0x00000004
-        SDDL_REVISION_1 = 1
-        wanted = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+        wanted = _OWNER_SECURITY_INFORMATION | _DACL_SECURITY_INFORMATION
 
         advapi32 = ctypes.windll.advapi32  # type: ignore[attr-defined]
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
@@ -1451,7 +1507,7 @@ def _read_security_sddl(path: str) -> Optional[str]:
         descriptor = ctypes.c_void_p()
         if advapi32.GetNamedSecurityInfoW(
             path,
-            SE_FILE_OBJECT,
+            _SE_FILE_OBJECT,
             wanted,
             None,
             None,
@@ -1465,7 +1521,7 @@ def _read_security_sddl(path: str) -> Optional[str]:
             length = wintypes.ULONG()
             if not convert(
                 descriptor,
-                SDDL_REVISION_1,
+                _SDDL_REVISION_1,
                 wanted,
                 ctypes.byref(text),
                 ctypes.byref(length),
@@ -1481,6 +1537,52 @@ def _read_security_sddl(path: str) -> Optional[str]:
             kernel32.LocalFree(descriptor)
     except Exception:  # noqa: BLE001 - cannot tell is not a finding
         return None
+
+
+def assign_config_dir_owner(path: str) -> bool:
+    """Hand ``path`` to :data:`_CONFIG_DIR_OWNER_SID` and change nothing else.
+
+    True when Administrators own the directory afterwards; False when the
+    assignment is refused (a caller that is not elevated) and on every
+    non-Windows host.  No ACL is touched, so a refusal leaves the
+    directory as it was found.
+    """
+    if not IS_WINDOWS:  # pragma: no cover (posix) - no owners to assign
+        return False
+    try:  # pragma: no cover (windows) - measured live, not in the suite
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.windll.advapi32  # type: ignore[attr-defined]
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+        advapi32.ConvertStringSidToSidW.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        # DWORD, not BOOL: a Win32 error code, zero on success
+        advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+        kernel32.LocalFree.restype = wintypes.HLOCAL
+        kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+        owner = ctypes.c_void_p()
+        if not advapi32.ConvertStringSidToSidW(
+            _CONFIG_DIR_OWNER_SID, ctypes.byref(owner)
+        ):
+            return False
+        try:
+            return not advapi32.SetNamedSecurityInfoW(
+                path,
+                _SE_FILE_OBJECT,
+                _OWNER_SECURITY_INFORMATION,
+                owner,
+                None,
+                None,
+                None,
+            )
+        finally:
+            kernel32.LocalFree(owner)
+    except Exception:  # noqa: BLE001 - best effort, like harden_config_dir
+        return False
 
 
 def harden_config_dir(path: str) -> bool:
@@ -1508,13 +1610,8 @@ def harden_config_dir(path: str) -> bool:
         import ctypes
         from ctypes import wintypes
 
-        SE_FILE_OBJECT = 1
-        OWNER_SECURITY_INFORMATION = 0x00000001
-        DACL_SECURITY_INFORMATION = 0x00000004
-        PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
-        SDDL_REVISION_1 = 1
         protected = (
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+            _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION
         )
 
         advapi32 = ctypes.windll.advapi32  # type: ignore[attr-defined]
@@ -1562,7 +1659,7 @@ def harden_config_dir(path: str) -> bool:
                 return False
             if not parse(
                 _CONFIG_DIR_SDDL,
-                SDDL_REVISION_1,
+                _SDDL_REVISION_1,
                 ctypes.byref(descriptor),
                 ctypes.byref(size),
             ):
@@ -1591,8 +1688,8 @@ def harden_config_dir(path: str) -> bool:
             # would read as truthy success under the ctypes default.
             if not advapi32.SetNamedSecurityInfoW(
                 path,
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | protected,
+                _SE_FILE_OBJECT,
+                _OWNER_SECURITY_INFORMATION | protected,
                 owner,
                 None,
                 dacl,
@@ -1601,7 +1698,7 @@ def harden_config_dir(path: str) -> bool:
                 return True
             return not advapi32.SetNamedSecurityInfoW(
                 path,
-                SE_FILE_OBJECT,
+                _SE_FILE_OBJECT,
                 protected,
                 None,
                 None,

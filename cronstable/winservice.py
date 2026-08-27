@@ -1466,11 +1466,8 @@ def install(args: Any, api: WinApi) -> int:
         # the operator named, and the daemon says the same thing once at
         # every start until the recipe is applied.
         print(
-            "cronstable service install: note, {} can be written by {}, so "
-            "any local account can add a job the service runs as SYSTEM. "
-            "Restrict it with: {}".format(
-                config, grantee, platform.config_dir_icacls_recipe(config)
-            ),
+            "cronstable service install: note, "
+            + platform.writable_config_advice(config, grantee),
             file=sys.stderr,
         )
     start_type, delayed = start_type_code(getattr(args, "start_type", "auto"))

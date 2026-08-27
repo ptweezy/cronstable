@@ -1271,13 +1271,20 @@ def test_a_reparse_point_is_a_finding_on_a_machine_wide_path():
         platform._security_finding(clean, machine_wide=False, reparse=True)
         is None
     )
-    # cannot tell is no finding, whatever else is known
+    # a reparse point needs no descriptor: its target's may well be
+    # unreadable, and that is the case the rule exists for
     assert (
         platform._security_finding(None, machine_wide=True, reparse=True)
-        is None
+        == platform._REPARSE_GRANTEE
     )
     assert (
-        platform._security_finding("", machine_wide=True, reparse=True) is None
+        platform._security_finding("", machine_wide=True, reparse=True)
+        == platform._REPARSE_GRANTEE
+    )
+    # cannot tell is no finding otherwise
+    assert (
+        platform._security_finding(None, machine_wide=True, reparse=False)
+        is None
     )
 
 
@@ -1292,19 +1299,49 @@ def test_path_is_user_scoped_compares_windows_paths():
     assert not platform.path_is_user_scoped(r"C:\x", None)
 
 
-def test_is_machine_wide_reads_the_profile(monkeypatch, tmp_path):
+def test_is_machine_wide_reads_the_profiles_root(monkeypatch, tmp_path):
+    # every profile beside the caller's own is user-scoped: another
+    # account's configuration directory is that account's by design, and
+    # the caller's own spelled another way (a short name) is still under
+    # the root; %ProgramData% and a drive root are outside
+    users = tmp_path / "Users"
+    (users / "p").mkdir(parents=True)
+    (users / "bob").mkdir()
+    program_data = tmp_path / "ProgramData"
+    program_data.mkdir()
     monkeypatch.setattr(platform, "IS_WINDOWS", True)
-    monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    assert not platform.is_machine_wide(str(tmp_path / "cronstable"))
-    elsewhere = str(tmp_path.parent / "elsewhere")
-    assert platform.is_machine_wide(elsewhere)
+    monkeypatch.setenv("USERPROFILE", str(users / "p"))
+    assert not platform.is_machine_wide(str(users / "p" / "cronstable"))
+    assert not platform.is_machine_wide(str(users / "bob" / "cronstable"))
+    assert platform.is_machine_wide(str(program_data / "cronstable"))
+    assert platform.is_machine_wide(str(tmp_path / "cronstable"))
     # no profile to be under
     monkeypatch.delenv("USERPROFILE")
-    assert platform.is_machine_wide(str(tmp_path / "cronstable"))
+    assert platform.is_machine_wide(str(users / "p" / "cronstable"))
     # and never on POSIX, where the owner rule has no ACL to read
     monkeypatch.setattr(platform, "IS_WINDOWS", False)
-    assert not platform.is_machine_wide(elsewhere)
-    assert platform.untrusted_owner(elsewhere) is None
+    assert not platform.is_machine_wide(str(program_data / "cronstable"))
+    assert platform.untrusted_owner(str(program_data / "cronstable")) is None
+
+
+def test_is_machine_wide_judges_both_spellings(monkeypatch, tmp_path):
+    # a link resolves the path elsewhere: outside on either side of it is
+    # outside, so a machine-wide directory reached through a link into a
+    # profile, or a profile link out to a machine-wide directory, stays
+    # machine-wide
+    users = tmp_path / "Users"
+    (users / "p").mkdir(parents=True)
+    program_data = tmp_path / "ProgramData"
+    target = program_data / "cronstable"
+    target.mkdir(parents=True)
+    monkeypatch.setattr(platform, "IS_WINDOWS", True)
+    monkeypatch.setenv("USERPROFILE", str(users / "p"))
+    outward = users / "p" / "cfg"
+    _make_link(str(target), str(outward))
+    assert platform.is_machine_wide(str(outward))
+    inward = program_data / "planted"
+    _make_link(str(users / "p"), str(inward))
+    assert platform.is_machine_wide(str(inward))
 
 
 def _make_link(target, link):
@@ -1329,6 +1366,78 @@ def test_is_reparse_point_sees_links_and_nothing_else(tmp_path):
     assert not platform.is_reparse_point(str(plain))
 
 
+def test_is_reparse_point_reads_the_tag_not_the_attribute(monkeypatch):
+    # a cloud-files placeholder or a deduplicated file carries a reparse
+    # tag and redirects nothing; only a symbolic link or a junction does
+    import stat
+    import types
+
+    def fake(tag):
+        return types.SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o755,
+            st_file_attributes=0x400,
+            st_reparse_tag=tag,
+        )
+
+    for tag, expected in (
+        (0x9000001A, False),  # IO_REPARSE_TAG_CLOUD
+        (0x80000013, False),  # IO_REPARSE_TAG_DEDUP
+        (0xA0000003, True),  # IO_REPARSE_TAG_MOUNT_POINT
+        (0xA000000C, True),  # IO_REPARSE_TAG_SYMLINK
+    ):
+        monkeypatch.setattr(os, "lstat", lambda path, tag=tag: fake(tag))
+        assert platform.is_reparse_point("x") is expected, hex(tag)
+
+
+def test_config_file_names_folds_case_like_the_loader(tmp_path):
+    # Windows preserves case without distinguishing it: JOBS.YAML is a
+    # configuration file to the loader, so it is one here
+    for name in ("JOBS.YAML", "b.yml", "CRONTAB", "c.cron", "_parked.yaml"):
+        (tmp_path / name).write_text("")
+    (tmp_path / ".hidden.yaml").write_text("")
+    (tmp_path / "notes.txt").write_text("")
+    assert platform.config_file_names(str(tmp_path)) == [
+        "CRONTAB",
+        "JOBS.YAML",
+        "b.yml",
+        "c.cron",
+    ]
+    with pytest.raises(OSError):
+        platform.config_file_names(str(tmp_path / "missing"))
+
+
+def test_writable_config_advice_has_one_wording_per_finding():
+    path = r"C:\ProgramData\cronstable"
+    text = platform.writable_config_advice(path, r"BUILTIN\Users")
+    assert text.startswith(path + r" can be written by BUILTIN\Users")
+    assert "runs them as SYSTEM" in text
+    assert "Restrict it with: icacls" in text
+    assert "/setowner *S-1-5-32-544" in text
+    # a junction gets the advice an ACL cannot give
+    text = platform.writable_config_advice(path, platform._REPARSE_GRANTEE)
+    assert text.startswith(path + " is a junction or symbolic link")
+    assert "Replace it with a real directory" in text
+    assert "icacls" not in text
+
+
+def test_assign_config_dir_owner_changes_nothing_when_refused(tmp_path):
+    # the hand-over is the owner alone: a refusal (an unelevated caller,
+    # or every non-Windows host) leaves the DACL as it was
+    target = tmp_path / "confdir"
+    target.mkdir()
+    before = platform._read_security_sddl(str(target))
+    handed = platform.assign_config_dir_owner(str(target))
+    assert isinstance(handed, bool)
+    if not platform.IS_WINDOWS:
+        assert handed is False
+    after = platform._read_security_sddl(str(target))
+    if not handed:
+        assert after == before
+    elif before is not None and after is not None:
+        # elevated: the owner moved, the DACL did not
+        assert after.split("D:")[1] == before.split("D:")[1]
+
+
 # --- the Windows arms, live and mocked --------------------------------------
 
 
@@ -1347,7 +1456,7 @@ def test_the_owner_and_reparse_rules_live(monkeypatch, tmp_path):
     assert "D:" in sddl
     assert platform._read_security_sddl(str(tmp_path / "missing")) is None
     assert platform.untrusted_owner(str(target)) is None
-    monkeypatch.setenv("USERPROFILE", str(tmp_path / "elsewhere"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "profiles" / "elsewhere"))
     owner = platform._sddl_owner(sddl)
     # an elevated runner creates it owned by Administrators; an unelevated
     # account creates it owned by itself, which is the finding

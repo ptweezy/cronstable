@@ -48,7 +48,7 @@ import os
 import queue
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -982,6 +982,19 @@ def _take_state_worker() -> _StateWorker:
     return _StateWorker()
 
 
+def store_identity(config: Mapping[str, Any]) -> tuple[str, str]:
+    """The store a ``state`` section names, as the backend resolves it: the
+    absolute root (``~`` expanded; ``path: ~/state`` must mean the home
+    directory, not a literal ``~`` under whatever CWD the daemon started
+    in) and the namespace, ``default`` when ``deploymentId`` is unset.
+    Two sections with one identity are one store.
+    """
+    return (
+        os.path.abspath(os.path.expanduser(config["path"])),
+        config.get("deploymentId") or "default",
+    )
+
+
 class FilesystemStateBackend(StateBackend):
     """A durable state backend over any POSIX filesystem.
 
@@ -997,13 +1010,10 @@ class FilesystemStateBackend(StateBackend):
     ) -> None:
         self.config = config
         self.get_job_set_id = get_job_set_id
-        # expanduser first: `path: ~/state` must mean the home directory, not
-        # a literal "~" directory under whatever CWD the daemon started in.
-        self.root = os.path.abspath(os.path.expanduser(config["path"]))
-        # a stable prefix so several deployments can share one store without
-        # colliding; job-set scoping (like the lease backends' @reboot set) is
-        # layered on top by callers via the stream name.
-        self.namespace = config.get("deploymentId") or "default"
+        # a stable namespace so several deployments can share one store
+        # without colliding; job-set scoping (like the lease backends'
+        # @reboot set) is layered on top by callers via the stream name.
+        self.root, self.namespace = store_identity(config)
         # The namespaced root all this backend's files live under, plus the
         # per-lane subroots; every path helper hangs off these, and root and
         # namespace hold for the backend's lifetime.

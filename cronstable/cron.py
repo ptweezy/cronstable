@@ -71,7 +71,7 @@ from cronstable.config import (
     parse_config_with_sources,
     resolve_bonjour_config,
 )
-from cronstable.cronexpr import LOCAL_ZONE, CronTab
+from cronstable.cronexpr import CronTab
 from cronstable.croninfo import (
     ScheduleEntry,
     describe_cron,
@@ -113,7 +113,12 @@ from cronstable.resources import (
     ResourceUsage,
     resolve_node_history_config,
 )
-from cronstable.state import Lease, StateBackend, make_state_backend
+from cronstable.state import (
+    Lease,
+    StateBackend,
+    make_state_backend,
+    store_identity,
+)
 
 
 class _AiohttpDoor:
@@ -1714,12 +1719,13 @@ def get_now(timezone: Optional[datetime.tzinfo]) -> datetime.datetime:
 
 def _store_identity(
     config: Optional[StateConfig],
-) -> Optional[tuple[Any, Any]]:
-    """The store a ``state`` section names: raw path and deploymentId (a
-    respelled path is a different store)."""
+) -> Optional[tuple[str, str]]:
+    """The store a ``state`` section names, as the backend resolves it
+    (:func:`cronstable.state.store_identity`): a respelled path or an
+    explicit ``deploymentId: default`` is the same store."""
     if config is None:
         return None
-    return (config.get("path"), config.get("deploymentId"))
+    return store_identity(config)
 
 
 async def _noop_state_write() -> None:
@@ -1776,7 +1782,7 @@ def schedule_slot(
     own frame) for a job without one.  ``now`` omitted reads the clock
     fresh per job.
     """
-    frame = job.timezone or LOCAL_ZONE
+    frame = job.frame
     now = get_now(frame) if now is None else now.astimezone(frame)
     if job.has_seconds:
         return now.replace(microsecond=0)
@@ -2325,7 +2331,7 @@ class Cron:
         # _store_identity of the store holding this process's slot leases;
         # kept across a failed restart so a move or section removal during
         # that outage still drops them.
-        self._slot_store: Optional[tuple[Any, Any]] = None
+        self._slot_store: Optional[tuple[str, str]] = None
         # the in-flight cross-node retry claim scan, if any (single-flight;
         # see _retry_claim_scan).
         self._retry_claim_task: Optional[asyncio.Task] = None
@@ -3947,7 +3953,7 @@ class Cron:
                 "level": "note",
                 "message": message,
             }
-        zone = job.timezone or LOCAL_ZONE
+        zone = job.frame
         payload: dict[str, Any] = {
             "job": name,
             "enabled": job.enabled,
@@ -5342,8 +5348,8 @@ class Cron:
             # no future occurrence; the engine's answer would be None too,
             # found only after walking the remaining horizon
             return None
-        seconds: Optional[float] = crontab.next(
-            now=get_now(job.timezone or LOCAL_ZONE)
+        seconds: Optional[float] = job.next_delay(
+            get_now(datetime.timezone.utc)
         )
         return seconds
 
@@ -5362,9 +5368,7 @@ class Cron:
             return False
         if name in self._dead_schedules:
             return True
-        return (
-            job.schedule.next(now=get_now(job.timezone or LOCAL_ZONE)) is None
-        )
+        return job.next_delay(get_now(datetime.timezone.utc)) is None
 
     def fleet_job_summaries(self) -> dict[str, Any]:
         """Compact per-job snapshot gossiped to peers for the fleet view.
@@ -8499,15 +8503,13 @@ class Cron:
     ) -> Optional[datetime.datetime]:
         """The aware-UTC instant ``job`` next fires strictly after ``after``.
 
-        The frame is aware (the job's zone, or LOCAL_ZONE for the host
-        clock), so CronTab.next resolves each civil match with that
-        zone's offset and DST policy. None when the schedule has no
-        further occurrence.
+        Resolved in the job's frame (:attr:`JobConfig.frame`): its zone,
+        or the host clock, whose fixed-offset shortcut
+        (:meth:`CronTab.next_local`) applies wherever the host offset is
+        provably constant across the answer. None when the schedule has
+        no further occurrence.
         """
-        crontab = job.schedule
-        assert isinstance(crontab, CronTab)
-        frame = after.astimezone(job.timezone or LOCAL_ZONE)
-        delay = crontab.next(now=frame)
+        delay = job.next_delay(after)
         if delay is None:
             return None
         return after + datetime.timedelta(seconds=delay)
@@ -8839,6 +8841,53 @@ class Cron:
             return True
         return await self._checkpoint_catchup(name, "close", watermark)
 
+    async def _pinned_catchup_names(self) -> Optional[set[str]]:
+        """Jobs with a catch-up checkpoint stream in the store, from one
+        listing; None when the listing cannot be trusted, so the caller
+        asks each stream instead."""
+        backend = self.state_backend
+        if backend is None:
+            return None
+        try:
+            names, complete = await asyncio.wait_for(
+                backend.list_stream_names_audit(CATCHUP_STREAM_PREFIX),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the per-job read decides
+            return None
+        if not complete:
+            return None
+        prefix = len(CATCHUP_STREAM_PREFIX)
+        return {name[prefix:] for name in names}
+
+    async def _retire_catchup_pin(
+        self, name: str, pinned: Optional[set[str]]
+    ) -> bool:
+        """Close the open checkpoint of a job nothing will backfill.
+
+        ``pinned`` is :meth:`_pinned_catchup_names`; a job outside it has
+        no stream to read. False: the pin could not be read or closed;
+        defer, never latch.
+        """
+        if pinned is not None and name not in pinned:
+            return True
+        try:
+            pending = await self._pending_catchup_watermark(name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - defer, never latch
+            logger.warning(
+                "catch-up: cannot read the checkpoint of %s (%s); will retry",
+                name,
+                ex,
+            )
+            return False
+        if pending is None:
+            return True
+        return await self._checkpoint_catchup(name, "close", pending)
+
     async def _missed_occurrences(
         self, job: JobConfig, now: datetime.datetime
     ) -> tuple[int, Optional[str], bool]:
@@ -8999,6 +9048,7 @@ class Cron:
     async def _evaluate_catch_up(self, now: datetime.datetime) -> bool:
         """One catch-up evaluation pass; returns whether jobs stay pending."""
         unresolved = False
+        checkpointed = await self._pinned_catchup_names()
         for name, job in list(self.cron_jobs.items()):
             if name in self._catchup_done:
                 continue
@@ -9007,7 +9057,14 @@ class Cron:
                 or not job.enabled
                 or not isinstance(job.schedule, CronTab)
             ):
-                self._catchup_done.add(name)
+                # nothing will ever backfill this job, so a pin it carries
+                # (paused at a boot before its config changed) closes
+                # here; left open, the first boot after the change is
+                # undone would hoist the watermark back to it
+                if await self._retire_catchup_pin(name, checkpointed):
+                    self._catchup_done.add(name)
+                else:
+                    unresolved = True
                 continue
             if self._pause_active(name) is not None:
                 # No backfill while paused, but a pause excuses only its

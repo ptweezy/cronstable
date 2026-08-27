@@ -31,6 +31,38 @@ def _render(entries, days=35, **kwargs):
     return render_calendar(entries, days=days, **kwargs)
 
 
+def test_local_entries_walk_on_the_fixed_frame(monkeypatch):
+    # a local-clock entry walks on the fixed offset the host keeps across
+    # a transition-free window, and renders exactly what the aware walk in
+    # LOCAL_ZONE renders
+    from cronstable import ical
+    from tests._helpers import _pin_host_zone
+
+    _pin_host_zone(monkeypatch, "America/New_York")
+    entries = [
+        CalendarEntry("gap", CronTab("30 2 * * *")),
+        CalendarEntry("q", CronTab("*/20 * * * *")),
+        CalendarEntry("z", CronTab("15 9 * * *"), _UTC),
+    ]
+    frames = []
+    real = ical._walk_frame
+
+    def recording(zone, start, end):
+        frame = real(zone, start, end)
+        frames.append(frame)
+        return frame
+
+    monkeypatch.setattr(ical, "_walk_frame", recording)
+    fast = _render(entries, days=7)
+    assert [type(frame) for frame in frames] == [datetime.timezone]
+    monkeypatch.setattr(ical, "_walk_frame", lambda zone, s, e: zone)
+    aware = _render(entries, days=7)
+    assert fast == aware
+    # seven daily gap fires, the twenty-minute job at the per-entry cap,
+    # seven zoned fires
+    assert fast.count("BEGIN:VEVENT") == 7 + 100 + 7
+
+
 def test_escape_specials_and_newlines():
     assert _escape("a,b;c\nd\\e") == "a\\,b\\;c\\nd\\\\e"
     assert _escape("x\r\ny\rz") == "x\\ny\\nz"

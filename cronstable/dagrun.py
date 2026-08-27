@@ -1198,6 +1198,7 @@ class DagScheduler:
                     if not isinstance(body.get("runKey"), str):
                         continue
                     await self._try_own(dagcfg, (name, key))
+                self._prune_launched(name, known)
                 return
         try:
             docs = await asyncio.wait_for(
@@ -1223,6 +1224,7 @@ class DagScheduler:
         # the self-heal for the stale-terminal corner ADOPT_FULL_REFRESH
         # documents).
         self._terminal_run_keys[name] = terminal
+        self._prune_launched(name, terminal)
 
     # =====================================================================
     # Advancing an owned run
@@ -1534,6 +1536,27 @@ class DagScheduler:
             return
         keys.discard((taskkey, int(attempt or 0), int(poke or 0)))
         if not keys:
+            del self._launched[ref]
+
+    def _settle_completion(
+        self,
+        ref: RunRef,
+        taskkey: Any,
+        attempt: Optional[int],
+        poke: Optional[int],
+    ) -> None:
+        """Retire a completion that is applied, fenced out or dropped: its
+        queued retry, if any, and the launch key it settles go together."""
+        self._pending_completions.pop((ref, taskkey), None)
+        self._settle_launch(ref, taskkey, attempt, poke)
+
+    def _prune_launched(self, name: str, finished: set[str]) -> None:
+        """Forget the launch registry of every run of ``name`` the store
+        shows terminal, whichever node finished it (a run finished here
+        is pruned by ``_on_terminal``)."""
+        for ref in [
+            r for r in self._launched if r[0] == name and r[1] in finished
+        ]:
             del self._launched[ref]
 
     async def _repair_lost_claims(
@@ -1890,9 +1913,15 @@ class DagScheduler:
             # persist a wrong terminal state and burn a retry attempt, and
             # swallowing the cancel would let the launch loop keep
             # launching the rest of the batch mid-shutdown.  Clean up the
-            # run registration and re-raise, like maybe_launch_job; the
-            # claimed slot is protected by reconciliation (proc was set at
-            # claim), so the next owner resumes it.
+            # run registration and re-raise, like maybe_launch_job.  The
+            # claim stays RUNNING under our token; with its registry key
+            # dropped, the next advance releases and re-claims it
+            # (_repair_lost_claims).  A cancel that lands after the
+            # subprocess spawned keeps the key: that launch is live.
+            if running.proc is None:
+                self._settle_launch(
+                    ref, taskkey, intent.attempt, intent.poke_number
+                )
             if token is not None and self._cron._job_api is not None:
                 await self._cron._job_api.finish_run(token)
             raise
@@ -2007,7 +2036,7 @@ class DagScheduler:
         if dref.dag_name not in self._dags():
             # dag removed mid-run; the doc is orphaned, GC handles it.  The
             # dropped completion is settled all the same.
-            self._settle_launch(ref, dref.taskkey, dref.attempt, dref.poke)
+            self._settle_completion(ref, dref.taskkey, dref.attempt, dref.poke)
             return
         success = running.fail_reason is None
         # sampled usage (monitorResources) rides the completion into the
@@ -2076,8 +2105,7 @@ class DagScheduler:
             # dag removed on reload: drop these completions (and any queued
             # retry of them), exactly as _finish_task drops a removed task's.
             for entry in entries:
-                self._pending_completions.pop((ref, entry["taskkey"]), None)
-                self._settle_launch(
+                self._settle_completion(
                     ref, entry["taskkey"], entry["attempt"], entry["poke"]
                 )
             return
@@ -2089,8 +2117,7 @@ class DagScheduler:
                 # the task was removed from the DAG (a config reload) while its
                 # instance was running: drop the stale completion (and a queued
                 # retry of it, which would otherwise re-run forever).
-                self._pending_completions.pop((ref, entry["taskkey"]), None)
-                self._settle_launch(
+                self._settle_completion(
                     ref, entry["taskkey"], entry["attempt"], entry["poke"]
                 )
                 continue
@@ -2131,8 +2158,7 @@ class DagScheduler:
             for entry in live:
                 # settled (applied, or fenced out as a duplicate/superseded/
                 # stale-poke completion): a queued copy must not retry forever.
-                self._pending_completions.pop((ref, entry["taskkey"]), None)
-                self._settle_launch(
+                self._settle_completion(
                     ref, entry["taskkey"], entry["attempt"], entry["poke"]
                 )
                 if entry["taskkey"] not in applied_set:
@@ -2167,8 +2193,7 @@ class DagScheduler:
             # the task was removed from the DAG (a config reload) while its
             # instance was running: drop the stale completion (including a
             # queued retry of it, which would otherwise re-run forever).
-            self._pending_completions.pop((ref, taskkey), None)
-            self._settle_launch(ref, taskkey, attempt, poke)
+            self._settle_completion(ref, taskkey, attempt, poke)
             return
         jitter = _jitter(task.poke_jitter) if task.type == dag.SENSOR else 0.0
         transform = self._wrap(
@@ -2211,8 +2236,7 @@ class DagScheduler:
             # fenced out (a duplicate, a superseded attempt, or a stale poke's
             # queued retry) or applied: either way this completion is settled,
             # so a queued copy must not retry forever.
-            self._pending_completions.pop((ref, taskkey), None)
-            self._settle_launch(ref, taskkey, attempt, poke)
+            self._settle_completion(ref, taskkey, attempt, poke)
             if not applied:
                 logger.debug(
                     "dag run %s/%s: task %s completion dropped as "
@@ -2306,8 +2330,7 @@ class DagScheduler:
             if dagcfg is None:
                 # dag removed on reload: the stale completion is dropped,
                 # like on_task_finished drops it.
-                self._pending_completions.pop(key, None)
-                self._settle_launch(
+                self._settle_completion(
                     ref, pc["taskkey"], pc["attempt"], pc["poke"]
                 )
                 continue
@@ -2934,6 +2957,9 @@ class DagScheduler:
             # same logical date re-creates it): a deleted key must not linger
             # as "known terminal".
             known.discard(run_key)
+        # nothing of a collected run is left to claim: the launch registry
+        # this node may keep for it goes with the document
+        self._launched.pop((name, run_key), None)
         if run_id:
             from cronstable.jobstate import ARTIFACT_STREAM_PREFIX
 
@@ -3047,16 +3073,16 @@ class DagScheduler:
         # Dropping a completion settles it, so its launch key goes too; the
         # registry itself is per process and survives the swap, since a
         # subprocess still running here stays ours on the new store.
-        for ref, entries in self._completion_buffer.items():
+        for ref, entries in list(self._completion_buffer.items()):
             for entry in entries:
-                self._settle_launch(
+                self._settle_completion(
                     ref,
                     entry.get("taskkey"),
                     entry.get("attempt"),
                     entry.get("poke"),
                 )
-        for (ref, taskkey), pc in self._pending_completions.items():
-            self._settle_launch(
+        for (ref, taskkey), pc in list(self._pending_completions.items()):
+            self._settle_completion(
                 ref, taskkey, pc.get("attempt"), pc.get("poke")
             )
         self._pending_completions.clear()
