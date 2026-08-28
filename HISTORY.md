@@ -129,6 +129,16 @@
   own sentence, since no permission on a link changes what its target
   holds. A configuration directory under a user profile is never reported
   for its owner by a user's own daemon or by `init`.
+- The dashboard's schedule engine walks a `utc: true` job in date
+  arithmetic, with no zone lookup, and reads a zoned job's offset through
+  the browser's zone tables twice per hour a walk touches rather than twice
+  per fire. The week calendar walks each distinct schedule and frame once
+  per day window, so an edit to one job's schedule re-walks that schedule
+  and not the fleet. The radar keeps each schedule's next fire until it
+  passes, so a poll on an unchanged fleet walks nothing. Opening the week
+  calendar over ten thousand UTC jobs used to block the page for seconds,
+  and the radar's walk of that fleet cost a tenth of a second on every
+  poll; both are down to milliseconds.
 
 ## 1.2.48
 

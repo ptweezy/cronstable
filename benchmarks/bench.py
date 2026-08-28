@@ -4221,6 +4221,70 @@ def bench_web_append_line():
     return value
 
 
+@bench(
+    "webui.week_walk_500",
+    "webui",
+    detail="computeWeek cold over 500 varied schedules, UTC and "
+    "America/New_York alternating (headless Chromium)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_web_week_walk():
+    """The week calendar's seven-day enumeration of every enabled schedule.
+
+    The page keeps each distinct (schedule, frame)'s fires for the day
+    window, so a poll on an unchanged fleet walks nothing; this times the
+    cold walk the panel pays on enable, on a schedule edit and at midnight,
+    over the suite's schedule mix on both frame kinds the engine has: UTC
+    (Date arithmetic) and an IANA zone (one Intl offset read per hour the
+    walk touches).  Needs the ``__perf.computeWeek`` hook, which clears the
+    memos first; a release without it records as skipped, never failed.
+    """
+    if _MODE == "smoke":
+        raise Skip("webui metrics do not run in smoke mode")
+    page = _web_page()
+    if not page.evaluate("() => typeof __perf.computeWeek === 'function'"):
+        raise Skip("page lacks the __perf.computeWeek hook")
+    return _web_time(
+        page,
+        "__perf.seedJobs(%d); __perf.varySchedules()" % _n(500),
+        "__perf.computeWeek()",
+        batch=2,
+        batches=8,
+    )
+
+
+@bench(
+    "webui.radar_walk_500",
+    "webui",
+    detail="computeRadar cold over 500 varied schedules, UTC and "
+    "America/New_York alternating (headless Chromium)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_web_radar_walk():
+    """The radar's next fire per enabled schedule, the walk the poll loop
+    runs while the panel is open.
+
+    The page keeps each distinct (schedule, frame)'s next fire until it
+    passes, so a poll re-walks only the schedules whose fire has elapsed;
+    this times the cold walk over the whole fleet.  Needs the
+    ``__perf.computeRadar`` hook; a release without it records as skipped.
+    """
+    if _MODE == "smoke":
+        raise Skip("webui metrics do not run in smoke mode")
+    page = _web_page()
+    if not page.evaluate("() => typeof __perf.computeRadar === 'function'"):
+        raise Skip("page lacks the __perf.computeRadar hook")
+    return _web_time(
+        page,
+        "__perf.seedJobs(%d); __perf.varySchedules()" % _n(500),
+        "__perf.computeRadar()",
+    )
+
+
 # ---------------------------------------------------------------------------
 # loop / webapi: the daemon's request-serving surface, driven in-process
 # through the real aiohttp handlers (make_mocked_request; no sockets).  The
