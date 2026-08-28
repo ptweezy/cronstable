@@ -1345,8 +1345,9 @@ def test_is_machine_wide_judges_both_spellings(monkeypatch, tmp_path):
 
 
 def _make_link(target, link):
-    # a junction on Windows, which needs no privilege; a symlink elsewhere
-    if platform.IS_WINDOWS:
+    # a junction on Windows, which needs no privilege; a symlink elsewhere.
+    # Reads the real OS: callers monkeypatch platform.IS_WINDOWS.
+    if os.name == "nt":
         import _winapi
 
         _winapi.CreateJunction(target, link)
