@@ -101,7 +101,7 @@ LONDON = ZoneInfo("Europe/London")
         (
             "59 14 * * *",
             "",
-            "utc: false",  # London is UTC+1 during DST
+            "utc: false",  # read on the host clock, pinned to London below
             DT(2020, 7, 20, 14, 59, 1, tzinfo=UTC).astimezone(LONDON),
             False,
             "",
@@ -158,6 +158,10 @@ LONDON = ZoneInfo("Europe/London")
 def test_job_should_run(
     monkeypatch, schedule, timezone, utc, now, startup, enabled, result
 ):
+    # a utc: false job is read in LOCAL_ZONE: pinned, so the row that
+    # depends on it answers the same on a UTC runner as on any other host
+    _pin_host_zone(monkeypatch, "Europe/London")
+
     def get_now(timezone):
         print("timezone: ", timezone)
         retval = now

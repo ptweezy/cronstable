@@ -1540,12 +1540,15 @@ def _read_security_sddl(path: str) -> Optional[str]:
 
 
 def assign_config_dir_owner(path: str) -> bool:
-    """Hand ``path`` to :data:`_CONFIG_DIR_OWNER_SID` and change nothing else.
+    """Hand ``path`` to :data:`_CONFIG_DIR_OWNER_SID` and write nothing else.
 
     True when Administrators own the directory afterwards; False when the
     assignment is refused (a caller that is not elevated) and on every
-    non-Windows host.  No ACL is touched, so a refusal leaves the
-    directory as it was found.
+    non-Windows host.  No ACL is written, so a refusal leaves the
+    directory as it was found.  A DACL that inherits an OWNER RIGHTS ACE
+    is rewritten by Windows with the owner change: that ACE turns
+    inherit-only, so the DACL is protected and its other inherited ACEs
+    become explicit.  Every grant survives.
     """
     if not IS_WINDOWS:  # pragma: no cover (posix) - no owners to assign
         return False

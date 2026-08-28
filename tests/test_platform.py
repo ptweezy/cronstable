@@ -1421,6 +1421,16 @@ def test_writable_config_advice_has_one_wording_per_finding():
     assert "icacls" not in text
 
 
+def _dacl_grants(sddl):
+    # who holds what: (type, rights, principal) per ACE, without the
+    # inheritance flags, which an owner change rewrites (see
+    # assign_config_dir_owner)
+    dacl = sddl.split("D:")[1]
+    aces = dacl[dacl.index("(") :].strip("()").split(")(")
+    fields = (ace.split(";") for ace in aces)
+    return sorted((a[0], a[2], a[5]) for a in fields)
+
+
 def test_assign_config_dir_owner_changes_nothing_when_refused(tmp_path):
     # the hand-over is the owner alone: a refusal (an unelevated caller,
     # or every non-Windows host) leaves the DACL as it was
@@ -1435,8 +1445,12 @@ def test_assign_config_dir_owner_changes_nothing_when_refused(tmp_path):
     if not handed:
         assert after == before
     elif before is not None and after is not None:
-        # elevated: the owner moved, the DACL did not
-        assert after.split("D:")[1] == before.split("D:")[1]
+        # elevated: Administrators own it and every grant survives. A temp
+        # directory inherits an OWNER RIGHTS ACE, and Windows rewrites the
+        # DACL with the owner change (that ACE turns inherit-only, the
+        # rest become explicit), so the flags are not compared
+        assert platform._sddl_owner(after) in platform._TRUSTED_OWNERS
+        assert _dacl_grants(after) == _dacl_grants(before)
 
 
 # --- the Windows arms, live and mocked --------------------------------------
