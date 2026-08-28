@@ -1802,7 +1802,7 @@ jobs:
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
       - name: Build binary (FreeBSD ${{ matrix.vmarch }})
-        uses: vmactions/freebsd-vm@v1.5.3
+        uses: vmactions/freebsd-vm@v1.5.5
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2075,7 +2075,7 @@ jobs:
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
       - name: Build binary (NetBSD 11.0 amd64)
-        uses: vmactions/netbsd-vm@v1.4.6
+        uses: vmactions/netbsd-vm@v1.4.7
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2171,7 +2171,7 @@ jobs:
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
       - name: Build binary (OmniOS r151054 amd64)
-        uses: vmactions/omnios-vm@v1.3.4
+        uses: vmactions/omnios-vm@v1.3.5
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
