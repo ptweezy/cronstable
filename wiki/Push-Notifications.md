@@ -97,6 +97,22 @@ and under `notify.report`:
 | `devicesFile` | str (Opt) | unset | Path of a local JSON file holding the paired-device registry. Required when no `state:` section is configured. When set, the daemon uses it even with a `state:` section. |
 | `allowUnauthenticated` | bool (Opt) | `false` | Serve the `/push/devices` pairing endpoints on a routable (non-loopback, non-socket) listener even with no `web.authToken`. The default fails closed: with no token the web app has no auth middleware at all, so a `push:` section alongside a routable listener raises a `ConfigError` at load. An `https://` listener with `web.tls.clientCa` set is exempt without this flag (mutual TLS authenticates the caller). Plain `https://` is not exempt. Set true only when the endpoints are protected by other means (an mTLS-terminating proxy, a network policy). |
 
+## Delivery quota on the hosted relay
+
+The hosted relay forwards up to 500 alerts per device per UTC calendar
+month for devices on the app's free plan, and without bound for devices
+holding a Cronstable Pro entitlement. Only alerts that reach APNs count;
+coalesced, suppressed, and rate-limited envelopes do not. Past the bound
+the relay answers the daemon with `{"outcome": "digested"}` (a 2xx, so
+the daemon logs no failure) and sends the device at most one fixed
+"alerts are waiting" digest per hour; the app keeps polling its servers
+directly. The device proves its plan to the relay itself, with the App
+Store's signed transaction; the daemon takes no part beyond naming the
+relay in `pairLinkBase`. A self-hosted relay applies whatever policy it
+runs, and the reference relay's bound is the `RELAY_FREE_MONTHLY_FORWARDS`
+knob. The wire details are in the
+[relay protocol](https://github.com/ptweezy/cronstable/blob/main/docs/relay-protocol.md#delivery-quota).
+
 ## Pairing devices
 
 Pairing registers a device's public key and platform push token with the
