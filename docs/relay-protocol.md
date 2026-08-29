@@ -171,7 +171,7 @@ behind. The alert reaches the phone with fewer log lines.
 
 | Status | Meaning | Daemon behavior |
 | --- | --- | --- |
-| 2xx | Accepted. The relay has taken responsibility for forwarding. | Success. |
+| 2xx | Accepted. The relay has taken responsibility for forwarding, or has folded the alert into a digest (see [Delivery quota](#delivery-quota)). | Success. |
 | 429 | Rate limited. | Logged per device (up to 512 bytes of the response body); no retry. |
 | Other 4xx | Rejected (malformed body, unknown or unroutable device token). | Logged per device; no retry. |
 | 5xx | Relay-side failure. | Logged per device; no retry. |
@@ -187,6 +187,9 @@ path.
   nodes of a cluster may report the same alert. The relay collapses them
   without learning what the alert is about.
 - **Rate limiting** per device token.
+- **Delivery quota** per device per month, lifted by a verified
+  entitlement, with a digest in place of the per-alert pushes past the
+  bound (both optional for a self-hosted relay).
 - **Flap suppression**: a job failing and recovering in a tight loop should
   not produce an unbounded notification stream. The relay owns the
   suppression policy, keyed on `collapseId`.
@@ -194,6 +197,99 @@ path.
   Notification Service Extension runs, decrypts the ciphertext, and renders
   the notification locally. The `priority` field maps to the APNs
   interruption level.
+
+## Delivery quota
+
+A relay may bound how many alerts it forwards to one device per UTC
+calendar month, and lift that bound for devices holding a paid
+entitlement. The hosted relay does: `RELAY_FREE_MONTHLY_FORWARDS`
+(500) forwards per device per month on the free plan, unlimited with a
+Cronstable Pro entitlement. Only alerts that reach APNs count; coalesced,
+suppressed, and rate-limited envelopes do not, and neither do digests.
+The month rolls over at 00:00 UTC on the first.
+
+Past the bound the relay stops forwarding individual alerts and answers
+each envelope with:
+
+```json
+{ "v": 1, "outcome": "digested" }
+```
+
+as a 2xx, so the daemon treats it as accepted. At most once per
+`RELAY_DIGEST_INTERVAL_S` (3600) while alerts keep arriving, the relay
+sends the device one fixed **digest** notification: a passive-priority
+push with no ciphertext, under its own collapse id `digest`, whose body
+tells the operator that alerts are waiting and to open the app. It
+carries a top-level `"kind": "digest"` in place of `ciphertext` and
+`suite`, so the app renders and routes it without decrypting anything.
+The app still polls its servers directly; the digest only replaces the
+per-alert pushes until the month resets or the device becomes entitled.
+
+## Entitlement proof
+
+A device proves a paid entitlement to the relay with the App Store's own
+signed transaction (a StoreKit 2 `jwsRepresentation`, ES256 JWS with an
+`x5c` chain to Apple Root CA G3). The relay verifies it offline: the
+chain (pinned root, validity windows, Apple's in-app purchase marker
+extension `1.2.840.113635.100.6.11.1` on the leaf), the signature, the
+`bundleId` against the relay's APNs topic, a `productId` in the relay's
+allowlist (`RELAY_PRO_PRODUCT_IDS`, default `com.cronstable.app.pro.monthly`
+and `com.cronstable.app.pro.yearly`), no `revocationDate`, and
+`expiresDate` (when present) in the future. The relay accepts `environment: "Sandbox"`
+transactions while `RELAY_ACCEPT_SANDBOX_ENTITLEMENTS` is `true` (the
+hosted default until App Store launch).
+
+```http
+POST /entitlement
+Content-Type: application/json
+
+{ "v": 1, "device": "8f3a1b…", "jws": "eyJhbGciOiJFUzI1NiIsIng1YyI6…" }
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `v` | int | Always `1`. |
+| `device` | string | The platform push token, the same value the daemon's envelopes carry. |
+| `jws` | string | Optional. The signed transaction. Without it, the request only reads the device's current plan and quota. |
+
+The body is at most 16384 bytes. The response, 200 on success:
+
+```json
+{
+  "v": 1,
+  "plan": "pro",
+  "expiresAt": "2027-08-01T00:00:00Z",
+  "environment": "Production",
+  "quota": { "used": 12, "limit": null, "resetsAt": "2026-10-01T00:00:00Z" }
+}
+```
+
+`plan` is `free` or `pro`. `expiresAt` and `environment` appear only
+on `pro`; `expiresAt` is null for an entitlement without an expiry. `quota.limit`
+is the month's bound, or null when unlimited; `used` is this month's
+forwards so far; `resetsAt` is the next rollover.
+
+Errors, all with `{"v": 1, "error": …}` and a `reason` where one applies:
+
+| Status | Meaning |
+| --- | --- |
+| 400 | Malformed body, device, or JWS. |
+| 401 | The transaction does not verify: bad chain or signature, wrong bundle, unknown product, revoked, expired, or a Sandbox transaction while the relay refuses those. |
+| 409 | The transaction already lifts its maximum number of devices (`RELAY_PRO_DEVICES_PER_TRANSACTION`, 5). The body carries `limit`. |
+| 413 | The body is over 16384 bytes. |
+
+One transaction (keyed by `originalTransactionId`) lifts at most that
+many devices. A device holds its slot while it keeps re-posting the proof,
+and the slot lapses after `RELAY_PRO_DEVICE_SLOT_TTL_S` (60 days) of silence, so
+a replaced phone frees its slot on its own. Devices re-post on every
+foreground and after a push-token rotation, and a newer, still-valid proof
+replaces the stored one; the relay keeps only the transaction id,
+product, expiry, environment, and verification time per device, never
+the JWS itself.
+
+The app learns from the daemon which relay to post to: the origin of
+`pairLinkBase` in `GET /whoami`. A self-hosted relay that does not
+implement this route answers 404, which the app treats as "no quota".
 
 ## Privacy guarantees
 
