@@ -176,7 +176,7 @@ Resolution order (`timezone` wins):
 
 1. If `timezone` is set, the job uses `ZoneInfo(timezone)`. An unknown name raises `ConfigError("unknown timezone: ...")`. The `utc` value is ignored in this case.
 2. Else if `utc` is `true` (the default), the job uses `datetime.timezone.utc`.
-3. Else (`utc: false`, no `timezone`) the resolved tzinfo is `None`, that is, naive **host local time**.
+3. Else (`utc: false`, no `timezone`) the resolved tzinfo is `None`: the job runs on the **host's local clock**. The scheduler and every schedule view frame that clock as `LOCAL_ZONE` (`cronstable/cronexpr.py`), a tzinfo that reads each offset from the C library. The job therefore follows the host's DST rules exactly as a job with an explicit `timezone` follows its zone's: a wall time the clocks skip fires once at the shifted time, and a wall time they repeat fires on its first occurrence only.
 
 The resolved value is a `datetime.tzinfo` (or `None`) stored on the job and passed to `get_now(job.timezone)` when the schedule is tested. Because `utc` is `true` by default, **schedules are interpreted in UTC unless you opt out.**
 
@@ -208,7 +208,7 @@ jobs:
 
 The scheduler does not run a per-job timer, and it does not scan every job on a fixed tick either. It keeps a **next-fire index** and **sleeps until the soonest job is due** (`cronstable/cron.py`):
 
-- **The next-fire index.** Every enabled `CronTab` job carries the instant it next fires: an aware **UTC** datetime in `Cron._next_fire`, mirrored into the `_fire_heap` min-heap. Each instant is computed by `crontab.next()` in the job's *own* frame (its `timezone`, or the system-local zone when it has none) and stored back in UTC. So a job's DST offset is handled where it applies, and the heap still orders everything on one absolute timeline. `@reboot` and disabled jobs are not in the index.
+- **The next-fire index.** Every enabled `CronTab` job carries the instant it next fires: an aware **UTC** datetime in `Cron._next_fire`, mirrored into the `_fire_heap` min-heap. Each instant is computed by `crontab.next()` in the job's *own* frame (its `timezone`, or `LOCAL_ZONE`, the host's local clock, when it has none) and stored back in UTC. So a job's DST offset is handled where it applies, and the heap still orders everything on one absolute timeline. `@reboot` and disabled jobs are not in the index.
 - **Sleep until the soonest fire.** Each iteration sleeps until the earliest instant in the heap, capped at the next whole UTC minute so housekeeping (described later) still runs about once a minute. On wake, `_due_names` pops only the jobs whose instant has arrived, and nothing else is touched. An idle wake over a large fleet is an O(1) heap peek, and a wake with a due cohort does crontab work only for that cohort. Cost scales with **jobs due**, not jobs configured.
 - **Structural, forward-only de-duplication.** A fired slot cannot fire twice because advancing the index moves the job's next fire strictly *past* the slot it just fired (`_advance` → `_set_next_fire`). There is no per-tick already-fired check: `_last_run_slot` is retained only for status and introspection, and no longer gates launching. So a minute-level job fires exactly once in its minute, and a second-level job exactly once per matching second, however often the loop wakes.
 - **Immune to clock steps.** The sleep length is derived from the wall clock but realized against the event loop's **monotonic** clock (`asyncio.wait_for`), and firing compares the wall clock against the fixed, forward-only instants in the heap. So a wall-clock or NTP step is absorbed on the next wake. A step **backward** defers the pending fire (it is not re-fired), and a step **forward** does not cause a catch-up storm (see the next item).
@@ -225,6 +225,6 @@ Implications:
 
 ## Inspecting the next run
 
-The [HTTP control API](HTTP-API) `/status` endpoint reports, per job, either `running`, `disabled`, or `scheduled` with a `scheduled_in` value. For `CronTab` jobs that value is `crontab.next(now=now, default_utc=job.utc)` evaluated in the job's time zone. For `@reboot` jobs it is the literal string `@reboot`. This is the recommended way to verify that a schedule resolves to the instant you expect.
+The [HTTP control API](HTTP-API) `/status` endpoint reports, per job, either `running`, `disabled`, or `scheduled` with a `scheduled_in` value. For `CronTab` jobs that value is the engine's next occurrence evaluated in the job's frame: its `timezone`, UTC, or `LOCAL_ZONE` for the host clock. For `@reboot` jobs it is the literal string `@reboot`. This is the recommended way to verify that a schedule resolves to the instant you expect.
 
 See also: [Commands and Environment](Commands-and-Environment), [Concurrency and Timeouts](Concurrency-and-Timeouts), [Troubleshooting and FAQ](Troubleshooting).

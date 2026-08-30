@@ -31,6 +31,35 @@ def _render(entries, days=35, **kwargs):
     return render_calendar(entries, days=days, **kwargs)
 
 
+def test_local_entries_walk_on_the_fixed_frame(monkeypatch):
+    # a local-clock entry walks on the fixed offset the host keeps across
+    # a transition-free window, and renders exactly what the aware walk in
+    # LOCAL_ZONE renders
+    from cronstable import ical
+    from tests._helpers import _pin_host_zone
+
+    _pin_host_zone(monkeypatch, "America/New_York")
+    entries = [
+        CalendarEntry("gap", CronTab("30 2 * * *")),
+        CalendarEntry("q", CronTab("*/20 * * * *")),
+        CalendarEntry("z", CronTab("15 9 * * *"), _UTC),
+    ]
+    fast = _render(entries, days=7)
+
+    def aware_walk(tab, zone, probe, end):
+        for when in tab.occurrences(probe.astimezone(zone)):
+            if when >= end:
+                return
+            yield when
+
+    monkeypatch.setattr(ical, "_walk_fires", aware_walk)
+    aware = _render(entries, days=7)
+    assert fast == aware
+    # seven daily gap fires, the twenty-minute job at the per-entry cap,
+    # seven zoned fires
+    assert fast.count("BEGIN:VEVENT") == 7 + 100 + 7
+
+
 def test_escape_specials_and_newlines():
     assert _escape("a,b;c\nd\\e") == "a\\,b\\;c\\nd\\\\e"
     assert _escape("x\r\ny\rz") == "x\\ny\\nz"
@@ -62,7 +91,7 @@ def test_duration_text_and_block_rounding():
     assert _block_seconds(None) == 300  # no history: the 5-minute floor
     assert _block_seconds(30.0) == 300
     assert _block_seconds(520.0) == 540  # rounded up to a whole minute
-    assert _block_seconds(10 ** 9) == 24 * 3600  # capped
+    assert _block_seconds(10**9) == 24 * 3600  # capped
 
 
 def test_render_requires_an_aware_start():

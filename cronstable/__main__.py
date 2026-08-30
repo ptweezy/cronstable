@@ -185,12 +185,12 @@ def _run_init(args: Any) -> int:
     Creates the target directory when needed and writes ``cronstable.yaml``
     into it. Never touches an existing setup: a target that is a file, that
     already holds config files, or that already has a ``cronstable.yaml``
-    is refused with the reason, so re-running init is always safe.
+    is refused with the reason, so re-running init is always safe. A
+    machine-wide directory that already exists is adopted only once
+    Administrators own it: one owned by another account that init cannot
+    re-own, or one that is a junction or symbolic link, is refused with
+    nothing written and its permissions untouched.
     """
-    # dispatch-time import, like the other subcommand branches: building the
-    # parser must stay import-light for every thin-client invocation.
-    from cronstable.crontabs import is_crontab_path
-
     # Precedence: the positional DIRECTORY, then a root-level -c/--config,
     # then the platform default. Honoring -c matters because the
     # configuration-not-found error that sends people here names that very
@@ -216,33 +216,12 @@ def _run_init(args: Any) -> int:
             file=sys.stderr,
         )
         return 1
-    existing = []
+    owner: str | None = None
     if os.path.isdir(target):
-        try:
-            names = sorted(os.listdir(target))
-        except OSError as ex:
-            # an unreadable target must report like every other init
-            # failure, not traceback; the write below would fail anyway.
-            print(
-                "cronstable init: could not read {}: {}".format(target, ex),
-                file=sys.stderr,
-            )
+        refusal, owner = _init_refuse_existing(target)
+        if refusal is not None:
+            print(refusal, file=sys.stderr)
             return 1
-        for name in names:
-            base, ext = os.path.splitext(name)
-            if not base or base[0] in {"_", "."}:
-                continue
-            if ext in {".yml", ".yaml"} or is_crontab_path(name):
-                existing.append(name)
-    if existing:
-        print(
-            "cronstable init: {} already holds configuration ({}); "
-            "refusing to add a starter to a live setup".format(
-                target, ", ".join(existing[:5])
-            ),
-            file=sys.stderr,
-        )
-        return 1
     hello = (
         "echo hello from cronstable on %COMPUTERNAME%"
         if platform.IS_WINDOWS
@@ -261,39 +240,10 @@ def _run_init(args: Any) -> int:
             file=sys.stderr,
         )
         return 1
+    if owner is not None and not _init_adopt(target, path, owner):
+        return 1
     print("wrote {}".format(path))
-    # Harden only where there is something to harden, asked of the
-    # directory itself rather than of its path. %ProgramData% inherits
-    # BUILTIN\Users create-file rights and a directory at the root of C:
-    # inherits Authenticated Users MODIFY, which is worse, while
-    # %APPDATA%\cronstable carries no any-user ACE at all and must be left
-    # alone: giving a per-user configuration a DACL naming only
-    # administrators would take it away from the person who wrote it.
-    #
-    # Applied AFTER the starter is written, because a caller who is not an
-    # administrator would otherwise be refused the write it just asked
-    # for. Ordering it this way also covers the file, since
-    # SetNamedSecurityInfoW propagates the new inheritable ACEs onto
-    # children whose own DACLs are unprotected.
-    grantee = platform.any_user_write_grantee(target)
-    if grantee is not None:
-        if platform.harden_config_dir(target):
-            print(
-                "restricted {} so {} can no longer add a job there".format(
-                    target, grantee
-                )
-            )
-        else:
-            print(
-                "cronstable init: {} can write {}, so any local account "
-                "can add a job, and a service runs it as SYSTEM. "
-                "Restrict it with: {}".format(
-                    grantee,
-                    target,
-                    platform.config_dir_icacls_recipe(target),
-                ),
-                file=sys.stderr,
-            )
+    _init_restrict(target)
     # Bare `cronstable` finds the default location on its own; anywhere else
     # has to be named, whichever way the caller named it here.
     if os.path.abspath(target) != os.path.abspath(CONFIG_DEFAULT):
@@ -301,6 +251,121 @@ def _run_init(args: Any) -> int:
     else:
         print("start the scheduler with: cronstable")
     return 0
+
+
+def _init_refuse_existing(target: str) -> tuple[str | None, str | None]:
+    """``(refusal, owner)`` for an existing ``target``.
+
+    ``refusal`` is why the directory cannot take the starter, or None.
+    ``owner`` is the untrusted account a machine-wide directory belongs
+    to, or None: the starter goes in first and :func:`_init_adopt` then
+    hands the directory to Administrators, so nobody else can reopen it;
+    its DACL follows (:func:`_init_restrict`).  A refusal leaves the
+    directory as it was found.
+    """
+    if platform.is_machine_wide(target) and platform.is_reparse_point(target):
+        return (
+            (
+                "cronstable init: {} is a junction or symbolic link, and a "
+                "scheduler reading a machine-wide directory through one runs "
+                "whatever its target holds. Replace it with a real directory, "
+                "then run init again.".format(target)
+            ),
+            None,
+        )
+    try:
+        existing = platform.config_file_names(target)
+    except OSError as ex:
+        # an unreadable target must report like every other init
+        # failure, not traceback; the starter write would fail anyway.
+        return "cronstable init: could not read {}: {}".format(
+            target, ex
+        ), None
+    if existing:
+        return (
+            (
+                "cronstable init: {} already holds configuration ({}); "
+                "refusing to add a starter to a live setup".format(
+                    target, ", ".join(existing[:5])
+                )
+            ),
+            None,
+        )
+    return None, platform.untrusted_owner(target)
+
+
+def _init_adopt(target: str, path: str, owner: str) -> bool:
+    """Hand ``target``, owned by ``owner``, to Administrators after the
+    starter ``path`` went in.
+
+    The write comes first so a failed write changes nothing; a hand-over
+    that fails takes the starter back out, so the refusal it prints
+    leaves the directory as init found it.
+    """
+    if platform.assign_config_dir_owner(target):
+        print(
+            "handed {} to Administrators; it was owned by {}".format(
+                target, owner
+            )
+        )
+        return True
+    try:
+        os.remove(path)
+    except OSError:  # pragma: no cover - the refusal below still names it
+        pass
+    print(
+        "cronstable init: {} already exists and is owned by {}, and "
+        "cronstable could not hand it to Administrators, which is what "
+        "keeps that account from reopening it. From an elevated prompt "
+        "run: {}. Or remove the directory and run init again.".format(
+            target, owner, platform.config_dir_icacls_recipe(target)
+        ),
+        file=sys.stderr,
+    )
+    return False
+
+
+def _init_restrict(target: str) -> None:
+    """Close ``target`` to every account but SYSTEM and Administrators.
+
+    Only where there is something to close, asked of the directory itself
+    rather than of its path: %ProgramData% inherits BUILTIN\\Users
+    create-file rights and a directory at the root of C: inherits
+    Authenticated Users MODIFY, which is worse, while %APPDATA%\\cronstable
+    carries no any-user ACE at all and must be left alone, since giving a
+    per-user configuration a DACL naming only administrators would take it
+    away from the person who wrote it.
+
+    Runs AFTER the starter is written, because a caller who is not an
+    administrator would otherwise be refused the write it just asked for.
+    That order also covers the file: SetNamedSecurityInfoW propagates the
+    new inheritable ACEs onto children whose own DACLs are unprotected.
+    """
+    grantee = platform.any_user_write_grantee(target)
+    if grantee is None:
+        return
+    if not platform.harden_config_dir(target):
+        print(
+            "cronstable init: "
+            + platform.writable_config_advice(target, grantee),
+            file=sys.stderr,
+        )
+        return
+    print(
+        "restricted {} so {} can no longer add a job there".format(
+            target, grantee
+        )
+    )
+    owner = platform.untrusted_owner(target)
+    if owner is not None:
+        print(
+            "cronstable init: {} stays owned by {}; OWNER RIGHTS holds that "
+            "account to read, and an elevated prompt can hand it to "
+            "Administrators with: {}".format(
+                target, owner, platform.config_dir_icacls_recipe(target)
+            ),
+            file=sys.stderr,
+        )
 
 
 def main_loop(loop=None):
@@ -605,12 +670,7 @@ def _warn_if_config_is_writable(config_arg: str | None) -> None:
     if grantee is None:
         return
     logging.getLogger("cronstable").warning(
-        "%s can be written by %s, so any local account can add or change "
-        "a job this daemon runs, and a service runs them as SYSTEM. "
-        "Restrict it with: %s",
-        config_arg,
-        grantee,
-        platform.config_dir_icacls_recipe(config_arg),
+        "%s", platform.writable_config_advice(config_arg, grantee)
     )
 
 

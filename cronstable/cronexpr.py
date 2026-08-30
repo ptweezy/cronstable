@@ -47,7 +47,9 @@ following occurrence) and runs in ``now``'s civil clock; an aware match
 resolves in its zone (``fold=0``) and the delay is true elapsed seconds
 across offset changes: a spring-forward gap label fires once at its
 shifted time, an ambiguous fall-back wall time on its first occurrence
-only.  ``test`` reads civil fields, ignoring microseconds.  ``prev``
+only.  ``LOCAL_ZONE`` is the host's local clock as a tzinfo, so a
+local-clock schedule takes that same aware path under the host's DST
+rules.  ``test`` reads civil fields, ignoring microseconds.  ``prev``
 mirrors into the past (floor 1970); ``occurrences`` iterates real
 instants, never yielding one twice.
 """
@@ -56,13 +58,14 @@ import datetime
 import hashlib
 import itertools
 import re
+import time
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Iterator, Mapping
 from typing import (
     Optional,
 )
 
-__all__ = ["CronTab", "expand_field"]
+__all__ = ["LOCAL_ZONE", "CronTab", "LocalZone", "expand_field"]
 
 _MACROS = {
     "@yearly": "0 0 1 1 *",
@@ -739,6 +742,247 @@ def _default_now(default_utc: bool) -> datetime.datetime:
     return datetime.datetime.now()
 
 
+def _host_civil(utc: datetime.datetime) -> datetime.datetime:
+    """The C library's reading of the aware UTC instant ``utc``: aware,
+    carrying that instant's fixed offset and zone name.  Raises outside
+    the library's time_t range (the MS CRT: 1970 to 3001)."""
+    return utc.astimezone()
+
+
+def _host_instant(civil: datetime.datetime) -> datetime.datetime:
+    """The aware UTC instant the C library resolves the naive label
+    ``civil`` to; ``civil.fold`` picks the reading of a gap or a repeat.
+    Raises as :func:`_host_civil` does (the resolution probes a day to
+    either side)."""
+    return civil.astimezone(_UTC)
+
+
+#: 2001..2028 holds every calendar layout (weekday of 1 January, length
+#: of February), so a proxy year keeps DST rules on the same dates.
+_PROXY_YEARS = {
+    (datetime.date(y, 1, 1).weekday(), _month_end(y, 2)): y
+    for y in range(2001, 2029)
+}
+
+
+def _proxy(dt: datetime.datetime) -> datetime.datetime:
+    """``dt`` moved to the proxy year that shares its calendar layout."""
+    year = dt.year
+    layout = (datetime.date(year, 1, 1).weekday(), _month_end(year, 2))
+    return dt.replace(year=_PROXY_YEARS[layout])
+
+
+def _local_civil(utc: datetime.datetime) -> datetime.datetime:
+    """:func:`_host_civil`, total over datetime's range: outside the
+    library's range the proxy year's offset applies."""
+    try:
+        return _host_civil(utc)
+    except (OSError, OverflowError, ValueError):
+        return utc.astimezone(_host_civil(_proxy(utc)).tzinfo)
+
+
+def _local_instant(civil: datetime.datetime) -> datetime.datetime:
+    """:func:`_host_instant`, total over datetime's range."""
+    try:
+        return _host_instant(civil)
+    except (OSError, OverflowError, ValueError):
+        proxy = _proxy(civil)
+        offset = proxy - _host_instant(proxy).replace(tzinfo=None)
+        return (civil - offset).replace(tzinfo=_UTC)
+
+
+#: How far past a probed instant :meth:`LocalZone.fixed_frame` samples
+#: the host offset when nothing bounds the request; one frame then serves
+#: a month of scheduler passes.
+_FRAME_SPAN = datetime.timedelta(days=35)
+
+#: A frame is re-sampled after this many seconds, so a host whose zone
+#: changes while the daemon runs follows the new rules within a minute.
+_FRAME_TTL = 60.0
+
+#: Frames sample hourly: a transition changes the offset for months, never
+#: for under an hour, so no change hides between two samples.
+_FRAME_STEP = datetime.timedelta(hours=1)
+
+#: Frames kept per zone: the live scheduler asks around now while a
+#: catch-up walk asks around an old watermark, and neither may evict the
+#: other on every call.
+_FRAMES_KEPT = 4
+
+
+class _Frame:
+    """The host offset verdict for instants in ``[lo, hi)``, both UTC.
+
+    ``fixed`` is the :class:`datetime.timezone` the host keeps from
+    ``lo - _GAP_PROBE`` through ``hi``, or None when a transition sits
+    inside that reach.  ``open`` says ``hi`` is the sampling horizon
+    rather than a transition, so the frame may be extended.
+    """
+
+    __slots__ = ("lo", "hi", "fixed", "open", "built")
+
+    def __init__(
+        self,
+        lo: datetime.datetime,
+        hi: datetime.datetime,
+        fixed: Optional[datetime.timezone],
+        open: bool,
+    ) -> None:
+        self.lo = lo
+        self.hi = hi
+        self.fixed = fixed
+        self.open = open
+        self.built = time.monotonic()
+
+
+def _host_offset(utc: datetime.datetime) -> Optional[datetime.timedelta]:
+    """The host offset at the aware instant ``utc``: one library reading."""
+    return _local_civil(utc).utcoffset()
+
+
+def _first_change(
+    start: datetime.datetime,
+    stop: datetime.datetime,
+    offset: Optional[datetime.timedelta],
+) -> Optional[datetime.datetime]:
+    """The first hourly sample after ``start``, reaching ``stop``, whose
+    host offset is not ``offset``; None when every sample agrees."""
+    at = start
+    while at < stop:
+        at += _FRAME_STEP
+        if _host_offset(at) != offset:
+            return at
+    return None
+
+
+def _build_frame(
+    at: datetime.datetime, until: Optional[datetime.datetime]
+) -> _Frame:
+    origin = at - _GAP_PROBE
+    first = _local_civil(origin)
+    offset = first.utcoffset()
+    assert offset is not None
+    name = first.tzname()
+    fixed = (
+        datetime.timezone(offset)
+        if name is None
+        else datetime.timezone(offset, name)
+    )
+    stop = at + _FRAME_SPAN
+    if until is not None and until > stop:
+        stop = until
+    change = _first_change(origin, stop, offset)
+    if change is None:
+        return _Frame(at, stop, fixed, True)
+    # the transition sits in (change - step, change]: every instant whose
+    # look-back can hold it, from change - step to change + _GAP_PROBE,
+    # walks aware; the instants before it keep the offset through the
+    # last agreeing sample
+    if at >= change - _FRAME_STEP:
+        return _Frame(at, change + _GAP_PROBE, None, False)
+    return _Frame(at, change - _FRAME_STEP, fixed, False)
+
+
+def _extend_frame(frame: _Frame, until: datetime.datetime) -> None:
+    """Sample an open frame's host offset on to ``until``."""
+    assert frame.fixed is not None
+    change = _first_change(frame.hi, until, frame.fixed.utcoffset(None))
+    if change is None:
+        frame.hi = until
+    else:
+        frame.hi = change - _FRAME_STEP
+        frame.open = False
+
+
+class LocalZone(datetime.tzinfo):
+    """The host's local clock as a tzinfo.
+
+    Every offset is the C library's live answer (:func:`_local_civil`,
+    :func:`_local_instant`), so a local-clock schedule takes the same
+    aware path as a zoned one and follows the host's own DST rules;
+    ``fold`` reads as in PEP 495.  ``dst`` is unknown (None): the
+    library reports the whole offset, never its DST share.
+    :meth:`fixed_frame` hands a walk the fixed offset the host keeps
+    across its reach, where the engine's fixed-offset path answers the
+    same instants at a fraction of the cost.
+    """
+
+    def __init__(self) -> None:
+        self._frames: list[_Frame] = []
+
+    def fixed_frame(
+        self,
+        at: datetime.datetime,
+        until: Optional[datetime.datetime] = None,
+    ) -> tuple[Optional[datetime.timezone], datetime.datetime]:
+        """The host clock as a fixed offset around the aware instant ``at``.
+
+        Returns ``(fixed, good_to)``.  ``fixed`` is a
+        :class:`datetime.timezone` equal to this zone from ``at`` less
+        :data:`_GAP_PROBE` (the engine's look-back) through ``good_to``,
+        so a walk from ``at`` whose instants stay at or before ``good_to``
+        answers the same on it as on this zone; None when a transition
+        sits inside that reach, ``good_to`` then being the instant from
+        which to ask again.  ``until`` extends the sampled span so a
+        window ending there is covered.  Frames are sampled hourly, kept
+        per process and re-sampled after :data:`_FRAME_TTL`.
+        """
+        at = at.astimezone(_UTC)
+        if until is not None:
+            until = until.astimezone(_UTC)
+        frames = self._frames
+        now = time.monotonic()
+        for frame in frames:
+            if frame.lo <= at < frame.hi and now - frame.built < _FRAME_TTL:
+                if until is not None and frame.open and frame.hi < until:
+                    _extend_frame(frame, until)
+                return frame.fixed, frame.hi
+        try:
+            frame = _build_frame(at, until)
+        except OverflowError:  # within _GAP_PROBE of datetime's range
+            return None, at
+        kept = [f for f in frames if now - f.built < _FRAME_TTL]
+        self._frames = [frame] + kept[: _FRAMES_KEPT - 1]
+        return frame.fixed, frame.hi
+
+    def utcoffset(
+        self, dt: Optional[datetime.datetime]
+    ) -> Optional[datetime.timedelta]:
+        if dt is None:
+            return None
+        civil = dt.replace(tzinfo=None)
+        return civil - _local_instant(civil).replace(tzinfo=None)
+
+    def dst(
+        self, dt: Optional[datetime.datetime]
+    ) -> Optional[datetime.timedelta]:
+        return None
+
+    def tzname(self, dt: Optional[datetime.datetime]) -> Optional[str]:
+        if dt is None:
+            return "local"
+        # the name in force at the instant the label resolves to
+        return _local_civil(_local_instant(dt.replace(tzinfo=None))).tzname()
+
+    def fromutc(self, dt: datetime.datetime) -> datetime.datetime:
+        utc = dt.replace(tzinfo=_UTC)
+        civil = _local_civil(utc).replace(tzinfo=None, fold=0)
+        # the second leg of a repeated wall time is the instant its
+        # fold=0 reading does not give back
+        fold = 0 if _local_instant(civil) == utc else 1
+        return civil.replace(tzinfo=self, fold=fold)
+
+    def __repr__(self) -> str:
+        return "LocalZone()"
+
+    def __str__(self) -> str:
+        return "local"
+
+
+#: The one host-clock frame: every local-clock job and view shares it.
+LOCAL_ZONE = LocalZone()
+
+
 class CronTab:
     """One parsed cron expression; see the module docstring for the dialect.
 
@@ -1175,11 +1419,11 @@ class CronTab:
             # identity: the immutable offset cancels in the comparison AND
             # the subtraction, and _next_civil already answers strictly
             # after its seed, so the guard always passes and the retry
-            # loop provably runs once.  This is the DEFAULT aware call: a
-            # job without an explicit timezone is re-armed against
-            # ``after.astimezone()``, which is exactly a datetime.timezone.
-            # ``type(...) is`` keeps the precondition literal; CPython
-            # refuses to subclass datetime.timezone anyway.
+            # loop provably runs once.  UTC jobs arm through here; a
+            # local-clock job arms against LOCAL_ZONE, whose offset moves,
+            # and takes the aware path below.  ``type(...) is`` keeps the
+            # precondition literal; CPython refuses to subclass
+            # datetime.timezone anyway.
             civil = now.replace(tzinfo=None)
             target = self._next_civil(civil)
             if target is None:
@@ -1206,6 +1450,24 @@ class CronTab:
                 tzinfo=None
             )
             civil = max(target, resolved_civil)
+
+    def next_local(self, now_utc: datetime.datetime) -> Optional[float]:
+        """Seconds until the next occurrence STRICTLY after the aware
+        instant ``now_utc`` on the host clock: what :meth:`next` answers
+        for ``now_utc.astimezone(LOCAL_ZONE)``, taken on the fixed-offset
+        path whenever :meth:`LocalZone.fixed_frame` vouches for the
+        answer.
+        """
+        fixed, good_to = LOCAL_ZONE.fixed_frame(now_utc)
+        if fixed is not None:
+            delay = self.next(now=now_utc.astimezone(fixed))
+            if delay is None:
+                # no civil match before the horizon: the same walk from
+                # the same label, whichever frame reads it
+                return None
+            if now_utc + datetime.timedelta(seconds=delay) <= good_to:
+                return delay
+        return self.next(now=now_utc.astimezone(LOCAL_ZONE))
 
     def _next_civil(
         self, civil: datetime.datetime

@@ -432,14 +432,7 @@ def config_is_user_scoped(config: str, user_profile: Optional[str]) -> bool:
     fatal depends on whether the operator CHOSE the path, which is the
     caller's decision, not this function's.
     """
-    if not config or not user_profile:
-        return False
-    # ntpath for the same reason as frozen_layout above: a Windows path
-    # compared with os.path on a POSIX box never matches, so the check
-    # would silently never fire.
-    resolved = ntpath.normcase(ntpath.normpath(config))
-    profile = ntpath.normcase(ntpath.normpath(user_profile))
-    return resolved == profile or resolved.startswith(profile + ntpath.sep)
+    return platform.path_is_user_scoped(config, user_profile)
 
 
 #: One sentence per Win32 error this module can actually produce.  These are
@@ -1465,6 +1458,16 @@ def install(args: Any, api: WinApi) -> int:
             "it, but a machine-wide directory such as "
             "%ProgramData%\\cronstable is the durable place for "
             "it.".format(config),
+            file=sys.stderr,
+        )
+    grantee = platform.any_user_write_grantee(config)
+    if grantee is not None:
+        # A note rather than a refusal: the service reads the directory
+        # the operator named, and the daemon says the same thing once at
+        # every start until the recipe is applied.
+        print(
+            "cronstable service install: note, "
+            + platform.writable_config_advice(config, grantee),
             file=sys.stderr,
         )
     start_type, delayed = start_type_code(getattr(args, "start_type", "auto"))

@@ -69,6 +69,45 @@ def test_gossip_requires_transport_keys(missing):
         _cluster(yaml)
 
 
+@pytest.mark.parametrize(
+    "tls_yaml, key",
+    [
+        pytest.param(
+            "    ca:\n    cert: /cert\n    key: /key\n", "ca", id="ca-blank"
+        ),
+        pytest.param(
+            "    ca: ''\n    cert: /cert\n    key: /key\n", "ca", id="ca-empty"
+        ),
+        pytest.param(
+            '    ca: ""\n    cert: /cert\n    key: /key\n', "ca", id="ca-dq"
+        ),
+        pytest.param(
+            "    ca: '  '\n    cert: /cert\n    key: /key\n", "ca", id="ca-ws"
+        ),
+        pytest.param(
+            "    ca: /ca\n    cert:\n    key: /key\n", "cert", id="cert"
+        ),
+        pytest.param(
+            "    ca: /ca\n    cert: /cert\n    key: ''\n", "key", id="key"
+        ),
+    ],
+)
+def test_gossip_rejects_blank_tls_paths(tls_yaml, key):
+    # the schema requires the keys only; a blank scalar (what a template
+    # renders for an unset variable) parses to '', and an empty ca reaches
+    # the context builders as "no client CA": a /peer listener that requires
+    # no client certificate. Refused at load, so --validate-config sees it.
+    yaml = (
+        "cluster:\n  backend: gossip\n  listen: '0.0.0.0:8443'\n  tls:\n"
+        + tls_yaml
+        + "  peers:\n    - host: b:8443\n"
+    )
+    with pytest.raises(
+        ConfigError, match="cluster.tls." + key + " must be a non-empty path"
+    ):
+        _cluster(yaml)
+
+
 # --- observability overlay ------------------------------------------------
 
 _OBS_TRANSPORT = (
@@ -185,6 +224,47 @@ def test_observability_lease_share_node_stats_opt_out():
     # stats are not shared
     assert cfg["shareNodeStats"] is False
     assert cfg["observabilityMesh"] is not None
+
+
+def test_observability_mesh_rejects_blank_tls_paths():
+    # the overlay mesh serves /peer too, under the same non-empty rule, and
+    # the error names the overlay block rather than cluster.tls
+    with pytest.raises(
+        ConfigError, match="cluster.observability.tls.ca must be a non-empty"
+    ):
+        _cluster(
+            "cluster:\n"
+            "  backend: kubernetes\n"
+            "  nodeName: node-a\n"
+            "  observability:\n"
+            "    listen: '0.0.0.0:8140'\n"
+            "    tls:\n      ca:\n      cert: /ocert\n      key: /okey\n"
+            "    peers:\n      - host: b:8140\n"
+        )
+
+
+def test_observability_mesh_errors_name_the_overlay_block():
+    # every check the overlay shares with the election mesh reports under
+    # cluster.observability, the block the operator has to edit
+    overlay = (
+        "cluster:\n"
+        "  backend: kubernetes\n"
+        "  nodeName: node-a\n"
+        "  observability:\n"
+        "{}"
+        "    listen: '0.0.0.0:8140'\n"
+        "    tls:\n      ca: /oca\n      cert: /ocert\n      key: /okey\n"
+        "    peers:\n      - host: {}\n"
+    )
+    with pytest.raises(
+        ConfigError, match="cluster.observability.interval must be > 0"
+    ):
+        _cluster(overlay.format("    interval: 0\n", "b:8140"))
+    with pytest.raises(
+        ConfigError,
+        match=r"cluster.observability.peers\[\].host must be host:port",
+    ):
+        _cluster(overlay.format("", "b"))
 
 
 # --- kubernetes -----------------------------------------------------------

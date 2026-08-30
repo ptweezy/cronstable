@@ -3368,6 +3368,46 @@ def test_render_press_full_grid(tmp_path):
     assert "suggest" in body
 
 
+def test_week_walks_local_jobs_on_the_frame_the_host_keeps(
+    tmp_path, monkeypatch
+):
+    # the week calendar frames a utc: false job in the host clock, walks it
+    # through _walk_fires (the fixed offset the host keeps, frame by
+    # frame), and lists exactly the instants the aware walk in LOCAL_ZONE
+    # lists
+    from cronstable.cronexpr import LOCAL_ZONE
+    from tests._helpers import _pin_host_zone
+
+    _pin_host_zone(monkeypatch, "America/New_York")
+    app = _bare_app(tmp_path)
+    local = _job("loc", schedule="30 2 * * *", scheduled_in=None)
+    local["utc"] = False
+    zoned = _job("z", schedule="15 9 * * *", scheduled_in=None)
+    app.jobs = [local, zoned]
+    app.by_name = {"loc": local, "z": zoned}
+    asked = []
+    real = tui._walk_fires
+
+    def recording(tab, zone, probe, end):
+        asked.append(zone)
+        return real(tab, zone, probe, end)
+
+    def aware(tab, zone, probe, end):
+        for when in tab.occurrences(probe.astimezone(zone)):
+            if when >= end:
+                return
+            yield when
+
+    monkeypatch.setattr(tui, "_walk_fires", recording)
+    app._recompute_week()
+    assert LOCAL_ZONE in asked and len(asked) == 2
+    fast = app.week
+    monkeypatch.setattr(tui, "_walk_fires", aware)
+    app._recompute_week()
+    assert app.week["items"] == fast["items"]
+    assert [name for _when, name in fast["items"]].count("loc") == 7
+
+
 def test_render_week_variants(tmp_path):
     app = _bare_app(tmp_path)
     paint = _paint(app)
@@ -4737,3 +4777,43 @@ async def test_timeline_entries_and_fleet_matrix_are_built_per_payload(
     app.fleet = dict(app.fleet)
     app.render_fleet(paint, 110, 24)
     assert app._fleet_memo[0] is app.fleet
+
+
+def test_drawer_schedule_local_frame_uses_the_host_zone(tmp_path, monkeypatch):
+    # a utc: false job with no timezone previews in LOCAL_ZONE, the
+    # daemon's own frame, and the local lint fallback lints it there too,
+    # as the daemon does
+    from cronstable.cronexpr import LOCAL_ZONE
+    from tests._helpers import _pin_host_zone
+
+    _pin_host_zone(monkeypatch, "America/New_York")
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    zones = []
+    real = tui.lint_schedule
+
+    def recording(*args, **kwargs):
+        zones.append(kwargs.get("timezone"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tui, "lint_schedule", recording)
+    job = _job("loc", schedule="30 2 * * *", scheduled_in=None)
+    job["utc"] = False
+    app.jobs = [job]
+    app.by_name = {"loc": job}
+    app.drawer_job = "loc"
+    body = _txt(app._drawer_schedule(paint, 70, 24))
+    assert "reference frame: local" in body
+    assert "next runs:" in body
+    facts = app._sched_facts
+    assert facts[2] == "local" and facts[4] is LOCAL_ZONE
+    assert facts[6] and all(w.tzinfo is LOCAL_ZONE for w in facts[6])
+    assert zones == [LOCAL_ZONE]
+    # a zoned job lints in its zone
+    zoned = _job("ny", schedule="30 2 * * *", scheduled_in=None)
+    zoned["timezone"] = "America/New_York"
+    app.jobs = [zoned]
+    app.by_name = {"ny": zoned}
+    app.drawer_job = "ny"
+    app._drawer_schedule(paint, 70, 24)
+    assert str(zones[1]) == "America/New_York"

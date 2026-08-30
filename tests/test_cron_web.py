@@ -2485,6 +2485,9 @@ async def test_webloop_run_shutdown_teardown(tmp_path, monkeypatch, run_cron):
     cron._catchup_tasks.add(catchup)
     pursuit = asyncio.create_task(asyncio.sleep(100))
     cron._slot_pursuits["p"] = pursuit
+    # a Replace cancel still in its tail is joined, never cancelled
+    replace_cancel = asyncio.create_task(asyncio.sleep(0.05))
+    cron._replace_cancel_tasks.add(replace_cancel)
 
     cron.signal_shutdown()
     await asyncio.wait_for(task, timeout=5)
@@ -2492,6 +2495,7 @@ async def test_webloop_run_shutdown_teardown(tmp_path, monkeypatch, run_cron):
     await asyncio.gather(
         renewer, catchup, pursuit, return_exceptions=True
     )
+    assert replace_cancel.done() and not replace_cancel.cancelled()
     assert stopped["mesh"] is True
     assert cron.observability_mesh is None
     assert cron.web_runner.cleaned is True
@@ -3229,3 +3233,81 @@ async def test_bounded_boot_scan_skips_a_job_whose_step_raises(caplog):
     logged = [r for r in caplog.records if "boot scan: job" in r.message]
     assert len(logged) == 1
     assert "j03" in logged[0].getMessage()
+
+
+def test_webloop_schedule_why_local_clock_gap(monkeypatch):
+    # a utc: false job is explained in LOCAL_ZONE: the probe carries the
+    # host's offset, a spring-gap label gets the DST note, and the next
+    # fire is the following day's, on the new offset
+    from tests._helpers import _pin_host_zone
+
+    _pin_host_zone(monkeypatch, "America/New_York")
+    yaml = """
+jobs:
+  - name: loc
+    command: echo hi
+    schedule: "30 2 * * *"
+    utc: false
+"""
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)
+    payload = cron.schedule_why_payload("loc", "2027-03-14T02:30:00")
+    assert payload is not None
+    assert payload["timezone"] == "local"
+    assert payload["matches"] is True
+    assert payload["at_in_zone"] == "2027-03-14T02:30:00-05:00"
+    assert [n["code"] for n in payload["notes"]] == ["dst-skipped-time"]
+    assert "in local" in payload["notes"][0]["message"]
+    assert payload["next_fire"] == "2027-03-15T02:30:00-04:00"
+    assert payload["previous_fire"] == "2027-03-13T02:30:00-05:00"
+
+
+def test_webloop_schedule_why_local_clock_outside_the_c_library_range(
+    monkeypatch,
+):
+    # with the host clock pinned to the MS CRT's shape, a probe before
+    # 1970 and a previous fire on the engine's 1970 floor still answer
+    # the payload the America/New_York twin gives
+    from tests._helpers import _pin_host_zone
+
+    _pin_host_zone(monkeypatch, "America/New_York", years=(1971, 2999))
+    yaml = """
+jobs:
+  - name: loc
+    command: echo hi
+    schedule: "30 2 * * *"
+    utc: false
+  - name: ny
+    command: echo hi
+    schedule: "30 2 * * *"
+    timezone: America/New_York
+  - name: seventy
+    command: echo hi
+    schedule: "0 0 1 1 * 1970"
+    utc: false
+  - name: seventy_ny
+    command: echo hi
+    schedule: "0 0 1 1 * 1970"
+    timezone: America/New_York
+"""
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)
+
+    def twins(local, zoned, at):
+        mine = cron.schedule_why_payload(local, at)
+        twin = cron.schedule_why_payload(zoned, at)
+        assert mine is not None and twin is not None
+        assert mine["timezone"] == "local"
+        for key in ("job", "timezone"):
+            del mine[key], twin[key]
+        assert mine == twin
+        return mine
+
+    early = twins("loc", "ny", "1969-06-01T00:00:00")
+    assert early["at_in_zone"] == "1969-06-01T00:00:00-04:00"
+    assert early["previous_fire"] is None
+    assert early["next_fire"] == "1969-06-01T02:30:00-04:00"
+    epoch = twins("loc", "ny", "1970-01-01T00:00:00Z")
+    assert epoch["at_in_zone"] == "1969-12-31T19:00:00-05:00"
+    assert epoch["next_fire"] == "1970-01-01T02:30:00-05:00"
+    floor = twins("seventy", "seventy_ny", "2027-01-01T00:00:00")
+    assert floor["previous_fire"] == "1970-01-01T00:00:00-05:00"
+    assert floor["next_fire"] is None

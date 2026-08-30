@@ -16,7 +16,7 @@
 #
 # Ids are kept in sorted order so an addition has one obvious home and a
 # duplicate is visible in review.  Every id bench.py registers belongs here
-# except the four at the bottom, each with the reason it cannot be gated.
+# except the six at the bottom, each with the reason it cannot be gated.
 #
 # The in-repo smoke net (tests/test_benchmarks.py) is the companion guard:
 # it derives its never-skip set from THIS file (minus documented
@@ -80,6 +80,7 @@ schedule.lint_250_zoned
 schedule.next_fires_2k
 schedule.pressure_20k_48h
 schedule.reseed_100k
+schedule.reseed_local_20k
 schedule.suggest_slot_5k
 startup.import_config
 startup.import_cronexpr
@@ -116,7 +117,7 @@ webui.render_fleet_15x400
 webui.render_rows_500
 webui.render_term_5k
 
-# The four benchmarks deliberately NOT listed above, and why.
+# The six benchmarks deliberately NOT listed above, and why.
 #
 # startup.python_baseline, loop.stall_jobs_500 and loop.stall_metrics_2000
 # all ship info=True, so bench.py records gate_pct as None and compare.py
@@ -136,3 +137,9 @@ webui.render_term_5k
 # Add it once a release carrying the hook is the baseline.  Its sibling
 # webui.render_term_5k needs no such wait: it drives the page's own
 # 'matches only' checkbox rather than a hook, and it does compare on 1.2.32.
+#
+# webui.week_walk_500 and webui.radar_walk_500 drive the __perf.computeWeek
+# and __perf.computeRadar hooks, which land in 1.2.49.  Run against an
+# earlier baseline tree each skips with "page lacks the ... hook", so the
+# pairing has nothing to compare.  Add both once a release carrying the
+# hooks is the baseline.

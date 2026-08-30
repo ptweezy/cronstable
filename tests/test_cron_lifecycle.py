@@ -1448,7 +1448,7 @@ def test_cluster_size_conflict_logged_on_transition(caplog):
         cron.cluster_manager = _Mgr(False)
         cron._log_cluster_role()
     msgs = [r.message for r in caplog.records]
-    detected = "agreeing peers declare 5 but we declare 3"
+    detected = "reachable peers declare 5 but we declare 3"
     assert sum(detected in m for m in msgs) == 1
     assert sum("cluster-size disagreement resolved" in m for m in msgs) == 1
 
@@ -3726,7 +3726,7 @@ async def test_missed_occurrences_pins_naive_watermark(tmp_path):
     cron = await _cron_with_watermark(
         tmp_path, "2026-07-01T10:00:00", onmissed="run-all"
     )
-    count, _ = await cron._missed_occurrences(cron.cron_jobs["j"], _NOW)
+    count, _, _ = await cron._missed_occurrences(cron.cron_jobs["j"], _NOW)
     assert count == 10  # slots 10:01..10:10, as with an aware watermark
 
 
@@ -3939,7 +3939,7 @@ async def test_open_checkpoint_anchors_watermark_until_closed(tmp_path):
     # an ordinary run lands, advancing the ledger past the missed slots
     await _put_ledger(cron, "success", "2026-07-01T10:10:00+00:00")
     job = cron.cron_jobs["j"]
-    count, watermark = await cron._missed_occurrences(job, _NOW)
+    count, watermark, _ = await cron._missed_occurrences(job, _NOW)
     assert watermark == t0  # anchored at the open intent, not the ledger
     assert count == 10
     # once the cycle closes, the (newer) run-ledger watermark rules
@@ -3948,7 +3948,7 @@ async def test_open_checkpoint_anchors_watermark_until_closed(tmp_path):
         cron._catchup_stream("j"),
         {"kind": "close", "watermark": t0, "at": _NOW.isoformat()},
     )
-    count, watermark = await cron._missed_occurrences(job, _NOW)
+    count, watermark, _ = await cron._missed_occurrences(job, _NOW)
     assert count == 0
     assert watermark == "2026-07-01T10:10:00+00:00"
 

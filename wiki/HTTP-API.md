@@ -385,9 +385,9 @@ Any of three triggers sets the umbrella `conflict` flag. Each trigger has its
 own detail list, and all three stand `Leader` jobs down:
 
 - A duplicate `nodeName`, the offending names in `conflict_names`.
-- An agreeing peer declaring a different cluster size (`size_conflict: true`,
-  the divergent sizes in `conflicting_sizes`).
-- A quorate peer advertising a different `distribution` or `elect_leader`
+- A reachable peer declaring a different cluster size (`size_conflict: true`,
+  the divergent sizes in `conflicting_sizes`), whatever job set it runs.
+- A reachable peer advertising a different `distribution` or `elect_leader`
   setting, a coordination-policy conflict surfaced as `policy_conflict: true`
   with the differing descriptors in `conflicting_policies`.
 

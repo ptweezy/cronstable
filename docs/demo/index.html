@@ -6381,7 +6381,6 @@ var qrcode = function() {
     "@daily":    "0 0 * * *", "@midnight": "0 0 * * *",
     "@hourly":   "0 * * * *",
   };
-  const WEEKDAY_IDX = { Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6 };
   const ordinal = (n) => { const s = ["th","st","nd","rd"], v = n % 100; return n + (s[(v-20)%10] || s[v] || s[0]); };
 
   function nameToNum(tok, names) {
@@ -6579,43 +6578,74 @@ var qrcode = function() {
   function daysInMonth(y, m) { return [31, (y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0)) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]; }
   function dowOf(y, m, d) { return new Date(Date.UTC(y, m - 1, d)).getUTCDay(); }
 
-  // wall-clock components of an instant in a given frame ('LOCAL' | IANA name)
+  // wall-clock components of an instant in a given frame ('LOCAL' | 'UTC' |
+  // IANA name). LOCAL and UTC are Date arithmetic; an IANA zone reads its
+  // offset through Intl once per hour a walk touches (tzOffset) and is Date
+  // arithmetic from there.
   const _dtfCache = {};
   function dtf(frame) {
     if (!_dtfCache[frame]) {
       _dtfCache[frame] = new Intl.DateTimeFormat("en-US", {
         timeZone: frame, hourCycle: "h23",
         year: "numeric", month: "2-digit", day: "2-digit",
-        hour: "2-digit", minute: "2-digit", second: "2-digit", weekday: "short",
+        hour: "2-digit", minute: "2-digit", second: "2-digit",
       });
     }
     return _dtfCache[frame];
+  }
+  function utcParts(date) {
+    return { Y: date.getUTCFullYear(), Mo: date.getUTCMonth() + 1, D: date.getUTCDate(),
+             h: date.getUTCHours(), mi: date.getUTCMinutes(), se: date.getUTCSeconds(), dow: date.getUTCDay() };
+  }
+  // the zone's UTC offset (ms) at instant t, read through Intl
+  function intlOffset(frame, t) {
+    const sec = Math.floor(t / 1000) * 1000;
+    const parts = dtf(frame).formatToParts(new Date(sec));
+    const m = {};
+    for (const p of parts) m[p.type] = p.value;
+    let h = parseInt(m.hour, 10); if (h === 24) h = 0;
+    return Date.UTC(+m.year, +m.month - 1, +m.day, h, +m.minute, +m.second) - sec;
+  }
+  // An IANA frame's UTC offset (ms) at instant t; wallParts and instantOf
+  // answer LOCAL and UTC in Date arithmetic and never call this. The offset
+  // is memoized per hour: no zone shifts twice within an hour, so one offset
+  // at both ends of an hour is its offset throughout, and an hour whose
+  // ends differ holds a transition and is read per instant.
+  const HOUR_MS = 3600000;
+  const _offCache = {};
+  function tzOffset(frame, t) {
+    let memo = _offCache[frame];
+    if (!memo) memo = _offCache[frame] = new Map();
+    const b = Math.floor(t / HOUR_MS);
+    let off = memo.get(b);
+    if (off === undefined) {
+      const o0 = intlOffset(frame, b * HOUR_MS), o1 = intlOffset(frame, b * HOUR_MS + HOUR_MS - 1);
+      off = o0 === o1 ? o0 : null;
+      if (memo.size >= 4096) memo.clear();
+      memo.set(b, off);
+    }
+    return off === null ? intlOffset(frame, t) : off;
   }
   function wallParts(date, frame) {
     if (frame === "LOCAL") {
       return { Y: date.getFullYear(), Mo: date.getMonth() + 1, D: date.getDate(),
                h: date.getHours(), mi: date.getMinutes(), se: date.getSeconds(), dow: date.getDay() };
     }
-    const parts = dtf(frame).formatToParts(date);
-    const m = {};
-    for (const p of parts) m[p.type] = p.value;
-    let h = parseInt(m.hour, 10); if (h === 24) h = 0;
-    return { Y: +m.year, Mo: +m.month, D: +m.day, h, mi: +m.minute, se: +m.second, dow: WEEKDAY_IDX[m.weekday] };
+    if (frame === "UTC") return utcParts(date);
+    const t = date.getTime();
+    return utcParts(new Date(t + tzOffset(frame, t)));
   }
   // convert wall-clock components in a frame back to an absolute instant (ms)
   function instantOf(c, frame) {
     const se = c.se || 0;
     if (frame === "LOCAL") return new Date(c.Y, c.Mo - 1, c.D, c.h, c.mi, se).getTime();
     const guess = Date.UTC(c.Y, c.Mo - 1, c.D, c.h, c.mi, se);
+    if (frame === "UTC") return guess;
     const off1 = tzOffset(frame, guess);
     let t = guess - off1;
     const off2 = tzOffset(frame, t);
     if (off2 !== off1) t = guess - off2;
     return t;
-  }
-  function tzOffset(frame, t) {
-    const w = wallParts(new Date(t), frame);
-    return Date.UTC(w.Y, w.Mo - 1, w.D, w.h, w.mi, w.se) - t;
   }
   function frameOf(job) {
     if (job.timezone) return job.timezone;       // IANA name (incl. "UTC")
@@ -7541,15 +7571,30 @@ var qrcode = function() {
     }
   }
 
-  // Recompute each enabled job's next fire instant. Cheap (parseCron is cached,
-  // nextRuns(n=1) is bounded), but only called when the panel is open or the
-  // soonest fire has already elapsed.
+  // Each enabled job's next fire instant. Runs on every poll while the panel
+  // is open and whenever the soonest fire has elapsed, so each distinct
+  // (schedule, frame) keeps its next fire until that fire passes: a fire
+  // still ahead of a later now is that now's next fire too. The browser's
+  // own offset keys the memo, so a zone change under a LOCAL-framed job
+  // re-walks it on the next poll.
+  const _radarNext = { localOff: null, byKey: new Map() };
   function computeRadar() {
     const now = Date.now();
+    const memo = _radarNext.byKey, localOff = new Date(now).getTimezoneOffset();
+    if (localOff !== _radarNext.localOff || memo.size > 2 * state.jobs.length + 256) {
+      _radarNext.localOff = localOff;
+      memo.clear();
+    }
     const items = [];
     forEachSchedulableJob((j, parsed) => {
-      const runs = nextRuns(parsed, 1, frameOf(j), now);
-      if (runs.length) items.push({ name: j.name, t: runs[0].t, c: runs[0].c });
+      const frame = frameOf(j), key = schedOf(j) + "|" + frame;
+      let hit = memo.get(key);
+      if (!hit || hit.t <= now) {
+        const runs = nextRuns(parsed, 1, frame, now);
+        hit = runs.length ? runs[0] : { t: Infinity, c: null };   // never fires: never re-walked
+        memo.set(key, hit);
+      }
+      if (hit.t !== Infinity) items.push({ name: j.name, t: hit.t, c: hit.c });
     });
     items.sort((a, b) => a.t - b.t);
     state.radar.items = items;
@@ -7639,6 +7684,10 @@ var qrcode = function() {
     for (let i = 0; i <= 7; i++) bounds.push(new Date(d0.getFullYear(), d0.getMonth(), d0.getDate() + i).getTime());
     return bounds;  // 8 local-midnight instants; DST days keep true lengths
   }
+  // each distinct (schedule, frame)'s fires over the current day window: a
+  // fleet on a few schedules walks each once, and one job's schedule edit
+  // re-walks that schedule rather than the fleet
+  const _weekWalks = { day: null, byKey: new Map() };
   function computeWeek() {
     const bounds = weekDayBounds();
     const tEnd = bounds[7];
@@ -7649,6 +7698,8 @@ var qrcode = function() {
       (j) => (j.enabled ? j.name + "|" + schedOf(j) + "|" + frameOf(j) : "")).join(";");
     if (inputSig === state.week.inputSig) return;
     state.week.inputSig = inputSig;
+    const walks = _weekWalks.byKey;
+    if (_weekWalks.day !== bounds[0]) { _weekWalks.day = bounds[0]; walks.clear(); }
     const items = [];
     const frequent = [];
     forEachSchedulableJob((j, parsed) => {
@@ -7656,9 +7707,14 @@ var qrcode = function() {
       // 00:00 lands in the grid; past fires today render dimmed. The walk
       // is bounded by the window's end and needs at most one fire past the
       // hum threshold, so sparse and dense schedules both stay cheap.
-      const fires = nextRuns(
-        parsed, WEEK_FREQ_MAX + 1, frameOf(j), bounds[0] - 1000, tEnd
-      ).map((r) => r.t);
+      const key = schedOf(j) + "|" + frameOf(j);
+      let fires = walks.get(key);
+      if (!fires) {
+        fires = nextRuns(
+          parsed, WEEK_FREQ_MAX + 1, frameOf(j), bounds[0] - 1000, tEnd
+        ).map((r) => r.t);
+        walks.set(key, fires);
+      }
       if (fires.length > WEEK_FREQ_MAX) {
         frequent.push({ name: j.name });
       } else {
@@ -13003,6 +13059,11 @@ var qrcode = function() {
   // browser. Each render wrapper clears its dirty-check signature first so the
   // timed call does the full rebuild rather than the early-return.
   if (location.search.indexOf("perf=1") >= 0) {
+    const _clearWalks = () => {
+      Object.keys(_offCache).forEach((f) => _offCache[f].clear());
+      _weekWalks.byKey.clear(); state.week.inputSig = null;
+      _radarNext.byKey.clear();
+    };
     const _pjob = (i) => ({
       name: "job" + i, enabled: true, running: i % 7 === 0,
       schedule: "*/5 * * * *", command: "echo " + i,
@@ -13083,6 +13144,24 @@ var qrcode = function() {
         }
       },
       ledgerAnalyze(names) { ledgerAnalyze(names); },
+      // the two fleet-wide schedule walks, each with its memos cleared so the
+      // timed call walks every distinct schedule. varySchedules gives the
+      // seeded fleet the suite's schedule mix (bench.py _varied_exprs) on
+      // alternating UTC and America/New_York frames, so one walk covers the
+      // arithmetic frame and the Intl-read one.
+      varySchedules() {
+        const steps = [2, 3, 4, 5, 6, 10, 12, 15, 20, 30];
+        state.jobs.forEach((j, i) => {
+          const r = i % 10;
+          j.schedule = r < 4 ? (i % 60) + " " + ((i * 7) % 24) + " * * *"
+            : r < 6 ? "*/" + steps[i % steps.length] + " * * * *"
+            : r < 8 ? (i % 60) + " 8-18 * * 1-5"
+            : (i % 60) + " " + ((i * 3) % 24) + " 1,15 * *";
+          j.utc = true; j.timezone = i % 2 ? "America/New_York" : null;
+        });
+      },
+      computeWeek() { _clearWalks(); computeWeek(); },
+      computeRadar() { _clearWalks(); computeRadar(); },
       tick() { tick(); },
     };
   }

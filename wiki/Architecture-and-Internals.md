@@ -204,7 +204,7 @@ per-job variants (`is_available_job_owner(name)` for `PreferLeader`, then
 out across the quorate nodes by rendezvous hashing.
 
 The `has_conflict()` fail-closed-first case stands `Leader` jobs down whenever a
-quorate peer makes the election unsafe (a duplicate `nodeName`, a cluster-size
+reachable peer makes the election unsafe (a duplicate `nodeName`, a cluster-size
 disagreement, or a coordination-policy conflict). `PreferLeader` is left running
 because it already accepts double-runs. A backend read is wrapped in a `try`,
 and any exception fails the gate closed (skip this cycle) so a backend bug

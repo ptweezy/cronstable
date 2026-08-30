@@ -1103,6 +1103,235 @@ async def test_stale_sensor_poke_completion_retry_is_fenced(
     assert body["tasks"]["s"]["state"] == dag.SUCCESS
 
 
+async def test_lost_claim_is_released_and_relaunched(tmp_path, dag_cron):
+    # A claim RMW that LANDS while its awaiter has timed out (the worker
+    # thread finishes the write after wait_for gives up) leaves the claimed
+    # task RUNNING under our own proc token with nothing launched: the
+    # LaunchIntents ride the abandoned result.  Reconcile trusts the token
+    # and the quiescence pre-scan keeps the document, so nothing else would
+    # ever touch that entry.  The driver recognizes the claim it never
+    # received, releases it, and re-claims it with no attempt spent.
+    cron = await dag_cron(_LINEAR)
+    _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+    _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+    run_key = await cron._dag.trigger_run("lin")
+    ref = ("lin", run_key)
+    assert ("a", 0, 0) in cron._dag._launched[ref]
+    fired = []
+
+    # the claim of b COMMITS but the caller times out (once)
+    async def _partial(dag_name, key, transform):
+        body, result = await orig(dag_name, key, transform)
+        adv = getattr(result, "advance", None) or result
+        launches = getattr(adv, "launches", None) or []
+        if not fired and any(li.taskkey == "b" for li in launches):
+            fired.append(1)
+            raise asyncio.TimeoutError()
+        return body, result
+
+    orig = cron._dag._mutate
+    cron._dag._mutate = _partial
+    # a finishes; its completion's advance claims b and loses the intents
+    await _reap_running(cron)
+    await _drain_pending(cron)
+    cron._dag._mutate = orig
+    assert fired
+    body = await cron._dag.get_run("lin", run_key)
+    entry = body["tasks"]["b"]
+    assert entry["state"] == dag.RUNNING
+    assert entry["proc"] == cron._proc_token
+    assert entry["pid"] is None
+    assert not any(cron.running_jobs.values())  # nothing was launched
+    assert ref not in cron._dag._launched  # a settled; b never registered
+    # the following advance releases the lost claim, re-runs at once, and
+    # launches b under a fresh claim of the SAME attempt
+    await cron._dag.advance_one(ref)
+    await _drain_pending(cron)
+    assert any(cron.running_jobs.values())
+    assert ("b", 0, 0) in cron._dag._launched[ref]
+    body = await _drive(cron, "lin", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert body["tasks"]["b"]["state"] == dag.SUCCESS
+    assert body["tasks"]["b"]["attempt"] == 0
+    assert ref not in cron._dag._launched  # pruned with the terminal run
+
+
+async def test_lost_claim_release_is_fenced_to_the_live_entry(
+    tmp_path, dag_cron
+):
+    # the release RMW re-checks the document: an entry that moved since the
+    # scan (here: b is still pending on disk) is left alone, and a fenced-out
+    # release does not latch another pass.
+    cron = await dag_cron(_LINEAR)
+    _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+    _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+    run_key = await cron._dag.trigger_run("lin")
+    ref = ("lin", run_key)
+    body = await cron._dag.get_run("lin", run_key)
+    stale = copy.deepcopy(body)
+    stale["tasks"]["b"]["state"] = dag.RUNNING
+    stale["tasks"]["b"]["proc"] = cron._proc_token
+    await cron._dag._repair_lost_claims(
+        cron.cron_dags["lin"].spec, ref, stale, cron._proc_token
+    )
+    assert ref not in cron._dag._advance_again
+    body = await cron._dag.get_run("lin", run_key)
+    assert body["tasks"]["b"]["state"] == dag.PENDING
+    assert body["tasks"]["b"]["proc"] is None
+    assert body["tasks"]["a"]["proc"] == cron._proc_token  # a: registered
+    body = await _drive(cron, "lin", run_key)
+    assert body["state"] == dag.SUCCESS
+
+
+async def test_lost_claim_release_cancellation_is_not_swallowed(
+    tmp_path, dag_cron
+):
+    # a cancelled release RMW (shutdown mid-advance) is not a store failure
+    # to retry: it propagates out of the repair like any other cancelled RMW
+    cron = await dag_cron(_LINEAR)
+    _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+    _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+    run_key = await cron._dag.trigger_run("lin")
+    ref = ("lin", run_key)
+    body = await cron._dag.get_run("lin", run_key)
+    stale = copy.deepcopy(body)
+    stale["tasks"]["b"]["state"] = dag.RUNNING
+    stale["tasks"]["b"]["proc"] = cron._proc_token
+
+    async def _cancelled(dag_name, key, transform):
+        raise asyncio.CancelledError()
+
+    orig = cron._dag._mutate
+    cron._dag._mutate = _cancelled
+    with pytest.raises(asyncio.CancelledError):
+        await cron._dag._repair_lost_claims(
+            cron.cron_dags["lin"].spec, ref, stale, cron._proc_token
+        )
+    cron._dag._mutate = orig
+    assert ref not in cron._dag._advance_again
+    body = await _drive(cron, "lin", run_key)
+    assert body["state"] == dag.SUCCESS
+
+
+async def test_own_claim_awaiting_its_completion_is_not_released(
+    tmp_path, dag_cron
+):
+    # An entry RUNNING under our token with no RunningJob is still ours
+    # while its completion sits in the reaper's buffer (or is in flight, or
+    # queued for retry): the lost-claim repair keys off the launch registry,
+    # never off cron.running_jobs, so an advance in that window leaves it
+    # alone.  Also pins the registry's lifecycle: a settled completion drops
+    # only its own key, a later claim joins the keys still live.
+    yaml = (
+        "dags:\n  - name: bc\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "      - id: b\n        command: 'x'\n"
+        "      - id: c\n        command: 'x'\n        dependsOn:\n"
+        "          - a\n"
+    )
+    cron = await dag_cron(yaml)
+    for tid in ("a", "b", "c"):
+        _set_cmd(cron, "bc", tid, [_PY, "-c", "pass"])
+    run_key = await cron._dag.trigger_run("bc")
+    ref = ("bc", run_key)
+    assert cron._dag._launched[ref] == {("a", 0, 0), ("b", 0, 0)}
+    # reap a WITHOUT flushing: its completion is buffered, its RunningJob
+    # is gone
+    rjs = [rj for jobs in cron.running_jobs.values() for rj in jobs]
+    (rj_a,) = [rj for rj in rjs if rj.dag_ref.taskkey == "a"]
+    await rj_a.wait()
+    await cron._handle_finished_job(rj_a)
+    assert ref in cron._dag._completion_buffer
+    await cron._dag.advance_one(ref)
+    await _drain_pending(cron)
+    body = await cron._dag.get_run("bc", run_key)
+    assert body["tasks"]["a"]["state"] == dag.RUNNING
+    assert body["tasks"]["a"]["proc"] == cron._proc_token  # not released
+    assert body["tasks"]["c"]["state"] == dag.PENDING
+    assert cron._dag._launched[ref] == {("a", 0, 0), ("b", 0, 0)}
+    # the buffered completion lands: a's key settles, the advance it spawns
+    # claims c beside b's still-live key
+    await cron._dag.flush_completions()
+    await _drain_pending(cron)
+    assert cron._dag._launched[ref] == {("b", 0, 0), ("c", 0, 0)}
+    body = await _drive(cron, "bc", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert ref not in cron._dag._launched
+
+
+async def _reap_task(cron, taskkey):
+    """Reap ONE running task by key and route its completion."""
+    rjs = [rj for jobs in cron.running_jobs.values() for rj in jobs]
+    (rj,) = [rj for rj in rjs if rj.dag_ref.taskkey == taskkey]
+    await rj.wait()
+    await cron._handle_finished_job(rj)
+    await cron._dag.flush_completions()
+    await _drain_pending(cron)
+
+
+async def test_failed_lost_claim_release_still_launches_the_pass(
+    tmp_path, dag_cron
+):
+    # A pass that claims a new task AND repairs an earlier lost claim
+    # registers the new intents before the release RMW.  That RMW failing
+    # (here: landed, awaiter timed out) must not abort the pass, or the
+    # fresh claims would sit registered and unlaunched, shielded by their
+    # own keys from the repair meant for that shape.  The launch loop runs
+    # regardless, and the lost claim is retried on the advance-failed
+    # backoff.
+    yaml = (
+        "dags:\n  - name: two\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "      - id: b\n        command: 'x'\n        dependsOn:\n"
+        "          - a\n"
+        "      - id: d\n        command: 'x'\n"
+        "      - id: c\n        command: 'x'\n        dependsOn:\n"
+        "          - d\n"
+    )
+    cron = await dag_cron(yaml)
+    for tid in ("a", "b", "c"):
+        _set_cmd(cron, "two", tid, [_PY, "-c", "pass"])
+    flag = tmp_path / "go"
+    _set_cmd(cron, "two", "d", [_PY, "-c", _wait_for_flag_script(flag)])
+    run_key = await cron._dag.trigger_run("two")
+    ref = ("two", run_key)
+    timed_out = []
+
+    # the claim of b, then the release of b, each COMMIT but time out
+    async def _partial(dag_name, key, transform):
+        body, result = await orig(dag_name, key, transform)
+        adv = getattr(result, "advance", None) or result
+        launches = getattr(adv, "launches", None) or []
+        if not timed_out and any(li.taskkey == "b" for li in launches):
+            timed_out.append("claim")
+            raise asyncio.TimeoutError()
+        if timed_out == ["claim"] and result == ["b"]:
+            timed_out.append("release")
+            raise asyncio.TimeoutError()
+        return body, result
+
+    orig = cron._dag._mutate
+    cron._dag._mutate = _partial
+    await _reap_task(cron, "a")  # its advance claims b, loses the intents
+    assert timed_out == ["claim"]
+    flag.write_text("go")
+    await _reap_task(cron, "d")  # its advance claims c and releases b
+    cron._dag._mutate = orig
+    assert timed_out == ["claim", "release"]
+    body = await cron._dag.get_run("two", run_key)
+    assert body["tasks"]["b"]["state"] == dag.PENDING  # the release landed
+    assert body["tasks"]["c"]["state"] == dag.RUNNING
+    assert body["tasks"]["c"]["pid"] is not None  # c was launched
+    assert ("c", 0, 0) in cron._dag._launched[ref]
+    assert ref not in cron._dag._advance_again
+    assert cron._dag._wake[ref] <= dagrun._now() + dagrun.ADVANCE_RETRY_DELAY
+    body = await _drive(cron, "two", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert body["tasks"]["b"]["attempt"] == 0
+    assert body["tasks"]["c"]["attempt"] == 0
+    assert ref not in cron._dag._launched
+
+
 async def test_superseded_owner_stops_advancing_after_lease_lapse(
     tmp_path, dag_cron
 ):
@@ -1863,6 +2092,116 @@ async def test_cancelled_launch_is_not_recorded_as_task_failure(
     assert entry.get("failReason") != "launch failed"
     assert entry.get("state") != dag.FAILED
     assert (body or {}).get("state") != dag.FAILED
+
+
+async def test_cancelled_launch_drops_its_registry_key_and_is_relaunched(
+    tmp_path, monkeypatch, dag_cron
+):
+    # A launch cancelled before its subprocess exists (a state-section
+    # reload while it waits behind the spawn gate) leaves the claim RUNNING
+    # under our token with nothing launched, the shape of a lost claim; its
+    # registry key goes with the cancel, so the next advance releases and
+    # re-claims it with no attempt spent.
+    from cronstable.job import RunningJob
+
+    yaml = (
+        "dags:\n  - name: cl\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await dag_cron(yaml)
+    _set_cmd(cron, "cl", "a", [_PY, "-c", "pass"])
+
+    async def cancelled(self):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(RunningJob, "start", cancelled)
+    run_key = None
+    try:
+        run_key = await cron._dag.trigger_run("cl")
+    except asyncio.CancelledError:
+        pass
+    monkeypatch.undo()
+    await _drain_pending(cron)
+    if run_key is None:
+        keys = list((await cron._dag.list_runs("cl", limit=10)) or [])
+        run_key = keys[0]["runKey"]
+    ref = ("cl", run_key)
+    body = await cron._dag.get_run("cl", run_key)
+    assert body["tasks"]["a"]["state"] == dag.RUNNING
+    assert body["tasks"]["a"]["proc"] == cron._proc_token
+    assert ref not in cron._dag._launched  # the key went with the cancel
+    await cron._dag.advance_one(ref)
+    await _drain_pending(cron)
+    assert ("a", 0, 0) in cron._dag._launched[ref]
+    body = await _drive(cron, "cl", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert body["tasks"]["a"]["attempt"] == 0
+
+
+async def test_cancel_after_the_spawn_keeps_the_registry_key(
+    tmp_path, monkeypatch, dag_cron
+):
+    # a cancel that lands once the subprocess exists is a live launch: its
+    # key stays, so the next advance leaves the claim alone
+    from cronstable.job import RunningJob
+
+    yaml = (
+        "dags:\n  - name: cl\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await dag_cron(yaml)
+    _set_cmd(cron, "cl", "a", [_PY, "-c", "pass"])
+    real_start = RunningJob.start
+    spawned = []
+
+    async def spawned_then_cancelled(self):
+        await real_start(self)
+        spawned.append(self)
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(RunningJob, "start", spawned_then_cancelled)
+    run_key = None
+    try:
+        run_key = await cron._dag.trigger_run("cl")
+    except asyncio.CancelledError:
+        pass
+    monkeypatch.undo()
+    await _drain_pending(cron)
+    if run_key is None:
+        keys = list((await cron._dag.list_runs("cl", limit=10)) or [])
+        run_key = keys[0]["runKey"]
+    assert ("a", 0, 0) in cron._dag._launched[("cl", run_key)]
+    (rj,) = spawned
+    await rj.wait()
+
+
+async def test_adopt_scan_prunes_the_registry_of_runs_finished_elsewhere(
+    tmp_path, dag_cron
+):
+    # a run this node launched tasks for and never advanced again (its
+    # lease lapsed and a peer finished it) keeps no registry entry once the
+    # adopt scan sees the store show it terminal, on the full pass and the
+    # keys-only pass alike; the GC's own delete drops it too
+    cron = await dag_cron(_LINEAR)
+    _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+    _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+    run_key = await cron._dag.trigger_run("lin")
+    body = await _drive(cron, "lin", run_key)
+    assert body["state"] == dag.SUCCESS
+    ref = ("lin", run_key)
+    d = cron._dag
+    assert ref not in d._launched
+    d._launched[ref] = {("a", 0, 0)}  # as if a peer finished the run
+    d._next_full_adopt = 0.0  # the full pass
+    await d._adopt_orphans()
+    assert ref not in d._launched
+    d._launched[ref] = {("a", 0, 0)}
+    d._next_full_adopt = float("inf")  # the keys-only pass
+    await d._adopt_orphans()
+    assert ref not in d._launched
+    d._launched[ref] = {("a", 0, 0)}
+    await d._delete_run(cron.state_backend, "lin", run_key, body.get("runId"))
+    assert ref not in d._launched
 
 
 async def test_advance_of_missing_document_releases_ownership(
@@ -4420,9 +4759,17 @@ async def test_retry_completions_skips_not_due_and_removed_dag(
         "delay": 5.0,
         "nextTryAt": 0.0,
     }
+    # a dropped completion keeps its launch key (the task ran, so its
+    # RUNNING entry is not a lost claim), as does a queued one
+    d._launched[("lin", "rk")] = {("a", 0, 0)}
+    d._launched[("ghost", "rk")] = {("a", 0, 0)}
     await d._retry_completions(dagrun._now())
     assert not_due in d._pending_completions
     assert gone not in d._pending_completions
+    assert d._launched == {
+        ("lin", "rk"): {("a", 0, 0)},
+        ("ghost", "rk"): {("a", 0, 0)},
+    }
 
 
 # ===========================================================================
@@ -4719,3 +5066,65 @@ async def test_reconcile_on_boot_isolates_a_failing_run(
     assert ("lin", "boom-run") not in cron._dag._owned
     monkeypatch.undo()
     await _drive(cron, "lin", "ok-run")  # reap the adopted launch
+
+
+async def test_dropped_completion_keeps_its_launch_key(tmp_path, dag_cron):
+    # A completion the driver drops (a same-store state reload that
+    # forgets in-memory ownership while a finished task's completion is
+    # still buffered) is NOT a lost claim: the task ran here.  Its launch
+    # key stays, so the next advance leaves the RUNNING entry alone
+    # instead of releasing it to PENDING and running the task twice.
+    cron = await dag_cron(_LINEAR)
+    _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+    _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+    run_key = await cron._dag.trigger_run("lin")
+    ref = ("lin", run_key)
+    # a finishes; the reaper hands its completion over but the flush
+    # never runs before the store is rebuilt
+    orig_flush = cron._dag.flush_completions
+    cron._dag.flush_completions = _noop_flush
+    await _reap_running(cron)
+    assert cron._dag._completion_buffer.get(ref)
+    cron._dag.flush_completions = orig_flush
+    # a different store: the completion is dropped, the key is kept
+    cron._dag.forget(same_store=False)
+    assert not cron._dag._completion_buffer
+    assert ("a", 0, 0) in cron._dag._launched[ref]
+    launched_before = dict(cron.running_jobs)
+    await cron._dag.advance_one(ref)
+    await _drain_pending(cron)
+    body = await cron._dag.get_run("lin", run_key)
+    assert body["tasks"]["a"]["state"] == dag.RUNNING  # not released
+    assert body["tasks"]["a"]["proc"] == cron._proc_token
+    assert dict(cron.running_jobs) == launched_before  # a did not run again
+
+
+async def test_same_store_forget_keeps_buffered_completions(
+    tmp_path, dag_cron
+):
+    # the same store under a rebuilt backend: the buffered completion still
+    # applies, so it is held and recorded by the next flush; the run then
+    # finishes with a run exactly once
+    cron = await dag_cron(_LINEAR)
+    _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+    _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+    run_key = await cron._dag.trigger_run("lin")
+    ref = ("lin", run_key)
+    orig_flush = cron._dag.flush_completions
+    cron._dag.flush_completions = _noop_flush
+    await _reap_running(cron)
+    cron._dag.flush_completions = orig_flush
+    cron._dag.forget(same_store=True)
+    assert cron._dag._completion_buffer.get(ref)
+    await cron._dag.flush_completions()
+    await _drain_pending(cron)
+    # the rebuilt backend re-adopts the run, as start_stop_state does
+    await cron._dag.reconcile_on_boot()
+    body = await _drive(cron, "lin", run_key)
+    assert body["state"] == dag.SUCCESS, _states(body)
+    assert body["tasks"]["a"]["attempt"] == 0
+    assert ref not in cron._dag._launched
+
+
+async def _noop_flush():
+    return None

@@ -1567,6 +1567,95 @@ def test_set_task_pids_all_fenced_keeps_document():
 
 
 # --------------------------------------------------------------------------
+# Releasing a claim whose launch intents the driver never received
+# --------------------------------------------------------------------------
+
+
+def test_release_lost_claims_resets_plain_task_and_sensor():
+    # the plain task goes back to pending with its attempt intact and its
+    # start cleared (the re-claim stamps the real launch), the sensor to
+    # its idle shape due now with its poke-timeout clock intact, and the
+    # next claim pass picks both up again as the SAME attempt / poke.
+    spec = _spec(
+        TaskSpec("a", max_attempts=3),
+        TaskSpec("s", type=dag.SENSOR, poke_interval=30.0, poke_timeout=1e9),
+    )
+    body = _body(spec)
+    body, res = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    assert sorted(li.taskkey for li in res.launches) == ["a", "s"]
+    claims = [("a", "p", 0, 0), ("s", "p", 0, 0)]
+    body, released = _apply(dag.release_lost_claims(spec, claims, 5.0), body)
+    assert released == ["a", "s"]
+    a = body["tasks"]["a"]
+    assert (a["state"], a["proc"], a["pid"], a["attempt"]) == (
+        dag.PENDING,
+        None,
+        None,
+        0,
+    )
+    assert a["startedAt"] is None
+    s = body["tasks"]["s"]
+    assert (s["state"], s["proc"], s["pid"]) == (dag.RUNNING, None, None)
+    assert s["nextPokeAt"] == 5.0
+    assert s["pokeCount"] == 0
+    assert (s["startedAt"], s["firstPokeAt"]) == (1.0, 1.0)
+    assert body["updatedAt"] == 5.0
+    body, res = _apply(dag.plan_and_claim(spec, 6.0, "p", "h", {}), body)
+    got = {li.taskkey: (li.attempt, li.poke_number) for li in res.launches}
+    assert got == {"a": (0, 0), "s": (0, 0)}
+    assert body["tasks"]["a"]["startedAt"] == 6.0
+
+
+def test_plain_claim_clears_a_stale_poke_count():
+    # a task retyped from a sensor keeps its poke count on the entry; the
+    # plain claim registers poke 0, so the entry must read 0 too, or the
+    # driver's launch registry would mistake the live launch for a lost
+    # claim and release it under its running subprocess
+    spec = _spec(TaskSpec("a", max_attempts=3))
+    body = _body(spec)
+    body["tasks"]["a"]["pokeCount"] = 1
+    body, res = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    assert [(li.taskkey, li.poke_number) for li in res.launches] == [("a", 0)]
+    assert "pokeCount" not in body["tasks"]["a"]
+
+
+def test_release_lost_claims_is_fenced():
+    # only the exact claim (proc, attempt, poke) is undone; an entry that
+    # moved since is left alone, and an all-fenced batch keeps the document.
+    spec = _spec(
+        TaskSpec("a", max_attempts=3),
+        TaskSpec("s", type=dag.SENSOR, poke_interval=0.0, poke_timeout=1e9),
+    )
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    updated = body["updatedAt"]
+    body["tasks"]["s"]["pokeCount"] = 1  # a later poke is the live one
+    claims = [
+        ("a", "other", 0, 0),  # foreign proc: re-claimed elsewhere
+        ("a", "p", 1, 0),  # stale attempt
+        ("s", "p", 0, 0),  # stale poke
+        ("ghost", "p", 0, 0),  # no such entry
+    ]
+    new, released = dag.release_lost_claims(spec, claims, 5.0)(body)
+    assert dag.is_keep(new) and released == []
+    assert body["tasks"]["a"]["proc"] == "p"
+    assert body["tasks"]["s"]["proc"] == "p"
+    assert body["updatedAt"] == updated
+    # a finished entry is not RUNNING: nothing to undo
+    body["tasks"]["a"]["state"] = dag.SUCCESS
+    claims = [("a", "p", 0, 0)]
+    new, released = dag.release_lost_claims(spec, claims, 6.0)(body)
+    assert dag.is_keep(new) and released == []
+    # no document, or a terminal run
+    new, released = dag.release_lost_claims(spec, claims, 6.0)(None)
+    assert dag.is_keep(new) and released == []
+    body["state"] = dag.SUCCESS
+    claims = [("s", "p", 0, 1)]
+    new, released = dag.release_lost_claims(spec, claims, 6.0)(body)
+    assert dag.is_keep(new) and released == []
+
+
+# --------------------------------------------------------------------------
 # Combined reconcile+claim transform (reconcile_and_plan)
 # --------------------------------------------------------------------------
 

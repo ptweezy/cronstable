@@ -19,6 +19,13 @@ cronstable service install -c C:\ProgramData\cronstable
 cronstable service start
 ```
 
+`init` hands `C:\ProgramData\cronstable` to the Administrators group and
+restricts it, so only SYSTEM and administrators can add a job there. When the
+directory already exists and another account owns it, or a junction stands at
+the path, `init` refuses and prints the fix: remove the directory or run the
+printed `icacls` commands, then run `init` again. See [who may write the
+config directory](Running-on-Windows#who-may-write-the-config-directory).
+
 `cronstable service status` reports the state and the process ID. `sc query
 cronstable` and the Services console (`services.msc`) see it like any other
 service.

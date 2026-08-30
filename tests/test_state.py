@@ -1566,7 +1566,7 @@ def test_catchup_offset_deterministic_and_in_range():
 
 async def test_missed_zero_when_never_ran(tmp_path):
     cron = await _cron_with_watermark(tmp_path, None, onmissed="run-all")
-    count, watermark = await cron._missed_occurrences(
+    count, watermark, _ = await cron._missed_occurrences(
         cron.cron_jobs["j"], _NOW
     )
     assert (count, watermark) == (0, None)
@@ -1576,7 +1576,7 @@ async def test_missed_zero_when_current(tmp_path):
     cron = await _cron_with_watermark(
         tmp_path, "2026-07-01T10:10:00+00:00", onmissed="run-all"
     )
-    count, watermark = await cron._missed_occurrences(
+    count, watermark, _ = await cron._missed_occurrences(
         cron.cron_jobs["j"], _NOW
     )
     assert count == 0
@@ -1587,7 +1587,7 @@ async def test_missed_run_once_coalesces_to_one(tmp_path):
     cron = await _cron_with_watermark(
         tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-once"
     )
-    count, watermark = await cron._missed_occurrences(
+    count, watermark, _ = await cron._missed_occurrences(
         cron.cron_jobs["j"], _NOW
     )
     assert count == 1
@@ -1599,7 +1599,7 @@ async def test_missed_run_all_counts_each(tmp_path):
         tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
     )
     # per-minute job, 10:01..10:10 missed by 10:10:30 -> 10 occurrences.
-    count, _ = await cron._missed_occurrences(cron.cron_jobs["j"], _NOW)
+    count, _, _ = await cron._missed_occurrences(cron.cron_jobs["j"], _NOW)
     assert count == 10
 
 
@@ -1608,7 +1608,7 @@ async def test_missed_deadline_bounds_window(tmp_path):
         tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all", deadline=180
     )
     # only the last 180s (10:08, 10:09, 10:10) count.
-    count, _ = await cron._missed_occurrences(cron.cron_jobs["j"], _NOW)
+    count, _, _ = await cron._missed_occurrences(cron.cron_jobs["j"], _NOW)
     assert count == 3
 
 
@@ -1617,7 +1617,7 @@ async def test_missed_hard_capped(tmp_path, caplog):
         tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
     )
     far = datetime.datetime(2026, 7, 1, 12, 30, 0, tzinfo=_UTC)  # 150 min
-    count, _ = await cron._missed_occurrences(cron.cron_jobs["j"], far)
+    count, _, _ = await cron._missed_occurrences(cron.cron_jobs["j"], far)
     assert count == 100
     assert any("dropping the rest" in r.getMessage() for r in caplog.records)
 
@@ -1629,7 +1629,7 @@ async def test_missed_naive_watermark_is_pinned_to_utc(tmp_path):
     cron = await _cron_with_watermark(
         tmp_path, "2026-07-01T10:00:00", onmissed="run-once"
     )
-    count, _ = await cron._missed_occurrences(cron.cron_jobs["j"], _NOW)
+    count, _, _ = await cron._missed_occurrences(cron.cron_jobs["j"], _NOW)
     assert count == 1
 
 

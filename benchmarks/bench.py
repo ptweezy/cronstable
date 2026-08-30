@@ -1163,11 +1163,11 @@ def bench_schedule_reseed():
 def bench_schedule_pressure():
     """schedule_pressure at a scale where its declared gate is real.
 
-    Note on the timezone half of the round-2 finding: _local_tzinfo()
-    always returns a fixed-offset datetime.timezone, so a zone dependence
-    here is a docstring nit, not a determinism hazard -- and whatever
-    effect exists cancels between the two sides of a paired run on one
-    runner.
+    The entries sit on the host clock. _fire_cells walks them in a fixed
+    offset whenever the host offset is constant across the window and the
+    engine's look-back, so the timing is zone-independent on any window
+    without a DST transition, and a paired run on one runner sees the
+    same host zone on both sides.
     """
     try:
         from cronstable.croninfo import schedule_pressure
@@ -1278,11 +1278,75 @@ def bench_schedule_lint_zoned():
     return time.perf_counter() - t0
 
 
+#: A pass instant a week clear of the 2026 US transitions, so the host-clock
+#: seed below takes the fixed-offset path on any host zone; also the
+#: due-pass base further down.
+_DUE_BASE = datetime(2026, 3, 15, 12, 31, 0, tzinfo=timezone.utc)
+
+
+@bench(
+    "schedule.reseed_local_20k",
+    "schedule",
+    detail="_ensure_seeded over 20k host-clock (utc: false) jobs",
+    repeats=(3, 2, 1),
+)
+def bench_schedule_reseed_local():
+    """The seed pass over jobs framed in the host clock.
+
+    schedule.reseed_100k walks the engine on a UTC frame, the fixed-offset
+    path.  A ``utc: false`` job (what the Task Scheduler importer emits for
+    every task) arms through CronTab.next_local, whose fixed-offset shortcut
+    holds only while the host offset is provably constant across the
+    answer, so a regression on that path shows here and nowhere else.
+    """
+    Cron = _cron_cls()
+    if not hasattr(Cron, "_ensure_seeded"):
+        raise Skip("Cron._ensure_seeded not present")
+
+    def build():
+        try:
+            from cronstable.config import (
+                DEFAULT_CONFIG,
+                JobConfig,
+                mergedicts,
+            )
+        except ImportError as exc:
+            raise Skip("cronstable.config API unavailable: %r" % exc) from None
+        jobs = {}
+        for i in range(_n(20000)):
+            name = "local%05d" % i
+            jobs[name] = JobConfig(
+                mergedicts(
+                    DEFAULT_CONFIG,
+                    {
+                        "name": name,
+                        "command": "true",
+                        "schedule": "%d %d * * *" % (i % 60, (i * 7) % 24),
+                        "utc": False,
+                    },
+                )
+            )
+        return jobs
+
+    jobs = fixture("local_jobs_20k", build)
+    try:
+        cron = Cron(
+            None,
+            config_yaml="jobs:\n  - name: seed\n    command: 'x'\n"
+            "    schedule: '0 0 * * *'\n",
+        )
+    except TypeError as exc:
+        raise Skip("Cron signature changed: %r" % exc) from None
+    cron.cron_jobs = jobs
+    t0 = time.perf_counter()
+    cron._ensure_seeded(_DUE_BASE)
+    return time.perf_counter() - t0
+
+
 # The forever-loop's fire pass at marketed scale.  The fixture is the single
 # most expensive in the suite (~100k JobConfigs, built once per process), so
 # it sits LAST in the schedule group: the group boundary evicts it before the
 # dag group starts.
-_DUE_BASE = datetime(2026, 3, 15, 12, 31, 0, tzinfo=timezone.utc)
 
 
 def _due_pass_jobs():
@@ -4155,6 +4219,70 @@ def bench_web_append_line():
             "did not reach appendLine"
         )
     return value
+
+
+@bench(
+    "webui.week_walk_500",
+    "webui",
+    detail="computeWeek cold over 500 varied schedules, UTC and "
+    "America/New_York alternating (headless Chromium)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_web_week_walk():
+    """The week calendar's seven-day enumeration of every enabled schedule.
+
+    The page keeps each distinct (schedule, frame)'s fires for the day
+    window, so a poll on an unchanged fleet walks nothing; this times the
+    cold walk the panel pays on enable, on a schedule edit and at midnight,
+    over the suite's schedule mix on both frame kinds the engine has: UTC
+    (Date arithmetic) and an IANA zone (one Intl offset read per hour the
+    walk touches).  Needs the ``__perf.computeWeek`` hook, which clears the
+    memos first; a release without it records as skipped, never failed.
+    """
+    if _MODE == "smoke":
+        raise Skip("webui metrics do not run in smoke mode")
+    page = _web_page()
+    if not page.evaluate("() => typeof __perf.computeWeek === 'function'"):
+        raise Skip("page lacks the __perf.computeWeek hook")
+    return _web_time(
+        page,
+        "__perf.seedJobs(%d); __perf.varySchedules()" % _n(500),
+        "__perf.computeWeek()",
+        batch=2,
+        batches=8,
+    )
+
+
+@bench(
+    "webui.radar_walk_500",
+    "webui",
+    detail="computeRadar cold over 500 varied schedules, UTC and "
+    "America/New_York alternating (headless Chromium)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_web_radar_walk():
+    """The radar's next fire per enabled schedule, the walk the poll loop
+    runs while the panel is open.
+
+    The page keeps each distinct (schedule, frame)'s next fire until it
+    passes, so a poll re-walks only the schedules whose fire has elapsed;
+    this times the cold walk over the whole fleet.  Needs the
+    ``__perf.computeRadar`` hook; a release without it records as skipped.
+    """
+    if _MODE == "smoke":
+        raise Skip("webui metrics do not run in smoke mode")
+    page = _web_page()
+    if not page.evaluate("() => typeof __perf.computeRadar === 'function'"):
+        raise Skip("page lacks the __perf.computeRadar hook")
+    return _web_time(
+        page,
+        "__perf.seedJobs(%d); __perf.varySchedules()" % _n(500),
+        "__perf.computeRadar()",
+    )
 
 
 # ---------------------------------------------------------------------------

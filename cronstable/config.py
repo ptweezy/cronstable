@@ -40,7 +40,7 @@ from strictyaml import Optional as Opt
 from strictyaml.ruamel.error import YAMLError
 
 from cronstable import crontabs, dag, platform
-from cronstable.cronexpr import CronTab
+from cronstable.cronexpr import LOCAL_ZONE, CronTab
 from cronstable.croninfo import Finding, lint_schedule
 
 
@@ -1773,11 +1773,11 @@ class JobConfig:
         if not isinstance(tab, CronTab):
             return []
         if lint_cache is None:
-            return lint_schedule(timezone=self.timezone, tab=tab)
-        key = (str(tab), tab.resolved_source, self.timezone)
+            return lint_schedule(timezone=self.frame, tab=tab)
+        key = (str(tab), tab.resolved_source, self.frame)
         findings = lint_cache.get(key)
         if findings is None:
-            findings = lint_schedule(timezone=self.timezone, tab=tab)
+            findings = lint_schedule(timezone=self.frame, tab=tab)
             lint_cache[key] = findings
         # a copy, so every job owns its own list
         return list(findings)
@@ -1833,6 +1833,21 @@ class JobConfig:
         if self.utc:
             return datetime.timezone.utc
         return None
+
+    @property
+    def frame(self) -> datetime.tzinfo:
+        """The zone the schedule is read in: ``timezone``, or the host clock
+        (:data:`LOCAL_ZONE`) for a ``utc: false`` job without one."""
+        return self.timezone or LOCAL_ZONE
+
+    def next_delay(self, now_utc: datetime.datetime) -> Optional[float]:
+        """Seconds from the aware instant ``now_utc`` to the schedule's next
+        occurrence in :attr:`frame`; None when it never occurs again."""
+        tab = self.schedule
+        assert isinstance(tab, CronTab)
+        if self.timezone is None:
+            return tab.next_local(now_utc)
+        return tab.next(now=now_utc.astimezone(self.timezone))
 
     def _validate_secrets(self) -> None:
         """Reject secret blocks that name no source.
@@ -2616,7 +2631,9 @@ def _attach_observability(
     for key in ("nodeName", "interval", "driftAfter", "connectTimeout"):
         if obs.get(key) is not None:
             mesh_raw[key] = obs[key]
-    cfg["observabilityMesh"] = _build_gossip_cluster_config(mesh_raw)
+    cfg["observabilityMesh"] = _build_gossip_cluster_config(
+        mesh_raw, where="cluster.observability"
+    )
 
 
 def _build_state_config(raw: dict) -> StateConfig:
@@ -2812,9 +2829,30 @@ def _validate_job_api_tls(job_api: dict[str, Any], listen: Any) -> None:
             )
 
 
-def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
+def _require_gossip_tls_paths(tls: Mapping[str, Any], where: str) -> None:
+    """Every path in a gossip ``tls`` block must be a non-blank string.
+
+    The schema requires the keys only, and strictyaml maps a blank scalar
+    (what a template renders for an unset variable) to ``''``. An empty
+    ``ca`` reaches the context builders as "no client CA": the ``/peer``
+    listener would require no client certificate and the poller would trust
+    the system root store.
+    """
+    for key in ("ca", "cert", "key"):
+        if not str(tls.get(key) or "").strip():
+            raise ConfigError(
+                "{}.{} must be a non-empty path; a blank value would disable "
+                "peer authentication".format(where, key)
+            )
+
+
+def _build_gossip_cluster_config(
+    raw: dict, *, where: str = "cluster"
+) -> ClusterConfig:
     # Fill defaults over the raw (schema-validated) cluster block and validate
     # the numeric fields, mirroring _validate_numeric_ranges for jobs.
+    # ``where`` names the block in errors; the observability overlay builds
+    # its mesh through here too.
     cfg = _cluster_base(raw)
     _reject_foreign_store_blocks(cfg, "gossip")
     # listen/tls/peers are schema-optional now (so a lease backend need not
@@ -2822,12 +2860,13 @@ def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
     for key in ("listen", "tls", "peers"):
         if cfg.get(key) is None:
             raise ConfigError(
-                "cluster.backend gossip requires cluster.{}".format(key)
+                "{0}.backend gossip requires {0}.{1}".format(where, key)
             )
+    _require_gossip_tls_paths(cfg["tls"], where + ".tls")
     if cfg["interval"] <= 0:
-        raise ConfigError("cluster.interval must be > 0")
+        raise ConfigError("{}.interval must be > 0".format(where))
     if cfg["driftAfter"] < 1:
-        raise ConfigError("cluster.driftAfter must be >= 1")
+        raise ConfigError("{}.driftAfter must be >= 1".format(where))
 
     # Validate every address is a well-formed host:port up front, so a typo
     # (a missing port, a non-numeric port) fails the config load pointing at
@@ -2850,8 +2889,8 @@ def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
             host = bracket[1:]
             if not sep or not host or not _is_port(port):
                 raise ConfigError(
-                    "cluster.{} must be [ipv6]:port, got {!r}".format(
-                        what, addr
+                    "{}.{} must be [ipv6]:port, got {!r}".format(
+                        where, what, addr
                     )
                 )
             return
@@ -2863,12 +2902,12 @@ def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
         # from quorum with no error. Require the bracketed form instead.
         if ":" in host:
             raise ConfigError(
-                "cluster.{} looks like a bare IPv6 address; write it as "
-                "[ipv6]:port, got {!r}".format(what, addr)
+                "{}.{} looks like a bare IPv6 address; write it as "
+                "[ipv6]:port, got {!r}".format(where, what, addr)
             )
         if not host or not _is_port(port):
             raise ConfigError(
-                "cluster.{} must be host:port, got {!r}".format(what, addr)
+                "{}.{} must be host:port, got {!r}".format(where, what, addr)
             )
 
     _require_host_port(cfg["listen"], "listen")

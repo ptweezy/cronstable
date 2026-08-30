@@ -29,6 +29,7 @@ import datetime
 import itertools
 import json
 import os
+import zoneinfo
 
 import pytest
 
@@ -181,3 +182,110 @@ def test_client_engine_matches_daemon_engine_over_the_golden_corpus():
         )
         assert py["fires"] == js["fires"], expr
         assert py["describe"] == js["describe"], expr
+
+
+#: Zones whose 2026 transitions exercise the client's zone path: whole-hour
+#: shifts west and east of UTC, a half-hour standard offset (Adelaide's
+#: transitions fall at :30 UTC), a half-hour DST shift (Lord Howe), a
+#: three-quarter-hour offset (Chatham), and two zones without transitions,
+#: one of them the IANA spelling of UTC.
+_ZONES = [
+    "America/New_York",
+    "Europe/London",
+    "Australia/Adelaide",
+    "Australia/Lord_Howe",
+    "Pacific/Chatham",
+    "Asia/Kolkata",
+    "Etc/UTC",
+]
+
+#: Every transition in those zones moves a label between 01:00 and 03:59,
+#: so these schedules never name a skipped or repeated wall time. Labels
+#: inside a moved hour are left out on purpose: the client's two-probe
+#: instantOf and the daemon's fold=0 rule resolve a gap or a repeated
+#: label differently, and this differential does not pin either reading.
+_ZONE_EXPRS = [
+    "0 9 * * *",
+    "45 23 * * *",
+    "*/20 0,4-23 * * *",
+    "30 12 * * 1-5",
+    "0 0 1,15 * *",
+    "15 */4 * * *",
+]
+_ZONE_COUNT = 40
+
+
+def _zone_seeds(zone):
+    """Instants six hours before each 2026 offset change in ``zone`` (found
+    by an hourly scan), or one fixed instant for a zone without any."""
+    tz = zoneinfo.ZoneInfo(zone)
+    utc = datetime.timezone.utc
+    t = datetime.datetime(2026, 1, 1, tzinfo=utc)
+    end = datetime.datetime(2027, 1, 1, tzinfo=utc)
+    step = datetime.timedelta(hours=1)
+    prev = t.astimezone(tz).utcoffset()
+    seeds = []
+    while t < end:
+        t += step
+        off = t.astimezone(tz).utcoffset()
+        if off != prev:
+            seeds.append(t - datetime.timedelta(hours=6))
+            prev = off
+    return seeds or [datetime.datetime(2026, 6, 15, tzinfo=utc)]
+
+
+def test_client_engine_matches_daemon_engine_across_zone_transitions():
+    """The zone path (a UTC frame's arithmetic, an IANA frame's per-hour
+    offset memo) yields the daemon's instants across every 2026 transition
+    of the zones above, from a seed six hours before each."""
+    cases = []
+    for zone in _ZONES:
+        tz = zoneinfo.ZoneInfo(zone)
+        for seed in _zone_seeds(zone):
+            for expr in _ZONE_EXPRS:
+                fires = [
+                    int(dt.timestamp() * 1000)
+                    for dt in itertools.islice(
+                        CronTab(expr).occurrences(seed.astimezone(tz)),
+                        _ZONE_COUNT,
+                    )
+                ]
+                cases.append(
+                    {
+                        "zone": zone,
+                        "expr": expr,
+                        "fromMs": int(seed.timestamp() * 1000),
+                        "fires": fires,
+                    }
+                )
+    assert len(cases) >= len(_ZONE_EXPRS) * (len(_ZONES) + 5)
+
+    with playwright_api.sync_playwright() as p:
+        try:
+            browser = p.chromium.launch()
+        except Exception as exc:  # no chromium provisioned
+            pytest.skip("playwright chromium unavailable: {}".format(exc))
+        page = browser.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.set_content("<html><body></body></html>")
+        page.add_script_tag(content=_engine_script())
+        got = page.evaluate(
+            """(args) => args.cases.map((c) => {
+                const p = window.__engine.parseCron(c.expr);
+                return window.__engine.nextRuns(
+                    p, args.count, c.zone, c.fromMs).map((x) => x.t);
+            })""",
+            {"cases": cases, "count": _ZONE_COUNT},
+        )
+        browser.close()
+
+    assert not errors, errors
+    for case, js in zip(cases, got, strict=True):
+        assert case["fires"] == js, (
+            case["zone"],
+            case["expr"],
+            datetime.datetime.fromtimestamp(
+                case["fromMs"] / 1000, datetime.timezone.utc
+            ).isoformat(),
+        )

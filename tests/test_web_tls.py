@@ -181,6 +181,14 @@ def test_build_listener_ssl_context_requires_clients_only_with_a_ca(tmp_path):
     assert mutual.verify_mode is ssl.CERT_REQUIRED
 
 
+def test_build_mutual_client_ssl_context_refuses_an_empty_ca():
+    # create_default_context(cafile='') loads the system root store, which
+    # would widen a cluster's trust set from its own CA to every public root
+    # on the box. Refused before any file is touched.
+    with pytest.raises(ValueError, match="requires a CA path"):
+        tlsutil.build_mutual_client_ssl_context("", "/c", "/k")
+
+
 def test_verifying_client_context_is_none_without_options():
     # so a client with no TLS flags keeps its existing default transport
     # rather than paying for a context that changes nothing.

@@ -241,9 +241,12 @@ that load-time validation: `listen` and every `peers[].host` must be
 `host:port` with a port in 1-65535, and an IPv6 literal must be written
 bracketed (`[2001:db8::1]:8443`). The bare form is rejected with a
 `ConfigError` up front rather than mis-splitting at the last colon and
-failing opaquely at connect time. The same checks apply to the
+failing opaquely at connect time. Every `tls` path must be non-empty: a
+blank `ca:` (what a template renders for an unset variable) is a
+`ConfigError` at load rather than a `/peer` listener that requires no
+client certificate. The same checks apply to the
 [`cluster.observability`](Configuration-Reference#observability-overlay)
-mesh addresses.
+mesh.
 
 The trust model is deliberately small and keeps no shared state:
 
@@ -466,12 +469,22 @@ mid-roll, the old nodes still carry `N = 3` (quorum 2) while the new ones carry
 quorate and each run the `Leader` jobs.
 
 The daemon closes this the same way as a duplicate `nodeName`. Each node
-reports its declared `N` on `/peer`, and a peer that **agrees on the job set but
-declares a different `N`** is treated as a first-class `conflict`: this node's
-`Leader` jobs **fail closed** until the cluster reconverges on one `N`. Because a
-resize leaves the job set unchanged, the divergent nodes *are* mutually `agreed`
-and therefore each observe the mismatch: both sides stand down, so no firing
-double-runs while the roll-out is under way.
+reports its declared `N` on `/peer`, and any reachable peer that **declares a
+different `N`** is treated as a first-class `conflict`, whatever job set that
+peer runs: this node's `Leader` jobs **fail closed** until the cluster
+reconverges on one `N`. Both sides of a resize observe the mismatch and stand
+down, so no firing double-runs while the roll-out is under way.
+
+The comparison ignores job-set agreement on purpose. A resize rolled out
+together with a job change (a `peers` edit and a job edit in the same deploy)
+puts the old and new config generations on different job-set ids, so the two
+sides see each other as `syncing` or `drifted` rather than `agreed`, while each
+side can still reach a quorum under its own `N`. Comparing every reachable
+peer's `N` catches that roll too: it stands **every** `Leader` job down on every
+node until every member of the new `peers` list declares the new `N`. A removed
+member that is still running sees the new `N` on the nodes it polls, so its own
+`Leader` jobs stay stood down until it stops. A pure job change at a fixed `N`
+declares one `N` everywhere and raises no conflict.
 
 The conflict is surfaced as the `size_conflict` / `conflicting_sizes` fields on
 [`GET /cluster`](#observing-the-cluster), a banner in the dashboard cluster
@@ -479,13 +492,13 @@ panel, and an `ERROR` log line, and clears automatically after every node's
 `peers` agree on the member set. As with a `nodeName` conflict, `PreferLeader`
 is *not* gated: it already accepts double-runs as the price of never skipping.
 
-> **Note:** the check compares the declared size `N`, which catches every
-> *resize* (the failure described earlier). It does not detect a same-`N` but
-> different-*membership* divergence (for example, swapping one peer for another
-> while keeping the count). To stay safe, change membership **one node at a
-> time** so
-> the old and new majorities always overlap, and let each change converge (the
-> dashboard shows `agreed` on every node) before the next.
+> **Note:** the check compares the declared size `N`. It does not detect a
+> same-`N` but different-*membership* divergence (for example, swapping one
+> peer for another while keeping the count). To stay safe, change membership
+> **one node at a time**: a change of one member keeps the old and new
+> majorities overlapping, so every step of the roll has at most one leader.
+> Let each change converge (the dashboard shows `agreed` on every node) before
+> the next.
 
 ### Sizing the cluster
 
@@ -597,8 +610,9 @@ Leader        -> run only if this node is the quorum-gated elected leader
 
 (The `conflict` row applies to `Leader` only. `PreferLeader` and `EveryNode` are
 gated on none of a duplicate `nodeName`, a cluster-size disagreement, or a
-coordination-policy mismatch. A coordination-policy conflict is a quorate peer
-advertising a different `distribution` or `elect_leader` setting, surfaced as
+coordination-policy mismatch. A coordination-policy conflict is a reachable
+peer advertising a different `distribution` or `elect_leader` setting, surfaced
+as
 `policy_conflict: true` with the differing descriptors in `conflicting_policies`.
 It is the third trigger of the umbrella `conflict` flag alongside `conflict_names`
 and `size_conflict`. Under `distribution: spread`, described next, the last two
@@ -757,8 +771,8 @@ What to know:
   workloads the default single leader is simpler and equally correct.
 
 * **Keep it consistent.** Every node must agree on `distribution` (as with the
-  peer list and `electLeader`). A quorate peer that agrees on the job set but
-  advertises a different `distribution` (or `electLeader`) is treated as a
+  peer list and `electLeader`). A reachable peer that advertises a different
+  `distribution` (or `electLeader`), whatever job set it runs, is treated as a
   first-class **coordination-policy conflict**: it surfaces as
   `policy_conflict: true` (with the differing descriptors in
   `conflicting_policies`) and, as the third trigger of the umbrella `conflict`
@@ -819,9 +833,9 @@ JSON. When no `cluster` section is configured it returns
   "distribution": "single-leader", // or "spread"
   "conflict": false,               // umbrella: true if any conflict pauses Leader jobs
   "conflict_names": [],            // the duplicated nodeName(s), if any
-  "size_conflict": false,          // true if an agreeing peer declares a different N
+  "size_conflict": false,          // true if a reachable peer declares a different N
   "conflicting_sizes": [],         // those divergent cluster sizes, if any
-  "policy_conflict": false,        // true if an agreeing peer declares a different distribution/elect_leader
+  "policy_conflict": false,        // true if a reachable peer declares a different distribution/elect_leader
   "conflicting_policies": [],      // those differing coordination-policy descriptors, if any
   "candidates_truncated": 0,       // nonzero: the fleet outgrew the candidate advertisement cap (see below)
   "quorate": true,                 // whether this node sees a quorum

@@ -1333,10 +1333,7 @@ class PrometheusMetrics:
                 # the loop's first tick, or metrics rendered on a Cron whose
                 # loop never ran. Compute the next fire directly so the gauge
                 # is still emitted (absent for disabled/@reboot jobs).
-                seconds = job_config.schedule.next(
-                    now=get_now(job_config.timezone),
-                    default_utc=job_config.utc,
-                )
+                seconds = job_config.next_delay(get_now(datetime.timezone.utc))
                 if seconds is not None:
                     next_run.add(
                         labels,

@@ -179,7 +179,7 @@ required **only for this backend**:
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `listen` | `Str` | required (gossip) | `host:port` the mTLS `/peer` listener binds to (for example, `0.0.0.0:8443`). Served only here, never on the public `web` API. |
-| `tls.ca` | `Str` | required (gossip) | Path to the cluster CA (trust anchor for peer certificates). |
+| `tls.ca` | `Str` | required (gossip) | Path to the cluster CA (trust anchor for peer certificates). Must be non-empty: a blank or whitespace-only value is a `ConfigError` at load (`cluster.tls.ca must be a non-empty path; a blank value would disable peer authentication`). The same rule covers `tls.cert` and `tls.key`. |
 | `tls.cert` | `Str` | required (gossip) | Path to this node's certificate (used both to serve `/peer` and to authenticate as a client). Its SAN must match the host other nodes use to reach it. |
 | `tls.key` | `Str` | required (gossip) | Path to this node's private key. |
 | `peers` | `Seq(Map({"host": Str}))` | required (gossip) | Every **other** member as `host:port`. Cluster size is `len(peers) + 1`. |
@@ -191,7 +191,10 @@ required **only for this backend**:
 | `distribution` | `Enum(["single-leader", "spread"])` | `single-leader` | How leader-gated jobs spread across the quorate cluster. `single-leader`: one elected leader runs every `Leader` job. `spread`: per-job ownership through rendezvous hashing, so the work fans out across the quorate nodes (same quorum gate, same guarantee). Inert without `electLeader` (warns if set anyway). With a lease backend (`kubernetes`/`etcd`/`filesystem`) a non-default `distribution` is a **hard `ConfigError` at load** (a single lease holder cannot be a per-job owner), not a silent fallback. See [clustering and leader election](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load). |
 
 Gossip load-time validation (in addition to the numeric ranges listed
-earlier): every address (`listen` and each `peers[].host`) must be `host:port`
+earlier): every `tls` path (`ca`, `cert`, `key`) must be non-empty, so a blank
+scalar (what a template renders for an unset variable) is a `ConfigError` at
+load rather than a `/peer` listener that requires no client certificate. Every
+address (`listen` and each `peers[].host`) must be `host:port`
 with a numeric port in `1`-`65535`, and an IPv6 host must be written
 **bracketed** (`[2001:db8::1]:8900`). A bare IPv6 literal is a `ConfigError` at
 load (`looks like a bare IPv6 address; write it as [ipv6]:port`), because

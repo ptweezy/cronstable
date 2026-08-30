@@ -2052,7 +2052,7 @@ async def test_pause_window_excuses_only_the_slots_inside_it(stateful_cron):
     now = datetime.datetime(2026, 7, 1, 10, 10, 30, tzinfo=_UTC)
     job = cron.cron_jobs["p"]
     # without a pause record: every slot since the watermark is owed
-    count, _ = await cron._missed_occurrences(job, now)
+    count, _, _ = await cron._missed_occurrences(job, now)
     assert count == 10
     await cron.state_backend.append_record(
         "paused/p",
@@ -2070,7 +2070,7 @@ async def test_pause_window_excuses_only_the_slots_inside_it(stateful_cron):
     # 10:01..10:04 fall inside [since, until) and are excused; 10:05
     # lands exactly on `until`, where _pause_active already reports the
     # job as unpaused, so it is owed like 10:06..10:10.
-    count, _ = await cron._missed_occurrences(job, now)
+    count, _, _ = await cron._missed_occurrences(job, now)
     assert count == 6
 
 
@@ -2108,7 +2108,7 @@ async def test_pause_window_leaves_the_pre_pause_backlog_owed(stateful_cron):
     job = cron.cron_jobs["p"]
     # 10:01..10:05 predate the window, 10:06 and 10:07 are inside it,
     # 10:08..10:10 are at/after its end: 8 owed, 2 excused.
-    count, _ = await cron._missed_occurrences(job, now)
+    count, _, _ = await cron._missed_occurrences(job, now)
     assert count == 8
 
 
@@ -2146,7 +2146,7 @@ async def test_pause_window_does_not_erase_an_open_checkpoint_backlog(
         },
     )
     now = datetime.datetime(2026, 7, 1, 10, 10, 30, tzinfo=_UTC)
-    count, watermark = await cron._missed_occurrences(
+    count, watermark, _ = await cron._missed_occurrences(
         cron.cron_jobs["p"], now
     )
     assert watermark == "2026-07-01T10:00:00+00:00"
@@ -2399,11 +2399,219 @@ async def test_missed_occurrences_backstops_an_unpinned_pause_window(
         )
     assert await cron._pending_catchup_watermark("p") is None
     ref = datetime.datetime(2026, 7, 1, 10, 25, 0, tzinfo=_UTC)
-    count, watermark = await cron._missed_occurrences(
+    count, watermark, _ = await cron._missed_occurrences(
         cron.cron_jobs["p"], ref
     )
     assert count == 11  # 5 pre-pause + 6 post-window: backlog preserved
     assert watermark == "2026-07-01T10:00:00+00:00"
+
+
+_HOURLY_CATCHUP_JOB = """
+jobs:
+  - name: p
+    command: ls
+    schedule: "0 * * * *"
+    onMissed: run-all
+"""
+
+_DAILY_RUN_ONCE_JOB = """
+jobs:
+  - name: p
+    command: ls
+    schedule: "0 3 * * *"
+    onMissed: run-once
+"""
+
+
+@pytest.mark.parametrize(
+    "yaml, last_run, window, ref, later_runs, ref2",
+    [
+        pytest.param(
+            _HOURLY_CATCHUP_JOB,
+            "2026-07-01T09:00:00+00:00",
+            ("2026-07-01T09:30:00+00:00", "2026-07-01T10:30:00+00:00"),
+            datetime.datetime(2026, 7, 1, 9, 45, 0, tzinfo=_UTC),
+            ["2026-07-01T%02d:00:00+00:00" % h for h in range(11, 24)]
+            + ["2026-07-02T%02d:00:00+00:00" % h for h in range(6)],
+            datetime.datetime(2026, 7, 2, 5, 10, 0, tzinfo=_UTC),
+            id="hourly-run-all",
+        ),
+        pytest.param(
+            _DAILY_RUN_ONCE_JOB,
+            "2026-07-01T03:00:00+00:00",
+            ("2026-07-01T10:00:00+00:00", "2026-07-01T12:00:00+00:00"),
+            datetime.datetime(2026, 7, 1, 10, 30, 0, tzinfo=_UTC),
+            ["2026-07-%02dT03:00:00+00:00" % d for d in range(2, 5)],
+            datetime.datetime(2026, 7, 4, 15, 0, 0, tzinfo=_UTC),
+            id="daily-run-once",
+        ),
+    ],
+)
+async def test_nothing_owed_after_a_pause_closes_the_pin_across_restarts(
+    yaml, last_run, window, ref, later_runs, ref2, stateful_cron
+):
+    # A job paused at boot pins its pre-pause watermark under an open
+    # checkpoint. When the pause lifts with nothing owed the evaluation must
+    # CLOSE that pin: left newest in catchup/p, the next boot would hoist
+    # the watermark back to it and count the ordinary runs since as missed
+    # (one spurious run under run-once, one per slot under run-all).
+    cron = await stateful_cron(yaml)
+    await _seed_real_run(cron, last_run)
+    await _seed_pause_window(cron, *window)
+    _make_pause_live(cron)
+    backfills = []
+
+    async def _fake_backfill(job, count, offset, now):
+        backfills.append((job.name, count))
+
+    cron._run_catch_up = _fake_backfill  # type: ignore[method-assign]
+    await cron._catch_up(ref)  # boot mid-pause: deferred and pinned
+    assert cron._caught_up is False
+    assert await cron._pending_catchup_watermark("p") == last_run
+
+    del cron._paused["p"]  # the window expires
+    cron._catchup_next_retry = 0.0
+    await cron._catch_up(ref)
+    await asyncio.sleep(0)
+    assert cron._caught_up is True
+    assert backfills == []
+    assert (await _newest(cron, "catchup/p"))["kind"] == "close"
+    assert await cron._pending_catchup_watermark("p") is None
+
+    # ordinary runs land, then a fresh process boots over the same store
+    for when in later_runs:
+        await _seed_real_run(cron, when)
+    cron2 = await stateful_cron(yaml)
+    cron2._run_catch_up = _fake_backfill  # type: ignore[method-assign]
+    await cron2._catch_up(ref2)
+    await asyncio.sleep(0)
+    assert cron2._caught_up is True
+    assert backfills == []
+
+
+async def test_nothing_owed_boot_without_a_pin_appends_no_checkpoint(
+    stateful_cron,
+):
+    # the close is guarded on an existing pin: a plain boot that owes nothing
+    # leaves catchup/p empty rather than appending a record per boot.
+    cron = await stateful_cron(_PAUSE_CATCHUP_JOB)
+    await _seed_real_run(cron, "2026-07-01T10:00:00+00:00")
+    backfills = []
+
+    async def _fake_backfill(job, count, offset, now):
+        backfills.append((job.name, count))
+
+    cron._run_catch_up = _fake_backfill  # type: ignore[method-assign]
+    ref = datetime.datetime(2026, 7, 1, 10, 0, 30, tzinfo=_UTC)
+    await cron._catch_up(ref)
+    assert cron._caught_up is True
+    assert backfills == []
+    assert await cron.state_backend.list_records("catchup/p") == []
+
+
+async def _pinned_by_a_lifted_pause(stateful_cron):
+    # boot paused with nothing owed pre-pause, so the evaluation pins the
+    # pre-pause watermark; the pause then expires with the pin still open.
+    cron = await stateful_cron(_PAUSE_CATCHUP_JOB)
+    await _seed_real_run(cron, "2026-07-01T10:00:00+00:00")
+    await _seed_pause_window(
+        cron, "2026-07-01T10:00:30+00:00", "2026-07-01T10:20:00+00:00"
+    )
+    _make_pause_live(cron)
+    backfills = []
+
+    async def _fake_backfill(job, count, offset, now):
+        backfills.append((job.name, count))
+
+    cron._run_catch_up = _fake_backfill  # type: ignore[method-assign]
+    ref = datetime.datetime(2026, 7, 1, 10, 0, 30, tzinfo=_UTC)
+    await cron._catch_up(ref)
+    assert (
+        await cron._pending_catchup_watermark("p")
+        == "2026-07-01T10:00:00+00:00"
+    )
+    del cron._paused["p"]
+    return cron, ref, backfills
+
+
+async def test_nothing_owed_defers_when_the_pin_cannot_be_read(stateful_cron):
+    # a pin that cannot be read cannot be closed: the job stays pending
+    # rather than latching with the pin left open, and the recheck closes it.
+    cron, ref, backfills = await _pinned_by_a_lifted_pause(stateful_cron)
+    real_read = cron._pending_catchup_watermark
+    calls = {"n": 0, "fail_on": 1}  # the walk's read, which the close reuses
+
+    async def _flaky_read(name):
+        calls["n"] += 1
+        if calls["n"] == calls["fail_on"]:
+            _raise_runtime()
+        return await real_read(name)
+
+    cron._pending_catchup_watermark = _flaky_read  # type: ignore[method-assign]
+    cron._catchup_next_retry = 0.0
+    await cron._catch_up(ref)
+    assert cron._caught_up is False
+    assert "p" not in cron._catchup_done
+    assert (await _newest(cron, "catchup/p"))["kind"] == "open"
+
+    calls["fail_on"] = 0  # the store recovers
+    cron._catchup_next_retry = 0.0
+    await cron._catch_up(ref)
+    await asyncio.sleep(0)
+    assert cron._caught_up is True
+    assert backfills == []
+    assert (await _newest(cron, "catchup/p"))["kind"] == "close"
+
+
+async def test_nothing_owed_defers_when_the_pin_close_is_dropped(
+    stateful_cron,
+):
+    # a dropped close write leaves the pin open exactly like a failed read:
+    # the job stays pending and the recheck retries the close.
+    cron, ref, backfills = await _pinned_by_a_lifted_pause(stateful_cron)
+    backend = cron.state_backend
+    real_append = backend.append_record
+    failing = {"catchup": True}
+
+    async def _flaky_append(stream, *a, **k):
+        if failing["catchup"] and stream.startswith("catchup/"):
+            _raise_runtime()
+        return await real_append(stream, *a, **k)
+
+    backend.append_record = _flaky_append  # type: ignore[method-assign]
+    cron._catchup_next_retry = 0.0
+    await cron._catch_up(ref)
+    assert cron._caught_up is False
+    assert "p" not in cron._catchup_done
+    assert (await _newest(cron, "catchup/p"))["kind"] == "open"
+
+    failing["catchup"] = False  # the store recovers
+    cron._catchup_next_retry = 0.0
+    await cron._catch_up(ref)
+    await asyncio.sleep(0)
+    assert cron._caught_up is True
+    assert backfills == []
+    assert (await _newest(cron, "catchup/p"))["kind"] == "close"
+
+
+async def test_nothing_owed_pin_close_reraises_cancelled(stateful_cron):
+    # a cancellation inside the pin read is a shutdown and propagates;
+    # the will-retry deferral is for store errors only.
+    cron = await stateful_cron(_PAUSE_CATCHUP_JOB)
+    await _seed_real_run(cron, "2026-07-01T10:00:00+00:00")
+    real_read = cron._pending_catchup_watermark
+    calls = {"n": 0}
+
+    async def _cancelled_read(name):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the walk's read, which the close reuses
+            raise asyncio.CancelledError()
+        return await real_read(name)
+
+    cron._pending_catchup_watermark = _cancelled_read  # type: ignore[method-assign]
+    ref = datetime.datetime(2026, 7, 1, 10, 0, 30, tzinfo=_UTC)
+    with pytest.raises(asyncio.CancelledError):
+        await cron._evaluate_catch_up(ref)
 
 
 async def test_refresh_picks_up_foreign_pause_and_resume(stateful_cron):
@@ -2862,3 +3070,121 @@ async def test_refresh_drops_a_job_a_reload_removed_during_its_read(tmp_path):
         assert "p" not in cron.metrics._jobs
     finally:
         await _stop_state(cron)
+
+
+_SKIP_JOB = """
+jobs:
+  - name: s
+    command: ls
+    schedule: "* * * * *"
+"""
+
+
+async def _no_backfill_into(backfills):
+    async def _fake_backfill(job, count, offset, now):
+        backfills.append((job.name, count))
+
+    return _fake_backfill
+
+
+async def test_a_job_set_aside_closes_the_pin_it_carries(stateful_cron):
+    # A job paused at boot pins its pre-pause watermark.  Its config then
+    # changes so nothing will ever backfill it (onMissed: skip here): the
+    # latch closes the pin.  Left open, the first boot after the change is
+    # undone would hoist the watermark back to it and replay every
+    # ordinary run since.
+    cron, ref, backfills = await _pinned_by_a_lifted_pause(stateful_cron)
+    cron.cron_jobs["p"].onMissed = "skip"
+    cron._catchup_next_retry = 0.0
+    await cron._catch_up(ref)
+    assert cron._caught_up is True
+    assert backfills == []
+    assert (await _newest(cron, "catchup/p"))["kind"] == "close"
+    assert await cron._pending_catchup_watermark("p") is None
+    # an ordinary run lands, the change is undone, a fresh process boots
+    # twenty seconds after that run: nothing is owed, where the open pin
+    # would have replayed the nine slots between it and the run
+    await _seed_real_run(cron, "2026-07-01T10:30:00+00:00")
+    cron2 = await stateful_cron(_PAUSE_CATCHUP_JOB)
+    cron2._run_catch_up = await _no_backfill_into(backfills)  # type: ignore[method-assign]
+    await cron2._catch_up(
+        datetime.datetime(2026, 7, 1, 10, 30, 20, tzinfo=_UTC)
+    )
+    await asyncio.sleep(0)
+    assert cron2._caught_up is True
+    assert backfills == []
+
+
+async def test_a_disabled_job_closes_the_pin_it_carries(stateful_cron):
+    cron, ref, backfills = await _pinned_by_a_lifted_pause(stateful_cron)
+    cron.cron_jobs["p"].enabled = False
+    cron._catchup_next_retry = 0.0
+    await cron._catch_up(ref)
+    assert cron._caught_up is True
+    assert backfills == []
+    assert (await _newest(cron, "catchup/p"))["kind"] == "close"
+
+
+async def test_setting_aside_reads_the_pin_when_the_listing_is_untrusted(
+    stateful_cron,
+):
+    # an incomplete stream listing answers for nobody: each job set aside
+    # then reads its own stream, and the pin still closes
+    cron, ref, backfills = await _pinned_by_a_lifted_pause(stateful_cron)
+    backend = cron.state_backend
+
+    async def _untrusted(prefix):
+        return [], False
+
+    backend.list_stream_names_audit = _untrusted  # type: ignore[method-assign]
+    cron.cron_jobs["p"].onMissed = "skip"
+    cron._catchup_next_retry = 0.0
+    await cron._catch_up(ref)
+    assert cron._caught_up is True
+    assert (await _newest(cron, "catchup/p"))["kind"] == "close"
+
+
+async def test_setting_aside_defers_when_the_pin_cannot_be_read(
+    stateful_cron,
+):
+    # a pin that cannot be read cannot be closed: the job stays pending
+    # rather than latching with the pin left open, and the recheck closes it
+    cron, ref, backfills = await _pinned_by_a_lifted_pause(stateful_cron)
+    cron.cron_jobs["p"].onMissed = "skip"
+    real_read = cron._pending_catchup_watermark
+    failing = {"read": True}
+
+    async def _flaky_read(name):
+        if failing["read"]:
+            _raise_runtime()
+        return await real_read(name)
+
+    cron._pending_catchup_watermark = _flaky_read  # type: ignore[method-assign]
+    cron._catchup_next_retry = 0.0
+    await cron._catch_up(ref)
+    assert cron._caught_up is False
+    assert "p" not in cron._catchup_done
+    assert (await _newest(cron, "catchup/p"))["kind"] == "open"
+    failing["read"] = False  # the store recovers
+    cron._catchup_next_retry = 0.0
+    await cron._catch_up(ref)
+    assert cron._caught_up is True
+    assert (await _newest(cron, "catchup/p"))["kind"] == "close"
+
+
+async def test_a_job_set_aside_without_a_pin_reads_nothing(stateful_cron):
+    # the default fleet is onMissed: skip throughout; one listing answers
+    # for every job, and a job with no checkpoint stream costs no read
+    cron = await stateful_cron(_SKIP_JOB)
+    backend = cron.state_backend
+    real_list = backend.list_records
+    streams = []
+
+    async def _recording(stream, *args, **kwargs):
+        streams.append(stream)
+        return await real_list(stream, *args, **kwargs)
+
+    backend.list_records = _recording  # type: ignore[method-assign]
+    await cron._catch_up(datetime.datetime(2026, 7, 1, 10, 0, 30, tzinfo=_UTC))
+    assert cron._caught_up is True
+    assert not [s for s in streams if s.startswith("catchup/")]

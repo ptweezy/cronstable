@@ -1311,7 +1311,8 @@ def _claim_task(
     # launches): reconciliation trusts a RUNNING task with proc == our token,
     # so a store hiccup on the pid write cannot make it fail a live task, and a
     # launch that never lands is failed explicitly by the driver, not left for
-    # reconciliation to guess.
+    # reconciliation to guess.  The one claim the driver cannot fail is one
+    # whose intents never reached it; see release_lost_claims.
     entry["proc"] = proc
     entry["pid"] = None
     entry["host"] = host
@@ -1322,6 +1323,11 @@ def _claim_task(
         entry["pokeCount"] = 0
         entry["firstPokeAt"] = now
         entry["nextPokeAt"] = None
+    else:
+        # a task retyped from a sensor may carry its poke count; the plain
+        # claim is poke 0, and the launch registry reads the entry
+        # (DagScheduler._repair_lost_claims)
+        entry.pop("pokeCount", None)
     result.launches.append(
         LaunchIntent(
             task_id=task.id,
@@ -1719,6 +1725,61 @@ def set_task_pids(
             return _DOC_KEEP, 0
         body["updatedAt"] = now
         return body, applied
+
+    return transform
+
+
+def release_lost_claims(
+    spec: DagSpec,
+    claims: list[tuple[str, str, int, int]],
+    now: float,
+):
+    """Transform undoing claims whose launch intents the driver never got.
+
+    A claim RMW whose write lands after the awaiting side timed out leaves
+    the instance RUNNING under the owner's proc token with nothing launched
+    (the intents rode the abandoned result).  Reconcile trusts that token,
+    so only the driver, which records what it launched, can tell such an
+    entry from a live one (see ``DagScheduler._repair_lost_claims``).
+    ``claims`` holds ``(taskkey, proc, attempt, pokeCount)`` per entry, and
+    each is undone only under that exact fence: a completion or re-claim
+    that landed since is left alone.  A plain task returns to ``pending``
+    with its attempt unchanged (nothing ran, so no attempt is spent) and
+    ``startedAt`` cleared, so the re-claim stamps the real launch time; a
+    sensor takes the idle-between-pokes shape, due now, keeping the
+    ``firstPokeAt`` its poke timeout counts from.  The result lists the
+    task keys released.
+    """
+
+    def transform(body):
+        if body is None or is_terminal_run(body):
+            return _DOC_KEEP, []
+        released = []
+        tasks = body.get("tasks", {})
+        for taskkey, proc, attempt, poke in claims:
+            entry = tasks.get(taskkey)
+            if entry is None or entry.get("state") != RUNNING:
+                continue
+            if entry.get("proc") != proc:
+                continue  # re-claimed by another owner: not ours to undo
+            if int(entry.get("attempt", 0)) != attempt:
+                continue  # a newer attempt is the live one
+            if int(entry.get("pokeCount", 0)) != poke:
+                continue  # a later poke is the live one
+            entry["proc"] = None
+            entry["pid"] = None
+            task = spec.by_id.get(entry.get("id"))
+            if task is not None and task.type == SENSOR:
+                entry["nextPokeAt"] = now
+            else:
+                entry["state"] = PENDING
+                entry["startedAt"] = None
+            entry["updatedAt"] = now
+            released.append(taskkey)
+        if not released:
+            return _DOC_KEEP, []
+        body["updatedAt"] = now
+        return body, released
 
     return transform
 

@@ -113,7 +113,12 @@ from cronstable.resources import (
     ResourceUsage,
     resolve_node_history_config,
 )
-from cronstable.state import Lease, StateBackend, make_state_backend
+from cronstable.state import (
+    Lease,
+    StateBackend,
+    make_state_backend,
+    store_identity,
+)
 
 
 class _AiohttpDoor:
@@ -221,6 +226,11 @@ STATE_OP_TIMEOUT = 10.0
 MAX_PENDING_STATE_WRITES = 8192
 # Retry cadence when catch-up could not resolve (backend/cluster not ready).
 CATCHUP_RECHECK_INTERVAL = 30.0
+#: Passes a job whose catch-up pin cannot be read or closed stays
+#: unresolved before it latches with the pin left open: a store outage
+#: must not keep re-evaluating (and re-listing) jobs nothing will backfill
+#: for its whole length; the next boot reads the pin as it always has.
+CATCHUP_PIN_RETRIES = 3
 # Idle wait between serialized backfill launches (pacing, not correctness);
 # Forbid waits unbounded because launching would be swallowed.
 CATCHUP_IDLE_WAIT_LIMIT = 30.0
@@ -1762,17 +1772,12 @@ def schedule_slot(
     clock ONCE: the same instant decides "due" and is recorded for de-dup, so
     the two cannot straddle a slot boundary and double-launch a single-slot
     job.  It is rendered into the job's own frame first: an explicit timezone
-    via ``astimezone``, or local time (naive, matching ``get_now(None)``) for
-    a job without one.  ``now`` omitted reads the clock fresh per job.
+    via ``astimezone``, or ``LOCAL_ZONE`` (the host clock, the scheduler's
+    own frame) for a job without one.  ``now`` omitted reads the clock
+    fresh per job.
     """
-    if now is None:
-        now = get_now(job.timezone)
-    elif job.timezone is not None:
-        now = now.astimezone(job.timezone)
-    else:
-        # no explicit timezone -> local wall clock, naive, exactly as
-        # get_now(None) (datetime.now(None)) would have returned.
-        now = now.astimezone().replace(tzinfo=None)
+    frame = job.frame
+    now = get_now(frame) if now is None else now.astimezone(frame)
     if job.has_seconds:
         return now.replace(microsecond=0)
     return now.replace(second=0, microsecond=0)
@@ -2186,6 +2191,10 @@ class Cron:
         # in-flight notify fan-outs, fire-and-forget (a slow reporter must
         # never stall the loop); cancelled at shutdown.
         self._notify_tasks: set[asyncio.Task] = set()
+        # in-flight cancels of instances a cluster Replace request named;
+        # joined (bounded) at shutdown, never cancelled: a cancel cut off
+        # mid-kill skips the unconditional group kill.
+        self._replace_cancel_tasks: set[asyncio.Task] = set()
         # in-flight completion sequences of finished jobs; drained at
         # shutdown and chained per job via _completion_tail so overlapping
         # instances are handled in finish order.
@@ -2208,6 +2217,9 @@ class Cron:
         # names whose catch-up decision is final, so unresolved jobs
         # elsewhere do not re-process them next pass.
         self._catchup_done: set[str] = set()
+        # passes in which a job's catch-up pin could not be read or closed;
+        # CATCHUP_PIN_RETRIES of them latch the job with its pin left open
+        self._catchup_pin_failures: dict[str, int] = {}
         # loop-clock gate for re-evaluating unresolved catch-up (see
         # CATCHUP_RECHECK_INTERVAL); 0.0 means "evaluate on the next pass".
         self._catchup_next_retry = 0.0
@@ -2313,6 +2325,10 @@ class Cron:
         # locks behave, else the reason they cannot be trusted. Reset when
         # the backend is rebuilt.
         self._slot_fidelity: Optional[str] = None
+        # store_identity of the store holding this process's slot leases;
+        # kept across a failed restart so a move or section removal during
+        # that outage still drops them.
+        self._slot_store: Optional[tuple[str, str]] = None
         # the in-flight cross-node retry claim scan, if any (single-flight;
         # see _retry_claim_scan).
         self._retry_claim_task: Optional[asyncio.Task] = None
@@ -2473,6 +2489,10 @@ class Cron:
         for task in list(self._slot_renewers.values()):
             task.cancel()
         self._slot_renewers.clear()
+        # the drain reaped every replaced instance, so a Replace cancel
+        # task has at most its _on_stop tail left; join it, bounded.
+        if self._replace_cancel_tasks:
+            await asyncio.wait(set(self._replace_cancel_tasks), timeout=5)
 
         # cancel pending catch-up backfills and in-flight notifications
         # (best-effort; each reporter is time-bounded).
@@ -3930,7 +3950,7 @@ class Cron:
                 "level": "note",
                 "message": message,
             }
-        zone = job.timezone or datetime.datetime.now().astimezone().tzinfo
+        zone = job.frame
         payload: dict[str, Any] = {
             "job": name,
             "enabled": job.enabled,
@@ -5325,8 +5345,8 @@ class Cron:
             # no future occurrence; the engine's answer would be None too,
             # found only after walking the remaining horizon
             return None
-        seconds: Optional[float] = crontab.next(
-            now=get_now(job.timezone), default_utc=job.utc
+        seconds: Optional[float] = job.next_delay(
+            get_now(datetime.timezone.utc)
         )
         return seconds
 
@@ -5345,10 +5365,7 @@ class Cron:
             return False
         if name in self._dead_schedules:
             return True
-        return (
-            job.schedule.next(now=get_now(job.timezone), default_utc=job.utc)
-            is None
-        )
+        return job.next_delay(get_now(datetime.timezone.utc)) is None
 
     def fleet_job_summaries(self) -> dict[str, Any]:
         """Compact per-job snapshot gossiped to peers for the fleet view.
@@ -7344,6 +7361,27 @@ class Cron:
                 return
             self.observability_mesh = mgr
 
+    def _drop_store_slots(self) -> None:
+        """Forget the slot leases, renewers and Replace pursuits of a store
+        this process is leaving; one warning per live cluster-scoped run
+        whose fence stays behind.
+        """
+        for name in self._slot_leases:
+            if self.running_jobs.get(name):
+                logger.warning(
+                    "Job %s: its cluster concurrency slot stays in the "
+                    "previous state store while the run continues here; "
+                    "a peer may launch it once that lease expires",
+                    name,
+                )
+        for task in list(self._slot_renewers.values()):
+            task.cancel()
+        self._slot_renewers.clear()
+        self._slot_leases.clear()
+        for task in list(self._slot_pursuits.values()):
+            task.cancel()
+        self._slot_pursuits.clear()
+
     async def start_stop_state(
         self, state_config: Optional[StateConfig]
     ) -> None:
@@ -7370,6 +7408,20 @@ class Cron:
             self._state_gc_grace = 0.0
             self._slot_ttl = 30.0
         backend = self.state_backend
+        # The held slot leases live in one store (store_identity): a
+        # same-store rebuild keeps them, their renewers and any Replace
+        # pursuit (the renewer re-reads self.state_backend every period);
+        # a move leaves them behind to lapse by TTL, and the next launch
+        # claims in the new store. The remembered identity is the
+        # reference rather than the live backend: a failed same-store
+        # restart keeps the leases for the retry, and a move or removal
+        # during that outage still drops them.
+        store = (
+            store_identity(state_config) if state_config is not None else None
+        )
+        if self._slot_store is not None and store != self._slot_store:
+            self._drop_store_slots()
+            self._slot_store = None
         if backend is not None and (
             state_config is None or state_config != backend.config
         ):
@@ -7396,18 +7448,7 @@ class Cron:
             # that have none in memory yet, instead of serving the old
             # store's history forever.
             self._state_rehydrated = False
-            # the concurrency slots live in the OLD store: drop the held
-            # leases (they lapse there by TTL) and stop their renewers and
-            # any Replace pursuits; re-claiming in the new store is the
-            # next launch's business. The lock-fidelity verdict is also
-            # per-store.
-            for task in list(self._slot_renewers.values()):
-                task.cancel()
-            self._slot_renewers.clear()
-            self._slot_leases.clear()
-            for task in list(self._slot_pursuits.values()):
-                task.cancel()
-            self._slot_pursuits.clear()
+            # the lock-fidelity verdict is re-probed per backend generation
             self._slot_fidelity = None
             # The @reboot gate's "store timed out, stop probing" latch is a
             # per-store health verdict just like the lock-fidelity one above:
@@ -7422,7 +7463,12 @@ class Cron:
             # to the old store; drop them (renewers cancelled, leases lapse by
             # TTL) so the new store's active runs are re-adopted from scratch
             # by reconcile_on_boot (re-run because _state_rehydrated cleared).
-            self._dag.forget()
+            # Queued task completions survive a same-store rebuild: they
+            # apply to the documents the replacement backend serves.
+            self._dag.forget(
+                same_store=store is not None
+                and store == store_identity(backend.config)
+            )
         elif backend is not None and state_config is not None:
             # config byte-identical, so the teardown above did not fire: the
             # store backend stays, but the job API's TLS certificate may have
@@ -7449,6 +7495,7 @@ class Cron:
                 )
                 return
             self.state_backend = backend
+            self._slot_store = store
             self._state_max_runs = state_config.get("maxRunsPerJob", 0)
             if self._state_max_runs == 1:
                 # Once per backend start, never per append, and never
@@ -8460,21 +8507,13 @@ class Cron:
     ) -> Optional[datetime.datetime]:
         """The aware-UTC instant ``job`` next fires strictly after ``after``.
 
-        The frame stays timezone-AWARE (job tz or system-local) so
-        CronTab.next returns a real duration corrected for DST; a naive
-        frame would land an hour off across a DST change. None when the
-        schedule has no further occurrence.
+        Resolved in the job's frame (:attr:`JobConfig.frame`): its zone,
+        or the host clock, whose fixed-offset shortcut
+        (:meth:`CronTab.next_local`) applies wherever the host offset is
+        provably constant across the answer. None when the schedule has
+        no further occurrence.
         """
-        crontab = job.schedule
-        assert isinstance(crontab, CronTab)
-        if job.timezone is not None:
-            frame: datetime.datetime = after.astimezone(job.timezone)
-        else:
-            # no explicit timezone -> the system-local wall clock, but kept
-            # AWARE (not .replace(tzinfo=None)) so the engine applies its
-            # DST correction. default_utc is inert for an aware `now`.
-            frame = after.astimezone()
-        delay = crontab.next(now=frame, default_utc=job.utc)
+        delay = job.next_delay(after)
         if delay is None:
             return None
         return after + datetime.timedelta(seconds=delay)
@@ -8658,10 +8697,8 @@ class Cron:
             assert isinstance(crontab, CronTab)
             now_slot = schedule_slot(job, now)
             # Record the fired slot as aware UTC, matching the normal
-            # branch, so _last_run_slot never mixes naive and aware
-            # values. schedule_slot renders now into the job's OWN frame
-            # (what crontab.test matches); astimezone(utc) reads a naive
-            # slot as local and is a no-op for an already-UTC one.
+            # branch. schedule_slot renders now into the job's OWN frame
+            # (what crontab.test matches); astimezone(utc) maps it back.
             fires = (
                 [now_slot.astimezone(datetime.timezone.utc)]
                 if crontab.test(now_slot)
@@ -8755,17 +8792,18 @@ class Cron:
 
     async def _checkpoint_catchup(
         self, name: str, kind: str, watermark: Optional[str]
-    ) -> None:
+    ) -> bool:
         """Append an ``open``/``close`` catch-up checkpoint (best-effort).
 
         A failure never blocks the backfill (costs crash-resume fidelity
         only). At-least-once: a timed-out ``open`` write can land AFTER
         the cycle's ``close`` and sort newer; the next restart then
         replays a completed cycle. Bounded replay, never a loss.
+        Returns whether the record landed.
         """
         backend = self.state_backend
         if backend is None:
-            return
+            return False
         record = {
             "kind": kind,
             "watermark": watermark or "",
@@ -8788,10 +8826,93 @@ class Cron:
                 name,
                 ex,
             )
+            return False
+        return True
+
+    async def _close_catchup_pin(
+        self, name: str, watermark: Optional[str], pinned: bool
+    ) -> bool:
+        """Close ``name``'s open catch-up cycle when ``pinned``.
+
+        Nothing owed must still close a pause pin (or a dropped backfill's
+        ``open``): left newest in the stream, the next boot hoists back
+        to its watermark and replays the ordinary runs since. ``pinned``
+        is :meth:`_missed_occurrences`' reading of the stream, so a plain
+        boot appends nothing and re-reads nothing. False: the close was
+        dropped; defer, never latch.
+        """
+        if not pinned:
+            return True
+        return await self._checkpoint_catchup(name, "close", watermark)
+
+    def _catchup_pin_deferred(self, name: str) -> bool:
+        """Whether a failed pin read or close defers ``name`` to the next
+        pass (True) or, after :data:`CATCHUP_PIN_RETRIES` such passes,
+        latches it with the pin left open (False, with a warning)."""
+        failures = self._catchup_pin_failures.get(name, 0) + 1
+        if failures < CATCHUP_PIN_RETRIES:
+            self._catchup_pin_failures[name] = failures
+            return True
+        self._catchup_pin_failures.pop(name, None)
+        logger.warning(
+            "catch-up: the checkpoint of %s could not be read or closed in "
+            "%d passes; leaving it as it is (the next boot may hoist its "
+            "watermark back to it)",
+            name,
+            failures,
+        )
+        return False
+
+    async def _pinned_catchup_names(self) -> Optional[set[str]]:
+        """Jobs with a catch-up checkpoint stream in the store, from one
+        listing; None when the listing cannot be trusted, so the caller
+        asks each stream instead."""
+        backend = self.state_backend
+        if backend is None:
+            return None
+        try:
+            names, complete = await asyncio.wait_for(
+                backend.list_stream_names_audit(CATCHUP_STREAM_PREFIX),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the per-job read decides
+            return None
+        if not complete:
+            return None
+        prefix = len(CATCHUP_STREAM_PREFIX)
+        return {name[prefix:] for name in names}
+
+    async def _retire_catchup_pin(
+        self, name: str, pinned: Optional[set[str]]
+    ) -> bool:
+        """Close the open checkpoint of a job nothing will backfill.
+
+        ``pinned`` is :meth:`_pinned_catchup_names`; a job outside it has
+        no stream to read. False: the pin could not be read or closed;
+        defer, never latch.
+        """
+        if pinned is not None and name not in pinned:
+            return True
+        try:
+            pending = await self._pending_catchup_watermark(name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - defer, never latch
+            logger.warning(
+                "catch-up: cannot read the checkpoint of %s (%s); will retry",
+                name,
+                ex,
+            )
+            return False
+        if pending is None:
+            return True
+        return await self._checkpoint_catchup(name, "close", pending)
 
     async def _missed_occurrences(
         self, job: JobConfig, now: datetime.datetime
-    ) -> tuple[int, Optional[str]]:
+    ) -> tuple[int, Optional[str], bool]:
         """How many catch-up launches ``job`` is owed, and from where.
 
         Steps the schedule forward (DST-safe) from the durable last-run
@@ -8801,7 +8922,8 @@ class Cron:
         Returns (0, ...) when nothing was missed or the job never ran
         under this store; (1, ...) for run-once; the bounded count for
         run-all. Second element is the reference watermark for the
-        cycle's checkpoint. Store errors propagate: callers treat them
+        cycle's checkpoint; third, whether an open checkpoint is pinned.
+        Store errors propagate: callers treat them
         as "cannot evaluate yet", never "nothing owed".
         """
         watermark = await asyncio.wait_for(
@@ -8809,11 +8931,12 @@ class Cron:
         )
         after = _parse_iso_utc(watermark)
         pending = await self._pending_catchup_watermark(job.name)
+        pinned = pending is not None
         pending_dt = _parse_iso_utc(pending)
         if pending_dt is not None and (after is None or pending_dt < after):
             after, watermark = pending_dt, pending
         if after is None:
-            return 0, None
+            return 0, None, pinned
         # Slots inside a (possibly expired) pause window are never owed,
         # and ONLY those: the window is skipped while walking, never used
         # as a floor on `after` (see _pause_excusal_window).
@@ -8853,7 +8976,7 @@ class Cron:
                 continue
             count += 1
             if job.onMissed == "run-once":
-                return 1, watermark  # all missed slots coalesce into one
+                return 1, watermark, pinned  # missed slots coalesce into one
             # run-all: count each missed occurrence, hard-capped.
             if count >= MAX_CATCHUP_OCCURRENCES:
                 logger.warning(
@@ -8866,7 +8989,7 @@ class Cron:
                 )
                 break
             nxt = self._compute_next_fire(job, nxt)
-        return count, watermark
+        return count, watermark, pinned
 
     async def _catch_up(self, now: datetime.datetime) -> None:
         """Replay (or coalesce) runs missed while down, on start-up.
@@ -8947,6 +9070,15 @@ class Cron:
     async def _evaluate_catch_up(self, now: datetime.datetime) -> bool:
         """One catch-up evaluation pass; returns whether jobs stay pending."""
         unresolved = False
+        # the stream listing serves only the retire branch below, and only
+        # on the first pass that reaches it: list on demand, once per pass
+        listing: list[Optional[set[str]]] = []
+
+        async def pinned_names() -> Optional[set[str]]:
+            if not listing:
+                listing.append(await self._pinned_catchup_names())
+            return listing[0]
+
         for name, job in list(self.cron_jobs.items()):
             if name in self._catchup_done:
                 continue
@@ -8955,7 +9087,17 @@ class Cron:
                 or not job.enabled
                 or not isinstance(job.schedule, CronTab)
             ):
-                self._catchup_done.add(name)
+                # nothing will ever backfill this job, so a pin it carries
+                # (paused at a boot before its config changed) closes
+                # here; left open, the first boot after the change is
+                # undone would hoist the watermark back to it
+                if await self._retire_catchup_pin(
+                    name, await pinned_names()
+                ) or not self._catchup_pin_deferred(name):
+                    self._catchup_done.add(name)
+                    self._catchup_pin_failures.pop(name, None)
+                else:
+                    unresolved = True
                 continue
             if self._pause_active(name) is not None:
                 # No backfill while paused, but a pause excuses only its
@@ -9009,7 +9151,9 @@ class Cron:
                     unresolved = True
                 continue
             try:
-                count, watermark = await self._missed_occurrences(job, now)
+                count, watermark, pinned = await self._missed_occurrences(
+                    job, now
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as ex:  # noqa: BLE001 - defer, never crash
@@ -9021,7 +9165,13 @@ class Cron:
                 unresolved = True
                 continue
             if count <= 0:
-                self._catchup_done.add(name)
+                if await self._close_catchup_pin(
+                    name, watermark, pinned
+                ) or not self._catchup_pin_deferred(name):
+                    self._catchup_done.add(name)
+                    self._catchup_pin_failures.pop(name, None)
+                else:
+                    unresolved = True
                 continue
             # Checkpoint the intent BEFORE scheduling: a crash/restart
             # mid-jitter or mid-backfill then resumes from `watermark`
@@ -9090,7 +9240,9 @@ class Cron:
             # would stretch the window over slots the live scheduler
             # already fired during the jitter and replay them.
             try:
-                count, watermark = await self._missed_occurrences(job, now)
+                count, watermark, _pinned = await self._missed_occurrences(
+                    job, now
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as ex:  # noqa: BLE001 - drop, resume on restart
@@ -9895,10 +10047,12 @@ class Cron:
             if bool(size_conflict) != self._was_size_conflict:
                 if size_conflict:
                     logger.error(
-                        "cluster: cluster-size disagreement -- agreeing peers "
-                        "declare %s but we declare %d; Leader jobs will stand "
-                        "down until every node's cluster.peers agree on the "
-                        "member set",
+                        "cluster: cluster-size disagreement -- reachable "
+                        "peers declare %s but we declare %d; Leader jobs will "
+                        "stand down until every reachable peer's "
+                        "cluster.peers agrees on the member set (a node "
+                        "leaving the cluster counts until it is stopped or "
+                        "removed from every peer list)",
                         ", ".join(str(s) for s in size_conflict),
                         mgr.cluster_size(),
                     )
@@ -9915,7 +10069,7 @@ class Cron:
             if bool(policy_conflict) != self._was_policy_conflict:
                 if policy_conflict:
                     logger.error(
-                        "cluster: coordination-policy divergence -- agreeing "
+                        "cluster: coordination-policy divergence -- reachable "
                         "peers declare %s; Leader jobs will stand down until "
                         "every node's cluster.distribution and "
                         "cluster.electLeader agree",
@@ -10557,19 +10711,27 @@ class Cron:
 
         Renews at a third of the TTL and doubles as the Replace listener
         (a cancel record for our exact fence cancels local instances,
-        marked replaced). A positively refused renew stops renewing but
+        marked replaced, in the background: renewal continues through
+        the drain). A positively refused renew stops renewing but
         NEVER cancels the running work; an ambiguous refusal keeps
         retrying (same-fence renew slightly past expiry is allowed, so a
         single blip self-heals).
         """
-        period = max(1.0, self._slot_ttl / 3)
         me = asyncio.current_task()
         while True:
-            await asyncio.sleep(period)
-            backend = self.state_backend
+            # per period: a state-section reload changes _slot_ttl under
+            # a kept renewer.
+            await asyncio.sleep(max(1.0, self._slot_ttl / 3))
             lease = self._slot_leases.get(name)
-            if backend is None or lease is None:
+            if lease is None:
                 return
+            backend = self.state_backend
+            if backend is None:
+                # a same-store rebuild spans several awaits between the
+                # old backend's stop() and the replacement's start(); the
+                # lease is still ours, so wait (the finish path retires a
+                # renewer whose store never returns).
+                continue
             try:
                 recs = await asyncio.wait_for(
                     backend.list_records(
@@ -10586,19 +10748,9 @@ class Cron:
                 rec is not None
                 and rec.get("kind") == "cancel"
                 and rec.get("fence") == lease.fence
-                and self.running_jobs.get(name)
             ):
-                logger.info(
-                    "Job %s: node %s requested this instance be replaced "
-                    "(concurrencyPolicy: Replace, concurrencyScope: "
-                    "cluster); cancelling",
-                    name,
-                    rec.get("by"),
-                )
-                for running_job in list(self.running_jobs.get(name) or []):
-                    running_job.replaced = True
-                    await running_job.cancel()
                 # the finish path releases the slot; keep renewing till then
+                self._cancel_replaced_instances(name, rec.get("by"))
             try:
                 renewed = await asyncio.wait_for(
                     backend.renew_lease(lease, self._slot_ttl),
@@ -10656,6 +10808,46 @@ class Cron:
                 self._slot_leases.pop(name, None)
                 return
             # our lease on disk (blip) or unreadable: keep trying.
+
+    def _cancel_replaced_instances(self, name: str, by: Any) -> None:
+        """Cancel the local instances a cluster Replace request names.
+
+        Each cancel runs as a tracked task: cancel() blocks up to
+        killTimeout, longer than the lease may have left, so the renewer
+        never awaits it. ``replaced`` is the single-flight guard; the
+        cancel record stays in the stream and is re-read every period.
+        """
+        pending = [
+            rj for rj in self.running_jobs.get(name) or [] if not rj.replaced
+        ]
+        if not pending:
+            return
+        logger.info(
+            "Job %s: node %s requested this instance be replaced "
+            "(concurrencyPolicy: Replace, concurrencyScope: cluster); "
+            "cancelling",
+            name,
+            by,
+        )
+        for running_job in pending:
+            running_job.replaced = True
+            task = asyncio.create_task(
+                self._cancel_replaced_instance(running_job)
+            )
+            self._replace_cancel_tasks.add(task)
+            task.add_done_callback(self._replace_cancel_tasks.discard)
+
+    async def _cancel_replaced_instance(self, running_job: RunningJob) -> None:
+        try:
+            await running_job.cancel()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the reaper still completes the run
+            logger.warning(
+                "Job %s: cancelling the replaced instance failed",
+                running_job.config.name,
+                exc_info=True,
+            )
 
     async def _release_cluster_slot(self, job: JobConfig) -> None:
         """Hand back the slot when a cluster-scoped job's last user is done.
