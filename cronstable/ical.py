@@ -35,7 +35,7 @@ from collections.abc import Sequence
 from typing import NamedTuple, Optional
 
 from cronstable.cronexpr import CronTab
-from cronstable.croninfo import _local_tzinfo, _walk_frame, describe_cron
+from cronstable.croninfo import _local_tzinfo, _walk_fires, describe_cron
 
 __all__ = ["CalendarEntry", "render_calendar"]
 
@@ -174,8 +174,8 @@ def render_calendar(
         "X-PUBLISHED-TTL:PT1H",
     ]
     # the host clock walks on a fixed offset wherever the window and the
-    # engine's look-back hold no transition (croninfo._walk_frame)
-    local_tz = _walk_frame(_local_tzinfo(), start, end_utc)
+    # engine's look-back hold no transition (croninfo._walk_fires)
+    local_tz = _local_tzinfo()
     for entry in entries:
         zone = entry.timezone or local_tz
         block = _block_seconds(entry.avg_duration)
@@ -194,10 +194,8 @@ def render_calendar(
         desc = _escape(description)
         count = 0
         truncated = False
-        for fire in entry.tab.occurrences(start.astimezone(zone)):
+        for fire in _walk_fires(entry.tab, zone, start, end_utc):
             fire_utc = fire.astimezone(datetime.timezone.utc)
-            if fire_utc >= end_utc:
-                break
             if count >= per_job_cap:
                 truncated = True
                 break

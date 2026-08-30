@@ -1550,6 +1550,18 @@ class DagScheduler:
         self._pending_completions.pop((ref, taskkey), None)
         self._settle_launch(ref, taskkey, attempt, poke)
 
+    def _drop_completion(self, ref: RunRef, taskkey: Any) -> None:
+        """Drop a completion that will never be recorded (its DAG or task
+        left the config, or its store is gone) without settling the launch.
+
+        The subprocess did run here, so the registry key stays: the entry
+        it left RUNNING under our token is a launch whose result was
+        dropped, not a lost claim, and :meth:`_repair_lost_claims` must
+        not release it to run again.  The key goes with the run
+        (:meth:`_prune_launched`).
+        """
+        self._pending_completions.pop((ref, taskkey), None)
+
     def _prune_launched(self, name: str, finished: set[str]) -> None:
         """Forget the launch registry of every run of ``name`` the store
         shows terminal, whichever node finished it (a run finished here
@@ -2035,8 +2047,8 @@ class DagScheduler:
         ref = (dref.dag_name, dref.run_key)
         if dref.dag_name not in self._dags():
             # dag removed mid-run; the doc is orphaned, GC handles it.  The
-            # dropped completion is settled all the same.
-            self._settle_completion(ref, dref.taskkey, dref.attempt, dref.poke)
+            # completion is dropped; its launch key stays (it did run).
+            self._drop_completion(ref, dref.taskkey)
             return
         success = running.fail_reason is None
         # sampled usage (monitorResources) rides the completion into the
@@ -2105,9 +2117,7 @@ class DagScheduler:
             # dag removed on reload: drop these completions (and any queued
             # retry of them), exactly as _finish_task drops a removed task's.
             for entry in entries:
-                self._settle_completion(
-                    ref, entry["taskkey"], entry["attempt"], entry["poke"]
-                )
+                self._drop_completion(ref, entry["taskkey"])
             return
         marks: list[dict[str, Any]] = []
         live: list[dict[str, Any]] = []
@@ -2117,9 +2127,7 @@ class DagScheduler:
                 # the task was removed from the DAG (a config reload) while its
                 # instance was running: drop the stale completion (and a queued
                 # retry of it, which would otherwise re-run forever).
-                self._settle_completion(
-                    ref, entry["taskkey"], entry["attempt"], entry["poke"]
-                )
+                self._drop_completion(ref, entry["taskkey"])
                 continue
             jitter = (
                 _jitter(task.poke_jitter) if task.type == dag.SENSOR else 0.0
@@ -2141,6 +2149,12 @@ class DagScheduler:
             live.append(entry)
         if not marks:
             return  # every entry was a removed task: nothing to record/advance
+        if self._backend() is None:
+            # no store to record into (a state rebuild mid-restart): queue
+            # the batch for retry instead of settling it against nothing,
+            # which would drop it and its launch keys
+            self._requeue_entries(ref, live)
+            return
         transform = self._wrap(dag.mark_tasks_finished(marks, _now()))
         try:
             _, applied = await self._mutate(ref[0], ref[1], transform)
@@ -2193,7 +2207,7 @@ class DagScheduler:
             # the task was removed from the DAG (a config reload) while its
             # instance was running: drop the stale completion (including a
             # queued retry of it, which would otherwise re-run forever).
-            self._settle_completion(ref, taskkey, attempt, poke)
+            self._drop_completion(ref, taskkey)
             return
         jitter = _jitter(task.poke_jitter) if task.type == dag.SENSOR else 0.0
         transform = self._wrap(
@@ -2321,6 +2335,8 @@ class DagScheduler:
         pokes apart).  A settled entry (applied OR fenced out as stale) pops
         the queue entry; another failure re-queues it with a bounded backoff.
         """
+        if self._backend() is None:
+            return  # nothing to record into yet; the queue keeps its entries
         for key in list(self._pending_completions):
             pc = self._pending_completions.get(key)
             if pc is None or pc["nextTryAt"] > now:
@@ -2330,9 +2346,7 @@ class DagScheduler:
             if dagcfg is None:
                 # dag removed on reload: the stale completion is dropped,
                 # like on_task_finished drops it.
-                self._settle_completion(
-                    ref, pc["taskkey"], pc["attempt"], pc["poke"]
-                )
+                self._drop_completion(ref, pc["taskkey"])
                 continue
             await self._finish_task(
                 dagcfg,
@@ -3038,7 +3052,7 @@ class DagScheduler:
         for ref in list(self._owned):
             await self._release(ref)
 
-    def forget(self) -> None:
+    def forget(self, same_store: bool = False) -> None:
         """Drop all in-memory run ownership after a backend swap.
 
         The old store's advance leases lapse by TTL (their renewers are
@@ -3047,6 +3061,12 @@ class DagScheduler:
         :meth:`reconcile_on_boot`, which reruns because the backend swap
         cleared ``_state_rehydrated``.  No store ops here -- the old backend is
         already gone.
+
+        ``same_store``: the replacement backend serves the same documents
+        (a ``state`` edit that keeps the store identity), so queued
+        completions still apply and are held for the next flush.  On a
+        move they are dropped, but never settled: their launch keys stay,
+        so a still-RUNNING entry of ours is not read as a lost claim.
         """
         if self._service_task is not None and not self._service_task.done():
             self._service_task.cancel()
@@ -3068,25 +3088,15 @@ class DagScheduler:
         self._next_logical.clear()
         self._seeded.clear()
         self._seed_failed.clear()
-        # queued completions targeted the old store; the new store's runs are
-        # reconciled from scratch (a still-RUNNING entry is recovered there).
-        # Dropping a completion settles it, so its launch key goes too; the
-        # registry itself is per process and survives the swap, since a
-        # subprocess still running here stays ours on the new store.
-        for ref, entries in list(self._completion_buffer.items()):
-            for entry in entries:
-                self._settle_completion(
-                    ref,
-                    entry.get("taskkey"),
-                    entry.get("attempt"),
-                    entry.get("poke"),
-                )
-        for (ref, taskkey), pc in list(self._pending_completions.items()):
-            self._settle_completion(
-                ref, taskkey, pc.get("attempt"), pc.get("poke")
-            )
-        self._pending_completions.clear()
-        self._completion_buffer.clear()
+        # The launch registry is per process and survives the swap: a
+        # subprocess that ran here stays ours on the new store, and an
+        # entry it left RUNNING must never be released as a lost claim
+        # and run twice.  Queued completions are kept for the same store
+        # (they apply to the same documents) and dropped, keys intact,
+        # for a different one, whose runs are reconciled from scratch.
+        if not same_store:
+            self._pending_completions.clear()
+            self._completion_buffer.clear()
         # Run keys are deterministic (dag name + logical date), so the new
         # store's runs collide with whatever the old store left cached here.
         # _dag_summary_cache is the load-bearing one: _dag_run_rollup skips

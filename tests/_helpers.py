@@ -63,6 +63,11 @@ def _pin_host_zone(monkeypatch, name, years=None):
     # host; the pinned zone starts with none, and the real ones return
     # with the undo
     monkeypatch.setattr(cronexpr.LOCAL_ZONE, "_frames", [])
+    # the lint memos key the host clock on a reading held for a minute;
+    # the pinned zone starts with a fresh one
+    from cronstable import croninfo
+
+    monkeypatch.setattr(croninfo, "_host_key", None)
     return zone
 
 

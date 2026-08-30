@@ -36,9 +36,12 @@
   runs since as missed, one run under `run-once` and up to 100 serialized
   runs under `run-all`. The close is written only when a pin exists (one
   listing of the checkpoint streams tells the boot which jobs carry one),
-  so a plain boot appends nothing to the stream, and a pin that cannot be
-  read, or whose close is dropped, keeps the job pending for the next
-  recheck.
+  so a plain boot appends nothing to the stream, and the listing is taken
+  only when a pass reaches such a job. A pin that cannot be read, or whose
+  close is dropped, keeps the job pending for the next recheck; after
+  three such passes the job is set aside with the pin left open and a
+  warning names it, so a store outage cannot hold every catch-up recheck
+  open for its whole length.
 - The cluster `Replace` listener cancels the instances a peer's cancel
   record names in the background and keeps renewing the slot lease while
   they drain. A drain longer than the lease had left (the default
@@ -55,7 +58,10 @@
   changed `slotTtlSeconds` applies from the next renew. Any
   other edit to the section (`maxRunsPerJob`, `gcGraceSeconds`, a job API
   key) used to drop them, so the lease expired under the live run and a peer
-  could start a second instance of a `Forbid` job. A reload that moves the
+  could start a second instance of a `Forbid` job. Such a reload also keeps
+  the DAG task completions the reaper has handed over but not yet recorded:
+  they apply to the same documents and go in on the next flush, and a
+  flush that finds no backend yet holds them. A reload that moves the
   store, or removes the section, leaves the lease behind to lapse by TTL and
   logs a warning for each live cluster-scoped run whose fence stays in the
   old store.
@@ -71,7 +77,11 @@
   subprocess starts (a `state` section reload while the task waits behind
   the spawn gate) is released the same way. The record forgets a run once
   the store shows it finished or collected, whichever node finished it, so
-  a node handing runs to its peers holds nothing for them. Such a task
+  a node handing runs to its peers holds nothing for them. A completion the
+  node drops instead of recording (its DAG or task left the configuration
+  while the instance ran, or a reload moved the store) keeps its record:
+  the task ran, so its entry is not a lost claim and is never released to
+  run a second time. Such a task
   otherwise sat running under the owner's process token with no subprocess
   for the daemon's lifetime, its lease keeping peers out, and a restart then
   failed it as a crash without it ever having run.
@@ -107,11 +117,12 @@
   with the entry in place that grant is refused. Where the caller cannot
   assign the owner, which is what an unelevated prompt gets, the DACL still
   goes on and `init` names the owner it could not change together with the
-  fix. An existing machine-wide directory is handed over before the starter
-  is written and given its DACL after it. `init` refuses such a directory
-  when another account owns it and the hand-over is refused, and it refuses
-  a junction or symbolic link standing at the path; in either case it
-  writes nothing and leaves the directory's permissions as they were. A
+  fix. An existing machine-wide directory takes the starter first, then
+  the hand-over, then its DACL, so a write that fails changes nothing.
+  `init` refuses such a directory when another account owns it and the
+  hand-over is refused (the starter it wrote comes out again), and it
+  refuses a junction or symbolic link standing at the path; in either
+  case it leaves the directory as it found it. A
   directory holding `JOBS.YAML` is a live setup: `init` judges names
   case-folded, as the loader does.
 - The startup permission check reads the owner as well as the DACL. On a
@@ -128,7 +139,19 @@
   because icacls refuses `/setowner` beside `/grant`; a junction gets its
   own sentence, since no permission on a link changes what its target
   holds. A configuration directory under a user profile is never reported
-  for its owner by a user's own daemon or by `init`.
+  for its owner by a user's own daemon or by `init`; the shared `Public`
+  and `Default` profiles count as outside, and a launcher that scrubs
+  `USERPROFILE` is read through `HOMEDRIVE`/`HOMEPATH` or `APPDATA` before
+  every path is taken as outside.
+- The dashboard heatmap, the `.ics` feed and the TUI week view walk a
+  host-clock schedule frame by frame: each stretch the host keeps one
+  offset takes the engine's fixed-offset path, and only the bracket around
+  a DST transition walks with live offsets, so a window that holds a
+  transition costs the slower path for that bracket alone. The schedule
+  lint keys its per-zone memos for the host clock on the host's current
+  name and offset plus its offset on the first of each month, so two host
+  zones that agree today but transition differently never share an entry,
+  and the key is re-read once a minute, not on every lookup.
 - The dashboard's schedule engine walks a `utc: true` job in date
   arithmetic, with no zone lookup, and reads a zoned job's offset through
   the browser's zone tables twice per hour a walk touches rather than twice

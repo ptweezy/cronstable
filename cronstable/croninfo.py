@@ -39,8 +39,9 @@ import datetime
 import functools
 import itertools
 import re
+import time
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from typing import (
     Any,
     NamedTuple,
@@ -50,6 +51,7 @@ from typing import (
 from cronstable.cronexpr import (
     _DOW_NAMES,
     _MONTH_NAMES,
+    _ONE_SECOND,
     LOCAL_ZONE,
     CronTab,
     LocalZone,
@@ -893,33 +895,62 @@ def _offset_at(
 
 class _HostZoneKey:
     """What :data:`LOCAL_ZONE` keys the lint memos with: the host's current
-    zone name and offset.  The singleton itself would serve one host's
+    zone name and offset, plus its offset on the first of each month of
+    the current year.  The singleton itself would serve one host's
     transitions to another once the host's zone changes, or a test pins a
-    different one; this key misses instead.
+    different one; this key misses instead.  The monthly samples tell
+    apart two zones that agree today but transition differently (New York
+    and Cancun are both EST in January), which name and offset alone
+    would key alike.
     """
 
-    __slots__ = ("name", "offset")
+    __slots__ = ("name", "offset", "samples")
 
     def __init__(self) -> None:
-        civil = _local_civil(datetime.datetime.now(datetime.timezone.utc))
+        now = datetime.datetime.now(datetime.timezone.utc)
+        civil = _local_civil(now)
         self.name = civil.tzname()
         self.offset = civil.utcoffset()
+        self.samples = tuple(
+            _local_civil(
+                datetime.datetime(
+                    now.year, month, 1, tzinfo=datetime.timezone.utc
+                )
+            ).utcoffset()
+            for month in range(1, 13)
+        )
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, _HostZoneKey) and (
             self.name,
             self.offset,
-        ) == (other.name, other.offset)
+            self.samples,
+        ) == (other.name, other.offset, other.samples)
 
     def __hash__(self) -> int:
-        return hash((self.name, self.offset))
+        return hash((self.name, self.offset, self.samples))
 
 
 _MemoZone = datetime.tzinfo | _HostZoneKey
 
+#: How long one reading of the host's zone keys the lint memos: the same
+#: span :class:`LocalZone` trusts a sampled frame for.
+_HOST_KEY_TTL = 60.0
+_host_key: tuple[float, _HostZoneKey] | None = None
+
+
+def _host_zone_key() -> _HostZoneKey:
+    """The current :class:`_HostZoneKey`, re-read after :data:`_HOST_KEY_TTL`
+    not on every memo lookup (a lint asks several times per job)."""
+    global _host_key
+    now = time.monotonic()
+    if _host_key is None or now - _host_key[0] >= _HOST_KEY_TTL:
+        _host_key = (now, _HostZoneKey())
+    return _host_key[1]
+
 
 def _memo_key(timezone: datetime.tzinfo) -> _MemoZone:
-    return _HostZoneKey() if isinstance(timezone, LocalZone) else timezone
+    return _host_zone_key() if isinstance(timezone, LocalZone) else timezone
 
 
 def _memo_zone(key: _MemoZone) -> datetime.tzinfo:
@@ -1395,6 +1426,43 @@ def _walk_frame(
     return zone if fixed is None or good_to < end else fixed
 
 
+def _walk_fires(
+    tab: CronTab,
+    zone: datetime.tzinfo,
+    probe: datetime.datetime,
+    end: datetime.datetime,
+) -> Iterator[datetime.datetime]:
+    """Every fire of ``tab`` in ``zone`` strictly after ``probe`` and
+    before ``end``, in order: :meth:`CronTab.occurrences` cut at ``end``.
+
+    The host clock is walked frame by frame: each stretch
+    :meth:`LocalZone.fixed_frame` vouches for takes the engine's
+    fixed-offset path, and only the bracket around a transition walks
+    aware, so a window holding one pays the aware path for that bracket
+    alone rather than for the whole window.  Each segment resumes one
+    second before the previous one's cut, so a fire exactly on the cut
+    is yielded once.  A fire's ``tzinfo`` is the frame it was found in.
+    """
+    if not isinstance(zone, LocalZone):
+        for when in tab.occurrences(probe.astimezone(zone)):
+            if when >= end:
+                return
+            yield when
+        return
+    seed, at = probe, probe
+    while True:
+        fixed, good_to = zone.fixed_frame(at, until=end)
+        stop = min(good_to, end) if good_to > at else end
+        frame = zone if fixed is None else fixed
+        for when in tab.occurrences(seed.astimezone(frame)):
+            if when >= stop:
+                break
+            yield when
+        if stop >= end:
+            return
+        at, seed = stop, stop - _ONE_SECOND
+
+
 def _fire_cells(
     entries: Sequence[ScheduleEntry],
     start: datetime.datetime,
@@ -1422,7 +1490,7 @@ def _fire_cells(
     work and none of their answer.
     """
     end = start + datetime.timedelta(hours=hours)
-    local_tz = _walk_frame(_local_tzinfo(), start, end)
+    local_tz = _local_tzinfo()
     tz = _walk_frame(tz, start, end)
     grid = [[0] * 60 for _ in range(24)]
     cell_jobs: dict[tuple[int, int], list[str]] = {}
@@ -1456,8 +1524,8 @@ def _fire_cells(
                 continue
             cells: list[tuple[int, int]] = []
             walked = 0
-            for when in mtab.occurrences(start.astimezone(zone)):
-                if when >= end or walked >= cap:
+            for when in _walk_fires(mtab, zone, start, end):
+                if walked >= cap:
                     break
                 walked += 1
                 label = when.astimezone(tz)

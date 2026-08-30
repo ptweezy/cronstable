@@ -3371,9 +3371,10 @@ def test_render_press_full_grid(tmp_path):
 def test_week_walks_local_jobs_on_the_frame_the_host_keeps(
     tmp_path, monkeypatch
 ):
-    # the week calendar frames a utc: false job in the host clock, asks
-    # _walk_frame for the fixed offset the host keeps across the week, and
-    # lists exactly the instants the aware walk in LOCAL_ZONE lists
+    # the week calendar frames a utc: false job in the host clock, walks it
+    # through _walk_fires (the fixed offset the host keeps, frame by
+    # frame), and lists exactly the instants the aware walk in LOCAL_ZONE
+    # lists
     from cronstable.cronexpr import LOCAL_ZONE
     from tests._helpers import _pin_host_zone
 
@@ -3385,17 +3386,23 @@ def test_week_walks_local_jobs_on_the_frame_the_host_keeps(
     app.jobs = [local, zoned]
     app.by_name = {"loc": local, "z": zoned}
     asked = []
-    real = tui._walk_frame
+    real = tui._walk_fires
 
-    def recording(zone, start, end):
+    def recording(tab, zone, probe, end):
         asked.append(zone)
-        return real(zone, start, end)
+        return real(tab, zone, probe, end)
 
-    monkeypatch.setattr(tui, "_walk_frame", recording)
+    def aware(tab, zone, probe, end):
+        for when in tab.occurrences(probe.astimezone(zone)):
+            if when >= end:
+                return
+            yield when
+
+    monkeypatch.setattr(tui, "_walk_fires", recording)
     app._recompute_week()
-    assert asked == [LOCAL_ZONE]
+    assert LOCAL_ZONE in asked and len(asked) == 2
     fast = app.week
-    monkeypatch.setattr(tui, "_walk_frame", lambda zone, s, e: zone)
+    monkeypatch.setattr(tui, "_walk_fires", aware)
     app._recompute_week()
     assert app.week["items"] == fast["items"]
     assert [name for _when, name in fast["items"]].count("loc") == 7

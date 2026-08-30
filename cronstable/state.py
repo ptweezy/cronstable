@@ -1012,7 +1012,7 @@ class FilesystemStateBackend(StateBackend):
         self.get_job_set_id = get_job_set_id
         # a stable namespace so several deployments can share one store
         # without colliding; job-set scoping (like the lease backends'
-        # @reboot set) is layered on top by callers via the stream name.
+        # @reboot set) is layered on top by callers through the stream name.
         self.root, self.namespace = store_identity(config)
         # The namespaced root all this backend's files live under, plus the
         # per-lane subroots; every path helper hangs off these, and root and

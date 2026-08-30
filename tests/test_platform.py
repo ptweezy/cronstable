@@ -1315,8 +1315,22 @@ def test_is_machine_wide_reads_the_profiles_root(monkeypatch, tmp_path):
     assert not platform.is_machine_wide(str(users / "bob" / "cronstable"))
     assert platform.is_machine_wide(str(program_data / "cronstable"))
     assert platform.is_machine_wide(str(tmp_path / "cronstable"))
-    # no profile to be under
+    # the shared profiles beside the users' own belong to no user
+    assert platform.is_machine_wide(str(users / "Public" / "cronstable"))
+    assert platform.is_machine_wide(str(users / "Default" / "cronstable"))
+    # a scrubbed USERPROFILE falls back to the other spellings of the
+    # profile a launcher keeps
     monkeypatch.delenv("USERPROFILE")
+    monkeypatch.setenv("HOMEDRIVE", str(users)[:2])
+    monkeypatch.setenv("HOMEPATH", str(users / "p")[2:])
+    assert not platform.is_machine_wide(str(users / "p" / "cronstable"))
+    monkeypatch.delenv("HOMEDRIVE")
+    monkeypatch.delenv("HOMEPATH")
+    monkeypatch.setenv("APPDATA", str(users / "p" / "AppData" / "Roaming"))
+    assert not platform.is_machine_wide(str(users / "p" / "cronstable"))
+    assert platform.is_machine_wide(str(program_data / "cronstable"))
+    # no profile to be under
+    monkeypatch.delenv("APPDATA")
     assert platform.is_machine_wide(str(users / "p" / "cronstable"))
     # and never on POSIX, where the owner rule has no ACL to read
     monkeypatch.setattr(platform, "IS_WINDOWS", False)

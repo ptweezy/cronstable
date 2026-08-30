@@ -75,6 +75,7 @@ from cronstable.croninfo import (  # noqa: F401  (re-exported for tests/back-com
     Finding,
     ScheduleEntry,
     _local_tzinfo,
+    _walk_fires,
     _walk_frame,
     describe_cron,
     duplicate_schedules,
@@ -205,6 +206,27 @@ SORT_KEYS = ["name", "status", "last", "next", "duration"]
 #  small formatting helpers (ports of the web page's fmt* family)
 #  (pad2 moved to cronstable.croninfo with the schedule describers)
 # ===================================================================
+def _job_frame(
+    job: dict[str, Any],
+) -> tuple[str, Optional[datetime.tzinfo]]:
+    """``(label, zone)`` a job's schedule is read in, as the daemon reads
+    it: a configured ``timezone`` outranks the ``utc`` flag.  ``zone`` is
+    None for the host clock (the label ``local``); an unknown zone name
+    falls back to UTC, keeping its name as the label.
+    """
+    tz_name = job.get("timezone")
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+
+            return str(tz_name), ZoneInfo(str(tz_name))
+        except Exception:  # noqa: BLE001 - unknown zone: fall back
+            return str(tz_name), datetime.timezone.utc
+    if job.get("utc", True):
+        return "UTC", datetime.timezone.utc
+    return "local", None
+
+
 def fmt_in(sec: Optional[float]) -> str:
     """``in 42s`` / ``in 3m`` / ``now``: the next-fire column."""
     if sec is None:
@@ -3593,8 +3615,6 @@ class App:
         schedule is assumed to be in the config default frame (UTC),
         because /dags carries neither flag.
         """
-        from zoneinfo import ZoneInfo
-
         entries: list[ScheduleEntry] = []
         for job in self.jobs:
             if not job.get("enabled"):
@@ -3608,15 +3628,7 @@ class App:
                 tab = CronTab(text)
             except (ValueError, KeyError):
                 continue
-            tz: Optional[datetime.tzinfo]
-            tz_name = job.get("timezone")
-            if tz_name:
-                try:
-                    tz = ZoneInfo(str(tz_name))
-                except Exception:  # noqa: BLE001 - unknown zone: fall back
-                    tz = datetime.timezone.utc
-            else:
-                tz = datetime.timezone.utc if job.get("utc", True) else None
+            _frame, tz = _job_frame(job)
             entries.append(ScheduleEntry(str(job.get("name", "")), tab, tz))
         seen = {entry.name for entry in entries}
         for dag in self.dags:
@@ -3706,16 +3718,14 @@ class App:
             # same rule as the web panel
             probe = start - datetime.timedelta(seconds=1)
             # the host clock walks on a fixed offset wherever the week and
-            # the engine's look-back hold no transition
-            local_tz = _walk_frame(_local_tzinfo(), probe, end)
+            # the engine's look-back hold no transition (_walk_fires)
+            local_tz = _local_tzinfo()
             for entry in entries:
                 zone = entry.timezone or local_tz
                 fires: list[datetime.datetime] = []
                 capped = False
-                for when in entry.tab.occurrences(probe.astimezone(zone)):
+                for when in _walk_fires(entry.tab, zone, probe, end):
                     utc = when.astimezone(datetime.timezone.utc)
-                    if utc >= end:
-                        break
                     if len(fires) >= WEEK_PER_JOB_CAP:
                         capped = True
                         break
@@ -7905,14 +7915,10 @@ class AppDrawers(AppOverlays):
         # payload carries it; hashing locally with the job's name is the
         # identical fallback (same salt) against an older daemon
         text = resolved or schedule
-        tz_name = job.get("timezone")
-        # a configured timezone outranks the utc flag, as in the daemon
-        frame = (
-            str(tz_name)
-            if tz_name
-            else ("UTC" if job.get("utc", True) else "local")
+        frame, zone = _job_frame(job)
+        tz, described, fires = self._schedule_facts(
+            text, name, frame, zone or LOCAL_ZONE
         )
-        tz, described, fires = self._schedule_facts(text, name, frame)
         rows = [
             " " + paint.style(schedule, "accent", bold=True),
             " " + paint.style(described, "bright"),
@@ -7964,15 +7970,20 @@ class AppDrawers(AppOverlays):
         return rows
 
     def _schedule_facts(
-        self, text: str, name: Optional[str], frame: str
+        self,
+        text: str,
+        name: Optional[str],
+        frame: str,
+        tz: datetime.tzinfo,
     ) -> tuple[datetime.tzinfo, str, list[datetime.datetime]]:
         """``(zone, prose, upcoming fires)`` for the schedule tab, parsed
         once per ``(text, name, frame)`` rather than per paint.
 
-        ``frame`` is the reference-frame label: a zone name, ``UTC``, or
-        ``local`` for the host clock (LOCAL_ZONE, the scheduler's own
-        frame).  The zone and the prose are pure functions of the
-        inputs.  The fire list is the engine's first eight occurrences
+        ``frame`` is the reference-frame label :func:`_job_frame` pairs
+        with ``tz``, the zone the fires are walked in (LOCAL_ZONE for the
+        host clock, the scheduler's own frame).  The prose is a pure
+        function of the inputs.  The fire list is the engine's first
+        eight occurrences
         strictly after the moment it was built, so it is exact until its
         first entry is due; it is rebuilt from the held parse then.  Both
         clocks are read for "due" (the instant, and the zone's civil time
@@ -7993,16 +8004,6 @@ class AppDrawers(AppOverlays):
                 fires = next_fires(text, 8, tz, hash_key=name, tab=tab)
                 self._sched_facts = cached[:6] + (fires,)
             return tz, described, fires
-        tz = datetime.timezone.utc
-        if frame == "local":
-            tz = LOCAL_ZONE
-        elif frame != "UTC":
-            try:
-                from zoneinfo import ZoneInfo
-
-                tz = ZoneInfo(frame)
-            except Exception:  # noqa: BLE001 - fall back to UTC
-                pass
         # the parse next_fires would make; describe_cron takes it as its
         # engine verdict and next_fires enumerates from it
         try:

@@ -737,9 +737,10 @@ def test_init_refuses_a_machine_wide_directory_it_cannot_re_own(
 def test_init_adopts_a_directory_it_could_hand_to_administrators(
     monkeypatch, tmp_path, capsys
 ):
-    # the hand-over is the owner alone, before the write; the DACL follows
-    # the starter in the pass that restricts a fresh directory, and the
-    # owner it then reads is Administrators
+    # the hand-over is the owner alone, after the starter went in (a
+    # failed write then changes nothing); the DACL follows in the pass
+    # that restricts a fresh directory, and the owner it then reads is
+    # Administrators
     target = tmp_path / "confdir"
     target.mkdir()
     owners = iter(["S-1-5-21-1-2-3-1001"])  # before the hand-over, then none
@@ -774,7 +775,7 @@ def test_init_adopts_a_directory_it_could_hand_to_administrators(
     assert "restricted {}".format(target) in captured.out
     assert captured.err == ""
     assert (target / "cronstable.yaml").is_file()
-    assert handed == [False]  # the owner moved before the starter went in
+    assert handed == [True]  # the owner moved after the starter went in
     assert hardened == [True]  # and the DACL went on after it
 
 

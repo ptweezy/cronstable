@@ -10,7 +10,7 @@ import datetime
 from zoneinfo import ZoneInfo
 
 from cronstable import croninfo
-from cronstable.cronexpr import LOCAL_ZONE
+from cronstable.cronexpr import LOCAL_ZONE, LocalZone
 from cronstable.croninfo import (
     Finding,
     _fire_cells,
@@ -318,9 +318,9 @@ def _entry(name, expr, tz=_UTC, key=None):
 
 
 def test_schedule_pressure_counts_the_herd():
-    entries = [
-        _entry("herd-%02d" % i, "0 * * * *") for i in range(37)
-    ] + [_entry("mid", "30 3 * * *")]
+    entries = [_entry("herd-%02d" % i, "0 * * * *") for i in range(37)] + [
+        _entry("mid", "30 3 * * *")
+    ]
     payload = schedule_pressure(entries, start=_P_START)
     # occurrences are strictly after start, and the window end is
     # exclusive, so an hourly job fires 23 times in an aligned 24h window
@@ -554,9 +554,7 @@ def test_why_allowed_prose_compacts_runs():
 
 
 def test_why_hashed_schedule_reports_the_resolved_slot():
-    got = _why(
-        "H * * * *", datetime.datetime(2026, 7, 18, 3, 0), key="hashed"
-    )
+    got = _why("H * * * *", datetime.datetime(2026, 7, 18, 3, 0), key="hashed")
     minute = CronTab("H * * * *", hash_key="hashed").resolved_source.split()[0]
     assert got["failed"] == ["minute"]
     assert got["checks"][1]["allowed"] == minute
@@ -963,6 +961,37 @@ def test_local_tzinfo_is_the_shared_host_zone(monkeypatch):
     )
 
 
+def _aware_walk(tab, zone, probe, end):
+    """The plain aware walk ``_walk_fires`` must match fire for fire."""
+    for when in tab.occurrences(probe.astimezone(zone)):
+        if when >= end:
+            return
+        yield when
+
+
+def test_walk_fires_splits_the_window_at_a_transition(monkeypatch):
+    # a window holding the spring-forward gap: the stretches either side
+    # walk on fixed offsets (a fire's tzinfo says which frame found it)
+    # and the bracket around the transition walks aware; the fires are
+    # the aware walk's, none dropped or doubled at the cuts
+    _pin_host_zone(monkeypatch, "America/New_York")
+    start = datetime.datetime(2027, 3, 12, 12, 0, tzinfo=_UTC)
+    end = start + datetime.timedelta(days=4)
+    tab = CronTab("*/20 * * * *")
+    fast = list(croninfo._walk_fires(tab, LOCAL_ZONE, start, end))
+    aware = list(_aware_walk(tab, LOCAL_ZONE, start, end))
+    assert fast == aware
+    assert len(fast) == len(set(fast))
+    kinds = [type(w.tzinfo) for w in fast]
+    assert datetime.timezone in kinds and LocalZone in kinds
+    # a fire exactly on a segment cut is yielded once
+    assert fast[0] > start and fast[-1] < end
+    # a zoned walk is the plain walk
+    assert list(croninfo._walk_fires(tab, _NY, start, end)) == list(
+        _aware_walk(tab, _NY, start, end)
+    )
+
+
 def test_walk_frame_is_a_fixed_offset_away_from_a_transition(monkeypatch):
     # a window whose host offset is constant, the engine's 26h look-back
     # included, walks on the fixed-offset path; a transition inside either
@@ -1008,6 +1037,7 @@ def test_fire_cells_fixed_frame_matches_the_aware_walk(monkeypatch):
         assert type(_walk_frame(LOCAL_ZONE, start, end)) is datetime.timezone
         with monkeypatch.context() as m:
             m.setattr(croninfo, "_walk_frame", lambda zone, s, e: zone)
+            m.setattr(croninfo, "_walk_fires", _aware_walk)
             aware = _fire_cells(entries, start, 48, LOCAL_ZONE)
         assert fast == aware
         # occurrences are strictly after start: 143 twenty-minute slots

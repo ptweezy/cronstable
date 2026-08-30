@@ -861,25 +861,6 @@ def _build_frame(
     origin = at - _GAP_PROBE
     first = _local_civil(origin)
     offset = first.utcoffset()
-    stop = at + _FRAME_SPAN
-    if until is not None and until > stop:
-        stop = until
-    change = _first_change(origin, stop, offset)
-    if change is None:
-        assert offset is not None
-        name = first.tzname()
-        fixed = (
-            datetime.timezone(offset)
-            if name is None
-            else datetime.timezone(offset, name)
-        )
-        return _Frame(at, stop, fixed, True)
-    # the transition sits in (change - step, change]: every instant whose
-    # look-back can hold it, from change - step to change + _GAP_PROBE,
-    # walks aware; the instants before it keep the offset through the
-    # last agreeing sample
-    if at >= change - _FRAME_STEP:
-        return _Frame(at, change + _GAP_PROBE, None, False)
     assert offset is not None
     name = first.tzname()
     fixed = (
@@ -887,6 +868,18 @@ def _build_frame(
         if name is None
         else datetime.timezone(offset, name)
     )
+    stop = at + _FRAME_SPAN
+    if until is not None and until > stop:
+        stop = until
+    change = _first_change(origin, stop, offset)
+    if change is None:
+        return _Frame(at, stop, fixed, True)
+    # the transition sits in (change - step, change]: every instant whose
+    # look-back can hold it, from change - step to change + _GAP_PROBE,
+    # walks aware; the instants before it keep the offset through the
+    # last agreeing sample
+    if at >= change - _FRAME_STEP:
+        return _Frame(at, change + _GAP_PROBE, None, False)
     return _Frame(at, change - _FRAME_STEP, fixed, False)
 
 

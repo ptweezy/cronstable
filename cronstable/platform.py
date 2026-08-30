@@ -1273,15 +1273,27 @@ def _sddl_write_grantee(sddl: str) -> Optional[str]:
     return None
 
 
-def _sddl_rights_write(rights: str) -> bool:
-    """Whether one ACE's rights field grants create-a-file."""
+def _sddl_rights(rights: str) -> tuple[Optional[int], set[str]]:
+    """One ACE's rights field decoded: ``(mask, tokens)``.
+
+    A hexadecimal field yields the mask and no tokens; a token string
+    yields the two-letter tokens and no mask; an unparseable hex field
+    yields neither, so every reading of it grants nothing.
+    """
     rights = rights.strip()
     if rights[:2].lower() == "0x":
         try:
-            return bool(int(rights, 16) & _WRITE_MASK)
+            return int(rights, 16), set()
         except ValueError:
-            return False
-    tokens = {rights[i : i + 2] for i in range(0, len(rights) - 1, 2)}
+            return None, set()
+    return None, {rights[i : i + 2] for i in range(0, len(rights) - 1, 2)}
+
+
+def _sddl_rights_write(rights: str) -> bool:
+    """Whether one ACE's rights field grants create-a-file."""
+    mask, tokens = _sddl_rights(rights)
+    if mask is not None:
+        return bool(mask & _WRITE_MASK)
     return bool(tokens & _WRITE_TOKENS)
 
 
@@ -1330,13 +1342,9 @@ def _sddl_owner_neutralized(sddl: str) -> bool:
         flags = parts[1]
         if "IO" in {flags[i : i + 2] for i in range(0, len(flags) - 1, 2)}:
             continue
-        rights = parts[2].strip()
-        if rights[:2].lower() == "0x":
-            try:
-                return not (int(rights, 16) & ~_OWNER_READ_MASK)
-            except ValueError:
-                return False
-        tokens = {rights[i : i + 2] for i in range(0, len(rights) - 1, 2)}
+        mask, tokens = _sddl_rights(parts[2])
+        if mask is not None:
+            return not (mask & ~_OWNER_READ_MASK)
         return bool(tokens) and tokens <= _OWNER_READ_TOKENS
     return False
 
@@ -1392,7 +1400,7 @@ def is_machine_wide(path: str) -> bool:
     """
     if not IS_WINDOWS:
         return False
-    profile = os.environ.get("USERPROFILE")
+    profile = _own_profile()
     if not profile:
         return True
     root = ntpath.dirname(ntpath.normpath(profile))
@@ -1401,7 +1409,43 @@ def is_machine_wide(path: str) -> bool:
         spellings.add(os.path.realpath(path))
     except (OSError, ValueError):
         pass
-    return not all(path_is_user_scoped(p, root) for p in spellings)
+    return not all(
+        path_is_user_scoped(p, root) and not _under_shared_profile(p, root)
+        for p in spellings
+    )
+
+
+#: Directories beside the profiles that belong to no user: ``Public`` is
+#: any-user-writable and ``Default`` seeds every new profile, so a
+#: configuration directory under either is machine-wide.
+_SHARED_PROFILES = ("public", "default", "default user", "all users")
+
+
+def _under_shared_profile(path: str, root: str) -> bool:
+    return any(
+        path_is_user_scoped(path, ntpath.join(root, shared))
+        for shared in _SHARED_PROFILES
+    )
+
+
+def _own_profile() -> Optional[str]:
+    """The caller's profile directory, from the environment.
+
+    ``USERPROFILE`` is the rule; a launcher that scrubs it (``runas``
+    with a bare environment, some task hosts) usually keeps
+    ``HOMEDRIVE``/``HOMEPATH`` or ``APPDATA`` (``<profile>\\AppData\\
+    Roaming``), which name the same directory.  None when nothing does.
+    """
+    profile = os.environ.get("USERPROFILE")
+    if profile:
+        return profile
+    drive, home = os.environ.get("HOMEDRIVE"), os.environ.get("HOMEPATH")
+    if drive and home:
+        return drive + home
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return ntpath.dirname(ntpath.dirname(ntpath.normpath(appdata)))
+    return None
 
 
 def is_reparse_point(path: str) -> bool:

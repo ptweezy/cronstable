@@ -226,6 +226,11 @@ STATE_OP_TIMEOUT = 10.0
 MAX_PENDING_STATE_WRITES = 8192
 # Retry cadence when catch-up could not resolve (backend/cluster not ready).
 CATCHUP_RECHECK_INTERVAL = 30.0
+#: Passes a job whose catch-up pin cannot be read or closed stays
+#: unresolved before it latches with the pin left open: a store outage
+#: must not keep re-evaluating (and re-listing) jobs nothing will backfill
+#: for its whole length; the next boot reads the pin as it always has.
+CATCHUP_PIN_RETRIES = 3
 # Idle wait between serialized backfill launches (pacing, not correctness);
 # Forbid waits unbounded because launching would be swallowed.
 CATCHUP_IDLE_WAIT_LIMIT = 30.0
@@ -1717,17 +1722,6 @@ def get_now(timezone: Optional[datetime.tzinfo]) -> datetime.datetime:
     return datetime.datetime.now(timezone)
 
 
-def _store_identity(
-    config: Optional[StateConfig],
-) -> Optional[tuple[str, str]]:
-    """The store a ``state`` section names, as the backend resolves it
-    (:func:`cronstable.state.store_identity`): a respelled path or an
-    explicit ``deploymentId: default`` is the same store."""
-    if config is None:
-        return None
-    return store_identity(config)
-
-
 async def _noop_state_write() -> None:
     """Placeholder body for a shed durable write (see _track_state_write).
 
@@ -2223,6 +2217,9 @@ class Cron:
         # names whose catch-up decision is final, so unresolved jobs
         # elsewhere do not re-process them next pass.
         self._catchup_done: set[str] = set()
+        # passes in which a job's catch-up pin could not be read or closed;
+        # CATCHUP_PIN_RETRIES of them latch the job with its pin left open
+        self._catchup_pin_failures: dict[str, int] = {}
         # loop-clock gate for re-evaluating unresolved catch-up (see
         # CATCHUP_RECHECK_INTERVAL); 0.0 means "evaluate on the next pass".
         self._catchup_next_retry = 0.0
@@ -2328,7 +2325,7 @@ class Cron:
         # locks behave, else the reason they cannot be trusted. Reset when
         # the backend is rebuilt.
         self._slot_fidelity: Optional[str] = None
-        # _store_identity of the store holding this process's slot leases;
+        # store_identity of the store holding this process's slot leases;
         # kept across a failed restart so a move or section removal during
         # that outage still drops them.
         self._slot_store: Optional[tuple[str, str]] = None
@@ -7411,7 +7408,7 @@ class Cron:
             self._state_gc_grace = 0.0
             self._slot_ttl = 30.0
         backend = self.state_backend
-        # The held slot leases live in one store (_store_identity): a
+        # The held slot leases live in one store (store_identity): a
         # same-store rebuild keeps them, their renewers and any Replace
         # pursuit (the renewer re-reads self.state_backend every period);
         # a move leaves them behind to lapse by TTL, and the next launch
@@ -7419,7 +7416,9 @@ class Cron:
         # reference rather than the live backend: a failed same-store
         # restart keeps the leases for the retry, and a move or removal
         # during that outage still drops them.
-        store = _store_identity(state_config)
+        store = (
+            store_identity(state_config) if state_config is not None else None
+        )
         if self._slot_store is not None and store != self._slot_store:
             self._drop_store_slots()
             self._slot_store = None
@@ -7464,7 +7463,12 @@ class Cron:
             # to the old store; drop them (renewers cancelled, leases lapse by
             # TTL) so the new store's active runs are re-adopted from scratch
             # by reconcile_on_boot (re-run because _state_rehydrated cleared).
-            self._dag.forget()
+            # Queued task completions survive a same-store rebuild: they
+            # apply to the documents the replacement backend serves.
+            self._dag.forget(
+                same_store=store is not None
+                and store == store_identity(backend.config)
+            )
         elif backend is not None and state_config is not None:
             # config byte-identical, so the teardown above did not fire: the
             # store backend stays, but the job API's TLS certificate may have
@@ -8841,6 +8845,24 @@ class Cron:
             return True
         return await self._checkpoint_catchup(name, "close", watermark)
 
+    def _catchup_pin_deferred(self, name: str) -> bool:
+        """Whether a failed pin read or close defers ``name`` to the next
+        pass (True) or, after :data:`CATCHUP_PIN_RETRIES` such passes,
+        latches it with the pin left open (False, with a warning)."""
+        failures = self._catchup_pin_failures.get(name, 0) + 1
+        if failures < CATCHUP_PIN_RETRIES:
+            self._catchup_pin_failures[name] = failures
+            return True
+        self._catchup_pin_failures.pop(name, None)
+        logger.warning(
+            "catch-up: the checkpoint of %s could not be read or closed in "
+            "%d passes; leaving it as it is (the next boot may hoist its "
+            "watermark back to it)",
+            name,
+            failures,
+        )
+        return False
+
     async def _pinned_catchup_names(self) -> Optional[set[str]]:
         """Jobs with a catch-up checkpoint stream in the store, from one
         listing; None when the listing cannot be trusted, so the caller
@@ -9048,7 +9070,15 @@ class Cron:
     async def _evaluate_catch_up(self, now: datetime.datetime) -> bool:
         """One catch-up evaluation pass; returns whether jobs stay pending."""
         unresolved = False
-        checkpointed = await self._pinned_catchup_names()
+        # the stream listing serves only the retire branch below, and only
+        # on the first pass that reaches it: list on demand, once per pass
+        listing: list[Optional[set[str]]] = []
+
+        async def pinned_names() -> Optional[set[str]]:
+            if not listing:
+                listing.append(await self._pinned_catchup_names())
+            return listing[0]
+
         for name, job in list(self.cron_jobs.items()):
             if name in self._catchup_done:
                 continue
@@ -9061,8 +9091,11 @@ class Cron:
                 # (paused at a boot before its config changed) closes
                 # here; left open, the first boot after the change is
                 # undone would hoist the watermark back to it
-                if await self._retire_catchup_pin(name, checkpointed):
+                if await self._retire_catchup_pin(
+                    name, await pinned_names()
+                ) or not self._catchup_pin_deferred(name):
                     self._catchup_done.add(name)
+                    self._catchup_pin_failures.pop(name, None)
                 else:
                     unresolved = True
                 continue
@@ -9132,8 +9165,11 @@ class Cron:
                 unresolved = True
                 continue
             if count <= 0:
-                if await self._close_catchup_pin(name, watermark, pinned):
+                if await self._close_catchup_pin(
+                    name, watermark, pinned
+                ) or not self._catchup_pin_deferred(name):
                     self._catchup_done.add(name)
+                    self._catchup_pin_failures.pop(name, None)
                 else:
                     unresolved = True
                 continue
@@ -10013,8 +10049,10 @@ class Cron:
                     logger.error(
                         "cluster: cluster-size disagreement -- reachable "
                         "peers declare %s but we declare %d; Leader jobs will "
-                        "stand down until every node's cluster.peers agree on "
-                        "the member set",
+                        "stand down until every reachable peer's "
+                        "cluster.peers agrees on the member set (a node "
+                        "leaving the cluster counts until it is stopped or "
+                        "removed from every peer list)",
                         ", ".join(str(s) for s in size_conflict),
                         mgr.cluster_size(),
                     )

@@ -216,8 +216,9 @@ def _run_init(args: Any) -> int:
             file=sys.stderr,
         )
         return 1
+    owner: str | None = None
     if os.path.isdir(target):
-        refusal = _init_refuse_existing(target)
+        refusal, owner = _init_refuse_existing(target)
         if refusal is not None:
             print(refusal, file=sys.stderr)
             return 1
@@ -239,6 +240,8 @@ def _run_init(args: Any) -> int:
             file=sys.stderr,
         )
         return 1
+    if owner is not None and not _init_adopt(target, path, owner):
+        return 1
     print("wrote {}".format(path))
     _init_restrict(target)
     # Bare `cronstable` finds the default location on its own; anywhere else
@@ -250,54 +253,76 @@ def _run_init(args: Any) -> int:
     return 0
 
 
-def _init_refuse_existing(target: str) -> str | None:
-    """Why an existing ``target`` cannot take the starter, or None.
+def _init_refuse_existing(target: str) -> tuple[str | None, str | None]:
+    """``(refusal, owner)`` for an existing ``target``.
 
-    A machine-wide directory owned by an untrusted account is handed to
-    Administrators here, before the write, so the starter lands in a
-    directory nobody else can reopen; its DACL follows the write
-    (:func:`_init_restrict`). The hand-over is the owner alone, so a
-    refusal leaves the directory as it was found, and names the owner and
-    the recipe.
+    ``refusal`` is why the directory cannot take the starter, or None.
+    ``owner`` is the untrusted account a machine-wide directory belongs
+    to, or None: the starter goes in first and :func:`_init_adopt` then
+    hands the directory to Administrators, so nobody else can reopen it;
+    its DACL follows (:func:`_init_restrict`).  A refusal leaves the
+    directory as it was found.
     """
     if platform.is_machine_wide(target) and platform.is_reparse_point(target):
         return (
-            "cronstable init: {} is a junction or symbolic link, and a "
-            "scheduler reading a machine-wide directory through one runs "
-            "whatever its target holds. Replace it with a real directory, "
-            "then run init again.".format(target)
+            (
+                "cronstable init: {} is a junction or symbolic link, and a "
+                "scheduler reading a machine-wide directory through one runs "
+                "whatever its target holds. Replace it with a real directory, "
+                "then run init again.".format(target)
+            ),
+            None,
         )
     try:
         existing = platform.config_file_names(target)
     except OSError as ex:
         # an unreadable target must report like every other init
         # failure, not traceback; the starter write would fail anyway.
-        return "cronstable init: could not read {}: {}".format(target, ex)
+        return "cronstable init: could not read {}: {}".format(
+            target, ex
+        ), None
     if existing:
         return (
-            "cronstable init: {} already holds configuration ({}); "
-            "refusing to add a starter to a live setup".format(
-                target, ", ".join(existing[:5])
-            )
+            (
+                "cronstable init: {} already holds configuration ({}); "
+                "refusing to add a starter to a live setup".format(
+                    target, ", ".join(existing[:5])
+                )
+            ),
+            None,
         )
-    owner = platform.untrusted_owner(target)
-    if owner is None:
-        return None
+    return None, platform.untrusted_owner(target)
+
+
+def _init_adopt(target: str, path: str, owner: str) -> bool:
+    """Hand ``target``, owned by ``owner``, to Administrators after the
+    starter ``path`` went in.
+
+    The write comes first so a failed write changes nothing; a hand-over
+    that fails takes the starter back out, so the refusal it prints
+    leaves the directory as init found it.
+    """
     if platform.assign_config_dir_owner(target):
         print(
             "handed {} to Administrators; it was owned by {}".format(
                 target, owner
             )
         )
-        return None
-    return (
+        return True
+    try:
+        os.remove(path)
+    except OSError:  # pragma: no cover - the refusal below still names it
+        pass
+    print(
         "cronstable init: {} already exists and is owned by {}, and "
         "cronstable could not hand it to Administrators, which is what "
         "keeps that account from reopening it. From an elevated prompt "
         "run: {}. Or remove the directory and run init again.".format(
             target, owner, platform.config_dir_icacls_recipe(target)
-        )
+        ),
+        file=sys.stderr,
     )
+    return False
 
 
 def _init_restrict(target: str) -> None:

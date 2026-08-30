@@ -4759,13 +4759,17 @@ async def test_retry_completions_skips_not_due_and_removed_dag(
         "delay": 5.0,
         "nextTryAt": 0.0,
     }
-    # a dropped completion settles its launch key; a queued one keeps it
+    # a dropped completion keeps its launch key (the task ran, so its
+    # RUNNING entry is not a lost claim), as does a queued one
     d._launched[("lin", "rk")] = {("a", 0, 0)}
     d._launched[("ghost", "rk")] = {("a", 0, 0)}
     await d._retry_completions(dagrun._now())
     assert not_due in d._pending_completions
     assert gone not in d._pending_completions
-    assert d._launched == {("lin", "rk"): {("a", 0, 0)}}
+    assert d._launched == {
+        ("lin", "rk"): {("a", 0, 0)},
+        ("ghost", "rk"): {("a", 0, 0)},
+    }
 
 
 # ===========================================================================
@@ -5062,3 +5066,65 @@ async def test_reconcile_on_boot_isolates_a_failing_run(
     assert ("lin", "boom-run") not in cron._dag._owned
     monkeypatch.undo()
     await _drive(cron, "lin", "ok-run")  # reap the adopted launch
+
+
+async def test_dropped_completion_keeps_its_launch_key(tmp_path, dag_cron):
+    # A completion the driver drops (a same-store state reload that
+    # forgets in-memory ownership while a finished task's completion is
+    # still buffered) is NOT a lost claim: the task ran here.  Its launch
+    # key stays, so the next advance leaves the RUNNING entry alone
+    # instead of releasing it to PENDING and running the task twice.
+    cron = await dag_cron(_LINEAR)
+    _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+    _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+    run_key = await cron._dag.trigger_run("lin")
+    ref = ("lin", run_key)
+    # a finishes; the reaper hands its completion over but the flush
+    # never runs before the store is rebuilt
+    orig_flush = cron._dag.flush_completions
+    cron._dag.flush_completions = _noop_flush
+    await _reap_running(cron)
+    assert cron._dag._completion_buffer.get(ref)
+    cron._dag.flush_completions = orig_flush
+    # a different store: the completion is dropped, the key is kept
+    cron._dag.forget(same_store=False)
+    assert not cron._dag._completion_buffer
+    assert ("a", 0, 0) in cron._dag._launched[ref]
+    launched_before = dict(cron.running_jobs)
+    await cron._dag.advance_one(ref)
+    await _drain_pending(cron)
+    body = await cron._dag.get_run("lin", run_key)
+    assert body["tasks"]["a"]["state"] == dag.RUNNING  # not released
+    assert body["tasks"]["a"]["proc"] == cron._proc_token
+    assert dict(cron.running_jobs) == launched_before  # a did not run again
+
+
+async def test_same_store_forget_keeps_buffered_completions(
+    tmp_path, dag_cron
+):
+    # the same store under a rebuilt backend: the buffered completion still
+    # applies, so it is held and recorded by the next flush; the run then
+    # finishes with a run exactly once
+    cron = await dag_cron(_LINEAR)
+    _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+    _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+    run_key = await cron._dag.trigger_run("lin")
+    ref = ("lin", run_key)
+    orig_flush = cron._dag.flush_completions
+    cron._dag.flush_completions = _noop_flush
+    await _reap_running(cron)
+    cron._dag.flush_completions = orig_flush
+    cron._dag.forget(same_store=True)
+    assert cron._dag._completion_buffer.get(ref)
+    await cron._dag.flush_completions()
+    await _drain_pending(cron)
+    # the rebuilt backend re-adopts the run, as start_stop_state does
+    await cron._dag.reconcile_on_boot()
+    body = await _drive(cron, "lin", run_key)
+    assert body["state"] == dag.SUCCESS, _states(body)
+    assert body["tasks"]["a"]["attempt"] == 0
+    assert ref not in cron._dag._launched
+
+
+async def _noop_flush():
+    return None

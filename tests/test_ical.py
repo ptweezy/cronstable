@@ -44,18 +44,15 @@ def test_local_entries_walk_on_the_fixed_frame(monkeypatch):
         CalendarEntry("q", CronTab("*/20 * * * *")),
         CalendarEntry("z", CronTab("15 9 * * *"), _UTC),
     ]
-    frames = []
-    real = ical._walk_frame
-
-    def recording(zone, start, end):
-        frame = real(zone, start, end)
-        frames.append(frame)
-        return frame
-
-    monkeypatch.setattr(ical, "_walk_frame", recording)
     fast = _render(entries, days=7)
-    assert [type(frame) for frame in frames] == [datetime.timezone]
-    monkeypatch.setattr(ical, "_walk_frame", lambda zone, s, e: zone)
+
+    def aware_walk(tab, zone, probe, end):
+        for when in tab.occurrences(probe.astimezone(zone)):
+            if when >= end:
+                return
+            yield when
+
+    monkeypatch.setattr(ical, "_walk_fires", aware_walk)
     aware = _render(entries, days=7)
     assert fast == aware
     # seven daily gap fires, the twenty-minute job at the per-entry cap,
@@ -94,7 +91,7 @@ def test_duration_text_and_block_rounding():
     assert _block_seconds(None) == 300  # no history: the 5-minute floor
     assert _block_seconds(30.0) == 300
     assert _block_seconds(520.0) == 540  # rounded up to a whole minute
-    assert _block_seconds(10 ** 9) == 24 * 3600  # capped
+    assert _block_seconds(10**9) == 24 * 3600  # capped
 
 
 def test_render_requires_an_aware_start():
