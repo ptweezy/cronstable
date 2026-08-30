@@ -7,9 +7,9 @@ reporter named `push` beside the mail, Sentry, shell, and webhook reporters
 the usual trust cost: no third-party service ever reads the alert.
 
 The encryption model: the daemon seals each alert to every paired device's
-X25519 public key, in a libsodium sealed box (X25519 + XSalsa20-Poly1305),
-so only that device's private key can open the payload. That key is
-generated on the phone and never leaves it. The relay forwards alerts to the
+public key under the device's sealing suite (a libsodium sealed box for
+`x25519`, X-Wing HPKE for `xwing`), so only that device's private key can
+open the payload. That key is generated on the phone and never leaves it. The relay forwards alerts to the
 platform push service (APNs), and sees only a device token, a ciphertext, an
 opaque coalescing hash (keyed with a per-installation salt the relay never
 sees), a priority, and an event flag, never job names, hostnames, or log
@@ -26,7 +26,9 @@ pip install "cronstable[push]"
 (The extra is PyNaCl, which bundles libsodium. The release binaries bundle
 it per architecture. A lane that cannot build it ships without the extra,
 and the daemon then refuses to start with a config that asks for push,
-reporting an error that says so.)
+reporting an error that says so.) The `push-pq` extra installs the
+`cryptography` library beside PyNaCl and adds post-quantum `xwing` sealing
+(see [pairing devices](#pairing-devices)).
 
 Then configure the daemon-global `push:` section, which says where alerts
 go and where device pairings are stored:
@@ -158,14 +160,26 @@ $ curl -X POST http://127.0.0.1:8080/push/devices \
 ```
 
 `publicKey` must be base64 decoding to the length its `suite` requires (32
-bytes for the default `x25519`) and be a usable key for that suite. At
-pairing, rather than on the first alert, the daemon rejects an all-zero or
-low-order X25519 key that libsodium refuses to seal to. `suite` is optional
-and defaults to `x25519`.
+bytes for the default `x25519`, 1216 bytes for `xwing`) and be a usable key
+for that suite. At pairing, rather than on the first alert, the daemon
+rejects a key its library refuses to seal to: an all-zero or low-order
+X25519 key, or an unusable X-Wing key. `suite` is optional and defaults to
+`x25519`.
 The daemon refuses a pairing that names a suite it cannot seal to, rather
 than storing a record whose every alert would fail. `name`, `platform`, and
 `pushToken` are bounded strings. Validation failures are a `400` naming the
 field.
+
+`xwing` is the post-quantum hybrid suite: X-Wing combines ML-KEM-768 with
+X25519, so recovering the plaintext requires breaking both. Sealing under
+it requires the `push-pq` extra (`pip install "cronstable[push-pq]"`),
+which installs the `cryptography` library beside PyNaCl; a daemon without
+it refuses `xwing` pairings, and `x25519` requires only the `push` extra.
+The companion app picks the suite automatically: `GET /whoami` lists the
+daemon's sealable suites as `sealableSuites`, and the app pairs under
+`xwing` whenever that list advertises it. The wire construction is
+normative in the
+[relay protocol](https://github.com/ptweezy/cronstable/blob/main/docs/relay-protocol.md#xwing-construction).
 
 Re-pairing the same public key (push tokens rotate; phones get renamed)
 answers `200` with `created: false` and updates `name`/`platform`/`pushToken`
@@ -289,9 +303,9 @@ APNs rejects notifications over 4096 bytes, so the daemon caps the sealed,
 base64-encoded ciphertext at 3800 characters: 4096 minus the 189 bytes of the
 relay's own APNs envelope, minus a 107-byte reserve for future protocol
 fields. The daemon fits each device's payload to that device's own suite
-budget (2802 bytes of plaintext under `x25519`), so a device paired under a
-wider-ciphertext suite is trimmed harder without costing the devices beside
-it any log lines. It trims an oversized payload in order: log-tail lines
+budget (2802 bytes of plaintext under `x25519`, 1714 under `xwing`), so a
+device paired under a wider-ciphertext suite is trimmed harder without
+costing the devices beside it any log lines. It trims an oversized payload in order: log-tail lines
 oldest-first (the newest lines carry the failure), then long free-text
 fields halved (never below 64 characters), then the optional
 context fields dropped. The alert's identity (`name`, `kind`, `host`) is

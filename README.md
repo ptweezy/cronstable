@@ -53,9 +53,9 @@ alerting, durable state, orchestration, clustering, and a live dashboard.
 * Built-in sending of Sentry, Mail, and webhook (Slack-compatible)
   notifications when cron jobs fail
 * **End-to-end encrypted push notifications**: a dedicated reporter seals each
-  alert to a paired device's own key (libsodium sealed box), so the relay
-  that forwards it to the platform push service never sees job names,
-  hostnames, or log lines. Pairing is a dashboard QR scan or one API call,
+  alert to a paired device's own key (an X25519 sealed box, or post-quantum
+  X-Wing HPKE), so the relay that forwards it to the platform push service
+  never sees job names, hostnames, or log lines. Pairing is a dashboard QR scan or one API call,
   and an opt-in Bonjour/mDNS advert lets a companion app find the daemon on
   the LAN (see [push notifications](#push-notifications), plus the
   [Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
@@ -1147,13 +1147,17 @@ the shell reporter's `CRONSTABLE_*` environment.
 ### Push notifications
 
 The `push` reporter delivers end-to-end encrypted alerts to paired devices.
-Each alert is sealed to the device's X25519 public key (a libsodium sealed
-box) before it leaves the daemon. The hosted relay that forwards it to the
-platform push service (APNs) sees only ciphertext and routing metadata, never
-job names, hostnames, or log lines.
+Each alert is sealed to the device's public key before it leaves the daemon:
+an X25519 device gets a libsodium sealed box, and an X-Wing device (the
+post-quantum ML-KEM-768 + X25519 hybrid) gets single-shot HPKE. The hosted
+relay that forwards it to the platform push service (APNs) sees only
+ciphertext and routing metadata, never job names, hostnames, or log lines.
 
 The reporter needs the `push` extra (`pip install "cronstable[push]"`), a
-daemon-global `push:` section, and an opt-in on the reporting hooks. If a
+daemon-global `push:` section, and an opt-in on the reporting hooks. The
+`push-pq` extra (`pip install "cronstable[push-pq]"`) adds X-Wing sealing;
+the companion app pairs under it automatically when the daemon lists it in
+`sealableSuites` on `GET /whoami`. If a
 config enables push without any of those, cronstable refuses to start rather
 than silently not alerting:
 

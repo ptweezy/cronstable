@@ -467,9 +467,10 @@ ntfy (plain-text body, priority in a header):
 ## Push reporter
 
 Sends an end-to-end encrypted alert to every paired device through a hosted
-relay. The payload is sealed to each device's X25519 public key (a libsodium
-sealed box) before it leaves the daemon, so the relay forwards ciphertext it
-cannot read. The companion app decrypts and renders the notification on the
+relay. The payload is sealed to each device's public key, under the sealing
+suite the device registered at pairing (see
+[push notifications](Push-Notifications#pairing-devices)), before it leaves
+the daemon, so the relay forwards ciphertext it cannot read. The companion app decrypts and renders the notification on the
 device. Reporting occurs only when `enabled` is `true`; otherwise the reporter
 returns early.
 
@@ -483,8 +484,8 @@ It also refuses a routable web listener with no `web.authToken`, because the
 pairing endpoints would be unauthenticated.
 
 The alert goes to every paired device at once, so an unreachable relay costs one
-`push.relay.timeout` in total rather than one per device. Pairing, storage,
-size limits, and the trust model are documented on
+`push.relay.timeout` in total rather than one per device. Pairing, sealing
+suites, storage, size limits, and the trust model are documented on
 [push notifications](Push-Notifications).
 
 | Option | Type | Default | Description |

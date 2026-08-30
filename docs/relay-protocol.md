@@ -103,14 +103,15 @@ from a key or ciphertext length.
 | Suite | Algorithm | Public key | Sealing overhead |
 | --- | --- | ---: | ---: |
 | `x25519` | libsodium sealed box (X25519 + XSalsa20-Poly1305) | 32 B | 48 B |
-| `xwing` | X-Wing (ML-KEM-768 + X25519), reserved | 1216 B | 1136 B |
+| `xwing` | X-Wing (ML-KEM-768 + X25519) | 1216 B | 1136 B |
 
-`x25519` is the default and the only suite a daemon seals under today.
-`xwing` is registered so that the wire format, the size fitting, and the
-pairing validation are already suite-driven. A daemon that cannot seal to a
-suite refuses the pairing rather than storing a record whose every alert
-would fail. Post-quantum sealing lands when PyNaCl exposes libsodium
-1.0.22's `crypto_kem_*` functions.
+`x25519` is the default suite; `xwing` is the post-quantum hybrid. A
+daemon seals each alert under the suite the target device registered at
+pairing, and a daemon that cannot seal to a suite (its install lacks the
+suite's library) refuses the pairing rather than storing a record whose
+every alert would fail. `GET /whoami` lists the suites a daemon can seal
+to as `sealableSuites`, and the companion app pairs under `xwing` when
+that list advertises it.
 
 Relays MUST treat `suite` as opaque routing metadata: the ciphertext is
 sealed to the device either way, and a relay that does not recognize a
@@ -123,6 +124,44 @@ that grammar, the same way it answers a malformed `collapseId`. The token
 lands in the APNs payload, so its length is part of the size budget below.
 The reserve absorbs the widest token the grammar allows, which costs 10
 bytes more than the measured `x25519`.
+
+### `x25519` construction
+
+The ciphertext is a libsodium sealed box (`crypto_box_seal`): a fresh
+ephemeral X25519 sender key per message, XSalsa20-Poly1305 over the
+plaintext, wire layout ephemeral public key (32 bytes) || box (plaintext
+length plus the 16-byte tag), standard base64. Sealing overhead is exactly
+48 bytes for every plaintext.
+
+### `xwing` construction
+
+This block is normative. Daemon and companion app implement it
+independently and must match byte for byte.
+
+The device public key on the wire is 1216 bytes, the ML-KEM-768
+encapsulation key (1184 bytes) followed by the X25519 public key
+(32 bytes), standard base64 in the pairing body.
+
+Sealing is HPKE ([RFC 9180](https://www.rfc-editor.org/rfc/rfc9180)) in
+base mode, single-shot, under this ciphersuite:
+
+| Role | Algorithm | HPKE id |
+| --- | --- | ---: |
+| KEM | X-Wing: ML-KEM-768 + X25519 ([draft-connolly-cfrg-xwing-kem-10](https://datatracker.ietf.org/doc/draft-connolly-cfrg-xwing-kem/10/)) | `0x647A` |
+| KDF | HKDF-SHA256 | `0x0001` |
+| AEAD | AES-256-GCM | `0x0002` |
+
+`info` is the ASCII bytes `cronstable-push-xwing`, exact, on both sides.
+There is no AAD: both sides pass none to their single-shot APIs.
+
+The wire ciphertext is the HPKE `enc` value (1120 bytes) followed by the
+single-shot ciphertext (plaintext length plus the 16-byte GCM tag),
+standard base64. Sealing overhead is exactly 1136 bytes for every
+plaintext.
+
+Every message carries a fresh encapsulation (HPKE base mode); the daemon
+holds no long-lived sending secret. That keeps sealing anonymous-sender
+under this suite (see [Privacy guarantees](#privacy-guarantees)).
 
 ## Size budget
 
@@ -294,22 +333,23 @@ implement this route answers 404, which the app treats as "no quota".
 ## Privacy guarantees
 
 - The relay never sees plaintext. Job names, hostnames, schedules, log
-  lines, and event details exist only inside the sealed box, which only the
-  target device's private key (generated on the phone and never leaving it)
-  can open.
+  lines, and event details exist only inside the sealed payload, which only
+  the target device's private key (generated on the phone and never leaving
+  it) can open.
 - `collapseId` is a truncated hash of identity fields, not the fields
   themselves. The hash is keyed with a per-installation salt stored beside
   the device registry and never sent to the relay. Identity fields are low
   entropy (on a stateless install they reduce to alert kind plus job name),
   so an unkeyed hash would let a relay recover job names from a precomputed
   wordlist. The salt closes that.
-- Sealing uses an ephemeral sender key per message (anonymous-sender sealed
-  box), so the daemon holds no long-lived sending secret worth stealing.
+- Sealing is anonymous-sender under every suite: a fresh ephemeral sender
+  key per message under `x25519`, a fresh encapsulation per message under
+  `xwing`, so the daemon holds no long-lived sending secret worth stealing.
 
 ## Replay protection
 
 The relay (or anyone who can reach APNs with a captured request) can
-re-deliver an old ciphertext. Sealed boxes are anonymous-sender, so the
+re-deliver an old ciphertext. Every suite seals anonymous-sender, so the
 payload itself is the only place freshness can live.
 
 Every sealed plaintext carries `ts`, the UTC instant the daemon built the

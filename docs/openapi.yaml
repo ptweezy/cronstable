@@ -1054,7 +1054,8 @@ paths:
         true) and restricted under a `web.anonymousScopes` grant
         (`label: "anonymous"`, `allScopes` false). See the `WhoAmI` schema
         for all three shapes. Every shape carries `pairLinkBase`, the base
-        URL of the pairing QR's deep link.
+        URL of the pairing QR's deep link, and `sealableSuites`, the
+        suites this daemon can seal push alerts under.
       responses:
         "200":
           description: The matched token's identity.
@@ -1123,15 +1124,17 @@ paths:
                   type: string
                   description: >-
                     The device public key, base64. Its length must match
-                    the suite: 32 bytes for `x25519`.
+                    the suite: 32 bytes for `x25519`, 1216 for `xwing`.
                 suite:
                   type: string
                   description: >-
                     Sealing suite the key belongs to. Optional; omitted
                     means `x25519`. Known values: `x25519`
                     (libsodium sealed box), `xwing` (X-Wing, ML-KEM-768 +
-                    X25519). A suite the daemon cannot seal to is
-                    refused at pairing rather than stored.
+                    X25519, sealed via HPKE). A suite the daemon's
+                    install cannot seal to is refused at pairing rather
+                    than stored; `GET /whoami` lists the sealable set as
+                    `sealableSuites`.
                   default: x25519
                 pushToken: { type: string, maxLength: 512 }
               required: [name, platform, publicKey, pushToken]
@@ -1150,7 +1153,7 @@ paths:
         "400":
           description: >-
             Malformed JSON body, or a field missing, over-long, or not a
-            valid base64 32-byte key.
+            valid base64 key of the length its suite requires.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1558,6 +1561,17 @@ components:
             the origin of `push.relay.url` plus `/pair` (embedded
             credentials dropped), or the hosted relay's landing while no
             `push:` section is applied.
+        sealableSuites:
+          type: array
+          items: { type: string }
+          description: >-
+            The suites this daemon can seal push alerts under: `x25519`
+            always, `xwing` when the install can seal post-quantum (the
+            `push-pq` extra). The companion app pairs under `xwing` when
+            it is listed. The field stays outside `required` on purpose:
+            a daemon that omits it seals `x25519` only, so generated
+            clients decode it as optional and read absence as
+            `["x25519"]`.
       required: [authenticated, scopes, allScopes, pairLinkBase]
 
     PushDevice:
@@ -1573,8 +1587,10 @@ components:
         suite:
           type: string
           description: >-
-            Sealing suite the key belongs to (`x25519`, `xwing`). Always
-            present; a record that names none reports `x25519`.
+            Sealing suite the key belongs to: `x25519` (libsodium sealed
+            box) or `xwing` (X-Wing, ML-KEM-768 + X25519, sealed via
+            HPKE). Always present; a record that names none reports
+            `x25519`.
         fingerprint:
           type: string
           nullable: true

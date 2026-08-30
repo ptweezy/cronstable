@@ -124,14 +124,25 @@ speedups = [
 # start when this is absent (an alerting channel must fail closed, not
 # self-disable). See config._validate_push_config.
 push = ["pynacl>=1.6.2"]
+# Post-quantum push sealing (the `xwing` suite; see cronstable.push): the
+# `push` extra plus cryptography, whose HPKE module seals X-Wing (ML-KEM-768
+# + X25519). The marker mirrors the dev extra's: cryptography ships no
+# win-arm64 wheel, so on that one platform this extra installs only PyNaCl
+# and the daemon refuses xwing pairings at pairing time (fail-closed; x25519
+# push still works).
+push-pq = [
+    "pynacl>=1.6.2",
+    "cryptography>=48; platform_machine != 'ARM64' or sys_platform != 'win32'",
+]
 # Zero-config LAN discovery (the opt-in `web.bonjour` mDNS advert; see
 # cronstable.discovery). Same fail-closed contract: web.bonjour without this
 # installed is a ConfigError, never a silent no-advert.
 discovery = ["zeroconf>=0.149.16"]
 dev = [
-    # only the cluster mTLS tests use it, and it has no win-arm64 wheel; see
+    # the cluster mTLS tests mint throwaway certs with it, and the X-Wing
+    # sealing tests need its HPKE module (>=48). No win-arm64 wheel; see
     # requirements_dev.txt for why it's gated to other platforms.
-    "cryptography; platform_machine != 'ARM64' or sys_platform != 'win32'",
+    "cryptography>=48; platform_machine != 'ARM64' or sys_platform != 'win32'",
     # The optional-extra deps the tests must really exercise (orjson, pynacl,
     # zeroconf); requirements_dev.txt documents why each is here.  Without
     # them a `pip install -e .[dev]` + `pytest` checkout runs the suite in
@@ -229,15 +240,19 @@ strict_optional = true
 
 [[tool.mypy.overrides]]
 # The optional-extra deps are imported behind try/except guards (orjson in
-# cronstable._json, uvloop in cronstable.__main__, pynacl in cronstable.push,
-# zeroconf in cronstable.discovery, kubernetes in the leadership backend's
-# official-client fast path), so a checkout without the extras installed must
-# still type-check cleanly.
+# cronstable._json, uvloop in cronstable.__main__, pynacl and cryptography
+# in cronstable.push, zeroconf in cronstable.discovery, kubernetes in the
+# leadership backend's official-client fast path), so a checkout without the
+# extras installed must still type-check cleanly. cryptography ships py.typed,
+# so where it IS installed (the dev env) mypy still checks it fully; this
+# entry only covers the bare tox mypy env, exactly like nacl's.
 module = [
     "orjson",
     "uvloop",
     "nacl",
     "nacl.*",
+    "cryptography",
+    "cryptography.*",
     "zeroconf",
     "zeroconf.*",
     "kubernetes",

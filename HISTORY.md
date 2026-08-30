@@ -1,5 +1,24 @@
 # History
 
+## 1.2.50
+
+- Push alerts can be sealed with post-quantum encryption. Every push
+  alert is end-to-end encrypted, so the relay that forwards it never sees
+  plaintext; the `x25519` encryption used for that is the kind a future
+  quantum computer could break, so traffic recorded today could be
+  decrypted then. A device paired under the new `xwing` suite closes that
+  window: its alerts are sealed with X-Wing (ML-KEM-768 + X25519), a
+  hybrid of post-quantum and classical key exchange, through HPKE in base
+  mode (HKDF-SHA256, AES-256-GCM). The daemon needs the `cryptography`
+  library, installed by the `push-pq` extra. `GET /whoami` names the
+  suites a daemon can seal to as `sealableSuites`, and the companion app
+  pairs under `xwing` on its own when it is listed. The post-quantum key
+  material costs 1136 bytes of the fixed notification budget, so an
+  `xwing` alert carries a somewhat shorter log tail. A daemon without the
+  library keeps refusing `xwing` pairings, existing `x25519` pairings are
+  unchanged, and the wire construction is normative in
+  `docs/relay-protocol.md`.
+
 ## 1.2.49
 
 - A job on the host's local clock (`utc: false` with no `timezone`) fires by

@@ -352,11 +352,11 @@ jobs:
   # never slip in. scripts/check_licenses.py reads the INSTALLED dist metadata
   # (no third-party scanner) and fails on a disallowed license; weak file-scoped
   # copyleft (LGPL/MPL) is reported but allowed. It installs the runtime plus
-  # every distributable extra (`speedups`, `push`, and `discovery` all ride in
-  # the binaries and Docker images) so nothing the artifacts can carry escapes
-  # the scan. zeroconf (discovery) is LGPL-2.1: expected in the report, and
-  # shipped with its compliance kit (in-binary notice, Release source archive,
-  # public build recipe). See LICENSING.md.
+  # every distributable extra (`speedups`, `push-pq`, and `discovery`;
+  # `push-pq` carries `push`'s pynacl too) so nothing the artifacts can carry
+  # escapes the scan. zeroconf (discovery) is LGPL-2.1: expected in the
+  # report, and shipped with its compliance kit (in-binary notice, Release
+  # source archive, public build recipe). See LICENSING.md.
   licenses:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -372,7 +372,7 @@ jobs:
         run: |
           set -euo pipefail
           uv venv --python 3.14
-          uv pip install ".[speedups,push,discovery]"
+          uv pip install ".[speedups,push-pq,discovery]"
       - name: Check dependency licenses
         run: uv run python .github/scripts/check_licenses.py
 
@@ -793,6 +793,15 @@ jobs:
               # the sealed-box round trip is uninstalled, so push fails closed
               # rather than shipping a miscompiled libsodium.
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" ${{ matrix.nacl }} "push extra not bundled"
+              # Bundle cryptography (the `push-pq` extra) so the frozen
+              # daemon seals X-Wing push. Wheels cover the two native rows
+              # only; the emulated rows ship without it and refuse xwing
+              # pairings at pairing time (x25519 push still seals). A bare
+              # pip install: verify_extra.py has no cryptography probe, and
+              # set -e makes a failed wheel install fail the lane.
+              if [ "${{ matrix.native }}" = "1" ]; then
+                $PIP install "cryptography>=48"
+              fi
               # Bundle zeroconf (the `discovery` extra): pure Python with
               # optional speedups, so a HARD install on every row. LGPL-2.1;
               # the in-binary notice, Release source archive and public build
@@ -1667,6 +1676,15 @@ jobs:
           # ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
+          # Bundle cryptography (the `push-pq` extra) on arm64 so the
+          # frozen daemon seals X-Wing push there; the amd64 builds ship
+          # without it and refuse xwing pairings at pairing time (x25519
+          # push still seals). A bare pip install: verify_extra.py has no
+          # cryptography probe, and set -e makes a failed install fail
+          # the lane.
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            uv pip install "cryptography>=48"
+          fi
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on both arches, HARD failure. LGPL-2.1; in-binary notice +
           # Release source archive + public build recipe (LICENSING.md).
@@ -2326,6 +2344,15 @@ jobs:
           # silently ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
+          # Bundle cryptography (the `push-pq` extra) on amd64 so the
+          # frozen daemon seals X-Wing push there; the arm64 and i686
+          # builds ship without it (no win-arm64 wheel) and refuse xwing
+          # pairings at pairing time (x25519 push still seals). A bare
+          # pip install: verify_extra.py has no cryptography probe, and
+          # set -e makes a failed install fail the lane.
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            uv pip install "cryptography>=48"
+          fi
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on win32/amd64/arm64, HARD failure. LGPL-2.1; in-binary
           # notice + Release source archive + public build recipe

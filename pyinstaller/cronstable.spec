@@ -74,6 +74,17 @@ try:
     hiddenimports.extend(["nacl.public", "_cffi_backend"])
 except ImportError:
     pass
+# cryptography (the `push-pq` extra): cronstable/push imports
+# cryptography.hazmat.primitives.hpke inside _xwing_suite, a guarded
+# call-site import like nacl's above. cryptography ships upstream
+# PyInstaller hooks that pull in the rest; the explicit entry is the
+# same insurance the nacl one is.
+try:
+    import cryptography.hazmat.primitives.hpke  # noqa: F401
+
+    hiddenimports.append("cryptography.hazmat.primitives.hpke")
+except ImportError:
+    pass
 # zeroconf (the `discovery` extra, behind web.bonjour): same guarded-import
 # pattern as pynacl above. It is LGPL-2.1; bundling is deliberate and paired
 # with the compliance kit (the in-binary notice behind --third-party-licenses,

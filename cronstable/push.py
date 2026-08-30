@@ -1,12 +1,14 @@
 """End-to-end encrypted push alerts: the ``push`` reporter's engine.
 
-The daemon seals a compact alert payload to each paired device's X25519
-public key (libsodium sealed boxes via PyNaCl) and hands the ciphertext,
-plus an opaque coalescing id, to a hosted relay that forwards it to the
-platform push service (APNs).  The relay never sees plaintext: it learns
-only a device token, a ciphertext and a hash, so a self-hosted daemon
-can use a shared relay without trusting it with job names, log lines or
-hostnames.  See wiki/Push-Notifications.md and docs/relay-protocol.md.
+The daemon seals a compact alert payload to each paired device's public
+key and hands the ciphertext, plus an opaque coalescing id, to a hosted
+relay that forwards it to the platform push service (APNs).  X25519
+devices get libsodium sealed boxes (PyNaCl); X-Wing devices get
+single-shot HPKE over the post-quantum hybrid KEM (cryptography).  The
+relay never sees plaintext: it learns only a device token, a ciphertext
+and a hash, so a self-hosted daemon can use a shared relay without
+trusting it with job names, log lines or hostnames.  See
+wiki/Push-Notifications.md and docs/relay-protocol.md.
 
 Three pieces live here:
 
@@ -24,11 +26,14 @@ Three pieces live here:
   reach the daemon's service through this module seam, the same way
   the loop reaches the daemon's config).
 
-PyNaCl is an optional extra (``pip install "cronstable[push]"``): the
-import is guarded, and config validation refuses a ``push:`` block when
-the library is absent.  Fail closed on purpose: an alerting channel
-that silently self-disables is a missed page, the one failure mode a
-paging feature must never have.
+The crypto libraries are optional extras.  PyNaCl
+(``pip install "cronstable[push]"``) seals X25519; cryptography
+(``pip install "cronstable[push-pq]"``) adds X-Wing.  Both imports are
+guarded and both gates fail closed: config validation refuses a
+``push:`` block when PyNaCl is absent, and pairing refuses a suite the
+running daemon cannot seal.  On purpose: an alerting channel that
+silently self-disables is a missed page, the one failure mode a paging
+feature must never have.
 """
 
 import asyncio
@@ -70,6 +75,19 @@ try:
     HAVE_PYNACL = importlib.util.find_spec("nacl.public") is not None
 except (ImportError, ValueError):  # pragma: no cover - no-push baseline
     HAVE_PYNACL = False
+
+try:
+    # Probed, not imported, for the same start-cost reasons as PyNaCl
+    # above.  find_spec answers "is it findable", not "can it seal": the
+    # real import lives in :func:`_xwing_suite`, inside the try that
+    # turns a cryptography too old or too broken to seal X-Wing into a
+    # PushError rather than an ImportError out of a never-raises path.
+    HAVE_XWING = (
+        importlib.util.find_spec("cryptography.hazmat.primitives.hpke")
+        is not None
+    )
+except (ImportError, ValueError):  # pragma: no cover - no-pq baseline
+    HAVE_XWING = False
 
 logger = logging.getLogger("cronstable")
 
@@ -125,14 +143,13 @@ CIPHERTEXT_B64_FLOOR = 3000
 #: envelope and (via the relay) the APNs payload, so daemon, relay and app
 #: never have to infer a key's algorithm from its length.
 #:
-#: Only ``x25519`` can be sealed to today.  ``xwing`` is registered but
-#: deliberately unsealable: PyNaCl bundles libsodium 1.0.20, and the
-#: ``crypto_kem_*`` functions that libsodium 1.0.22 added (X-Wing:
-#: ML-KEM-768 + X25519, the hybrid both this daemon's and the companion
-#: app's crypto stacks converge on) have no PyNaCl bindings yet.  Its
-#: sizes are recorded here so the wire format, the size fitting and the
-#: pairing validation are all already suite-driven: when the bindings
-#: land, sealing is the only thing that has to change.
+#: ``x25519`` seals as a libsodium sealed box (PyNaCl, the ``push``
+#: extra).  ``xwing`` seals as single-shot HPKE base mode over the
+#: X-Wing hybrid KEM, ML-KEM-768 + X25519 (cryptography, the
+#: ``push-pq`` extra).  Each entry's ``sealable`` flag records what this
+#: runtime can actually do, and pairing refuses a suite whose flag is
+#: down: a paging channel accepting a device it cannot deliver to would
+#: be a silently missed page, so the gate fails closed.
 SUITE_X25519 = "x25519"
 SUITE_XWING = "xwing"
 
@@ -170,9 +187,9 @@ SUITES: dict[str, _Suite] = {
     # bytes) and a Poly1305 MAC (16 bytes) to the plaintext.
     SUITE_X25519: _Suite(SUITE_X25519, 32, 48, True),
     # X-Wing: a 1216-byte encapsulation key (ML-KEM-768's 1184 plus
-    # X25519's 32), a 1120-byte ciphertext (1088 + 32) and a 16-byte AEAD
-    # tag.  draft-connolly-cfrg-xwing-kem-10.
-    SUITE_XWING: _Suite(SUITE_XWING, 1216, 1136, False),
+    # X25519's 32), a 1120-byte HPKE ``enc`` (1088 + 32) and a 16-byte
+    # AEAD tag.  draft-connolly-cfrg-xwing-kem-10.
+    SUITE_XWING: _Suite(SUITE_XWING, 1216, 1136, HAVE_XWING),
 }
 
 
@@ -196,6 +213,11 @@ def suite_or_error(name: Optional[str]) -> _Suite:
     return suite
 
 
+def sealable_suites() -> list[str]:
+    """Sorted names of the suites this daemon can seal to."""
+    return sorted(n for n, s in SUITES.items() if s.sealable)
+
+
 def max_plaintext_bytes(
     suite: str = DEFAULT_SUITE, cap: int = CIPHERTEXT_B64_MAX
 ) -> int:
@@ -213,8 +235,8 @@ def max_plaintext_bytes(
     return cap // 4 * 3 - suite_or_error(suite).overhead
 
 
-#: The X25519 budget, kept as a module constant because it is the one the
-#: shipped daemon actually seals under and the tests quote it directly.
+#: The X25519 budget, kept as a module constant because it is the
+#: default suite's budget and the tests quote it directly.
 MAX_PLAINTEXT_BYTES = max_plaintext_bytes(SUITE_X25519)
 
 #: Durable-state document namespace holding one document per paired
@@ -379,6 +401,66 @@ def _sealed_box(raw: bytes) -> Any:
     return SealedBox(PublicKey(raw))
 
 
+#: HPKE ``info`` for X-Wing sealing.  Daemon and app bind to these
+#: exact ASCII bytes (docs/relay-protocol.md); a ciphertext sealed
+#: under any other info string does not open.
+_XWING_INFO = b"cronstable-push-xwing"
+
+
+def _xwing_suite() -> tuple[Any, Callable[[bytes], Any]]:
+    """The HPKE X-Wing suite plus a wire-key-to-public-key builder.
+
+    The one place cryptography is imported (see :data:`HAVE_XWING`).
+    Returns ``(suite, build_key)``: ``suite`` seals via single-shot
+    HPKE base mode (X-Wing KEM, HKDF-SHA256, AES-256-GCM), and
+    ``build_key`` turns a decoded 1216-byte wire key (ML-KEM-768
+    encapsulation key, then X25519 key) into the hybrid public key it
+    seals to.  A cryptography that is findable but cannot seal X-Wing
+    (too old for the HPKE module or the X-Wing KEM, half-installed, or
+    built against an OpenSSL without ML-KEM) becomes a
+    :class:`PushError` here, on :func:`_sealed_box`'s contract: the
+    reason goes to the log, and the raised sentence is fixed because
+    pairing 400s and test-alert 502s return it verbatim.
+    """
+    try:
+        from cryptography.hazmat.primitives.asymmetric import (
+            mlkem,
+            x25519,
+        )
+        from cryptography.hazmat.primitives.hpke import (
+            AEAD,
+            KDF,
+            KEM,
+            MLKEM768X25519PublicKey,
+            Suite,
+        )
+
+        suite = Suite(KEM.MLKEM768_X25519, KDF.HKDF_SHA256, AEAD.AES_256_GCM)
+    except Exception as exc:
+        # Broad on purpose: no key material is in scope yet, so anything
+        # this block raises is a library failure, never a device's fault.
+        # The concrete non-ImportError case is UnsupportedAlgorithm from
+        # a cryptography built against an OpenSSL without ML-KEM; letting
+        # it escape would misfile the install problem as a bad device key.
+        logger.warning(
+            "push: cryptography is findable but cannot seal X-Wing: %s",
+            exc,
+        )
+        raise PushError(
+            "cryptography is installed but cannot seal X-Wing; the "
+            "reason is in the cronstable log (reinstall the post-quantum "
+            'push extra: pip install "cronstable[push-pq]")'
+        ) from None
+
+    def build_key(raw: bytes) -> Any:
+        return MLKEM768X25519PublicKey(
+            mlkem.MLKEM768PublicKey.from_public_bytes(raw[:1184]),
+            x25519.X25519PublicKey.from_public_bytes(raw[1184:]),
+        )
+
+    return suite, build_key
+
+
 def _utcnow_iso() -> str:
     return (
         datetime.datetime.now(datetime.timezone.utc)
@@ -392,9 +474,8 @@ def validate_public_key(value: Any, suite: str = DEFAULT_SUITE) -> str:
 
     Returns the canonical (re-encoded) base64 form; raises
     :class:`PushError` with an operator-readable reason otherwise.  The
-    expected length comes from the suite, so a device pairing under a
-    future suite is checked against that suite's key size rather than
-    X25519's 32 bytes.
+    expected length comes from the suite, so an X-Wing key is checked
+    against its own 1216 bytes rather than X25519's 32.
     """
     spec = suite_or_error(suite)
     if not isinstance(value, str) or not value.strip():
@@ -415,11 +496,16 @@ def validate_public_key(value: Any, suite: str = DEFAULT_SUITE) -> str:
         # would fail on.  Same fail-closed reasoning as the PyNaCl gate in
         # config: a paging channel must never accept something it cannot
         # actually deliver through.
-        raise PushError(
-            "suite {} is not sealable by this daemon yet (it needs "
-            "libsodium 1.0.22's crypto_kem_* through PyNaCl); pair with "
+        message = (
+            "suite {} is not sealable by this daemon; pair with "
             "suite {} instead".format(spec.name, DEFAULT_SUITE)
         )
+        if spec.name == SUITE_XWING:
+            message += (
+                ", or install the post-quantum push extra "
+                '(pip install "cronstable[push-pq]")'
+            )
+        raise PushError(message)
     if HAVE_PYNACL and spec.name == SUITE_X25519:
         # Length is one check of two: libsodium refuses to seal to
         # all-zero / low-order points, and it does so at encrypt time, not
@@ -433,6 +519,23 @@ def validate_public_key(value: Any, suite: str = DEFAULT_SUITE) -> str:
         except Exception:
             raise PushError(
                 "publicKey is not a usable X25519 public key"
+            ) from None
+    if HAVE_XWING and spec.name == SUITE_XWING:
+        # The same probe-at-pairing rule for X-Wing.  Encapsulation
+        # accepts some malformed ML-KEM component keys, so this is a
+        # capability and sanity check rather than a full key validator;
+        # what it does catch (an unusable X25519 point, a library that
+        # cannot seal) becomes a 400 here instead of a registry record
+        # that fails on every alert.
+        try:
+            hpke_suite, build_key = _xwing_suite()
+            hpke_suite.encrypt(b"probe", build_key(raw), info=_XWING_INFO)
+        except PushError:
+            # a broken cryptography, not a broken key: keep its wording
+            raise
+        except Exception:
+            raise PushError(
+                "publicKey is not a usable X-Wing public key"
             ) from None
     return base64.b64encode(raw).decode("ascii")
 
@@ -479,23 +582,26 @@ def seal_to_device(
 ) -> str:
     """Seal ``plaintext`` to a device public key; return base64 text.
 
-    Anonymous-sender sealed box: an ephemeral key pair per message, so
-    the daemon holds no long-lived sending secret and only the device's
-    private key (which never leaves the phone) can open it.
-
-    The suite dispatch is the seam the post-quantum swap goes through: a
-    second branch here (X-Wing encapsulation plus an AEAD over the shared
-    secret) is the whole daemon-side change once PyNaCl exposes
-    libsodium's ``crypto_kem_*``.  Everything around it -- pairing
-    validation, size fitting, the wire envelope, the registry -- is
-    already suite-driven.
+    An X25519 device gets a libsodium sealed box; an X-Wing device gets
+    single-shot HPKE base mode over the hybrid key (see
+    :func:`_xwing_suite`).  Both constructions are anonymous-sender: a
+    fresh ephemeral key pair (sealed box) or encapsulation (HPKE) per
+    message, so the daemon holds no long-lived sending secret and only
+    the device's private key (which never leaves the phone) can open
+    the result.  Everything around the dispatch (pairing validation,
+    size fitting, the wire envelope, the registry) is suite-driven.
     """
     spec = suite_or_error(suite)
-    if not spec.sealable:  # pragma: no cover - pairing refuses these
+    if not spec.sealable:
+        detail = (
+            "; install the post-quantum push extra "
+            '(pip install "cronstable[push-pq]")'
+            if spec.name == SUITE_XWING
+            else ""
+        )
         raise PushError(
-            "cannot seal to suite {}: no implementation in this daemon".format(
-                spec.name
-            )
+            "cannot seal to suite {}: no implementation in this "
+            "daemon{}".format(spec.name, detail)
         )
     if not HAVE_PYNACL:  # pragma: no cover - config validation gates this
         raise PushError(
@@ -504,13 +610,20 @@ def seal_to_device(
         )
     try:
         raw = base64.b64decode(public_key_b64, validate=True)
-        # encrypt stays INSIDE the try: libsodium rejects all-zero /
-        # low-order keys at encrypt time (nacl.exceptions.RuntimeError,
-        # not a PushError), and one bad registry record must surface as
-        # a per-device PushError, never escape a whole-fleet fan-out.
-        sealed = _sealed_box(raw).encrypt(plaintext)
+        # encrypt stays INSIDE the try for both suites: the libraries
+        # reject bad keys at encrypt time (libsodium refuses all-zero /
+        # low-order points, HPKE raises on a key it cannot encapsulate
+        # to), and one bad registry record must surface as a per-device
+        # PushError, never escape a whole-fleet fan-out.
+        if spec.name == SUITE_XWING:
+            hpke_suite, build_key = _xwing_suite()
+            sealed = hpke_suite.encrypt(
+                plaintext, build_key(raw), info=_XWING_INFO
+            )
+        else:
+            sealed = _sealed_box(raw).encrypt(plaintext)
     except PushError:
-        raise  # a broken PyNaCl, not a broken key: keep its wording
+        raise  # a broken library, not a broken key: keep its wording
     except Exception as exc:
         raise PushError(
             "device public key is unusable: {}".format(exc)
@@ -718,7 +831,7 @@ def key_fingerprint(public_key_b64: Optional[str]) -> Optional[str]:
     in the device listing and pairing response so the operator can
     compare it against the one the companion app displays, closing the
     key-substitution hole an on-path attacker (plaintext HTTP, hostile
-    LAN) would otherwise have.  SHA-256 over the raw 32 key bytes,
+    LAN) would otherwise have.  SHA-256 over the raw decoded key bytes,
     first 12 hex chars grouped for reading aloud.
     """
     if not public_key_b64:

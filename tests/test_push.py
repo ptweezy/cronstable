@@ -1,22 +1,28 @@
 """End-to-end encrypted push alerts: sealing, registry, service, API.
 
-Covers cronstable.push (payload build/fit, sealed-box round-trip, the two
-device stores, PushService), the PushReporter edge in cronstable.job, the
-fail-closed config validation, the /push/devices and /whoami handlers,
-scope enforcement on the new routes, the start_stop_push lifecycle, and
-the Bonjour advertiser (with a fake zeroconf).
+Covers cronstable.push (payload build/fit, sealing round-trips under
+both suites, the two device stores, PushService), the PushReporter edge
+in cronstable.job, the fail-closed config validation, the /push/devices
+and /whoami handlers, scope enforcement on the new routes, the
+start_stop_push lifecycle, and the Bonjour advertiser (with a fake
+zeroconf).
 
-PyNaCl is a dev dependency (wheels on every CI cell), but only the tests
-that actually touch key material skip without it (the ``requires_pynacl``
-marker); the store, config-validation, handler-scope, /whoami, lifecycle
-and Bonjour tests are crypto-free and run on a bare `pip install -e .`
-checkout too. A module-level importorskip here once silently vaporized
-all of them on any cell without the wheel; never reintroduce one.
+PyNaCl (x25519 sealed boxes, the push extra) and cryptography (X-Wing
+HPKE, the push-pq extra) are dev dependencies: PyNaCl has wheels on
+every CI cell, cryptography on every cell except win-arm64 (see
+requirements_dev.txt). Only the tests that actually touch key material
+skip without them (the ``requires_pynacl`` and ``requires_xwing``
+markers); the
+store, config-validation, handler-scope, /whoami, lifecycle and Bonjour
+tests are crypto-free and run on a bare `pip install -e .` checkout
+too. A module-level importorskip here once silently vaporized all of
+them on any cell without the wheel; never reintroduce one.
 """
 
 import asyncio
 import base64
 import copy
+import importlib.util
 import json
 import logging
 import os
@@ -60,6 +66,29 @@ requires_pynacl = pytest.mark.skipif(
     reason="pynacl (the push extra) is not installed",
 )
 
+try:
+    # The same find_spec probe push.HAVE_XWING runs, done independently
+    # so a broken daemon probe fails these tests instead of skipping
+    # them.
+    _xwing_findable = (
+        importlib.util.find_spec("cryptography.hazmat.primitives.hpke")
+        is not None
+    )
+except (ImportError, ValueError):  # no cryptography at all
+    _xwing_findable = False
+
+requires_xwing = pytest.mark.skipif(
+    not _xwing_findable,
+    reason="cryptography with HPKE (the push-pq extra) is not installed",
+)
+
+
+def _sealable_now() -> list[str]:
+    """What /whoami advertises on this box, keyed to the probe above
+    rather than pinned as a constant: the post-quantum library is an
+    optional extra."""
+    return ["x25519", "xwing"] if _xwing_findable else ["x25519"]
+
 
 # ---------------------------------------------------------------- helpers
 
@@ -73,6 +102,45 @@ def _device_keypair():
 def _open_sealed(private, ciphertext_b64: str) -> dict[str, Any]:
     sealed = base64.b64decode(ciphertext_b64)
     plaintext = nacl_public.SealedBox(private).decrypt(sealed)
+    return json.loads(plaintext.decode("utf-8"))
+
+
+def _xwing_keypair():
+    """A generated X-Wing device keypair: (private key, wire base64).
+
+    The wire form the companion app registers: the ML-KEM-768
+    encapsulation key (1184 bytes) followed by the X25519 public key
+    (32), standard base64.
+    """
+    from cryptography.hazmat.primitives import hpke
+    from cryptography.hazmat.primitives.asymmetric import mlkem, x25519
+
+    mlkem_private = mlkem.MLKEM768PrivateKey.generate()
+    x_private = x25519.X25519PrivateKey.generate()
+    private = hpke.MLKEM768X25519PrivateKey(mlkem_private, x_private)
+    wire = (
+        mlkem_private.public_key().public_bytes_raw()
+        + x_private.public_key().public_bytes_raw()
+    )
+    return private, base64.b64encode(wire).decode()
+
+
+def _open_xwing(sealed_b64: str, private) -> dict[str, Any]:
+    """Open one sealed X-Wing alert the way the companion app does.
+
+    Single-shot HPKE decrypt over the combined enc||ct blob.  The
+    ciphersuite and info bytes are spelled out here rather than read
+    from push, so the test pins the wire contract instead of the
+    module's agreement with itself.
+    """
+    from cryptography.hazmat.primitives.hpke import AEAD, KDF, KEM, Suite
+
+    suite = Suite(KEM.MLKEM768_X25519, KDF.HKDF_SHA256, AEAD.AES_256_GCM)
+    plaintext = suite.decrypt(
+        base64.b64decode(sealed_b64),
+        private,
+        info=b"cronstable-push-xwing",
+    )
     return json.loads(plaintext.decode("utf-8"))
 
 
@@ -635,11 +703,55 @@ def test_pairing_accepts_an_explicit_x25519_suite():
     assert fields["suite"] == push.SUITE_X25519
 
 
-def test_pairing_refuses_a_suite_the_daemon_cannot_seal_to():
-    # Fail closed, exactly like the PyNaCl config gate: accepting an
-    # X-Wing pairing this daemon cannot seal to would store a record that
-    # silently fails every later alert -- a missed page, which is the one
-    # failure mode this feature exists to prevent.
+@requires_xwing
+async def test_pairing_accepts_an_xwing_device_and_stores_its_suite(
+    tmp_path,
+):
+    # The pairing probe seals through the real HPKE path, so a generated
+    # key passes validation and the stored record names its suite for
+    # every later seal and listing.
+    _, public_b64 = _xwing_keypair()
+    fields = push.validate_pairing(
+        {
+            "name": "pq-phone",
+            "platform": "ios",
+            "publicKey": public_b64,
+            "pushToken": "tok-pq",
+            "suite": push.SUITE_XWING,
+        }
+    )
+    assert fields["suite"] == push.SUITE_XWING
+    service = _service(push.FileDeviceStore(str(tmp_path / "d.json")))
+    record, created = await service.pair(fields, "authToken")
+    assert created
+    assert record["suite"] == push.SUITE_XWING
+    (listed,) = service.devices_payload()
+    assert listed["suite"] == push.SUITE_XWING
+    assert listed["fingerprint"] == push.key_fingerprint(public_b64)
+
+
+@requires_xwing
+def test_xwing_key_validation_accepts_a_generated_key():
+    # The probe is a capability and sanity check, not a full key
+    # validator: encapsulation accepts some malformed ML-KEM component
+    # keys, so only real generated keys are asserted here.  A canonical
+    # key comes back unchanged.
+    _, public_b64 = _xwing_keypair()
+    assert push.validate_public_key(public_b64, push.SUITE_XWING) == public_b64
+
+
+def test_pairing_refuses_a_suite_the_daemon_cannot_seal_to(monkeypatch):
+    # Fail closed, exactly like the PyNaCl config gate: accepting a
+    # pairing this daemon cannot seal to would store a record that
+    # silently fails every later alert (a missed page, the one failure
+    # mode this feature exists to prevent).  A daemon without the
+    # post-quantum library is in this state for xwing; the monkeypatched
+    # flag reproduces it whatever this box has installed.
+    monkeypatch.setitem(
+        push.SUITES,
+        push.SUITE_XWING,
+        push._Suite(push.SUITE_XWING, 1216, 1136, False),
+    )
     key = base64.b64encode(
         b"\x01" * push.SUITES[push.SUITE_XWING].public_key_bytes
     ).decode()
@@ -654,6 +766,8 @@ def test_pairing_refuses_a_suite_the_daemon_cannot_seal_to():
             }
         )
     assert "not sealable" in str(excinfo.value)
+    # the refusal names what would lift it
+    assert "push-pq" in str(excinfo.value)
 
 
 def test_pairing_checks_key_length_against_its_own_suite():
@@ -676,13 +790,58 @@ def test_pairing_checks_key_length_against_its_own_suite():
     assert "suite must be a string" in str(excinfo.value)
 
 
-@requires_pynacl
-def test_seal_rejects_a_suite_with_no_implementation():
+@requires_xwing
+def test_xwing_seal_round_trip():
+    private, public_b64 = _xwing_keypair()
+    ciphertext = push.seal_to_device(
+        public_b64, b'{"hello": "world"}', push.SUITE_XWING
+    )
+    assert _open_xwing(ciphertext, private) == {"hello": "world"}
+
+
+@requires_xwing
+def test_xwing_sealing_overhead_is_exact():
+    # The suite table's overhead is what the budget arithmetic trusts:
+    # the construction adds exactly a 1120-byte HPKE enc plus a 16-byte
+    # AEAD tag to every plaintext.
+    _, public_b64 = _xwing_keypair()
+    plaintext = b'{"kind":"test"}'
+    sealed = base64.b64decode(
+        push.seal_to_device(public_b64, plaintext, push.SUITE_XWING)
+    )
+    assert (
+        len(sealed) - len(plaintext) == push.SUITES[push.SUITE_XWING].overhead
+    )
+
+
+@requires_xwing
+def test_xwing_sealing_encapsulates_freshly_per_message():
+    # HPKE base mode: a fresh encapsulation per message, so the daemon
+    # holds no long-lived sending secret and two seals of one plaintext
+    # differ (the anonymous-sender property the docs state).
+    _, public_b64 = _xwing_keypair()
+    first = push.seal_to_device(public_b64, b"{}", push.SUITE_XWING)
+    second = push.seal_to_device(public_b64, b"{}", push.SUITE_XWING)
+    assert first != second
+
+
+def test_seal_rejects_a_suite_with_no_implementation(monkeypatch):
+    # The not-sealable branch stays live even though pairing refuses the
+    # suite first: an older build or another tool can have written the
+    # record, and the refusal must be a per-device PushError naming the
+    # fix, never a fan-out escapee.
+    monkeypatch.setitem(
+        push.SUITES,
+        push.SUITE_XWING,
+        push._Suite(push.SUITE_XWING, 1216, 1136, False),
+    )
     key = base64.b64encode(
         b"\x01" * push.SUITES[push.SUITE_XWING].public_key_bytes
     ).decode()
-    with pytest.raises(push.PushError):
+    with pytest.raises(push.PushError) as excinfo:
         push.seal_to_device(key, b"{}", push.SUITE_XWING)
+    assert "cannot seal" in str(excinfo.value)
+    assert "push-pq" in str(excinfo.value)
 
 
 def test_fit_payload_honors_a_narrower_suite_budget():
@@ -1199,6 +1358,48 @@ async def test_send_report_seals_to_each_device_and_posts_relay(tmp_path):
 
 
 @requires_pynacl
+@requires_xwing
+async def test_mixed_suite_fanout_fits_each_device_to_its_own_budget(
+    tmp_path,
+):
+    # One registry, both suites: each envelope names its device's own
+    # suite and carries a copy fitted to that suite's budget, so the
+    # x25519 device keeps log lines the narrower xwing budget trims
+    # (the fan-out sibling of the _fit_for isolation test above).
+    x_private, x_public = _device_keypair()
+    w_private, w_public = _xwing_keypair()
+    async with _RelayServer() as relay:
+        service, _ = await _paired_service(tmp_path, relay.url, x_public)
+        await service.pair(
+            {
+                "name": "pq-phone",
+                "platform": "ios",
+                "publicKey": w_public,
+                "pushToken": "tok-pq",
+                "suite": push.SUITE_XWING,
+            },
+            "authToken",
+        )
+        ctx, lines = _tail_ctx(count=200, width=80)
+        await service.send_report(ctx, False, {"enabled": True})
+    by_suite = {r["suite"]: r for r in relay.requests}
+    assert set(by_suite) == {push.SUITE_X25519, push.SUITE_XWING}
+    assert by_suite[push.SUITE_XWING]["device"] == "tok-pq"
+    # the xwing copy fits its 1714-byte budget as sealed
+    narrow_budget = push.max_plaintext_bytes(push.SUITE_XWING)
+    assert narrow_budget == 1714
+    sealed = base64.b64decode(by_suite[push.SUITE_XWING]["ciphertext"])
+    overhead = push.SUITES[push.SUITE_XWING].overhead
+    assert len(sealed) - overhead <= narrow_budget
+    wide = _open_sealed(x_private, by_suite[push.SUITE_X25519]["ciphertext"])
+    narrow = _open_xwing(by_suite[push.SUITE_XWING]["ciphertext"], w_private)
+    assert len(wide["log_tail"]) > len(narrow["log_tail"])
+    # trimming stays oldest-first for both: the newest line survives
+    assert wide["log_tail"][-1] == lines[-1]
+    assert narrow["log_tail"][-1] == lines[-1]
+
+
+@requires_pynacl
 async def test_collapse_id_comes_from_the_persistent_salt(tmp_path):
     # The relay coalesces the same (job, run) across nodes and restarts
     # by collapseId, which only holds if every service over one registry
@@ -1372,6 +1573,56 @@ async def test_one_bad_registry_key_does_not_break_the_fanout(tmp_path):
         assert [r["device"] for r in relay.requests] == ["tok-good"]
         opened = _open_sealed(private, relay.requests[0]["ciphertext"])
         assert opened["name"] == "backup"
+
+
+@requires_pynacl
+@requires_xwing
+async def test_one_bad_xwing_registry_key_stays_per_device(tmp_path, caplog):
+    # The same isolation for the other suite: a registry record whose
+    # key is not even base64 fails inside the seal try, becomes one
+    # "sealing failed" outcome, and the sibling device is still paged.
+    private, good_b64 = _device_keypair()
+    path = tmp_path / "devices.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "devices": [
+                    # the bad device first, so the loop must survive it
+                    # to ever reach the good one
+                    {
+                        "id": "bad",
+                        "name": "pq-evil",
+                        "platform": "ios",
+                        "publicKey": "not base64!!",
+                        "pushToken": "tok-bad",
+                        "suite": push.SUITE_XWING,
+                    },
+                    {
+                        "id": "good",
+                        "name": "phone",
+                        "platform": "ios",
+                        "publicKey": good_b64,
+                        "pushToken": "tok-good",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    async with _RelayServer() as relay:
+        service = _service(push.FileDeviceStore(str(path)), relay.url)
+        await service.send_report(_FakeJobCtx(), False, {"enabled": True})
+        assert [r["device"] for r in relay.requests] == ["tok-good"]
+        opened = _open_sealed(private, relay.requests[0]["ciphertext"])
+        assert opened["name"] == "backup"
+    failures = [
+        r.getMessage()
+        for r in caplog.records
+        if "delivery to device bad" in r.getMessage()
+    ]
+    assert len(failures) == 1
+    assert "sealing failed" in failures[0]
 
 
 @requires_pynacl
@@ -2425,11 +2676,16 @@ async def test_whoami_with_and_without_token():
         "scopes": ["view"],
         "allScopes": False,
         "pairLinkBase": "https://relay.cronstable.com/pair",
+        "sealableSuites": _sealable_now(),
     }
     body = json.loads((await cron._web_whoami(_Req())).body)
     assert body["authenticated"] is False
     assert body["allScopes"] is True
     assert body["scopes"] == sorted(["view", "control", "approve"])
+    # every shape advertises the sealable suites (the companion app
+    # picks its pairing suite from this list)
+    assert body["sealableSuites"] == _sealable_now()
+    assert "x25519" in body["sealableSuites"]
 
 
 async def test_whoami_reports_an_anonymous_grant():
@@ -2446,6 +2702,7 @@ async def test_whoami_reports_an_anonymous_grant():
         "scopes": ["view"],
         "allScopes": False,
         "pairLinkBase": "https://relay.cronstable.com/pair",
+        "sealableSuites": _sealable_now(),
     }
 
 
@@ -2470,6 +2727,7 @@ async def test_all_scopes_token_reports_all_scopes():
     )
     body = json.loads((await cron._web_whoami(_Req(token=token))).body)
     assert body["allScopes"] is True
+    assert body["sealableSuites"] == _sealable_now()
 
 
 # --------------------------------------------------- scope enforcement

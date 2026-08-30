@@ -22,6 +22,7 @@ import pytest
 from aiohttp import web
 
 import cronstable.cron
+import cronstable.push
 from cronstable.config import ConfigError
 from cronstable.cron import (
     _WEB_ALL_SCOPES,
@@ -772,6 +773,9 @@ async def test_anonymous_view_end_to_end(caplog):
                     "scopes": ["view"],
                     "allScopes": False,
                     "pairLinkBase": "https://relay.cronstable.com/pair",
+                    # what this box can seal to; tests/test_push.py pins
+                    # the list's content against the library probe
+                    "sealableSuites": cronstable.push.sealable_suites(),
                 }
             # ...but cannot act, on any of the three mutating gates
             async with session.post(base + "/jobs/test/start") as resp:
