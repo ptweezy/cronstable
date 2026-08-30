@@ -1678,8 +1678,9 @@ jobs:
             sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
           # Bundle cryptography (the `push-pq` extra) on arm64 so the
           # frozen daemon seals X-Wing push there; the amd64 builds ship
-          # without it and refuse xwing pairings at pairing time (x25519
-          # push still seals). A bare pip install: verify_extra.py has no
+          # without it (cryptography publishes no macOS x86_64 wheel) and
+          # refuse xwing pairings at pairing time (x25519 push still
+          # seals). A bare pip install: verify_extra.py has no
           # cryptography probe, and set -e makes a failed install fail
           # the lane.
           if [ "${{ matrix.arch }}" = "arm64" ]; then

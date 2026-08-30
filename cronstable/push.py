@@ -214,8 +214,20 @@ def suite_or_error(name: Optional[str]) -> _Suite:
 
 
 def sealable_suites() -> list[str]:
-    """Sorted names of the suites this daemon can seal to."""
-    return sorted(n for n, s in SUITES.items() if s.sealable)
+    """Sorted names of the suites this daemon can seal to.
+
+    What ``GET /whoami`` advertises, and what the companion app picks a
+    fresh pairing's suite from, so the answer must be proven rather than
+    probable: ``xwing``'s ``sealable`` flag only says the HPKE module is
+    findable, and a cryptography built against an OpenSSL without ML-KEM
+    is findable yet cannot seal.  Advertising it would steer every fresh
+    pairing into a 400.  :func:`_xwing_probe` settles the question with
+    one real seal, cached for the life of the process.
+    """
+    names = [n for n, s in SUITES.items() if s.sealable]
+    if SUITE_XWING in names and not _xwing_probe():
+        names.remove(SUITE_XWING)
+    return sorted(names)
 
 
 def max_plaintext_bytes(
@@ -459,6 +471,50 @@ def _xwing_suite() -> tuple[Any, Callable[[bytes], Any]]:
         )
 
     return suite, build_key
+
+
+#: :func:`_xwing_probe`'s cached verdict: None until the first call, then
+#: whether one real probe seal succeeded.  Process-lifetime on purpose: a
+#: broken install does not heal without a reinstall and a restart.
+_XWING_PROBE: Optional[bool] = None
+
+
+def _xwing_probe() -> bool:
+    """Whether this install actually seals X-Wing, proven by one seal.
+
+    :data:`HAVE_XWING` answers "findable"; this seals a probe message to
+    a throwaway generated key through the same suite the alert path
+    uses, so the verdict covers the whole stack: the HPKE module, the
+    X-Wing KEM, and the OpenSSL underneath.  Cached because the
+    advertisement in :func:`sealable_suites` reads it on every
+    ``/whoami``, and so a broken library logs its reason once (in
+    :func:`_xwing_suite`) rather than per request.
+    """
+    global _XWING_PROBE
+    if _XWING_PROBE is None:
+        try:
+            suite, build_key = _xwing_suite()
+            from cryptography.hazmat.primitives.asymmetric import (
+                mlkem,
+                x25519,
+            )
+
+            wire = (
+                mlkem.MLKEM768PrivateKey.generate()
+                .public_key()
+                .public_bytes_raw()
+                + x25519.X25519PrivateKey.generate()
+                .public_key()
+                .public_bytes_raw()
+            )
+            suite.encrypt(b"probe", build_key(wire), info=_XWING_INFO)
+            _XWING_PROBE = True
+        except PushError:
+            _XWING_PROBE = False  # _xwing_suite already logged the reason
+        except Exception as exc:
+            logger.warning("push: X-Wing probe seal failed: %s", exc)
+            _XWING_PROBE = False
+    return _XWING_PROBE
 
 
 def _utcnow_iso() -> str:

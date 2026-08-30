@@ -86,7 +86,10 @@ requires_xwing = pytest.mark.skipif(
 def _sealable_now() -> list[str]:
     """What /whoami advertises on this box, keyed to the probe above
     rather than pinned as a constant: the post-quantum library is an
-    optional extra."""
+    optional extra.  The daemon additionally backs the advertisement
+    with a real probe seal (push._xwing_probe); on the healthy installs
+    CI runs, the two probes agree, and the divergent case (findable but
+    cannot seal) has its own test below."""
     return ["x25519", "xwing"] if _xwing_findable else ["x25519"]
 
 
@@ -738,6 +741,40 @@ def test_xwing_key_validation_accepts_a_generated_key():
     # key comes back unchanged.
     _, public_b64 = _xwing_keypair()
     assert push.validate_public_key(public_b64, push.SUITE_XWING) == public_b64
+
+
+def test_sealable_suites_advertises_only_a_proven_seal(monkeypatch):
+    # A findable-but-broken cryptography (an OpenSSL without ML-KEM, a
+    # half-installed wheel) must not be advertised: the companion app
+    # steers every fresh pairing by this list, and an advertised suite
+    # the daemon cannot seal would turn each of those pairings into a
+    # 400 with no client-side fallback.  The advertisement therefore
+    # rides a real probe seal, and its verdict is cached so the broken
+    # import is not retried on every /whoami.
+    monkeypatch.setitem(
+        push.SUITES,
+        push.SUITE_XWING,
+        push._Suite(push.SUITE_XWING, 1216, 1136, True),
+    )
+    monkeypatch.setattr(push, "_XWING_PROBE", None)
+    calls = []
+
+    def broken():
+        calls.append(True)
+        raise push.PushError("cryptography cannot seal X-Wing")
+
+    monkeypatch.setattr(push, "_xwing_suite", broken)
+    assert push.sealable_suites() == [push.SUITE_X25519]
+    assert push.sealable_suites() == [push.SUITE_X25519]
+    assert len(calls) == 1
+
+
+@requires_xwing
+def test_sealable_suites_advertises_a_proven_xwing_seal(monkeypatch):
+    # The healthy arm of the probe: a fresh (uncached) probe seal
+    # succeeds through the real library and xwing is advertised.
+    monkeypatch.setattr(push, "_XWING_PROBE", None)
+    assert push.sealable_suites() == [push.SUITE_X25519, push.SUITE_XWING]
 
 
 def test_pairing_refuses_a_suite_the_daemon_cannot_seal_to(monkeypatch):

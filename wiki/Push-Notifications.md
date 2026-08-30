@@ -177,8 +177,15 @@ which installs the `cryptography` library beside PyNaCl; a daemon without
 it refuses `xwing` pairings, and `x25519` requires only the `push` extra.
 The companion app picks the suite automatically: `GET /whoami` lists the
 daemon's sealable suites as `sealableSuites`, and the app pairs under
-`xwing` whenever that list advertises it. The wire construction is
-normative in the
+`xwing` whenever that list advertises it. The daemon proves `xwing` with
+one real probe seal through its own library before advertising it, so an
+install whose `cryptography` is present but broken advertises `x25519`
+only. A device already paired under `x25519` keeps that suite across
+re-pairs, because the public key is the pairing identity and a suite
+change means a new record; the app's pairing screen offers a one-tap
+upgrade when the daemon advertises `xwing`, which registers the device's
+X-Wing key as a new record and then revokes the superseded one. The wire
+construction is normative in the
 [relay protocol](https://github.com/ptweezy/cronstable/blob/main/docs/relay-protocol.md#xwing-construction).
 
 Re-pairing the same public key (push tokens rotate; phones get renamed)
