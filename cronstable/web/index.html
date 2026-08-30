@@ -5719,18 +5719,14 @@ var qrcode = function() {
     let h = parseInt(m.hour, 10); if (h === 24) h = 0;
     return Date.UTC(+m.year, +m.month - 1, +m.day, h, +m.minute, +m.second) - sec;
   }
-  // The frame's UTC offset (ms) at instant t. An IANA zone's offset is
-  // memoized per hour: no zone shifts twice within an hour, so one offset
+  // An IANA frame's UTC offset (ms) at instant t; wallParts and instantOf
+  // answer LOCAL and UTC in Date arithmetic and never call this. The offset
+  // is memoized per hour: no zone shifts twice within an hour, so one offset
   // at both ends of an hour is its offset throughout, and an hour whose
   // ends differ holds a transition and is read per instant.
   const HOUR_MS = 3600000;
   const _offCache = {};
   function tzOffset(frame, t) {
-    if (frame === "UTC") return 0;
-    if (frame === "LOCAL") {
-      const w = wallParts(new Date(t), frame);
-      return Date.UTC(w.Y, w.Mo - 1, w.D, w.h, w.mi, w.se) - Math.floor(t / 1000) * 1000;
-    }
     let memo = _offCache[frame];
     if (!memo) memo = _offCache[frame] = new Map();
     const b = Math.floor(t / HOUR_MS);

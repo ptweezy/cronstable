@@ -243,6 +243,30 @@ def test_observability_mesh_rejects_blank_tls_paths():
         )
 
 
+def test_observability_mesh_errors_name_the_overlay_block():
+    # every check the overlay shares with the election mesh reports under
+    # cluster.observability, the block the operator has to edit
+    overlay = (
+        "cluster:\n"
+        "  backend: kubernetes\n"
+        "  nodeName: node-a\n"
+        "  observability:\n"
+        "{}"
+        "    listen: '0.0.0.0:8140'\n"
+        "    tls:\n      ca: /oca\n      cert: /ocert\n      key: /okey\n"
+        "    peers:\n      - host: {}\n"
+    )
+    with pytest.raises(
+        ConfigError, match="cluster.observability.interval must be > 0"
+    ):
+        _cluster(overlay.format("    interval: 0\n", "b:8140"))
+    with pytest.raises(
+        ConfigError,
+        match=r"cluster.observability.peers\[\].host must be host:port",
+    ):
+        _cluster(overlay.format("", "b"))
+
+
 # --- kubernetes -----------------------------------------------------------
 
 _K8S = "cluster:\n  backend: kubernetes\n  nodeName: node-a\n"

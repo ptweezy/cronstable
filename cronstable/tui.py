@@ -76,7 +76,6 @@ from cronstable.croninfo import (  # noqa: F401  (re-exported for tests/back-com
     ScheduleEntry,
     _local_tzinfo,
     _walk_fires,
-    _walk_frame,
     describe_cron,
     duplicate_schedules,
     lint_schedule,

@@ -2860,13 +2860,13 @@ def _build_gossip_cluster_config(
     for key in ("listen", "tls", "peers"):
         if cfg.get(key) is None:
             raise ConfigError(
-                "cluster.backend gossip requires cluster.{}".format(key)
+                "{0}.backend gossip requires {0}.{1}".format(where, key)
             )
     _require_gossip_tls_paths(cfg["tls"], where + ".tls")
     if cfg["interval"] <= 0:
-        raise ConfigError("cluster.interval must be > 0")
+        raise ConfigError("{}.interval must be > 0".format(where))
     if cfg["driftAfter"] < 1:
-        raise ConfigError("cluster.driftAfter must be >= 1")
+        raise ConfigError("{}.driftAfter must be >= 1".format(where))
 
     # Validate every address is a well-formed host:port up front, so a typo
     # (a missing port, a non-numeric port) fails the config load pointing at
@@ -2889,8 +2889,8 @@ def _build_gossip_cluster_config(
             host = bracket[1:]
             if not sep or not host or not _is_port(port):
                 raise ConfigError(
-                    "cluster.{} must be [ipv6]:port, got {!r}".format(
-                        what, addr
+                    "{}.{} must be [ipv6]:port, got {!r}".format(
+                        where, what, addr
                     )
                 )
             return
@@ -2902,12 +2902,12 @@ def _build_gossip_cluster_config(
         # from quorum with no error. Require the bracketed form instead.
         if ":" in host:
             raise ConfigError(
-                "cluster.{} looks like a bare IPv6 address; write it as "
-                "[ipv6]:port, got {!r}".format(what, addr)
+                "{}.{} looks like a bare IPv6 address; write it as "
+                "[ipv6]:port, got {!r}".format(where, what, addr)
             )
         if not host or not _is_port(port):
             raise ConfigError(
-                "cluster.{} must be host:port, got {!r}".format(what, addr)
+                "{}.{} must be host:port, got {!r}".format(where, what, addr)
             )
 
     _require_host_port(cfg["listen"], "listen")

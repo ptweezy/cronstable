@@ -707,8 +707,9 @@ class DagScheduler:
         if isinstance(sched.schedule, CronTab):
             now_slot = schedule_slot(sched, now_dt)
             if sched.schedule.test(now_slot):
-                # record as aware-UTC like every other run key; astimezone
-                # reads a naive slot as local, as schedule_slot produced it.
+                # record as aware-UTC like every other run key; schedule_slot
+                # renders now into the job's own frame (its zone, or the host
+                # clock as LOCAL_ZONE) and astimezone maps it back.
                 fired_now = now_slot.astimezone(datetime.timezone.utc)
         # Create THEN resync, like the replay loop above: a create that
         # raises (into _fire_scheduled's per-dag isolation) leaves the stale
