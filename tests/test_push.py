@@ -777,6 +777,17 @@ def test_sealable_suites_advertises_a_proven_xwing_seal(monkeypatch):
     assert push.sealable_suites() == [push.SUITE_X25519, push.SUITE_XWING]
 
 
+def test_xwing_sealable_flag_is_wired_to_the_real_import():
+    # The refusal tests below monkeypatch the flag for determinism, so
+    # the wiring needs its own pin: xwing's ``sealable`` bit is the
+    # import probe itself, and a hardcoded True would make
+    # validate_public_key accept pairings a library-less daemon can
+    # never seal (its probe seal is HAVE_XWING-gated too, so nothing
+    # else on the pairing path would catch it).
+    assert push.SUITES[push.SUITE_XWING].sealable == push.HAVE_XWING
+    assert push.SUITES[push.SUITE_X25519].sealable is True
+
+
 def test_pairing_refuses_a_suite_the_daemon_cannot_seal_to(monkeypatch):
     # Fail closed, exactly like the PyNaCl config gate: accepting a
     # pairing this daemon cannot seal to would store a record that
