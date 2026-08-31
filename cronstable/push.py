@@ -900,7 +900,9 @@ def key_fingerprint(public_key_b64: Optional[str]) -> Optional[str]:
     return "-".join(digest[i : i + 4] for i in range(0, 12, 4))
 
 
-def public_device(device: dict[str, Any]) -> dict[str, Any]:
+def public_device(
+    device: dict[str, Any], sealable: Optional[set[str]] = None
+) -> dict[str, Any]:
     """A device record as served by ``GET /push/devices``.
 
     The push token is redacted to its tail: it is not key material, but
@@ -910,15 +912,28 @@ def public_device(device: dict[str, Any]) -> dict[str, Any]:
     (the app re-checks it against its own on screen), and its
     ``fingerprint`` is included for the human comparison step (see
     :func:`key_fingerprint`).
+
+    ``sealableHere`` is the record's suite measured against THIS node's
+    libraries.  The registry is shared across every node on one state
+    store while the libraries are per node, so a record can name a suite
+    the node reading it cannot seal, and every alert that node fires to
+    that device fails.  The flag is what makes that visible instead of
+    leaving the row looking healthy; ``Here`` because a false on one node
+    says nothing about the others.  Pass ``sealable`` to reuse one
+    :func:`sealable_suites` answer across a whole listing.
     """
     token = device.get("pushToken") or ""
+    # A record naming no suite is X25519 (see DEFAULT_SUITE).
+    suite = device.get("suite") or DEFAULT_SUITE
+    if sealable is None:
+        sealable = set(sealable_suites())
     return {
         "id": device.get("id"),
         "name": device.get("name"),
         "platform": device.get("platform"),
         "publicKey": device.get("publicKey"),
-        # A record naming no suite is X25519 (see DEFAULT_SUITE).
-        "suite": device.get("suite") or DEFAULT_SUITE,
+        "suite": suite,
+        "sealableHere": suite in sealable,
         "fingerprint": key_fingerprint(device.get("publicKey")),
         "pushToken": "…" + token[-6:] if token else "",
         "createdAt": device.get("createdAt"),
@@ -1397,9 +1412,14 @@ class PushService:
         # CIPHERTEXT_B64_FLOOR, so the "relay is behind" warning is one
         # line per process rather than one per large alert.
         self._floor_cap_logged = False
+        # Device ids last reported as unsealable by this node, so a
+        # standing mismatch costs one warning per change of the set
+        # rather than one per refresh.
+        self._warned_unsealable: set[str] = set()
 
     async def start(self) -> None:
         """Warm the device mirror; never fatal (the store may be down)."""
+        self._log_sealing_capability()
         try:
             await self.refresh(force=True)
         except PushError as exc:
@@ -1413,6 +1433,39 @@ class PushService:
                 "push: %d paired device(s) loaded from %s",
                 len(self._devices),
                 self.store.describe(),
+            )
+
+    @staticmethod
+    def _log_sealing_capability() -> None:
+        """Report the suites this daemon can seal, once, at start-up.
+
+        The ``push`` extra is a start-refusing gate, so its absence is
+        impossible by the time this runs.  ``push-pq`` cannot be: a platform
+        with no ``cryptography`` wheel installs the extra as PyNaCl alone,
+        and the daemon then seals ``x25519`` and refuses ``xwing`` pairings.
+        That costs no page, so it is not a ConfigError, but an operator who
+        asked for post-quantum sealing and did not get it must hear it from
+        the daemon rather than from a pairing 400 weeks later.
+
+        This is also the only place the X-Wing probe runs off a request
+        path: :func:`sealable_suites` caches it, so warming it here keeps
+        the first ``GET /whoami`` from paying for an ML-KEM keygen on the
+        event loop.
+        """
+        suites = sealable_suites()
+        logger.info("push: sealing suites: %s", ", ".join(suites))
+        if SUITE_XWING not in suites:
+            logger.info(
+                "push: post-quantum xwing sealing is off (%s); x25519 "
+                "alerts are unaffected",
+                (
+                    "cryptography is installed but cannot seal it, for the "
+                    "reason logged above"
+                    if HAVE_XWING
+                    else "this install has no cryptography; it comes with "
+                    'the push-pq extra (pip install "cronstable[push-pq]"), '
+                    "which carries no wheel on some platforms"
+                ),
             )
 
     async def refresh(self, force: bool = False) -> None:
@@ -1463,6 +1516,7 @@ class PushService:
                 raise
             self._registry_error = None
             self._devices = {d["id"]: d for d in devices if d.get("id")}
+            self._warn_about_unsealable_records()
             self._mirror_fresh_until = (
                 asyncio.get_running_loop().time() + REGISTRY_REFRESH_SECONDS
             )
@@ -1478,11 +1532,66 @@ class PushService:
                         exc,
                     )
 
+    def _warn_about_unsealable_records(self) -> None:
+        """Name the mirrored devices this node cannot seal to.
+
+        The fail-closed gate in :func:`validate_public_key` refuses a
+        pairing under a suite the daemon cannot seal, which makes an
+        unsealable record impossible *on the node the phone paired
+        against*.  It cannot make one impossible anywhere else: the
+        registry is one shared document set (see :class:`StateDeviceStore`)
+        while the libraries are per node, so a device that paired against
+        a ``push-pq`` node is invisible to a node without it, and every
+        alert that node fires to that device dies in
+        :func:`seal_to_device`.  Nothing else says so out loud: the
+        listing marks the row ``sealableHere`` false, but only if someone
+        looks.
+
+        Warns on the set, not per alert, and only when the set changes,
+        so a permanent mismatch costs one line per change rather than one
+        per report.
+        """
+        sealable = set(sealable_suites())
+        stranded = {
+            device_id: record
+            for device_id, record in self._devices.items()
+            if (record.get("suite") or DEFAULT_SUITE) not in sealable
+        }
+        if set(stranded) == self._warned_unsealable:
+            return
+        self._warned_unsealable = set(stranded)
+        if not stranded:
+            logger.info(
+                "push: every paired device now uses a suite this node can "
+                "seal"
+            )
+            return
+        logger.warning(
+            "push: %d paired device(s) use a suite this node cannot seal, "
+            "so alerts raised HERE will not reach them: %s. Install the "
+            "matching extra on this node (post-quantum xwing needs "
+            '"cronstable[push-pq]"), or re-pair those devices under a '
+            "suite every node shares. Nodes sharing a device registry "
+            "must carry the same sealing libraries.",
+            len(stranded),
+            ", ".join(
+                sorted(
+                    "{} ({}, {})".format(
+                        record.get("name") or "unnamed",
+                        device_id,
+                        record.get("suite") or DEFAULT_SUITE,
+                    )
+                    for device_id, record in stranded.items()
+                )
+            ),
+        )
+
     def devices_payload(self) -> list[dict[str, Any]]:
         devices = sorted(
             self._devices.values(), key=lambda d: d.get("createdAt") or ""
         )
-        return [public_device(d) for d in devices]
+        sealable = set(sealable_suites())
+        return [public_device(d, sealable) for d in devices]
 
     def get_device(self, device_id: str) -> Optional[dict[str, Any]]:
         return self._devices.get(device_id)

@@ -283,7 +283,7 @@ def test_dockerignore_excludes_the_heavy_untouched_trees():
 
 
 def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
-    # The push+discovery extras pair now lives in exactly one place, so pin
+    # The push-pq+discovery extras pair lives in exactly one place, so pin
     # what the script writes against a straight read of pyproject.toml, and
     # that everything it writes is echoed to stdout (the build-log
     # visibility the old `cat` provided). tomllib is 3.11+; every image venv
@@ -307,7 +307,7 @@ def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
     project = data["project"]
     expected = (
         project["dependencies"]
-        + project["optional-dependencies"]["push"]
+        + project["optional-dependencies"]["push-pq"]
         + project["optional-dependencies"]["discovery"]
     )
     written = tmp_path / "requirements.txt"

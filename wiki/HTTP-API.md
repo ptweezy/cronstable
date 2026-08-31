@@ -972,11 +972,14 @@ empty `stream` parameter is a `400`; a stateless install is a `404`
 ### `GET /whoami`
 
 Describes the bearer token that authenticated this request, as
-`{authenticated, label, scopes, allScopes, pairLinkBase}`: its `label`, the
-scopes it grants (with the implied `view` expanded), whether it is an
-all-scopes token, and the base URL of the pairing QR's deep link (the
-origin of `push.relay.url` plus `/pair`, the hosted landing while no
-`push:` section is applied).
+`{authenticated, label, scopes, allScopes, pairLinkBase, sealableSuites}`:
+its `label`, the scopes it grants (with the implied `view` expanded),
+whether it is an all-scopes token, the base URL of the pairing QR's deep
+link (the origin of `push.relay.url` plus `/pair`, the hosted landing while
+no `push:` section is applied), and the push sealing suites this daemon can
+seal under. `sealableSuites` is `["x25519"]` on a daemon without the
+`push-pq` extra and adds `xwing` with it; a daemon that omits the field
+seals `x25519` only. A client picks a fresh pairing's suite from it.
 
 A companion app uses it to show what it may do. The dashboard uses it to warn
 when its pairing QR would hand a phone the all-scopes token (see
@@ -999,7 +1002,15 @@ Lists every device paired for [end-to-end encrypted push
 alerts](Push-Notifications), sorted by pairing time. Push tokens are redacted
 to their trailing six characters (the token is what lets a third party
 address the device through the platform push service); public keys are
-returned whole. Requires the `view` scope. It is the one view route a
+returned whole. Requires the `view` scope.
+
+Each record carries `suite`, the sealing suite its key belongs to, and
+`sealableHere`, whether the daemon answering this request can seal that
+suite. The registry is shared by every node on one state store while the
+sealing libraries are per node, so a device that paired against a
+`push-pq` node reads `sealableHere: false` on a node without it, and
+alerts raised there never reach that device. False is a per-node fact and
+says nothing about the other nodes. It is the one view route a
 [`web.anonymousScopes`](#public-read-only-access-webanonymousscopes) grant
 deliberately excludes: it answers `403` to a credential-less request, naming
 the scope the method needs, because the registry lists every paired phone.
@@ -1020,6 +1031,8 @@ $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/push/devices
             "name": "parker-iphone",
             "platform": "ios",
             "publicKey": "jSNlDu28No2itHnvrs6ajHHuNAxvqgOjmGxHJrMo8yg=",
+            "suite": "x25519",
+            "sealableHere": true,
             "pushToken": "…4af1c9",
             "createdAt": "2026-07-23T14:00:00+00:00",
             "createdBy": "parker-iphone"

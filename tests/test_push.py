@@ -691,6 +691,78 @@ def test_absent_suite_reads_as_x25519():
     )
 
 
+def test_public_device_flags_a_suite_this_node_cannot_seal(monkeypatch):
+    # The registry is shared across nodes while the libraries are per
+    # node, so the fail-closed pairing gate cannot keep an unsealable
+    # record out of a node that did not take the pairing. The listing is
+    # where the operator sees it: without the flag the row reads healthy
+    # on the node that is silently dropping its alerts.
+    record = {"id": "d", "publicKey": None, "suite": push.SUITE_XWING}
+    monkeypatch.setattr(push, "sealable_suites", lambda: [push.SUITE_X25519])
+    assert push.public_device(record)["sealableHere"] is False
+    # x25519 is sealable wherever the daemon started at all: PyNaCl is a
+    # start-refusing gate.
+    assert push.public_device({"id": "d", "publicKey": None})[
+        "sealableHere"
+    ] is True
+    # and an explicit set (what the listing passes once per response)
+    # overrides the lookup rather than re-probing per row
+    assert push.public_device(record, {push.SUITE_XWING})["sealableHere"] is (
+        True
+    )
+
+
+async def test_refresh_warns_once_about_records_it_cannot_seal(
+    tmp_path, caplog, monkeypatch
+):
+    # A node that cannot seal a stored record drops every alert to that
+    # device with one logger.error per alert and nothing that names the
+    # cause. The mirror load is where it gets said out loud, once per
+    # change of the stranded set rather than once per refresh.
+    store = push.FileDeviceStore(str(tmp_path / "devices.json"))
+    service = _service(store)
+    await store.upsert(
+        {
+            "id": "dev-1",
+            "name": "phone",
+            "publicKey": "k",
+            "suite": push.SUITE_XWING,
+            "pushToken": "tok",
+        }
+    )
+    monkeypatch.setattr(push, "sealable_suites", lambda: [push.SUITE_X25519])
+    caplog.set_level(logging.INFO, logger="cronstable")
+
+    await service.refresh(force=True)
+    warnings = [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "cannot seal" in warnings[0]
+    assert "phone (dev-1, xwing)" in warnings[0]
+    assert "push-pq" in warnings[0]
+
+    # a standing mismatch does not re-warn on every refresh
+    caplog.clear()
+    await service.refresh(force=True)
+    assert not [
+        r for r in caplog.records if r.levelno >= logging.WARNING
+    ]
+
+    # ... and recovering the capability says so, so an operator watching
+    # the log sees the mismatch close
+    caplog.clear()
+    monkeypatch.setattr(
+        push, "sealable_suites", lambda: [push.SUITE_X25519, push.SUITE_XWING]
+    )
+    await service.refresh(force=True)
+    assert any(
+        "every paired device now uses a suite this node can seal"
+        in r.getMessage()
+        for r in caplog.records
+    )
+
+
 @requires_pynacl
 def test_pairing_accepts_an_explicit_x25519_suite():
     _, public_b64 = _device_keypair()
@@ -2921,6 +2993,44 @@ async def test_start_stop_push_absorbs_a_corrupt_registry_document(caplog):
     await cron.start_stop_push(dict(push_config))
     assert cron._push_service is first
     await cron.start_stop_push(None)
+
+
+async def test_start_announces_the_suites_it_can_seal(caplog, monkeypatch):
+    # The `push` extra is a start-refusing gate, so a daemon that reaches
+    # start() always seals x25519. `push-pq` is not: on a platform with no
+    # cryptography wheel the extra installs PyNaCl alone, which costs no
+    # page and therefore no ConfigError. Start-up is where an operator who
+    # asked for post-quantum sealing and did not get it finds out, so the
+    # capability line is pinned in both directions.
+    # A platform with no cryptography wheel: the module-level flag and the
+    # suite's `sealable` bit are one fact read at import, so both move.
+    monkeypatch.setattr(push, "HAVE_XWING", False)
+    monkeypatch.setitem(
+        push.SUITES,
+        push.SUITE_XWING,
+        push._Suite(push.SUITE_XWING, 1216, 1136, False),
+    )
+    monkeypatch.setattr(push, "_XWING_PROBE", None)
+    caplog.set_level(logging.INFO, logger="cronstable")
+    push.PushService._log_sealing_capability()
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("push: sealing suites: x25519" == m for m in messages)
+    reason = [m for m in messages if "post-quantum xwing sealing is off" in m]
+    assert reason and "push-pq" in reason[0]
+
+    # ... and with a working install the offer line stays away entirely.
+    caplog.clear()
+    monkeypatch.setattr(push, "HAVE_XWING", True)
+    monkeypatch.setattr(push, "_XWING_PROBE", True)
+    monkeypatch.setitem(
+        push.SUITES,
+        push.SUITE_XWING,
+        push._Suite(push.SUITE_XWING, 1216, 1136, True),
+    )
+    push.PushService._log_sealing_capability()
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("x25519, xwing" in m for m in messages)
+    assert not any("sealing is off" in m for m in messages)
 
 
 async def test_start_stop_push_never_raises(monkeypatch, caplog):

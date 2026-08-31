@@ -458,6 +458,13 @@ their runners, the rest under QEMU emulation. The `riscv64` builds cover 64-bit
 RISC-V for both glibc and musl. The musl-only `armv6` build extends to older
 32-bit ARM, such as a Raspberry Pi 1 or Zero. There is no glibc `armv6` build.
 
+Each build bundles the optional extras its architecture has a wheel for.
+`cryptography`, which carries post-quantum push sealing, has the shortest
+reach: `linux-amd64`, `linux-arm64`, `linux-armv7`, `linux-amd64-musl`,
+`linux-arm64-musl`, `macos-arm64` and `windows-amd64` seal the `xwing` suite,
+and every other build seals `x25519` only. See
+[Push notifications](Push-Notifications).
+
 The `mips64le` build covers 64-bit little-endian MIPS on glibc hosts. It is
 built in an emulated Debian bookworm container, the last Debian suite that
 carries this port, pinned to a snapshot of that archive because bookworm's LTS

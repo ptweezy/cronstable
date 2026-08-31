@@ -30,6 +30,30 @@ reporting an error that says so.) The `push-pq` extra installs the
 `cryptography` library beside PyNaCl and adds post-quantum `xwing` sealing
 (see [pairing devices](#pairing-devices)).
 
+`cryptography` publishes wheels for fewer platforms than PyNaCl, so
+post-quantum sealing follows where a wheel exists:
+
+| How you run cronstable | Post-quantum sealing |
+| --- | --- |
+| `pip install "cronstable[push-pq]"` | Linux x86_64 and aarch64, macOS Apple Silicon, Windows x64 |
+| Release binary | `linux-amd64`, `linux-arm64`, `linux-armv7`, `linux-amd64-musl`, `linux-arm64-musl`, `macos-arm64`, `windows-amd64` |
+| Docker image | `linux/amd64` and `linux/arm64` |
+
+Everywhere else, `push-pq` installs PyNaCl alone and the daemon seals
+`x25519` only, which works on every platform. The daemon logs the suites it
+can seal at start-up, so a host that asked for post-quantum sealing and did
+not get it says so on boot.
+
+The pip route stops at two Linux architectures because a dependency marker
+cannot see which libc you are on, and `cryptography` publishes `ppc64le` and
+`armv7l` wheels for glibc but not for musl. Each release binary is built
+against a known libc, so the `armv7` build reaches one architecture past pip
+on the same hardware.
+
+Install `push-pq` on every node that shares a device registry. The pairing is
+stored once and read by all of them, while the library is per node, so a node
+without `cryptography` cannot page a device that paired under `xwing`.
+
 Then configure the daemon-global `push:` section, which says where alerts
 go and where device pairings are stored:
 

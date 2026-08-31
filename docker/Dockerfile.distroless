@@ -56,8 +56,8 @@ COPY docker/extract_deps.py /tmp/deps/extract_deps.py
 
 # Install the third-party dependencies into the venv the runtime stage will
 # copy. The requirement strings are read out of pyproject.toml by the COPYd
-# extract_deps.py helper (core dependencies plus the push and discovery
-# extras), the exact strings `pip install ".[push,discovery]"` would
+# extract_deps.py helper (core dependencies plus the push-pq and discovery
+# extras), the exact strings `pip install ".[push-pq,discovery]"` would
 # resolve, so the two can never drift and a renamed extra fails the build
 # loudly (KeyError). The build backend (build-system.requires) goes into a
 # throwaway venv, /tmp/deps/buildenv: the project install below uses it to
@@ -72,13 +72,16 @@ RUN set -eux; \
     python3.13 -m venv /tmp/deps/buildenv; \
     retry /tmp/deps/buildenv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/build-requires.txt
 
-# The push (PyNaCl) and discovery (zeroconf) extras above are part of the
-# image contract: a `push:` or `web.bonjour` section fails closed at config
+# The push-pq (PyNaCl + cryptography) and discovery (zeroconf) extras above
+# are part of the image contract: a `push:` or `web.bonjour` section fails closed at config
 # load, so an image missing them would crash-loop with no in-image
 # remediation (pip is stripped from the runtime stage below). This image
 # publishes only amd64/arm64, which both have wheels; verify with a real
-# sealed-box round-trip plus a zeroconf import all the same.
-RUN /opt/venv/bin/python -c 'from nacl.public import PrivateKey, SealedBox; k = PrivateKey.generate(); m = b"cronstable push self-test"; assert SealedBox(k).decrypt(SealedBox(k.public_key).encrypt(m)) == m; import zeroconf, zeroconf.asyncio; print("push and discovery extras verified")'
+# sealed-box round-trip plus a zeroconf import all the same. cryptography carries the post-quantum `xwing` suite behind
+# an environment marker, so it is checked only where it resolved, and by its
+# HPKE module rather than by sealing: these images take a PyPI wheel with its
+# own OpenSSL, so a too-old release is the failure worth catching.
+RUN /opt/venv/bin/python -c 'from nacl.public import PrivateKey, SealedBox; k = PrivateKey.generate(); m = b"cronstable push self-test"; assert SealedBox(k).decrypt(SealedBox(k.public_key).encrypt(m)) == m; import importlib.util as u; assert u.find_spec("cryptography") is None or u.find_spec("cryptography.hazmat.primitives.hpke") is not None, "cryptography is too old to seal xwing"; import zeroconf, zeroconf.asyncio; print("push-pq and discovery extras verified")'
 
 # Best-effort orjson (the `speedups` extra) for the durable-state / cluster
 # JSON paths. This image publishes only amd64/arm64, which have orjson

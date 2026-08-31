@@ -126,13 +126,21 @@ speedups = [
 push = ["pynacl>=1.6.2"]
 # Post-quantum push sealing (the `xwing` suite; see cronstable.push): the
 # `push` extra plus cryptography, whose HPKE module seals X-Wing (ML-KEM-768
-# + X25519). The marker mirrors the dev extra's: cryptography ships no
-# win-arm64 wheel, so on that one platform this extra installs only PyNaCl
-# and the daemon refuses xwing pairings at pairing time (fail-closed; x25519
-# push still works).
+# + X25519).  Two extras because the libraries reach different distances:
+# PyNaCl covers every target above, so `push` can be the hard, start-refusing
+# gate, while cryptography is Rust plus OpenSSL and publishes wheels for a
+# subset.  The marker lists the targets that have one, so this extra always
+# resolves; off the list it installs PyNaCl alone and the daemon refuses
+# xwing pairings (fail-closed; x25519 push still seals).  Unmarked, pip would
+# take the newest cryptography and fail building its sdist for want of Rust
+# and OpenSSL headers.  Linux stops at x86_64 and aarch64, the arches with a
+# wheel under BOTH libcs: cryptography publishes ppc64le and armv7l for
+# manylinux but not musllinux, and a marker cannot see the libc.  Those two
+# get xwing from the release binaries instead, whose lanes do know their libc
+# (the `pq` matrix keys in .github/workflows/release.yml).
 push-pq = [
     "pynacl>=1.6.2",
-    "cryptography>=48; platform_machine != 'ARM64' or sys_platform != 'win32'",
+    "cryptography>=48; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
 ]
 # Zero-config LAN discovery (the opt-in `web.bonjour` mDNS advert; see
 # cronstable.discovery). Same fail-closed contract: web.bonjour without this
@@ -140,9 +148,10 @@ push-pq = [
 discovery = ["zeroconf>=0.149.16"]
 dev = [
     # the cluster mTLS tests mint throwaway certs with it, and the X-Wing
-    # sealing tests need its HPKE module (>=48). No win-arm64 wheel; see
-    # requirements_dev.txt for why it's gated to other platforms.
-    "cryptography>=48; platform_machine != 'ARM64' or sys_platform != 'win32'",
+    # sealing tests need its HPKE module (>=48). Same wheel allowlist as the
+    # push-pq extra above; see requirements_dev.txt for what the tests do
+    # where it resolves to nothing.
+    "cryptography>=48; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     # The optional-extra deps the tests must really exercise (orjson, pynacl,
     # zeroconf); requirements_dev.txt documents why each is here.  Without
     # them a `pip install -e .[dev]` + `pytest` checkout runs the suite in

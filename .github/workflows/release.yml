@@ -615,6 +615,9 @@ jobs:
             # build rather than a missing wheel; the emulated rows source-build
             # it and stay best-effort.
             nacl: hard
+            # A manylinux2014_x86_64 wheel always exists for cryptography, so
+            # this row bundles post-quantum sealing and fails if it cannot.
+            pq: hard
             rust: '1'
             native: '1'
           - arch: arm64
@@ -626,6 +629,7 @@ jobs:
             floor: '2.17'
             archspec: elf:2:1:183   # 64-bit, little-endian, EM_AARCH64
             nacl: hard
+            pq: hard   # manylinux2014_aarch64 wheel; see the amd64 row
             rust: '1'
             native: '1'
           - arch: ppc64le
@@ -666,6 +670,11 @@ jobs:
             # Hard-float, and nothing in the bundle may need above ARMv7.
             armgate: '--arm-float hard --max-arm-arch v7 --max-arm-fp 4'
             nacl: soft
+            # cryptography publishes a manylinux_2_31_armv7l wheel, which is
+            # this row's image exactly, so post-quantum sealing rides along
+            # with no source build and no Rust. hard for the same reason the
+            # native rows are: the wheel is always there.
+            pq: hard
             # No Rust here, which is a cost decision rather than a limitation:
             # rustup does publish host tools for armv7-unknown-linux-gnueabihf
             # (the soft-float gnueabi triple is the one that lacks them), but
@@ -793,14 +802,25 @@ jobs:
               # the sealed-box round trip is uninstalled, so push fails closed
               # rather than shipping a miscompiled libsodium.
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" ${{ matrix.nacl }} "push extra not bundled"
-              # Bundle cryptography (the `push-pq` extra) so the frozen
-              # daemon seals X-Wing push. Wheels cover the two native rows
-              # only; the emulated rows ship without it and refuse xwing
-              # pairings at pairing time (x25519 push still seals). A bare
-              # pip install: verify_extra.py has no cryptography probe, and
-              # set -e makes a failed wheel install fail the lane.
-              if [ "${{ matrix.native }}" = "1" ]; then
-                $PIP install "cryptography>=48"
+              # Bundle cryptography (the `push-pq` extra) so the frozen daemon
+              # seals post-quantum X-Wing push. NO APOSTROPHES BELOW: this
+              # whole script is the argument of a single-quoted sh -euc, so
+              # one would end it mid-comment. Only the rows declaring `pq`
+              # install it, and those are the rows whose image has a matching
+              # wheel: manylinux2014 on amd64/arm64, manylinux_2_31_armv7l on
+              # armv7. The other two go without for different reasons, so
+              # neither is worth revisiting: ppc64le has a wheel, but only at
+              # manylinux_2_28 and up, above the 2.17 floor this lane holds,
+              # and s390x has no cryptography wheel at any tag, so no image
+              # would give it one. hard wherever it is declared, because the
+              # wheel is always there and absence means a broken build;
+              # verify_extra.py then seals a real X-Wing probe, catching an
+              # ML-KEM-less OpenSSL here rather than at the first pairing an
+              # operator makes. A row without `pq` refuses xwing pairings
+              # (fail-closed; x25519 push still seals).
+              if [ -n "${{ matrix.pq }}" ]; then
+                sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
+                  ${{ matrix.pq }} "post-quantum push not bundled"
               fi
               # Bundle zeroconf (the `discovery` extra): pure Python with
               # optional speedups, so a HARD install on every row. LGPL-2.1;
@@ -924,6 +944,13 @@ jobs:
           - { arch: amd64, platform: linux/amd64, runner: ubuntu-24.04 }
           - { arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
           - { arch: i686, platform: linux/386, runner: ubuntu-24.04 }
+          # Post-quantum sealing rides the rows with a musllinux_1_2 wheel,
+          # which cryptography publishes for x86_64 and aarch64 only. Keyed on
+          # both libc and arch because the glibc twins of these two build in
+          # the manylinux `binaries` job instead, and the remaining rows here
+          # (i686, riscv64, and the musl arches below) have no wheel at all.
+          - { libc: musl, arch: amd64, pq: hard }
+          - { libc: musl, arch: arm64, pq: hard }
           # `armgate` is the ABI assertion elf_floor.py makes on 32-bit ARM,
           # which no functional test can make for itself: the float ABI, and
           # the newest instruction set anything in the bundle needs.
@@ -1070,6 +1097,20 @@ jobs:
               # libsodium (push fails closed).
               ${{ matrix.nacl_tools }}
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              # Bundle cryptography (the `push-pq` extra) so the frozen daemon
+              # seals post-quantum X-Wing push. Only the rows declaring `pq`
+              # install it: cryptography publishes musllinux_1_2 for x86_64 and
+              # aarch64 and nothing this lane could use elsewhere, so the rest
+              # refuse xwing pairings (fail-closed; x25519 push still seals).
+              # hard rather than the soft policy pynacl takes, because
+              # pynacl source-builds here while cryptography takes a wheel
+              # or nothing (and no apostrophes: single-quoted sh -euc);
+              # verify_extra.py then seals a real X-Wing probe before the
+              # bundle is frozen.
+              if [ -n "${{ matrix.pq }}" ]; then
+                sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
+                  ${{ matrix.pq }} "post-quantum push not bundled"
+              fi
               # Bundle zeroconf (the `discovery` extra): pure Python with
               # optional speedups, so a HARD install even under QEMU. It
               # is LGPL-2.1; the in-binary notice, Release source
@@ -1623,6 +1664,10 @@ jobs:
             runner: macos-15          # macOS 15, Apple Silicon -- shipped
             ship: true
             asset: macos-arm64
+            # cryptography ships macosx_11_0_arm64 and nothing for x86_64,
+            # so post-quantum sealing is bundled on the Apple Silicon rows
+            # and left off the Intel ones.
+            pq: hard
           - arch: amd64
             runner: macos-15-intel    # macOS 15, Intel -- shipped
             ship: true
@@ -1631,6 +1676,7 @@ jobs:
             runner: macos-26          # macOS 26 (Tahoe), Apple Silicon -- CI only
             ship: false
             asset: macos26-arm64
+            pq: hard   # see the macOS 15 arm64 row
           - arch: amd64
             runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
             ship: false
@@ -1676,15 +1722,16 @@ jobs:
           # ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
-          # Bundle cryptography (the `push-pq` extra) on arm64 so the
-          # frozen daemon seals X-Wing push there; the amd64 builds ship
-          # without it (cryptography publishes no macOS x86_64 wheel) and
-          # refuse xwing pairings at pairing time (x25519 push still
-          # seals). A bare pip install: verify_extra.py has no
-          # cryptography probe, and set -e makes a failed install fail
-          # the lane.
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            uv pip install "cryptography>=48"
+          # Bundle cryptography (the `push-pq` extra) so the frozen daemon
+          # seals post-quantum X-Wing push. Only the arm64 rows declare `pq`:
+          # cryptography publishes macosx_11_0_arm64 and no x86_64 or
+          # universal2 wheel, so the Intel builds refuse xwing pairings
+          # (fail-closed; x25519 push still seals). hard where declared, and
+          # verify_extra.py seals a real X-Wing probe before freezing.
+          if [ -n "${{ matrix.pq }}" ]; then
+            PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+              sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
+                ${{ matrix.pq }} "post-quantum push not bundled"
           fi
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on both arches, HARD failure. LGPL-2.1; in-binary notice +
@@ -2288,6 +2335,9 @@ jobs:
             pyarch: ''
             pfsuffix: ''
             regflag: /reg:64
+            # cryptography ships win_amd64 and nothing for win32 or
+            # win-arm64, so post-quantum sealing is bundled here only.
+            pq: hard
           - arch: arm64
             runner: windows-11-arm
             pyarch: ''
@@ -2345,14 +2395,16 @@ jobs:
           # silently ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
-          # Bundle cryptography (the `push-pq` extra) on amd64 so the
-          # frozen daemon seals X-Wing push there; the arm64 and i686
-          # builds ship without it (no win-arm64 wheel) and refuse xwing
-          # pairings at pairing time (x25519 push still seals). A bare
-          # pip install: verify_extra.py has no cryptography probe, and
-          # set -e makes a failed install fail the lane.
-          if [ "${{ matrix.arch }}" = "amd64" ]; then
-            uv pip install "cryptography>=48"
+          # Bundle cryptography (the `push-pq` extra) so the frozen daemon
+          # seals post-quantum X-Wing push. Only the amd64 row declares `pq`:
+          # cryptography publishes win_amd64 and nothing for win32 or
+          # win-arm64, so those two refuse xwing pairings (fail-closed; x25519
+          # push still seals). hard where declared, and verify_extra.py seals
+          # a real X-Wing probe before freezing.
+          if [ -n "${{ matrix.pq }}" ]; then
+            PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+              sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
+                ${{ matrix.pq }} "post-quantum push not bundled"
           fi
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on win32/amd64/arm64, HARD failure. LGPL-2.1; in-binary

@@ -1,10 +1,13 @@
 # cryptography backs two test arms: the cluster mTLS tests mint throwaway
 # certs with it, and the X-Wing push-sealing tests in tests/test_push.py use
 # its HPKE module (stock wheels carry working ML-KEM from 48, hence the
-# floor). It ships no win-arm64 wheel and can't build from source on that CI
-# runner (no OpenSSL), so don't install it there; those tests importorskip it
-# and self-skip when it's absent. Every other platform keeps full coverage.
-cryptography>=48; platform_machine != "ARM64" or sys_platform != "win32"
+# floor). It publishes wheels for a subset of the platforms cronstable
+# targets, and a CI runner off that list has neither the Rust toolchain nor
+# the OpenSSL headers to build the sdist, so the marker is the same wheel
+# list the push-pq extra carries: Linux x86_64/aarch64, macOS arm64, Windows
+# amd64. Both test arms importorskip it, so the win-arm64 and Intel-mac cells
+# self-skip those tests and every other cell keeps full coverage.
+cryptography>=48; (sys_platform == "linux" and (platform_machine == "x86_64" or platform_machine == "aarch64")) or (sys_platform == "darwin" and platform_machine == "arm64") or (sys_platform == "win32" and platform_machine == "AMD64")
 # orjson is the optional `speedups` extra, but the tests that cover the
 # accelerated durable-state/gossip JSON paths are worthless if no CI cell ever
 # installs it: they were importorskip-guarded and therefore skipped in all 12

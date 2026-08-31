@@ -1591,6 +1591,17 @@ components:
             box) or `xwing` (X-Wing, ML-KEM-768 + X25519, sealed via
             HPKE). Always present; a record that names none reports
             `x25519`.
+        sealableHere:
+          type: boolean
+          description: >-
+            Whether the daemon answering this request can seal `suite`.
+            The device registry is shared by every node on one state
+            store while the sealing libraries are per node, so a record
+            that paired against a `push-pq` node reads as false on a node
+            without it, and alerts raised there never reach that device.
+            False is a per-node fact and says nothing about the others.
+            The field stays outside `required`: a daemon that omits it
+            seals every suite it stores.
         fingerprint:
           type: string
           nullable: true

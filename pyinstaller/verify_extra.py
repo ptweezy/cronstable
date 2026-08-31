@@ -14,6 +14,11 @@ cronstable prefers each of these packages whenever it is merely importable:
 - pynacl: a broken bundled libsodium corrupts or crashes every push alert;
   with it absent, the daemon's fail-closed config check reports push as
   unavailable instead of sealing garbage.
+- cryptography: importable is not sealable. The HPKE module can be present
+  while the OpenSSL underneath has no ML-KEM, which no import can see, so the
+  probe seals X-Wing for real. Absent or demoted here, the daemon advertises
+  `x25519` only and refuses `xwing` pairings, which costs post-quantum
+  sealing and pages nobody less.
 - zeroconf: pure Python (no miscompile risk); its probe only proves the
   install produced an importable package, async surface included, before
   the bundle is frozen.
@@ -26,7 +31,8 @@ Exit 0 (nothing to verify) when the package is not installed at all: the
 arch had no wheel and the optional source build was skipped or failed;
 that artifact simply ships without the extra.
 
-Usage: python pyinstaller/verify_extra.py {uvloop|orjson|pynacl|zeroconf}
+Usage: python pyinstaller/verify_extra.py
+       {uvloop|orjson|pynacl|cryptography|zeroconf}
 """
 
 import importlib.util
@@ -76,6 +82,21 @@ def _verify_pynacl():
     return "sealed-box round-trip ok"
 
 
+def _verify_cryptography():
+    from cronstable import push
+
+    # The daemon's own probe, not a reimplementation: it seals a message to a
+    # throwaway X-Wing key through the same suite the alert path uses, so a
+    # pass here means this build really seals `xwing`. It logs the underlying
+    # reason on failure, as it does on the daemon's first /whoami.
+    if not push._xwing_probe():
+        raise AssertionError(
+            "X-Wing probe seal failed (see the logged reason above); the "
+            "HPKE module is present but this build cannot seal ML-KEM"
+        )
+    return "X-Wing probe seal ok"
+
+
 def _verify_zeroconf():
     import zeroconf
     import zeroconf.asyncio  # noqa: F401  (the surface cronstable.discovery uses)
@@ -88,6 +109,10 @@ _PROBES = {
     "uvloop": ("uvloop", _verify_uvloop),
     "orjson": ("orjson", _verify_orjson),
     "pynacl": ("nacl", _verify_pynacl),
+    # `cryptography`, not its HPKE submodule: a cryptography too old for the
+    # module is installed-but-useless, which the probe must fail (so the
+    # caller uninstalls it) rather than skip as "nothing to verify".
+    "cryptography": ("cryptography", _verify_cryptography),
     "zeroconf": ("zeroconf", _verify_zeroconf),
 }
 

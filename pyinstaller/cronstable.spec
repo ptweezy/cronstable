@@ -74,15 +74,25 @@ try:
     hiddenimports.extend(["nacl.public", "_cffi_backend"])
 except ImportError:
     pass
-# cryptography (the `push-pq` extra): cronstable/push imports
-# cryptography.hazmat.primitives.hpke inside _xwing_suite, a guarded
-# call-site import like nacl's above. cryptography ships upstream
-# PyInstaller hooks that pull in the rest; the explicit entry is the
-# same insurance the nacl one is.
+# cryptography (the `push-pq` extra): cronstable/push imports the hpke
+# module and the mlkem and x25519 asymmetric modules inside _xwing_suite,
+# guarded call-site imports like nacl's above. All three are named because
+# nothing else names them: cryptography ships no PyInstaller hooks of its
+# own (no __pyinstaller package, no entry point), and the hook that
+# PyInstaller's contrib set carries covers the backends and bindings
+# rather than these. The analysis does follow the import statement itself
+# today, so this is the insurance the nacl entry is: it holds the bundle
+# together if that import is ever made dynamic.
 try:
     import cryptography.hazmat.primitives.hpke  # noqa: F401
 
-    hiddenimports.append("cryptography.hazmat.primitives.hpke")
+    hiddenimports.extend(
+        [
+            "cryptography.hazmat.primitives.hpke",
+            "cryptography.hazmat.primitives.asymmetric.mlkem",
+            "cryptography.hazmat.primitives.asymmetric.x25519",
+        ]
+    )
 except ImportError:
     pass
 # zeroconf (the `discovery` extra, behind web.bonjour): same guarded-import
