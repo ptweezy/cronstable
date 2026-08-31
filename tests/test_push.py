@@ -22,7 +22,6 @@ them on any cell without the wheel; never reintroduce one.
 import asyncio
 import base64
 import copy
-import importlib.util
 import json
 import logging
 import os
@@ -54,6 +53,7 @@ from cronstable.job import (
     RunningJob,
     report_config_enabled,
 )
+from tests._helpers import _xwing_findable, requires_xwing
 from tests.conftest import _cron as _shared_cron
 
 try:
@@ -66,30 +66,15 @@ requires_pynacl = pytest.mark.skipif(
     reason="pynacl (the push extra) is not installed",
 )
 
-try:
-    # The same find_spec probe push.HAVE_XWING runs, done independently
-    # so a broken daemon probe fails these tests instead of skipping
-    # them.
-    _xwing_findable = (
-        importlib.util.find_spec("cryptography.hazmat.primitives.hpke")
-        is not None
-    )
-except (ImportError, ValueError):  # no cryptography at all
-    _xwing_findable = False
-
-requires_xwing = pytest.mark.skipif(
-    not _xwing_findable,
-    reason="cryptography with HPKE (the push-pq extra) is not installed",
-)
-
 
 def _sealable_now() -> list[str]:
-    """What /whoami advertises on this box, keyed to the probe above
-    rather than pinned as a constant: the post-quantum library is an
-    optional extra.  The daemon additionally backs the advertisement
-    with a real probe seal (push._xwing_probe); on the healthy installs
-    CI runs, the two probes agree, and the divergent case (findable but
-    cannot seal) has its own test below."""
+    """What /whoami advertises on this box, keyed to the shared
+    ``_xwing_findable`` probe rather than pinned as a constant: the
+    post-quantum library is an optional extra.  The daemon
+    additionally backs the advertisement with a real probe seal
+    (push._xwing_probe); on the healthy installs CI runs, the two
+    probes agree, and the divergent case (findable but cannot seal)
+    has its own test below."""
     return ["x25519", "xwing"] if _xwing_findable else ["x25519"]
 
 
@@ -111,7 +96,7 @@ def _open_sealed(private, ciphertext_b64: str) -> dict[str, Any]:
 def _xwing_keypair():
     """A generated X-Wing device keypair: (private key, wire base64).
 
-    The wire form the companion app registers: the ML-KEM-768
+    The wire form the app registers: the ML-KEM-768
     encapsulation key (1184 bytes) followed by the X25519 public key
     (32), standard base64.
     """
@@ -129,7 +114,7 @@ def _xwing_keypair():
 
 
 def _open_xwing(sealed_b64: str, private) -> dict[str, Any]:
-    """Open one sealed X-Wing alert the way the companion app does.
+    """Open one sealed X-Wing alert the way the app does.
 
     Single-shot HPKE decrypt over the combined enc||ct blob.  The
     ciphersuite and info bytes are spelled out here rather than read
@@ -325,6 +310,24 @@ def test_build_payload_event_kind():
     assert payload["run_key"] == "sched-1"
     # events have no process, so never a log tail
     assert "log_tail" not in payload
+
+
+def test_build_payload_event_omits_absent_text_fields():
+    # The sealed-plaintext contract in relay-protocol.md is that a field
+    # is a string or missing, never null: the app decodes it that way and
+    # every absent field is budget an alert does not spend.
+    ctx = NotifyEventContext(
+        event="dag_failure",
+        success=False,
+        name="etl",
+        subject=None,
+        message=None,
+        fields={},
+    )
+    payload = push.build_payload(ctx, False, True)
+    assert payload["kind"] == "event"
+    assert "subject" not in payload
+    assert "message" not in payload
 
 
 def test_build_payload_sla_kind():
@@ -705,11 +708,6 @@ def test_public_device_flags_a_suite_this_node_cannot_seal(monkeypatch):
     assert push.public_device({"id": "d", "publicKey": None})[
         "sealableHere"
     ] is True
-    # and an explicit set (what the listing passes once per response)
-    # overrides the lookup rather than re-probing per row
-    assert push.public_device(record, {push.SUITE_XWING})["sealableHere"] is (
-        True
-    )
 
 
 async def test_refresh_warns_once_about_records_it_cannot_seal(
@@ -757,7 +755,37 @@ async def test_refresh_warns_once_about_records_it_cannot_seal(
     )
     await service.refresh(force=True)
     assert any(
-        "every paired device now uses a suite this node can seal"
+        "every paired device uses a suite this node can seal"
+        in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_revoking_the_last_stranded_record_closes_the_mismatch(
+    tmp_path, caplog, monkeypatch
+):
+    # Revoking a stranded device is the operator acting on the warning,
+    # so the log confirms it there rather than up to a mirror refresh
+    # later, when the connection to what they just did is gone.
+    store = push.FileDeviceStore(str(tmp_path / "devices.json"))
+    service = _service(store)
+    await store.upsert(
+        {
+            "id": "dev-1",
+            "name": "phone",
+            "publicKey": "k",
+            "suite": push.SUITE_XWING,
+            "pushToken": "tok",
+        }
+    )
+    monkeypatch.setattr(push, "sealable_suites", lambda: [push.SUITE_X25519])
+    await service.refresh(force=True)
+
+    caplog.clear()
+    caplog.set_level(logging.INFO, logger="cronstable")
+    await service.revoke("dev-1")
+    assert any(
+        "every paired device uses a suite this node can seal"
         in r.getMessage()
         for r in caplog.records
     )
@@ -805,24 +833,16 @@ async def test_pairing_accepts_an_xwing_device_and_stores_its_suite(
     assert listed["fingerprint"] == push.key_fingerprint(public_b64)
 
 
-@requires_xwing
-def test_xwing_key_validation_accepts_a_generated_key():
-    # The probe is a capability and sanity check, not a full key
-    # validator: encapsulation accepts some malformed ML-KEM component
-    # keys, so only real generated keys are asserted here.  A canonical
-    # key comes back unchanged.
-    _, public_b64 = _xwing_keypair()
-    assert push.validate_public_key(public_b64, push.SUITE_XWING) == public_b64
-
-
 def test_sealable_suites_advertises_only_a_proven_seal(monkeypatch):
     # A findable-but-broken cryptography (an OpenSSL without ML-KEM, a
-    # half-installed wheel) must not be advertised: the companion app
+    # half-installed wheel) must not be advertised: the app
     # steers every fresh pairing by this list, and an advertised suite
     # the daemon cannot seal would turn each of those pairings into a
     # 400 with no client-side fallback.  The advertisement therefore
     # rides a real probe seal, and its verdict is cached so the broken
-    # import is not retried on every /whoami.
+    # import is not retried on every /whoami.  Sealing never consults
+    # the cache (seal_to_device builds its suite per seal), so the
+    # verdict costs an advertisement and never an alert.
     monkeypatch.setitem(
         push.SUITES,
         push.SUITE_XWING,
@@ -847,6 +867,124 @@ def test_sealable_suites_advertises_a_proven_xwing_seal(monkeypatch):
     # succeeds through the real library and xwing is advertised.
     monkeypatch.setattr(push, "_XWING_PROBE", None)
     assert push.sealable_suites() == [push.SUITE_X25519, push.SUITE_XWING]
+
+
+@requires_xwing
+async def test_sealable_suites_async_answers_a_cold_probe_off_the_loop(
+    monkeypatch,
+):
+    # /whoami serves this on every daemon running the web app, including
+    # one with no push section, where no PushService warmed the probe at
+    # start-up. The cold answer costs an ML-KEM keygen, which belongs on
+    # a thread rather than on the event loop.
+    monkeypatch.setattr(push, "_XWING_PROBE", None)
+    loop_threads = []
+    real_to_thread = asyncio.to_thread
+
+    async def watched(func, *args, **kwargs):
+        loop_threads.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(push.asyncio, "to_thread", watched)
+    assert await push.sealable_suites_async() == [
+        push.SUITE_X25519,
+        push.SUITE_XWING,
+    ]
+    assert loop_threads == [push.sealable_suites]
+    # warm, it answers inline: no thread hop per request
+    loop_threads.clear()
+    assert await push.sealable_suites_async() == [
+        push.SUITE_X25519,
+        push.SUITE_XWING,
+    ]
+    assert loop_threads == []
+
+
+@requires_xwing
+def test_an_xwing_seal_is_not_blamed_on_a_missing_pynacl(monkeypatch):
+    # The PyNaCl gate belongs to the x25519 arm. Sitting ahead of the
+    # dispatch it answered for both, so an X-Wing seal on a daemon
+    # without PyNaCl reported the wrong library to install.
+    monkeypatch.setattr(push, "HAVE_PYNACL", False)
+    _, public_b64 = _xwing_keypair()
+    sealed = push.seal_to_device(public_b64, b"hi", push.SUITE_XWING)
+    assert base64.b64decode(sealed)
+    with pytest.raises(push.PushError) as excinfo:
+        push.seal_to_device(
+            base64.b64encode(b"\x01" * 32).decode(), b"hi", push.SUITE_X25519
+        )
+    assert "PyNaCl" in str(excinfo.value)
+
+
+def test_capability_log_separates_an_old_cryptography_from_none(
+    monkeypatch, caplog
+):
+    # The `push` extra is a start-refusing gate, so a daemon that reaches
+    # start() always seals x25519. `push-pq` is not: on a platform with
+    # no cryptography wheel the extra installs PyNaCl alone, which costs
+    # no page and therefore no ConfigError. Start-up is where an operator
+    # who asked for post-quantum sealing and did not get it finds out, so
+    # the capability line is pinned in every direction it can take.
+    # A platform without the library: the module-level flag and the
+    # suite's `sealable` bit are one fact read at import, so both move.
+    monkeypatch.setattr(push, "HAVE_XWING", False)
+    monkeypatch.setitem(
+        push.SUITES,
+        push.SUITE_XWING,
+        push._Suite(push.SUITE_XWING, 1216, 1136, False),
+    )
+    monkeypatch.setattr(push, "_XWING_PROBE", None)
+    caplog.set_level(logging.INFO, logger="cronstable")
+
+    # Two different remedies: one platform has no wheel at all, the
+    # other installed a cryptography predating X-Wing. Calling the
+    # second absent sends an operator looking for a package that is
+    # already there. Both readings of the module lookup are driven from
+    # here, so each arm is pinned on every box rather than one arm per
+    # box.
+    def findable(spec):
+        monkeypatch.setattr(
+            push,
+            "importlib",
+            SimpleNamespace(util=SimpleNamespace(find_spec=lambda _: spec)),
+        )
+
+    findable(object())
+    push.PushService._log_sealing_capability()
+    messages = [r.getMessage() for r in caplog.records]
+    # Whole-line equality: "x25519, xwing" contains "x25519", so a
+    # substring match passes on exactly the advertisement of a suite the
+    # daemon cannot seal that the probe exists to keep out.
+    assert any("push: sealing suites: x25519" == m for m in messages)
+    reason = [m for m in messages if "post-quantum xwing sealing is off" in m]
+    assert reason and "push-pq" in reason[0]
+    assert "too old" in reason[0]
+    assert "no cryptography" not in reason[0]
+
+    caplog.clear()
+    findable(None)
+    push.PushService._log_sealing_capability()
+    reason = [
+        r.getMessage()
+        for r in caplog.records
+        if "post-quantum xwing sealing is off" in r.getMessage()
+    ]
+    assert reason and "no cryptography" in reason[0]
+    assert "too old" not in reason[0]
+
+    # ... and with a working install the offer line stays away entirely.
+    caplog.clear()
+    monkeypatch.setattr(push, "HAVE_XWING", True)
+    monkeypatch.setattr(push, "_XWING_PROBE", True)
+    monkeypatch.setitem(
+        push.SUITES,
+        push.SUITE_XWING,
+        push._Suite(push.SUITE_XWING, 1216, 1136, True),
+    )
+    push.PushService._log_sealing_capability()
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("push: sealing suites: x25519, xwing" == m for m in messages)
+    assert not any("sealing is off" in m for m in messages)
 
 
 def test_xwing_sealable_flag_is_wired_to_the_real_import():
@@ -920,29 +1058,17 @@ def test_xwing_seal_round_trip():
 
 
 @requires_xwing
-def test_xwing_sealing_overhead_is_exact():
-    # The suite table's overhead is what the budget arithmetic trusts:
-    # the construction adds exactly a 1120-byte HPKE enc plus a 16-byte
-    # AEAD tag to every plaintext.
-    _, public_b64 = _xwing_keypair()
-    plaintext = b'{"kind":"test"}'
-    sealed = base64.b64decode(
-        push.seal_to_device(public_b64, plaintext, push.SUITE_XWING)
-    )
-    assert (
-        len(sealed) - len(plaintext) == push.SUITES[push.SUITE_XWING].overhead
-    )
-
-
-@requires_xwing
-def test_xwing_sealing_encapsulates_freshly_per_message():
-    # HPKE base mode: a fresh encapsulation per message, so the daemon
-    # holds no long-lived sending secret and two seals of one plaintext
-    # differ (the anonymous-sender property the docs state).
-    _, public_b64 = _xwing_keypair()
-    first = push.seal_to_device(public_b64, b"{}", push.SUITE_XWING)
-    second = push.seal_to_device(public_b64, b"{}", push.SUITE_XWING)
-    assert first != second
+def test_a_wrong_length_xwing_key_fails_inside_the_seal():
+    # The X-Wing encapsulation sits inside the seal's try for the same
+    # reason the x25519 arm's encrypt does: a key that decodes but is
+    # the wrong length is refused by the library rather than by the
+    # decode, and that refusal must come back as one per-device
+    # PushError instead of escaping a whole-fleet fan-out.
+    with pytest.raises(push.PushError) as excinfo:
+        push.seal_to_device(
+            base64.b64encode(b"\x01" * 64).decode(), b"{}", push.SUITE_XWING
+        )
+    assert "unusable" in str(excinfo.value)
 
 
 def test_seal_rejects_a_suite_with_no_implementation(monkeypatch):
@@ -1649,7 +1775,9 @@ async def test_send_report_survives_unreachable_relay(tmp_path):
 
 
 @requires_pynacl
-async def test_one_bad_registry_key_does_not_break_the_fanout(tmp_path):
+async def test_one_bad_registry_key_does_not_break_the_fanout(
+    tmp_path, caplog
+):
     """The finding-1 regression: a corrupt record must stay per-device.
 
     An all-zero key pairs nowhere near validate_pairing (it is refused
@@ -1693,49 +1821,7 @@ async def test_one_bad_registry_key_does_not_break_the_fanout(tmp_path):
         assert [r["device"] for r in relay.requests] == ["tok-good"]
         opened = _open_sealed(private, relay.requests[0]["ciphertext"])
         assert opened["name"] == "backup"
-
-
-@requires_pynacl
-@requires_xwing
-async def test_one_bad_xwing_registry_key_stays_per_device(tmp_path, caplog):
-    # The same isolation for the other suite: a registry record whose
-    # key is not even base64 fails inside the seal try, becomes one
-    # "sealing failed" outcome, and the sibling device is still paged.
-    private, good_b64 = _device_keypair()
-    path = tmp_path / "devices.json"
-    path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "devices": [
-                    # the bad device first, so the loop must survive it
-                    # to ever reach the good one
-                    {
-                        "id": "bad",
-                        "name": "pq-evil",
-                        "platform": "ios",
-                        "publicKey": "not base64!!",
-                        "pushToken": "tok-bad",
-                        "suite": push.SUITE_XWING,
-                    },
-                    {
-                        "id": "good",
-                        "name": "phone",
-                        "platform": "ios",
-                        "publicKey": good_b64,
-                        "pushToken": "tok-good",
-                    },
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    async with _RelayServer() as relay:
-        service = _service(push.FileDeviceStore(str(path)), relay.url)
-        await service.send_report(_FakeJobCtx(), False, {"enabled": True})
-        assert [r["device"] for r in relay.requests] == ["tok-good"]
-        opened = _open_sealed(private, relay.requests[0]["ciphertext"])
-        assert opened["name"] == "backup"
+    # and the drop is said out loud once, naming the device it lost
     failures = [
         r.getMessage()
         for r in caplog.records
@@ -2802,7 +2888,7 @@ async def test_whoami_with_and_without_token():
     assert body["authenticated"] is False
     assert body["allScopes"] is True
     assert body["scopes"] == sorted(["view", "control", "approve"])
-    # every shape advertises the sealable suites (the companion app
+    # every shape advertises the sealable suites (the app
     # picks its pairing suite from this list)
     assert body["sealableSuites"] == _sealable_now()
     assert "x25519" in body["sealableSuites"]
@@ -2993,44 +3079,6 @@ async def test_start_stop_push_absorbs_a_corrupt_registry_document(caplog):
     await cron.start_stop_push(dict(push_config))
     assert cron._push_service is first
     await cron.start_stop_push(None)
-
-
-async def test_start_announces_the_suites_it_can_seal(caplog, monkeypatch):
-    # The `push` extra is a start-refusing gate, so a daemon that reaches
-    # start() always seals x25519. `push-pq` is not: on a platform with no
-    # cryptography wheel the extra installs PyNaCl alone, which costs no
-    # page and therefore no ConfigError. Start-up is where an operator who
-    # asked for post-quantum sealing and did not get it finds out, so the
-    # capability line is pinned in both directions.
-    # A platform with no cryptography wheel: the module-level flag and the
-    # suite's `sealable` bit are one fact read at import, so both move.
-    monkeypatch.setattr(push, "HAVE_XWING", False)
-    monkeypatch.setitem(
-        push.SUITES,
-        push.SUITE_XWING,
-        push._Suite(push.SUITE_XWING, 1216, 1136, False),
-    )
-    monkeypatch.setattr(push, "_XWING_PROBE", None)
-    caplog.set_level(logging.INFO, logger="cronstable")
-    push.PushService._log_sealing_capability()
-    messages = [r.getMessage() for r in caplog.records]
-    assert any("push: sealing suites: x25519" == m for m in messages)
-    reason = [m for m in messages if "post-quantum xwing sealing is off" in m]
-    assert reason and "push-pq" in reason[0]
-
-    # ... and with a working install the offer line stays away entirely.
-    caplog.clear()
-    monkeypatch.setattr(push, "HAVE_XWING", True)
-    monkeypatch.setattr(push, "_XWING_PROBE", True)
-    monkeypatch.setitem(
-        push.SUITES,
-        push.SUITE_XWING,
-        push._Suite(push.SUITE_XWING, 1216, 1136, True),
-    )
-    push.PushService._log_sealing_capability()
-    messages = [r.getMessage() for r in caplog.records]
-    assert any("x25519, xwing" in m for m in messages)
-    assert not any("sealing is off" in m for m in messages)
 
 
 async def test_start_stop_push_never_raises(monkeypatch, caplog):

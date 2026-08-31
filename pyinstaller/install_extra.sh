@@ -1,10 +1,14 @@
 #!/bin/sh
 # Install ONE optional extra into the current build env and prove it works,
 # with the failure policy the calling lane chose. The release binary lanes
-# bundle uvloop, pynacl and zeroconf in per-lane subsets and policies; this
-# replaces their hand-spelled install+verify blocks so the choreography lives
-# once. orjson stays on install_orjson.sh (it carries its own Rust
-# source-build ladder and stays best-effort everywhere).
+# bundle uvloop, pynacl, cryptography and zeroconf in per-lane subsets and
+# policies; this replaces their hand-spelled install+verify blocks so the
+# choreography lives once. orjson stays on install_orjson.sh (it carries its
+# own Rust source-build ladder and stays best-effort everywhere).
+#
+# Everything here happens in the BUILD env. The lanes that bundle
+# cryptography also gate the frozen artifact on `cronstable
+# --sealable-suites`, which no build-env probe can stand in for.
 #
 # Usage: install_extra.sh NAME SPEC hard|soft [FALLBACK]
 #   NAME      verify_extra.py probe name, also the pip name to uninstall

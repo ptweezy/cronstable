@@ -58,6 +58,9 @@ COPY docker/extract_deps.py /tmp/deps/extract_deps.py
 # throwaway venv, /tmp/deps/buildenv: the project install below uses it to
 # build the wheel without network access, and it never pollutes the shipped
 # /opt/venv.
+#
+# The helper resolves the cryptography line itself: a PEP 508 marker reads
+# the KERNEL arch, not the userland bitness and libc that decide the wheel.
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
     python -m venv /opt/venv; \

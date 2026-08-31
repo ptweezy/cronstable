@@ -7,6 +7,11 @@
 # list the push-pq extra carries: Linux x86_64/aarch64, macOS arm64, Windows
 # amd64. Both test arms importorskip it, so the win-arm64 and Intel-mac cells
 # self-skip those tests and every other cell keeps full coverage.
+#
+# `platform_machine` is the raw `uname -m`, so a 32-bit userland on a 64-bit
+# kernel passes this marker, finds no i686 wheel, and fails the sdist build
+# for want of Rust. Use `linux32 pip install -r requirements_dev.txt` there:
+# uname reports 32-bit, dropping cryptography so both test arms self-skip.
 cryptography>=48; (sys_platform == "linux" and (platform_machine == "x86_64" or platform_machine == "aarch64")) or (sys_platform == "darwin" and platform_machine == "arm64") or (sys_platform == "win32" and platform_machine == "AMD64")
 # orjson is the optional `speedups` extra, but the tests that cover the
 # accelerated durable-state/gossip JSON paths are worthless if no CI cell ever

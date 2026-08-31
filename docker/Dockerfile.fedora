@@ -58,6 +58,9 @@ COPY docker/extract_deps.py /tmp/deps/extract_deps.py
 # build the wheel without network access, and it never pollutes the shipped
 # /opt/venv.
 #
+# The helper resolves the cryptography line itself: a PEP 508 marker reads
+# the KERNEL arch, not the userland bitness and libc that decide the wheel.
+#
 # libsodium-devel + SODIUM_INSTALL=system: on the archs with no PyNaCl wheel
 # (ppc64le/s390x) pip builds PyNaCl from its sdist, and with SODIUM_INSTALL
 # unset that build compiles the BUNDLED libsodium and runs its whole autotools
@@ -81,15 +84,16 @@ RUN set -eux; \
     retry /tmp/deps/buildenv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/build-requires.txt
 
 # The push-pq (PyNaCl + cryptography) and discovery (zeroconf) extras above
-# are part of the image contract: a `push:` or `web.bonjour` section fails closed at config
-# load, so an image missing them would crash-loop with no in-image
-# remediation (pip is stripped from the runtime stage below). PyNaCl has
-# wheels on amd64/arm64 and source-builds against the system libsodium on
-# ppc64le/s390x (see SODIUM_INSTALL above). Verify with a real sealed-box
-# round-trip plus a zeroconf import; a failure fails the build. cryptography carries the post-quantum `xwing` suite behind
-# an environment marker, so it is checked only where it resolved, and by its
-# HPKE module rather than by sealing: these images take a PyPI wheel with its
-# own OpenSSL, so a too-old release is the failure worth catching.
+# are part of the image contract: a `push:` or `web.bonjour` section fails
+# closed at config load, so an image missing them would crash-loop with no
+# in-image remediation (pip is stripped from the runtime stage below).
+# PyNaCl has wheels on amd64/arm64 and source-builds against the system
+# libsodium on ppc64le/s390x (see SODIUM_INSTALL above). Verify with a real
+# sealed-box round-trip plus a zeroconf import; a failure fails the build.
+# cryptography carries the post-quantum `xwing` suite behind an environment
+# marker, so it is checked only where it resolved, and by its HPKE module
+# rather than by sealing: these images take a PyPI wheel with its own
+# OpenSSL, so a too-old release is the failure worth catching.
 RUN /opt/venv/bin/python -c 'from nacl.public import PrivateKey, SealedBox; k = PrivateKey.generate(); m = b"cronstable push self-test"; assert SealedBox(k).decrypt(SealedBox(k.public_key).encrypt(m)) == m; import importlib.util as u; assert u.find_spec("cryptography") is None or u.find_spec("cryptography.hazmat.primitives.hpke") is not None, "cryptography is too old to seal xwing"; import zeroconf, zeroconf.asyncio; print("push-pq and discovery extras verified")'
 
 # Best-effort orjson (the `speedups` extra) for the durable-state / cluster

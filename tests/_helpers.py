@@ -14,6 +14,7 @@ import ast
 import asyncio
 import datetime
 import errno
+import importlib.util
 import json
 import os
 import socket
@@ -273,6 +274,42 @@ def _exit(code=0):
     # the default mirrors test_state_job_cli.py (a bare sys.exit());
     # test_state_admin.py and test_main.py always pass the code explicitly.
     raise ExitError(code)
+
+
+# --- the X-Wing (post-quantum) probe ---------------------------------------
+# the one home: tests/test_push.py and tests/test_push_vectors.py import
+# both names from here.
+#
+# This is the module's one cryptography touch outside a function body, and
+# it stays a probe for that reason.  find_spec answers "is it findable",
+# not "does it import": it imports the parent packages to read their
+# __path__ and stops there, so it loads no key material, and a cell
+# without the wheel gets the ImportError caught right below instead of a
+# collection error.  The TLS helpers further down keep their real imports
+# inside function bodies behind _write_tls's importorskip, which is the
+# discipline an import needs.  The answer here has to exist at import time
+# because requires_xwing is a marker, and pytest resolves a skipif marker
+# at collection, before any test body runs.
+
+try:
+    # The same find_spec probe push.HAVE_XWING runs, done independently so
+    # a broken daemon probe fails the tests that ride on it instead of
+    # silently skipping them.
+    _xwing_findable = (
+        importlib.util.find_spec("cryptography.hazmat.primitives.hpke")
+        is not None
+    )
+except (ImportError, ValueError):  # pragma: no cover - no cryptography
+    _xwing_findable = False
+
+#: Skips a test that touches X-Wing key material.  The probe names the HPKE
+#: module rather than cryptography itself, so the reason does too: a
+#: cryptography old enough to ship no HPKE is installed and still cannot
+#: seal.
+requires_xwing = pytest.mark.skipif(
+    not _xwing_findable,
+    reason="cryptography with HPKE (the push-pq extra) is not installed",
+)
 
 
 # --- TLS cert cluster -----------------------------------------------------

@@ -19,6 +19,7 @@ two: COPYd below the dependency layers (so editing it cannot invalidate their
 cache) and invoked above the per-commit section.
 """
 
+import importlib.util
 import json
 import os
 import re
@@ -282,6 +283,16 @@ def test_dockerignore_excludes_the_heavy_untouched_trees():
         )
 
 
+def _extract_deps_module():
+    """docker/extract_deps.py imported by path (it ships no package)."""
+    pytest.importorskip("tomllib")  # 3.11+, as the script itself needs
+    path = os.path.join(ROOT, "docker", "extract_deps.py")
+    spec = importlib.util.spec_from_file_location("_extract_deps", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
     # The push-pq+discovery extras pair lives in exactly one place, so pin
     # what the script writes against a straight read of pyproject.toml, and
@@ -289,6 +300,7 @@ def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
     # visibility the old `cat` provided). tomllib is 3.11+; every image venv
     # has it, only the 3.10 tox rows skip here.
     tomllib = pytest.importorskip("tomllib")
+    module = _extract_deps_module()
     shutil.copy(
         os.path.join(ROOT, "pyproject.toml"), tmp_path / "pyproject.toml"
     )
@@ -305,17 +317,88 @@ def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
     with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fobj:
         data = tomllib.load(fobj)
     project = data["project"]
-    expected = (
+    declared = (
         project["dependencies"]
         + project["optional-dependencies"]["push-pq"]
         + project["optional-dependencies"]["discovery"]
     )
-    written = tmp_path / "requirements.txt"
-    assert written.read_text(encoding="utf-8").splitlines() == expected
+    written = (
+        (tmp_path / "requirements.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    # Every requirement but cryptography rides through verbatim, marker and
+    # all, in pyproject's own order.
+    others = [
+        line
+        for line in declared
+        if module.requirement_name(line) != "cryptography"
+    ]
+    assert [
+        line
+        for line in written
+        if module.requirement_name(line) != "cryptography"
+    ] == others
     build_requires = tmp_path / "build-requires.txt"
     assert (
         build_requires.read_text(encoding="utf-8").splitlines()
         == data["build-system"]["requires"]
     )
-    for line in expected + data["build-system"]["requires"]:
+    for line in written + data["build-system"]["requires"]:
         assert line in proc.stdout
+
+
+@pytest.mark.parametrize(
+    "target,keeps",
+    [
+        (("x86_64", 8, "glibc"), True),  # linux/amd64
+        (("x86_64", 4, "glibc"), False),  # linux/386 on an amd64 host
+        (("armv7l", 4, "musl"), False),  # the Alpine linux/arm/v7 row
+        (("ppc64le", 8, "glibc"), True),  # manylinux_2_28 wheel
+    ],
+)
+def test_extract_deps_writes_the_file_the_target_can_install(
+    tmp_path, monkeypatch, target, keeps
+):
+    # The end of the same story, on the written file rather than the
+    # decision: an image whose target has no wheel must get a
+    # requirements.txt with no cryptography line at all, because pip reading
+    # one there is exactly what turns the linux/386 rows red. Driven through
+    # a patched target so every row is reachable from any dev machine.
+    module = _extract_deps_module()
+    monkeypatch.setattr(module, "detect_target", lambda: target)
+    shutil.copy(
+        os.path.join(ROOT, "pyproject.toml"), tmp_path / "pyproject.toml"
+    )
+    module.main(str(tmp_path / "pyproject.toml"))
+    written = (
+        (tmp_path / "requirements.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    crypto = [
+        line
+        for line in written
+        if module.requirement_name(line) == "cryptography"
+    ]
+    assert crypto == (["cryptography>=48"] if keeps else [])
+    # PyNaCl rides through untouched either way: it has wheels or a plain C
+    # source build everywhere, so push keeps sealing x25519 on the rows that
+    # lose the post-quantum suite.
+    assert any(module.requirement_name(line) == "pynacl" for line in written)
+
+
+def test_cryptography_line_keeps_its_floor_and_loses_its_marker():
+    # Where the script says yes, the marker comes off (it is narrower than
+    # the decision just made and would veto the armv7l/ppc64le images), and
+    # the floor survives untouched: pyproject stays the one place it is
+    # spelled, which is what tests/test_extra_pins_parity.py depends on.
+    module = _extract_deps_module()
+    line = "cryptography>=48; sys_platform == 'linux'"
+    assert module.resolve_cryptography(line, ("x86_64", 8, "glibc")) == (
+        "cryptography>=48"
+    )
+    assert module.resolve_cryptography(line, ("x86_64", 4, "glibc")) is None
+    # Off Linux there is no image to resolve for, so pip and the marker keep
+    # the decision.
+    assert module.resolve_cryptography(line, None) == line

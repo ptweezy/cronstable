@@ -105,9 +105,7 @@ def test_docker_inline_orjson_probe_matches_verify_extra():
     ) as f:
         script = f.read()
     probe = re.search(r"python -c '([^']*)'", script)
-    assert probe, (
-        "inline python -c probe not found in docker/install_orjson.sh"
-    )
+    assert probe, "inline python -c probe not found in docker/install_orjson.sh"
     # the probe rides through docker build argv as-is; it stays ASCII on
     # purpose (its own comment) so no build-stage locale can mangle it
     assert probe.group(1).isascii(), "the inline probe is no longer ASCII"

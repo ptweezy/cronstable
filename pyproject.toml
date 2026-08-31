@@ -136,8 +136,19 @@ push = ["pynacl>=1.6.2"]
 # and OpenSSL headers.  Linux stops at x86_64 and aarch64, the arches with a
 # wheel under BOTH libcs: cryptography publishes ppc64le and armv7l for
 # manylinux but not musllinux, and a marker cannot see the libc.  Those two
-# get xwing from the release binaries instead, whose lanes do know their libc
-# (the `pq` matrix keys in .github/workflows/release.yml).
+# get xwing from the builds that DO know their libc: the release binaries
+# (the `pq` matrix keys in .github/workflows/release.yml) and the glibc
+# container images, whose docker/extract_deps.py resolves this line from
+# inside the target image rather than through the marker.
+#
+# One residual rides along, because no PEP 508 marker can express it:
+# `platform_machine` is the raw `uname -m`, which reports the KERNEL.  A
+# 32-bit userland on a 64-bit kernel therefore passes the marker, pip
+# correctly looks for the i686 (or armv7l) wheel, finds none, and fails
+# building the sdist for want of Rust.  Install under `linux32` there
+# (`linux32 pip install "cronstable[push-pq]"`), which makes uname report
+# the 32-bit machine so the marker excludes cryptography and the install
+# lands PyNaCl alone.
 push-pq = [
     "pynacl>=1.6.2",
     "cryptography>=48; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",

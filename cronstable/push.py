@@ -216,18 +216,34 @@ def suite_or_error(name: Optional[str]) -> _Suite:
 def sealable_suites() -> list[str]:
     """Sorted names of the suites this daemon can seal to.
 
-    What ``GET /whoami`` advertises, and what the companion app picks a
-    fresh pairing's suite from, so the answer must be proven rather than
-    probable: ``xwing``'s ``sealable`` flag only says the HPKE module is
+    What ``GET /whoami`` advertises, and what the app picks a fresh
+    pairing's suite from, so the answer must be proven rather than
+    assumed: ``xwing``'s ``sealable`` flag only says the HPKE module is
     findable, and a cryptography built against an OpenSSL without ML-KEM
     is findable yet cannot seal.  Advertising it would steer every fresh
     pairing into a 400.  :func:`_xwing_probe` settles the question with
-    one real seal, cached for the life of the process.
+    one real seal (cached for the life of the process).
     """
     names = [n for n, s in SUITES.items() if s.sealable]
     if SUITE_XWING in names and not _xwing_probe():
         names.remove(SUITE_XWING)
     return sorted(names)
+
+
+async def sealable_suites_async() -> list[str]:
+    """:func:`sealable_suites` without blocking the event loop.
+
+    The probe behind the answer is an ML-KEM keygen plus a seal, which
+    costs milliseconds warm but up to a fifth of a second on the first
+    call of a process (it imports the cryptography extension too).
+    ``GET /whoami`` serves this on every daemon that runs the web app,
+    including one with no ``push:`` section, where no
+    :class:`PushService` exists to have warmed it at start-up.  The
+    cached case answers inline; only the cold one pays for a thread.
+    """
+    if HAVE_XWING and _XWING_PROBE is None:
+        return await asyncio.to_thread(sealable_suites)
+    return sealable_suites()
 
 
 def max_plaintext_bytes(
@@ -485,10 +501,17 @@ def _xwing_probe() -> bool:
     :data:`HAVE_XWING` answers "findable"; this seals a probe message to
     a throwaway generated key through the same suite the alert path
     uses, so the verdict covers the whole stack: the HPKE module, the
-    X-Wing KEM, and the OpenSSL underneath.  Cached because the
-    advertisement in :func:`sealable_suites` reads it on every
-    ``/whoami``, and so a broken library logs its reason once (in
-    :func:`_xwing_suite`) rather than per request.
+    X-Wing KEM, and the OpenSSL underneath.  Cached for the life of the
+    process because the advertisement in :func:`sealable_suites` reads
+    it on every ``/whoami``, because a broken library then logs its
+    reason once (in :func:`_xwing_suite`) rather than per request, and
+    because nothing the seal can hit changes under a running daemon:
+    :data:`HAVE_XWING` freezes at import, so a library installed after
+    start is never a candidate here, and an OpenSSL without ML-KEM stays
+    without it for as long as cryptography sits in ``sys.modules``.
+    Sealing never consults the cache (:func:`seal_to_device` builds its
+    suite fresh per seal), so the verdict steers the advertisement only,
+    never a page.
     """
     global _XWING_PROBE
     if _XWING_PROBE is None:
@@ -551,17 +574,17 @@ def validate_public_key(value: Any, suite: str = DEFAULT_SUITE) -> str:
         # Refuse the pairing rather than store a record every later alert
         # would fail on.  Same fail-closed reasoning as the PyNaCl gate in
         # config: a paging channel must never accept something it cannot
-        # actually deliver through.
-        message = (
-            "suite {} is not sealable by this daemon; pair with "
-            "suite {} instead".format(spec.name, DEFAULT_SUITE)
-        )
-        if spec.name == SUITE_XWING:
-            message += (
-                ", or install the post-quantum push extra "
-                '(pip install "cronstable[push-pq]")'
+        # actually deliver through.  X-Wing is the one suite whose flag
+        # can be down (X25519 is sealable by construction), so its remedy
+        # is the message; a third such suite would carry its own on
+        # :class:`_Suite`.
+        raise PushError(
+            "suite {} is not sealable by this daemon; pair with suite "
+            "{} instead, or install the post-quantum push extra "
+            '(pip install "cronstable[push-pq]")'.format(
+                spec.name, DEFAULT_SUITE
             )
-        raise PushError(message)
+        )
     if HAVE_PYNACL and spec.name == SUITE_X25519:
         # Length is one check of two: libsodium refuses to seal to
         # all-zero / low-order points, and it does so at encrypt time, not
@@ -589,7 +612,11 @@ def validate_public_key(value: Any, suite: str = DEFAULT_SUITE) -> str:
         except PushError:
             # a broken cryptography, not a broken key: keep its wording
             raise
-        except Exception:
+        except Exception as exc:
+            # The 400 stays generic (the caller sent the key and has it),
+            # but the operator log keeps the library's reason: "is not
+            # usable" alone is undebuggable from the daemon side.
+            logger.warning("push: X-Wing pairing key rejected: %s", exc)
             raise PushError(
                 "publicKey is not a usable X-Wing public key"
             ) from None
@@ -649,20 +676,10 @@ def seal_to_device(
     """
     spec = suite_or_error(suite)
     if not spec.sealable:
-        detail = (
-            "; install the post-quantum push extra "
-            '(pip install "cronstable[push-pq]")'
-            if spec.name == SUITE_XWING
-            else ""
-        )
         raise PushError(
-            "cannot seal to suite {}: no implementation in this "
-            "daemon{}".format(spec.name, detail)
-        )
-    if not HAVE_PYNACL:  # pragma: no cover - config validation gates this
-        raise PushError(
-            "PyNaCl is not installed; install the push extra "
-            '(pip install "cronstable[push]")'
+            "cannot seal to suite {}: no implementation in this daemon; "
+            "install the post-quantum push extra "
+            '(pip install "cronstable[push-pq]")'.format(spec.name)
         )
     try:
         raw = base64.b64decode(public_key_b64, validate=True)
@@ -677,6 +694,14 @@ def seal_to_device(
                 plaintext, build_key(raw), info=_XWING_INFO
             )
         else:
+            # The PyNaCl gate sits inside the X25519 arm so a missing
+            # PyNaCl can never masquerade as the diagnosis for an X-Wing
+            # seal failure.
+            if not HAVE_PYNACL:  # pragma: no cover - config gates this
+                raise PushError(
+                    "PyNaCl is not installed; install the push extra "
+                    '(pip install "cronstable[push]")'
+                )
             sealed = _sealed_box(raw).encrypt(plaintext)
     except PushError:
         raise  # a broken library, not a broken key: keep its wording
@@ -733,8 +758,13 @@ def build_payload(
             payload[field] = value
     if kind == "event":
         payload["event"] = event
-        payload["subject"] = tv.get("subject")
-        payload["message"] = tv.get("message")
+        # The sealed-plaintext contract promises each field is either a
+        # string or missing, so an empty one is dropped rather than sent
+        # as null.
+        for field in ("subject", "message"):
+            value = tv.get(field)
+            if value is not None:
+                payload[field] = value
         for field in ("dag", "run_key", "taskkey", "role", "leader"):
             value = tv.get(field)
             if value not in (None, ""):
@@ -900,9 +930,7 @@ def key_fingerprint(public_key_b64: Optional[str]) -> Optional[str]:
     return "-".join(digest[i : i + 4] for i in range(0, 12, 4))
 
 
-def public_device(
-    device: dict[str, Any], sealable: Optional[set[str]] = None
-) -> dict[str, Any]:
+def public_device(device: dict[str, Any]) -> dict[str, Any]:
     """A device record as served by ``GET /push/devices``.
 
     The push token is redacted to its tail: it is not key material, but
@@ -919,21 +947,18 @@ def public_device(
     the node reading it cannot seal, and every alert that node fires to
     that device fails.  The flag is what makes that visible instead of
     leaving the row looking healthy; ``Here`` because a false on one node
-    says nothing about the others.  Pass ``sealable`` to reuse one
-    :func:`sealable_suites` answer across a whole listing.
+    says nothing about the others.
     """
     token = device.get("pushToken") or ""
     # A record naming no suite is X25519 (see DEFAULT_SUITE).
     suite = device.get("suite") or DEFAULT_SUITE
-    if sealable is None:
-        sealable = set(sealable_suites())
     return {
         "id": device.get("id"),
         "name": device.get("name"),
         "platform": device.get("platform"),
         "publicKey": device.get("publicKey"),
         "suite": suite,
-        "sealableHere": suite in sealable,
+        "sealableHere": suite in sealable_suites(),
         "fingerprint": key_fingerprint(device.get("publicKey")),
         "pushToken": "…" + token[-6:] if token else "",
         "createdAt": device.get("createdAt"),
@@ -1455,17 +1480,29 @@ class PushService:
         suites = sealable_suites()
         logger.info("push: sealing suites: %s", ", ".join(suites))
         if SUITE_XWING not in suites:
+            if HAVE_XWING:
+                reason = (
+                    "cryptography is installed but cannot seal it, for "
+                    "the reason logged above"
+                )
+            elif importlib.util.find_spec("cryptography") is not None:
+                # Present but without the HPKE module: an older
+                # cryptography, which the log must not call absent.
+                reason = (
+                    "the installed cryptography is too old to seal it "
+                    "(X-Wing needs cryptography 48 or newer; reinstall "
+                    'the push-pq extra: pip install "cronstable[push-pq]")'
+                )
+            else:
+                reason = (
+                    "this install has no cryptography; it comes with "
+                    'the push-pq extra (pip install "cronstable[push-pq]"), '
+                    "which carries no wheel on some platforms"
+                )
             logger.info(
                 "push: post-quantum xwing sealing is off (%s); x25519 "
                 "alerts are unaffected",
-                (
-                    "cryptography is installed but cannot seal it, for the "
-                    "reason logged above"
-                    if HAVE_XWING
-                    else "this install has no cryptography; it comes with "
-                    'the push-pq extra (pip install "cronstable[push-pq]"), '
-                    "which carries no wheel on some platforms"
-                ),
+                reason,
             )
 
     async def refresh(self, force: bool = False) -> None:
@@ -1543,9 +1580,9 @@ class PushService:
         while the libraries are per node, so a device that paired against
         a ``push-pq`` node is invisible to a node without it, and every
         alert that node fires to that device dies in
-        :func:`seal_to_device`.  Nothing else says so out loud: the
-        listing marks the row ``sealableHere`` false, but only if someone
-        looks.
+        :func:`seal_to_device`.  Nothing else surfaces it: the listing
+        marks the row ``sealableHere`` false, but only for a reader who
+        goes looking.
 
         Warns on the set, not per alert, and only when the set changes,
         so a permanent mismatch costs one line per change rather than one
@@ -1562,8 +1599,7 @@ class PushService:
         self._warned_unsealable = set(stranded)
         if not stranded:
             logger.info(
-                "push: every paired device now uses a suite this node can "
-                "seal"
+                "push: every paired device uses a suite this node can seal"
             )
             return
         logger.warning(
@@ -1590,8 +1626,7 @@ class PushService:
         devices = sorted(
             self._devices.values(), key=lambda d: d.get("createdAt") or ""
         )
-        sealable = set(sealable_suites())
-        return [public_device(d, sealable) for d in devices]
+        return [public_device(d) for d in devices]
 
     def get_device(self, device_id: str) -> Optional[dict[str, Any]]:
         return self._devices.get(device_id)
@@ -1627,12 +1662,18 @@ class PushService:
             created = True
         await self.store.upsert(record)
         self._devices[record["id"]] = record
+        # A re-pair can move a record onto a sealable suite, so the
+        # stranded-set warning updates here as well as on mirror loads.
+        self._warn_about_unsealable_records()
         return record, created
 
     async def revoke(self, device_id: str) -> bool:
         await self.refresh(force=True)
         removed = await self.store.remove(device_id)
         self._devices.pop(device_id, None)
+        # Revoking the last stranded record closes the mismatch at the
+        # revoke, not at the next mirror load.
+        self._warn_about_unsealable_records()
         return bool(removed)
 
     async def send_report(

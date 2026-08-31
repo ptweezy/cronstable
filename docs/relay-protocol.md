@@ -135,8 +135,8 @@ length plus the 16-byte tag), standard base64. Sealing overhead is exactly
 
 ### `xwing` construction
 
-This block is normative. Daemon and companion app implement it
-independently and must match byte for byte.
+This block is normative. The daemon and the app implement it
+independently, so the two must match byte for byte.
 
 The device public key on the wire is 1216 bytes, the ML-KEM-768
 encapsulation key (1184 bytes) followed by the X25519 public key
@@ -151,8 +151,9 @@ base mode, single-shot, under this ciphersuite:
 | KDF | HKDF-SHA256 | `0x0001` |
 | AEAD | AES-256-GCM | `0x0002` |
 
-`info` is the ASCII bytes `cronstable-push-xwing`, exact, on both sides.
-There is no AAD: both sides pass none to their single-shot APIs.
+`info` is the ASCII bytes `cronstable-push-xwing`, the same string on
+both sides. Neither side passes AAD: both call their single-shot APIs
+without it.
 
 The wire ciphertext is the HPKE `enc` value (1120 bytes) followed by the
 single-shot ciphertext (plaintext length plus the 16-byte GCM tag),

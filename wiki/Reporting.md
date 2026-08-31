@@ -470,9 +470,9 @@ Sends an end-to-end encrypted alert to every paired device through a hosted
 relay. The payload is sealed to each device's public key, under the sealing
 suite the device registered at pairing (see
 [push notifications](Push-Notifications#pairing-devices)), before it leaves
-the daemon, so the relay forwards ciphertext it cannot read. The companion app decrypts and renders the notification on the
-device. Reporting occurs only when `enabled` is `true`; otherwise the reporter
-returns early.
+the daemon, so the relay forwards ciphertext it cannot read. The companion
+app decrypts and renders the notification on the device. Reporting occurs
+only when `enabled` is `true`; otherwise the reporter returns early.
 
 It requires the following, enforced at config load:
 

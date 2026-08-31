@@ -1567,8 +1567,8 @@ components:
           description: >-
             The suites this daemon can seal push alerts under: `x25519`
             always, `xwing` when the install can seal post-quantum (the
-            `push-pq` extra). The companion app pairs under `xwing` when
-            it is listed. The field stays outside `required` on purpose:
+            `push-pq` extra). The app pairs under `xwing` when it is
+            listed. The field stays outside `required` on purpose:
             a daemon that omits it seals `x25519` only, so generated
             clients decode it as optional and read absence as
             `["x25519"]`.
@@ -1589,8 +1589,8 @@ components:
           description: >-
             Sealing suite the key belongs to: `x25519` (libsodium sealed
             box) or `xwing` (X-Wing, ML-KEM-768 + X25519, sealed via
-            HPKE). Always present; a record that names none reports
-            `x25519`.
+            HPKE). The field stays outside `required`: a record naming no
+            suite is `x25519`, the only suite such a record can hold.
         sealableHere:
           type: boolean
           description: >-

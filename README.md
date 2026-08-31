@@ -55,9 +55,10 @@ alerting, durable state, orchestration, clustering, and a live dashboard.
 * **End-to-end encrypted push notifications**: a dedicated reporter seals each
   alert to a paired device's own key (an X25519 sealed box, or post-quantum
   X-Wing HPKE), so the relay that forwards it to the platform push service
-  never sees job names, hostnames, or log lines. Pairing is a dashboard QR scan or one API call,
-  and an opt-in Bonjour/mDNS advert lets a companion app find the daemon on
-  the LAN (see [push notifications](#push-notifications), plus the
+  never sees job names, hostnames, or log lines. Pairing is a dashboard QR
+  scan or one API call, and an opt-in Bonjour/mDNS advert lets a companion
+  app find the daemon on the LAN (see
+  [push notifications](#push-notifications), plus the
   [Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
   and [LAN Discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)
   wiki pages)
@@ -1155,11 +1156,13 @@ ciphertext and routing metadata, never job names, hostnames, or log lines.
 
 The reporter needs the `push` extra (`pip install "cronstable[push]"`), a
 daemon-global `push:` section, and an opt-in on the reporting hooks. The
-`push-pq` extra (`pip install "cronstable[push-pq]"`) adds X-Wing sealing;
-the companion app pairs under it automatically when the daemon lists it in
-`sealableSuites` on `GET /whoami`. If a
-config enables push without any of those, cronstable refuses to start rather
-than silently not alerting:
+`push-pq` extra (`pip install "cronstable[push-pq]"`) adds X-Wing sealing on
+the platforms with a `cryptography` wheel (see
+[Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
+for the list), and the app pairs under it on its own when the daemon lists
+it in `sealableSuites` on `GET /whoami`. If a config enables push without
+any of those, cronstable refuses to start rather than silently not
+alerting:
 
 ```yaml
 push:

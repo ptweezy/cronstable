@@ -835,6 +835,15 @@ jobs:
               if $PY -c "import nacl" 2>/dev/null; then
                 dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
               fi
+              # Gate the FROZEN artifact too (see install_extra.sh header).
+              if [ -n "${{ matrix.pq }}" ]; then
+                suites=$(dist/cronstable --sealable-suites)
+                echo "sealable suites: $suites"
+                echo "$suites" | grep -qx xwing || {
+                  echo "FAIL: the frozen binary cannot seal xwing" >&2
+                  exit 1
+                }
+              fi
               # A job that shells out to the CLI, asserted on the KV side
               # effect: proves the daemon PyInstaller env scrub against the
               # real bootloader, which no venv test reaches. Native rows only;
@@ -1124,6 +1133,15 @@ jobs:
               # config validates only when both import inside the bundle.
               if python -c "import nacl" 2>/dev/null; then
                 dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+              fi
+              # Gate the FROZEN artifact too (see install_extra.sh header).
+              if [ -n "${{ matrix.pq }}" ]; then
+                suites=$(dist/cronstable --sealable-suites)
+                echo "sealable suites: $suites"
+                echo "$suites" | grep -qx xwing || {
+                  echo "FAIL: the frozen binary cannot seal xwing" >&2
+                  exit 1
+                }
               fi
               # The CLI-from-job smoke (cli_job_smoke.sh) runs on the native
               # lanes only: it needs a daemon, loopback HTTP and curl, and
@@ -1743,6 +1761,15 @@ jobs:
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
           # fail closed at config validation when they cannot import).
           dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+          # Gate the FROZEN artifact too (see install_extra.sh header).
+          if [ -n "${{ matrix.pq }}" ]; then
+            suites=$(dist/cronstable --sealable-suites)
+            echo "sealable suites: $suites"
+            echo "$suites" | grep -qx xwing || {
+              echo "FAIL: the frozen binary cannot seal xwing" >&2
+              exit 1
+            }
+          fi
           # A job that shells out to the CLI, asserted on the KV side effect:
           # proves the daemon's PyInstaller env scrub against the real
           # bootloader, which no venv test reaches (see the script header).
@@ -2434,6 +2461,25 @@ jobs:
           esac
           uv run python .github/scripts/assert_arch.py dist/cronstable.exe "$spec"
           mv dist/cronstable.exe "dist/cronstable-windows-${{ matrix.arch }}.exe"
+      # Gate the FROZEN artifact too, on the one row that bundles cryptography
+      # (see install_extra.sh header). Its own step in pwsh, the shell a
+      # Windows host runs this binary from; the one-directory bundle needs no
+      # second pass, since it comes out of the same Analysis as this exe.
+      - name: Prove the frozen binary seals xwing
+        if: ${{ matrix.pq != '' }}
+        shell: pwsh
+        run: |
+          $exe = "dist/cronstable-windows-${{ matrix.arch }}.exe"
+          $suites = & $exe --sealable-suites
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAIL: --sealable-suites exited $LASTEXITCODE"
+            exit 1
+          }
+          Write-Host "sealable suites: $($suites -join ', ')"
+          if ($suites -notcontains 'xwing') {
+            Write-Host "FAIL: the frozen binary cannot seal xwing"
+            exit 1
+          }
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-windows-${{ matrix.arch }}

@@ -1009,8 +1009,10 @@ Each record carries `suite`, the sealing suite its key belongs to, and
 suite. The registry is shared by every node on one state store while the
 sealing libraries are per node, so a device that paired against a
 `push-pq` node reads `sealableHere: false` on a node without it, and
-alerts raised there never reach that device. False is a per-node fact and
-says nothing about the other nodes. It is the one view route a
+alerts raised there never reach that device. A `false` on one node says
+nothing about the other nodes.
+
+`GET /push/devices` is the one view route a
 [`web.anonymousScopes`](#public-read-only-access-webanonymousscopes) grant
 deliberately excludes: it answers `403` to a credential-less request, naming
 the scope the method needs, because the registry lists every paired phone.
@@ -1033,6 +1035,7 @@ $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/push/devices
             "publicKey": "jSNlDu28No2itHnvrs6ajHHuNAxvqgOjmGxHJrMo8yg=",
             "suite": "x25519",
             "sealableHere": true,
+            "fingerprint": "6acc-efc7-9869",
             "pushToken": "…4af1c9",
             "createdAt": "2026-07-23T14:00:00+00:00",
             "createdBy": "parker-iphone"

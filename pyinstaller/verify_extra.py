@@ -18,7 +18,7 @@ cronstable prefers each of these packages whenever it is merely importable:
   while the OpenSSL underneath has no ML-KEM, which no import can see, so the
   probe seals X-Wing for real. Absent or demoted here, the daemon advertises
   `x25519` only and refuses `xwing` pairings, which costs post-quantum
-  sealing and pages nobody less.
+  sealing without costing anyone a page.
 - zeroconf: pure Python (no miscompile risk); its probe only proves the
   install produced an importable package, async surface included, before
   the bundle is frozen.
@@ -26,6 +26,14 @@ cronstable prefers each of these packages whenever it is merely importable:
 Each probe exercises the real code path the daemon depends on. The caller
 uninstalls the package on a nonzero exit, so a broken build is never frozen
 or shipped and the runtime fallback (where one exists) engages.
+
+Every probe here runs in the BUILD environment, before PyInstaller freezes
+anything, so it answers what the venv can do rather than what the artifact
+carries. The release lanes close that gap on the far side of the freeze:
+`--validate-config -c pyinstaller/smoke-push.yaml` proves the frozen bundle
+reaches PyNaCl and zeroconf, and `--sealable-suites` prints the suites it
+can really seal, which the lanes bundling cryptography require to include
+`xwing`.
 
 Exit 0 (nothing to verify) when the package is not installed at all: the
 arch had no wheel and the optional source build was skipped or failed;
