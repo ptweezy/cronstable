@@ -2027,8 +2027,13 @@ jobs:
             vmarch: x86_64
             # Host-native. A Rust orjson source build costs minutes here,
             # so the speedups extra is worth attempting.
-            pkgs: python314 rust gmake pkgconf libsodium
+            # openssl35 is the port OpenSSL 3.5 (the base 3.0 cannot seal
+            # ML-KEM), under /usr/local beside libsodium; with the port
+            # rust already here for orjson, that is the whole cryptography
+            # source build.
+            pkgs: python314 rust gmake pkgconf libsodium openssl35
             orjson: '1'
+            pq: '1'
             cflags: -I/usr/local/include
           - arch: arm64
             vmarch: aarch64
@@ -2039,9 +2044,12 @@ jobs:
             # design, so this row skips it outright and the binary uses the
             # stdlib json fallback (cronstable/_json). uvloop stays: it is
             # a plain C build against bundled libuv, and the event loop is
-            # the win that actually matters for a scheduler.
+            # the win that actually matters for a scheduler. cryptography is
+            # a Rust extension too and skips this row for the same reason,
+            # so the arm64 build refuses xwing pairings (x25519 still seals).
             pkgs: python314 gmake pkgconf libsodium
             orjson: '0'
+            pq: '0'
             cflags: -I/usr/local/include -include sys/cdefs.h
     runs-on: ubuntu-latest
     timeout-minutes: 180
@@ -2134,6 +2142,18 @@ jobs:
             # fails closed rather than shipping a miscompiled libsodium.
             SODIUM_INSTALL=system \
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+            # Bundle cryptography (the `push-pq` extra) from its sdist on
+            # the row that attempts it (see the matrix): the port OpenSSL
+            # 3.5 under /usr/local is the library, linked statically so the
+            # bundle carries no libssl, and the port rust the compiler. Soft
+            # like pynacl: verify_extra.py seals a real X-Wing probe and
+            # drops a build that cannot.
+            if [ "${{ matrix.pq }}" = "1" ]; then
+              OPENSSL_DIR=/usr/local OPENSSL_STATIC=1 \
+                sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
+            else
+              echo "cryptography: skipped on this lane; post-quantum push not bundled"
+            fi
             # Bundle zeroconf (the `discovery` extra): pure Python with
             # optional speedups, so a HARD install even here. LGPL-2.1; the
             # in-binary notice, Release source archive and public build
@@ -2147,6 +2167,16 @@ jobs:
             # validates only when both import inside the bundle.
             if venv/bin/python -c "import nacl" 2>/dev/null; then
               dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+            fi
+            # And whenever it kept cryptography, the frozen bundle must seal
+            # xwing (see install_extra.sh header).
+            if venv/bin/python -c "import cryptography" 2>/dev/null; then
+              suites=$(dist/cronstable --sealable-suites)
+              echo "sealable suites: $suites"
+              echo "$suites" | grep -qx xwing || {
+                echo "FAIL: the frozen binary cannot seal xwing" >&2
+                exit 1
+              }
             fi
             # cli_job_smoke.sh is deliberately not run here: it needs bash,
             # curl and a live daemon, none of which this lean VM carries,
@@ -2701,6 +2731,13 @@ jobs:
         if: ${{ matrix.pq != '' }}
         shell: pwsh
         run: |
+          # A soft row (arm64) can have dropped a source build that failed
+          # its probe; the install log said so, and there is nothing to gate.
+          uv run python -c "import cryptography" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "cryptography is not in the build env; nothing to gate"
+            exit 0
+          }
           $exe = "dist/cronstable-windows-${{ matrix.arch }}.exe"
           $suites = & $exe --sealable-suites
           if ($LASTEXITCODE -ne 0) {
