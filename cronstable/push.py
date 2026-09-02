@@ -494,7 +494,10 @@ def _xwing_sealer() -> Callable[[bytes, bytes], bytes]:
                 mlkem.MLKEM768PublicKey.from_public_bytes(raw_key[:1184]),
                 x25519.X25519PublicKey.from_public_bytes(raw_key[1184:]),
             )
-            return suite.encrypt(plaintext, key, info=_XWING_INFO)
+            # Named so the bare mypy env (no cryptography, so `suite` is
+            # Any) sees a declared bytes rather than an Any return.
+            sealed: bytes = suite.encrypt(plaintext, key, info=_XWING_INFO)
+            return sealed
         except UnsupportedAlgorithm as exc:
             raise _xwing_library_failure(exc) from None
 
