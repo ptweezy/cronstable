@@ -47,7 +47,7 @@ amd64   amd64   amd64   2.17
 arm64   arm64   arm64   2.17
 i686    386     i386    2.36
 armv7   arm7    armhf   2.31
-ppc64le ppc64le ppc64el 2.17
+ppc64le ppc64le ppc64el 2.28
 s390x   s390x   s390x   2.17
 riscv64 riscv64 riscv64 2.41
 "
