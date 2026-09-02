@@ -115,7 +115,27 @@ def detect_target():
     return platform.machine(), struct.calcsize("P"), detect_libc()
 
 
-def resolve_cryptography(line, target):
+def wheelhouse_has_cryptography(wheelhouse, machine, pointer_size):
+    """Whether a wheelhouse directory holds a cryptography wheel for here.
+
+    The release workflow's pq-wheels job builds cryptography for the image
+    platforms PyPI publishes no wheel for and the Dockerfiles COPY the
+    result beside this script, one directory per libc, so the libc is
+    already decided by which directory this image was handed; only the
+    machine is matched, on the linux_<machine> tag an unrepaired build
+    carries (or a manylinux/musllinux tag, should one ever be repaired).
+    """
+    if not wheelhouse:
+        return False
+    wanted = wheel_machine(machine, pointer_size)
+    for path in glob.glob(os.path.join(wheelhouse, "cryptography-*.whl")):
+        platform_tag = os.path.basename(path)[: -len(".whl")].split("-")[-1]
+        if platform_tag.endswith("_" + wanted):
+            return True
+    return False
+
+
+def resolve_cryptography(line, target, wheelhouse=None):
     """The cryptography requirement to emit, or None to drop it.
 
     Where a wheel exists the marker comes off: this script has already made
@@ -125,7 +145,10 @@ def resolve_cryptography(line, target):
     """
     if target is None:
         return line
-    if not cryptography_has_wheel(*target):
+    machine, pointer_size, _libc = target
+    if not cryptography_has_wheel(*target) and not wheelhouse_has_cryptography(
+        wheelhouse, machine, pointer_size
+    ):
         return None
     # The requirement lines here carry no other semicolon, so the marker is
     # everything past the first one.
@@ -164,7 +187,7 @@ def requirement_name(line):
     return re.split(r"[\s\[(<>=!~;]", line.strip(), maxsplit=1)[0].lower()
 
 
-def main(pyproject_path):
+def main(pyproject_path, wheelhouse=None):
     with open(pyproject_path, "rb") as fobj:
         data = tomllib.load(fobj)
     project = data["project"]
@@ -177,7 +200,7 @@ def main(pyproject_path):
         if requirement_name(line) == "cryptography":
             if target is not None and not marker_can_hold_on_linux(line):
                 continue  # another OS's line; no image is built for it
-            line = resolve_cryptography(line, target)
+            line = resolve_cryptography(line, target, wheelhouse)
             if line is None:
                 sys.stdout.write(
                     "cryptography: no wheel for this image "
@@ -197,4 +220,6 @@ def main(pyproject_path):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    # argv[2], when given, is the wheelhouse directory the Dockerfile COPYd
+    # beside pyproject.toml (see wheelhouse_has_cryptography).
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)

@@ -566,7 +566,7 @@ def test_package_dependencies_declare_the_floor_the_lane_enforces():
     }
     assert not mismatched, (
         "packaged floor != the floor the build lane declares and elf_floor.py "
-        "enforces, as {arch: (packaged, lane)}: {}".format(mismatched)
+        "enforces, as {{arch: (packaged, lane)}}: {}".format(mismatched)
     )
 
 
@@ -582,13 +582,29 @@ def test_every_32_bit_arm_row_asserts_its_abi():
     arm = {"armv5", "armv6", "armv7", "armel"}
     missing = []
     for name, job in _workflow()["jobs"].items():
+        # Only the lanes that freeze a binary. pq-wheels compiles one
+        # dependency wheel for the container images and never runs
+        # PyInstaller, so it has no bundle for elf_floor.py to hold to an
+        # ABI.
+        if "dist/cronstable" not in str(job.get("steps", [])):
+            continue
+        # Actions merges every `include` entry naming an arch into that
+        # arch's rows, so the gate can sit on one entry (the per-arch row)
+        # while another (a per-libc-and-arch row adding pq) names the same
+        # arch without it. Judge the merged row: an arch is gated when any
+        # of its entries carries armgate.
+        gated = {}
         for entry in (
             job.get("strategy", {}).get("matrix", {}).get("include", []) or []
         ):
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or entry.get("arch") not in arm:
                 continue
-            if entry.get("arch") in arm and not entry.get("armgate"):
-                missing.append((name, entry["arch"]))
+            gated[entry["arch"]] = gated.get(entry["arch"], False) or bool(
+                entry.get("armgate")
+            )
+        missing.extend(
+            (name, arch) for arch, ok in sorted(gated.items()) if not ok
+        )
     assert not missing, (
         "these 32-bit ARM rows declare no armgate, so nothing checks their "
         "float ABI or instruction set: {}".format(sorted(missing))

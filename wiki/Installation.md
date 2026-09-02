@@ -465,14 +465,15 @@ their runners, the rest under QEMU emulation. The `riscv64` builds cover 64-bit
 RISC-V for both glibc and musl. The musl-only `armv6` build extends to older
 32-bit ARM, such as a Raspberry Pi 1 or Zero. There is no glibc `armv6` build.
 
-Each build bundles the optional extras its build lane can take a wheel for.
-`cryptography`, which carries post-quantum push sealing, has the shortest
-reach: `linux-amd64`, `linux-arm64`, `linux-armv7`, `linux-ppc64le`,
-`linux-amd64-musl`, `linux-arm64-musl`, `macos-arm64`, `macos-amd64`,
-`windows-amd64`, and `windows-i686` seal the `xwing` suite, and every other
-build seals `x25519` only. The `macos-amd64` and `windows-i686` builds carry
+Each build bundles the optional extras its build lane can take a wheel for
+or compile. `cryptography`, which carries post-quantum push sealing, takes a
+wheel where PyPI has one and is built from source everywhere else, so every
+build seals the `xwing` suite except `linux-mips64le`, `linux-armel`, the
+glibc `linux-armv6`, `freebsd-arm64` and `illumos-amd64`, which seal
+`x25519` only. The `macos-amd64` and `windows-i686` builds carry
 `cryptography` 48.x, the last release line with a wheel for those platforms.
-See [Push notifications](Push-Notifications).
+See [Push notifications](Push-Notifications) for what the source builds
+promise and how to check a binary.
 
 The `mips64le` build covers 64-bit little-endian MIPS on glibc hosts. It is
 built in an emulated Debian bookworm container, the last Debian suite that
