@@ -858,6 +858,9 @@ jobs:
                     if [ ! -x /opt/cargo/bin/cargo ]; then
                       sh -c "$RUST_SETUP_CMD"
                     fi
+                    # OpenSSL Configure needs perl IPC::Cmd, which CentOS 7
+                    # packages apart from perl and the image leaves out.
+                    perl -MIPC::Cmd -e 1 2>/dev/null || retry 5 yum install -y perl-IPC-Cmd
                     sh pyinstaller/build_openssl.sh /src/.openssl-${{ matrix.arch }}
                   } || pq_ready=0
                   PATH=/opt/cargo/bin:$PATH
@@ -1215,15 +1218,18 @@ jobs:
               # Bundle cryptography (the `push-pq` extra) so the frozen daemon
               # seals post-quantum X-Wing push. The wheel rows take it hard;
               # the pq_src rows first install the distro Rust and OpenSSL
-              # (pq_tools) and let pip build the sdist, statically linked so
-              # the bundle carries no libssl of its own, under the soft
-              # policy the matrix explains (and no apostrophes: single-quoted
-              # sh -euc). Either way verify_extra.py seals a real X-Wing
-              # probe before the bundle is frozen.
+              # (pq_tools) and let pip build the sdist against the distro
+              # libssl, which PyInstaller collects into the bundle for the
+              # interpreter's own ssl module in any case, so the binary
+              # carries one OpenSSL rather than two. Soft, as the matrix
+              # explains (and no apostrophes: single-quoted sh -euc). The
+              # bookworm row is the exception: its distro OpenSSL cannot
+              # seal ML-KEM, so it links a static one it builds (pq_openssl
+              # below). Either way verify_extra.py seals a real X-Wing probe
+              # before the bundle is frozen.
               if [ -n "${{ matrix.pq }}" ]; then
                 if [ -n "${{ matrix.pq_src }}" ]; then
                   ${{ matrix.pq_tools }}
-                  export OPENSSL_STATIC=1
                 fi
                 # The bookworm row (see its matrix entry): the distro has
                 # neither the Rust nor the OpenSSL the build needs, so both
@@ -1243,7 +1249,8 @@ jobs:
                   CARGO_HOME=/opt/cargo
                   RUSTUP_HOME=/opt/rustup
                   OPENSSL_DIR=/opt/openssl
-                  export PATH CARGO_HOME RUSTUP_HOME OPENSSL_DIR
+                  OPENSSL_STATIC=1
+                  export PATH CARGO_HOME RUSTUP_HOME OPENSSL_DIR OPENSSL_STATIC
                 fi
                 if [ "$pq_ready" = 1 ]; then
                   sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
@@ -1783,12 +1790,15 @@ jobs:
               # Bundle cryptography (the `push-pq` extra): no loong64 wheel
               # exists, so it builds from its sdist against the distro
               # OpenSSL 3.5 (pq_tools) with the rustup Rust the orjson step
-              # installed (fetched here if that step never got to it),
-              # linked statically so the bundle carries no libssl. Soft like
-              # the other compiled extras on this lane: verify_extra.py seals
-              # a real X-Wing probe and drops a build that cannot.
+              # installed (fetched here if that step never got to it). The
+              # extension links the distro libssl, which PyInstaller collects
+              # into the bundle for the interpreter's own ssl module in any
+              # case, so the binary carries one OpenSSL rather than two.
+              # Soft like the other compiled extras on this lane:
+              # verify_extra.py seals a real X-Wing probe and drops a build
+              # that cannot.
               if { ${{ matrix.pq_tools }}; } && { [ -x /opt/cargo/bin/cargo ] || sh -c "${{ matrix.rust_setup }}"; }; then
-                PATH=/opt/cargo/bin:$PATH CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup OPENSSL_STATIC=1 \
+                PATH=/opt/cargo/bin:$PATH CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup \
                   sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
               else
                 echo "cryptography: source-build toolchain setup failed; post-quantum push not bundled"
@@ -3011,9 +3021,13 @@ jobs:
         if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
         env:
           # Per-libc toolchain, spliced in as env so the single-quoted script
-          # below stays free of quote characters. The manylinux row has no
-          # usable distro OpenSSL or Rust and takes the from-source route.
-          PQ_TOOLS: ${{ matrix.libc == 'musl' && 'retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && ':' || 'retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev pkg-config' }}
+          # below stays free of quote characters. It runs under `sh -c`, a
+          # fresh shell that inherits no function, so every string sources
+          # retry.sh for itself, as RUST_SETUP_CMD does. The manylinux row
+          # has no usable distro OpenSSL or Rust and takes the from-source
+          # route; what it installs is the one perl module OpenSSL's
+          # Configure needs that the image leaves out.
+          PQ_TOOLS: ${{ matrix.libc == 'musl' && '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && '. /src/.github/scripts/retry.sh && retry 5 yum install -y perl-IPC-Cmd' || '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev pkg-config' }}
           RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
           # The probe below installs the project, whose version comes from
           # this rather than from git: the python images carry no git, and
@@ -3033,6 +3047,12 @@ jobs:
                 # any 3.11+: the result is an abi3 wheel. manylinux ships
                 # its own at /opt/python; the newest 3.14 there does.
                 PY=$(ls -d /opt/python/cp314-cp314 | head -1)/bin/python
+                # The checkout is the runner user and this container is
+                # root, so git calls the bind mount dubiously owned, and the
+                # project install below (setuptools_scm shells out to git
+                # for its file finder) dies on the refusal. The python
+                # images carry no git and never see this.
+                git config --global --add safe.directory /src
                 sh -c "$RUST_SETUP_CMD"
                 sh pyinstaller/build_openssl.sh /src/.openssl-${{ matrix.arch }}
                 PATH=/opt/cargo/bin:$PATH
@@ -3040,9 +3060,24 @@ jobs:
                 RUSTUP_HOME=/opt/rustup
                 OPENSSL_DIR=/src/.openssl-${{ matrix.arch }}
                 export PATH CARGO_HOME RUSTUP_HOME OPENSSL_DIR
+              elif [ "${{ matrix.libc }}" = musl ]; then
+                PY=python
+                # openssl-libs-static puts the archives under /usr/lib.
+                OPENSSL_DIR=/usr
+                export OPENSSL_DIR
               else
                 PY=python
+                # Debian keeps them in the multiarch library directory.
+                OPENSSL_LIB_DIR=/usr/lib/$(gcc -print-multiarch)
+                OPENSSL_INCLUDE_DIR=/usr/include
+                export OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR
               fi
+              # Static on every row, with the archives named outright: left
+              # to pkg-config, openssl-sys never links an archive that lives
+              # under /usr (the pkg-config crate treats a system root as
+              # dynamic-only), so OPENSSL_STATIC alone yields a wheel that
+              # loads only beside the libssl.so.3 it was built next to.
+              # These wheels go to eight images, so they carry their own.
               export OPENSSL_STATIC=1
               $PY -m pip install --upgrade pip
               rm -rf /src/wheelhouse
@@ -3055,6 +3090,13 @@ jobs:
               $PY -m pip install /src/wheelhouse/cryptography-*.whl
               $PY -m pip install .
               $PY pyinstaller/verify_extra.py cryptography
+              # And prove the link: an extension that still names libssl or
+              # libcrypto as a shared dependency is not self-contained.
+              ext=$($PY -c "import cryptography.hazmat.bindings._rust as m; print(m.__file__)")
+              if readelf -d "$ext" | grep -E "NEEDED.*lib(ssl|crypto)"; then
+                echo "FAIL: the wheel links OpenSSL dynamically" >&2
+                exit 1
+              fi
               chmod -R a+rX /src/wheelhouse
               ls -l /src/wheelhouse
             '

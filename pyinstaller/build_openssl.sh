@@ -17,7 +17,9 @@
 #
 # Usage: build_openssl.sh PREFIX
 #
-# Needs perl, make, a C compiler, and curl or wget. No `set -e` around the
+# Needs perl with IPC::Cmd (Configure imports it; RHEL-family distributions
+# package it apart from perl as perl-IPC-Cmd, and the manylinux images leave
+# it out), make, a C compiler, and curl or wget. No `set -e` around the
 # fetch: retry.sh handles the network hop when it is on hand.
 set -u
 
@@ -29,6 +31,13 @@ prefix="${1:?usage: build_openssl.sh PREFIX}"
 if [ -f "$prefix/lib/libcrypto.a" ]; then
     echo "build_openssl.sh: $prefix already holds a build; skipping"
     exit 0
+fi
+
+# Checked before the fetch so the failure names the module, rather than
+# surfacing as a perl compilation error from inside Configure.
+if ! perl -MIPC::Cmd -e 1 2>/dev/null; then
+    echo "build_openssl.sh: perl lacks IPC::Cmd (perl-IPC-Cmd on RHEL-likes)" >&2
+    exit 1
 fi
 
 tarball="openssl-$VERSION.tar.gz"
@@ -63,14 +72,34 @@ fi
 tar xzf "$tarball" || exit 1
 cd "openssl-$VERSION" || exit 1
 
-# `config` picks the target from the machine it runs on, which under
-# docker --platform or QEMU is the one the binary is for. Static only,
-# position independent (the archive is linked into a shared extension),
-# and with --libdir=lib so the result lands in lib/ on every distro rather
-# than lib64/ on some. Docs and tests are skipped: nothing here reads them
-# and under emulation they cost real time.
+# `config` picks the target from uname, which reports the KERNEL: under
+# docker --platform a 32-bit userland on a 64-bit host still says x86_64
+# or aarch64, and config then chooses a target the 32-bit toolchain cannot
+# build (on x86_64 it takes the 32-bit compiler for the x32 ABI). The
+# compiler knows what it emits, so where the two disagree the target is
+# named outright; everywhere else config's own guess stands.
+target=
+case "$(uname -m)" in
+    x86_64)
+        if ${CC:-cc} -dM -E -x c /dev/null 2>/dev/null | grep -q __i386__; then
+            target=linux-x86
+        fi ;;
+    aarch64)
+        if ${CC:-cc} -dM -E -x c /dev/null 2>/dev/null | grep -q __arm__; then
+            target=linux-armv4
+        fi ;;
+esac
+
+# Static only, position independent (the archive is linked into a shared
+# extension), and with --libdir=lib so the result lands in lib/ on every
+# distro rather than lib64/ on some. Docs and tests are skipped: nothing
+# here reads them and under emulation they cost real time.
 set -e
-./config --prefix="$prefix" --libdir=lib no-shared no-docs no-tests -fPIC
+if [ -n "$target" ]; then
+    ./Configure "$target" --prefix="$prefix" --libdir=lib no-shared no-docs no-tests -fPIC
+else
+    ./config --prefix="$prefix" --libdir=lib no-shared no-docs no-tests -fPIC
+fi
 jobs=$(nproc 2>/dev/null || echo 2)
 make -j"$jobs" build_libs
 make install_dev
