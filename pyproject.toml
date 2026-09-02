@@ -135,11 +135,14 @@ push = ["pynacl>=1.6.2"]
 # take the newest cryptography and fail building its sdist for want of Rust
 # and OpenSSL headers.  Linux stops at x86_64 and aarch64, the arches with a
 # wheel under BOTH libcs: cryptography publishes ppc64le and armv7l for
-# manylinux but not musllinux, and a marker cannot see the libc.  Those two
-# get xwing from the builds that DO know their libc: the release binaries
-# (the `pq` matrix keys in .github/workflows/release.yml) and the glibc
-# container images, whose docker/extract_deps.py resolves this line from
-# inside the target image rather than through the marker.
+# manylinux but not musllinux, and a marker cannot see the libc.  Every
+# other platform gets xwing from the builds that DO know their libc and can
+# compile: the release binaries (the `pq` and `pq_src` matrix keys in
+# .github/workflows/release.yml, the latter building cryptography from
+# source with an OpenSSL 3.5) and the container images, whose
+# docker/extract_deps.py resolves this line from inside the target image
+# and reads the wheelhouse the workflow's pq-wheels job fills for the
+# platforms PyPI has no wheel for.
 #
 # Intel macOS and 32-bit Windows take a second line, capped: cryptography
 # 49.0.0 dropped both, and 48.0.1 (June 2026) is the last release with a

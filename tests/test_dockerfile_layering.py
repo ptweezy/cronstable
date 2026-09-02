@@ -404,6 +404,44 @@ def test_cryptography_line_keeps_its_floor_and_loses_its_marker():
     assert module.resolve_cryptography(line, None) == line
 
 
+def test_a_wheelhouse_wheel_keeps_cryptography_where_pypi_has_none(
+    tmp_path, monkeypatch
+):
+    # The pq-wheels job hands the image builds a cryptography wheel for the
+    # platforms PyPI publishes none for. With one in the wheelhouse the
+    # script keeps the line (marker stripped, as for a PyPI wheel); with an
+    # empty wheelhouse, or one holding another arch's wheel, it drops it as
+    # before. Only the machine is matched: the libc is decided by which
+    # per-libc directory the Dockerfile COPYd.
+    module = _extract_deps_module()
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    target = ("s390x", 8, "glibc")
+    line = "cryptography>=48; sys_platform == 'linux'"
+    assert module.resolve_cryptography(line, target, str(wheelhouse)) is None
+    (wheelhouse / "cryptography-50.0.1-cp311-abi3-linux_riscv64.whl").touch()
+    assert module.resolve_cryptography(line, target, str(wheelhouse)) is None
+    (wheelhouse / "cryptography-50.0.1-cp311-abi3-linux_s390x.whl").touch()
+    assert module.resolve_cryptography(line, target, str(wheelhouse)) == (
+        "cryptography>=48"
+    )
+    # A 32-bit userland matches on the machine pip resolves under.
+    (wheelhouse / "cryptography-50.0.1-cp311-abi3-linux_i686.whl").touch()
+    assert module.resolve_cryptography(
+        line, ("x86_64", 4, "glibc"), str(wheelhouse)
+    ) == "cryptography>=48"
+    # And main() threads the directory through from its second argument.
+    monkeypatch.setattr(module, "detect_target", lambda: target)
+    shutil.copy(
+        os.path.join(ROOT, "pyproject.toml"), tmp_path / "pyproject.toml"
+    )
+    module.main(str(tmp_path / "pyproject.toml"), str(wheelhouse))
+    written = (
+        (tmp_path / "requirements.txt").read_text(encoding="utf-8").splitlines()
+    )
+    assert "cryptography>=48" in written
+
+
 def test_another_platforms_cryptography_line_never_reaches_an_image():
     # pyproject carries a second, capped cryptography line for Intel macOS
     # and 32-bit Windows. Stripping its marker on a Linux image would pin

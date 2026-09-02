@@ -2671,29 +2671,41 @@ jobs:
           # Either way verify_extra.py seals a real X-Wing probe before
           # freezing.
           if [ -n "${{ matrix.pq }}" ]; then
+            pq_ready=1
             if [ -n "${{ matrix.pq_src }}" ]; then
-              # A current Rust for this host. The arm64 image does not
-              # promise one, so rustup-init is fetched when cargo is absent.
-              if ! command -v cargo >/dev/null 2>&1; then
-                curl --proto '=https' --tlsv1.2 -sSfo rustup-init.exe \
-                  https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe
-                ./rustup-init.exe -y --profile minimal --default-toolchain stable
-                export PATH="$USERPROFILE/.cargo/bin:$PATH"
-              fi
-              # A static OpenSSL 3.5+ from the runner's vcpkg, brought to
-              # the current port set first: the checkout an image carries can
-              # predate the OpenSSL release ML-KEM needs, and the probe below
-              # would then drop a build that compiled fine. vcpkg fetches its
-              # own perl, so no toolchain beyond MSVC is assumed.
-              git -C "$VCPKG_INSTALLATION_ROOT" pull --ff-only
-              "$VCPKG_INSTALLATION_ROOT/bootstrap-vcpkg.bat" -disableMetrics
-              "$VCPKG_INSTALLATION_ROOT/vcpkg" install openssl:arm64-windows-static
-              export OPENSSL_DIR="$VCPKG_INSTALLATION_ROOT/installed/arm64-windows-static"
-              export OPENSSL_STATIC=1
+              # The toolchain for a source build, best effort as a whole:
+              # the row is soft, so a step here that fails costs the build
+              # its post-quantum suite (logged below), never the job.
+              {
+                # A current Rust for this host. The arm64 image does not
+                # promise one, so rustup-init is fetched when cargo is absent.
+                if ! command -v cargo >/dev/null 2>&1; then
+                  curl --proto '=https' --tlsv1.2 -sSfo rustup-init.exe \
+                    https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe
+                  ./rustup-init.exe -y --profile minimal --default-toolchain stable
+                  export PATH="$USERPROFILE/.cargo/bin:$PATH"
+                fi
+                # A static OpenSSL 3.5+ from the runner's vcpkg, brought to
+                # the current port set first: the checkout an image carries
+                # can predate the OpenSSL release ML-KEM needs, and the probe
+                # below would then drop a build that compiled fine. vcpkg
+                # fetches its own perl, so no toolchain beyond MSVC is
+                # assumed.
+                test -n "${VCPKG_INSTALLATION_ROOT:-}"
+                git -C "$VCPKG_INSTALLATION_ROOT" pull --ff-only
+                "$VCPKG_INSTALLATION_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+                "$VCPKG_INSTALLATION_ROOT/vcpkg" install openssl:arm64-windows-static
+                export OPENSSL_DIR="$VCPKG_INSTALLATION_ROOT/installed/arm64-windows-static"
+                export OPENSSL_STATIC=1
+              } || pq_ready=0
             fi
-            PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-              sh pyinstaller/install_extra.sh cryptography "cryptography>=48${{ matrix.pqcap }}" \
-                ${{ matrix.pq }} "post-quantum push not bundled"
+            if [ "$pq_ready" = 1 ]; then
+              PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+                sh pyinstaller/install_extra.sh cryptography "cryptography>=48${{ matrix.pqcap }}" \
+                  ${{ matrix.pq }} "post-quantum push not bundled"
+            else
+              echo "cryptography: source-build toolchain setup failed; post-quantum push not bundled"
+            fi
           fi
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on win32/amd64/arm64, HARD failure. LGPL-2.1; in-binary
@@ -2907,13 +2919,157 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # cryptography wheels for the image platforms PyPI publishes none for, so
+  # every image seals post-quantum push on every arch it ships. Built once
+  # per (libc, arch) here and handed to both docker jobs as a wheelhouse
+  # (docker/wheelhouse/<libc>/, which the Dockerfiles COPY beside
+  # pyproject.toml and pip reads with --find-links), rather than compiled
+  # inside each image build: six images build s390x, and one QEMU Rust
+  # compile of cryptography is an hour or more.
+  #
+  # Each row builds in the container the wheel must load in: Alpine 3.23 for
+  # the musl rows (distro rust + OpenSSL 3.5, static), Debian trixie for the
+  # glibc i686 and riscv64 rows (same, from apt; every consumer of those two
+  # arches is trixie or newer), and manylinux_2_28 for glibc s390x, whose
+  # consumers span RHEL 10 (glibc 2.39) through Ubuntu 26.04, so the wheel
+  # is built against the oldest of them with a rustup Rust and an OpenSSL
+  # built from source (build_openssl.sh, cached). The wheel carries the
+  # plain linux_<arch> tag pip gives an unrepaired build, which every Linux
+  # pip accepts; the per-libc directories are what keep a musl wheel away
+  # from a glibc image and vice versa.
+  #
+  # Every row is best-effort at the job level (continue-on-error), so a
+  # failed compile costs that platform its post-quantum suite (the image
+  # then seals x25519 only, which extract_deps.py reports) rather than the
+  # release. The wheel is cached across pushes and rebuilt on a release,
+  # matching the freshness the image dependency layers get from
+  # DEPS_REFRESH. Saved trunk-only, like every other cache writer.
+  pq-wheels:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { libc: musl, arch: i686, platform: linux/386, image: python:3.14-alpine3.23 }
+          - { libc: musl, arch: armv7, platform: linux/arm/v7, image: python:3.14-alpine3.23, qemu: true }
+          - { libc: musl, arch: ppc64le, platform: linux/ppc64le, image: python:3.14-alpine3.23, qemu: true }
+          - { libc: musl, arch: s390x, platform: linux/s390x, image: python:3.14-alpine3.23, qemu: true }
+          - { libc: musl, arch: riscv64, platform: linux/riscv64, image: python:3.14-alpine3.23, qemu: true }
+          - { libc: glibc, arch: i686, platform: linux/386, image: python:3.14-slim-trixie }
+          - { libc: glibc, arch: riscv64, platform: linux/riscv64, image: python:3.14-slim-trixie, qemu: true }
+          - { libc: glibc, arch: s390x, platform: linux/s390x, image: quay.io/pypa/manylinux_2_28_s390x:2026.08.15-1, qemu: true, manylinux: '1' }
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Restore a cached wheel
+        # A release rebuilds: the wheel then carries the newest cryptography
+        # the index has, as the image dependency layers do under DEPS_REFRESH.
+        if: ${{ needs.version.outputs.release != 'true' }}
+        id: wheel-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: wheelhouse
+          key: pq-wheel-${{ matrix.libc }}-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', 'pyinstaller/build_openssl.sh', '.github/workflows/release.yml') }}
+      - name: Restore the OpenSSL build (manylinux rows)
+        if: ${{ matrix.manylinux && steps.wheel-cache.outputs.cache-hit != 'true' }}
+        id: openssl-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .openssl-${{ matrix.arch }}
+          key: openssl-pqwheel-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
+      - if: ${{ matrix.qemu && steps.wheel-cache.outputs.cache-hit != 'true' }}
+        uses: docker/setup-qemu-action@v4.2.0
+      - name: Pull the build image
+        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/retry.sh
+          retry 5 docker pull --platform ${{ matrix.platform }} ${{ matrix.image }}
+      - name: Build the cryptography wheel (${{ matrix.libc }} ${{ matrix.arch }})
+        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
+        env:
+          # Per-libc toolchain, spliced in as env so the single-quoted script
+          # below stays free of quote characters. The manylinux row has no
+          # usable distro OpenSSL or Rust and takes the from-source route.
+          PQ_TOOLS: ${{ matrix.libc == 'musl' && 'retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && ':' || 'retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev pkg-config' }}
+          RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -e PIP_RETRIES -e PIP_TIMEOUT -e PQ_TOOLS -e RUST_SETUP_CMD \
+            -v "$PWD:/src" -w /src \
+            ${{ matrix.image }} sh -euc '
+              . /src/.github/scripts/retry.sh
+              sh -c "$PQ_TOOLS"
+              if [ -n "${{ matrix.manylinux }}" ]; then
+                # The interpreter the wheel is built with only has to be
+                # any 3.11+: the result is an abi3 wheel. manylinux ships
+                # its own at /opt/python; the newest 3.14 there does.
+                PY=$(ls -d /opt/python/cp314-cp314 | head -1)/bin/python
+                sh -c "$RUST_SETUP_CMD"
+                sh pyinstaller/build_openssl.sh /src/.openssl-${{ matrix.arch }}
+                PATH=/opt/cargo/bin:$PATH
+                CARGO_HOME=/opt/cargo
+                RUSTUP_HOME=/opt/rustup
+                OPENSSL_DIR=/src/.openssl-${{ matrix.arch }}
+                export PATH CARGO_HOME RUSTUP_HOME OPENSSL_DIR
+              else
+                PY=python
+              fi
+              export OPENSSL_STATIC=1
+              $PY -m pip install --upgrade pip
+              rm -rf /src/wheelhouse
+              # tests/test_extra_pins_parity.py checks this floor against
+              # pyproject: bump them together.
+              $PY -m pip wheel --no-deps --wheel-dir /src/wheelhouse "cryptography>=48"
+              # Prove the wheel seals X-Wing through the daemon itself, the
+              # same probe the binary lanes run, before it is handed to an
+              # image build.
+              $PY -m pip install /src/wheelhouse/cryptography-*.whl
+              $PY -m pip install .
+              $PY pyinstaller/verify_extra.py cryptography
+              chmod -R a+rX /src/wheelhouse
+              ls -l /src/wheelhouse
+            '
+      - name: Make the caches readable by the cache save
+        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+          for d in wheelhouse .openssl-${{ matrix.arch }}; do
+            if [ -d "$d" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$d"
+            fi
+          done
+      - name: Save the wheel (trunk only)
+        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: wheelhouse
+          key: pq-wheel-${{ matrix.libc }}-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', 'pyinstaller/build_openssl.sh', '.github/workflows/release.yml') }}
+      - name: Save the OpenSSL build (manylinux rows, trunk only)
+        if: ${{ matrix.manylinux && steps.wheel-cache.outputs.cache-hit != 'true' && steps.openssl-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .openssl-${{ matrix.arch }}
+          key: openssl-pqwheel-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: pq-wheel-${{ matrix.libc }}-${{ matrix.arch }}
+          path: wheelhouse/cryptography-*.whl
+          if-no-files-found: error
+          retention-days: 7
+
   # Build EVERY container image (8 distros, full published arch set) build-only,
   # no push -- the Docker half of the gate. Proves every Dockerfile still builds
   # for every arch on every commit; `docker-push` re-runs these with a push once
   # the whole gate passes. Uniform across PRs and releases (no secrets, no
   # login), so a fork PR exercises it too.
   docker:
-    needs: version
+    # pq-wheels is best-effort (continue-on-error), so a failed wheel never
+    # holds the gate; the image then seals x25519 only on that platform.
+    needs: [version, pq-wheels]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false  # one distro failing must not cancel the others
@@ -2928,6 +3084,28 @@ jobs:
       # setuptools_scm never walks history inside the build (only a plain
       # local `docker build .` does, and that uses the builder's own git).
       - uses: actions/checkout@v7.0.1
+      # The cryptography wheels pq-wheels built for the platforms PyPI has
+      # none for, sorted into docker/wheelhouse/<libc>/ for the Dockerfiles
+      # to COPY. A missing artifact (that row failed) leaves its platform
+      # on x25519; nothing here may fail the gate over it.
+      - name: Fetch the post-quantum wheelhouse
+        continue-on-error: true
+        uses: actions/download-artifact@v7.0.0
+        with:
+          pattern: pq-wheel-*
+          path: pq-wheels
+      - name: Sort the wheelhouse by libc
+        run: |
+          set -euo pipefail
+          for d in pq-wheels/pq-wheel-*; do
+            [ -d "$d" ] || continue
+            case "$(basename "$d")" in
+              pq-wheel-musl-*) dest=docker/wheelhouse/musl ;;
+              *) dest=docker/wheelhouse/glibc ;;
+            esac
+            cp "$d"/cryptography-*.whl "$dest"/
+          done
+          ls -lR docker/wheelhouse
       - uses: docker/setup-qemu-action@v4.2.0
       - uses: docker/setup-buildx-action@v4.3.0
       - name: Build image (build-only gate)
@@ -3869,7 +4047,10 @@ jobs:
   # the DOCKERHUB_* secrets are set); the Debian image owns the bare
   # `latest`/`<version>` tags, the variants get `-<distro>` suffixes.
   docker-push:
-    needs: [version, release]
+    # pq-wheels for the wheelhouse artifacts (best-effort there, so it
+    # never blocks this job through `needs`; a row that failed just leaves
+    # its platform on x25519, as it did in the gate build).
+    needs: [version, release, pq-wheels]
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -3914,6 +4095,27 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.version.outputs.new }}  # the tag `release` just pushed
+
+      # The same wheelhouse the gate `docker` job built with, so the layers
+      # this run cached are the layers pushed (see that job).
+      - name: Fetch the post-quantum wheelhouse
+        continue-on-error: true
+        uses: actions/download-artifact@v7.0.0
+        with:
+          pattern: pq-wheel-*
+          path: pq-wheels
+      - name: Sort the wheelhouse by libc
+        run: |
+          set -euo pipefail
+          for d in pq-wheels/pq-wheel-*; do
+            [ -d "$d" ] || continue
+            case "$(basename "$d")" in
+              pq-wheel-musl-*) dest=docker/wheelhouse/musl ;;
+              *) dest=docker/wheelhouse/glibc ;;
+            esac
+            cp "$d"/cryptography-*.whl "$dest"/
+          done
+          ls -lR docker/wheelhouse
 
       - name: Docker metadata
         id: meta

@@ -22,6 +22,18 @@
   32-bit Windows take `cryptography` 48.x, the last release line with a
   wheel for them, and the `linux-ppc64le` binary now needs glibc 2.28
   (RHEL 8 onward) rather than 2.17, the floor of the only ppc64le wheel.
+- Post-quantum sealing ships in every release binary and container image
+  whose platform can compile it, not only where PyPI publishes a
+  `cryptography` wheel: CI builds the library from source, against an
+  OpenSSL 3.5 it installs or builds, for the musl and glibc Linux builds
+  without a wheel, for `windows-arm64`, `freebsd-amd64`, `openbsd-amd64`
+  and `netbsd-amd64`, and for every image platform. Those builds are best
+  effort and each proves itself with a real X-Wing seal before it is frozen
+  in. Intel macOS and 32-bit Windows carry `cryptography` 48.x, the last
+  line with a wheel for them. The `linux-ppc64le` binary now needs glibc
+  2.28 rather than 2.17, the floor of the only ppc64le wheel. Left out:
+  `linux-mips64le`, `linux-armel`, the glibc `linux-armv6`, `freebsd-arm64`
+  and `illumos-amd64`, which seal `x25519` only.
 - A daemon event alert whose subject or message is empty leaves that field
   out of the sealed plaintext instead of sending it as `null`, which is what
   the relay protocol's field contract specifies.

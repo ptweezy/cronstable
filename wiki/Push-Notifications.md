@@ -36,8 +36,18 @@ post-quantum sealing reaches only the platforms with a wheel:
 | How you run cronstable | Post-quantum sealing |
 | --- | --- |
 | `pip install "cronstable[push-pq]"` | Linux x86_64 and aarch64, macOS (Apple Silicon and Intel), and Windows x64 and 32-bit x86 |
-| Release binary | `linux-amd64`, `linux-arm64`, `linux-armv7`, `linux-ppc64le`, `linux-amd64-musl`, `linux-arm64-musl`, `macos-arm64`, `macos-amd64`, `windows-amd64`, `windows-i686` |
-| Docker image | `linux/amd64` and `linux/arm64` on every tag; `linux/arm/v7` and `linux/ppc64le` on the glibc tags that build them (every tag except `-alpine`) |
+| Release binary | Every Linux build except `linux-mips64le`, `linux-armel` and the glibc `linux-armv6`; every macOS and Windows build; `freebsd-amd64`, `openbsd-amd64` and `netbsd-amd64` |
+| Docker image | Every platform of every tag |
+
+The binaries and images reach past pip because CI builds `cryptography`
+from source wherever PyPI has no wheel, against an OpenSSL 3.5 and a Rust
+toolchain the lane installs or builds. Those builds are best effort: each
+one seals a real X-Wing probe before it is frozen in, and a build that
+fails the probe ships without the suite and says so in the build log. The
+three Linux builds left out run on Debian bookworm, whose Rust and OpenSSL
+are both too old, and have no newer Rust toolchain for their architecture.
+`freebsd-arm64` and `illumos-amd64` are left out because their lanes take
+no Rust source builds at all.
 
 Everywhere else, `push-pq` installs PyNaCl alone and the daemon seals
 `x25519` only, which works on every platform. The daemon logs the suites it

@@ -53,6 +53,10 @@ RUN set -eux; \
 # reads it, never the rest of the tree.
 COPY pyproject.toml /tmp/deps/pyproject.toml
 COPY docker/extract_deps.py /tmp/deps/extract_deps.py
+# The cryptography wheels the release workflow's pq-wheels job built for the
+# platforms PyPI publishes none for (this image's libc only; see the job).
+# Empty on a plain local build, which then seals x25519 on those platforms.
+COPY docker/wheelhouse/glibc/ /tmp/deps/pqwheels/
 
 # Install the third-party dependencies into a self-contained venv so the
 # runtime stage can copy just that, leaving the build toolchain behind. The
@@ -74,8 +78,8 @@ RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
     python -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    /opt/venv/bin/python /tmp/deps/extract_deps.py /tmp/deps/pyproject.toml; \
-    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/requirements.txt; \
+    /opt/venv/bin/python /tmp/deps/extract_deps.py /tmp/deps/pyproject.toml /tmp/deps/pqwheels; \
+    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 --find-links /tmp/deps/pqwheels --only-binary cryptography -r /tmp/deps/requirements.txt; \
     python -m venv /tmp/deps/buildenv; \
     retry /tmp/deps/buildenv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/build-requires.txt
 
