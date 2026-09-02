@@ -377,7 +377,7 @@ assets, each built for its own platform and architecture:
 | `cronstable-linux-armv7` | Linux | glibc, 32-bit ARM | 32-bit ARM (armv7), glibc 2.31 or newer: Raspberry Pi OS bullseye, Debian 11, Ubuntu 20.04 onward. Raspberry Pi 2 and newer. |
 | `cronstable-linux-armv6` | Linux | glibc, 32-bit ARM | ARMv6 hard-float, glibc 2.36 or newer: the Raspberry Pi 1, Zero and Zero W running Raspberry Pi OS. |
 | `cronstable-linux-armel` | Linux | glibc, 32-bit ARM | ARMv5 soft-float (Debian armel), glibc 2.36 or newer: Kirkwood devices such as the SheevaPlug, QNAP TS-x1x, D-Link DNS-320, Zyxel NSA325 and Pogoplug. |
-| `cronstable-linux-ppc64le` | Linux | glibc, ppc64le | 64-bit little-endian POWER (IBM POWER), glibc 2.17 or newer. |
+| `cronstable-linux-ppc64le` | Linux | glibc, ppc64le | 64-bit little-endian POWER (IBM POWER), glibc 2.28 or newer: RHEL, Alma and Rocky 8 onward, Debian 10 onward, Ubuntu 18.10 onward. |
 | `cronstable-linux-s390x` | Linux | glibc, s390x | IBM Z (s390x, big-endian), glibc 2.17 or newer. |
 | `cronstable-linux-riscv64` | Linux | glibc, riscv64 | 64-bit RISC-V, glibc 2.41 or newer: Debian 13 onward. |
 | `cronstable-linux-loong64` | Linux | glibc, loongarch64 | LoongArch, glibc 2.41 or newer. New-world ABI only; the older Loongnix, Kylin and UOS fleets run a different, incompatible ABI. |
@@ -419,14 +419,16 @@ whether it starts is the oldest glibc or musl it accepts. Each build declares
 that number, and CI re-derives it from the frozen bytes on every release, so the
 table above is measured rather than estimated.
 
-`amd64`, `arm64`, `ppc64le` and `s390x` need glibc 2.17, which reaches every
-glibc distribution still in production, including the RHEL family from 7 onward
+`amd64`, `arm64` and `s390x` need glibc 2.17, which reaches every glibc
+distribution still in production, including the RHEL family from 7 onward
 and Amazon Linux 2. They are built inside manylinux2014 containers against a
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
-interpreter, which is where that number comes from. `armv7` needs glibc 2.31;
-`i686`, `armv6`, `armel` and `mips64le` need 2.36; `riscv64` and `loong64` need
-2.41. Each is set by the oldest base image carrying a working toolchain for that
-architecture.
+interpreter, which is where that number comes from. `ppc64le` needs 2.28: it
+is built inside a manylinux_2_28 container so that it can carry the
+`cryptography` wheel behind post-quantum push sealing, which exists for
+POWER only at that floor. `armv7` needs glibc 2.31; `i686`, `armv6`, `armel`
+and `mips64le` need 2.36; `riscv64` and `loong64` need 2.41. Each is set by
+the oldest base image carrying a working toolchain for that architecture.
 
 On 32-bit ARM the glibc version is only half the requirement, because there are
 three incompatible ABIs. `armv7` is hard-float ARMv7 and covers the Raspberry Pi
@@ -465,10 +467,12 @@ RISC-V for both glibc and musl. The musl-only `armv6` build extends to older
 
 Each build bundles the optional extras its build lane can take a wheel for.
 `cryptography`, which carries post-quantum push sealing, has the shortest
-reach: `linux-amd64`, `linux-arm64`, `linux-armv7`, `linux-amd64-musl`,
-`linux-arm64-musl`, `macos-arm64`, and `windows-amd64` seal the `xwing` suite,
-and every other build seals `x25519` only. See
-[Push notifications](Push-Notifications).
+reach: `linux-amd64`, `linux-arm64`, `linux-armv7`, `linux-ppc64le`,
+`linux-amd64-musl`, `linux-arm64-musl`, `macos-arm64`, `macos-amd64`,
+`windows-amd64`, and `windows-i686` seal the `xwing` suite, and every other
+build seals `x25519` only. The `macos-amd64` and `windows-i686` builds carry
+`cryptography` 48.x, the last release line with a wheel for those platforms.
+See [Push notifications](Push-Notifications).
 
 The `mips64le` build covers 64-bit little-endian MIPS on glibc hosts. It is
 built in an emulated Debian bookworm container, the last Debian suite that

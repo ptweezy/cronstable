@@ -593,9 +593,12 @@ jobs:
   # amd64 and arm64 build natively; armv7, ppc64le and s390x run under QEMU.
   # armv7 has no manylinux2014 image, so it builds on manylinux_2_31_armv7l
   # (Ubuntu 20.04) and declares GLIBC_2.31, which covers Raspberry Pi OS
-  # bullseye and Debian 11 armhf. Every row ends with elf_floor.py, which
-  # re-derives the floor from the frozen bytes and fails the job if a
-  # dependency raised it.
+  # bullseye and Debian 11 armhf. ppc64le builds on manylinux_2_28_ppc64le
+  # (AlmaLinux 8) and declares GLIBC_2.28, the floor of the only ppc64le
+  # wheel cryptography publishes: post-quantum push sealing on POWER costs
+  # RHEL 7, whose ppc64le builds left support in 2024. Every row ends with
+  # elf_floor.py, which re-derives the floor from the frozen bytes and fails
+  # the job if a dependency raised it.
   binaries:
     needs: version
     strategy:
@@ -636,12 +639,18 @@ jobs:
             runner: ubuntu-24.04
             platform: linux/ppc64le
             qemu: true
-            image: quay.io/pypa/manylinux2014_ppc64le:2026.08.15-1
+            # manylinux_2_28 rather than manylinux2014: cryptography publishes
+            # its ppc64le wheel at manylinux_2_28 and up, so this row's floor
+            # is 2.28 (RHEL 8, Ubuntu 18.10, Debian 10) to carry it. The
+            # pip cache key includes the image name, so the source-built
+            # wheels never cross from the 2.17 image.
+            image: quay.io/pypa/manylinux_2_28_ppc64le:2026.08.15-1
             pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.14.7+20260814-ppc64le-unknown-linux-gnu-install_only.tar.gz'
             pysha: '5b9089861601ead3af0ab4c564cecd2c02b3e6cdf2eb4ef08e1caba98311a79f'
-            floor: '2.17'
+            floor: '2.28'
             archspec: elf:2:1:21    # 64-bit, little-endian, EM_PPC64
             nacl: soft
+            pq: hard   # manylinux_2_28_ppc64le wheel; see the image note above
             rust: '1'
             native: '0'
           - arch: s390x
@@ -808,12 +817,12 @@ jobs:
               # one would end it mid-comment. Only the rows declaring `pq`
               # install it, and those are the rows whose image has a matching
               # wheel: manylinux2014 on amd64/arm64, manylinux_2_31_armv7l on
-              # armv7. The other two go without for different reasons, so
-              # neither is worth revisiting: ppc64le has a wheel, but only at
-              # manylinux_2_28 and up, above the 2.17 floor this lane holds,
-              # and s390x has no cryptography wheel at any tag, so no image
-              # would give it one. hard wherever it is declared, because the
-              # wheel is always there and absence means a broken build;
+              # armv7, manylinux_2_28_ppc64le on ppc64le. s390x goes without:
+              # cryptography publishes no s390x wheel at any tag, and a source
+              # build would need Rust plus an OpenSSL 3.5 built from source
+              # inside the CentOS 7 image, all under QEMU. hard wherever it is
+              # declared, because the wheel is always there and absence means
+              # a broken build;
               # verify_extra.py then seals a real X-Wing probe, catching an
               # ML-KEM-less OpenSSL here rather than at the first pairing an
               # operator makes. A row without `pq` refuses xwing pairings
@@ -1682,14 +1691,24 @@ jobs:
             runner: macos-15          # macOS 15, Apple Silicon -- shipped
             ship: true
             asset: macos-arm64
-            # cryptography ships macosx_11_0_arm64 and nothing for x86_64,
-            # so post-quantum sealing is bundled on the Apple Silicon rows
-            # and left off the Intel ones.
+            # Every cryptography release ships macosx_11_0_arm64, so the
+            # Apple Silicon rows take the newest.
             pq: hard
           - arch: amd64
             runner: macos-15-intel    # macOS 15, Intel -- shipped
             ship: true
             asset: macos-amd64
+            # cryptography 49.0.0 dropped x86_64 macOS; 48.0.1 (2026-06-09)
+            # is the last release with a universal2 wheel, and its OpenSSL
+            # 4.0.1 seals ML-KEM. The Intel rows pin below 49 so the wheel
+            # resolves, which means these two binaries carry a cryptography
+            # that receives no further fixes. Bounded on purpose: the daemon
+            # uses it for one HPKE seal per alert and nothing else (no TLS,
+            # no parsing of untrusted input), so the exposure is the KEM and
+            # AEAD code paths, and the alternative is no post-quantum sealing
+            # on Intel Macs at all.
+            pq: hard
+            pqcap: ',<49'
           - arch: arm64
             runner: macos-26          # macOS 26 (Tahoe), Apple Silicon -- CI only
             ship: false
@@ -1699,6 +1718,8 @@ jobs:
             runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
             ship: false
             asset: macos26-amd64
+            pq: hard   # see the macOS 15 Intel row
+            pqcap: ',<49'
     runs-on: ${{ matrix.runner }}
     # The macOS 26 rows are coverage-only: never let them gate a release.
     continue-on-error: ${{ !matrix.ship }}
@@ -1741,14 +1762,14 @@ jobs:
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
           # Bundle cryptography (the `push-pq` extra) so the frozen daemon
-          # seals post-quantum X-Wing push. Only the arm64 rows declare `pq`:
-          # cryptography publishes macosx_11_0_arm64 and no x86_64 or
-          # universal2 wheel, so the Intel builds refuse xwing pairings
-          # (fail-closed; x25519 push still seals). hard where declared, and
-          # verify_extra.py seals a real X-Wing probe before freezing.
+          # seals post-quantum X-Wing push. Every row declares `pq`: the
+          # arm64 rows take the newest release, and the Intel rows cap at
+          # `pqcap` (below 49, the last line with a universal2 wheel; see the
+          # matrix). hard everywhere, and verify_extra.py seals a real X-Wing
+          # probe before freezing.
           if [ -n "${{ matrix.pq }}" ]; then
             PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-              sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
+              sh pyinstaller/install_extra.sh cryptography "cryptography>=48${{ matrix.pqcap }}" \
                 ${{ matrix.pq }} "post-quantum push not bundled"
           fi
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
@@ -2362,19 +2383,30 @@ jobs:
             pyarch: ''
             pfsuffix: ''
             regflag: /reg:64
-            # cryptography ships win_amd64 and nothing for win32 or
-            # win-arm64, so post-quantum sealing is bundled here only.
+            # Every cryptography release ships win_amd64, so this row takes
+            # the newest.
             pq: hard
           - arch: arm64
             runner: windows-11-arm
             pyarch: ''
             pfsuffix: ''
             regflag: /reg:64
+            # No `pq`: cryptography shipped win_arm64 wheels for 46.0.0
+            # through 46.0.3 only, before the release that added ML-KEM, and
+            # a source build here would need an OpenSSL 3.5 built for arm64
+            # Windows on the runner. This build refuses xwing pairings
+            # (fail-closed; x25519 push still seals).
           - arch: i686
             runner: windows-latest
             pyarch: x86
             pfsuffix: ' (x86)'
             regflag: /reg:32
+            # cryptography 49.0.0 dropped 32-bit Windows; 48.0.1 is the last
+            # release with a win32 wheel, on an OpenSSL that seals ML-KEM.
+            # Same pin and the same fixed-version tradeoff as the Intel
+            # macOS rows (see binaries-macos).
+            pq: hard
+            pqcap: ',<49'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -2423,14 +2455,14 @@ jobs:
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
           # Bundle cryptography (the `push-pq` extra) so the frozen daemon
-          # seals post-quantum X-Wing push. Only the amd64 row declares `pq`:
-          # cryptography publishes win_amd64 and nothing for win32 or
-          # win-arm64, so those two refuse xwing pairings (fail-closed; x25519
-          # push still seals). hard where declared, and verify_extra.py seals
-          # a real X-Wing probe before freezing.
+          # seals post-quantum X-Wing push. The amd64 and i686 rows declare
+          # `pq` (i686 capped by `pqcap` at the last release with a win32
+          # wheel); arm64 has no wheel to take (see the matrix) and refuses
+          # xwing pairings. hard where declared, and verify_extra.py seals a
+          # real X-Wing probe before freezing.
           if [ -n "${{ matrix.pq }}" ]; then
             PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-              sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
+              sh pyinstaller/install_extra.sh cryptography "cryptography>=48${{ matrix.pqcap }}" \
                 ${{ matrix.pq }} "post-quantum push not bundled"
           fi
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels

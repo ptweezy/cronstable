@@ -290,8 +290,9 @@ binaries for Linux (glibc and musl builds for `amd64`, `arm64`, `i686`,
 `mips64le` and `armel`), macOS (`amd64` and `arm64`, signed and notarized by
 Apple), FreeBSD (`amd64` and `arm64`), OpenBSD, NetBSD, illumos (`amd64`) and
 Windows (`amd64`, `arm64` and `i686`), plus `.deb`, `.rpm`, Alpine `.apk` and
-FreeBSD `.pkg` packages. The 64-bit glibc builds need only glibc 2.17, so they
-run on everything from RHEL 7 onward. Python is not required on the target
+FreeBSD `.pkg` packages. The `amd64`, `arm64` and `s390x` glibc builds need
+only glibc 2.17, so they run on everything from RHEL 7 onward; `ppc64le`
+needs 2.28 (RHEL 8 onward). Python is not required on the target
 system. It is embedded in the executable:
 
 ```shell

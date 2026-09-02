@@ -132,6 +132,33 @@ def resolve_cryptography(line, target):
     return line.split(";", 1)[0].strip()
 
 
+def marker_can_hold_on_linux(line):
+    """Whether a requirement's marker admits some Linux target at all.
+
+    pyproject splits cryptography across marker lines: one for Linux and
+    the other platforms that take the newest release, one capped for Intel
+    macOS and 32-bit Windows.  Only a line that can be true on Linux is
+    this script's to resolve; the other is another OS's and must not reach
+    an image with its marker stripped.  Probed as Linux x86_64 because the
+    split is by OS, and which Linux machines get the wheel is the table's
+    decision rather than the marker's.
+    """
+    if ";" not in line:
+        return True
+    try:
+        from packaging.markers import Marker
+    except ImportError:  # the image venv carries pip's vendored copy
+        from pip._vendor.packaging.markers import Marker
+    return Marker(line.split(";", 1)[1].strip()).evaluate(
+        {
+            "sys_platform": "linux",
+            "platform_system": "Linux",
+            "os_name": "posix",
+            "platform_machine": "x86_64",
+        }
+    )
+
+
 def requirement_name(line):
     """The distribution name at the head of a requirement line."""
     return re.split(r"[\s\[(<>=!~;]", line.strip(), maxsplit=1)[0].lower()
@@ -148,6 +175,8 @@ def main(pyproject_path):
     resolved = []
     for line in requirements:
         if requirement_name(line) == "cryptography":
+            if target is not None and not marker_can_hold_on_linux(line):
+                continue  # another OS's line; no image is built for it
             line = resolve_cryptography(line, target)
             if line is None:
                 sys.stdout.write(

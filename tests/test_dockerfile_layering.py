@@ -402,3 +402,25 @@ def test_cryptography_line_keeps_its_floor_and_loses_its_marker():
     # Off Linux there is no image to resolve for, so pip and the marker keep
     # the decision.
     assert module.resolve_cryptography(line, None) == line
+
+
+def test_another_platforms_cryptography_line_never_reaches_an_image():
+    # pyproject carries a second, capped cryptography line for Intel macOS
+    # and 32-bit Windows. Stripping its marker on a Linux image would pin
+    # the image below 49 for no reason, so the script must recognize it as
+    # another OS's line and drop it, and keep the Linux line as before.
+    module = _extract_deps_module()
+    capped = (
+        "cryptography>=48,<49; (sys_platform == 'darwin' and "
+        "platform_machine == 'x86_64') or (sys_platform == 'win32' and "
+        "platform_machine == 'x86')"
+    )
+    linux = (
+        "cryptography>=48; (sys_platform == 'linux' and "
+        "platform_machine == 'x86_64') or (sys_platform == 'darwin' and "
+        "platform_machine == 'arm64')"
+    )
+    assert not module.marker_can_hold_on_linux(capped)
+    assert module.marker_can_hold_on_linux(linux)
+    # A line with no marker is everyone's.
+    assert module.marker_can_hold_on_linux("cryptography>=48")

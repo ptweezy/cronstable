@@ -141,6 +141,16 @@ push = ["pynacl>=1.6.2"]
 # container images, whose docker/extract_deps.py resolves this line from
 # inside the target image rather than through the marker.
 #
+# Intel macOS and 32-bit Windows take a second line, capped: cryptography
+# 49.0.0 dropped both, and 48.0.1 (June 2026) is the last release with a
+# universal2 and a win32 wheel, built on an OpenSSL that seals ML-KEM.  The
+# cap is what makes the extra resolve there at all, and it is also the
+# cost: that cryptography receives no further fixes.  The daemon uses it
+# for one HPKE seal per alert and nothing else, which bounds the exposure
+# to the KEM and AEAD code paths, and an environment that needs a newer
+# cryptography for something else can install `push` instead and stay on
+# x25519.
+#
 # One residual rides along, because no PEP 508 marker can express it:
 # `platform_machine` is the raw `uname -m`, which reports the KERNEL.  A
 # 32-bit userland on a 64-bit kernel therefore passes the marker, pip
@@ -148,10 +158,14 @@ push = ["pynacl>=1.6.2"]
 # building the sdist for want of Rust.  Install under `linux32` there
 # (`linux32 pip install "cronstable[push-pq]"`), which makes uname report
 # the 32-bit machine so the marker excludes cryptography and the install
-# lands PyNaCl alone.
+# lands PyNaCl alone.  Windows has the same shape with no `linux32`: a
+# 32-bit Python on 64-bit Windows reports `AMD64`, takes the uncapped
+# line, and finds no win32 wheel past 48.0.1.  Install `push` plus
+# `cryptography>=48,<49` by hand there.
 push-pq = [
     "pynacl>=1.6.2",
     "cryptography>=48; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "cryptography>=48,<49; (sys_platform == 'darwin' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'x86')",
 ]
 # Zero-config LAN discovery (the opt-in `web.bonjour` mDNS advert; see
 # cronstable.discovery). Same fail-closed contract: web.bonjour without this
@@ -159,10 +173,12 @@ push-pq = [
 discovery = ["zeroconf>=0.149.16"]
 dev = [
     # the cluster mTLS tests mint throwaway certs with it, and the X-Wing
-    # sealing tests need its HPKE module (>=48). Same wheel allowlist as the
-    # push-pq extra above; see requirements_dev.txt for what the tests do
-    # where it resolves to nothing.
+    # sealing tests need its HPKE module (>=48). Same two lines as the
+    # push-pq extra above (the second is the capped Intel macOS and 32-bit
+    # Windows line); see requirements_dev.txt for what the tests do where
+    # they resolve to nothing.
     "cryptography>=48; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "cryptography>=48,<49; (sys_platform == 'darwin' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'x86')",
     # The optional-extra deps the tests must really exercise (orjson, pynacl,
     # zeroconf); requirements_dev.txt documents why each is here.  Without
     # them a `pip install -e .[dev]` + `pytest` checkout runs the suite in

@@ -35,8 +35,8 @@ post-quantum sealing reaches only the platforms with a wheel:
 
 | How you run cronstable | Post-quantum sealing |
 | --- | --- |
-| `pip install "cronstable[push-pq]"` | Linux x86_64 and aarch64, macOS Apple Silicon, and Windows x64 |
-| Release binary | `linux-amd64`, `linux-arm64`, `linux-armv7`, `linux-amd64-musl`, `linux-arm64-musl`, `macos-arm64`, `windows-amd64` |
+| `pip install "cronstable[push-pq]"` | Linux x86_64 and aarch64, macOS (Apple Silicon and Intel), and Windows x64 and 32-bit x86 |
+| Release binary | `linux-amd64`, `linux-arm64`, `linux-armv7`, `linux-ppc64le`, `linux-amd64-musl`, `linux-arm64-musl`, `macos-arm64`, `macos-amd64`, `windows-amd64`, `windows-i686` |
 | Docker image | `linux/amd64` and `linux/arm64` on every tag; `linux/arm/v7` and `linux/ppc64le` on the glibc tags that build them (every tag except `-alpine`) |
 
 Everywhere else, `push-pq` installs PyNaCl alone and the daemon seals
@@ -44,6 +44,18 @@ Everywhere else, `push-pq` installs PyNaCl alone and the daemon seals
 can seal at start-up. If you asked for post-quantum sealing and did not get
 it, that line says so. To ask a binary directly, run
 `cronstable --sealable-suites`, which prints one suite per line.
+
+Intel macOS and 32-bit Windows run on `cryptography` 48.x. Release 49.0.0
+dropped both platforms, so 48.0.1 (June 2026) is the last release with a
+wheel for them, and its bundled OpenSSL seals ML-KEM. The `push-pq` extra
+and the `macos-amd64` and `windows-i686` binaries pin below 49 there, which
+means that copy of `cryptography` receives no further fixes. The daemon
+uses it for one HPKE seal per alert and nothing else, so the exposure is the
+KEM and AEAD code paths. An environment that needs a newer `cryptography`
+for another package can install `push` instead and stay on `x25519`. A
+32-bit Python on 64-bit Windows reports the 64-bit machine, so the extra
+takes the uncapped line there and finds no wheel; install `push` plus
+`cryptography>=48,<49` by hand on such a host.
 
 The pip route stops at two Linux architectures because a dependency marker
 cannot see which libc you are on, and `cryptography` publishes `ppc64le` and

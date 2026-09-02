@@ -17,6 +17,11 @@
   `xwing` alert carries a shorter log tail. A daemon without the library
   refuses `xwing` pairings, `x25519` pairings are unchanged, and the wire
   construction is normative in `docs/relay-protocol.md`.
+- The `push-pq` extra and the release binaries carry post-quantum sealing on
+  every platform `cryptography` publishes a wheel for. Intel macOS and
+  32-bit Windows take `cryptography` 48.x, the last release line with a
+  wheel for them, and the `linux-ppc64le` binary now needs glibc 2.28
+  (RHEL 8 onward) rather than 2.17, the floor of the only ppc64le wheel.
 - A daemon event alert whose subject or message is empty leaves that field
   out of the sealed plaintext instead of sending it as `null`, which is what
   the relay protocol's field contract specifies.

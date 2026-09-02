@@ -3,16 +3,19 @@
 # its HPKE module (stock wheels carry working ML-KEM from 48, hence the
 # floor). It publishes wheels for a subset of the platforms cronstable
 # targets, and a CI runner off that list has neither the Rust toolchain nor
-# the OpenSSL headers to build the sdist, so the marker is the same wheel
-# list the push-pq extra carries: Linux x86_64/aarch64, macOS arm64, Windows
-# amd64. Both test arms importorskip it, so the win-arm64 and Intel-mac cells
-# self-skip those tests and every other cell keeps full coverage.
+# the OpenSSL headers to build the sdist, so the markers are the same two
+# lines the push-pq extra carries: Linux x86_64/aarch64, macOS arm64 and
+# Windows amd64 take the newest release; Intel macOS and 32-bit Windows take
+# 48.x, the last line with a wheel for them (pyproject.toml says why the cap
+# is acceptable). Both test arms importorskip it, so the win-arm64 cell
+# self-skips those tests and every other cell keeps full coverage.
 #
 # `platform_machine` is the raw `uname -m`, so a 32-bit userland on a 64-bit
 # kernel passes this marker, finds no i686 wheel, and fails the sdist build
 # for want of Rust. Use `linux32 pip install -r requirements_dev.txt` there:
 # uname reports 32-bit, dropping cryptography so both test arms self-skip.
 cryptography>=48; (sys_platform == "linux" and (platform_machine == "x86_64" or platform_machine == "aarch64")) or (sys_platform == "darwin" and platform_machine == "arm64") or (sys_platform == "win32" and platform_machine == "AMD64")
+cryptography>=48,<49; (sys_platform == "darwin" and platform_machine == "x86_64") or (sys_platform == "win32" and platform_machine == "x86")
 # orjson is the optional `speedups` extra, but the tests that cover the
 # accelerated durable-state/gossip JSON paths are worthless if no CI cell ever
 # installs it: they were importorskip-guarded and therefore skipped in all 12
