@@ -858,9 +858,10 @@ jobs:
                     if [ ! -x /opt/cargo/bin/cargo ]; then
                       sh -c "$RUST_SETUP_CMD"
                     fi
-                    # OpenSSL Configure needs perl IPC::Cmd, which CentOS 7
-                    # packages apart from perl and the image leaves out.
-                    perl -MIPC::Cmd -e 1 2>/dev/null || retry 5 yum install -y perl-IPC-Cmd
+                    # OpenSSL Configure needs perl IPC::Cmd and its generated
+                    # Makefile Time::Piece; CentOS 7 packages both apart from
+                    # perl and the image leaves them out.
+                    perl -MIPC::Cmd -MTime::Piece -e 1 2>/dev/null || retry 5 yum install -y perl-IPC-Cmd perl-Time-Piece
                     sh pyinstaller/build_openssl.sh /src/.openssl-${{ matrix.arch }}
                   } || pq_ready=0
                   PATH=/opt/cargo/bin:$PATH
@@ -3025,9 +3026,10 @@ jobs:
           # fresh shell that inherits no function, so every string sources
           # retry.sh for itself, as RUST_SETUP_CMD does. The manylinux row
           # has no usable distro OpenSSL or Rust and takes the from-source
-          # route; what it installs is the one perl module OpenSSL's
-          # Configure needs that the image leaves out.
-          PQ_TOOLS: ${{ matrix.libc == 'musl' && '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && '. /src/.github/scripts/retry.sh && retry 5 yum install -y perl-IPC-Cmd' || '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev pkg-config' }}
+          # route; what it installs is the two perl modules OpenSSL's
+          # Configure and its generated Makefile need that the image
+          # leaves out.
+          PQ_TOOLS: ${{ matrix.libc == 'musl' && '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && '. /src/.github/scripts/retry.sh && retry 5 yum install -y perl-IPC-Cmd perl-Time-Piece' || '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev zlib1g-dev libzstd-dev pkg-config' }}
           RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
           # The probe below installs the project, whose version comes from
           # this rather than from git: the python images carry no git, and
@@ -3067,10 +3069,17 @@ jobs:
                 export OPENSSL_DIR
               else
                 PY=python
-                # Debian keeps them in the multiarch library directory.
+                # Debian keeps them in the multiarch library directory, and
+                # builds libcrypto with zlib and zstd compression, so its
+                # archive needs both at link time. openssl-sys names
+                # neither, so RUSTFLAGS adds them as shared libraries (the
+                # two -dev packages in PQ_TOOLS supply the link names).
+                # Every consumer of these wheels is a Debian-family image,
+                # where dpkg and Python already need both.
                 OPENSSL_LIB_DIR=/usr/lib/$(gcc -print-multiarch)
                 OPENSSL_INCLUDE_DIR=/usr/include
-                export OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR
+                RUSTFLAGS="-C link-arg=-lz -C link-arg=-lzstd"
+                export OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR RUSTFLAGS
               fi
               # Static on every row, with the archives named outright: left
               # to pkg-config, openssl-sys never links an archive that lives
@@ -3091,8 +3100,11 @@ jobs:
               $PY -m pip install .
               $PY pyinstaller/verify_extra.py cryptography
               # And prove the link: an extension that still names libssl or
-              # libcrypto as a shared dependency is not self-contained.
+              # libcrypto as a shared dependency is not self-contained. The
+              # full NEEDED list goes to the log first, so what the wheel
+              # does ask of an image is on record.
               ext=$($PY -c "import cryptography.hazmat.bindings._rust as m; print(m.__file__)")
+              readelf -d "$ext" | grep NEEDED || true
               if readelf -d "$ext" | grep -E "NEEDED.*lib(ssl|crypto)"; then
                 echo "FAIL: the wheel links OpenSSL dynamically" >&2
                 exit 1

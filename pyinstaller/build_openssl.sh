@@ -17,9 +17,10 @@
 #
 # Usage: build_openssl.sh PREFIX
 #
-# Needs perl with IPC::Cmd (Configure imports it; RHEL-family distributions
-# package it apart from perl as perl-IPC-Cmd, and the manylinux images leave
-# it out), make, a C compiler, and curl or wget. No `set -e` around the
+# Needs perl with IPC::Cmd and Time::Piece (Configure and the Makefile it
+# generates import them; RHEL-family distributions package both apart from
+# perl, as perl-IPC-Cmd and perl-Time-Piece, and the manylinux images leave
+# them out), make, a C compiler, and curl or wget. No `set -e` around the
 # fetch: retry.sh handles the network hop when it is on hand.
 set -u
 
@@ -33,10 +34,11 @@ if [ -f "$prefix/lib/libcrypto.a" ]; then
     exit 0
 fi
 
-# Checked before the fetch so the failure names the module, rather than
-# surfacing as a perl compilation error from inside Configure.
-if ! perl -MIPC::Cmd -e 1 2>/dev/null; then
-    echo "build_openssl.sh: perl lacks IPC::Cmd (perl-IPC-Cmd on RHEL-likes)" >&2
+# The check runs before the fetch so a failure names the modules instead
+# of surfacing as a perl compilation error inside Configure.
+if ! perl -MIPC::Cmd -MTime::Piece -e 1 2>/dev/null; then
+    echo "build_openssl.sh: perl lacks IPC::Cmd or Time::Piece" \
+        "(perl-IPC-Cmd and perl-Time-Piece on RHEL-likes)" >&2
     exit 1
 fi
 
@@ -76,8 +78,8 @@ cd "openssl-$VERSION" || exit 1
 # docker --platform a 32-bit userland on a 64-bit host still says x86_64
 # or aarch64, and config then chooses a target the 32-bit toolchain cannot
 # build (on x86_64 it takes the 32-bit compiler for the x32 ABI). The
-# compiler knows what it emits, so where the two disagree the target is
-# named outright; everywhere else config's own guess stands.
+# compiler knows what it emits, so where the two disagree this script
+# names the target itself; everywhere else config's own guess stands.
 target=
 case "$(uname -m)" in
     x86_64)
