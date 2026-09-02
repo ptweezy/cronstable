@@ -17,6 +17,9 @@
   `xwing` alert carries a shorter log tail. A daemon without the library
   refuses `xwing` pairings, `x25519` pairings are unchanged, and the wire
   construction is normative in `docs/relay-protocol.md`.
+- A daemon event alert whose subject or message is empty leaves that field
+  out of the sealed plaintext instead of sending it as `null`, which is what
+  the relay protocol's field contract specifies.
 
 ## 1.2.49
 

@@ -37,7 +37,7 @@ post-quantum sealing reaches only the platforms with a wheel:
 | --- | --- |
 | `pip install "cronstable[push-pq]"` | Linux x86_64 and aarch64, macOS Apple Silicon, and Windows x64 |
 | Release binary | `linux-amd64`, `linux-arm64`, `linux-armv7`, `linux-amd64-musl`, `linux-arm64-musl`, `macos-arm64`, `windows-amd64` |
-| Docker image | `linux/amd64` and `linux/arm64` |
+| Docker image | `linux/amd64` and `linux/arm64` on every tag; `linux/arm/v7` and `linux/ppc64le` on the glibc tags that build them (every tag except `-alpine`) |
 
 Everywhere else, `push-pq` installs PyNaCl alone and the daemon seals
 `x25519` only, which works on every platform. The daemon logs the suites it
@@ -49,7 +49,11 @@ The pip route stops at two Linux architectures because a dependency marker
 cannot see which libc you are on, and `cryptography` publishes `ppc64le` and
 `armv7l` wheels for glibc but not for musl. Each release binary is built
 against a known libc, so the `armv7` build reaches one architecture past pip
-on the same hardware.
+on the same hardware. The Docker images resolve the dependency from inside
+the target image, where the libc is known, so the glibc images reach both
+architectures. Every image build proves the result the same way the
+binaries do, by running `cronstable --sealable-suites` and requiring
+`xwing` wherever `cryptography` was installed.
 
 Install `push-pq` on every node that shares a device registry. The pairing is
 stored once and read by all of them, while the library is per node, so a node
@@ -212,6 +216,28 @@ offers a one-tap upgrade: it registers the device's X-Wing key as a new
 record, then revokes the superseded one. The wire construction is
 normative in the
 [relay protocol](https://github.com/ptweezy/cronstable/blob/main/docs/relay-protocol.md#xwing-construction).
+
+The app also moves a pairing the other way, on its own. An `xwing` pairing
+outlives the daemon's ability to seal it whenever the daemon loses
+`cryptography`: a reinstall without the `push-pq` extra, a move onto an
+image or a binary with no wheel for that platform, or a cluster node that
+never had it. Every alert to that device is then dropped at sealing, and
+the re-pair the app sends on each push-token rotation answers `400` for as
+long as that lasts. When `sealableSuites` omits the pairing's suite on two
+checks in a row, the app re-pairs under `x25519`, which every daemon seals,
+and revokes the stranded record. The pairing screen shows the same state
+with a manual switch, and offers the post-quantum upgrade again once the
+daemon advertises `xwing`.
+
+The heal trades sealing strength for delivery on purpose. The daemon's
+advertisement is authenticated only by the transport, so a party who can
+rewrite two `GET /whoami` answers can move a pairing from `xwing` down to
+`x25519`. On a transport that allows that, the same party can already read
+the bearer token and substitute the key at pairing (see
+[pair over a trusted transport](#pair-over-a-trusted-transport-then-compare-fingerprints)).
+On a cluster where only some nodes carry `cryptography`, the heal and the
+upgrade offer alternate as requests land on different nodes, which is one
+more reason to install `push-pq` on every node that shares a registry.
 
 Re-pairing the same public key (push tokens rotate; phones get renamed)
 answers `200` with `created: false` and updates `name`/`platform`/`pushToken`

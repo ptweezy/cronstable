@@ -77,10 +77,11 @@ RUN set -eux; \
 # PyNaCl has wheels on amd64/arm64 and source-builds its bundled libsodium
 # on ppc64le/s390x (hence make + libffi-devel in the toolchain). Verify with
 # a real sealed-box round-trip plus a zeroconf import; a failure fails the
-# build. cryptography carries the post-quantum `xwing` suite behind an
-# environment marker, so it is checked only where it resolved, and by its
-# HPKE module rather than by sealing: these images take a PyPI wheel with
-# its own OpenSSL, so a too-old release is the failure worth catching.
+# build. cryptography carries the post-quantum `xwing` suite and is present
+# only where docker/extract_deps.py resolved it, so it is checked only
+# there, and here only for age: a release too old to carry the HPKE module.
+# Whether it really seals is proved after the project install below, by the
+# daemon's own `--sealable-suites`.
 RUN /opt/venv/bin/python -c 'from nacl.public import PrivateKey, SealedBox; k = PrivateKey.generate(); m = b"cronstable push self-test"; assert SealedBox(k).decrypt(SealedBox(k.public_key).encrypt(m)) == m; import importlib.util as u; assert u.find_spec("cryptography") is None or u.find_spec("cryptography.hazmat.primitives.hpke") is not None, "cryptography is too old to seal xwing"; import zeroconf, zeroconf.asyncio; print("push-pq and discovery extras verified")'
 
 # Best-effort orjson (the `speedups` extra) for the durable-state / cluster
@@ -117,6 +118,20 @@ RUN set -eux; \
     /tmp/deps/buildenv/bin/pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/deps/wheelhouse .; \
     /opt/venv/bin/pip install --no-cache-dir --no-deps /tmp/deps/wheelhouse/cronstable-*.whl; \
     /opt/venv/bin/pip check
+
+# Prove the installed daemon seals `xwing` wherever the dependency layer
+# resolved cryptography. The extras check above proves only that the HPKE
+# module is findable; a wheel whose bundled OpenSSL lacks ML-KEM passes
+# that and fails at the first pairing. `--sealable-suites` seals one real
+# probe through the daemon's own path, the same gate the release binaries
+# pass on the frozen artifact. An image the helper resolved without
+# cryptography seals x25519 only and skips this.
+RUN set -eux; \
+    if /opt/venv/bin/python -c 'import cryptography' 2>/dev/null; then \
+        suites=$(/opt/venv/bin/python -m cronstable --sealable-suites); \
+        echo "sealable suites: $suites"; \
+        echo "$suites" | grep -qx xwing; \
+    fi
 
 # Drop pip from the venv before it ships. The runtime image installs nothing
 # (no package manager, read-only root filesystem), so pip and its vendored
