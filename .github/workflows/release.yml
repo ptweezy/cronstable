@@ -663,6 +663,15 @@ jobs:
             floor: '2.17'
             archspec: elf:2:2:22    # 64-bit, BIG-endian, EM_S390
             nacl: soft
+            # No cryptography wheel exists for s390x at any tag, so this row
+            # builds it from source: the rustup Rust it already has for
+            # orjson, plus an OpenSSL 3.5 built from source (CentOS 7 ships
+            # 1.0.2, and ML-KEM needs 3.5) into the workspace, where the
+            # cache steps below keep it across runs. soft, like every other
+            # source build under QEMU here: verify_extra.py seals a real
+            # X-Wing probe and drops a build that cannot.
+            pq: soft
+            pq_src: '1'
             rust: '1'
             native: '0'
           - arch: armv7
@@ -715,6 +724,18 @@ jobs:
           key: pip-manylinux-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
           restore-keys: |
             pip-manylinux-${{ matrix.arch }}-
+      # The static OpenSSL the pq_src row builds for cryptography (see
+      # build_openssl.sh): an hour under QEMU, so it is kept across runs.
+      # Keyed on the script, which pins the OpenSSL version, and on the
+      # image, whose toolchain produced the objects. Saved trunk-only like
+      # the pip cache above, and for the same quota reason.
+      - name: Restore the OpenSSL build (pq_src rows)
+        if: ${{ matrix.pq_src }}
+        id: openssl-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .openssl-${{ matrix.arch }}
+          key: openssl-manylinux-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
       - if: ${{ matrix.qemu }}
         uses: docker/setup-qemu-action@v4.2.0
       # Pulled in its own retried step, like every other container lane, so a
@@ -814,20 +835,32 @@ jobs:
               # Bundle cryptography (the `push-pq` extra) so the frozen daemon
               # seals post-quantum X-Wing push. NO APOSTROPHES BELOW: this
               # whole script is the argument of a single-quoted sh -euc, so
-              # one would end it mid-comment. Only the rows declaring `pq`
-              # install it, and those are the rows whose image has a matching
-              # wheel: manylinux2014 on amd64/arm64, manylinux_2_31_armv7l on
-              # armv7, manylinux_2_28_ppc64le on ppc64le. s390x goes without:
-              # cryptography publishes no s390x wheel at any tag, and a source
-              # build would need Rust plus an OpenSSL 3.5 built from source
-              # inside the CentOS 7 image, all under QEMU. hard wherever it is
-              # declared, because the wheel is always there and absence means
-              # a broken build;
-              # verify_extra.py then seals a real X-Wing probe, catching an
-              # ML-KEM-less OpenSSL here rather than at the first pairing an
-              # operator makes. A row without `pq` refuses xwing pairings
-              # (fail-closed; x25519 push still seals).
+              # one would end it mid-comment. Every row declares `pq`. Where
+              # a wheel matches the image (manylinux2014 on amd64/arm64,
+              # manylinux_2_31_armv7l on armv7, manylinux_2_28_ppc64le on
+              # ppc64le) it is hard: the wheel is always there and absence
+              # means a broken build. s390x has no wheel at any tag and
+              # declares pq_src instead: a current Rust from rustup and an
+              # OpenSSL 3.5 built from source by build_openssl.sh into the
+              # bind-mounted workspace (the cache steps around this one keep
+              # it), both linked statically so the bundle carries no libssl,
+              # under the soft policy the other QEMU source builds here take.
+              # Either way verify_extra.py then seals a real X-Wing probe,
+              # catching an ML-KEM-less OpenSSL here rather than at the first
+              # pairing an operator makes.
               if [ -n "${{ matrix.pq }}" ]; then
+                if [ -n "${{ matrix.pq_src }}" ]; then
+                  if [ ! -x /opt/cargo/bin/cargo ]; then
+                    sh -c "$RUST_SETUP_CMD"
+                  fi
+                  sh pyinstaller/build_openssl.sh /src/.openssl-${{ matrix.arch }}
+                  PATH=/opt/cargo/bin:$PATH
+                  CARGO_HOME=/opt/cargo
+                  RUSTUP_HOME=/opt/rustup
+                  OPENSSL_DIR=/src/.openssl-${{ matrix.arch }}
+                  OPENSSL_STATIC=1
+                  export PATH CARGO_HOME RUSTUP_HOME OPENSSL_DIR OPENSSL_STATIC
+                fi
                 sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
                   ${{ matrix.pq }} "post-quantum push not bundled"
               fi
@@ -844,8 +877,11 @@ jobs:
               if $PY -c "import nacl" 2>/dev/null; then
                 dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
               fi
-              # Gate the FROZEN artifact too (see install_extra.sh header).
-              if [ -n "${{ matrix.pq }}" ]; then
+              # Gate the FROZEN artifact too (see install_extra.sh header):
+              # whenever the build env kept cryptography, the frozen bundle
+              # must seal xwing. On a soft row that dropped a broken source
+              # build there is nothing to gate, and the install log said so.
+              if $PY -c "import cryptography" 2>/dev/null; then
                 suites=$(dist/cronstable --sealable-suites)
                 echo "sealable suites: $suites"
                 echo "$suites" | grep -qx xwing || {
@@ -883,9 +919,11 @@ jobs:
       - name: Make the pip cache readable by the cache save
         run: |
           set -euo pipefail
-          if [ -d .pip-cache ]; then
-            sudo chown -R "$(id -u):$(id -g)" .pip-cache
-          fi
+          for d in .pip-cache .openssl-${{ matrix.arch }}; do
+            if [ -d "$d" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$d"
+            fi
+          done
       # Branch-gated like every other cache writer: the Actions cache is ONE
       # 10 GB pool per repository and is already over it, so writing from every
       # branch would evict the layer cache the docker job depends on. Other
@@ -896,6 +934,12 @@ jobs:
         with:
           path: .pip-cache
           key: pip-manylinux-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
+      - name: Save the OpenSSL build (pq_src rows, trunk only)
+        if: ${{ matrix.pq_src && steps.openssl-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .openssl-${{ matrix.arch }}
+          key: openssl-manylinux-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-linux-${{ matrix.arch }}
@@ -948,6 +992,12 @@ jobs:
             toolchain: 'retry 5 apk add --no-cache build-base libffi-dev zlib-dev'
             nacl_tools: 'retry 3 apk add --no-cache libffi-dev make >/dev/null 2>&1 || true'
             rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache curl && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+            # What a cryptography SOURCE build needs on the rows with no
+            # wheel (pq_src below): Alpine 3.23 ships rust 1.91 (the MSRV
+            # is 1.83) and OpenSSL 3.5 (ML-KEM needs 3.5) for all nine of
+            # its arches, static libs included, so the distro toolchain
+            # does the whole job with no rustup and no OpenSSL build.
+            pq_tools: 'retry 5 apk add --no-cache rust cargo openssl-dev openssl-libs-static pkgconf'
           - libc: glibc
             # Overridden per row below: the two remaining glibc rows sit on
             # different Debian suites, because bookworm has no riscv64 port
@@ -957,18 +1007,39 @@ jobs:
             toolchain: 'retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev'
             nacl_tools: 'retry 3 apt-get -o Acquire::Retries=5 install -y --no-install-recommends libffi-dev make >/dev/null 2>&1 || true'
             rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+            # The trixie counterpart of the musl pq_tools: rustc 1.85 and
+            # OpenSSL 3.5.7 on every port trixie ships, static libs in
+            # libssl-dev. Only the trixie row uses it (riscv64); the
+            # bookworm i686 row has OpenSSL 3.0 and rustc 1.63 and takes
+            # its own route below.
+            pq_tools: 'retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends rustc cargo libssl-dev pkg-config'
           # per-arch: docker platform, runner, and whether QEMU is needed
           # (amd64/arm64/i686 execute natively on the runners)
           - { arch: amd64, platform: linux/amd64, runner: ubuntu-24.04 }
           - { arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
           - { arch: i686, platform: linux/386, runner: ubuntu-24.04 }
-          # Post-quantum sealing rides the rows with a musllinux_1_2 wheel,
-          # which cryptography publishes for x86_64 and aarch64 only. Keyed on
-          # both libc and arch because the glibc twins of these two build in
-          # the manylinux `binaries` job instead, and the remaining rows here
-          # (i686, riscv64, and the musl arches below) have no wheel at all.
+          # Post-quantum sealing on every row. `pq: hard` where cryptography
+          # publishes a musllinux_1_2 wheel (x86_64 and aarch64): the wheel
+          # is always there, so absence is a broken build. `pq: soft` with
+          # `pq_src` everywhere else: cryptography compiles from its sdist
+          # with the distro Rust and OpenSSL that pq_tools installs, under
+          # QEMU on most of these rows, and takes the policy pynacl takes
+          # for its own source builds here: verify_extra.py seals a real
+          # X-Wing probe and uninstalls a build that cannot, so a
+          # miscompiled cryptography is never frozen in and the binary
+          # refuses xwing pairings instead (x25519 push still seals). The
+          # pip cache keeps the built wheel, so the compile is paid once
+          # per cryptography bump. Keyed on both libc and arch because the
+          # glibc twins of several arches build in the manylinux `binaries`
+          # job instead.
           - { libc: musl, arch: amd64, pq: hard }
           - { libc: musl, arch: arm64, pq: hard }
+          - { libc: musl, arch: i686, pq: soft, pq_src: '1' }
+          - { libc: musl, arch: armv7, pq: soft, pq_src: '1' }
+          - { libc: musl, arch: armv6, pq: soft, pq_src: '1' }
+          - { libc: musl, arch: ppc64le, pq: soft, pq_src: '1' }
+          - { libc: musl, arch: s390x, pq: soft, pq_src: '1' }
+          - { libc: musl, arch: riscv64, pq: soft, pq_src: '1' }
           # `armgate` is the ABI assertion elf_floor.py makes on 32-bit ARM,
           # which no functional test can make for itself: the float ABI, and
           # the newest instruction set anything in the bundle needs.
@@ -998,8 +1069,24 @@ jobs:
           # target, so the manylinux route the other arches take is closed
           # here. riscv64 stays on trixie, the first Debian release with the
           # port at all.
-          - { libc: glibc, arch: i686, image: python:3.14-slim-bookworm, floor: '2.36' }
-          - { libc: glibc, arch: riscv64, image: python:3.14-slim-trixie, floor: '2.41' }
+          - libc: glibc
+            arch: i686
+            image: python:3.14-slim-bookworm
+            floor: '2.36'
+            # bookworm has OpenSSL 3.0 and rustc 1.63, both short of what a
+            # cryptography source build needs (3.5 for ML-KEM, Rust 1.83),
+            # so this row overrides the glibc pq_tools with the build
+            # prerequisites alone and takes pq_openssl: a rustup Rust plus
+            # an OpenSSL 3.5 built from source (build_openssl.sh). Native
+            # rather than emulated, so that build is minutes, and not
+            # cached. rustup is told the host explicitly: uname inside a
+            # linux/386 container can still say x86_64.
+            pq: soft
+            pq_src: '1'
+            pq_openssl: '1'
+            pq_tools: 'retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates perl make pkg-config'
+            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --default-host i686-unknown-linux-gnu --profile minimal --no-modify-path'
+          - { libc: glibc, arch: riscv64, image: python:3.14-slim-trixie, floor: '2.41', pq: soft, pq_src: '1' }
     runs-on: ${{ matrix.runner }}
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
@@ -1116,16 +1203,32 @@ jobs:
               ${{ matrix.nacl_tools }}
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
               # Bundle cryptography (the `push-pq` extra) so the frozen daemon
-              # seals post-quantum X-Wing push. Only the rows declaring `pq`
-              # install it: cryptography publishes musllinux_1_2 for x86_64 and
-              # aarch64 and nothing this lane could use elsewhere, so the rest
-              # refuse xwing pairings (fail-closed; x25519 push still seals).
-              # hard rather than the soft policy pynacl takes, because
-              # pynacl source-builds here while cryptography takes a wheel
-              # or nothing (and no apostrophes: single-quoted sh -euc);
-              # verify_extra.py then seals a real X-Wing probe before the
-              # bundle is frozen.
+              # seals post-quantum X-Wing push. The wheel rows take it hard;
+              # the pq_src rows first install the distro Rust and OpenSSL
+              # (pq_tools) and let pip build the sdist, statically linked so
+              # the bundle carries no libssl of its own, under the soft
+              # policy the matrix explains (and no apostrophes: single-quoted
+              # sh -euc). Either way verify_extra.py seals a real X-Wing
+              # probe before the bundle is frozen.
               if [ -n "${{ matrix.pq }}" ]; then
+                if [ -n "${{ matrix.pq_src }}" ]; then
+                  ${{ matrix.pq_tools }}
+                  export OPENSSL_STATIC=1
+                fi
+                # The bookworm row (see its matrix entry): the distro has
+                # neither the Rust nor the OpenSSL the build needs, so both
+                # come from outside it.
+                if [ -n "${{ matrix.pq_openssl }}" ]; then
+                  if [ ! -x /opt/cargo/bin/cargo ]; then
+                    sh -c "${{ matrix.rust_setup }}"
+                  fi
+                  sh pyinstaller/build_openssl.sh /opt/openssl
+                  PATH=/opt/cargo/bin:$PATH
+                  CARGO_HOME=/opt/cargo
+                  RUSTUP_HOME=/opt/rustup
+                  OPENSSL_DIR=/opt/openssl
+                  export PATH CARGO_HOME RUSTUP_HOME OPENSSL_DIR
+                fi
                 sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
                   ${{ matrix.pq }} "post-quantum push not bundled"
               fi
@@ -1143,8 +1246,11 @@ jobs:
               if python -c "import nacl" 2>/dev/null; then
                 dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
               fi
-              # Gate the FROZEN artifact too (see install_extra.sh header).
-              if [ -n "${{ matrix.pq }}" ]; then
+              # Gate the FROZEN artifact too (see install_extra.sh header):
+              # whenever the build env kept cryptography, the frozen bundle
+              # must seal xwing. On a soft row that dropped a broken source
+              # build there is nothing to gate, and the install log said so.
+              if python -c "import cryptography" 2>/dev/null; then
                 suites=$(dist/cronstable --sealable-suites)
                 echo "sealable suites: $suites"
                 echo "$suites" | grep -qx xwing || {
@@ -1580,6 +1686,9 @@ jobs:
             image: ghcr.io/loong64/python:3.14-slim-trixie
             toolchain: 'retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev curl ca-certificates'
             rust_setup: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+            # What the cryptography source build needs beyond the rustup
+            # Rust: trixie's OpenSSL 3.5 headers and static libs.
+            pq_tools: 'retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends libssl-dev pkg-config'
             floor: '2.41'
           - libc: musl
             suffix: -musl
@@ -1589,6 +1698,9 @@ jobs:
             image: ghcr.io/loong64/alpine:3.24.1
             toolchain: 'retry 5 apk add --no-cache build-base libffi-dev zlib-dev python3 python3-dev py3-pip curl'
             rust_setup: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+            # Alpine 3.24's OpenSSL 3.5 headers and static libs, for the
+            # same source build.
+            pq_tools: 'retry 5 apk add --no-cache openssl-dev openssl-libs-static pkgconf'
             floor: ''
     runs-on: ubuntu-24.04
     # Emulated LoongArch compiles the whole dependency stack plus a bootloader.
@@ -1648,6 +1760,19 @@ jobs:
               sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
               RUST_SETUP="${{ matrix.rust_setup }}" sh pyinstaller/install_orjson.sh
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              # Bundle cryptography (the `push-pq` extra): no loong64 wheel
+              # exists, so it builds from its sdist against the distro
+              # OpenSSL 3.5 (pq_tools) with the rustup Rust the orjson step
+              # installed (fetched here if that step never got to it),
+              # linked statically so the bundle carries no libssl. Soft like
+              # the other compiled extras on this lane: verify_extra.py seals
+              # a real X-Wing probe and drops a build that cannot.
+              ${{ matrix.pq_tools }}
+              if [ ! -x /opt/cargo/bin/cargo ]; then
+                sh -c "${{ matrix.rust_setup }}"
+              fi
+              PATH=/opt/cargo/bin:$PATH CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup OPENSSL_STATIC=1 \
+                sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
               sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version          # smoke test, emulated on its own libc
@@ -1656,6 +1781,16 @@ jobs:
               # validates only when both import inside the bundle.
               if python3 -c "import nacl" 2>/dev/null; then
                 dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+              fi
+              # And whenever it kept cryptography, the frozen bundle must
+              # seal xwing (see install_extra.sh header).
+              if python3 -c "import cryptography" 2>/dev/null; then
+                suites=$(dist/cronstable --sealable-suites)
+                echo "sealable suites: $suites"
+                echo "$suites" | grep -qx xwing || {
+                  echo "FAIL: the frozen binary cannot seal xwing" >&2
+                  exit 1
+                }
               fi
               # cli_job_smoke.sh is deliberately not run here: it needs a
               # daemon, loopback HTTP and curl, and this row is emulated. The
@@ -2093,7 +2228,7 @@ jobs:
           # Only NAMED host variables cross into the guest.
           envs: 'SETUPTOOLS_SCM_PRETEND_VERSION'
           prepare: |
-            pkg_add -I python%3.13 py3-pip libsodium py3-psutil py3-multidict py3-yarl py3-propcache py3-aiohappyeyeballs py3-jinja2 py3-uvloop
+            pkg_add -I python%3.13 py3-pip libsodium py3-psutil py3-multidict py3-yarl py3-propcache py3-aiohappyeyeballs py3-jinja2 py3-uvloop rust openssl%3.5
           run: |
             set -eu
 
@@ -2139,6 +2274,18 @@ jobs:
             export CFLAGS LDFLAGS
             SODIUM_INSTALL=system \
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+            # Bundle cryptography (the `push-pq` extra) from its sdist: no
+            # OpenBSD wheel exists. The base LibreSSL is no use to it (its
+            # ML-KEM compiles only against OpenSSL 3.5 or newer), so the
+            # openssl%3.5 port installed above is the library, at the
+            # side-by-side paths OpenBSD gives an alternate OpenSSL, and the
+            # port rust (1.94, past the 1.83 MSRV) is the compiler. Static so
+            # the bundle carries no libssl of its own. Soft, like pynacl:
+            # verify_extra.py seals a real X-Wing probe and drops a build
+            # that cannot.
+            OPENSSL_INCLUDE_DIR=/usr/local/include/eopenssl35 \
+              OPENSSL_LIB_DIR=/usr/local/lib/eopenssl35 OPENSSL_STATIC=1 \
+              sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
             # Bundle zeroconf (the `discovery` extra): pure Python with
             # optional speedups, so a HARD install here too. LGPL-2.1; the
             # in-binary notice, Release source archive and public build recipe
@@ -2152,6 +2299,16 @@ jobs:
             # only when both import inside the bundle.
             if $PY -c "import nacl" 2>/dev/null; then
               dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+            fi
+            # And whenever it kept cryptography, the frozen bundle must seal
+            # xwing (see install_extra.sh header).
+            if $PY -c "import cryptography" 2>/dev/null; then
+              suites=$(dist/cronstable --sealable-suites)
+              echo "sealable suites: $suites"
+              echo "$suites" | grep -qx xwing || {
+                echo "FAIL: the frozen binary cannot seal xwing" >&2
+                exit 1
+              }
             fi
             # cli_job_smoke.sh is deliberately not run here: it needs bash,
             # curl and a live daemon, none of which this lean VM carries. The
@@ -2201,7 +2358,7 @@ jobs:
           # pkgin is not in NetBSD base and is not on this image; pkg_add from
           # base is the package manager here, with PKG_PATH already set.
           prepare: |
-            /usr/sbin/pkg_add python313 libsodium py313-psutil py313-multidict py313-yarl py313-propcache py313-aiohappyeyeballs py313-jinja2 py313-uvloop py313-orjson
+            /usr/sbin/pkg_add python313 libsodium py313-psutil py313-multidict py313-yarl py313-propcache py313-aiohappyeyeballs py313-jinja2 py313-uvloop py313-orjson rust openssl
           run: |
             set -eu
             . .github/scripts/retry.sh
@@ -2244,6 +2401,15 @@ jobs:
             # closed rather than shipping a miscompiled libsodium.
             SODIUM_INSTALL=system \
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+            # Bundle cryptography (the `push-pq` extra) from its sdist: no
+            # NetBSD wheel exists. pkgsrc's openssl (3.6, past the 3.5 that
+            # ML-KEM needs) and rust (past the 1.83 MSRV), both installed
+            # above under /usr/pkg, are the library and the compiler. Static
+            # so the bundle carries no libssl of its own. Soft, like pynacl:
+            # verify_extra.py seals a real X-Wing probe and drops a build
+            # that cannot.
+            OPENSSL_DIR=/usr/pkg OPENSSL_STATIC=1 \
+              sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
             # Bundle zeroconf (the `discovery` extra): pure Python with
             # optional speedups, so a HARD install. LGPL-2.1; see LICENSING.md.
             sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
@@ -2252,6 +2418,16 @@ jobs:
             dist/cronstable --version           # smoke test: fails the job if the bundle is broken
             if $PY -c "import nacl" 2>/dev/null; then
               dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+            fi
+            # And whenever the build env kept cryptography, the frozen bundle
+            # must seal xwing (see install_extra.sh header).
+            if $PY -c "import cryptography" 2>/dev/null; then
+              suites=$(dist/cronstable --sealable-suites)
+              echo "sealable suites: $suites"
+              echo "$suites" | grep -qx xwing || {
+                echo "FAIL: the frozen binary cannot seal xwing" >&2
+                exit 1
+              }
             fi
             # 64-bit, little-endian, EM_X86_64.
             $PY .github/scripts/assert_arch.py dist/cronstable elf:2:1:62
@@ -2391,11 +2567,15 @@ jobs:
             pyarch: ''
             pfsuffix: ''
             regflag: /reg:64
-            # No `pq`: cryptography shipped win_arm64 wheels for 46.0.0
-            # through 46.0.3 only, before the release that added ML-KEM, and
-            # a source build here would need an OpenSSL 3.5 built for arm64
-            # Windows on the runner. This build refuses xwing pairings
-            # (fail-closed; x25519 push still seals).
+            # cryptography shipped win_arm64 wheels for 46.0.0 through 46.0.3
+            # only, before the release that added ML-KEM, so this row builds
+            # from source (pq_src): a rustup Rust for aarch64-pc-windows-msvc
+            # and a static OpenSSL from the runner's vcpkg. soft, because
+            # both come from outside the wheel index: verify_extra.py seals a
+            # real X-Wing probe and drops a build that cannot, and the binary
+            # then refuses xwing pairings (x25519 push still seals).
+            pq: soft
+            pq_src: '1'
           - arch: i686
             runner: windows-latest
             pyarch: x86
@@ -2455,12 +2635,32 @@ jobs:
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
           # Bundle cryptography (the `push-pq` extra) so the frozen daemon
-          # seals post-quantum X-Wing push. The amd64 and i686 rows declare
-          # `pq` (i686 capped by `pqcap` at the last release with a win32
-          # wheel); arm64 has no wheel to take (see the matrix) and refuses
-          # xwing pairings. hard where declared, and verify_extra.py seals a
-          # real X-Wing probe before freezing.
+          # seals post-quantum X-Wing push. amd64 and i686 take a wheel
+          # (i686 capped by `pqcap` at the last release with a win32 wheel);
+          # arm64 has none and builds from source (pq_src, see the matrix).
+          # Either way verify_extra.py seals a real X-Wing probe before
+          # freezing.
           if [ -n "${{ matrix.pq }}" ]; then
+            if [ -n "${{ matrix.pq_src }}" ]; then
+              # A current Rust for this host. The arm64 image does not
+              # promise one, so rustup-init is fetched when cargo is absent.
+              if ! command -v cargo >/dev/null 2>&1; then
+                curl --proto '=https' --tlsv1.2 -sSfo rustup-init.exe \
+                  https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe
+                ./rustup-init.exe -y --profile minimal --default-toolchain stable
+                export PATH="$USERPROFILE/.cargo/bin:$PATH"
+              fi
+              # A static OpenSSL 3.5+ from the runner's vcpkg, brought to
+              # the current port set first: the checkout an image carries can
+              # predate the OpenSSL release ML-KEM needs, and the probe below
+              # would then drop a build that compiled fine. vcpkg fetches its
+              # own perl, so no toolchain beyond MSVC is assumed.
+              git -C "$VCPKG_INSTALLATION_ROOT" pull --ff-only
+              "$VCPKG_INSTALLATION_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+              "$VCPKG_INSTALLATION_ROOT/vcpkg" install openssl:arm64-windows-static
+              export OPENSSL_DIR="$VCPKG_INSTALLATION_ROOT/installed/arm64-windows-static"
+              export OPENSSL_STATIC=1
+            fi
             PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
               sh pyinstaller/install_extra.sh cryptography "cryptography>=48${{ matrix.pqcap }}" \
                 ${{ matrix.pq }} "post-quantum push not bundled"
