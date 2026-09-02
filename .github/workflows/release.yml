@@ -849,11 +849,17 @@ jobs:
               # catching an ML-KEM-less OpenSSL here rather than at the first
               # pairing an operator makes.
               if [ -n "${{ matrix.pq }}" ]; then
+                pq_ready=1
                 if [ -n "${{ matrix.pq_src }}" ]; then
-                  if [ ! -x /opt/cargo/bin/cargo ]; then
-                    sh -c "$RUST_SETUP_CMD"
-                  fi
-                  sh pyinstaller/build_openssl.sh /src/.openssl-${{ matrix.arch }}
+                  # Best effort as a whole, like the row: a toolchain step
+                  # that fails costs the build its post-quantum suite and
+                  # says so, never the job.
+                  {
+                    if [ ! -x /opt/cargo/bin/cargo ]; then
+                      sh -c "$RUST_SETUP_CMD"
+                    fi
+                    sh pyinstaller/build_openssl.sh /src/.openssl-${{ matrix.arch }}
+                  } || pq_ready=0
                   PATH=/opt/cargo/bin:$PATH
                   CARGO_HOME=/opt/cargo
                   RUSTUP_HOME=/opt/rustup
@@ -861,8 +867,12 @@ jobs:
                   OPENSSL_STATIC=1
                   export PATH CARGO_HOME RUSTUP_HOME OPENSSL_DIR OPENSSL_STATIC
                 fi
-                sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
-                  ${{ matrix.pq }} "post-quantum push not bundled"
+                if [ "$pq_ready" = 1 ]; then
+                  sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
+                    ${{ matrix.pq }} "post-quantum push not bundled"
+                else
+                  echo "cryptography: source-build toolchain setup failed; post-quantum push not bundled"
+                fi
               fi
               # Bundle zeroconf (the `discovery` extra): pure Python with
               # optional speedups, so a HARD install on every row. LGPL-2.1;
