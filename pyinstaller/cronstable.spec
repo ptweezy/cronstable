@@ -75,7 +75,7 @@ try:
 except ImportError:
     pass
 # cryptography (the `push-pq` extra): cronstable/push imports the hpke
-# module and the mlkem and x25519 asymmetric modules inside _xwing_suite,
+# module and the mlkem and x25519 asymmetric modules inside _xwing_sealer,
 # guarded call-site imports like nacl's above. All three are named because
 # nothing else names them: cryptography ships no PyInstaller hooks of its
 # own (no __pyinstaller package, no entry point), and the hook that

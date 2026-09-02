@@ -855,10 +855,76 @@ def test_sealable_suites_advertises_only_a_proven_seal(monkeypatch):
         calls.append(True)
         raise push.PushError("cryptography cannot seal X-Wing")
 
-    monkeypatch.setattr(push, "_xwing_suite", broken)
+    monkeypatch.setattr(push, "_xwing_sealer", broken)
     assert push.sealable_suites() == [push.SUITE_X25519]
     assert push.sealable_suites() == [push.SUITE_X25519]
     assert len(calls) == 1
+
+
+@requires_xwing
+def test_a_backend_without_mlkem_is_blamed_on_the_library_not_the_key(
+    monkeypatch, caplog
+):
+    # A cryptography whose OpenSSL lacks ML-KEM imports and builds its
+    # HPKE suite fine; the refusal comes out of the key builder as
+    # UnsupportedAlgorithm (the 47.0.0 wheel does exactly this). Pairing
+    # and sealing must answer with the fixed library sentence, never the
+    # "unusable key" 400 that would send an operator debugging the phone.
+    from cryptography.exceptions import UnsupportedAlgorithm
+    from cryptography.hazmat.primitives.asymmetric import mlkem
+
+    def unsupported(_data):
+        raise UnsupportedAlgorithm(
+            "ML-KEM-768 is not supported by this backend."
+        )
+
+    monkeypatch.setattr(
+        mlkem,
+        "MLKEM768PublicKey",
+        SimpleNamespace(from_public_bytes=unsupported),
+    )
+    _, public_b64 = _xwing_keypair()
+    caplog.set_level(logging.WARNING, logger="cronstable")
+    with pytest.raises(push.PushError) as excinfo:
+        push.validate_public_key(public_b64, push.SUITE_XWING)
+    assert "cannot seal X-Wing" in str(excinfo.value)
+    assert "push-pq" in str(excinfo.value)
+    with pytest.raises(push.PushError) as excinfo:
+        push.seal_to_device(public_b64, b"{}", push.SUITE_XWING)
+    assert "cannot seal X-Wing" in str(excinfo.value)
+    assert "unusable" not in str(excinfo.value)
+    # the probe stands down for the same reason, in the same words
+    monkeypatch.setattr(push, "_XWING_PROBE", None)
+    assert push.sealable_suites() == [push.SUITE_X25519]
+    reasons = [
+        r.getMessage()
+        for r in caplog.records
+        if "cannot seal X-Wing" in r.getMessage()
+    ]
+    assert len(reasons) == 3
+    assert all("not supported by this backend" in m for m in reasons)
+
+
+@requires_xwing
+async def test_start_warms_the_xwing_probe_off_the_loop(
+    tmp_path, monkeypatch
+):
+    # The cold probe is an ML-KEM keygen plus a seal; start() pays for it
+    # on a thread once, so the capability line, the mirror's stranded-set
+    # check and the first /whoami all read the cache on the loop.
+    monkeypatch.setattr(push, "_XWING_PROBE", None)
+    hops = []
+    real_to_thread = asyncio.to_thread
+
+    async def watched(func, *args, **kwargs):
+        hops.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(push.asyncio, "to_thread", watched)
+    service = _service(push.FileDeviceStore(str(tmp_path / "devices.json")))
+    await service.start()
+    assert hops.count(push.sealable_suites) == 1
+    assert push._XWING_PROBE is True
 
 
 @requires_xwing

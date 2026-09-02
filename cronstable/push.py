@@ -79,7 +79,7 @@ except (ImportError, ValueError):  # pragma: no cover - no-push baseline
 try:
     # Probed, not imported, for the same start-cost reasons as PyNaCl
     # above.  find_spec answers "is it findable", not "can it seal": the
-    # real import lives in :func:`_xwing_suite`, inside the try that
+    # real import lives in :func:`_xwing_sealer`, inside the try that
     # turns a cryptography too old or too broken to seal X-Wing into a
     # PushError rather than an ImportError out of a never-raises path.
     HAVE_XWING = (
@@ -435,22 +435,41 @@ def _sealed_box(raw: bytes) -> Any:
 _XWING_INFO = b"cronstable-push-xwing"
 
 
-def _xwing_suite() -> tuple[Any, Callable[[bytes], Any]]:
-    """The HPKE X-Wing suite plus a wire-key-to-public-key builder.
+#: The sentence for a cryptography that is findable but cannot seal
+#: X-Wing.  Fixed because pairing 400s and test-alert 502s return it
+#: verbatim; the library's own reason goes to the log instead.
+_XWING_BROKEN = (
+    "cryptography is installed but cannot seal X-Wing; the reason is in "
+    "the cronstable log (reinstall the post-quantum push extra: "
+    'pip install "cronstable[push-pq]")'
+)
+
+
+def _xwing_library_failure(exc: BaseException) -> PushError:
+    """Log a library failure's reason; return the fixed PushError for it."""
+    logger.warning(
+        "push: cryptography is findable but cannot seal X-Wing: %s", exc
+    )
+    return PushError(_XWING_BROKEN)
+
+
+def _xwing_sealer() -> Callable[[bytes, bytes], bytes]:
+    """A ``seal(raw_key, plaintext)`` over the HPKE X-Wing suite.
 
     The one place cryptography is imported (see :data:`HAVE_XWING`).
-    Returns ``(suite, build_key)``: ``suite`` seals via single-shot
-    HPKE base mode (X-Wing KEM, HKDF-SHA256, AES-256-GCM), and
-    ``build_key`` turns a decoded 1216-byte wire key (ML-KEM-768
-    encapsulation key, then X25519 key) into the hybrid public key it
-    seals to.  A cryptography that is findable but cannot seal X-Wing
-    (too old for the HPKE module or the X-Wing KEM, half-installed, or
-    built against an OpenSSL without ML-KEM) becomes a
-    :class:`PushError` here, on :func:`_sealed_box`'s contract: the
-    reason goes to the log, and the raised sentence is fixed because
-    pairing 400s and test-alert 502s return it verbatim.
+    ``raw_key`` is the decoded 1216-byte wire key (ML-KEM-768
+    encapsulation key, then X25519 key); the result is single-shot HPKE
+    base mode (X-Wing KEM, HKDF-SHA256, AES-256-GCM) bound to
+    :data:`_XWING_INFO`.  A library that cannot seal X-Wing raises
+    :class:`PushError` with :data:`_XWING_BROKEN`, on
+    :func:`_sealed_box`'s contract.  An OpenSSL without ML-KEM surfaces
+    as ``UnsupportedAlgorithm`` from the key builder, not from the import
+    (the 47.0.0 wheel constructs the suite and fails at keygen), so the
+    sealer classifies it there.  Every other exception a seal raises is
+    the key's and is left to the caller.
     """
     try:
+        from cryptography.exceptions import UnsupportedAlgorithm
         from cryptography.hazmat.primitives.asymmetric import (
             mlkem,
             x25519,
@@ -467,26 +486,19 @@ def _xwing_suite() -> tuple[Any, Callable[[bytes], Any]]:
     except Exception as exc:
         # Broad on purpose: no key material is in scope yet, so anything
         # this block raises is a library failure, never a device's fault.
-        # The concrete non-ImportError case is UnsupportedAlgorithm from
-        # a cryptography built against an OpenSSL without ML-KEM; letting
-        # it escape would misfile the install problem as a bad device key.
-        logger.warning(
-            "push: cryptography is findable but cannot seal X-Wing: %s",
-            exc,
-        )
-        raise PushError(
-            "cryptography is installed but cannot seal X-Wing; the "
-            "reason is in the cronstable log (reinstall the post-quantum "
-            'push extra: pip install "cronstable[push-pq]")'
-        ) from None
+        raise _xwing_library_failure(exc) from None
 
-    def build_key(raw: bytes) -> Any:
-        return MLKEM768X25519PublicKey(
-            mlkem.MLKEM768PublicKey.from_public_bytes(raw[:1184]),
-            x25519.X25519PublicKey.from_public_bytes(raw[1184:]),
-        )
+    def seal(raw_key: bytes, plaintext: bytes) -> bytes:
+        try:
+            key = MLKEM768X25519PublicKey(
+                mlkem.MLKEM768PublicKey.from_public_bytes(raw_key[:1184]),
+                x25519.X25519PublicKey.from_public_bytes(raw_key[1184:]),
+            )
+            return suite.encrypt(plaintext, key, info=_XWING_INFO)
+        except UnsupportedAlgorithm as exc:
+            raise _xwing_library_failure(exc) from None
 
-    return suite, build_key
+    return seal
 
 
 #: :func:`_xwing_probe`'s cached verdict: None until the first call, then
@@ -504,19 +516,19 @@ def _xwing_probe() -> bool:
     X-Wing KEM, and the OpenSSL underneath.  Cached for the life of the
     process because the advertisement in :func:`sealable_suites` reads
     it on every ``/whoami``, because a broken library then logs its
-    reason once (in :func:`_xwing_suite`) rather than per request, and
-    because nothing the seal can hit changes under a running daemon:
-    :data:`HAVE_XWING` freezes at import, so a library installed after
-    start is never a candidate here, and an OpenSSL without ML-KEM stays
-    without it for as long as cryptography sits in ``sys.modules``.
+    reason once (in :func:`_xwing_library_failure`) rather than per
+    request, and because nothing the seal can hit changes under a running
+    daemon: :data:`HAVE_XWING` freezes at import, so a library installed
+    after start is never a candidate here, and an OpenSSL without ML-KEM
+    stays without it for as long as cryptography sits in ``sys.modules``.
     Sealing never consults the cache (:func:`seal_to_device` builds its
-    suite fresh per seal), so the verdict steers the advertisement only,
+    sealer fresh per seal), so the verdict steers the advertisement only,
     never a page.
     """
     global _XWING_PROBE
     if _XWING_PROBE is None:
         try:
-            suite, build_key = _xwing_suite()
+            seal = _xwing_sealer()
             from cryptography.hazmat.primitives.asymmetric import (
                 mlkem,
                 x25519,
@@ -530,12 +542,13 @@ def _xwing_probe() -> bool:
                 .public_key()
                 .public_bytes_raw()
             )
-            suite.encrypt(b"probe", build_key(wire), info=_XWING_INFO)
+            seal(wire, b"probe")
             _XWING_PROBE = True
         except PushError:
-            _XWING_PROBE = False  # _xwing_suite already logged the reason
+            _XWING_PROBE = False  # the sealer already logged the reason
         except Exception as exc:
-            logger.warning("push: X-Wing probe seal failed: %s", exc)
+            # No device key is in play, so this too is the library's.
+            _xwing_library_failure(exc)
             _XWING_PROBE = False
     return _XWING_PROBE
 
@@ -600,15 +613,12 @@ def validate_public_key(value: Any, suite: str = DEFAULT_SUITE) -> str:
                 "publicKey is not a usable X25519 public key"
             ) from None
     if HAVE_XWING and spec.name == SUITE_XWING:
-        # The same probe-at-pairing rule for X-Wing.  Encapsulation
-        # accepts some malformed ML-KEM component keys, so this is a
-        # capability and sanity check rather than a full key validator;
-        # what it does catch (an unusable X25519 point, a library that
-        # cannot seal) becomes a 400 here instead of a registry record
-        # that fails on every alert.
+        # The same probe-at-pairing rule for X-Wing: what the seal
+        # catches (an unusable X25519 point, an out-of-range ML-KEM key,
+        # a library that cannot seal) becomes a 400 here instead of a
+        # registry record that fails on every alert.
         try:
-            hpke_suite, build_key = _xwing_suite()
-            hpke_suite.encrypt(b"probe", build_key(raw), info=_XWING_INFO)
+            _xwing_sealer()(raw, b"probe")
         except PushError:
             # a broken cryptography, not a broken key: keep its wording
             raise
@@ -667,7 +677,7 @@ def seal_to_device(
 
     An X25519 device gets a libsodium sealed box; an X-Wing device gets
     single-shot HPKE base mode over the hybrid key (see
-    :func:`_xwing_suite`).  Both constructions are anonymous-sender: a
+    :func:`_xwing_sealer`).  Both constructions are anonymous-sender: a
     fresh ephemeral key pair (sealed box) or encapsulation (HPKE) per
     message, so the daemon holds no long-lived sending secret and only
     the device's private key (which never leaves the phone) can open
@@ -689,10 +699,7 @@ def seal_to_device(
         # to), and one bad registry record must surface as a per-device
         # PushError, never escape a whole-fleet fan-out.
         if spec.name == SUITE_XWING:
-            hpke_suite, build_key = _xwing_suite()
-            sealed = hpke_suite.encrypt(
-                plaintext, build_key(raw), info=_XWING_INFO
-            )
+            sealed = _xwing_sealer()(raw, plaintext)
         else:
             # The PyNaCl gate sits inside the X25519 arm so a missing
             # PyNaCl can never masquerade as the diagnosis for an X-Wing
@@ -1444,6 +1451,10 @@ class PushService:
 
     async def start(self) -> None:
         """Warm the device mirror; never fatal (the store may be down)."""
+        # The cold X-Wing probe (an ML-KEM keygen plus a seal) runs off
+        # the loop here, once, so the capability line, the mirror's
+        # stranded-set check and the first GET /whoami all read the cache.
+        await sealable_suites_async()
         self._log_sealing_capability()
         try:
             await self.refresh(force=True)
@@ -1471,11 +1482,6 @@ class PushService:
         That costs no page, so it is not a ConfigError, but an operator who
         asked for post-quantum sealing and did not get it must hear it from
         the daemon rather than from a pairing 400 weeks later.
-
-        This is also the only place the X-Wing probe runs off a request
-        path: :func:`sealable_suites` caches it, so warming it here keeps
-        the first ``GET /whoami`` from paying for an ML-KEM keygen on the
-        event loop.
         """
         suites = sealable_suites()
         logger.info("push: sealing suites: %s", ", ".join(suites))
