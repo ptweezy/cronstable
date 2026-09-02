@@ -1228,19 +1228,29 @@ jobs:
                 # The bookworm row (see its matrix entry): the distro has
                 # neither the Rust nor the OpenSSL the build needs, so both
                 # come from outside it.
+                pq_ready=1
                 if [ -n "${{ matrix.pq_openssl }}" ]; then
-                  if [ ! -x /opt/cargo/bin/cargo ]; then
-                    sh -c "${{ matrix.rust_setup }}"
-                  fi
-                  sh pyinstaller/build_openssl.sh /opt/openssl
+                  # Best effort as a whole, like the row: a toolchain step
+                  # that fails costs the build its post-quantum suite and
+                  # says so, never the job.
+                  {
+                    if [ ! -x /opt/cargo/bin/cargo ]; then
+                      sh -c "${{ matrix.rust_setup }}"
+                    fi
+                    sh pyinstaller/build_openssl.sh /opt/openssl
+                  } || pq_ready=0
                   PATH=/opt/cargo/bin:$PATH
                   CARGO_HOME=/opt/cargo
                   RUSTUP_HOME=/opt/rustup
                   OPENSSL_DIR=/opt/openssl
                   export PATH CARGO_HOME RUSTUP_HOME OPENSSL_DIR
                 fi
-                sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
-                  ${{ matrix.pq }} "post-quantum push not bundled"
+                if [ "$pq_ready" = 1 ]; then
+                  sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
+                    ${{ matrix.pq }} "post-quantum push not bundled"
+                else
+                  echo "cryptography: source-build toolchain setup failed; post-quantum push not bundled"
+                fi
               fi
               # Bundle zeroconf (the `discovery` extra): pure Python with
               # optional speedups, so a HARD install even under QEMU. It
@@ -1777,12 +1787,12 @@ jobs:
               # linked statically so the bundle carries no libssl. Soft like
               # the other compiled extras on this lane: verify_extra.py seals
               # a real X-Wing probe and drops a build that cannot.
-              ${{ matrix.pq_tools }}
-              if [ ! -x /opt/cargo/bin/cargo ]; then
-                sh -c "${{ matrix.rust_setup }}"
+              if { ${{ matrix.pq_tools }}; } && { [ -x /opt/cargo/bin/cargo ] || sh -c "${{ matrix.rust_setup }}"; }; then
+                PATH=/opt/cargo/bin:$PATH CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup OPENSSL_STATIC=1 \
+                  sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
+              else
+                echo "cryptography: source-build toolchain setup failed; post-quantum push not bundled"
               fi
-              PATH=/opt/cargo/bin:$PATH CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup OPENSSL_STATIC=1 \
-                sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
               sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version          # smoke test, emulated on its own libc
@@ -3005,10 +3015,15 @@ jobs:
           # usable distro OpenSSL or Rust and takes the from-source route.
           PQ_TOOLS: ${{ matrix.libc == 'musl' && 'retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && ':' || 'retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev pkg-config' }}
           RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+          # The probe below installs the project, whose version comes from
+          # this rather than from git: the python images carry no git, and
+          # the manylinux image refuses the bind mount's ownership.
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         run: |
           set -euo pipefail
           docker run --rm --platform ${{ matrix.platform }} \
             -e PIP_RETRIES -e PIP_TIMEOUT -e PQ_TOOLS -e RUST_SETUP_CMD \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
             -v "$PWD:/src" -w /src \
             ${{ matrix.image }} sh -euc '
               . /src/.github/scripts/retry.sh

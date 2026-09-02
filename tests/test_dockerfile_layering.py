@@ -436,10 +436,8 @@ def test_a_wheelhouse_wheel_keeps_cryptography_where_pypi_has_none(
         os.path.join(ROOT, "pyproject.toml"), tmp_path / "pyproject.toml"
     )
     module.main(str(tmp_path / "pyproject.toml"), str(wheelhouse))
-    written = (
-        (tmp_path / "requirements.txt").read_text(encoding="utf-8").splitlines()
-    )
-    assert "cryptography>=48" in written
+    written = (tmp_path / "requirements.txt").read_text(encoding="utf-8")
+    assert "cryptography>=48" in written.splitlines()
 
 
 def test_another_platforms_cryptography_line_never_reaches_an_image():
