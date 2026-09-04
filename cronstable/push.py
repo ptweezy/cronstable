@@ -633,10 +633,10 @@ def _trim_log_tail(
             lo = mid + 1
     if fitted is None:
         return drop(total)
-    # lo is now the minimal fitting drop count and `fitted` is already its
-    # encoding (the bisection's last success lands on lo); when the last
-    # probe was the failing one just below it, re-apply that state to the
-    # payload without paying a seventh encode.
+    # At this point lo is the minimal fitting drop count and `fitted` is
+    # its encoding (the bisection's last success lands on lo); when the
+    # last probe is the failing one just below it, re-apply that state to
+    # the payload, which needs no further encode.
     if applied != lo:
         apply(lo)
     return fitted

@@ -160,11 +160,11 @@ def render_calendar(
     if now is None:
         now = datetime.datetime.now(utc)
     end_utc = (start + datetime.timedelta(days=days)).astimezone(utc)
-    # Every line is folded ONCE, where it is built, and only the lines
+    # Every line is folded once, where it is built, and only the lines
     # that can pass 75 octets are folded at all: the literals below and
-    # the timestamp / duration lines cannot.  ``parts`` holds finished
+    # the timestamp and duration lines cannot.  ``parts`` holds finished
     # text, one line or (per event) one pre-joined block, so the final
-    # join is the only per-line work left.
+    # join is the only per-line work.
     parts = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -217,7 +217,7 @@ def render_calendar(
         # The event block, with the fire's stamp cut out of it: the UID
         # (44 ASCII octets) and DTSTART (24) never fold, so the stamp is
         # spliced in raw; everything else is folded here, once per entry,
-        # and the CRLFs are already in place.
+        # with the CRLFs in place.
         head = "BEGIN:VEVENT" + _CRLF + "UID:" + uid_ns + "-"
         middle = "@cronstable" + _CRLF + dtstamp_line + _CRLF + "DTSTART:"
         tail = _CRLF.join(

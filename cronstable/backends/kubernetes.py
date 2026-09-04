@@ -904,8 +904,8 @@ def resolve_namespace(
 def _kubeconfig_active_context(
     path: str,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """The ``context``, ``cluster`` and ``user`` blocks of ``path``'s current
-    context.
+    """The ``context``, ``cluster``, and ``user`` blocks of ``path``'s
+    current context.
 
     The one kubeconfig parse both transports share (the native client's
     referenced-file discovery, the REST transport's server and credential

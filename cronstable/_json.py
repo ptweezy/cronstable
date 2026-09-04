@@ -215,14 +215,14 @@ def _ensure_finite(obj: Any, _depth: int = 0) -> None:
 def _finite_values(values: Iterable[Any], _depth: int) -> None:
     """:func:`_ensure_finite`'s container loop, with one level inlined.
 
-    ``_depth`` is the depth of the values themselves.  An exact ``dict``,
-    ``list`` or ``float`` is handled right here, without the call frame
-    :func:`_ensure_finite` costs per node: under orjson this walk dominated
-    ``dumps_bytes``, and a real document is nested exact dicts and lists
-    whose only leaf needing a test is the float.  Anything else (a tuple,
-    a subclass, an unknown object) still goes through the dispatch, and the
-    arms here repeat its rules to the letter: a container at ``_depth`` is
-    refused at :data:`MAX_DEPTH` and its values walk at ``_depth + 1``, and
+    ``_depth`` is the depth of the values themselves.  This loop handles an
+    exact ``dict``, ``list``, or ``float`` in place, without the call frame
+    that :func:`_ensure_finite` costs per node: under orjson this walk is
+    most of ``dumps_bytes``, and a real document is nested exact dicts and
+    lists whose only leaf that needs a test is the float.  Anything else (a
+    tuple, a subclass, an unknown object) goes through the dispatch, and
+    the arms here repeat its rules to the letter: a container at ``_depth``
+    is refused at :data:`MAX_DEPTH`, its values walk at ``_depth + 1``, and
     the errors come from the same two helpers, so no verdict or message can
     differ from the dispatch's.
     """
@@ -296,19 +296,19 @@ def ensure_portable(obj: Any, _depth: int = 0) -> None:
 def _portable_items(obj: Any, _depth: int) -> None:
     """:func:`ensure_portable`'s dict branch, in the order it always ran.
 
-    The per-value LEAF test is deliberately ONE-SIDED: it decides only that
-    a value is DEFINITELY portable (an ASCII str, an in-window int, a
+    The per-value leaf test is deliberately one-sided: it decides only that
+    a value is definitely portable (an ASCII str, an in-window int, a
     finite float, a bool, None) and skips the call; a leaf it cannot clear
-    -- a subclass, a value that fails the cheap test -- goes to
-    :func:`ensure_portable`, so every leaf verdict and error message still
-    comes from that one dispatch.  An exact ``dict`` or ``list`` value
-    takes the dispatch's own container arm inlined (refused at
-    :data:`MAX_DEPTH`, recursed at ``_depth + 1``, the error from the same
-    helper), because a call per nested container was the other half of the
-    walk's cost; a tuple or a container subclass still goes through the
-    dispatch.  It is spelled out here and in :func:`_portable_values`
-    rather than factored into a shared callee because a call per value is
-    the cost being removed.
+    (a subclass, a value that fails the cheap test) goes to
+    :func:`ensure_portable`, so every leaf verdict and error message comes
+    from that one dispatch.  An exact ``dict`` or ``list`` value takes the
+    dispatch's own container arm inlined (refused at :data:`MAX_DEPTH`,
+    recursed at ``_depth + 1``, the error from the same helper), because a
+    call per nested container is the other half of the walk's cost; a
+    tuple or a container subclass goes through the dispatch.  The arms are
+    spelled out here and in :func:`_portable_values` rather than factored
+    into a shared callee because a call per value is the cost being
+    avoided.
     """
     for key, value in obj.items():
         if not isinstance(key, str):

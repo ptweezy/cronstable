@@ -941,7 +941,7 @@ class Theme:
         self._fg = {key: _sgr_fg(spec) for key, spec in palette.items()}
         self._bg = {key: _sgr_bg(spec) for key, spec in palette.items()}
         # a log line's escape tokens re-ink to the same fragments every
-        # time, so rewrite_sgr memoises per token here: entries carry
+        # time, so rewrite_sgr memoizes per token here: entries carry
         # this theme's ink, and _retheme() replacing the Theme drops them
         self._sgr_memo: dict[str, str] = {}
         self._sgr_dispatch = self._make_sgr_dispatch()
@@ -960,8 +960,8 @@ class Theme:
 
     def _make_sgr_dispatch(self) -> Callable[["re.Match[str]"], str]:
         """The ``_ANSI_RE.sub`` callback for :func:`rewrite_sgr`, built
-        once per theme rather than twice per line: a memo hit is one
-        dict lookup, a miss runs :func:`_rewrite_sgr_token`."""
+        once per theme: a memo hit is one dict lookup, and a miss runs
+        :func:`_rewrite_sgr_token`."""
         memo = self._sgr_memo
         get = memo.get
 
@@ -2083,7 +2083,7 @@ class Term:
             out.append("\x1b[%d;1H" % (idx + 1))
             out.append(bg + "\x1b[K" + row + RESET)
         out.append(SYNC_OFF)
-        # the slice is a fresh list already, so it needs no second copy
+        # the slice is a fresh list, so no second copy is needed
         self._last_rows = rows[:lines]
         self._write("".join(out))
         self.flush()
@@ -7553,7 +7553,7 @@ class AppDrawers(AppOverlays):
         wrap = self.wrap
         content_width = width - 4 - (9 if timestamps else 0)
         # per-frame constants the rows share: the two stream markers, and
-        # the lookups render() would otherwise resolve once per line
+        # the attribute lookups render() needs, resolved once per frame
         style = paint.style
         ansi_line = self._ansi_line
         mark_err = style("▏", "fail")

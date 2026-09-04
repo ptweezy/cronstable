@@ -98,7 +98,7 @@ def _walk_carried(base: str) -> Iterator[tuple[str, str]]:
     for sub in _CARRIED_DIRS:
         root = os.path.join(base, sub)
         for dirpath, _dirnames, filenames in os.walk(root):
-            # One relpath per DIRECTORY, not per file: it re-normalises both
+            # One relpath per directory, not per file: it re-normalizes both
             # of its arguments on every call, and a store is many files in
             # few directories.  relpath of a file's own path is the
             # directory's relative path plus a separator and the name

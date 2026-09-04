@@ -110,8 +110,8 @@ _YEAR_HORIZON = 2099
 #: backward mirror of ``_YEAR_HORIZON``.
 _YEAR_FLOOR = 1970
 
-#: The first instant past the horizon: prev() clamps a far-future ``now``
-#: to it (see there), once per call without rebuilding it.
+#: The first instant past the horizon, which prev() clamps a far-future
+#: ``now`` to (see there).
 _HORIZON_EDGE = datetime.datetime(_YEAR_HORIZON + 1, 1, 1)
 
 #: How far back :meth:`CronTab._gap_rewound_seed` probes for a spring-forward.
@@ -169,7 +169,7 @@ _DAY_INDEXES = {5: (2, 4), 6: (2, 4), 7: (3, 5)}
 #: malformed hash item, not a value (no month/weekday name starts with h).
 _HASH_ITEM = re.compile(r"h(?:\((\d+)-(\d+)\))?(?:/(\d+))?\Z")
 
-#: an item that OPENS with ``h`` (at the start of a field or after a
+#: an item that opens with ``h`` (at the start of a field or after a
 #: comma) is the only position an H item can occupy, so ``thu`` and
 #: ``@hourly`` never trip this; runs on the lowercased expression
 _ITEM_H = re.compile(r"(?:^|[\s,])h")
@@ -514,8 +514,8 @@ _DowParse = tuple[frozenset[int], frozenset[int], frozenset[tuple[int, int]]]
 _HMS = tuple[int, int, int]
 
 #: The time-of-day floor (or ceiling) the time walks take.  They read
-#: only hour/minute/second, so a datetime serves as well as a time and
-#: the civil walks pass their seed through instead of slicing a time off.
+#: only hour/minute/second, so a datetime serves as well as a time, and
+#: the civil walks pass their seed through as is.
 _TimeOfDay = datetime.time | datetime.datetime
 
 #: How many distinct field texts each interning cache below keeps.  Fleets
@@ -1042,10 +1042,10 @@ class CronTab:
         lowered = crontab.lower()
         fields = lowered.split()
         # Skip the (not cheap) H expansion when no item opens with 'h';
-        # ``display is None`` already means "nothing to resolve".  The
-        # expansion only acts on an item-opening h, so the probe skips
-        # exactly what it would pass through untouched; the substring
-        # test comes first, the regex only when it hits (``thu``).
+        # ``display is None`` means "nothing to resolve".  The expansion
+        # only acts on an item-opening h, so the probe skips exactly what
+        # the expansion passes through untouched; the substring test
+        # comes first, the regex only when it hits (``thu``).
         has_hash = "h" in lowered and _ITEM_H.search(lowered) is not None
         display: Optional[list[str]] = (
             self._source.split() if has_hash else None
@@ -1580,8 +1580,8 @@ class CronTab:
         if self._dow_free:
             # Day-of-week unrestricted, so only the day-of-month list
             # constrains the day: bisect to the first listed day at or
-            # after ``day`` instead of testing every calendar day in
-            # between.  Two candidates at most: the seed day (the only
+            # after ``day``; the calendar days in between are never
+            # tested.  Two candidates at most: the seed day (the only
             # one the floor applies to) and, once its times are spent,
             # the next listed day, which starts from midnight.
             dom_sorted = self._dom_sorted

@@ -953,10 +953,11 @@ def _kept(
 ) -> dict[str, _MapValueT]:
     """``mapping`` without the entries whose key is not in ``keep``.
 
-    The mapping itself when nothing is dropped (the ordinary reload, whose
-    job set did not shrink), so a reload rebuilds only the per-job maps
-    that changed; a fresh dict otherwise, never an in-place delete, so an
-    iteration over the old map parked at an await keeps its snapshot.
+    Returns the mapping itself when nothing is dropped (the ordinary
+    reload, whose job set does not shrink), so a reload rebuilds only the
+    per-job maps that change; otherwise a fresh dict, never an in-place
+    delete, so an iteration parked at an await over the map passed in
+    keeps its snapshot.
     """
     if mapping.keys() <= keep:
         return mapping
@@ -2837,7 +2838,7 @@ class Cron:
         # mid-run would let the finishing run recreate the series from zero
         # (a phantom counter reset). The per-job maps below prune on the
         # same keep-set, through _kept, which hands a map back untouched
-        # when the job set did not shrink.
+        # when the job set does not shrink.
         keep = set(self.cron_jobs) | set(self.running_jobs)
         self.metrics.prune(keep)
         # Drop last-run slots for removed jobs (churning names must not
@@ -3382,10 +3383,11 @@ class Cron:
             if last is not None and last.outcome == "failure":
                 failing += 1
             scheduled_in = self._scheduled_in(name, job, is_running, now)
-            # a dead schedule's None means NEVER, distinct from the
-            # running/disabled Nones. For a non-running job _scheduled_in
-            # already answered (the derivation _job_to_dict relies on);
-            # only a running job needs the direct probe.
+            # a dead schedule's None means never, distinct from the
+            # running/disabled Nones. For a non-running job the
+            # scheduled_in value answers the question (the derivation
+            # _job_to_dict relies on); only a running job needs the
+            # direct probe.
             if is_running:
                 if self._schedule_never_fires(name, job):
                     never_fires += 1
@@ -4231,10 +4233,10 @@ class Cron:
         The dashboard's own definition (:func:`_run_stats`'s
         ``avg_duration``: ``sum`` over ``len`` of the rows carrying a
         duration, in ring order), so the .ics feed's event lengths can
-        never disagree with the run drawer. Folded here directly rather
-        than through _run_stats, whose fifteen other fields (and their
-        list copy of the ring) the feed never reads; the fleet feed calls
-        this once per job.
+        never disagree with the run drawer. The fold runs here directly:
+        _run_stats computes 15 other fields (and a list copy of the ring)
+        that the feed never reads, and the fleet feed calls this once per
+        job.
         """
         durations = [
             duration
@@ -4253,10 +4255,10 @@ class Cron:
         ``None`` for an unknown job; a known job with no timetable or a
         fleet of none is an empty list. Both feeds apply the
         _schedule_entries filter (enabled, cron-scheduled), so they cannot
-        disagree; the per-job feed applies it to the one job in hand
-        rather than building the fleet-wide snapshot to keep a single
-        entry. Reads live state, so it runs on the loop; the render walks
-        the immutable result on an executor.
+        disagree; the per-job feed applies it to the one job in hand, so
+        no fleet-wide snapshot is built to keep a single entry. Reads live
+        state, so it runs on the loop; the render walks the immutable
+        result on an executor.
         """
         if name is None:
             schedule_entries = sorted(
@@ -4808,7 +4810,7 @@ class Cron:
             # A latch of a job with no sla block (or one a reload blanked)
             # must not stay stuck at breached. The walk below visits the
             # SLA jobs only, so such latches are found from the (small)
-            # latch map rather than by walking the whole fleet per pass.
+            # latch map; the whole fleet is never walked for them.
             jobs = self.cron_jobs
             for latched in {name for name, _check in self._sla_state}:
                 holder = jobs.get(latched)
@@ -8485,8 +8487,8 @@ class Cron:
     def _sla_jobs(self) -> list[tuple[str, JobConfig]]:
         """The ``(name, job)`` pairs of every loaded job with an ``sla`` block.
 
-        Memoized alongside _job_pos, with the same lifecycle; lets the SLA
-        pass walk the jobs it evaluates instead of the whole fleet.
+        Memoized alongside _job_pos, with the same lifecycle, so the SLA
+        pass walks only the jobs it evaluates.
         """
         cached = self._sla_jobs_cache
         if cached is None:
@@ -8537,9 +8539,10 @@ class Cron:
         slot rather than firing once for the partial period already under way.
 
         The fires are collected and mirrored into the heap in one go: a
-        bulk seed (boot, or a reload adding more jobs than the index holds)
-        pays one O(n) heapify instead of n O(log n) pushes, and the heap's
-        pop order is the same either way (entries are unique by name).
+        bulk seed (boot, or a reload that adds more jobs than the index
+        holds) pays one O(n) heapify, where a push per job costs O(log n)
+        each, and the heap's pop order is the same either way (entries are
+        unique by name).
         """
         next_fire = self._next_fire
         dead = self._dead_schedules
@@ -11443,13 +11446,13 @@ class Cron:
     async def _wait_for_running_jobs(self) -> None:
         # job -> wait task
         wait_tasks: dict[RunningJob, asyncio.Task] = {}
-        # A completion is delivered by the wait task's own done callback,
-        # which files the job here and sets `completed`: O(1) per finish,
-        # however many jobs are running. Re-entering asyncio.wait over
-        # the whole wait set instead registered (and then removed) a
-        # waiter on EVERY running job per completion, quadratic in the
-        # running count on the scheduler's own loop (the shape
-        # loop.stall_completions_500 measures).
+        # The wait task's own done callback delivers a completion: it
+        # files the job here and sets `completed`, O(1) per finish,
+        # however many jobs are running. Waiting on the whole wait set with
+        # asyncio.wait costs a waiter registered and removed on every
+        # running job per completion, quadratic in the running count on
+        # the scheduler's own loop (the shape loop.stall_completions_500
+        # measures).
         finished: list[RunningJob] = []
         completed = asyncio.Event()
 
@@ -11458,7 +11461,7 @@ class Cron:
             completed.set()
 
         # standing waits on _jobs_running and `completed` in the busy
-        # branch's wait set: a launch, the shutdown signal or a finished
+        # branch's wait set: a launch, the shutdown signal, or a finished
         # job wakes the reaper immediately, so the loop is fully
         # event-driven (no poll timeout).
         event_wait: asyncio.Task | None = None

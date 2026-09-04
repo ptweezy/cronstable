@@ -1488,11 +1488,11 @@ class FilesystemStateBackend(StateBackend):
         try:
             fdesc = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
-                # Raw descriptor writes rather than an os.fdopen buffered
-                # writer: the payload is one finished bytes object, so the
-                # wrapper's buffer, flush and object setup were pure
-                # overhead on every record and lease write.  os.write may
-                # write short (a signal, an odd mount), hence the loop.
+                # Raw descriptor writes: the payload is one finished bytes
+                # object, so a buffered writer's buffer, flush, and object
+                # setup add only overhead to every record and lease write.
+                # os.write may write short (a signal, an odd mount), hence
+                # the loop.
                 view = memoryview(payload)
                 while view:
                     view = view[os.write(fdesc, view) :]
@@ -1558,8 +1558,8 @@ class FilesystemStateBackend(StateBackend):
         prune_latest_by: Optional[str] = None,
     ) -> str:
         token = _fs_safe(stream)
-        # _stream_dir(stream), spelled out so the token is not re-derived
-        # from the path with a basename on every append.
+        # _stream_dir(stream), spelled out so the token is in hand without
+        # a basename of the path on every append.
         stream_dir = os.path.join(self._records_root, token)
         self._makedirs_durable(stream_dir)
         if _FS_TRUNCATION_MARKER in token:
@@ -1778,8 +1778,8 @@ class FilesystemStateBackend(StateBackend):
         record it cannot read RIGHT NOW must fail the caller closed, so it
         always goes to the store and never substitutes a remembered body.
         """
-        # Byte-identical to os.path.join, minus its fspath and separator
-        # checks on a path built once per record read: every stream_dir
+        # Byte-identical to os.path.join, without its fspath and separator
+        # checks, on a path built once per record read: every stream_dir
         # comes from _stream_dir (a root joined to a non-empty _fs_safe
         # token, so it never ends in a separator) and every name from a
         # listing of it.
@@ -1956,7 +1956,7 @@ class FilesystemStateBackend(StateBackend):
         token_prefix = _fs_safe_fragment(prefix)
         try:
             # scandir: the is-a-directory test below rides on the entry's
-            # own d_type, where isdir was a stat per token.
+            # own d_type, so no stat per token.
             with os.scandir(records_root) as listing:
                 entries = list(listing)
         except FileNotFoundError:
@@ -2008,9 +2008,9 @@ class FilesystemStateBackend(StateBackend):
     ) -> list[dict[str, Any]]:
         stream_dir = self._stream_dir(stream)
         try:
-            # one descending sort in place of sort-then-reverse: the names
-            # are distinct filenames, so the stable sort's reverse= order
-            # is exactly the reversed ascending one.
+            # one descending sort: the names are distinct filenames, so
+            # the stable sort's reverse= order is exactly the reversed
+            # ascending one.
             names = sorted(
                 [n for n in os.listdir(stream_dir) if n.endswith(".json")],
                 reverse=newest_first,
@@ -2241,9 +2241,9 @@ class FilesystemStateBackend(StateBackend):
         sweep uses mtime as the activity signal.
 
         ``blocking=False`` is :meth:`_try_locked`'s lane: contention raises
-        ``OSError`` at once instead of waiting, and the wait-time stats are
-        left alone (a try-lock never waits, so counting it would only
-        dilute the contention signal).
+        ``OSError`` at once, with no wait, and the wait-time stats are left
+        alone (a try-lock never waits, so counting it dilutes the
+        contention signal).
         """
         self._makedirs_durable(os.path.dirname(lock_path))
         began = time.perf_counter()
@@ -2251,9 +2251,9 @@ class FilesystemStateBackend(StateBackend):
             fdesc = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
             try:
                 # msvcrt.locking needs a byte present to lock; guarantee one.
-                # The same fstat fixes OUR inode identity for the re-verify
-                # after acquiring: an open descriptor's inode never changes,
-                # so a second fstat there could only repeat it.
+                # The same fstat fixes this descriptor's inode identity for
+                # the re-verify after acquiring: an open descriptor's inode
+                # never changes, so a second fstat there repeats it.
                 ours = os.fstat(fdesc)
                 if ours.st_size == 0:
                     try:
@@ -2898,8 +2898,8 @@ class FilesystemStateBackend(StateBackend):
         records_root = self._records_root
         try:
             # scandir: the directory test below rides on the entry's own
-            # d_type instead of a stat per token; sorted by name, the order
-            # the sorted listdir gave.
+            # d_type, so no stat per token; sorted by name, so the walk
+            # order is deterministic.
             with os.scandir(records_root) as listing:
                 entries = sorted(listing, key=lambda e: e.name)
         except OSError:
@@ -3316,10 +3316,9 @@ class FilesystemStateBackend(StateBackend):
         for name in names:
             full = os.path.join(path, name)
             try:
-                # one stat answers both the regular-file test (isfile was a
-                # second stat of the same path) and the age gate; a
-                # directory fails S_ISREG and a broken symlink raises, and
-                # each skips exactly as isfile's False did.
+                # one stat answers both the regular-file test and the age
+                # gate; a directory fails S_ISREG and a broken symlink
+                # raises OSError, and each skips the entry.
                 info = os.stat(full)
                 if not stat.S_ISREG(info.st_mode) or info.st_mtime >= cutoff:
                     continue
@@ -3544,7 +3543,7 @@ class FilesystemStateBackend(StateBackend):
             # group per first path segment: {prefix: {count, streams, scopes}}
             groups: dict[str, dict[str, Any]] = {}
             # os.listdir here, not scandir: `cronstable state check` must
-            # degrade an unreadable ROOT to zero streams, and that seam is
+            # degrade an unreadable root to zero streams, and that seam is
             # pinned by injecting the failure through os.listdir.
             try:
                 tokens = sorted(os.listdir(root))

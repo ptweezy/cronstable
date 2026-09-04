@@ -2512,14 +2512,14 @@ def test_rewrite_sgr_memo_is_per_theme_and_bounded(monkeypatch):
     assert set(memo) == {"\x1b[31m", "\x1b[0m", "\x1b]0;title\x07"}
     assert memo["\x1b]0;title\x07"] == ""  # a stripped escape is a hit too
     assert rewrite_sgr(line, theme) == first
-    # the memo holds this theme's ink only: a new theme starts empty
+    # the memo holds this theme's ink only: a fresh theme starts empty
     assert Theme("carolina", light=True)._sgr_memo == {}
     monkeypatch.setattr(tui, "_SGR_MEMO_MAX", 4)
     for n in range(40):
         out = rewrite_sgr("\x1b[38;5;%dmx" % n, theme)
         assert strip_ansi(out) == "x" and theme.fg("bright") in out
         assert len(memo) <= 4
-    # still re-inks correctly after a clear-and-refill
+    # re-inks correctly after a clear-and-refill
     assert theme.fg("fail") in rewrite_sgr("\x1b[31mred", theme)
 
 
