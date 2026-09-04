@@ -519,6 +519,129 @@ def test_hoisted_seq_deepcopy_parses_identically_to_the_stock_one():
         ), field.name
 
 
+def test_forked_pointer_parses_identically_to_the_stock_one():
+    # The twin of the test above for config._patch_strictyaml_pointer_copy,
+    # which forks strictyaml's YAMLPointer with a list copy instead of a
+    # deepcopy per navigation step.  A document parsed under upstream's
+    # methods and under the forked ones must produce indistinguishable
+    # configs, and an INVALID document must render the same error: the
+    # error path slices the offending chunk out of the document through the
+    # very pointers being forked, so a pointer that went wrong would show
+    # up as a mislocated or blank snippet there before anywhere else.
+    import copy as copy_mod
+    import dataclasses
+
+    from strictyaml.yamlpointer import YAMLPointer
+
+    from cronstable.config import ConfigError, parse_config_string
+
+    def stock_val(self, regularkey, strictkey):  # verbatim upstream
+        new_location = copy_mod.deepcopy(self)
+        new_location._indices.append(("val", (regularkey, strictkey)))
+        return new_location
+
+    def stock_key(self, regularkey, strictkey):
+        new_location = copy_mod.deepcopy(self)
+        new_location._indices.append(("key", (regularkey, strictkey)))
+        return new_location
+
+    def stock_index(self, index):
+        new_location = copy_mod.deepcopy(self)
+        new_location._indices.append(("index", index))
+        return new_location
+
+    def stock_textslice(self, start, end):
+        new_location = copy_mod.deepcopy(self)
+        new_location._indices.append(("textslice", (start, end)))
+        return new_location
+
+    def stock_parent(self):
+        new_location = copy_mod.deepcopy(self)
+        new_location._indices = new_location._indices[:-1]
+        return new_location
+
+    stock = {
+        "val": stock_val,
+        "key": stock_key,
+        "index": stock_index,
+        "textslice": stock_textslice,
+        "parent": stock_parent,
+    }
+    forked = {name: getattr(YAMLPointer, name) for name in stock}
+    # the shim must actually be installed, or this compares stock to stock
+    assert all(
+        "deepcopy" not in fn.__code__.co_names for fn in forked.values()
+    ), "config._patch_strictyaml_pointer_copy did not rebind YAMLPointer"
+
+    good = textwrap.dedent(
+        """\
+        defaults:
+          captureStderr: true
+        jobs:
+          # a comment inside the sequence
+          - name: alpha
+            command: echo alpha
+            schedule: '*/5 * * * *'
+            environment:
+              - key: A
+                value: '1'
+          - name: beta
+            command: echo beta
+            schedule: '0 1 * * *'
+            captureStdout: true
+        """
+    )
+    bad = [
+        # a scalar the schema rejects, deep inside the jobs sequence
+        textwrap.dedent(
+            """\
+            jobs:
+              - name: alpha
+                command: echo alpha
+                schedule: '*/5 * * * *'
+              - name: beta
+                command: echo beta
+                schedule: '0 1 * * *'
+                captureStdout: sometimes
+            """
+        ),
+        # a key the schema does not know
+        textwrap.dedent(
+            """\
+            jobs:
+              - name: alpha
+                command: echo alpha
+                schedule: '*/5 * * * *'
+                bogus: 1
+            """
+        ),
+    ]
+
+    def parse_under(methods):
+        for name, method in methods.items():
+            setattr(YAMLPointer, name, method)
+        parsed = parse_config_string(good, "test")
+        errors = []
+        for text in bad:
+            with pytest.raises(ConfigError) as err:
+                parse_config_string(text, "test")
+            errors.append(str(err.value))
+        return parsed, errors
+
+    try:
+        expected, expected_errors = parse_under(stock)
+        actual, actual_errors = parse_under(forked)
+    finally:
+        for name, method in forked.items():
+            setattr(YAMLPointer, name, method)
+
+    assert actual_errors == expected_errors
+    for field in dataclasses.fields(expected):
+        assert _deep_repr(getattr(actual, field.name)) == _deep_repr(
+            getattr(expected, field.name)
+        ), field.name
+
+
 # --- 8. the lazy import doors stay shut ------------------------------------
 #
 # cron.py binds `web` and `aiohttp` to a _AiohttpDoor proxy that imports the
@@ -670,8 +793,7 @@ def test_importing_the_daemon_loads_no_aiohttp_and_first_touch_loads_it():
     assert probe["AIOHTTP-NAME-AFTER-TOUCH"] == "aiohttp", (
         "cron.aiohttp resolved to %r after touching cron.web, not aiohttp: "
         "the door rebinds only one of the two globals it promises, or binds "
-        "them to the same module."
-        % probe["AIOHTTP-NAME-AFTER-TOUCH"]
+        "them to the same module." % probe["AIOHTTP-NAME-AFTER-TOUCH"]
     )
 
 

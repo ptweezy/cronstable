@@ -606,7 +606,7 @@ def _trim_log_tail(
     original = list(tail)
     total = len(original)
 
-    def drop(count: int) -> bytes:
+    def apply(count: int) -> None:
         # Same list object, so the key keeps its position in the encoded
         # object; the key itself goes only when nothing is left, which is
         # what frees the last few bytes.
@@ -614,6 +614,9 @@ def _trim_log_tail(
             payload.pop("log_tail", None)
         else:
             tail[:] = original[count:]
+
+    def drop(count: int) -> bytes:
+        apply(count)
         return _encode(payload)
 
     lo, hi = 1, total  # 0 is the caller's already-measured non-fit
@@ -630,10 +633,12 @@ def _trim_log_tail(
             lo = mid + 1
     if fitted is None:
         return drop(total)
-    # lo is now the minimal fitting drop count; the last probe may have
-    # been the failing one just below it, so re-apply when it was.
+    # lo is now the minimal fitting drop count and `fitted` is already its
+    # encoding (the bisection's last success lands on lo); when the last
+    # probe was the failing one just below it, re-apply that state to the
+    # payload without paying a seventh encode.
     if applied != lo:
-        return drop(lo)
+        apply(lo)
     return fitted
 
 

@@ -180,15 +180,19 @@ def close_endpoints() -> None:
             task.result()[0].close()
 
 
+#: statsd wire-format metacharacters (CR, LF, ':', '|'), deleted from a
+#: configured prefix so it cannot forge or inject additional samples into
+#: the datagram. None of these are legal in a statsd metric name, so a
+#: prefix that works today is left unchanged. Built once: a writer is
+#: constructed per job run.
+_PREFIX_DELETED_CHARS = {ord(c): None for c in "\r\n:|"}
+
+
 class StatsdJobMetricWriter:
     def __init__(self, host, port, prefix, job):
         self.host = host
         self.port = port
-        # Strip statsd wire-format metacharacters (CR, LF, ':', '|') from the
-        # prefix so a configured prefix cannot forge or inject additional
-        # samples into the datagram. None of these are legal in a statsd
-        # metric name, so a prefix that works today is left unchanged.
-        self.prefix = prefix.translate({ord(c): None for c in "\r\n:|"})
+        self.prefix = prefix.translate(_PREFIX_DELETED_CHARS)
         self.start_time = None
         self.job = job
 
