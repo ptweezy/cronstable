@@ -118,23 +118,22 @@ def _patch_strictyaml_pointer_copy() -> None:
     child pointer with ``copy.deepcopy(self)``.  A pointer's only state is
     ``_indices``, a list of ``(kind, payload)`` tuples whose leaves are
     strings and ints, so the generic deepcopy machinery (reconstruct, the
-    per-container dispatch, the memo dict) spends some forty Python calls
+    per-container dispatch, the memo dict) spends some 40 Python calls
     producing what one list copy produces identically.  The walk runs once
-    per key and element of the document: on a 300-job config the deepcopy
-    was a quarter of the whole parse, and it lands on every boot parse,
-    every --validate-config, every --job-set-id and every reload that
-    touches a file.  Measured here: 300 jobs 318 ms to 240 ms, 3k jobs
-    3.29 s to 2.70 s.
+    per key and element of the document, on every boot parse, every
+    --validate-config, every --job-set-id, and every reload that touches a
+    file; with the deepcopy in place it is about a quarter of a 300-job
+    parse.
 
     A pure cost change: nothing mutates ``_indices`` in place (every
-    navigation returns a new pointer), the tuples are immutable, and the
-    argument assertions are kept verbatim.  Error rendering is untouched:
-    ``_slice_segment`` deep-copies the DOCUMENT, not a pointer.
+    navigation returns a fresh pointer), the tuples are immutable, and the
+    argument assertions are kept verbatim.  Error rendering is unaffected:
+    ``_slice_segment`` deep-copies the document, not a pointer.
 
     Probed like the Seq shim: the rebinding happens only while upstream's
-    methods still deep-copy and a pointer still carries ``_indices`` alone,
-    so a strictyaml that ships a fix or adds pointer state, or a second
-    import of this module, is left alone.
+    methods deep-copy and a pointer carries ``_indices`` alone, so a
+    strictyaml that ships a fix or adds pointer state, or a second import
+    of this module, is left alone.
     """
     try:
         from strictyaml.yamlpointer import YAMLPointer
@@ -1613,9 +1612,9 @@ _NO_SLA_THRESHOLDS: Mapping[str, Any] = types.MappingProxyType({})
 #: The findings of a clean schedule, shared by every such job: two fresh
 #: empty lists per JobConfig (the lint result and its JSON twin) are two
 #: GC-tracked containers per job walked on every full collection, for the
-#: overwhelmingly common case of nothing to report.  READ-ONLY by
+#: overwhelmingly common case of nothing to report.  Read-only by
 #: convention, like _NO_SLA_THRESHOLDS (a list, not a tuple: the payload
-#: serialises it, and consumers compare it to ``[]``).
+#: serializes it, and consumers compare it to ``[]``).
 _NO_FINDINGS: list[Finding] = []
 _NO_FINDINGS_JSON: list[dict[str, Any]] = []
 
@@ -1874,7 +1873,7 @@ class JobConfig:
             findings = lint_schedule(timezone=self.frame, tab=tab)
             lint_cache[key] = findings
         # a copy, so every job with findings owns its own list; a clean
-        # schedule shares the one empty list instead
+        # schedule shares the one empty list
         return list(findings) if findings else _NO_FINDINGS
 
     def _parse_schedule(
@@ -4182,7 +4181,7 @@ class CronstableConfig:
 # ``${x:-`` fragments, which would stall config load and hot-reload.  Names
 # are ASCII ``[A-Za-z_][A-Za-z0-9_]*``, read by one anchored match: it
 # consumes the name and nothing else (no default group), so it can never
-# rescan the tail, and it replaces a per-character Python step.
+# rescan the tail, and the scan costs one C call per name.
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -4314,8 +4313,8 @@ def _interpolate_env(doc: Any, path: str) -> Any:
 
     def walk(node: Any, location: str, kind: str) -> Any:
         if isinstance(node, str):
-            # leaves outnumber containers, so they are answered first, and
-            # the $-free ones (nearly all of them) without a call
+            # leaves outnumber containers, so the walk tests for them first
+            # and returns a $-free leaf (nearly all of them) without a call
             if "$" not in node:
                 return node
             return _interpolate_env_value(node, path, location)

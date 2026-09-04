@@ -761,7 +761,7 @@ def test_prev_rolls_back_through_year_column():
             datetime.datetime(2025, 1, 15),
             id="single-month-wraps-month-below-one",
         ),
-        # the seed day IS the only listed day, but 08:00 sits before its
+        # the seed day is the only listed day, but 08:00 sits before its
         # one fire time: the seed is spent, no earlier listed day exists,
         # and the walk moves to the previous month.
         pytest.param(

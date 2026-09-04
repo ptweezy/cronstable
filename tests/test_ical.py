@@ -183,8 +183,8 @@ def test_summary_escapes_awkward_job_names():
 
 def test_shared_schedules_describe_alike_and_h_slots_apart():
     # a fleet repeats schedules and the renderer describes each distinct
-    # expression once: every entry's DESCRIPTION still reads exactly as
-    # it does rendered alone, while H slots (hashed from the job name)
+    # expression once: every entry's DESCRIPTION reads exactly as it
+    # does rendered alone, while H slots (hashed from the job name)
     # keep their own prose
     entries = [
         CalendarEntry("p1", CronTab("30 4 * * *"), _UTC, avg_duration=120.0),

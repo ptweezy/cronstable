@@ -642,9 +642,9 @@ def _cmd_lock(args: argparse.Namespace) -> int:
                 "lock run needs a command to run (put it after `--`)"
             )
         # lazy import: only this branch spawns anything, and subprocess
-        # drags threading, selectors and signal in behind it, which every
-        # other verb (`cronstable state get` inside a job, the common
-        # case) would otherwise pay for at startup.
+        # drags threading, selectors, and signal in behind it, a startup
+        # cost that every other verb (`cronstable state get` inside a
+        # job, the common case) skips.
         import subprocess
 
         acquired, token = _lock_acquire(args)

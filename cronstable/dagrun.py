@@ -37,8 +37,8 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 # jobstate at module scope: it imports nothing beyond state and _json, both
-# already on this module's graph, so the per-call imports it replaced bought
-# no laziness, only an IMPORT_NAME per XCom read and per run GC.
+# on this module's graph anyway, so a deferred import buys no laziness here
+# and costs an IMPORT_NAME per XCom read and per run GC.
 from cronstable import _json, dag, jobstate, platform
 from cronstable.cronexpr import CronTab
 from cronstable.dag import DagSpec

@@ -521,13 +521,13 @@ def test_hoisted_seq_deepcopy_parses_identically_to_the_stock_one():
 
 def test_forked_pointer_parses_identically_to_the_stock_one():
     # The twin of the test above for config._patch_strictyaml_pointer_copy,
-    # which forks strictyaml's YAMLPointer with a list copy instead of a
-    # deepcopy per navigation step.  A document parsed under upstream's
-    # methods and under the forked ones must produce indistinguishable
-    # configs, and an INVALID document must render the same error: the
-    # error path slices the offending chunk out of the document through the
-    # very pointers being forked, so a pointer that went wrong would show
-    # up as a mislocated or blank snippet there before anywhere else.
+    # which forks strictyaml's YAMLPointer with a list copy per navigation
+    # step.  A document parsed under upstream's methods and under the
+    # forked ones must produce indistinguishable configs, and an invalid
+    # document must render the same error: the error path slices the
+    # offending chunk out of the document through the very pointers being
+    # forked, so a pointer that goes wrong shows up as a mislocated or
+    # blank snippet there before anywhere else.
     import copy as copy_mod
     import dataclasses
 

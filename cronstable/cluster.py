@@ -254,7 +254,7 @@ def _finite_number(value: Any) -> Optional[float]:
     """
     kind = type(value)
     if kind is float:
-        # the common wire shape, answered without the isinstance chain
+        # a float, the common wire shape, needs no isinstance chain
         exact: float = value
         return exact if math.isfinite(exact) else None
     if kind is int:
@@ -532,16 +532,16 @@ def _hrw_owner_bytes(
     first.update(member_bytes[0])
     best_name = members[0]
     best_score = first.digest()[:8]
-    # islice rather than two [1:] slices, so a call copies no member list;
-    # the strict zip is still drained, so a length mismatch still raises.
+    # islice skips the first pair without copying either member list; the
+    # strict zip is drained in full, so a length mismatch raises.
     for name, name_bytes in islice(
         zip(members, member_bytes, strict=True), 1, None
     ):
         digest = copy()
         digest.update(name_bytes)
         score = digest.digest()[:8]
-        # (score, name) > (best_score, best_name), spelled out so the
-        # per-member compare allocates no tuples
+        # (score, name) > (best_score, best_name), spelled out so that
+        # the per-member compare allocates no tuples
         if score > best_score or (score == best_score and name > best_name):
             best_score, best_name = score, name
     return best_name
@@ -1338,8 +1338,9 @@ class ClusterManager(LeadershipBackend):
         """
         stable: dict[str, Any] = {}
         for name, entry in job_summaries.items():
-            # copy, then rewrite the one key: no per-key Python compare
-            # (an entry without scheduled_in stays without it)
+            # copy the entry, then rewrite the one key, so no per-key
+            # Python compare runs (an entry without scheduled_in stays
+            # without it)
             copy = dict(entry)
             if "scheduled_in" in copy:
                 value = copy["scheduled_in"]

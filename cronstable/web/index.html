@@ -5250,9 +5250,9 @@ var qrcode = function() {
   const pad2 = (n) => String(n).padStart(2, "0");
   const debounce = (fn, ms) => { let t; return function () { clearTimeout(t); t = setTimeout(fn, ms); }; };
 
-  // the replacement map lives outside esc: a literal in the callback is
-  // built once per escaped character, and rowHtml escapes a dozen strings
-  // per row
+  // the replacement map lives outside esc: a literal inside the callback
+  // costs one object per escaped character, and rowHtml escapes a dozen
+  // strings per row
   const _ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => _ESC[c]);
@@ -5423,8 +5423,8 @@ var qrcode = function() {
   //  formatting
   // ===================================================================
   function fmtAgo(iso) { return fmtAgoMs(iso ? new Date(iso).getTime() : null); }
-  // the same readout from an instant already parsed (null: no instant);
-  // renderFleet parses each cell's finished_at once for both its readouts
+  // the same readout from a parsed instant (null: no instant); renderFleet
+  // parses each cell's finished_at once for both its readouts
   function fmtAgoMs(ms) {
     if (ms === null) return "never";
     const s = (Date.now() - ms) / 1000;
@@ -5827,8 +5827,8 @@ var qrcode = function() {
       if (parsed.year.restricted && !parsed.year.has(c.Y)) { advYear(); continue; }
       if (!parsed.month.has(c.Mo)) { advMonth(); continue; }
       if (!dayMatches(parsed, c)) { advDay(); continue; }
-      // The plain fields are jumped, not stepped: the step-by-one crawl only
-      // ever landed on the first matching value, or cascaded into the next
+      // The plain fields are jumped, not stepped: a step-by-one crawl only
+      // ever lands on the first matching value, or cascades into the next
       // unit with the lower fields zeroed, and the guards above read only
       // Y/Mo/D, which every skipped state shares with the landing one.
       if (!parsed.hour.has(c.h)) {
@@ -6090,7 +6090,8 @@ var qrcode = function() {
   // ===================================================================
   function renderSummary() {
     const total = state.jobs.length;
-    // one pass and one health() per job (four filters cost three each)
+    // one pass and one health() per job; a filter per count costs three
+    // health() calls per job
     let running = 0, failing = 0, ok = 0, paused = 0;
     for (const j of state.jobs) {
       if (j.running) running++;
@@ -6317,9 +6318,9 @@ var qrcode = function() {
   }
   // Absolute browser-local label for a future instant: HH:MM today, "tom"
   // for tomorrow, month + day beyond that.
-  // The two reference strings are memoised on the exact Date.now() value:
+  // The two reference strings are memoized on the exact Date.now() value:
   // rowHtml asks once per row per rebuild, and every call in the same
-  // millisecond gets the answer it would have formatted itself.
+  // millisecond shares them.
   const _atRef = { now: NaN, today: "", tom: "" };
   function fmtAt(ms) {
     const d = new Date(ms), nowMs = Date.now();
@@ -7705,8 +7706,8 @@ var qrcode = function() {
   //  swimlane: lease backends carry no summaries.
   // ===================================================================
   function agoShort(iso) { return agoShortMs(iso ? new Date(iso).getTime() : null); }
-  // the compact age from an instant already parsed (null: no instant), the
-  // twin of fmtAgoMs; tick() keeps the attribute-driven ISO path
+  // the compact age from a parsed instant (null: no instant), the twin of
+  // fmtAgoMs; tick() keeps the attribute-driven ISO path
   function agoShortMs(ms) {
     if (ms === null) return "";
     const s = Math.max(0, (Date.now() - ms) / 1000);
@@ -7727,9 +7728,9 @@ var qrcode = function() {
   // singleFlight). A cycle that finds its predecessor still pending joins it,
   // and the next cluster poll calls straight back in.
   // Each /fleet payload's response text, keyed by the object it parsed to:
-  // renderFleet's dirty-check reads it back instead of re-serialising the
-  // whole nodes x jobs payload every poll (a seeded payload has none and
-  // falls back to that serialisation).
+  // renderFleet's dirty-check reads it back, so the whole nodes-by-jobs
+  // payload is not re-serialized every poll (a seeded payload has none and
+  // falls back to serializing it).
   const _fleetText = new WeakMap();
   function loadFleet() {
     return singleFlight("fleet", async () => {
@@ -8606,9 +8607,10 @@ var qrcode = function() {
   function stopStream() { if (state.stream) { state.stream.abort(); state.stream = null; } }
 
   // The regex query's RegExp is kept across calls and rebuilt only when its
-  // source changes: logQuery runs once per streamed line, and the compile
-  // was the costliest step of appending one. The "g" flag makes it stateful,
-  // and every consumer (highlight, lineMatches) resets lastIndex before use.
+  // source changes: logQuery runs once per streamed line, and compiling a
+  // RegExp is the costliest step of appending one. The "g" flag makes it
+  // stateful, and every consumer (highlight, lineMatches) resets lastIndex
+  // before use.
   const _logRe = { src: null, re: null, bad: false };
   function logQuery() {
     const q = $("logSearch").value;
@@ -8710,8 +8712,8 @@ var qrcode = function() {
     return esc(text);
   }
   // Takes the buffered item, not its text: the ANSI-stripped and lowercased
-  // forms are cached on it (its text never changes), so the rescan a query
-  // change triggers and the per-line count fold stop re-deriving both.
+  // forms are cached on it (its text never changes), so neither the rescan
+  // a query change triggers nor the per-line count fold re-derives them.
   function lineMatches(item, q) {
     if (!q) return true;
     let plain = item._pl;
@@ -8730,7 +8732,7 @@ var qrcode = function() {
   // of a 5000-line rebuild with a search active; the rest of that rebuild is
   // laying out 5000 block lines, which only virtualization would remove).
   // only / ansiOn: the drawer's "matches only" and "ansi" checkboxes, read
-  // once per render by the callers rather than once per line here.
+  // once per render by the callers, not once per line here.
   function lineHtml(item, q, only, ansiOn) {
     const hide = q && (q.text || q.re) && !item.kind && only && !lineMatches(item, q);
     // absolute line number (monotonic, survives ring-buffer trimming)
@@ -8746,7 +8748,7 @@ var qrcode = function() {
   function renderTerm() {
     const t = termEl();
     const q = logQuery();
-    // the two checkboxes lineHtml honours, read once per rebuild
+    // the two checkboxes lineHtml honors, read once per rebuild
     const only = $("optOnly").checked, ansi = $("optAnsi").checked;
     state.log.curMatch = -1;            // re-render invalidates any current-match marker
     t.classList.toggle("nowrap", !prefs.wrap);
@@ -8834,10 +8836,10 @@ var qrcode = function() {
     if (q.text) return "t:" + q.text;
     return null;
   }
-  // q: the parsed query when the caller already holds one (appendLine,
-  // renderTerm), parsed here otherwise. The label is written only when it
-  // changed: an equal string would replace the text node for nothing, once
-  // per streamed line.
+  // q: the parsed query when the caller holds one (appendLine, renderTerm),
+  // parsed here otherwise. The label is written only when it changes:
+  // writing an equal string replaces the text node for nothing, once per
+  // streamed line.
   function updateLogCount(q) {
     if (q === undefined) q = logQuery();
     const c = $("logCount");

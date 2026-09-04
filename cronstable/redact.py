@@ -395,6 +395,6 @@ def redact_lines(lines: Iterable[str]) -> list[str]:
             # a line that OPENS a block still gets the per-line pass (the
             # header pattern redacts from the marker to end of line).
             append(redact_secrets(line))
-        if "-----" in line:  # _pem_state_after's own gate, minus the call
+        if "-----" in line:  # _pem_state_after's own gate, inlined
             in_pem = _pem_state_after(line, in_pem)
     return out
