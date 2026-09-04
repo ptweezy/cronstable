@@ -31,6 +31,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from itertools import islice
 from typing import (
     Any,
     ClassVar,
@@ -251,6 +252,14 @@ def _finite_number(value: Any) -> Optional[float]:
     module re-emits ``Infinity``/``NaN``, which JSON.parse rejects, so one
     planted value would blank the dashboard's fleet view cluster-wide.
     """
+    kind = type(value)
+    if kind is float:
+        # the common wire shape, answered without the isinstance chain
+        exact: float = value
+        return exact if math.isfinite(exact) else None
+    if kind is int:
+        # bool is excluded (type(True) is bool); float(int) is finite
+        return float(value)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     out = float(value)
@@ -518,15 +527,22 @@ def _hrw_owner_bytes(
     :func:`_hrw_score`'s ordering and the name tie-break).
     """
     seed = hashlib.sha256(job_name.encode("utf-8") + b"\x00")
-    first = seed.copy()
+    copy = seed.copy
+    first = copy()
     first.update(member_bytes[0])
     best_name = members[0]
     best_score = first.digest()[:8]
-    for name, name_bytes in zip(members[1:], member_bytes[1:], strict=True):
-        digest = seed.copy()
+    # islice rather than two [1:] slices, so a call copies no member list;
+    # the strict zip is still drained, so a length mismatch still raises.
+    for name, name_bytes in islice(
+        zip(members, member_bytes, strict=True), 1, None
+    ):
+        digest = copy()
         digest.update(name_bytes)
         score = digest.digest()[:8]
-        if (score, name) > (best_score, best_name):
+        # (score, name) > (best_score, best_name), spelled out so the
+        # per-member compare allocates no tuples
+        if score > best_score or (score == best_score and name > best_name):
             best_score, best_name = score, name
     return best_name
 
@@ -1320,22 +1336,21 @@ class ClusterManager(LeadershipBackend):
         factored out so :meth:`_handle_peer` builds it once per cached
         (payload, etag) pair.
         """
-        return {
-            name: {
-                key: (
-                    value
-                    if key != "scheduled_in"
-                    else (
-                        round(now_epoch + value)
-                        if isinstance(value, (int, float))
-                        and not isinstance(value, bool)
-                        else None
-                    )
+        stable: dict[str, Any] = {}
+        for name, entry in job_summaries.items():
+            # copy, then rewrite the one key: no per-key Python compare
+            # (an entry without scheduled_in stays without it)
+            copy = dict(entry)
+            if "scheduled_in" in copy:
+                value = copy["scheduled_in"]
+                copy["scheduled_in"] = (
+                    round(now_epoch + value)
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    else None
                 )
-                for key, value in entry.items()
-            }
-            for name, entry in job_summaries.items()
-        }
+            stable[name] = copy
+        return stable
 
     @staticmethod
     def _encode_peer_body(payload: dict[str, Any]) -> bytes:
@@ -2697,6 +2712,7 @@ class ClusterManager(LeadershipBackend):
                 )
         return sorted(conflicts)
 
+    @_memoized_derived
     def has_conflict(self) -> bool:
         """Whether any conflict that makes the election unsafe is visible here.
 
@@ -2710,6 +2726,9 @@ class ClusterManager(LeadershipBackend):
         closes. Accepted cost: one hostile CA-vouched member can wedge the
         gate closed cluster-wide (an availability DoS, never a double-run);
         see :func:`build_server_ssl_context`.
+
+        Memoized like its three inputs: the Leader gate asks per job per
+        tick, and each input's own memo lookup costs a state-key build.
         """
         return (
             bool(self.conflict_names())

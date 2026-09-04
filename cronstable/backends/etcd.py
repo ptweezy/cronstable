@@ -205,6 +205,16 @@ def lease_id_from_grant(resp: dict[str, Any]) -> Optional[str]:
     return str(lease_id) if lease_id is not None else None
 
 
+def _ttl_or_none(ttl: Any) -> Optional[int]:
+    """A wire TTL as an int, or ``None`` when absent or unparseable."""
+    if ttl is None:
+        return None
+    try:
+        return int(ttl)
+    except (TypeError, ValueError):
+        return None
+
+
 def lease_ttl_from_grant(resp: dict[str, Any]) -> Optional[int]:
     """The *server-chosen* TTL from a ``/v3/lease/grant`` response, if any.
 
@@ -213,13 +223,7 @@ def lease_ttl_from_grant(resp: dict[str, Any]) -> Optional[int]:
     key's real expiry.  ``None`` if absent or unparseable (the caller keeps
     the configured ttl).
     """
-    ttl = resp.get("TTL")
-    if ttl is None:
-        return None
-    try:
-        return int(ttl)
-    except (TypeError, ValueError):
-        return None
+    return _ttl_or_none(resp.get("TTL"))
 
 
 def lease_ttl_from_keepalive(resp: dict[str, Any]) -> Optional[int]:
@@ -229,13 +233,7 @@ def lease_ttl_from_keepalive(resp: dict[str, Any]) -> Optional[int]:
     re-grant and re-campaign.
     """
     result = resp.get("result") or {}
-    ttl = result.get("TTL")
-    if ttl is None:
-        return None
-    try:
-        return int(ttl)
-    except (TypeError, ValueError):
-        return None
+    return _ttl_or_none(result.get("TTL"))
 
 
 class EtcdBackend(StoreLeaseBackend):

@@ -901,6 +901,32 @@ def resolve_namespace(
     return configured or context_namespace or incluster_namespace or "default"
 
 
+def _kubeconfig_active_context(
+    path: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """The ``context``, ``cluster`` and ``user`` blocks of ``path``'s current
+    context.
+
+    The one kubeconfig parse both transports share (the native client's
+    referenced-file discovery, the REST transport's server and credential
+    read), so the two cannot drift on the file's shape.  Raises whatever the
+    file or its shape raises (OSError, the ruamel parse-error family, and
+    KeyError/TypeError/AttributeError for well-formed YAML that is not a
+    kubeconfig); each caller maps that to its own outcome.
+    """
+    from strictyaml.ruamel import YAML
+
+    with open(path) as cfg_file:
+        data = YAML(typ="safe").load(cfg_file)
+    contexts = {c["name"]: c["context"] for c in data.get("contexts", [])}
+    ctx: dict[str, Any] = contexts[data["current-context"]]
+    clusters = {c["name"]: c["cluster"] for c in data.get("clusters", [])}
+    users = {u["name"]: u["user"] for u in data.get("users", [])}
+    cluster: dict[str, Any] = clusters[ctx["cluster"]]
+    user: dict[str, Any] = users.get(ctx["user"], {})
+    return ctx, cluster, user
+
+
 def _kubeconfig_cert_files(path: str) -> list[Optional[str]]:
     """File-referenced CA / client-cert / client-key of a kubeconfig's active
     context, for TLS-rotation tracking (:meth:`KubernetesBackend.tls_files_
@@ -920,18 +946,10 @@ def _kubeconfig_cert_files(path: str) -> list[Optional[str]]:
     parse error yields ``[]`` -- the kubeconfig path stays tracked regardless,
     so the worst case is the pre-existing under-tracking, never a crash.
     """
-    from strictyaml.ruamel import YAML
     from strictyaml.ruamel.error import YAMLError, YAMLFutureWarning
 
     try:
-        with open(path) as cfg_file:
-            data = YAML(typ="safe").load(cfg_file)
-        contexts = {c["name"]: c["context"] for c in data.get("contexts", [])}
-        ctx = contexts[data["current-context"]]
-        clusters = {c["name"]: c["cluster"] for c in data.get("clusters", [])}
-        users = {u["name"]: u["user"] for u in data.get("users", [])}
-        cluster = clusters[ctx["cluster"]]
-        user = users.get(ctx["user"], {})
+        _ctx, cluster, user = _kubeconfig_active_context(path)
         return [
             cluster.get("certificate-authority"),
             user.get("client-certificate"),
@@ -1099,7 +1117,6 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         kind for local testing: a bearer token, or client-certificate(+key)
         data/files, with an embedded or referenced CA (or ``insecure``).
         """
-        from strictyaml.ruamel import YAML
         from strictyaml.ruamel.error import YAMLError, YAMLFutureWarning
 
         # A syntactically-broken kubeconfig (truncated mid-rotation, a tab
@@ -1114,18 +1131,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         # bad kubeconfig is logged as "cluster: failed to start" and the
         # daemon survives, mirroring the native transport's _setup_sync.
         try:
-            with open(path) as cfg_file:
-                data = YAML(typ="safe").load(cfg_file)
-            contexts = {
-                c["name"]: c["context"] for c in data.get("contexts", [])
-            }
-            ctx = contexts[data["current-context"]]
-            clusters = {
-                c["name"]: c["cluster"] for c in data.get("clusters", [])
-            }
-            users = {u["name"]: u["user"] for u in data.get("users", [])}
-            cluster = clusters[ctx["cluster"]]
-            user = users.get(ctx["user"], {})
+            ctx, cluster, user = _kubeconfig_active_context(path)
             self._base_url = cluster["server"].rstrip("/")
         except (
             KeyError,
