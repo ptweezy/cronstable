@@ -98,9 +98,21 @@ def _walk_carried(base: str) -> Iterator[tuple[str, str]]:
     for sub in _CARRIED_DIRS:
         root = os.path.join(base, sub)
         for dirpath, _dirnames, filenames in os.walk(root):
+            # One relpath per DIRECTORY, not per file: it re-normalises both
+            # of its arguments on every call, and a store is many files in
+            # few directories.  relpath of a file's own path is the
+            # directory's relative path plus a separator and the name
+            # (relpath never ends in a separator), except directly under
+            # base, where it is the bare name while the directory reads
+            # ".": never reached, every root being a subdirectory of base,
+            # but kept exact.
+            rel_dir = os.path.relpath(dirpath, base)
+            arc_dir = "" if rel_dir == os.curdir else rel_dir + os.sep
             for filename in sorted(filenames):
-                full = os.path.join(dirpath, filename)
-                yield full, os.path.relpath(full, base).replace(os.sep, "/")
+                yield (
+                    os.path.join(dirpath, filename),
+                    (arc_dir + filename).replace(os.sep, "/"),
+                )
 
 
 def cmd_backup(config_arg: str, output: str) -> int:

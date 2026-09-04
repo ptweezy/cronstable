@@ -98,6 +98,10 @@ class _FloatSubclass(float):
     pass
 
 
+class _DictSubclass(dict):
+    pass
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -313,6 +317,41 @@ def test_gate_on_a_parsed_deep_body_raises_unsupported_not_recursion():
     parsed = _json.loads(("[" * 1000 + "]" * 1000).encode())
     with pytest.raises(_json.UnsupportedValue):
         _json.ensure_portable(parsed)
+
+
+def _nested_chain(depth, ctors):
+    """A ``depth``-deep container chain, ``ctors`` cycling outermost-first."""
+    obj = 1
+    for level in reversed(range(depth)):
+        obj = ctors[level % len(ctors)](obj)
+    return obj
+
+
+@pytest.mark.parametrize("flavour", ["installed", "stdlib"])
+@pytest.mark.parametrize(
+    "ctors",
+    [
+        (lambda x: {"k": x},),
+        (lambda x: [x],),
+        (lambda x: {"k": x}, lambda x: [x]),  # a list sits at the bound
+        (lambda x: [x], lambda x: {"k": x}),  # a dict sits at the bound
+        (lambda x: (x,),),  # tuples take the dispatch's own arm
+        (lambda x: _DictSubclass(k=x),),  # a subclass takes it too
+    ],
+)
+def test_depth_bound_holds_in_every_container_arm(flavour, ctors):
+    # The gates inline the dict and list arms of their dispatch inside the
+    # container loops (and the orjson pre-walk folds a whole level in), so
+    # the depth counter is checked in several places.  A chain that puts
+    # each kind of container at the bound must be refused by every gate,
+    # and the same chain one level shorter accepted, on both backends.
+    mod = _json if flavour == "installed" else _load_json_without_orjson()
+    ok = _nested_chain(mod.MAX_DEPTH, ctors)
+    too_deep = _nested_chain(mod.MAX_DEPTH + 1, ctors)
+    for gate in (mod.ensure_portable, mod._ensure_finite, mod.dumps_bytes):
+        gate(ok)
+        with pytest.raises(mod.UnsupportedValue):
+            gate(too_deep)
 
 
 @pytest.mark.parametrize("flavour", ["installed", "stdlib"])

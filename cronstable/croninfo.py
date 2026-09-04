@@ -783,9 +783,14 @@ def _lint_month_lengths(tab: CronTab) -> list[Finding]:
     if tab.last_day_of_month or tab.last_weekday_of_month:
         return []
     dom = tab.days_of_month
-    day_like = dom | tab.nearest_weekday_days
+    if _FULL_DOM <= dom:
+        return []  # an unrestricted day column reaches every month
+    nearest = tab.nearest_weekday_days
+    day_like = dom | nearest if nearest else dom
     offsets = tab.last_day_offsets
-    if (not day_like and not offsets) or _FULL_DOM <= dom:
+    # the parser never leaves a day column empty, so past the two exits
+    # above something below is always set
+    if not day_like and not offsets:  # pragma: no cover - defensive
         return []
     findings: list[Finding] = []
     dmin = min(day_like) if day_like else None
@@ -1512,30 +1517,33 @@ def _fire_cells(
     keys: list[_WalkKey] = []
     for entry in entries:
         zone = entry.timezone or local_tz
-        key = (entry.tab.resolved_source, zone)
+        # the slot, not the property (one Python call per entry at scale)
+        key = (entry.tab._resolved, zone)
         keys.append(key)  # kept aligned with ``entries``, skips included
-        if key not in walk_cache:
-            if key in unwalkable:  # pragma: no cover - defensive
-                continue
-            try:
-                mtab, weight = _minute_tab(entry.tab)
-            except (ValueError, KeyError):  # pragma: no cover - defensive
-                unwalkable.add(key)
-                continue
-            cells: list[tuple[int, int]] = []
-            walked = 0
-            for when in _walk_fires(mtab, zone, start, end):
-                if walked >= cap:
-                    break
-                walked += 1
-                label = when.astimezone(tz)
-                cells.append((label.hour, label.minute))
-            walk_cache[key] = (cells, weight)
+        # ``members`` and ``walk_cache`` hold the same keys (a walk is
+        # stored together with its first member), so the one probe that
+        # finds the group also says the walk is done
         group = members.get(key)
-        if group is None:
-            members[key] = [entry.name]
-        else:
+        if group is not None:
             group.append(entry.name)
+            continue
+        if key in unwalkable:  # pragma: no cover - defensive
+            continue
+        try:
+            mtab, weight = _minute_tab(entry.tab)
+        except (ValueError, KeyError):  # pragma: no cover - defensive
+            unwalkable.add(key)
+            continue
+        cells: list[tuple[int, int]] = []
+        walked = 0
+        for when in _walk_fires(mtab, zone, start, end):
+            if walked >= cap:
+                break
+            walked += 1
+            label = when.astimezone(tz)
+            cells.append((label.hour, label.minute))
+        walk_cache[key] = (cells, weight)
+        members[key] = [entry.name]
     for key, group in members.items():
         cells, weight = walk_cache[key]
         share = weight * len(group)
@@ -1718,8 +1726,10 @@ def duplicate_schedules(
     for members in groups.values():
         if len(members) < 2:
             continue
-        sources = Counter(str(entry.tab) for entry in members)
-        resolved = Counter(entry.tab.resolved_source for entry in members)
+        # read off the slots, as _semantic_key does: str() and the
+        # property hand back these same strings at one Python call each
+        sources = Counter(entry.tab._source for entry in members)
+        resolved = Counter(entry.tab._resolved for entry in members)
         out.append(
             {
                 "expression": sources.most_common(1)[0][0],

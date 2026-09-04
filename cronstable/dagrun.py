@@ -36,7 +36,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from cronstable import _json, dag, platform
+# jobstate at module scope: it imports nothing beyond state and _json, both
+# already on this module's graph, so the per-call imports it replaced bought
+# no laziness, only an IMPORT_NAME per XCom read and per run GC.
+from cronstable import _json, dag, jobstate, platform
 from cronstable.cronexpr import CronTab
 from cronstable.dag import DagSpec
 from cronstable.job import RunningJob
@@ -200,7 +203,7 @@ def _jitter(max_jitter: float) -> float:
     return random.uniform(0.0, max_jitter)  # noqa: S311 - not cryptographic
 
 
-@dataclass
+@dataclass(slots=True)
 class _DagRef:
     """The marker a launched DAG-task :class:`RunningJob` carries.
 
@@ -1654,8 +1657,6 @@ class DagScheduler:
         backend = self._backend()
         if backend is None:
             return None
-        from cronstable import jobstate
-
         scope = dag.xcom_scope(dag_name, run_id)
         name = dag.xcom_name(taskkey, key)
         try:
@@ -2795,8 +2796,6 @@ class DagScheduler:
         metadata only.  ``None`` if the dag or run is unknown; degrades to an
         empty list on a backend hiccup rather than failing.
         """
-        from cronstable import jobstate
-
         backend = self._backend()
         if backend is None or dag_name not in self._dags():
             return None
@@ -2976,13 +2975,11 @@ class DagScheduler:
         # this node may keep for it goes with the document
         self._launched.pop((name, run_key), None)
         if run_id:
-            from cronstable.jobstate import ARTIFACT_STREAM_PREFIX
-
             scope = dag.xcom_scope(name, str(run_id))
             try:
                 await asyncio.wait_for(
                     backend.prune_records(
-                        ARTIFACT_STREAM_PREFIX + scope, keep=0
+                        jobstate.ARTIFACT_STREAM_PREFIX + scope, keep=0
                     ),
                     timeout=STATE_OP_TIMEOUT,
                 )
