@@ -940,6 +940,11 @@ class Theme:
         # there dominated their cost.
         self._fg = {key: _sgr_fg(spec) for key, spec in palette.items()}
         self._bg = {key: _sgr_bg(spec) for key, spec in palette.items()}
+        # a log line's escape tokens re-ink to the same fragments every
+        # time, so rewrite_sgr memoises per token here: entries carry
+        # this theme's ink, and _retheme() replacing the Theme drops them
+        self._sgr_memo: dict[str, str] = {}
+        self._sgr_dispatch = self._make_sgr_dispatch()
 
     @property
     def name(self) -> str:
@@ -952,6 +957,25 @@ class Theme:
     def bg(self, key: str) -> str:
         got = self._bg.get(key)
         return got if got is not None else self._bg["bg"]
+
+    def _make_sgr_dispatch(self) -> Callable[["re.Match[str]"], str]:
+        """The ``_ANSI_RE.sub`` callback for :func:`rewrite_sgr`, built
+        once per theme rather than twice per line: a memo hit is one
+        dict lookup, a miss runs :func:`_rewrite_sgr_token`."""
+        memo = self._sgr_memo
+        get = memo.get
+
+        def dispatch(outer: "re.Match[str]") -> str:
+            token = outer.group(0)
+            hit = get(token)
+            if hit is None:
+                hit = _rewrite_sgr_token(token, self)
+                if len(memo) >= _SGR_MEMO_MAX:
+                    memo.clear()
+                memo[token] = hit
+            return hit
+
+        return dispatch
 
 
 def _hex_rgb(spec: str) -> tuple[int, int, int]:
@@ -1095,9 +1119,16 @@ def truncate(text: str, width: int, ellipsis: str = _ELLIPSIS) -> str:
     ell_w = 1 if ellipsis == _ELLIPSIS else text_width(ellipsis)
     out: list[str] = []
     used = 0
+    limit = width - ell_w
     for ch in text:
-        w = char_width(ch)
-        if used + w > width - ell_w:
+        # the inlined width lookup of text_width / cut_to_width: printable
+        # ASCII is one cell, everything else goes through the _CHAR_W memo
+        if " " <= ch <= "~":
+            w = 1
+        else:
+            memo = _char_w_get(ch)
+            w = _char_width_memo(ch) if memo is None else memo
+        if used + w > limit:
             break
         out.append(ch)
         used += w
@@ -1210,55 +1241,63 @@ _sgr_match = _SGR_TOKEN_RE.match
 _ansi_match = _ANSI_RE.match
 
 
+#: bound on a theme's escape-token memo (see Theme._make_sgr_dispatch):
+#: the token set is job-controlled, so it is capped and reset like _CHAR_W
+_SGR_MEMO_MAX = 4096
+
+
+def _rewrite_sgr_token(token: str, theme: Theme) -> str:
+    """Re-ink one escape token for ``theme``: the memo-miss half of
+    :func:`rewrite_sgr`.  Every non-SGR escape rewrites to nothing."""
+    sgr = _SGR_TOKEN_RE.fullmatch(token)
+    if sgr is None:
+        return ""
+    out: list[str] = []
+    params = sgr.group(1) or "0"
+    parts = params.split(";")
+    i = 0
+    while i < len(parts):
+        p = parts[i] or "0"
+        try:
+            code = int(p)
+        except ValueError:
+            i += 1
+            continue
+        if code == 0:
+            out.append(RESET + theme.fg("fg"))
+        elif code in (1, 2, 3, 4, 7, 22, 23, 24, 27):
+            out.append("\x1b[%dm" % code)
+        elif 30 <= code <= 37:
+            out.append(theme.fg(_LOG_BASE[code - 30]))
+        elif 90 <= code <= 97:
+            out.append(theme.fg(_LOG_BASE[code - 90 + 8]))
+        elif code == 39:
+            out.append(theme.fg("fg"))
+        elif code in (38, 48) and i + 1 < len(parts):
+            # eat 38;5;n / 38;2;r;g;b (and the bg variants) whole
+            skip = 2 if parts[i + 1] == "5" else 4
+            if code == 38:
+                out.append(theme.fg("bright"))
+            i += skip
+        i += 1
+    return "".join(out)
+
+
 def rewrite_sgr(line: str, theme: Theme) -> str:
     """Translate a log line's SGR colours into theme colours.
 
     Bold/dim/reset survive; the 16-colour and 256/truecolour foregrounds
     are mapped onto the theme's log palette (background requests are
     dropped: the TUI owns the background).  All non-SGR escapes are
-    stripped.
+    stripped.  The ink is a function of the token and the theme alone,
+    so each distinct token is rewritten once per theme (the memo lives
+    on the Theme, see :meth:`Theme._make_sgr_dispatch`).
     """
     if "\x1b" not in line:
         # every _ANSI_RE alternative is anchored on an ESC, so the sub is
         # a guaranteed identity here; most job output carries no SGR.
         return line
-
-    def replace(match: "re.Match[str]") -> str:
-        out: list[str] = []
-        params = match.group(1) or "0"
-        parts = params.split(";")
-        i = 0
-        while i < len(parts):
-            p = parts[i] or "0"
-            try:
-                code = int(p)
-            except ValueError:
-                i += 1
-                continue
-            if code == 0:
-                out.append(RESET + theme.fg("fg"))
-            elif code in (1, 2, 3, 4, 7, 22, 23, 24, 27):
-                out.append("\x1b[%dm" % code)
-            elif 30 <= code <= 37:
-                out.append(theme.fg(_LOG_BASE[code - 30]))
-            elif 90 <= code <= 97:
-                out.append(theme.fg(_LOG_BASE[code - 90 + 8]))
-            elif code == 39:
-                out.append(theme.fg("fg"))
-            elif code in (38, 48) and i + 1 < len(parts):
-                # eat 38;5;n / 38;2;r;g;b (and the bg variants) whole
-                skip = 2 if parts[i + 1] == "5" else 4
-                if code == 38:
-                    out.append(theme.fg("bright"))
-                i += skip
-            i += 1
-        return "".join(out)
-
-    def dispatch(outer: "re.Match[str]") -> str:
-        sgr = _SGR_TOKEN_RE.fullmatch(outer.group(0))
-        return replace(sgr) if sgr is not None else ""
-
-    return _ANSI_RE.sub(dispatch, line)
+    return _ANSI_RE.sub(theme._sgr_dispatch, line)
 
 
 def sparkline(history: list[dict[str, Any]], width: int = 10) -> str:
@@ -2035,18 +2074,17 @@ class Term:
         out: list[str] = [SYNC_ON]
         if full:
             out.append(bg + CLEAR)
+        last = self._last_rows
+        n_rows, n_last = len(rows), len(last)
         for idx in range(lines):
-            row = rows[idx] if idx < len(rows) else ""
-            if (
-                not full
-                and idx < len(self._last_rows)
-                and self._last_rows[idx] == row
-            ):
+            row = rows[idx] if idx < n_rows else ""
+            if not full and idx < n_last and last[idx] == row:
                 continue
             out.append("\x1b[%d;1H" % (idx + 1))
             out.append(bg + "\x1b[K" + row + RESET)
         out.append(SYNC_OFF)
-        self._last_rows = list(rows[:lines])
+        # the slice is a fresh list already, so it needs no second copy
+        self._last_rows = rows[:lines]
         self._write("".join(out))
         self.flush()
 
@@ -2635,8 +2673,9 @@ class Painter:
         self.theme = theme
         self.bg = theme.bg("bg")
         # style() is the per-span hot path: bind the theme's fragment
-        # lookup and the constant tail once per painter
+        # lookups and the constant tail once per painter
         self._fg = theme.fg
+        self._bgf = theme.bg
         self._tail = RESET + self.bg
 
     def style(
@@ -2662,7 +2701,7 @@ class Painter:
             )
         return (
             head
-            + self.theme.bg(bg)
+            + self._bgf(bg)
             + (BOLD if bold else "")
             + (DIM_SGR if dim else "")
             + (REVERSE if reverse else "")
@@ -7510,29 +7549,33 @@ class AppDrawers(AppOverlays):
             rows.append(paint.style("  no stream", "dim"))
             return rows
         needle = search.strip().lower()
-        content_width = width - 4 - (9 if self.timestamps else 0)
+        timestamps = self.timestamps
+        wrap = self.wrap
+        content_width = width - 4 - (9 if timestamps else 0)
+        # per-frame constants the rows share: the two stream markers, and
+        # the lookups render() would otherwise resolve once per line
+        style = paint.style
+        ansi_line = self._ansi_line
+        mark_err = style("▏", "fail")
+        mark_out = style("▏", "border")
 
         def render(stream: str, line: str, when: float) -> list[str]:
             if stream == "meta":  # inline end-of-run separator
-                return [paint.style("  ── %s ──" % line, "dim")]
-            text, plain = self._ansi_line(line)
+                return [style("  ── %s ──" % line, "dim")]
+            text, plain = ansi_line(line)
             prefix = ""
-            if self.timestamps:
+            if timestamps:
                 stamp = datetime.datetime.fromtimestamp(when)
-                prefix = paint.style(stamp.strftime("%H:%M:%S "), "dim")
-            marker = paint.style(
-                "▏", "fail" if stream == "stderr" else "border"
-            )
+                prefix = style(stamp.strftime("%H:%M:%S "), "dim")
+            marker = mark_err if stream == "stderr" else mark_out
             if needle and needle in plain.lower():
-                text = paint.style(plain, "bright", bg="sel")
-            if self.wrap and text_width(plain) > content_width:
+                text = style(plain, "bright", bg="sel")
+            if wrap and text_width(plain) > content_width:
                 chunks: list[str] = []
                 start = 0
                 while start < len(plain):
                     chunk = plain[start : start + content_width]
-                    chunks.append(
-                        " " + marker + prefix + paint.style(chunk, "fg")
-                    )
+                    chunks.append(" " + marker + prefix + style(chunk, "fg"))
                     start += content_width
                 return chunks
             return [" " + marker + prefix + text]
@@ -7544,7 +7587,7 @@ class AppDrawers(AppOverlays):
             suffix.append(
                 paint.style("  ── end of run output (no-output) ──", "dim")
             )
-        if self.wrap:
+        if wrap:
             rows.extend(
                 self._wrapped_window(
                     tail, suffix, render, content_width, available
@@ -7554,15 +7597,17 @@ class AppDrawers(AppOverlays):
             # unwrapped, every buffered entry paints exactly one row:
             # clamp the scroll from counts alone and build only the
             # visible slice instead of transforming the whole buffer
-            total = len(tail.lines) + len(suffix)
+            lines = tail.lines
+            n = len(lines)
+            total = n + len(suffix)
             max_scroll = max(0, total - available)
             self.log_scroll = min(self.log_scroll, max_scroll)
             end = total - self.log_scroll
             for idx in range(max(0, end - available), end):
-                if idx < len(tail.lines):
-                    rows.extend(render(*tail.lines[idx]))
+                if idx < n:
+                    rows.extend(render(*lines[idx]))
                 else:
-                    rows.append(suffix[idx - len(tail.lines)])
+                    rows.append(suffix[idx - n])
         if not tail.lines and tail.ended is None and not tail.error:
             rows.append(paint.style("  waiting for output…", "dim"))
         return rows
@@ -8270,21 +8315,24 @@ class AppDrawers(AppOverlays):
         available = body_lines - 1
         # no wrapping here, so one buffered entry is one row: clamp the
         # scroll from counts and transform only the visible slice
-        total = len(tail.lines) + len(suffix)
+        lines = tail.lines
+        n = len(lines)
+        total = n + len(suffix)
         max_scroll = max(0, total - available)
         self.panel_scroll = min(self.panel_scroll, max_scroll)
         end = total - self.panel_scroll
+        # the two stream markers are per-frame constants, not per-row
+        mark_err = paint.style("▏", "fail")
+        mark_out = paint.style("▏", "border")
         for idx in range(max(0, end - available), end):
-            if idx >= len(tail.lines):
-                rows.append(suffix[idx - len(tail.lines)])
+            if idx >= n:
+                rows.append(suffix[idx - n])
                 continue
-            stream, line, _when = tail.lines[idx]
+            stream, line, _when = lines[idx]
             if stream == "meta":
                 rows.append(paint.style("  ── end of log ──", "dim"))
                 continue
-            marker = paint.style(
-                "▏", "fail" if stream == "stderr" else "border"
-            )
+            marker = mark_err if stream == "stderr" else mark_out
             rows.append(" " + marker + self._ansi_line(line)[0])
         return rows
 
@@ -8323,21 +8371,27 @@ class AppDrawers(AppOverlays):
         # stable across the trim (tuples are built in the same order),
         # so ties on the timestamp render identically too.
         window = available + self.panel_scroll
-        merged: list[tuple[float, int, str, str, str]] = []
+        merged: list[tuple[float, int, str, str]] = []
         for idx, tail in enumerate(self.tails):
             for stream, line, when in tail.lines[-window:]:
                 if stream == "meta":
                     line = "── %s ──" % line
-                merged.append((when, idx, tail.label, stream, line))
+                merged.append((when, idx, stream, line))
         merged.sort(key=lambda item: item[0])
+        # a tail's label prefix is the same on every one of its rows:
+        # styled once per tail per frame and picked by tail index below
+        prefixes = [
+            paint.style(
+                pad_to(tail.label, 14) + "▏", identity[idx % len(identity)]
+            )
+            for idx, tail in enumerate(self.tails)
+        ]
+        timestamps = self.timestamps
         end = len(merged) - self.panel_scroll
-        for when, idx, label, stream, line in merged[
-            max(0, end - available) : end
-        ]:
-            color = identity[idx % len(identity)]
-            prefix = paint.style(pad_to(label, 14) + "▏", color)
+        for when, idx, stream, line in merged[max(0, end - available) : end]:
+            prefix = prefixes[idx]
             stamp = ""
-            if self.timestamps:
+            if timestamps:
                 stamp = paint.style(
                     datetime.datetime.fromtimestamp(when).strftime(
                         "%H:%M:%S "

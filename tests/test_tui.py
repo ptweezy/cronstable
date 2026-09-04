@@ -2501,6 +2501,28 @@ def test_rewrite_sgr_intensity_and_default_codes():
     assert theme.fg("fg") in out2  # code 39 -> the theme default ink
 
 
+def test_rewrite_sgr_memo_is_per_theme_and_bounded(monkeypatch):
+    """Each distinct escape token is re-inked once per theme and served
+    from the theme's memo after that; the memo is capped and reset like
+    _CHAR_W because job output picks the token set."""
+    theme = Theme("carolina", light=False)
+    line = "\x1b[31mred\x1b[0m \x1b]0;title\x07plain"
+    first = rewrite_sgr(line, theme)
+    memo = theme._sgr_memo
+    assert set(memo) == {"\x1b[31m", "\x1b[0m", "\x1b]0;title\x07"}
+    assert memo["\x1b]0;title\x07"] == ""  # a stripped escape is a hit too
+    assert rewrite_sgr(line, theme) == first
+    # the memo holds this theme's ink only: a new theme starts empty
+    assert Theme("carolina", light=True)._sgr_memo == {}
+    monkeypatch.setattr(tui, "_SGR_MEMO_MAX", 4)
+    for n in range(40):
+        out = rewrite_sgr("\x1b[38;5;%dmx" % n, theme)
+        assert strip_ansi(out) == "x" and theme.fg("bright") in out
+        assert len(memo) <= 4
+    # still re-inks correctly after a clear-and-refill
+    assert theme.fg("fail") in rewrite_sgr("\x1b[31mred", theme)
+
+
 def test_sparkline_returns_a_plain_string():
     from cronstable.tui import sparkline
 
