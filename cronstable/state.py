@@ -114,6 +114,16 @@ TMP_MAX_AGE = 86400.0
 # content-addressed blobs (immutable, named by SHA-256).  Directories are
 # only ever created, never renamed (a directory rename is the one costly
 # operation on an S3 Files mount), so this layout is safe there.
+#: The open flags of the temp file behind :meth:`FilesystemStateBackend.
+#: _atomic_write`.  A descriptor from ``os.open`` is in text mode on
+#: Windows unless ``O_BINARY`` is set, and text mode rewrites every LF in a
+#: write as CRLF, which corrupts a byte payload (a record's JSON, an
+#: artifact blob).  POSIX has no text mode and no such flag, so the mask
+#: is 0 there.
+_ATOMIC_WRITE_FLAGS = (
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+)
+
 RECORDS_DIR = "records"
 LEASES_DIR = "leases"
 QUARANTINE_DIR = "quarantine"
@@ -1486,13 +1496,15 @@ class FilesystemStateBackend(StateBackend):
         """
         tmp = self._tmp_path()
         try:
-            fdesc = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fdesc = os.open(tmp, _ATOMIC_WRITE_FLAGS, 0o600)
             try:
                 # Raw descriptor writes: the payload is one finished bytes
                 # object, so a buffered writer's buffer, flush, and object
                 # setup add only overhead to every record and lease write.
-                # os.write may write short (a signal, an odd mount), hence
-                # the loop.
+                # The descriptor is opened in binary mode (see
+                # _ATOMIC_WRITE_FLAGS), so the bytes land as given on
+                # every platform.  os.write may write short (a signal, an
+                # odd mount), hence the loop.
                 view = memoryview(payload)
                 while view:
                     view = view[os.write(fdesc, view) :]
