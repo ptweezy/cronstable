@@ -137,7 +137,7 @@ MAX_CLAIMS_PER_PASS = 32
 # --------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ExpandSpec:
     """A dynamic-mapping directive: fan out over an upstream's XCom list."""
 
@@ -145,7 +145,7 @@ class ExpandSpec:
     key: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TaskSpec:
     """One node of a DAG, normalised for the state machine.
 
@@ -458,7 +458,7 @@ def is_terminal_run(body: dict[str, Any]) -> bool:
 # --------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(slots=True)
 class LaunchIntent:
     """One task instance the driver should now start a subprocess for."""
 
@@ -1186,7 +1186,9 @@ def _advance_task(
         )
         return
     if state == UP_FOR_RETRY:
-        if float(entry.get("nextRetryAt") or 0.0) <= now:
+        if float(entry.get("nextRetryAt") or 0.0) <= now and not (
+            result.deferred and task.type != APPROVAL
+        ):
             _claim_task(
                 task, taskkey, map_index, item, entry, now, proc, host, result
             )
@@ -1204,6 +1206,14 @@ def _advance_task(
         return
     if verdict == "skip":
         _terminalise_task(entry, SKIPPED, now, result)
+        return
+    if result.deferred and task.type != APPROVAL:
+        # Quota spent this pass: only _claims_full sets deferred, and
+        # launches never shrink within a pass, so _claim_task would return
+        # untouched for every later plain task or sensor; skip the call.
+        # The first over-quota claim still goes through it (that call is
+        # what marks the result), and a gate is never quota-bound.  The
+        # retry arm above applies the same rule.
         return
     _claim_task(task, taskkey, map_index, item, entry, now, proc, host, result)
 

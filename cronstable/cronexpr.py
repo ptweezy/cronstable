@@ -110,6 +110,10 @@ _YEAR_HORIZON = 2099
 #: backward mirror of ``_YEAR_HORIZON``.
 _YEAR_FLOOR = 1970
 
+#: The first instant past the horizon: prev() clamps a far-future ``now``
+#: to it (see there), once per call without rebuilding it.
+_HORIZON_EDGE = datetime.datetime(_YEAR_HORIZON + 1, 1, 1)
+
 #: How far back :meth:`CronTab._gap_rewound_seed` probes for a spring-forward.
 #: 26 hours is wider than every IANA offset jump, including the date-line hops
 #: (Samoa 2011, +24h), and no real zone transitions twice inside one window.
@@ -164,6 +168,11 @@ _DAY_INDEXES = {5: (2, 4), 6: (2, 4), 7: (3, 5)}
 #: ``h(a-b)/n`` (lowercased).  Anything else opening with ``h`` is a
 #: malformed hash item, not a value (no month/weekday name starts with h).
 _HASH_ITEM = re.compile(r"h(?:\((\d+)-(\d+)\))?(?:/(\d+))?\Z")
+
+#: an item that OPENS with ``h`` (at the start of a field or after a
+#: comma) is the only position an H item can occupy, so ``thu`` and
+#: ``@hourly`` never trip this; runs on the lowercased expression
+_ITEM_H = re.compile(r"(?:^|[\s,])h")
 
 #: a rangeless ``H`` form (bare ``H`` or ``H/n``) in day-of-month hashes
 #: over this range, not 1-31: a hashed day of 29-31 would silently skip
@@ -503,6 +512,11 @@ _DowParse = tuple[frozenset[int], frozenset[int], frozenset[tuple[int, int]]]
 
 #: A time of day as the three numbers a datetime constructor wants.
 _HMS = tuple[int, int, int]
+
+#: The time-of-day floor (or ceiling) the time walks take.  They read
+#: only hour/minute/second, so a datetime serves as well as a time and
+#: the civil walks pass their seed through instead of slicing a time off.
+_TimeOfDay = datetime.time | datetime.datetime
 
 #: How many distinct field texts each interning cache below keeps.  Fleets
 #: have few distinct FIELD texts, so the cap is only reached by pathological
@@ -1027,11 +1041,12 @@ class CronTab:
         self._resolved = self._source
         lowered = crontab.lower()
         fields = lowered.split()
-        # Skip the (not cheap) H expansion when no 'h' appears at all;
-        # ``display is None`` already means "nothing to resolve".
-        # Deliberately conservative: any 'h' (``thu``, ``@hourly``) still
-        # takes the expansion path, so no spelling of H can slip past.
-        has_hash = "h" in lowered
+        # Skip the (not cheap) H expansion when no item opens with 'h';
+        # ``display is None`` already means "nothing to resolve".  The
+        # expansion only acts on an item-opening h, so the probe skips
+        # exactly what it would pass through untouched; the substring
+        # test comes first, the regex only when it hits (``thu``).
+        has_hash = "h" in lowered and _ITEM_H.search(lowered) is not None
         display: Optional[list[str]] = (
             self._source.split() if has_hash else None
         )
@@ -1281,10 +1296,13 @@ class CronTab:
     # ------------------------------------------------------------------
     def test(self, entry: datetime.datetime) -> bool:
         """Whether ``entry``'s civil fields match (microseconds ignored)."""
+        # a pure AND of set probes, so the order is free: the minute
+        # column rejects most often (every scheduler probe carries second
+        # 0, which nearly every schedule accepts), so it goes first
         if not (
-            entry.second in self._seconds
-            and entry.minute in self._minutes
+            entry.minute in self._minutes
             and entry.hour in self._hours
+            and entry.second in self._seconds
             and entry.month in self._months
             and (self._years is None or entry.year in self._years)
         ):
@@ -1339,15 +1357,19 @@ class CronTab:
             and (month_end - day) in self._dom_last_offsets
         ):
             return True
-        if self._dom_last_weekday and day == _shift_to_weekday(
-            year, month, month_end, month_end
+        # a W shift moves at most two days, so the range guards skip the
+        # date construction on every day the item cannot land on
+        if (
+            self._dom_last_weekday
+            and day >= month_end - 2  # LW lands on the final three days
+            and day == _shift_to_weekday(year, month, month_end, month_end)
         ):
             return True
         if self._dom_nearest:
             for target in self._dom_nearest:
-                if target <= month_end and day == _shift_to_weekday(
-                    year, month, target, month_end
-                ):
+                if not target - 2 <= day <= target + 2 or target > month_end:
+                    continue
+                if day == _shift_to_weekday(year, month, target, month_end):
                     return True
         return False
 
@@ -1465,7 +1487,11 @@ class CronTab:
                 # no civil match before the horizon: the same walk from
                 # the same label, whichever frame reads it
                 return None
-            if now_utc + datetime.timedelta(seconds=delay) <= good_to:
+            # ``now_utc + timedelta(seconds=delay) <= good_to`` without
+            # building either object: ``delay`` is a whole number of
+            # microseconds and total_seconds() rounds monotonically, so
+            # the float comparison is exact over the engine's range
+            if delay <= (good_to - now_utc).total_seconds():
                 return delay
         return self.next(now=now_utc.astimezone(LOCAL_ZONE))
 
@@ -1478,15 +1504,14 @@ class CronTab:
             civil.replace(microsecond=0) if civil.microsecond else civil
         ) + _ONE_SECOND
         year, month, day = base.year, base.month, base.day
-        tod: Optional[datetime.time] = base.time()
+        # the seed itself is the time-of-day floor: the time walks read
+        # only hour/minute/second, so no datetime.time is sliced off it
+        tod: Optional[_TimeOfDay] = base
         years = self._years
         years_sorted = self._years_sorted
         months = self._months
         months_sorted = self._months_sorted
         days_plain = self._days_plain
-        dom_matches = self._dom_matches
-        dow_matches = self._dow_matches
-        at_first_time = self._at_first_time
         horizon = _YEAR_HORIZON
         while year <= horizon:
             # membership against the frozenset, not a scan of the tuple
@@ -1513,6 +1538,11 @@ class CronTab:
                 if found is not None:
                     return found
             else:
+                # bound here, not once per call: the plain-day path (most
+                # schedules) never reads them
+                dom_matches = self._dom_matches
+                dow_matches = self._dow_matches
+                at_first_time = self._at_first_time
                 # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
                 dow = (datetime.date(year, month, day).weekday() + 1) % 7
                 while day <= month_end:
@@ -1537,7 +1567,7 @@ class CronTab:
         month: int,
         day: int,
         month_end: int,
-        tod: Optional[datetime.time],
+        tod: Optional[_TimeOfDay],
     ) -> Optional[datetime.datetime]:
         """Forward day scan for a tab whose day columns are plain sets.
 
@@ -1549,23 +1579,34 @@ class CronTab:
         """
         if self._dow_free:
             # Day-of-week unrestricted, so only the day-of-month list
-            # constrains the day: bisect to each listed day instead of
-            # testing every calendar day in between.
+            # constrains the day: bisect to the first listed day at or
+            # after ``day`` instead of testing every calendar day in
+            # between.  Two candidates at most: the seed day (the only
+            # one the floor applies to) and, once its times are spent,
+            # the next listed day, which starts from midnight.
             dom_sorted = self._dom_sorted
-            dom_count = len(dom_sorted)
             index = bisect_left(dom_sorted, day)
-            seed_day = day
-            while index < dom_count:
-                day = dom_sorted[index]
-                if day > month_end:
-                    return None
-                found = self._at_first_time(
-                    year, month, day, tod if day == seed_day else None
-                )
+            if index == len(dom_sorted):
+                return None
+            first = dom_sorted[index]
+            if first > month_end:
+                return None
+            if first == day:
+                found = self._at_first_time(year, month, day, tod)
                 if found is not None:
                     return found
                 index += 1
-            return None
+                if index == len(dom_sorted):
+                    return None
+                first = dom_sorted[index]
+                if first > month_end:
+                    return None
+            # from midnight every column's first value matches: never None
+            hms = self._first_time(None)
+            assert hms is not None
+            return datetime.datetime(
+                year, month, first, hms[0], hms[1], hms[2]
+            )
         # Two set lookups per candidate day, the weekday carried forward
         # day to day.  Exactly the dom/dow test of _next_civil's L/W/#
         # branch with the plain sets (see _days_plain).
@@ -1588,7 +1629,7 @@ class CronTab:
         year: int,
         month: int,
         day: int,
-        tod: Optional[datetime.time],
+        tod: Optional[_TimeOfDay],
     ) -> Optional[datetime.datetime]:
         """``(year, month, day)`` at its earliest matching time, if any.
 
@@ -1607,7 +1648,7 @@ class CronTab:
         year: int,
         month: int,
         day: int,
-        tod: Optional[datetime.time],
+        tod: Optional[_TimeOfDay],
     ) -> Optional[datetime.datetime]:
         """The backward mirror of :meth:`_at_first_time`, for
         :meth:`_prev_civil`."""
@@ -1622,9 +1663,7 @@ class CronTab:
         index = bisect_right(ordered, current)
         return ordered[index] if index < len(ordered) else None
 
-    def _first_time(
-        self, at_or_after: Optional[datetime.time]
-    ) -> Optional[_HMS]:
+    def _first_time(self, at_or_after: Optional[_TimeOfDay]) -> Optional[_HMS]:
         """Earliest matching time of day, at/after ``at_or_after`` if set.
 
         Each column is bisected, not scanned.  The fall-throughs preserve
@@ -1704,18 +1743,13 @@ class CronTab:
         # edge.  Without the clamp every anchor past the horizon replays an
         # EMPTY forward iterator and the loop steps back one fire instant
         # per pass: hours of event-loop starvation for a dense schedule.
-        civil = min(
-            now.replace(tzinfo=None),
-            datetime.datetime(_YEAR_HORIZON + 1, 1, 1),
-        )
+        civil = min(now.replace(tzinfo=None), _HORIZON_EDGE)
         anchor = self._prev_civil(civil)
         while anchor is not None:
             resolved = anchor.replace(tzinfo=tz).astimezone(utc).astimezone(tz)
             if resolved.replace(tzinfo=None) == anchor:
                 last: Optional[datetime.datetime] = None
-                start = (anchor - datetime.timedelta(seconds=1)).replace(
-                    tzinfo=tz
-                )
+                start = (anchor - _ONE_SECOND).replace(tzinfo=tz)
                 for instant in self.occurrences(start):
                     instant_utc = instant.astimezone(utc)
                     if instant_utc >= now_utc:
@@ -1735,15 +1769,12 @@ class CronTab:
         else:
             base = civil - _ONE_SECOND
         year, month, day = base.year, base.month, base.day
-        tod: Optional[datetime.time] = base.time()
+        tod: Optional[_TimeOfDay] = base  # the ceiling; see _next_civil
         years = self._years
         years_sorted = self._years_sorted
         months = self._months
         months_sorted = self._months_sorted
         days_plain = self._days_plain
-        dom_matches = self._dom_matches
-        dow_matches = self._dow_matches
-        at_last_time = self._at_last_time
         floor = _YEAR_FLOOR
         while year >= floor:
             if years is not None and year not in years:
@@ -1771,6 +1802,10 @@ class CronTab:
                 if found is not None:
                     return found
             else:
+                # bound on the L/W/# path alone, as in _next_civil
+                dom_matches = self._dom_matches
+                dow_matches = self._dow_matches
+                at_last_time = self._at_last_time
                 # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
                 dow = (datetime.date(year, month, day).weekday() + 1) % 7
                 while day >= 1:
@@ -1794,7 +1829,7 @@ class CronTab:
         year: int,
         month: int,
         day: int,
-        tod: Optional[datetime.time],
+        tod: Optional[_TimeOfDay],
     ) -> Optional[datetime.datetime]:
         """The backward mirror of :meth:`_next_plain_day`.
 
@@ -1802,18 +1837,26 @@ class CronTab:
         ``month_end`` is owed here.
         """
         if self._dow_free:
+            # the mirror of _next_plain_day's two candidates: the seed
+            # day under the ceiling, then the previous listed day from
+            # the end of the day
             dom_sorted = self._dom_sorted
             index = bisect_right(dom_sorted, day) - 1
-            seed_day = day
-            while index >= 0:
-                day = dom_sorted[index]
-                found = self._at_last_time(
-                    year, month, day, tod if day == seed_day else None
-                )
+            if index < 0:
+                return None
+            last = dom_sorted[index]
+            if last == day:
+                found = self._at_last_time(year, month, day, tod)
                 if found is not None:
                     return found
                 index -= 1
-            return None
+                if index < 0:
+                    return None
+                last = dom_sorted[index]
+            # from the end of the day every column's last value matches
+            hms = self._last_time(None)
+            assert hms is not None
+            return datetime.datetime(year, month, last, hms[0], hms[1], hms[2])
         dom = self._dom
         dow_set = self._dow
         dow = (datetime.date(year, month, day).weekday() + 1) % 7
@@ -1833,9 +1876,7 @@ class CronTab:
         index = bisect_left(ordered, current) - 1
         return ordered[index] if index >= 0 else None
 
-    def _last_time(
-        self, at_or_before: Optional[datetime.time]
-    ) -> Optional[_HMS]:
+    def _last_time(self, at_or_before: Optional[_TimeOfDay]) -> Optional[_HMS]:
         """Latest matching time of day, at/before ``at_or_before`` if set.
 
         The backward mirror of :meth:`_first_time`, with the order of

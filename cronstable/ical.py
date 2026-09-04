@@ -156,33 +156,56 @@ def render_calendar(
     """
     if start.tzinfo is None:
         raise ValueError("render_calendar needs an aware start")
+    utc = datetime.timezone.utc
     if now is None:
-        now = datetime.datetime.now(datetime.timezone.utc)
-    dtstamp = _stamp(now)
-    end_utc = (start + datetime.timedelta(days=days)).astimezone(
-        datetime.timezone.utc
-    )
-    lines = [
+        now = datetime.datetime.now(utc)
+    end_utc = (start + datetime.timedelta(days=days)).astimezone(utc)
+    # Every line is folded ONCE, where it is built, and only the lines
+    # that can pass 75 octets are folded at all: the literals below and
+    # the timestamp / duration lines cannot.  ``parts`` holds finished
+    # text, one line or (per event) one pre-joined block, so the final
+    # join is the only per-line work left.
+    parts = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        "PRODID:-//cronstable//{}//EN".format(prodid_version or "unversioned"),
+        _fold(
+            "PRODID:-//cronstable//{}//EN".format(
+                prodid_version or "unversioned"
+            )
+        ),
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-WR-CALNAME:" + _escape(calname),
+        _fold("X-WR-CALNAME:" + _escape(calname)),
         # subscription clients honour one of these two refresh hints
         "REFRESH-INTERVAL;VALUE=DURATION:PT1H",
         "X-PUBLISHED-TTL:PT1H",
     ]
+    dtstamp_line = "DTSTAMP:" + _stamp(now)
     # the host clock walks on a fixed offset wherever the window and the
     # engine's look-back hold no transition (croninfo._walk_fires)
     local_tz = _local_tzinfo()
+    # A fleet repeats a handful of schedules across many jobs, and for a
+    # tab without an H item the prose is a function of the expression
+    # alone (the hash key only reaches an H item), so each distinct
+    # expression is described once.  An H slot's prose hashes from the
+    # job name and is never shared.
+    described: dict[str, str] = {}
     for entry in entries:
+        tab = entry.tab
         zone = entry.timezone or local_tz
-        block = _block_seconds(entry.avg_duration)
-        duration = _duration_text(block)
+        source = str(tab)
+        if tab.resolved_differs:
+            text = describe_cron(source, hash_key=entry.name, tab=tab)
+        else:
+            memo = described.get(source)
+            if memo is None:
+                memo = described[source] = describe_cron(
+                    source, hash_key=entry.name, tab=tab
+                )
+            text = memo
         description = "Schedule: {}\n{}\nTimezone: {}".format(
-            str(entry.tab),
-            describe_cron(str(entry.tab), hash_key=entry.name, tab=entry.tab),
+            source,
+            text,
             str(entry.timezone) if entry.timezone is not None else "local",
         )
         if entry.avg_duration is not None and entry.avg_duration > 0:
@@ -191,15 +214,32 @@ def render_calendar(
             )
         uid_ns = hashlib.sha256(entry.name.encode("utf-8")).hexdigest()[:12]
         summary = _escape(entry.name)
-        desc = _escape(description)
+        # The event block, with the fire's stamp cut out of it: the UID
+        # (44 ASCII octets) and DTSTART (24) never fold, so the stamp is
+        # spliced in raw; everything else is folded here, once per entry,
+        # and the CRLFs are already in place.
+        head = "BEGIN:VEVENT" + _CRLF + "UID:" + uid_ns + "-"
+        middle = "@cronstable" + _CRLF + dtstamp_line + _CRLF + "DTSTART:"
+        tail = _CRLF.join(
+            (
+                "",
+                "DURATION:"
+                + _duration_text(_block_seconds(entry.avg_duration)),
+                _fold("SUMMARY:" + summary),
+                _fold("DESCRIPTION:" + _escape(description)),
+                "STATUS:CONFIRMED",
+                "TRANSP:TRANSPARENT",
+                "END:VEVENT",
+            )
+        )
         count = 0
         truncated = False
-        for fire in _walk_fires(entry.tab, zone, start, end_utc):
-            fire_utc = fire.astimezone(datetime.timezone.utc)
+        for fire in _walk_fires(tab, zone, start, end_utc):
             if count >= per_job_cap:
                 truncated = True
                 break
             count += 1
+            fire_utc = fire.astimezone(utc)
             # the same text strftime("%Y%m%dT%H%M%SZ") produces, at a
             # third of the cost, once per event in the feed; the engine's
             # horizon is inside the four-digit years %04d covers
@@ -211,26 +251,17 @@ def render_calendar(
                 fire_utc.minute,
                 fire_utc.second,
             )
-            lines.extend(
-                [
-                    "BEGIN:VEVENT",
-                    "UID:{}-{}@cronstable".format(uid_ns, stamp),
-                    "DTSTAMP:" + dtstamp,
-                    "DTSTART:" + stamp,
-                    "DURATION:" + duration,
-                    "SUMMARY:" + summary,
-                    "DESCRIPTION:" + desc,
-                    "STATUS:CONFIRMED",
-                    "TRANSP:TRANSPARENT",
-                    "END:VEVENT",
-                ]
-            )
+            parts.append(head + stamp + middle + stamp + tail)
         if truncated:
             # the cap rides as a property parameter, not in the value: a
             # raw ';' inside a TEXT value is illegal per RFC 5545, and the
             # job name (the value) must stay unambiguous
-            lines.append(
-                "X-CRONSTABLE-TRUNCATED;CAP={}:{}".format(per_job_cap, summary)
+            parts.append(
+                _fold(
+                    "X-CRONSTABLE-TRUNCATED;CAP={}:{}".format(
+                        per_job_cap, summary
+                    )
+                )
             )
-    lines.append("END:VCALENDAR")
-    return _CRLF.join([_fold(line) for line in lines]) + _CRLF
+    parts.append("END:VCALENDAR")
+    return _CRLF.join(parts) + _CRLF

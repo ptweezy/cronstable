@@ -177,6 +177,14 @@ def _depth_error(depth: int) -> "UnsupportedValue":
     )
 
 
+def _nonfinite_error(value: float) -> "UnsupportedValue":
+    return UnsupportedValue(
+        "non-finite float {!r} is not portable across the fleet "
+        "(NaN/Infinity serializes differently with and without "
+        "orjson)".format(value)
+    )
+
+
 def _ensure_finite(obj: Any, _depth: int = 0) -> None:
     """The float-and-depth half of :func:`ensure_portable`, standalone.
 
@@ -188,29 +196,53 @@ def _ensure_finite(obj: Any, _depth: int = 0) -> None:
     :data:`MAX_DEPTH` and its own 256-deep encoder limit that the full gate
     (and so every stdlib node) rejects -- the two corruptions only a walk
     can catch before the bytes are written.  Kept light so the per-node work
-    is a couple of isinstance checks, not the full rule set.
+    is a couple of isinstance checks, not the full rule set; the container
+    loop itself lives in :func:`_finite_values`.
     """
     if isinstance(obj, float):
         if not math.isfinite(obj):
-            raise UnsupportedValue(
-                "non-finite float {!r} is not portable across the fleet "
-                "(NaN/Infinity serializes differently with and without "
-                "orjson)".format(obj)
-            )
+            raise _nonfinite_error(obj)
     elif isinstance(obj, dict):
         if _depth >= MAX_DEPTH:
             raise _depth_error(_depth)
-        _next = _depth + 1
-        for value in obj.values():
-            if value.__class__ not in _FINITE_LEAF:
-                _ensure_finite(value, _next)
+        _finite_values(obj.values(), _depth + 1)
     elif isinstance(obj, (list, tuple)):
         if _depth >= MAX_DEPTH:
             raise _depth_error(_depth)
-        _next = _depth + 1
-        for value in obj:
-            if value.__class__ not in _FINITE_LEAF:
-                _ensure_finite(value, _next)
+        _finite_values(obj, _depth + 1)
+
+
+def _finite_values(values: Iterable[Any], _depth: int) -> None:
+    """:func:`_ensure_finite`'s container loop, with one level inlined.
+
+    ``_depth`` is the depth of the values themselves.  An exact ``dict``,
+    ``list`` or ``float`` is handled right here, without the call frame
+    :func:`_ensure_finite` costs per node: under orjson this walk dominated
+    ``dumps_bytes``, and a real document is nested exact dicts and lists
+    whose only leaf needing a test is the float.  Anything else (a tuple,
+    a subclass, an unknown object) still goes through the dispatch, and the
+    arms here repeat its rules to the letter: a container at ``_depth`` is
+    refused at :data:`MAX_DEPTH` and its values walk at ``_depth + 1``, and
+    the errors come from the same two helpers, so no verdict or message can
+    differ from the dispatch's.
+    """
+    for value in values:
+        cls = value.__class__
+        if cls in _FINITE_LEAF:
+            continue
+        if cls is float:
+            if not math.isfinite(value):
+                raise _nonfinite_error(value)
+        elif cls is dict:
+            if _depth >= MAX_DEPTH:
+                raise _depth_error(_depth)
+            _finite_values(value.values(), _depth + 1)
+        elif cls is list:
+            if _depth >= MAX_DEPTH:
+                raise _depth_error(_depth)
+            _finite_values(value, _depth + 1)
+        else:
+            _ensure_finite(value, _depth)
 
 
 def ensure_portable(obj: Any, _depth: int = 0) -> None:
@@ -235,11 +267,7 @@ def ensure_portable(obj: Any, _depth: int = 0) -> None:
         return  # a bool is an int subclass but always in range and portable
     if isinstance(obj, float):
         if not math.isfinite(obj):
-            raise UnsupportedValue(
-                "non-finite float {!r} is not portable across the fleet "
-                "(NaN/Infinity serializes differently with and without "
-                "orjson)".format(obj)
-            )
+            raise _nonfinite_error(obj)
     elif isinstance(obj, int):
         if obj < _INT_MIN or obj > _INT_MAX:
             raise UnsupportedValue(
@@ -268,14 +296,19 @@ def ensure_portable(obj: Any, _depth: int = 0) -> None:
 def _portable_items(obj: Any, _depth: int) -> None:
     """:func:`ensure_portable`'s dict branch, in the order it always ran.
 
-    The per-value test is deliberately ONE-SIDED: it decides only that a
-    value is DEFINITELY portable (an ASCII str, an in-window int, a bool,
-    None) and skips the call; anything it cannot clear -- a float, a
-    container, a subclass, a value that fails the cheap test -- goes to
-    :func:`ensure_portable`, so every actual verdict and error message still
-    comes from that one dispatch.  It is spelled out here and in
-    :func:`_portable_values` rather than factored into a shared callee
-    because a call per value is the cost being removed.
+    The per-value LEAF test is deliberately ONE-SIDED: it decides only that
+    a value is DEFINITELY portable (an ASCII str, an in-window int, a
+    finite float, a bool, None) and skips the call; a leaf it cannot clear
+    -- a subclass, a value that fails the cheap test -- goes to
+    :func:`ensure_portable`, so every leaf verdict and error message still
+    comes from that one dispatch.  An exact ``dict`` or ``list`` value
+    takes the dispatch's own container arm inlined (refused at
+    :data:`MAX_DEPTH`, recursed at ``_depth + 1``, the error from the same
+    helper), because a call per nested container was the other half of the
+    walk's cost; a tuple or a container subclass still goes through the
+    dispatch.  It is spelled out here and in :func:`_portable_values`
+    rather than factored into a shared callee because a call per value is
+    the cost being removed.
     """
     for key, value in obj.items():
         if not isinstance(key, str):
@@ -297,6 +330,17 @@ def _portable_items(obj: Any, _depth: int) -> None:
         elif cls is int:
             if value < _INT_MIN or value > _INT_MAX:
                 ensure_portable(value, _depth)
+        elif cls is float:
+            if not math.isfinite(value):
+                ensure_portable(value, _depth)
+        elif cls is dict:
+            if _depth >= MAX_DEPTH:
+                raise _depth_error(_depth)
+            _portable_items(value, _depth + 1)
+        elif cls is list:
+            if _depth >= MAX_DEPTH:
+                raise _depth_error(_depth)
+            _portable_values(value, _depth + 1)
         elif cls is not bool and cls is not _NONE_TYPE:
             ensure_portable(value, _depth)
 
@@ -304,7 +348,8 @@ def _portable_items(obj: Any, _depth: int) -> None:
 def _portable_values(values: Iterable[Any], _depth: int) -> None:
     """:func:`ensure_portable`'s list/tuple branch.
 
-    Same one-sided leaf test as :func:`_portable_items`; see its docstring.
+    Same one-sided leaf test and inlined container arms as
+    :func:`_portable_items`; see its docstring.
     """
     for value in values:
         cls = value.__class__
@@ -314,6 +359,17 @@ def _portable_values(values: Iterable[Any], _depth: int) -> None:
         elif cls is int:
             if value < _INT_MIN or value > _INT_MAX:
                 ensure_portable(value, _depth)
+        elif cls is float:
+            if not math.isfinite(value):
+                ensure_portable(value, _depth)
+        elif cls is dict:
+            if _depth >= MAX_DEPTH:
+                raise _depth_error(_depth)
+            _portable_items(value, _depth + 1)
+        elif cls is list:
+            if _depth >= MAX_DEPTH:
+                raise _depth_error(_depth)
+            _portable_values(value, _depth + 1)
         elif cls is not bool and cls is not _NONE_TYPE:
             ensure_portable(value, _depth)
 

@@ -761,6 +761,15 @@ def test_prev_rolls_back_through_year_column():
             datetime.datetime(2025, 1, 15),
             id="single-month-wraps-month-below-one",
         ),
+        # the seed day IS the only listed day, but 08:00 sits before its
+        # one fire time: the seed is spent, no earlier listed day exists,
+        # and the walk moves to the previous month.
+        pytest.param(
+            "0 12 15 * *",
+            datetime.datetime(2026, 7, 15, 8, 0),
+            datetime.datetime(2026, 6, 15, 12, 0),
+            id="spent-seed-day-with-no-earlier-listed-day",
+        ),
     ],
 )
 def test_prev_civil_rollback_branches(expr, probe, expected):
@@ -852,7 +861,9 @@ def test_occurrences_start_omitted_utc_and_local():
     ct = CronTab("* * * * *")
     before_utc = datetime.datetime.now(UTC).replace(tzinfo=None)
     first_utc = next(iter(ct.occurrences(default_utc=True)))
-    assert isinstance(first_utc, datetime.datetime) and first_utc.tzinfo is None
+    assert (
+        isinstance(first_utc, datetime.datetime) and first_utc.tzinfo is None
+    )
     assert 0 <= (first_utc - before_utc).total_seconds() <= 120
 
     before_local = datetime.datetime.now()

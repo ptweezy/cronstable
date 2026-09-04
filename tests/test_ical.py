@@ -181,6 +181,34 @@ def test_summary_escapes_awkward_job_names():
     assert "SUMMARY:sync\\; a\\,b" in text
 
 
+def test_shared_schedules_describe_alike_and_h_slots_apart():
+    # a fleet repeats schedules and the renderer describes each distinct
+    # expression once: every entry's DESCRIPTION still reads exactly as
+    # it does rendered alone, while H slots (hashed from the job name)
+    # keep their own prose
+    entries = [
+        CalendarEntry("p1", CronTab("30 4 * * *"), _UTC, avg_duration=120.0),
+        CalendarEntry("p2", CronTab("30 4 * * *"), _UTC),
+        CalendarEntry("p3", CronTab("30  4 * *   *"), _UTC),
+        CalendarEntry("h1", CronTab("H 4 * * *", hash_key="h1"), _UTC),
+        CalendarEntry("h2", CronTab("H 4 * * *", hash_key="h2"), _UTC),
+    ]
+
+    def descriptions(text):
+        unfolded = text.replace("\r\n ", "")
+        return [
+            line
+            for line in unfolded.split("\r\n")
+            if line.startswith("DESCRIPTION:")
+        ]
+
+    together = descriptions(_render(entries, days=2))
+    alone = [descriptions(_render([entry], days=2)) for entry in entries]
+    assert together == [line for lines in alone for line in lines]
+    assert len(together) == 2 * len(entries)  # two fires per entry
+    assert alone[3] != alone[4]  # h1 and h2 hash to different minutes
+
+
 # ---------------------------------------------------------------------------
 # _runtime_phrase: the seconds, minutes, and hours arms.
 # ---------------------------------------------------------------------------
