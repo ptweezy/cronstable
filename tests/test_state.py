@@ -5303,3 +5303,32 @@ async def test_shutdown_completes_despite_hung_state_write(
     pending.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await pending
+
+
+async def test_atomic_write_opens_its_temp_file_in_binary_mode(
+    fs_backend, monkeypatch
+):
+    # A descriptor from os.open is in text mode on Windows unless O_BINARY
+    # is in its flags, and text mode rewrites every LF in a write as CRLF:
+    # a b"a,b\n" artifact reads back as b"a,b\r\n".  POSIX has no text
+    # mode, so the byte check passes there whatever the flags; the flag
+    # check is what gates every platform, by asserting that the mask the
+    # platform defines (0 on POSIX) is in every _atomic_write open.
+    backend = fs_backend
+    binary = getattr(os, "O_BINARY", 0)
+    opens = []
+    real_open = os.open
+
+    def recording_open(path, flags, *args, **kwargs):
+        opens.append((os.fspath(path), flags))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    dest = os.path.join(backend._records_root, "probe.bin")
+    payload = b"a,b\n\r\nc\n"
+    backend._atomic_write(dest, payload)
+    with open(dest, "rb") as fobj:
+        assert fobj.read() == payload
+    tmp_flags = [flags for path, flags in opens if path.endswith(".tmp")]
+    assert tmp_flags, "the write did not go through a temp file"
+    assert all(flags & binary == binary for flags in tmp_flags)
