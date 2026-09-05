@@ -371,11 +371,9 @@ def _init_restrict(target: str) -> None:
 def _answer_bare_version() -> None:
     """Print the version and exit when argv is exactly ``--version``.
 
-    main_loop calls this before it builds its parser: the parser's roughly
-    40 subparsers cost about a fifth of the command's wall time, and
-    startup.version is a gated metric. Any other argv, including
-    ``--version`` alongside other flags, takes the full parse, so argparse
-    handles its usage errors and its log level.
+    Runs before main_loop builds its parser, whose subparsers cost about
+    a fifth of the command's wall time (startup.version is a gated
+    metric). Any other argv takes the full parse.
     """
     if sys.argv[1:] == ["--version"]:
         print(cronstable.version.version)

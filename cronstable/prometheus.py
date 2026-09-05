@@ -132,11 +132,11 @@ def escape_help(text: str, openmetrics: bool = False) -> str:
 _EXACT_INT_MIN = -9007199254740992.0  # -2**53
 _EXACT_INT_MAX = 9007199254740992.0  # 2**53
 
-#: The rendering of every integral value from 0 to 4095, keyed so that an
-#: int, an integral float, or a bool of that value all hit (they hash and
-#: compare equal, and the tail below renders each as the same digits).
-#: Counters, 0/1 gauges, bucket counts, and exit codes are nearly every
-#: sample of a scrape, and the table answers them in one dict probe.
+#: Every integral value from 0 to 4095, rendered.  An int, an integral
+#: float, or a bool of that value all hit (they hash and compare equal,
+#: and the tail below renders each as the same digits), so nearly every
+#: sample of a scrape (counters, 0/1 gauges, bucket counts, exit codes)
+#: is one dict probe.
 _SMALL_INTEGRAL_STRS = {float(i): str(i) for i in range(4096)}
 
 
@@ -238,12 +238,12 @@ class _SharedLabels(dict[str, str]):
     """A per-job label dict shared across scrapes, carrying its own block.
 
     :meth:`PrometheusMetrics._label_sets` hands every job one read-only
-    set of these, reused by about 28 of its 29 samples per scrape; the
-    builder below answers a sample from the dict's own rendered block,
-    skipping the items-tuple build, its hash, and the memo probe that a
-    plain dict pays.  The memo is filled on the cold pass as well (its cap
-    and the clears in prune/set_duration_buckets keep their meaning); a
-    block cached here dies with its dict, which those same clears drop.
+    set of these, reused by nearly all of its samples per scrape; the
+    builder answers such a dict from its own rendered block instead of
+    the items-tuple build, hash, and memo probe a plain dict pays.  The
+    memo is filled on the cold pass too, so its cap and the clears in
+    prune/set_duration_buckets keep their meaning; a cached block dies
+    with its dict, which those clears drop.
     """
 
     __slots__ = ("block",)
@@ -388,18 +388,17 @@ def render_families(
             )
         )
         out.append("# TYPE {} {}".format(type_name, mtype))
-        # The per-sample line is built inline, with no helper: this is
-        # the innermost loop of a scrape (one pass per sample, tens of
-        # thousands of them on a large fleet), and a helper's call frame
-        # plus a (name, block) tuple per sample cost more than the
-        # two-line body they save.  Formatting is the same as
-        # iter_family_samples': same stem, same block builder, same
+        # The per-sample line is built inline: this is the innermost loop
+        # of a scrape (tens of thousands of samples on a large fleet),
+        # where a helper's call frame and its (name, block) tuple cost
+        # more than the two-line body they save.  Formatting is the same
+        # as iter_family_samples': same stem, block builder, and
         # format_value.
         append = out.append
         for suffix, labels, value in family.samples:
             block = block_for(labels) if labels else ""
-            # one f-string build per line; chained concatenation allocates
-            # a throwaway intermediate string per operator
+            # one f-string build per line: chained concatenation allocates
+            # an intermediate string per operator
             append(f"{sample_base}{suffix}{block} {format_value(value)}")
     if openmetrics:
         out.append("# EOF")
@@ -516,9 +515,9 @@ class PrometheusMetrics:
 
     def __init__(self) -> None:
         self._jobs: dict[str, _JobMetrics] = {}
-        # the scrape's job order, memoized: a sort of every name per scrape
-        # is tens of milliseconds on the loop at fleet scale. Dropped
-        # wherever _jobs gains or loses a name (_job, prune).
+        # the scrape's job order, memoized (a sort per scrape costs tens
+        # of milliseconds at fleet scale) and dropped wherever _jobs gains
+        # or loses a name (_job, prune)
         self._sorted_job_names: Optional[list[str]] = None
         self._buckets: tuple[float, ...] = DEFAULT_DURATION_BUCKETS
         # The histogram "le" label strings are a pure function of the (fixed
@@ -1152,11 +1151,10 @@ class PrometheusMetrics:
         """Every configured job's accumulator ensured; the names in order.
 
         Ensuring gives each job zero-filled counters from the first scrape
-        (prune keeps the set aligned with the loaded config on reload);
-        the steady state costs one C-level superset test, not a Python
-        call per job. The sorted list is memoized (_sorted_job_names): a
-        sort of every name per scrape is tens of milliseconds on the loop
-        at fleet scale.
+        (prune keeps the set aligned with the config on reload); in the
+        steady state it is one C-level superset test.  The sorted names
+        are memoized in _sorted_job_names: a sort per scrape costs tens of
+        milliseconds on the loop at fleet scale.
         """
         if not (self._jobs.keys() >= cron.cron_jobs.keys()):
             for name in cron.cron_jobs:
@@ -1356,8 +1354,7 @@ class PrometheusMetrics:
             info.add(
                 {
                     "job_name": name,
-                    # the same string schedule_str renders, precomputed
-                    # on the JobConfig (its _precompute_payload_views)
+                    # schedule_str's string, precomputed on the JobConfig
                     "schedule": job_config.schedule_display,
                     "cluster_policy": job_config.clusterPolicy,
                 },

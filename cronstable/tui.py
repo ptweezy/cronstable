@@ -940,9 +940,9 @@ class Theme:
         # there dominated their cost.
         self._fg = {key: _sgr_fg(spec) for key, spec in palette.items()}
         self._bg = {key: _sgr_bg(spec) for key, spec in palette.items()}
-        # a log line's escape tokens re-ink to the same fragments every
-        # time, so rewrite_sgr memoizes per token here: entries carry
-        # this theme's ink, and _retheme() replacing the Theme drops them
+        # rewrite_sgr's per-token memo: a token always re-inks to the
+        # same fragment for one theme, and _retheme() replacing the Theme
+        # drops the entries
         self._sgr_memo: dict[str, str] = {}
         self._sgr_dispatch = self._make_sgr_dispatch()
 

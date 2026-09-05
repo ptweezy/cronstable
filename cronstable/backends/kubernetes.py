@@ -907,12 +907,10 @@ def _kubeconfig_active_context(
     """The ``context``, ``cluster``, and ``user`` blocks of ``path``'s
     current context.
 
-    The one kubeconfig parse both transports share (the native client's
-    referenced-file discovery, the REST transport's server and credential
-    read), so the two cannot drift on the file's shape.  Raises whatever the
-    file or its shape raises (OSError, the ruamel parse-error family, and
-    KeyError/TypeError/AttributeError for well-formed YAML that is not a
-    kubeconfig); each caller maps that to its own outcome.
+    The one kubeconfig parse both transports share.  Raises whatever the
+    file or its shape raises (OSError, the ruamel parse errors, and
+    KeyError/TypeError/AttributeError for YAML that is not a kubeconfig);
+    each caller maps that to its own outcome.
     """
     from strictyaml.ruamel import YAML
 
