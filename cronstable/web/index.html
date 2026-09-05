@@ -5250,17 +5250,16 @@ var qrcode = function() {
   const pad2 = (n) => String(n).padStart(2, "0");
   const debounce = (fn, ms) => { let t; return function () { clearTimeout(t); t = setTimeout(fn, ms); }; };
 
-  // the replacement map lives outside esc: a literal inside the callback
-  // costs one object per escaped character, and rowHtml escapes a dozen
-  // strings per row
+  // the map lives outside esc: a literal in the callback costs an object
+  // per escaped character, and rowHtml escapes a dozen strings per row
   const _ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => _ESC[c]);
   }
   function escAttr(s) { return esc(s); }
-  // One collator for every name sort. ECMA-402 defines a no-argument
+  // One collator for every name sort: ECMA-402 defines no-argument
   // localeCompare as a fresh default Collator per comparison, so this
-  // orders identically and skips that construction.
+  // orders identically without that construction.
   const _cmp = new Intl.Collator().compare;
 
   // ---- preferences ----
@@ -5805,10 +5804,9 @@ var qrcode = function() {
       c.se++;
       if (c.se > 59) { c.se = 0; c.mi++; if (c.mi > 59) { c.mi = 0; c.h++; if (c.h > 23) { c.h = 0; advDay(); } } }
     };
-    // next value of a restricted plain field strictly after `cur` (values are
-    // sorted ascending, see parseField), or -1 when none is left in this
-    // unit. A tolerant out-of-range value (minute 70) sits past `max`, where
-    // the walk never lands, so it reads as none too.
+    // next value of a restricted plain field after `cur` (values are sorted,
+    // see parseField), or -1 when none is left in this unit; a tolerant
+    // out-of-range value (minute 70) sits past `max` and reads as none too
     const nextOf = (field, cur, max) => {
       const vals = field.values;
       for (let i = 0; i < vals.length; i++) if (vals[i] > cur) return vals[i] <= max ? vals[i] : -1;
@@ -5827,10 +5825,10 @@ var qrcode = function() {
       if (parsed.year.restricted && !parsed.year.has(c.Y)) { advYear(); continue; }
       if (!parsed.month.has(c.Mo)) { advMonth(); continue; }
       if (!dayMatches(parsed, c)) { advDay(); continue; }
-      // The plain fields are jumped, not stepped: a step-by-one crawl only
-      // ever lands on the first matching value, or cascades into the next
-      // unit with the lower fields zeroed, and the guards above read only
-      // Y/Mo/D, which every skipped state shares with the landing one.
+      // The plain fields are jumped, not stepped: a step-by-one crawl lands
+      // on the first matching value or cascades into the next unit with the
+      // lower fields zeroed, and the guards above read only Y/Mo/D, which
+      // the skipped states share with the landing one.
       if (!parsed.hour.has(c.h)) {
         const nh = nextOf(parsed.hour, c.h, 23);
         c.mi = 0; c.se = 0;
@@ -6318,9 +6316,8 @@ var qrcode = function() {
   }
   // Absolute browser-local label for a future instant: HH:MM today, "tom"
   // for tomorrow, month + day beyond that.
-  // The two reference strings are memoized on the exact Date.now() value:
-  // rowHtml asks once per row per rebuild, and every call in the same
-  // millisecond shares them.
+  // The two reference strings are memoized per Date.now() value: rowHtml
+  // asks once per row per rebuild.
   const _atRef = { now: NaN, today: "", tom: "" };
   function fmtAt(ms) {
     const d = new Date(ms), nowMs = Date.now();
@@ -7727,10 +7724,9 @@ var qrcode = function() {
   // cycle against the browser's ~6-per-origin connection cap (see
   // singleFlight). A cycle that finds its predecessor still pending joins it,
   // and the next cluster poll calls straight back in.
-  // Each /fleet payload's response text, keyed by the object it parsed to:
-  // renderFleet's dirty-check reads it back, so the whole nodes-by-jobs
-  // payload is not re-serialized every poll (a seeded payload has none and
-  // falls back to serializing it).
+  // Each /fleet response text, keyed by its parsed object: renderFleet's
+  // dirty-check reads it back instead of re-serializing the nodes-by-jobs
+  // payload every poll (a seeded payload has none and is serialized).
   const _fleetText = new WeakMap();
   function loadFleet() {
     return singleFlight("fleet", async () => {
@@ -8606,11 +8602,10 @@ var qrcode = function() {
   function clearTerm() { state.log.lines = []; state.log.curMatch = -1; state.log.total = 0; state.log.matchSig = null; termEl().innerHTML = ""; updateLogCount(); }
   function stopStream() { if (state.stream) { state.stream.abort(); state.stream = null; } }
 
-  // The regex query's RegExp is kept across calls and rebuilt only when its
-  // source changes: logQuery runs once per streamed line, and compiling a
-  // RegExp is the costliest step of appending one. The "g" flag makes it
-  // stateful, and every consumer (highlight, lineMatches) resets lastIndex
-  // before use.
+  // The RegExp is kept across calls and rebuilt only when its source
+  // changes: logQuery runs once per streamed line, and the compile is the
+  // costliest step of appending one. The "g" flag makes it stateful; every
+  // consumer (highlight, lineMatches) resets lastIndex first.
   const _logRe = { src: null, re: null, bad: false };
   function logQuery() {
     const q = $("logSearch").value;
@@ -8711,9 +8706,9 @@ var qrcode = function() {
     }
     return esc(text);
   }
-  // Takes the buffered item, not its text: the ANSI-stripped and lowercased
-  // forms are cached on it (its text never changes), so neither the rescan
-  // a query change triggers nor the per-line count fold re-derives them.
+  // Takes the buffered item, not its text: the stripped and lowercased
+  // forms are cached on it (its text never changes), so a rescan and the
+  // per-line count fold reuse them.
   function lineMatches(item, q) {
     if (!q) return true;
     let plain = item._pl;
@@ -8837,9 +8832,8 @@ var qrcode = function() {
     return null;
   }
   // q: the parsed query when the caller holds one (appendLine, renderTerm),
-  // parsed here otherwise. The label is written only when it changes:
-  // writing an equal string replaces the text node for nothing, once per
-  // streamed line.
+  // parsed here otherwise. The label is written only when it changes; an
+  // equal write replaces the text node for nothing, once per streamed line.
   function updateLogCount(q) {
     if (q === undefined) q = logQuery();
     const c = $("logCount");

@@ -113,27 +113,22 @@ _patch_strictyaml_seq_deepcopy()
 def _patch_strictyaml_pointer_copy() -> None:
     """Make strictyaml's chunk navigation fork a pointer without deepcopy.
 
-    strictyaml walks a document through ``YAMLPointer`` objects, and every
-    step (``val``/``key``/``index``/``textslice``/``parent``) derives the
-    child pointer with ``copy.deepcopy(self)``.  A pointer's only state is
-    ``_indices``, a list of ``(kind, payload)`` tuples whose leaves are
-    strings and ints, so the generic deepcopy machinery (reconstruct, the
-    per-container dispatch, the memo dict) spends some 40 Python calls
-    producing what one list copy produces identically.  The walk runs once
-    per key and element of the document, on every boot parse, every
-    --validate-config, every --job-set-id, and every reload that touches a
-    file; with the deepcopy in place it is about a quarter of a 300-job
-    parse.
+    strictyaml derives each child ``YAMLPointer`` (``val``/``key``/
+    ``index``/``textslice``/``parent``) with ``copy.deepcopy(self)``.  A
+    pointer's only state is ``_indices``, a list of tuples of strings and
+    ints, so the generic deepcopy spends some 40 Python calls producing
+    what one list copy produces; the walk runs once per key and element,
+    about a quarter of a 300-job parse.
 
-    A pure cost change: nothing mutates ``_indices`` in place (every
-    navigation returns a fresh pointer), the tuples are immutable, and the
-    argument assertions are kept verbatim.  Error rendering is unaffected:
-    ``_slice_segment`` deep-copies the document, not a pointer.
+    A pure cost change: nothing mutates ``_indices`` in place, the tuples
+    are immutable, and the argument assertions are kept.  Error rendering
+    is unaffected (``_slice_segment`` deep-copies the document, not a
+    pointer).
 
     Probed like the Seq shim: the rebinding happens only while upstream's
     methods deep-copy and a pointer carries ``_indices`` alone, so a
-    strictyaml that ships a fix or adds pointer state, or a second import
-    of this module, is left alone.
+    strictyaml with a fix or added pointer state, or a second import of
+    this module, is left alone.
     """
     try:
         from strictyaml.yamlpointer import YAMLPointer
@@ -1609,12 +1604,11 @@ LintCache = dict[tuple[str, str, Optional[datetime.tzinfo]], list[Finding]]
 #: sharing safe by construction (an accidental edit fails loudly).
 _NO_SLA_THRESHOLDS: Mapping[str, Any] = types.MappingProxyType({})
 
-#: The findings of a clean schedule, shared by every such job: two fresh
-#: empty lists per JobConfig (the lint result and its JSON twin) are two
-#: GC-tracked containers per job walked on every full collection, for the
-#: overwhelmingly common case of nothing to report.  Read-only by
-#: convention, like _NO_SLA_THRESHOLDS (a list, not a tuple: the payload
-#: serializes it, and consumers compare it to ``[]``).
+#: The findings of a clean schedule, shared by every such job: a fresh
+#: empty list per JobConfig (and its JSON twin) is a GC-tracked container
+#: walked on every full collection.  Read-only by convention, like
+#: _NO_SLA_THRESHOLDS; a list rather than a tuple because the payload
+#: serializes it and consumers compare it to ``[]``.
 _NO_FINDINGS: list[Finding] = []
 _NO_FINDINGS_JSON: list[dict[str, Any]] = []
 
@@ -2298,10 +2292,10 @@ class DagTaskConfig:
         raw_task: dict,
         defaults: Optional[dict[str, Any]] = None,
     ) -> None:
-        # Imported at the point of use, not at module load: only a config
-        # with a dags: section needs the DAG state machine, and this module
-        # is what --validate-config and --job-set-id import (the daemon
-        # pays nothing extra, cron.py imports dag itself).
+        # Imported at the point of use: only a config with a dags: section
+        # needs the DAG state machine, and this module is on the
+        # --validate-config and --job-set-id import paths (the daemon
+        # imports dag anyway, through cron.py).
         from cronstable import dag
 
         # `defaults` is the assembled job-defaults base, the same base a
@@ -4179,9 +4173,8 @@ class CronstableConfig:
 # The scanner is hand-rolled and single-pass: ``re.sub`` with a
 # ``:-([^}]*)`` default is O(n^2) on a value carrying many unterminated
 # ``${x:-`` fragments, which would stall config load and hot-reload.  Names
-# are ASCII ``[A-Za-z_][A-Za-z0-9_]*``, read by one anchored match: it
-# consumes the name and nothing else (no default group), so it can never
-# rescan the tail, and the scan costs one C call per name.
+# are ASCII ``[A-Za-z_][A-Za-z0-9_]*``, read by one anchored match that
+# consumes the name and nothing else, so it can never rescan the tail.
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -4313,8 +4306,8 @@ def _interpolate_env(doc: Any, path: str) -> Any:
 
     def walk(node: Any, location: str, kind: str) -> Any:
         if isinstance(node, str):
-            # leaves outnumber containers, so the walk tests for them first
-            # and returns a $-free leaf (nearly all of them) without a call
+            # leaves outnumber containers: test for them first, and answer
+            # a $-free one (nearly all of them) without a call
             if "$" not in node:
                 return node
             return _interpolate_env_value(node, path, location)

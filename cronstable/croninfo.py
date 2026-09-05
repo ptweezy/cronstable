@@ -788,8 +788,7 @@ def _lint_month_lengths(tab: CronTab) -> list[Finding]:
     nearest = tab.nearest_weekday_days
     day_like = dom | nearest if nearest else dom
     offsets = tab.last_day_offsets
-    # the parser never leaves a day column empty, so past the two exits
-    # above something below is always set
+    # the parser never leaves a day column empty, so this cannot fire
     if not day_like and not offsets:  # pragma: no cover - defensive
         return []
     findings: list[Finding] = []
@@ -1520,9 +1519,8 @@ def _fire_cells(
         # the slot, not the property (one Python call per entry at scale)
         key = (entry.tab._resolved, zone)
         keys.append(key)  # kept aligned with ``entries``, skips included
-        # ``members`` and ``walk_cache`` hold the same keys (a walk is
-        # stored together with its first member), so the one probe that
-        # finds the group also says the walk is done
+        # ``members`` and ``walk_cache`` hold the same keys, so one probe
+        # answers both
         group = members.get(key)
         if group is not None:
             group.append(entry.name)
@@ -1726,8 +1724,8 @@ def duplicate_schedules(
     for members in groups.values():
         if len(members) < 2:
             continue
-        # read off the slots, as _semantic_key does: str() and the
-        # property hand back these same strings at one Python call each
+        # the slots, as in _semantic_key: str() and the property return
+        # the same strings at a call each
         sources = Counter(entry.tab._source for entry in members)
         resolved = Counter(entry.tab._resolved for entry in members)
         out.append(

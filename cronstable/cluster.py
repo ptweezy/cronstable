@@ -532,16 +532,15 @@ def _hrw_owner_bytes(
     first.update(member_bytes[0])
     best_name = members[0]
     best_score = first.digest()[:8]
-    # islice skips the first pair without copying either member list; the
-    # strict zip is drained in full, so a length mismatch raises.
+    # islice: no list copies, and the strict zip still raises on a length
+    # mismatch
     for name, name_bytes in islice(
         zip(members, member_bytes, strict=True), 1, None
     ):
         digest = copy()
         digest.update(name_bytes)
         score = digest.digest()[:8]
-        # (score, name) > (best_score, best_name), spelled out so that
-        # the per-member compare allocates no tuples
+        # (score, name) > (best_score, best_name), without the tuples
         if score > best_score or (score == best_score and name > best_name):
             best_score, best_name = score, name
     return best_name
@@ -1338,9 +1337,8 @@ class ClusterManager(LeadershipBackend):
         """
         stable: dict[str, Any] = {}
         for name, entry in job_summaries.items():
-            # copy the entry, then rewrite the one key, so no per-key
-            # Python compare runs (an entry without scheduled_in stays
-            # without it)
+            # copy, then rewrite the one key; an entry without
+            # scheduled_in stays without it
             copy = dict(entry)
             if "scheduled_in" in copy:
                 value = copy["scheduled_in"]
@@ -2728,8 +2726,8 @@ class ClusterManager(LeadershipBackend):
         gate closed cluster-wide (an availability DoS, never a double-run);
         see :func:`build_server_ssl_context`.
 
-        Memoized like its three inputs: the Leader gate asks per job per
-        tick, and each input's own memo lookup costs a state-key build.
+        Memoized like its three inputs: the Leader gate asks once per job
+        per tick.
         """
         return (
             bool(self.conflict_names())

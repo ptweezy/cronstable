@@ -160,11 +160,11 @@ def render_calendar(
     if now is None:
         now = datetime.datetime.now(utc)
     end_utc = (start + datetime.timedelta(days=days)).astimezone(utc)
-    # Every line is folded once, where it is built, and only the lines
-    # that can pass 75 octets are folded at all: the literals below and
-    # the timestamp and duration lines cannot.  ``parts`` holds finished
-    # text, one line or (per event) one pre-joined block, so the final
-    # join is the only per-line work.
+    # Each line is folded once, where it is built; the literals and the
+    # timestamp and duration lines cannot pass 75 octets, so they are
+    # not folded at all.  ``parts`` holds finished text (a line, or one
+    # pre-joined block per event), so the final join is the only
+    # per-line work.
     parts = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -184,11 +184,10 @@ def render_calendar(
     # the host clock walks on a fixed offset wherever the window and the
     # engine's look-back hold no transition (croninfo._walk_fires)
     local_tz = _local_tzinfo()
-    # A fleet repeats a handful of schedules across many jobs, and for a
-    # tab without an H item the prose is a function of the expression
-    # alone (the hash key only reaches an H item), so each distinct
-    # expression is described once.  An H slot's prose hashes from the
-    # job name and is never shared.
+    # A fleet repeats a few schedules across many jobs, and for a tab
+    # without an H item the prose depends on the expression alone, so
+    # each distinct expression is described once.  An H slot's prose
+    # hashes from the job name and is never shared.
     described: dict[str, str] = {}
     for entry in entries:
         tab = entry.tab
@@ -214,10 +213,10 @@ def render_calendar(
             )
         uid_ns = hashlib.sha256(entry.name.encode("utf-8")).hexdigest()[:12]
         summary = _escape(entry.name)
-        # The event block, with the fire's stamp cut out of it: the UID
-        # (44 ASCII octets) and DTSTART (24) never fold, so the stamp is
-        # spliced in raw; everything else is folded here, once per entry,
-        # with the CRLFs in place.
+        # The event block with the fire's stamp cut out: the UID (44
+        # ASCII octets) and DTSTART (24) never fold, so the stamp is
+        # spliced in raw; the rest is folded once per entry, CRLFs
+        # included.
         head = "BEGIN:VEVENT" + _CRLF + "UID:" + uid_ns + "-"
         middle = "@cronstable" + _CRLF + dtstamp_line + _CRLF + "DTSTART:"
         tail = _CRLF.join(

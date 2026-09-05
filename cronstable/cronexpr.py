@@ -169,9 +169,8 @@ _DAY_INDEXES = {5: (2, 4), 6: (2, 4), 7: (3, 5)}
 #: malformed hash item, not a value (no month/weekday name starts with h).
 _HASH_ITEM = re.compile(r"h(?:\((\d+)-(\d+)\))?(?:/(\d+))?\Z")
 
-#: an item that opens with ``h`` (at the start of a field or after a
-#: comma) is the only position an H item can occupy, so ``thu`` and
-#: ``@hourly`` never trip this; runs on the lowercased expression
+#: an H item can only open a field or follow a comma, so ``thu`` and
+#: ``@hourly`` never match; applied to the lowercased expression
 _ITEM_H = re.compile(r"(?:^|[\s,])h")
 
 #: a rangeless ``H`` form (bare ``H`` or ``H/n``) in day-of-month hashes
@@ -513,9 +512,9 @@ _DowParse = tuple[frozenset[int], frozenset[int], frozenset[tuple[int, int]]]
 #: A time of day as the three numbers a datetime constructor wants.
 _HMS = tuple[int, int, int]
 
-#: The time-of-day floor (or ceiling) the time walks take.  They read
-#: only hour/minute/second, so a datetime serves as well as a time, and
-#: the civil walks pass their seed through as is.
+#: The time-of-day floor (or ceiling) the time walks take: they read
+#: only hour/minute/second, so the civil walks pass their seed datetime
+#: as is.
 _TimeOfDay = datetime.time | datetime.datetime
 
 #: How many distinct field texts each interning cache below keeps.  Fleets
@@ -1041,11 +1040,10 @@ class CronTab:
         self._resolved = self._source
         lowered = crontab.lower()
         fields = lowered.split()
-        # Skip the (not cheap) H expansion when no item opens with 'h';
-        # ``display is None`` means "nothing to resolve".  The expansion
-        # only acts on an item-opening h, so the probe skips exactly what
-        # the expansion passes through untouched; the substring test
-        # comes first, the regex only when it hits (``thu``).
+        # Skip the (not cheap) H expansion when no item opens with 'h',
+        # the only place it acts (``display is None`` means nothing to
+        # resolve).  Substring test first, the regex only when it hits
+        # (``thu``).
         has_hash = "h" in lowered and _ITEM_H.search(lowered) is not None
         display: Optional[list[str]] = (
             self._source.split() if has_hash else None
@@ -1296,9 +1294,9 @@ class CronTab:
     # ------------------------------------------------------------------
     def test(self, entry: datetime.datetime) -> bool:
         """Whether ``entry``'s civil fields match (microseconds ignored)."""
-        # a pure AND of set probes, so the order is free: the minute
-        # column rejects most often (every scheduler probe carries second
-        # 0, which nearly every schedule accepts), so it goes first
+        # a pure AND of set probes, so order is free: the minute column
+        # rejects most often (scheduler probes carry second 0, which
+        # nearly every schedule accepts), so it goes first
         if not (
             entry.minute in self._minutes
             and entry.hour in self._hours
@@ -1358,7 +1356,7 @@ class CronTab:
         ):
             return True
         # a W shift moves at most two days, so the range guards skip the
-        # date construction on every day the item cannot land on
+        # date construction on every other day
         if (
             self._dom_last_weekday
             and day >= month_end - 2  # LW lands on the final three days
@@ -1487,10 +1485,10 @@ class CronTab:
                 # no civil match before the horizon: the same walk from
                 # the same label, whichever frame reads it
                 return None
-            # ``now_utc + timedelta(seconds=delay) <= good_to`` without
-            # building either object: ``delay`` is a whole number of
+            # equals ``now_utc + timedelta(seconds=delay) <= good_to``
+            # without building either object: ``delay`` is whole
             # microseconds and total_seconds() rounds monotonically, so
-            # the float comparison is exact over the engine's range
+            # the comparison is exact over the engine's range
             if delay <= (good_to - now_utc).total_seconds():
                 return delay
         return self.next(now=now_utc.astimezone(LOCAL_ZONE))
@@ -1504,8 +1502,8 @@ class CronTab:
             civil.replace(microsecond=0) if civil.microsecond else civil
         ) + _ONE_SECOND
         year, month, day = base.year, base.month, base.day
-        # the seed itself is the time-of-day floor: the time walks read
-        # only hour/minute/second, so no datetime.time is sliced off it
+        # the seed itself is the floor: the time walks read only
+        # hour/minute/second
         tod: Optional[_TimeOfDay] = base
         years = self._years
         years_sorted = self._years_sorted
@@ -1580,10 +1578,9 @@ class CronTab:
         if self._dow_free:
             # Day-of-week unrestricted, so only the day-of-month list
             # constrains the day: bisect to the first listed day at or
-            # after ``day``; the calendar days in between are never
-            # tested.  Two candidates at most: the seed day (the only
-            # one the floor applies to) and, once its times are spent,
-            # the next listed day, which starts from midnight.
+            # after ``day``.  Two candidates at most: the seed day (the
+            # only one the floor applies to) and, once its times are
+            # spent, the next listed day from midnight.
             dom_sorted = self._dom_sorted
             index = bisect_left(dom_sorted, day)
             if index == len(dom_sorted):

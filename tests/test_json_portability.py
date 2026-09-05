@@ -340,11 +340,10 @@ def _nested_chain(depth, ctors):
     ],
 )
 def test_depth_bound_holds_in_every_container_arm(flavour, ctors):
-    # The gates inline the dict and list arms of their dispatch inside the
-    # container loops (and the orjson pre-walk folds a whole level in), so
-    # the depth counter is checked in several places.  A chain that puts
-    # each kind of container at the bound must be refused by every gate,
-    # and the same chain one level shorter accepted, on both backends.
+    # The gates check the depth counter in several places (the inlined
+    # dict and list arms, the orjson pre-walk's folded level).  A chain
+    # with each kind of container at the bound must be refused by every
+    # gate, and one level shorter accepted, on both backends.
     mod = _json if flavour == "installed" else _load_json_without_orjson()
     ok = _nested_chain(mod.MAX_DEPTH, ctors)
     too_deep = _nested_chain(mod.MAX_DEPTH + 1, ctors)
