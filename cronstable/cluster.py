@@ -532,8 +532,7 @@ def _hrw_owner_bytes(
     first.update(member_bytes[0])
     best_name = members[0]
     best_score = first.digest()[:8]
-    # islice: no list copies, and the strict zip still raises on a length
-    # mismatch
+    # islice: no list copies; the strict zip raises on a length mismatch
     for name, name_bytes in islice(
         zip(members, member_bytes, strict=True), 1, None
     ):

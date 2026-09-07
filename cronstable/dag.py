@@ -1208,12 +1208,9 @@ def _advance_task(
         _terminalise_task(entry, SKIPPED, now, result)
         return
     if result.deferred and task.type != APPROVAL:
-        # Quota spent this pass: only _claims_full sets deferred, and
-        # launches never shrink within a pass, so _claim_task returns
-        # untouched for every later plain task or sensor.  The first
-        # over-quota claim goes through it (that call marks the result),
-        # a gate is never quota-bound, and the retry arm above applies
-        # the same rule.
+        # Quota spent this pass (only _claims_full sets deferred, and
+        # launches never shrink within a pass): _claim_task would return
+        # untouched. A gate parks without a launch, so it is never quota-bound.
         return
     _claim_task(task, taskkey, map_index, item, entry, now, proc, host, result)
 

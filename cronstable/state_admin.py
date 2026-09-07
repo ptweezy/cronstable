@@ -98,12 +98,9 @@ def _walk_carried(base: str) -> Iterator[tuple[str, str]]:
     for sub in _CARRIED_DIRS:
         root = os.path.join(base, sub)
         for dirpath, _dirnames, filenames in os.walk(root):
-            # One relpath per directory, not per file: relpath
-            # re-normalizes both arguments on every call, and a store is
-            # many files in few directories.  A file's relative path is
-            # its directory's plus a separator and the name; directly
-            # under base the directory reads ".", never the case here
-            # (every root is a subdirectory) but handled.
+            # One relpath per directory: relpath re-normalizes both
+            # arguments on every call, and a store is many files in few
+            # directories.  relpath spells base itself as ".".
             rel_dir = os.path.relpath(dirpath, base)
             arc_dir = "" if rel_dir == os.curdir else rel_dir + os.sep
             for filename in sorted(filenames):

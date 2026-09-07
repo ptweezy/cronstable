@@ -9,6 +9,8 @@ server up via start_stop_web_app and scrape it like Prometheus would.
 import asyncio
 import datetime
 import math
+import subprocess
+import sys
 import threading
 from functools import partial
 
@@ -1673,6 +1675,100 @@ def test_render_is_stable_when_the_memo_overflows(monkeypatch):
     cron.metrics._label_blocks.clear()
     monkeypatch.setattr(cronstable.prometheus, "LABEL_BLOCK_CACHE_MAX", 3)
     assert cron.metrics.render(cron) == uncapped
+
+
+def _is_job_only(key):
+    """Whether a memo key is one of the label sets _label_sets shares."""
+    return {name for name, _ in key} <= {"job_name", "status", "le", "mode"}
+
+
+def test_shared_job_label_blocks_stay_out_of_the_memo(monkeypatch):
+    # A job's shared label dicts carry their own rendered block, so the
+    # memo holds only the plain dicts a scrape builds fresh (info
+    # families, the SLA dicts, the non-job families).
+    cron = _pinned_cron()
+    cron.metrics.job_run_recorded("alpha", "success", 2.0)
+    text = cron.metrics.render(cron)
+    assert 'cronstable_job_paused{job_name="alpha"} 0' in text
+    assert (
+        'cronstable_job_runs_total{job_name="alpha",status="success"} 1'
+        in text
+    )
+    assert (
+        'cronstable_job_duration_seconds_bucket{job_name="alpha",le="5.0"} 1'
+        in text
+    )
+    memo = cron.metrics._label_blocks
+    assert memo  # the plain dicts are memoized
+    assert not any(_is_job_only(key) for key in memo)
+    built = []
+    real = cronstable.prometheus._render_label_block
+
+    def counting(key):
+        built.append(key)
+        return real(key)
+
+    monkeypatch.setattr(cronstable.prometheus, "_render_label_block", counting)
+    # a warm scrape renders nothing: every block is pinned or memoized
+    assert cron.metrics.render(cron) == text
+    assert built == []
+    # with the memo emptied, only the plain dicts are rendered again; the
+    # shared dicts answer from their pinned block
+    memo.clear()
+    assert cron.metrics.render(cron) == text
+    assert built
+    assert not any(_is_job_only(key) for key in built)
+    assert not any(_is_job_only(key) for key in memo)
+
+
+def test_recording_a_new_job_refreshes_the_scrape_order():
+    # _job() drops the memoized name order when it adds an accumulator, so
+    # a job first seen between scrapes appears on the next one.
+    metrics = PrometheusMetrics()
+    metrics.job_run_recorded("a", "success", 1.0)
+    text = _registry_text(metrics)
+    assert _job_runs(text, job_name="a", status="success") == 1
+    metrics.job_run_recorded("b", "success", 1.0)
+    text = _registry_text(metrics)
+    assert _job_runs(text, job_name="a", status="success") == 1
+    assert _job_runs(text, job_name="b", status="success") == 1
+
+
+def test_small_integral_table_fills_on_the_first_scrape():
+    # The table is empty after an import and filled by the first render;
+    # format_value renders the same digits either way. A subprocess, since
+    # this process rendered long ago.
+    code = (
+        "import cronstable.prometheus as p\n"
+        "assert p._SMALL_INTEGRAL_STRS == {}, p._SMALL_INTEGRAL_STRS\n"
+        "assert p.format_value(7.0) == '7'\n"
+        "fam = p.MetricFamily('t', 'gauge', 'x')\n"
+        "fam.add({}, 7)\n"
+        "assert 't 7\\n' in p.render_families([fam])\n"
+        "assert len(p._SMALL_INTEGRAL_STRS) == 4096\n"
+        "assert p._SMALL_INTEGRAL_STRS[7.0] == '7'\n"
+        "assert p.format_value(7.0) == '7'\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    assert out.returncode == 0, out.stderr
+
+
+def test_small_integral_table_fills_from_iter_family_samples():
+    # the sample iterator is the other scrape entry point
+    from cronstable.prometheus import _SMALL_INTEGRAL_STRS, iter_family_samples
+
+    fam = MetricFamily("t", "gauge", "x")
+    fam.add({}, 7)
+    _SMALL_INTEGRAL_STRS.clear()
+    try:
+        assert format_value(7.0) == "7"
+        assert list(iter_family_samples([fam])) == [("t", "", "7")]
+        assert len(_SMALL_INTEGRAL_STRS) == 4096
+        assert format_value(7.0) == "7"
+    finally:
+        cronstable.prometheus._fill_small_integral_strs()
 
 
 # ---------------------------------------------------------------------------

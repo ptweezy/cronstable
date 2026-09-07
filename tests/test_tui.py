@@ -466,6 +466,18 @@ def test_rewrite_sgr_reinks_log_colors():
     # 256-color foregrounds collapse to the bright ink, not garbage
     out = rewrite_sgr("\x1b[38;5;196mX", theme)
     assert strip_ansi(out) == "X"
+    assert theme.fg("bright") in out
+    # background requests (256-color and truecolor) are dropped whole:
+    # the TUI owns the background
+    for bg in ("\x1b[48;5;196mX", "\x1b[48;2;1;2;3mX"):
+        out = rewrite_sgr(bg, theme)
+        assert strip_ansi(out) == "X"
+        assert theme.fg("bright") not in out
+        assert "48;" not in out
+    # an unknown code emits nothing
+    assert rewrite_sgr("\x1b[5mX", theme) == "X"
+    # a trailing 38 with no colour spec after it emits nothing
+    assert rewrite_sgr("\x1b[38mX", theme) == "X"
 
 
 def test_oneline_flattens_multiline_commands():
@@ -2511,7 +2523,19 @@ def test_rewrite_sgr_memo_is_per_theme_and_bounded(monkeypatch):
     memo = theme._sgr_memo
     assert set(memo) == {"\x1b[31m", "\x1b[0m", "\x1b]0;title\x07"}
     assert memo["\x1b]0;title\x07"] == ""  # a stripped escape is a hit too
+    # the warm call is served from the memo: the dispatch closure reads
+    # the module-level _rewrite_sgr_token, so a counting wrapper sees
+    # every miss
+    real_token = tui._rewrite_sgr_token
+    misses: list[str] = []
+
+    def counting(token, theme_):
+        misses.append(token)
+        return real_token(token, theme_)
+
+    monkeypatch.setattr(tui, "_rewrite_sgr_token", counting)
     assert rewrite_sgr(line, theme) == first
+    assert misses == []
     # the memo holds this theme's ink only: a fresh theme starts empty
     assert Theme("carolina", light=True)._sgr_memo == {}
     monkeypatch.setattr(tui, "_SGR_MEMO_MAX", 4)

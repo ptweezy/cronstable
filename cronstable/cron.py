@@ -11441,12 +11441,11 @@ class Cron:
     async def _wait_for_running_jobs(self) -> None:
         # job -> wait task
         wait_tasks: dict[RunningJob, asyncio.Task] = {}
-        # The wait task's done callback delivers a completion: it files
-        # the job here and sets `completed`, O(1) per finish however many
-        # jobs are running. asyncio.wait over the whole wait set costs a
-        # waiter registered and removed on every running job per
-        # completion, quadratic in the running count on the scheduler's
-        # own loop (what loop.stall_completions_500 measures).
+        # The wait task's done callback files the job here and sets
+        # `completed`: O(1) per finish. asyncio.wait over every wait task
+        # would register and remove a waiter per running job per
+        # completion, quadratic in the running count
+        # (loop.stall_completions_500 measures it).
         finished: list[RunningJob] = []
         completed = asyncio.Event()
 

@@ -2686,6 +2686,20 @@ jobs:
     assert (
         conf.jobs[0].streamPrefix == "price $5, $VAR, ${unclosed and a{brace}"
     )
+    # A `${` followed by anything but a name (a digit, a `}`, a `-`, or a
+    # `:-` with no name) is literal too, even with a `}` in reach.
+    conf = config.parse_config_string(
+        """
+jobs:
+  - name: n
+    command: c
+    schedule:
+      minute: "*"
+    streamPrefix: "${5} ${} ${-x} ${:-d}"
+""",
+        "test.yaml",
+    )
+    assert conf.jobs[0].streamPrefix == "${5} ${} ${-x} ${:-d}"
 
 
 def test_env_interp_expands_state_path_and_include_path(monkeypatch, tmp_path):
@@ -2937,6 +2951,47 @@ def test_duplicate_job_names_rejected(tmp_path):
         config.parse_config(str(cfg))
     assert "duplicate job name" in str(exc.value)
     assert "backup" in str(exc.value)
+
+
+_DAG_X = """
+dags:
+  - name: x
+    schedule: "0 1 * * *"
+    tasks:
+      - id: a
+        command: echo a
+"""
+
+
+@pytest.mark.parametrize("dag_section", ["", _DAG_X], ids=["no-dag", "dag-x"])
+def test_job_name_under_dag_prefix_rejected(dag_section):
+    # a scheduled DAG runs under a synthetic job named 'dag:<name>', and the
+    # calendar feed, /schedule/why, and the jobs list resolve that name to a
+    # job; the prefix is reserved whether or not a DAG of that name exists.
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config_string(
+            "jobs:\n"
+            "  - name: 'dag:x'\n"
+            '    schedule: "0 1 * * *"\n'
+            "    command: echo one\n" + dag_section,
+            "test.yaml",
+        )
+    assert "'dag:x'" in str(exc.value)
+    assert "'dag:'" in str(exc.value)
+    assert str(exc.value).startswith("test.yaml: job ")
+
+
+@pytest.mark.parametrize("name", ["dagx", "mydag:x"])
+def test_job_name_near_dag_prefix_loads(name):
+    # only the exact prefix is reserved
+    conf = config.parse_config_string(
+        "jobs:\n"
+        "  - name: '{}'\n"
+        '    schedule: "0 1 * * *"\n'
+        "    command: echo one\n".format(name),
+        "test.yaml",
+    )
+    assert conf.jobs[0].name == name
 
 
 # ---------------------------------------------------------------------------

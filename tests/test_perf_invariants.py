@@ -519,21 +519,13 @@ def test_hoisted_seq_deepcopy_parses_identically_to_the_stock_one():
         ), field.name
 
 
-def test_forked_pointer_parses_identically_to_the_stock_one():
-    # The twin of the test above for config._patch_strictyaml_pointer_copy.
-    # A document parsed under upstream's pointer methods and under the
-    # forked ones must give indistinguishable configs, and an invalid
-    # document the same error: the error path slices the offending chunk
-    # out through the very pointers being forked, so a wrong pointer shows
-    # up there first, as a mislocated or blank snippet.
+def _stock_pointer_methods():
+    """strictyaml's YAMLPointer navigation: upstream's bodies without their
+    type assertions, so each fork goes through the deepcopy the config shim
+    removes."""
     import copy as copy_mod
-    import dataclasses
 
-    from strictyaml.yamlpointer import YAMLPointer
-
-    from cronstable.config import ConfigError, parse_config_string
-
-    def stock_val(self, regularkey, strictkey):  # verbatim upstream
+    def stock_val(self, regularkey, strictkey):
         new_location = copy_mod.deepcopy(self)
         new_location._indices.append(("val", (regularkey, strictkey)))
         return new_location
@@ -558,13 +550,29 @@ def test_forked_pointer_parses_identically_to_the_stock_one():
         new_location._indices = new_location._indices[:-1]
         return new_location
 
-    stock = {
+    return {
         "val": stock_val,
         "key": stock_key,
         "index": stock_index,
         "textslice": stock_textslice,
         "parent": stock_parent,
     }
+
+
+def test_forked_pointer_parses_identically_to_the_stock_one():
+    # The twin of the test above for config._patch_strictyaml_pointer_copy.
+    # A document parsed under upstream's pointer methods and under the
+    # forked ones must give indistinguishable configs, and an invalid
+    # document the same error: the error path slices the offending chunk
+    # out through the very pointers being forked, so a wrong pointer shows
+    # up there first, as a mislocated or blank snippet.
+    import dataclasses
+
+    from strictyaml.yamlpointer import YAMLPointer
+
+    from cronstable.config import ConfigError, parse_config_string
+
+    stock = _stock_pointer_methods()
     forked = {name: getattr(YAMLPointer, name) for name in stock}
     # the shim must actually be installed, or this compares stock to stock
     assert all(
@@ -638,6 +646,71 @@ def test_forked_pointer_parses_identically_to_the_stock_one():
         assert _deep_repr(getattr(actual, field.name)) == _deep_repr(
             getattr(expected, field.name)
         ), field.name
+
+    # Pointer by pointer, for all five methods: a config parse never
+    # reaches textslice (strictyaml's only caller is CommaSeparated, which
+    # no cronstable schema uses), so the parse above cannot vouch for it.
+    calls = {
+        "val": ("jobs", "jobs"),
+        "key": ("name", "name"),
+        "index": (2,),
+        "textslice": (1, 3),
+        "parent": (),
+    }
+    predicates = ("is_val", "is_key", "is_index", "is_textslice")
+    for name, args in calls.items():
+        source = YAMLPointer()
+        source._indices = [("val", ("jobs", "jobs")), ("index", 0)]
+        before = list(source._indices)
+        expected_ptr = stock[name](source, *args)
+        actual_ptr = forked[name](source, *args)
+        assert actual_ptr._indices == expected_ptr._indices, name
+        assert source._indices == before, name
+        assert actual_ptr._indices is not source._indices, name
+        for predicate in predicates:
+            assert getattr(actual_ptr, predicate)() == getattr(
+                expected_ptr, predicate
+            )(), (name, predicate)
+
+
+def test_pointer_shim_stands_down_on_unknown_pointer_state():
+    # config._patch_strictyaml_pointer_copy installs its fork only while a
+    # pointer's state is exactly `_indices`: a strictyaml whose pointers
+    # carry more state would lose it to the fork. Once installed, a second call
+    # sees no deepcopy to remove and leaves the methods as they are.
+    from strictyaml.yamlpointer import YAMLPointer
+
+    from cronstable import config
+
+    stock = _stock_pointer_methods()
+    forked = {name: getattr(YAMLPointer, name) for name in stock}
+    stock_init = YAMLPointer.__init__
+
+    def init_with_extra_state(self):
+        stock_init(self)
+        self._extra = None
+
+    try:
+        for name, method in stock.items():
+            setattr(YAMLPointer, name, method)
+        YAMLPointer.__init__ = init_with_extra_state
+        config._patch_strictyaml_pointer_copy()
+        for name, method in stock.items():
+            assert getattr(YAMLPointer, name) is method, name
+
+        YAMLPointer.__init__ = stock_init
+        config._patch_strictyaml_pointer_copy()
+        installed = {name: getattr(YAMLPointer, name) for name in stock}
+        for name, method in installed.items():
+            assert method is not stock[name], name
+            assert "deepcopy" not in method.__code__.co_names, name
+        config._patch_strictyaml_pointer_copy()
+        for name, method in installed.items():
+            assert getattr(YAMLPointer, name) is method, name
+    finally:
+        YAMLPointer.__init__ = stock_init
+        for name, method in forked.items():
+            setattr(YAMLPointer, name, method)
 
 
 # --- 8. the lazy import doors stay shut ------------------------------------
@@ -791,7 +864,8 @@ def test_importing_the_daemon_loads_no_aiohttp_and_first_touch_loads_it():
     assert probe["AIOHTTP-NAME-AFTER-TOUCH"] == "aiohttp", (
         "cron.aiohttp resolved to %r after touching cron.web, not aiohttp: "
         "the door rebinds only one of the two globals it promises, or binds "
-        "them to the same module." % probe["AIOHTTP-NAME-AFTER-TOUCH"]
+        "them to the same module."
+        % probe["AIOHTTP-NAME-AFTER-TOUCH"]
     )
 
 

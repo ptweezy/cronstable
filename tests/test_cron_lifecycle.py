@@ -7,6 +7,7 @@ import time
 import warnings
 from collections import OrderedDict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -667,6 +668,105 @@ async def test_reaper_flushes_completions_even_when_the_batch_unwinds(
 
     assert recorded == [(ref, handled[0])]
     assert cron._dag._completion_buffer == {}
+
+
+class _EventRunningJob:
+    # what the reaper touches, over a process exit the test controls:
+    # wait() returns once `exit` is set, and `filed` is set after the
+    # reaper's done callback (registered first, so it runs first) has
+    # filed the job for its next batch.
+    def __init__(self, name):
+        self.config = SimpleNamespace(name=name)
+        self.exit = asyncio.Event()
+        self.filed = asyncio.Event()
+
+    async def wait(self):
+        await self.exit.wait()
+        asyncio.current_task().add_done_callback(lambda _t: self.filed.set())
+
+
+@pytest.mark.asyncio
+async def test_reaper_parks_between_batches(monkeypatch):
+    # The reaper clears `completed` at the start of every batch. Without
+    # the clear, the standing completion wait resolves at once on every
+    # pass and the reaper spins through empty batches (each ending in a
+    # flush) for as long as any job is running.
+    cron = cronstable.cron.Cron(None)
+    cron._stop_event.set()
+    first, second = _EventRunningJob("t1"), _EventRunningJob("t2")
+    cron.running_jobs["t1"] = [first]
+    cron.running_jobs["t2"] = [second]
+    flushes = 0
+
+    async def fake_handle_finished_job(job):
+        cron.running_jobs.pop(job.config.name, None)
+
+    async def counting_flush():
+        nonlocal flushes
+        flushes += 1
+
+    monkeypatch.setattr(cron, "_handle_finished_job", fake_handle_finished_job)
+    monkeypatch.setattr(cron._dag, "flush_completions", counting_flush)
+
+    reaper = asyncio.create_task(cron._wait_for_running_jobs())
+    first.exit.set()
+    await first.filed.wait()
+    # t2 stays running for a while after t1's batch: a parked reaper runs
+    # no batch in that window.
+    await asyncio.sleep(0.05)
+    second.exit.set()
+    await asyncio.wait_for(reaper, timeout=2)
+    # one batch per completion; a spinning reaper flushes thousands of times
+    assert flushes <= 3
+
+
+@pytest.mark.asyncio
+async def test_reaper_handles_a_completion_filed_mid_batch_without_parking(
+    monkeypatch,
+):
+    # A job that finishes while an earlier job's handler is awaited is
+    # filed for the next batch, and the reaper runs that batch without
+    # re-entering asyncio.wait (the `if not finished` gate).
+    cron = cronstable.cron.Cron(None)
+    cron._stop_event.set()
+    first, second = _EventRunningJob("t1"), _EventRunningJob("t2")
+    cron.running_jobs["t1"] = [first]
+    cron.running_jobs["t2"] = [second]
+    handled = []
+    release = asyncio.Event()
+
+    async def fake_handle_finished_job(job):
+        cron.running_jobs.pop(job.config.name, None)
+        handled.append(job.config.name)
+        if job.config.name == "t1":
+            await release.wait()
+
+    async def fake_flush():
+        return None
+
+    real_wait = asyncio.wait
+    entries = 0
+
+    async def counting_wait(fs, **kwargs):
+        nonlocal entries
+        entries += 1
+        return await real_wait(fs, **kwargs)
+
+    monkeypatch.setattr(cron, "_handle_finished_job", fake_handle_finished_job)
+    monkeypatch.setattr(cron._dag, "flush_completions", fake_flush)
+    monkeypatch.setattr(cronstable.cron.asyncio, "wait", counting_wait)
+
+    reaper = asyncio.create_task(cron._wait_for_running_jobs())
+    first.exit.set()
+    await first.filed.wait()
+    await _wait_until(lambda: handled == ["t1"])
+    # t1's handler is parked: t2 finishes and is filed for the next batch
+    second.exit.set()
+    await second.filed.wait()
+    release.set()
+    await asyncio.wait_for(reaper, timeout=2)
+    assert handled == ["t1", "t2"]
+    assert entries == 1
 
 
 def test_simple_config_file(tracing_running_job):

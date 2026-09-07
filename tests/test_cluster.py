@@ -4898,6 +4898,36 @@ def test_parse_job_summaries_hostile_fields_degrade_not_poison():
     }
 
 
+def test_finite_number_subclasses_take_the_generic_arm():
+    # exact int and float take the fast paths; every subclass (IntEnum,
+    # bool, a float or int subclass) and every non-number goes through the
+    # isinstance arm, which applies the same bool and finiteness rules
+    import enum
+
+    from cronstable.cluster import _finite_number
+
+    class Level(enum.IntEnum):
+        HIGH = 3
+
+    class Wide(float):
+        pass
+
+    class Narrow(int):
+        pass
+
+    assert _finite_number(Level.HIGH) == 3.0
+    assert type(_finite_number(Level.HIGH)) is float
+    assert _finite_number(Wide(2.5)) == 2.5
+    assert _finite_number(Wide("nan")) is None
+    assert _finite_number(Wide("inf")) is None
+    assert _finite_number(Narrow(7)) == 7.0
+    assert type(_finite_number(Narrow(7))) is float
+    assert _finite_number(True) is None
+    assert _finite_number(False) is None
+    assert _finite_number("1") is None
+    assert _finite_number(None) is None
+
+
 def test_parse_node_stats_absent_and_garbage():
     from cronstable.cluster import _parse_node_stats
 
@@ -5560,6 +5590,29 @@ def test_peer_etag_ignores_countdown_ticks_but_rolls_on_fire(no_tls):
     assert mgr._peer_etag(payload(None), 1.0) == mgr._peer_etag(
         payload(None), 2.0
     )
+
+
+def test_stable_job_summaries_rewrites_only_scheduled_in():
+    # the ETag projection: scheduled_in becomes the absolute next-fire
+    # instant (rounded), None and bool map to None, and an entry without
+    # the key comes back equal and without it
+    raw = {
+        "absent": {"running": False, "enabled": True, "last": None},
+        "none": {"scheduled_in": None},
+        "flag": {"scheduled_in": True},
+        "soon": {"scheduled_in": 70.4, "running": False},
+        "whole": {"scheduled_in": 30},
+    }
+    stable = ClusterManager._stable_job_summaries(raw, 1_000_000.0)
+    assert stable["absent"] == raw["absent"]
+    assert "scheduled_in" not in stable["absent"]
+    assert stable["none"] == {"scheduled_in": None}
+    assert stable["flag"] == {"scheduled_in": None}
+    assert stable["soon"] == {"scheduled_in": 1_000_070, "running": False}
+    assert stable["whole"] == {"scheduled_in": 1_000_030}
+    # the input is copied, never rewritten in place
+    assert raw["soon"]["scheduled_in"] == 70.4
+    assert stable["soon"] is not raw["soon"]
 
 
 @pytest.mark.asyncio

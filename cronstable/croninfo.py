@@ -1535,7 +1535,7 @@ def _fire_cells(
         cells: list[tuple[int, int]] = []
         walked = 0
         for when in _walk_fires(mtab, zone, start, end):
-            if walked >= cap:
+            if walked >= cap:  # pragma: no cover - backstop
                 break
             walked += 1
             label = when.astimezone(tz)

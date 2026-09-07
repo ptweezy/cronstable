@@ -8838,8 +8838,8 @@ var qrcode = function() {
     if (q === undefined) q = logQuery();
     const c = $("logCount");
     let label;
-    if (!q || (!q.text && !q.re)) { label = ""; state.log.matchSig = null; }
-    else if (q.bad) { label = "bad regex"; state.log.matchSig = null; }
+    if (q && q.bad) { label = "bad regex"; state.log.matchSig = null; }
+    else if (!q || (!q.text && !q.re)) { label = ""; state.log.matchSig = null; }
     else {
       const sig = logQuerySig(q);
       // Full rescan only when the query changed since the last count; the per-

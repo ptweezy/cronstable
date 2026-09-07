@@ -1604,11 +1604,11 @@ LintCache = dict[tuple[str, str, Optional[datetime.tzinfo]], list[Finding]]
 #: sharing safe by construction (an accidental edit fails loudly).
 _NO_SLA_THRESHOLDS: Mapping[str, Any] = types.MappingProxyType({})
 
-#: The findings of a clean schedule, shared by every such job: a fresh
-#: empty list per JobConfig (and its JSON twin) is a GC-tracked container
-#: walked on every full collection.  Read-only by convention, like
-#: _NO_SLA_THRESHOLDS; a list rather than a tuple because the payload
-#: serializes it and consumers compare it to ``[]``.
+#: The findings of a clean schedule, shared by every such job.  A list,
+#: the type lint_schedule returns and the annotation promises, so every
+#: caller sees one shape.  Read-only by convention, like
+#: _NO_SLA_THRESHOLDS, and shared because a fresh empty list per job is a
+#: tracked container every full collection walks.
 _NO_FINDINGS: list[Finding] = []
 _NO_FINDINGS_JSON: list[dict[str, Any]] = []
 
@@ -2363,6 +2363,11 @@ class DagTaskConfig:
         )
 
 
+#: Prefix of a scheduled DAG's synthetic schedule job, ``dag:<dag name>``.
+#: Reserved: a configured job may not carry it (see _config_from_doc).
+DAG_SCHEDULE_JOB_PREFIX = "dag:"
+
+
 class DagConfig:
     """A whole DAG: its scheduling frame, its tasks, and the validated graph.
 
@@ -2421,7 +2426,7 @@ class DagConfig:
 
     def _build_schedule_job(self, raw: dict, schedule: Any) -> JobConfig:
         overrides: dict[str, Any] = {
-            "name": "dag:" + self.name,
+            "name": DAG_SCHEDULE_JOB_PREFIX + self.name,
             "command": "true",
             "schedule": schedule,
             "enabled": self.enabled,
@@ -4535,6 +4540,17 @@ def _config_from_doc(
     lint_cache: LintCache = {}
     for config_job in doc.get("jobs", []):
         job_dict = mergedicts(defaults, config_job)
+        # A DAG's schedule job is named 'dag:<dag name>', and the calendar
+        # feed, /schedule/why, and the jobs list resolve a name to a job
+        # first, so a configured job under the prefix would shadow the
+        # DAG's. Rejected whether or not such a DAG exists.
+        if job_dict["name"].startswith(DAG_SCHEDULE_JOB_PREFIX):
+            raise ConfigError(
+                "{}: job {!r}: names starting with {!r} belong to a DAG's "
+                "schedule job; rename the job".format(
+                    path, job_dict["name"], DAG_SCHEDULE_JOB_PREFIX
+                )
+            )
         jobs.append(
             JobConfig(job_dict, env_cache=env_cache, lint_cache=lint_cache)
         )

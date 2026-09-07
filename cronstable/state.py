@@ -108,21 +108,19 @@ PROTECTED_STREAMS = frozenset({"meta", "manifests"})
 # legitimate in-flight write lives near this long, so older is crash debris.
 TMP_MAX_AGE = 86400.0
 
+#: Open flags of the temp file behind :meth:`FilesystemStateBackend.
+#: _atomic_write`.  ``O_BINARY`` keeps the descriptor in binary mode on
+#: Windows; the mask is 0 elsewhere.
+_ATOMIC_WRITE_FLAGS = (
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+)
+
 # Subdirectories under a namespace root: per-stream records, leases,
 # quarantined corrupt records, write-temp files, mutable job-facing
 # documents (one file per key, atomic rename under an advisory flock), and
 # content-addressed blobs (immutable, named by SHA-256).  Directories are
 # only ever created, never renamed (a directory rename is the one costly
 # operation on an S3 Files mount), so this layout is safe there.
-#: Open flags of the temp file behind :meth:`FilesystemStateBackend.
-#: _atomic_write`.  On Windows a descriptor from ``os.open`` is in text
-#: mode unless ``O_BINARY`` is set, and text mode rewrites LF as CRLF on
-#: write, corrupting a byte payload; POSIX has no such flag, so the mask
-#: is 0 there.
-_ATOMIC_WRITE_FLAGS = (
-    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-)
-
 RECORDS_DIR = "records"
 LEASES_DIR = "leases"
 QUARANTINE_DIR = "quarantine"
@@ -516,6 +514,26 @@ def _local_lock_reason(path: str) -> Optional[str]:
         ):
             return "the NFS mount is mounted with '{}'".format(opt)
     return None
+
+
+_REPARSE_POINT = stat.FILE_ATTRIBUTE_REPARSE_POINT if os.name == "nt" else 0
+
+
+def _entry_is_dir(entry: "os.DirEntry[str]") -> bool:
+    """``os.path.isdir`` for a scandir entry: False on any error, and a
+    Windows reparse point (a junction) answered through its target."""
+    try:
+        if not entry.is_dir():
+            return False
+        if _REPARSE_POINT:
+            attrs = getattr(
+                entry.stat(follow_symlinks=False), "st_file_attributes", 0
+            )
+            if attrs & _REPARSE_POINT:
+                return os.path.isdir(entry.path)
+        return True
+    except OSError:
+        return False
 
 
 def detect_topology(path: str) -> Optional[str]:
@@ -1962,8 +1980,8 @@ class FilesystemStateBackend(StateBackend):
         records_root = self._records_root
         token_prefix = _fs_safe_fragment(prefix)
         try:
-            # scandir: the is-a-directory test below rides on the entry's
-            # own d_type, so no stat per token.
+            # scandir: the directory test below rides on the entry's own
+            # d_type; only a link pays a stat call.
             with os.scandir(records_root) as listing:
                 entries = list(listing)
         except FileNotFoundError:
@@ -1977,7 +1995,7 @@ class FilesystemStateBackend(StateBackend):
             token = entry.name
             if not token.startswith(token_prefix):
                 continue
-            if not entry.is_dir():
+            if not _entry_is_dir(entry):
                 continue
             stream_dir = entry.path
             if _FS_TRUNCATION_MARKER in token:
@@ -2699,7 +2717,7 @@ class FilesystemStateBackend(StateBackend):
             token = entry.name
             if not token.startswith(token_prefix):
                 continue
-            if not entry.is_dir():
+            if not _entry_is_dir(entry):
                 continue
             if _FS_TRUNCATION_MARKER in token:
                 # truncated namespace tokens have no name sidecar: report
@@ -2902,14 +2920,14 @@ class FilesystemStateBackend(StateBackend):
         records_root = self._records_root
         try:
             # scandir: the directory test below rides on the entry's own
-            # d_type, so no stat per token; sorted by name, so the walk
-            # order is deterministic.
+            # d_type; only a link pays a stat call.  Sorted by name, so
+            # the walk order is deterministic.
             with os.scandir(records_root) as listing:
                 entries = sorted(listing, key=lambda e: e.name)
         except OSError:
             entries = []
         for entry in entries:
-            if not entry.is_dir():
+            if not _entry_is_dir(entry):
                 continue
             token = entry.name
             stream_dir = entry.path
@@ -3025,7 +3043,7 @@ class FilesystemStateBackend(StateBackend):
         for ns_entry in ns_entries:
             if not ns_entry.name.startswith(idem_token_prefix):
                 continue
-            if not ns_entry.is_dir():
+            if not _entry_is_dir(ns_entry):
                 continue
             ns_dir = ns_entry.path
             try:
@@ -3227,7 +3245,7 @@ class FilesystemStateBackend(StateBackend):
         except OSError:
             ns_entries = []
         for ns_entry in ns_entries:
-            if not ns_entry.is_dir():
+            if not _entry_is_dir(ns_entry):
                 continue
             ns_dir = ns_entry.path
             try:
@@ -3356,7 +3374,7 @@ class FilesystemStateBackend(StateBackend):
         except OSError:
             streams = []
         for entry in streams:
-            if not entry.is_dir():
+            if not _entry_is_dir(entry):
                 continue
             stream_dir = entry.path
             try:

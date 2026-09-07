@@ -39,6 +39,59 @@
 - A daemon event alert whose subject or message is empty leaves that field
   out of the sealed plaintext instead of sending it as `null`, which is what
   the relay protocol's field contract specifies.
+- The reaper learns of a finished job through a done callback on that job's
+  wait task, and filing the completion is one list append however many jobs
+  are running. Draining 500 completions one at a time with 500 jobs running
+  measures 6 ms locally against 50 ms.
+- A bare `cronstable --version` prints the version before it builds the
+  argument parser and its subparsers. The command measures 54 ms locally
+  against 64 ms.
+- The SLA pass walks a memoized list of the jobs that carry an `sla` block
+  and reads the latch map to find a latch left on a job whose block a
+  reload removed. One pass over 2,000 jobs with 20 SLA blocks measures
+  0.02 ms locally against 0.15 ms; over 10,000 jobs with 100 blocks,
+  0.09 ms against 0.79 ms.
+- The Prometheus scrape carries a rendered block on each shared per-job
+  label set, renders small integral values from a table filled on the
+  first scrape, builds each sample line as one string, and keeps its
+  sorted job order between scrapes. Two renders of a 500-job exposition
+  with run counters measure 8.7 ms locally against 13 ms.
+- The calendar feed folds each line once as it builds it, describes each
+  distinct schedule without an `H` item once, and stops a capped entry
+  before converting the fire it drops. A 500-entry, seven-day feed
+  measures 25 ms locally against 43 ms.
+- The configuration parser forks a strictyaml position pointer with one
+  list copy, passes a value holding no `$` through the interpolation walk
+  without a call, and hands every job with a clean schedule the same empty
+  findings list. A 300-job parse measures 96 ms locally against 108 ms, an
+  interpolation walk over 2,000 references 41 ms against 49 ms, and a full
+  garbage collection with 100,000 jobs resident 34 ms against 99 ms.
+- The filesystem state store writes each atomic file through its raw
+  descriptor, opened in binary mode on every platform, lists a records or
+  documents root with `scandir` so the directory test reads each entry's
+  own type, sorts each stream listing once in the order the caller reads it,
+  and takes its try-lock through the one lock routine's non-blocking lane.
+  Twenty repeat listings of an unchanged 2,000-record stream measure 83 ms
+  locally against 103 ms, and a garbage-collection sweep over 2,000 unkept
+  streams 103 ms against 169 ms.
+- The dashboard's schedule engine jumps a restricted hour, minute, or
+  second field straight to its next listed value, keeps one collator for
+  every name sort, memoizes each schedule's prose, counts the running,
+  failing, ok, and paused jobs in one pass, and checks a fleet poll against
+  the response text it parsed. The log drawer keeps its search pattern
+  compiled across streamed lines, caches each line's stripped and lowercased
+  text, writes the match count only when it changes, and shows `bad regex`
+  in its place for a pattern that doesn't compile. Counting the matches in
+  a 5,000-line buffer measures 0.04 ms locally against 0.28 ms, and a cold
+  week walk over 500 schedules 1.75 ms against 4.2 ms.
+- The terminal dashboard inks each escape token once per theme and serves
+  it from the theme's memo after that, and the log drawer, the DAG log tab,
+  and the tail view bind their style helpers and stream markers once per
+  frame. Restyling a 5,000-line drawer measures 17 ms locally against
+  25 ms, and a drawer scroll walk with steady repaints 67 ms against
+  101 ms.
+- Config load rejects a job name that starts with `dag:`, the prefix of a
+  DAG's schedule job.
 
 ## 1.2.49
 

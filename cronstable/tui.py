@@ -1257,12 +1257,9 @@ def _rewrite_sgr_token(token: str, theme: Theme) -> str:
     parts = params.split(";")
     i = 0
     while i < len(parts):
-        p = parts[i] or "0"
-        try:
-            code = int(p)
-        except ValueError:
-            i += 1
-            continue
+        # _SGR_TOKEN_RE admits only digits and semicolons, so every part
+        # is an int
+        code = int(parts[i] or "0")
         if code == 0:
             out.append(RESET + theme.fg("fg"))
         elif code in (1, 2, 3, 4, 7, 22, 23, 24, 27):
