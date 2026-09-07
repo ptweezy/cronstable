@@ -368,6 +368,42 @@ def _init_restrict(target: str) -> None:
         )
 
 
+def _print_build_facts(args) -> None:
+    """Answer the flags that describe the build itself, then exit.
+
+    Each one asks what this artifact is or carries rather than what it
+    should run, so none of them reads a configuration file and all of
+    them exit before dispatch.
+    """
+    if args.version:
+        print(cronstable.version.version)
+        sys.exit(0)
+
+    if args.third_party_licenses:
+        # Package data, so the notice travels inside every artifact the
+        # code does (wheel, Docker, the one-file frozen binaries): the
+        # LGPL notice for bundled python-zeroconf must accompany the
+        # binary itself, not just the repository. See LICENSING.md.
+        from importlib.resources import files
+
+        print(
+            files("cronstable")
+            .joinpath("licenses/THIRD-PARTY-NOTICES.txt")
+            .read_text(encoding="utf-8")
+        )
+        sys.exit(0)
+
+    if args.sealable_suites:
+        # The release lanes run this against the FROZEN binary: the build
+        # environment can prove it installed the sealing libraries, but
+        # only the artifact can prove they survived the freeze.
+        from cronstable import push
+
+        for suite in push.sealable_suites():
+            print(suite)
+        sys.exit(0)
+
+
 def main_loop(loop=None):
     """Parse argv, dispatch, and (for the daemon) run the scheduler.
 
@@ -415,6 +451,15 @@ def main_loop(loop=None):
         help="print the bundled third-party license notices (the LGPL "
         "notice for python-zeroconf) and exit",
     )
+    parser.add_argument(
+        "--sealable-suites",
+        default=False,
+        action="store_true",
+        help="print the push sealing suites this build can seal under, "
+        "one per line, and exit; each is proven by a real seal, so the "
+        "list reports what the binary carries, not what its build asked "
+        "for",
+    )
     _add_state_subcommands(parser)
     # `lock run NAME [flags] -- CMD...` carries an arbitrary trailing command.
     # argparse cannot capture it portably: nargs=REMAINDER swallows our own
@@ -451,23 +496,7 @@ def main_loop(loop=None):
     # logging.getLogger("asyncio").setLevel(logging.WARNING)
     logger = logging.getLogger("cronstable")
 
-    if args.version:
-        print(cronstable.version.version)
-        sys.exit(0)
-
-    if args.third_party_licenses:
-        # Package data, so the notice travels inside every artifact the
-        # code does (wheel, Docker, the one-file frozen binaries): the
-        # LGPL notice for bundled python-zeroconf must accompany the
-        # binary itself, not just the repository. See LICENSING.md.
-        from importlib.resources import files
-
-        print(
-            files("cronstable")
-            .joinpath("licenses/THIRD-PARTY-NOTICES.txt")
-            .read_text(encoding="utf-8")
-        )
-        sys.exit(0)
+    _print_build_facts(args)
 
     command = getattr(args, "command", None)
     if command == "state":

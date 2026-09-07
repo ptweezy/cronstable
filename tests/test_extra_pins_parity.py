@@ -36,7 +36,13 @@ _PIN = re.compile(r"\b([A-Za-z][A-Za-z0-9_.\-]*)>=([0-9][A-Za-z0-9.\-]*)")
 
 
 def _canonical_floors():
-    """{package: specifier} from every runtime extra (dev has its own test)."""
+    """{package: ">=floor"} from every runtime extra (dev has its own test).
+
+    Only the ``>=`` clause counts: a package can appear on more than one
+    marker-split line with the same floor and a cap on one of them
+    (cryptography's capped Intel macOS and 32-bit Windows line), and every
+    line must agree on the floor for the pin scan below to mean anything.
+    """
     with open(os.path.join(ROOT, "pyproject.toml"), "rb") as f:
         pyproject = tomllib.load(f)
     floors = {}
@@ -45,7 +51,17 @@ def _canonical_floors():
             continue
         for line in lines:
             req = requirements.Requirement(line)
-            floors[req.name.lower()] = str(req.specifier)
+            name = req.name.lower()
+            floor = [
+                ">=" + spec.version
+                for spec in req.specifier
+                if spec.operator == ">="
+            ]
+            assert len(floor) == 1, "%s has no single >= floor" % (line,)
+            assert floors.get(name, floor[0]) == floor[0], (
+                "%s appears with two different floors in pyproject" % (name,)
+            )
+            floors[name] = floor[0]
     return floors
 
 
@@ -69,9 +85,15 @@ def test_hand_spelled_extra_pins_match_pyproject_floors():
                     "%s pins %s%s but pyproject's extra floor is %s%s"
                     % (rel, name, spelled, name, floors[name])
                 )
-    # self-check: the four extras the lanes actually bundle must be visible
+    # self-check: the five extras the lanes actually bundle must be visible
     # to the scan, or the pin idiom changed and the regex needs updating
-    assert {"uvloop", "pynacl", "zeroconf", "orjson"} <= found, (
+    assert {
+        "uvloop",
+        "pynacl",
+        "zeroconf",
+        "orjson",
+        "cryptography",
+    } <= found, (
         "the extra-pin scan no longer sees the pins it was built on "
         "(found only %r); update _PIN or _SCANNED" % (sorted(found),)
     )

@@ -29,6 +29,9 @@ docker
 # dependency layers). The negations must follow the exclusion they carve out.
 !docker/extract_deps.py
 !docker/install_orjson.sh
+# and the post-quantum wheelhouse the release workflow fills per libc; on a
+# local build the directories hold only their .gitkeep placeholders.
+!docker/wheelhouse
 example
 scripts
 target

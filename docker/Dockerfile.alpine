@@ -48,6 +48,10 @@ RUN set -eux; \
 # reads it, never the rest of the tree.
 COPY pyproject.toml /tmp/deps/pyproject.toml
 COPY docker/extract_deps.py /tmp/deps/extract_deps.py
+# The cryptography wheels the release workflow's pq-wheels job built for the
+# platforms PyPI publishes none for (this image's libc only; see the job).
+# Empty on a plain local build, which then seals x25519 on those platforms.
+COPY docker/wheelhouse/musl/ /tmp/deps/pqwheels/
 
 # Install the third-party dependencies into the venv the runtime stage will
 # copy. The requirement strings are read out of pyproject.toml by the COPYd
@@ -58,22 +62,30 @@ COPY docker/extract_deps.py /tmp/deps/extract_deps.py
 # throwaway venv, /tmp/deps/buildenv: the project install below uses it to
 # build the wheel without network access, and it never pollutes the shipped
 # /opt/venv.
+#
+# The helper resolves the cryptography line itself: a PEP 508 marker reads
+# the KERNEL arch, not the userland bitness and libc that decide the wheel.
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
     python -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    /opt/venv/bin/python /tmp/deps/extract_deps.py /tmp/deps/pyproject.toml; \
-    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/requirements.txt; \
+    /opt/venv/bin/python /tmp/deps/extract_deps.py /tmp/deps/pyproject.toml /tmp/deps/pqwheels; \
+    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 --find-links /tmp/deps/pqwheels --only-binary cryptography -r /tmp/deps/requirements.txt; \
     python -m venv /tmp/deps/buildenv; \
     retry /tmp/deps/buildenv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/build-requires.txt
 
-# The push (PyNaCl) and discovery (zeroconf) extras above are part of the
-# image contract: a `push:` or `web.bonjour` section fails closed at config
-# load, so an image missing them would crash-loop with no in-image
-# remediation (pip is stripped from the runtime stage below). Verify with a
-# real sealed-box round-trip (catches a QEMU-miscompiled libsodium on the
-# source-built arches) plus a zeroconf import; a failure fails the build.
-RUN /opt/venv/bin/python -c 'from nacl.public import PrivateKey, SealedBox; k = PrivateKey.generate(); m = b"cronstable push self-test"; assert SealedBox(k).decrypt(SealedBox(k.public_key).encrypt(m)) == m; import zeroconf, zeroconf.asyncio; print("push and discovery extras verified")'
+# The push (PyNaCl + cryptography) and discovery (zeroconf) extras above
+# are part of the image contract: a `push:` or `web.bonjour` section fails
+# closed at config load, so an image missing them would crash-loop with no
+# in-image remediation (pip is stripped from the runtime stage below).
+# Verify with a real sealed-box round-trip (catches a QEMU-miscompiled
+# libsodium on the source-built arches) plus a zeroconf import; a failure
+# fails the build. cryptography carries the post-quantum `xwing` suite and
+# is present only where docker/extract_deps.py resolved it, so it is checked
+# only there, and here only for age: a release too old to carry the HPKE
+# module. Whether it really seals is proved after the project install below,
+# by the daemon's own `--sealable-suites`.
+RUN /opt/venv/bin/python -c 'from nacl.public import PrivateKey, SealedBox; k = PrivateKey.generate(); m = b"cronstable push self-test"; assert SealedBox(k).decrypt(SealedBox(k.public_key).encrypt(m)) == m; import importlib.util as u; assert u.find_spec("cryptography") is None or u.find_spec("cryptography.hazmat.primitives.hpke") is not None, "cryptography is too old to seal xwing"; import zeroconf, zeroconf.asyncio; print("push and discovery extras verified")'
 
 # Best-effort orjson (the `speedups` extra) for the durable-state / cluster
 # JSON paths; docker/install_orjson.sh never fails the build and never ships
@@ -108,6 +120,20 @@ RUN set -eux; \
     /tmp/deps/buildenv/bin/pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/deps/wheelhouse .; \
     /opt/venv/bin/pip install --no-cache-dir --no-deps /tmp/deps/wheelhouse/cronstable-*.whl; \
     /opt/venv/bin/pip check
+
+# Prove the installed daemon seals `xwing` wherever the dependency layer
+# resolved cryptography. The extras check above proves only that the HPKE
+# module is findable; a wheel whose bundled OpenSSL lacks ML-KEM passes
+# that and fails at the first pairing. `--sealable-suites` seals one real
+# probe through the daemon's own path, the same gate the release binaries
+# pass on the frozen artifact. An image the helper resolved without
+# cryptography seals x25519 only and skips this.
+RUN set -eux; \
+    if /opt/venv/bin/python -c 'import cryptography' 2>/dev/null; then \
+        suites=$(/opt/venv/bin/python -m cronstable --sealable-suites); \
+        echo "sealable suites: $suites"; \
+        echo "$suites" | grep -qx xwing; \
+    fi
 
 # Drop pip from the venv before it ships. The runtime image installs nothing
 # (no package manager, read-only root filesystem), so pip and its vendored

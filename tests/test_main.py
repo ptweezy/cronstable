@@ -100,6 +100,23 @@ def test_third_party_licenses_prints_and_exits(monkeypatch, capsys):
     assert "GNU LESSER GENERAL PUBLIC LICENSE" in out
 
 
+def test_sealable_suites_prints_and_exits(monkeypatch, capsys):
+    # The release lanes run this against the frozen binary: the build
+    # environment can prove it installed the sealing libraries, but only
+    # the artifact can prove they survived the freeze. It answers a
+    # question about the build, so it needs no configuration file.
+    import cronstable.push as push
+
+    monkeypatch.setattr(sys, "argv", ["cronstable", "--sealable-suites"])
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop(_loop())
+    assert exc.value.code == 0
+    printed = capsys.readouterr().out.split()
+    assert printed == push.sealable_suites()
+    # x25519 rides the start-refusing push extra, so it is always there
+    assert push.SUITE_X25519 in printed
+
+
 def test_trailing_dashdash_without_lock_run_errors(monkeypatch, capsys):
     # `--` before anything other than a `lock run` command is rejected by the
     # hand-rolled split (argparse would already have exited otherwise).
