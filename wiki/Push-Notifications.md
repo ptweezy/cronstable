@@ -7,13 +7,13 @@ reporter named `push` beside the mail, Sentry, shell, and webhook reporters
 the usual trust cost: no third-party service ever reads the alert.
 
 The encryption model: the daemon seals each alert to every paired device's
-X25519 public key, in a libsodium sealed box (X25519 + XSalsa20-Poly1305),
-so only that device's private key can open the payload. That key is
-generated on the phone and never leaves it. The relay forwards alerts to the
-platform push service (APNs), and sees only a device token, a ciphertext, an
-opaque coalescing hash (keyed with a per-installation salt the relay never
-sees), a priority, and an event flag, never job names, hostnames, or log
-lines.
+public key under the device's sealing suite (a libsodium sealed box for
+`x25519`, X-Wing HPKE for `xwing`), so only that device's private key can
+open the payload. That key is generated on the phone and never leaves it.
+The relay forwards alerts to the platform push service (APNs), and sees only
+a device token, a ciphertext, an opaque coalescing hash (keyed with a
+per-installation salt the relay never sees), a priority, and an event flag,
+never job names, hostnames, or log lines.
 
 ## Enabling push
 
@@ -23,10 +23,71 @@ Push is an optional extra. Install it alongside cronstable:
 pip install "cronstable[push]"
 ```
 
-(The extra is PyNaCl, which bundles libsodium. The release binaries bundle
-it per architecture. A lane that cannot build it ships without the extra,
-and the daemon then refuses to start with a config that asks for push,
-reporting an error that says so.)
+The extra carries two libraries. PyNaCl, which bundles libsodium, seals
+the `x25519` suite on every platform. `cryptography` seals the post-quantum
+`xwing` suite (see [pairing devices](#pairing-devices)) and comes along on
+every platform it publishes a wheel for. The release binaries and the
+container images bundle both. A build that cannot carry PyNaCl ships
+without push, and the daemon then refuses to start with a config that asks
+for it and reports an error that says so. A build that cannot carry
+`cryptography` seals `x25519` only.
+
+`cryptography` publishes wheels for fewer platforms than PyNaCl, so the
+pip route reaches post-quantum sealing on fewer platforms than the binaries
+and images do:
+
+| How you run cronstable | Post-quantum sealing |
+| --- | --- |
+| `pip install "cronstable[push]"` | Linux x86_64 and aarch64, macOS (Apple Silicon and Intel), and Windows x64 and 32-bit x86 |
+| Release binary | Every Linux build except `linux-mips64le` and `linux-armel`; every macOS, Windows, FreeBSD, OpenBSD, NetBSD, and illumos build |
+| Docker image | Every platform of every tag |
+
+The binaries and images reach past pip because CI builds `cryptography`
+from source wherever PyPI has no wheel, against an OpenSSL 3.5 and a Rust
+toolchain the lane installs or builds. Each source build seals a real
+X-Wing probe before it is frozen in, and a build that fails the probe
+ships without the suite and says so in the build log. The
+two Linux builds left out run on Debian bookworm, whose Rust and OpenSSL
+are both too old, and have no newer Rust toolchain for their
+architectures.
+
+Everywhere else, the extra installs PyNaCl alone and the daemon seals
+`x25519` only, which works on every platform. The daemon logs the suites it
+can seal at startup. If you expected post-quantum sealing and did not get
+it, that line says so. To ask a binary directly, run
+`cronstable --sealable-suites`, which prints one suite per line. On a
+platform without a wheel, you can still get post-quantum sealing by
+building `cryptography` 48 or newer from source
+(`pip install "cryptography>=48"`, which needs a Rust toolchain and the
+OpenSSL 3.5 headers on that host).
+
+Intel macOS and 32-bit Windows run on `cryptography` 48.x. Release 49.0.0
+dropped both platforms, so 48.0.1 (June 2026) is the last release with a
+wheel for them, and its bundled OpenSSL seals ML-KEM. The `push` extra and
+the `macos-amd64` and `windows-i686` binaries pin below 49 there, which
+means that copy of `cryptography` receives no further fixes. The daemon
+uses it for one HPKE seal per alert and nothing else, so the exposure is
+the KEM and AEAD code paths. If you need a newer `cryptography` for
+another package, install cronstable with `pynacl` alone and stay on
+`x25519`. A 32-bit Python on 64-bit Windows reports the
+64-bit machine, so the extra takes the uncapped line there and finds no
+wheel; install cronstable plus `pynacl` and `cryptography>=48,<49` by hand
+on such a host.
+
+The pip route stops at two Linux architectures because a dependency marker
+cannot see which libc you are on, and `cryptography` publishes `ppc64le` and
+`armv7l` wheels for glibc but not for musl. Each release binary is built
+against a known libc, so the `armv7` build reaches one architecture past pip
+on the same hardware. The Docker images resolve the dependency from inside
+the target image, where the libc is known, so the glibc images reach both
+architectures. Every image build proves the result the same way the
+binaries do, by running `cronstable --sealable-suites` and requiring
+`xwing` wherever `cryptography` was installed.
+
+Install `cryptography` on every node that shares a device registry. The
+pairing is stored once and read by all of them, while the library is per
+node, so a node without `cryptography` cannot page a device that paired
+under `xwing`.
 
 Then configure the daemon-global `push:` section, which says where alerts
 go and where device pairings are stored:
@@ -158,14 +219,61 @@ $ curl -X POST http://127.0.0.1:8080/push/devices \
 ```
 
 `publicKey` must be base64 decoding to the length its `suite` requires (32
-bytes for the default `x25519`) and be a usable key for that suite. At
-pairing, rather than on the first alert, the daemon rejects an all-zero or
-low-order X25519 key that libsodium refuses to seal to. `suite` is optional
-and defaults to `x25519`.
-The daemon refuses a pairing that names a suite it cannot seal to, rather
-than storing a record whose every alert would fail. `name`, `platform`, and
-`pushToken` are bounded strings. Validation failures are a `400` naming the
-field.
+bytes for the default `x25519`, 1216 bytes for `xwing`) and be a usable key
+for that suite. At pairing, rather than on the first alert, the daemon
+rejects a key its library refuses to seal to: an all-zero or low-order
+X25519 key, or an unusable X-Wing key. `suite` is optional and defaults to
+`x25519`. The daemon refuses a pairing that names a suite it cannot seal
+to, rather than storing a record whose every alert would fail. `name`,
+`platform`, and `pushToken` are bounded strings. Validation failures are a
+`400` naming the field.
+
+`xwing` is the post-quantum hybrid suite: X-Wing combines ML-KEM-768 with
+X25519, so recovering the plaintext requires breaking both. Sealing under
+it requires the `cryptography` library, which the `push` extra carries on
+every platform with a wheel; a daemon without it refuses `xwing` pairings
+and seals `x25519` with PyNaCl alone.
+The app picks the suite for you: `GET /whoami` lists the daemon's
+sealable suites as `sealableSuites`, and the app pairs under `xwing`
+whenever that list advertises it. The daemon proves `xwing` with one real
+probe seal through its own library before advertising it, so an install
+whose `cryptography` is present but broken advertises `x25519` only.
+
+A device already paired under `x25519` keeps that suite across re-pairs,
+because the public key is the pairing identity and a suite change means a
+new record. When a daemon starts advertising `xwing` after the pairing was
+made (an upgrade to a release that carries `cryptography`, or a node that
+installed it), the app moves the pairing up on its own: once
+`sealableSuites` has listed `xwing` on two checks in a row, it registers
+the device's X-Wing key as a new record, then revokes the superseded one.
+The pairing screen shows the same move as a button for anyone who would
+rather not wait for the next check. The wire construction is normative in
+the
+[relay protocol](https://github.com/ptweezy/cronstable/blob/main/docs/relay-protocol.md#xwing-construction).
+
+The app also moves a pairing the other way. An `xwing` pairing outlives
+the daemon's ability to seal it whenever the daemon loses `cryptography`:
+a reinstall without it, a move onto an image or a binary with no wheel for
+that platform, or a cluster node that never had it. Every alert to that
+device is then dropped at sealing, and the re-pair the app sends on each
+push-token rotation answers `400` for as long as that lasts. When
+`sealableSuites` omits the pairing's suite on two checks in a row, the app
+re-pairs under `x25519`, which every daemon seals, and revokes the
+stranded record. The pairing screen shows the same state with a manual
+switch. After a move down, the automatic move back up stands down until
+the app next launches, and the pairing screen's upgrade button remains, so
+a cluster where only some nodes carry `cryptography` does not trade the
+pairing back and forth.
+
+The heal trades sealing strength for delivery on purpose. The daemon's
+advertisement is authenticated only by the transport, so a party who can
+rewrite two `GET /whoami` answers can move a pairing from `xwing` down to
+`x25519`. On a transport that allows that, the same party can already read
+the bearer token and substitute the key at pairing (see
+[pair over a trusted transport](#pair-over-a-trusted-transport-then-compare-fingerprints)).
+On a cluster where only some nodes carry `cryptography`, the daemon's
+answers alternate as requests land on different nodes, which is one more
+reason to install `cryptography` on every node that shares a registry.
 
 Re-pairing the same public key (push tokens rotate; phones get renamed)
 answers `200` with `created: false` and updates `name`/`platform`/`pushToken`
@@ -289,18 +397,18 @@ APNs rejects notifications over 4096 bytes, so the daemon caps the sealed,
 base64-encoded ciphertext at 3800 characters: 4096 minus the 189 bytes of the
 relay's own APNs envelope, minus a 107-byte reserve for future protocol
 fields. The daemon fits each device's payload to that device's own suite
-budget (2802 bytes of plaintext under `x25519`), so a device paired under a
-wider-ciphertext suite is trimmed harder without costing the devices beside
-it any log lines. It trims an oversized payload in order: log-tail lines
-oldest-first (the newest lines carry the failure), then long free-text
-fields halved (never below 64 characters), then the optional
-context fields dropped. The alert's identity (`name`, `kind`, `host`) is
-never trimmed. A relay that enforces the 3000-character floor (the smallest
-cap the relay protocol allows) answers a larger ciphertext with a 400. The
-daemon then re-fits that alert to the floor, posts it again, and logs once
-that the relay is behind, so the page lands with fewer log lines instead of
-bouncing. There is no per-job template: the companion app renders the
-decrypted fields itself.
+budget (2802 bytes of plaintext under `x25519`, 1714 under `xwing`), so a
+device paired under a wider-ciphertext suite is trimmed harder without
+costing the devices beside it any log lines. It trims an oversized payload
+in order: log-tail lines oldest-first (the newest lines carry the failure),
+then long free-text fields halved (never below 64 characters), then the
+optional context fields dropped. The alert's identity (`name`, `kind`,
+`host`) is never trimmed. A relay that enforces the 3000-character floor
+(the smallest cap the relay protocol allows) answers a larger ciphertext
+with a 400. The daemon then re-fits that alert to the floor, posts it
+again, and logs once that the relay is behind, so the page lands with fewer
+log lines instead of bouncing. There is no per-job template: the companion
+app renders the decrypted fields itself.
 
 ## Failure behavior
 

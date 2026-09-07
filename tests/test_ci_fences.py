@@ -566,7 +566,7 @@ def test_package_dependencies_declare_the_floor_the_lane_enforces():
     }
     assert not mismatched, (
         "packaged floor != the floor the build lane declares and elf_floor.py "
-        "enforces, as {arch: (packaged, lane)}: {}".format(mismatched)
+        "enforces, as {{arch: (packaged, lane)}}: {}".format(mismatched)
     )
 
 
@@ -582,13 +582,29 @@ def test_every_32_bit_arm_row_asserts_its_abi():
     arm = {"armv5", "armv6", "armv7", "armel"}
     missing = []
     for name, job in _workflow()["jobs"].items():
+        # Only the lanes that freeze a binary. pq-wheels compiles one
+        # dependency wheel for the container images and never runs
+        # PyInstaller, so it has no bundle for elf_floor.py to hold to an
+        # ABI.
+        if "dist/cronstable" not in str(job.get("steps", [])):
+            continue
+        # Actions merges every `include` entry naming an arch into that
+        # arch's rows, so the gate can sit on one entry (the per-arch row)
+        # while another (a per-libc-and-arch row adding pq) names the same
+        # arch without it. Judge the merged row: an arch is gated when any
+        # of its entries carries armgate.
+        gated = {}
         for entry in (
             job.get("strategy", {}).get("matrix", {}).get("include", []) or []
         ):
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or entry.get("arch") not in arm:
                 continue
-            if entry.get("arch") in arm and not entry.get("armgate"):
-                missing.append((name, entry["arch"]))
+            gated[entry["arch"]] = gated.get(entry["arch"], False) or bool(
+                entry.get("armgate")
+            )
+        missing.extend(
+            (name, arch) for arch, ok in sorted(gated.items()) if not ok
+        )
     assert not missing, (
         "these 32-bit ARM rows declare no armgate, so nothing checks their "
         "float ABI or instruction set: {}".format(sorted(missing))
@@ -638,4 +654,49 @@ def test_apk_packages_are_built_from_the_musl_binaries():
     )
     assert not recipe.get("overrides"), (
         "the apk recipe carries format overrides it cannot use"
+    )
+
+
+def _single_quoted_scripts():
+    """Every (job, step, line) inside a `sh -euc '...'` container script.
+
+    The container lanes hand their whole build to `docker run ... sh -euc '`
+    as one single-quoted argument that closes on a line holding only the
+    quote.  Bash ends the argument at the first apostrophe, so one inside
+    (a comment that said "the interpreter's ssl module" did it) splits the
+    script: the container runs the head, and the runner's own bash runs
+    the tail, which fails on the first helper only the container provides
+    (`retry: command not found`).  Every row of the job fails.
+    """
+    opener = re.compile(r"\b(?:ba)?sh -[a-z]*c '$")
+    for name, job in _workflow()["jobs"].items():
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if not isinstance(run, str):
+                continue
+            inside = False
+            for line in run.splitlines():
+                if inside:
+                    if line.strip() == "'":
+                        inside = False
+                    else:
+                        yield name, step.get("name", "?"), line
+                elif opener.search(line.rstrip()):
+                    inside = True
+
+
+def test_container_scripts_carry_no_apostrophe():
+    offenders = [
+        "{} / {}: {}".format(job, step, line.strip())
+        for job, step, line in _single_quoted_scripts()
+        if "'" in line
+    ]
+    assert not offenders, (
+        "an apostrophe inside a single-quoted container script ends the "
+        "script early and runs the rest on the runner: {}".format(offenders)
+    )
+    # The fence must also find something to check: the container lanes
+    # still use this shape.
+    assert any(True for _ in _single_quoted_scripts()), (
+        "no single-quoted container script found; the fence is blind"
     )

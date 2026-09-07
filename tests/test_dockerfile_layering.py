@@ -19,6 +19,7 @@ two: COPYd below the dependency layers (so editing it cannot invalidate their
 cache) and invoked above the per-commit section.
 """
 
+import importlib.util
 import json
 import os
 import re
@@ -282,13 +283,24 @@ def test_dockerignore_excludes_the_heavy_untouched_trees():
         )
 
 
+def _extract_deps_module():
+    """docker/extract_deps.py imported by path (it ships no package)."""
+    pytest.importorskip("tomllib")  # 3.11+, as the script itself needs
+    path = os.path.join(ROOT, "docker", "extract_deps.py")
+    spec = importlib.util.spec_from_file_location("_extract_deps", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
-    # The push+discovery extras pair now lives in exactly one place, so pin
+    # The push+discovery extras pair lives in exactly one place, so pin
     # what the script writes against a straight read of pyproject.toml, and
     # that everything it writes is echoed to stdout (the build-log
     # visibility the old `cat` provided). tomllib is 3.11+; every image venv
     # has it, only the 3.10 tox rows skip here.
     tomllib = pytest.importorskip("tomllib")
+    module = _extract_deps_module()
     shutil.copy(
         os.path.join(ROOT, "pyproject.toml"), tmp_path / "pyproject.toml"
     )
@@ -305,17 +317,183 @@ def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
     with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fobj:
         data = tomllib.load(fobj)
     project = data["project"]
-    expected = (
+    declared = (
         project["dependencies"]
         + project["optional-dependencies"]["push"]
         + project["optional-dependencies"]["discovery"]
     )
-    written = tmp_path / "requirements.txt"
-    assert written.read_text(encoding="utf-8").splitlines() == expected
+    written = (
+        (tmp_path / "requirements.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    # Every requirement but cryptography rides through verbatim, marker and
+    # all, in pyproject's own order.
+    others = [
+        line
+        for line in declared
+        if module.requirement_name(line) != "cryptography"
+    ]
+    assert [
+        line
+        for line in written
+        if module.requirement_name(line) != "cryptography"
+    ] == others
     build_requires = tmp_path / "build-requires.txt"
     assert (
         build_requires.read_text(encoding="utf-8").splitlines()
         == data["build-system"]["requires"]
     )
-    for line in expected + data["build-system"]["requires"]:
+    for line in written + data["build-system"]["requires"]:
         assert line in proc.stdout
+
+
+@pytest.mark.parametrize(
+    "target,keeps",
+    [
+        (("x86_64", 8, "glibc"), True),  # linux/amd64
+        (("x86_64", 4, "glibc"), False),  # linux/386 on an amd64 host
+        (("armv7l", 4, "musl"), False),  # the Alpine linux/arm/v7 row
+        (("ppc64le", 8, "glibc"), True),  # manylinux_2_28 wheel
+    ],
+)
+def test_extract_deps_writes_the_file_the_target_can_install(
+    tmp_path, monkeypatch, target, keeps
+):
+    # The end of the same story, on the written file rather than the
+    # decision: an image whose target has no wheel must get a
+    # requirements.txt with no cryptography line at all, because pip reading
+    # one there is exactly what turns the linux/386 rows red. Driven through
+    # a patched target so every row is reachable from any dev machine.
+    module = _extract_deps_module()
+    monkeypatch.setattr(module, "detect_target", lambda: target)
+    shutil.copy(
+        os.path.join(ROOT, "pyproject.toml"), tmp_path / "pyproject.toml"
+    )
+    module.main(str(tmp_path / "pyproject.toml"))
+    written = (
+        (tmp_path / "requirements.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    crypto = [
+        line
+        for line in written
+        if module.requirement_name(line) == "cryptography"
+    ]
+    assert crypto == (["cryptography>=48"] if keeps else [])
+    # PyNaCl rides through untouched either way: it has wheels or a plain C
+    # source build everywhere, so push keeps sealing x25519 on the rows that
+    # lose the post-quantum suite.
+    assert any(module.requirement_name(line) == "pynacl" for line in written)
+
+
+def test_cryptography_line_keeps_its_floor_and_loses_its_marker():
+    # Where the script says yes, the marker comes off (it is narrower than
+    # the decision just made and would veto the armv7l/ppc64le images), and
+    # the floor survives untouched: pyproject stays the one place it is
+    # spelled, which is what tests/test_extra_pins_parity.py depends on.
+    module = _extract_deps_module()
+    line = "cryptography>=48; sys_platform == 'linux'"
+    assert module.resolve_cryptography(line, ("x86_64", 8, "glibc")) == (
+        "cryptography>=48"
+    )
+    assert module.resolve_cryptography(line, ("x86_64", 4, "glibc")) is None
+    # Off Linux there is no image to resolve for, so pip and the marker keep
+    # the decision.
+    assert module.resolve_cryptography(line, None) == line
+
+
+def test_a_wheelhouse_wheel_keeps_cryptography_where_pypi_has_none(
+    tmp_path, monkeypatch
+):
+    # The pq-wheels job hands the image builds a cryptography wheel for the
+    # platforms PyPI publishes none for. With one in the wheelhouse the
+    # script keeps the line (marker stripped, as for a PyPI wheel); with an
+    # empty wheelhouse, or one holding another arch's wheel, it drops it as
+    # before. Only the machine is matched: the libc is decided by which
+    # per-libc directory the Dockerfile COPYd.
+    module = _extract_deps_module()
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    target = ("s390x", 8, "glibc")
+    line = "cryptography>=48; sys_platform == 'linux'"
+    assert module.resolve_cryptography(line, target, str(wheelhouse)) is None
+    (wheelhouse / "cryptography-50.0.1-cp311-abi3-linux_riscv64.whl").touch()
+    assert module.resolve_cryptography(line, target, str(wheelhouse)) is None
+    (wheelhouse / "cryptography-50.0.1-cp311-abi3-linux_s390x.whl").touch()
+    assert module.resolve_cryptography(line, target, str(wheelhouse)) == (
+        "cryptography>=48"
+    )
+    # A 32-bit userland matches on the machine pip resolves under.
+    (wheelhouse / "cryptography-50.0.1-cp311-abi3-linux_i686.whl").touch()
+    assert module.resolve_cryptography(
+        line, ("x86_64", 4, "glibc"), str(wheelhouse)
+    ) == "cryptography>=48"
+    # And main() threads the directory through from its second argument.
+    monkeypatch.setattr(module, "detect_target", lambda: target)
+    shutil.copy(
+        os.path.join(ROOT, "pyproject.toml"), tmp_path / "pyproject.toml"
+    )
+    module.main(str(tmp_path / "pyproject.toml"), str(wheelhouse))
+    written = (tmp_path / "requirements.txt").read_text(encoding="utf-8")
+    assert "cryptography>=48" in written.splitlines()
+
+
+def test_a_wheelhouse_wheel_must_load_on_the_image_interpreter(tmp_path):
+    # The interpreter a pq-wheels row builds with sets the floor of the
+    # wheel's abi3 tag, and an image interpreter can sit below it (the rhel
+    # image runs 3.12). Such a wheel is no wheel for that image: keeping the
+    # requirement would end in a failed `pip install --only-binary` instead
+    # of the designed x25519-only fallback.
+    module = _extract_deps_module()
+    major, minor = sys.version_info[:2]
+    admits = module.python_tag_admits
+    assert admits("cp%d%d" % (major, minor), "abi3")
+    assert admits("cp%d%d" % (major, minor - 1), "abi3")
+    assert not admits("cp%d%d" % (major, minor + 1), "abi3")
+    # A wheel that is not abi3 names the exact interpreter.
+    assert admits("cp%d%d" % (major, minor), "cp%d%d" % (major, minor))
+    assert not admits(
+        "cp%d%d" % (major, minor - 1), "cp%d%d" % (major, minor - 1)
+    )
+    assert admits("py3", "none")
+    # The caller can pass the version, as the resolver in an image does.
+    assert not admits("cp314", "abi3", version=(3, 12))
+    assert admits("cp311", "abi3", version=(3, 12))
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    target = ("s390x", 8, "glibc")
+    line = "cryptography>=48; sys_platform == 'linux'"
+    too_new = "cryptography-50.0.1-cp%d%d-abi3-linux_s390x.whl" % (
+        major,
+        minor + 1,
+    )
+    (wheelhouse / too_new).touch()
+    assert module.resolve_cryptography(line, target, str(wheelhouse)) is None
+    (wheelhouse / "cryptography-50.0.1-cp311-abi3-linux_s390x.whl").touch()
+    assert module.resolve_cryptography(line, target, str(wheelhouse)) == (
+        "cryptography>=48"
+    )
+
+
+def test_another_platforms_cryptography_line_never_reaches_an_image():
+    # pyproject carries a second, capped cryptography line for Intel macOS
+    # and 32-bit Windows. Stripping its marker on a Linux image would pin
+    # the image below 49 for no reason, so the script must recognize it as
+    # another OS's line and drop it, and keep the Linux line as before.
+    module = _extract_deps_module()
+    capped = (
+        "cryptography>=48,<49; (sys_platform == 'darwin' and "
+        "platform_machine == 'x86_64') or (sys_platform == 'win32' and "
+        "platform_machine == 'x86')"
+    )
+    linux = (
+        "cryptography>=48; (sys_platform == 'linux' and "
+        "platform_machine == 'x86_64') or (sys_platform == 'darwin' and "
+        "platform_machine == 'arm64')"
+    )
+    assert not module.marker_can_hold_on_linux(capped)
+    assert module.marker_can_hold_on_linux(linux)
+    # A line with no marker is everyone's.
+    assert module.marker_can_hold_on_linux("cryptography>=48")

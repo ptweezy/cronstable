@@ -13,6 +13,8 @@
 # smoke test cannot: --version imports neither cronstable.push nor
 # cronstable.discovery.
 #
+# Sealing the post-quantum suite is the sibling `--sealable-suites` check.
+#
 # No file I/O or socket binding happens at validation, so devicesFile is
 # never created and the listen address is never bound.
 push:

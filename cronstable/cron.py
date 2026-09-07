@@ -3471,7 +3471,9 @@ class Cron:
         web.anonymousScopes is also unauthenticated, but reports the
         granted scope set under the reserved label ``anonymous`` with
         ``allScopes`` false, the discriminator clients key on. Every
-        shape carries ``pairLinkBase``, the pairing QR's deep-link base.
+        shape carries ``pairLinkBase``, the pairing QR's deep-link base,
+        and ``sealableSuites``, the suites this daemon can seal alerts
+        to (the app picks its pairing suite from that list).
         """
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         anon = request.get(WEB_ANON_REQUEST_KEY)
@@ -3497,6 +3499,7 @@ class Cron:
                 "allScopes": matched.scopes == _WEB_ALL_SCOPES,
             }
         payload["pairLinkBase"] = self._web_pair_link_base()
+        payload["sealableSuites"] = await push.sealable_suites_async()
         return _json_response(payload, headers=self._web_headers())
 
     def _web_pair_link_base(self) -> str:
