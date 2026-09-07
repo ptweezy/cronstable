@@ -3,13 +3,14 @@
 #
 # cryptography compiles its ML-KEM (the `xwing` push suite) only against
 # OpenSSL 3.5 or newer. The build lanes whose base image predates that
-# (manylinux2014 is CentOS 7 with 1.0.2; Debian bookworm has 3.0) and whose
-# arch has no cryptography wheel get one this way, then point the sdist
-# build at it with OPENSSL_DIR=PREFIX and OPENSSL_STATIC=1, so the frozen
-# bundle links the library in and carries no libssl of its own. Under QEMU
-# the build takes on the order of an hour, which is why callers keep PREFIX
-# somewhere their cache step persists: an existing libcrypto.a is trusted
-# as a finished build and the script returns at once.
+# (manylinux2014 is CentOS 7 with 1.0.2, manylinux_2_28 is AlmaLinux 8
+# with 1.1.1, Debian bookworm has 3.0) and whose arch has no cryptography
+# wheel get one this way, then point the sdist build at it with
+# OPENSSL_DIR=PREFIX and OPENSSL_STATIC=1, so the extension links the
+# library in and needs no libssl at run time. Under QEMU the build takes
+# about an hour, which is why callers keep PREFIX somewhere their cache
+# step persists: the script treats an existing libcrypto.a as a finished
+# build and returns immediately.
 #
 # Pinned by version and checksum, fetched from the project's GitHub
 # releases (the same bytes openssl.org serves). Bump VERSION and SHA256
@@ -17,11 +18,13 @@
 #
 # Usage: build_openssl.sh PREFIX
 #
-# Needs perl with IPC::Cmd and Time::Piece (Configure and the Makefile it
-# generates import them; RHEL-family distributions package both apart from
-# perl, as perl-IPC-Cmd and perl-Time-Piece, and the manylinux images leave
-# them out), make, a C compiler, and curl or wget. No `set -e` around the
-# fetch: retry.sh handles the network hop when it is on hand.
+# Needs perl with IPC::Cmd, Time::Piece, and bigint, plus make, a C
+# compiler, and curl or wget. Configure, the Makefile it generates, and the
+# s390x assembler generators import those three modules; RHEL-family
+# distributions package them apart from perl, as perl-IPC-Cmd,
+# perl-Time-Piece, and perl-bignum, and the manylinux images leave them
+# out. No `set -e` around the fetch: retry.sh handles the network hop when
+# it is on hand.
 set -u
 
 VERSION=3.5.8
@@ -36,9 +39,14 @@ fi
 
 # The check runs before the fetch so a failure names the modules instead
 # of surfacing as a perl compilation error inside Configure.
-if ! perl -MIPC::Cmd -MTime::Piece -e 1 2>/dev/null; then
-    echo "build_openssl.sh: perl lacks IPC::Cmd or Time::Piece" \
-        "(perl-IPC-Cmd and perl-Time-Piece on RHEL-likes)" >&2
+if ! command -v perl >/dev/null 2>&1; then
+    echo "build_openssl.sh: perl is not installed" >&2
+    exit 1
+fi
+if ! perl -MIPC::Cmd -MTime::Piece -Mbigint -e 1 2>/dev/null; then
+    echo "build_openssl.sh: perl lacks IPC::Cmd, Time::Piece, or bigint" \
+        "(perl-IPC-Cmd, perl-Time-Piece, and perl-bignum on RHEL-family" \
+        "distributions)" >&2
     exit 1
 fi
 
@@ -74,23 +82,18 @@ fi
 tar xzf "$tarball" || exit 1
 cd "openssl-$VERSION" || exit 1
 
-# `config` picks the target from uname, which reports the KERNEL: under
-# docker --platform a 32-bit userland on a 64-bit host still says x86_64
-# or aarch64, and config then chooses a target the 32-bit toolchain cannot
-# build (on x86_64 it takes the 32-bit compiler for the x32 ABI). The
-# compiler knows what it emits, so where the two disagree this script
-# names the target itself; everywhere else config's own guess stands.
+# `config` picks the target from uname, which reports the kernel: under
+# docker --platform an i686 userland on an x86_64 host still says x86_64,
+# and config, which finds a 32-bit compiler under that name, selects the
+# x32 ABI, which the i686 toolchain cannot build. The compiler reports the
+# ABI it targets, so where the two disagree this script names the target
+# itself, the one config selects natively on i686; everywhere else config's
+# own guess stands.
 target=
-case "$(uname -m)" in
-    x86_64)
-        if ${CC:-cc} -dM -E -x c /dev/null 2>/dev/null | grep -q __i386__; then
-            target=linux-x86
-        fi ;;
-    aarch64)
-        if ${CC:-cc} -dM -E -x c /dev/null 2>/dev/null | grep -q __arm__; then
-            target=linux-armv4
-        fi ;;
-esac
+if [ "$(uname -m)" = x86_64 ] &&
+    ${CC:-cc} -dM -E -x c /dev/null 2>/dev/null | grep -q __i386__; then
+    target=linux-x86
+fi
 
 # Static only, position independent (the archive is linked into a shared
 # extension), and with --libdir=lib so the result lands in lib/ on every

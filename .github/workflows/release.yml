@@ -858,9 +858,12 @@ jobs:
                     if [ ! -x /opt/cargo/bin/cargo ]; then
                       sh -c "$RUST_SETUP_CMD"
                     fi
-                    # OpenSSL Configure needs perl IPC::Cmd and its generated
-                    # Makefile Time::Piece; CentOS 7 packages both apart from
-                    # perl and the image leaves them out.
+                    # OpenSSL Configure imports perl IPC::Cmd, and the
+                    # Makefile it writes imports Time::Piece; CentOS 7
+                    # packages both apart from perl and the image leaves
+                    # them out. The bigint the s390x assembler generators
+                    # import is in its base perl: CentOS 7 has no
+                    # perl-bignum package, and naming one fails yum.
                     perl -MIPC::Cmd -MTime::Piece -e 1 2>/dev/null || retry 5 yum install -y perl-IPC-Cmd perl-Time-Piece
                     sh pyinstaller/build_openssl.sh /src/.openssl-${{ matrix.arch }}
                   } || pq_ready=0
@@ -1009,9 +1012,10 @@ jobs:
             # What a cryptography SOURCE build needs on the rows with no
             # wheel (pq_src below): Alpine 3.23 ships rust 1.91 (the MSRV
             # is 1.83) and OpenSSL 3.5 (ML-KEM needs 3.5) for all nine of
-            # its arches, static libs included, so the distro toolchain
-            # does the whole job with no rustup and no OpenSSL build.
-            pq_tools: 'retry 5 apk add --no-cache rust cargo openssl-dev openssl-libs-static pkgconf'
+            # its arches, so the distro toolchain does the whole job with
+            # no rustup and no OpenSSL build. The extension links the
+            # distro libssl (see the lane script), so the headers suffice.
+            pq_tools: 'retry 5 apk add --no-cache rust cargo openssl-dev pkgconf'
           - libc: glibc
             # Overridden per row below: the two remaining glibc rows sit on
             # different Debian suites, because bookworm has no riscv64 port
@@ -1022,7 +1026,7 @@ jobs:
             nacl_tools: 'retry 3 apt-get -o Acquire::Retries=5 install -y --no-install-recommends libffi-dev make >/dev/null 2>&1 || true'
             rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
             # The trixie counterpart of the musl pq_tools: rustc 1.85 and
-            # OpenSSL 3.5.7 on every port trixie ships, static libs in
+            # OpenSSL 3.5.7 on every port trixie ships, headers in
             # libssl-dev. Only the trixie row uses it (riscv64); the
             # bookworm i686 row has OpenSSL 3.0 and rustc 1.63 and takes
             # its own route below.
@@ -1220,8 +1224,8 @@ jobs:
               # seals post-quantum X-Wing push. The wheel rows take it hard;
               # the pq_src rows first install the distro Rust and OpenSSL
               # (pq_tools) and let pip build the sdist against the distro
-              # libssl, which PyInstaller collects into the bundle for the
-              # interpreter's own ssl module in any case, so the binary
+              # libssl, which PyInstaller already collects into the bundle
+              # for the ssl module of the interpreter, so the binary
               # carries one OpenSSL rather than two. Soft, as the matrix
               # explains (and no apostrophes: single-quoted sh -euc). The
               # bookworm row is the exception: its distro OpenSSL cannot
@@ -1715,7 +1719,8 @@ jobs:
             toolchain: 'retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev curl ca-certificates'
             rust_setup: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
             # What the cryptography source build needs beyond the rustup
-            # Rust: trixie's OpenSSL 3.5 headers and static libs.
+            # Rust: trixie's OpenSSL 3.5 headers (the extension links the
+            # distro libssl; see the lane script).
             pq_tools: 'retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends libssl-dev pkg-config'
             floor: '2.41'
           - libc: musl
@@ -1726,9 +1731,8 @@ jobs:
             image: ghcr.io/loong64/alpine:3.24.1
             toolchain: 'retry 5 apk add --no-cache build-base libffi-dev zlib-dev python3 python3-dev py3-pip curl'
             rust_setup: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
-            # Alpine 3.24's OpenSSL 3.5 headers and static libs, for the
-            # same source build.
-            pq_tools: 'retry 5 apk add --no-cache openssl-dev openssl-libs-static pkgconf'
+            # Alpine 3.24's OpenSSL 3.5 headers, for the same source build.
+            pq_tools: 'retry 5 apk add --no-cache openssl-dev pkgconf'
             floor: ''
     runs-on: ubuntu-24.04
     # Emulated LoongArch compiles the whole dependency stack plus a bootloader.
@@ -1792,9 +1796,10 @@ jobs:
               # exists, so it builds from its sdist against the distro
               # OpenSSL 3.5 (pq_tools) with the rustup Rust the orjson step
               # installed (fetched here if that step never got to it). The
-              # extension links the distro libssl, which PyInstaller collects
-              # into the bundle for the interpreter's own ssl module in any
-              # case, so the binary carries one OpenSSL rather than two.
+              # extension links the distro libssl, which PyInstaller already
+              # collects into the bundle for the ssl module of the
+              # interpreter, so the binary carries one OpenSSL rather than
+              # two.
               # Soft like the other compiled extras on this lane:
               # verify_extra.py seals a real X-Wing probe and drops a build
               # that cannot.
@@ -2964,10 +2969,15 @@ jobs:
   # arches is trixie or newer), and manylinux_2_28 for glibc s390x, whose
   # consumers span RHEL 10 (glibc 2.39) through Ubuntu 26.04, so the wheel
   # is built against the oldest of them with a rustup Rust and an OpenSSL
-  # built from source (build_openssl.sh, cached). The wheel carries the
-  # plain linux_<arch> tag pip gives an unrepaired build, which every Linux
-  # pip accepts; the per-libc directories are what keep a musl wheel away
-  # from a glibc image and vice versa.
+  # built from source (build_openssl.sh, cached). Every row builds with
+  # CPython 3.11: the build interpreter sets the floor of the abi3 tag on
+  # the wheel, and cp311-abi3 (the tag the PyPI wheels carry) loads on
+  # every image interpreter, where a newer floor would keep the wheel out
+  # of the rhel (3.12) and opensuse (3.13) images. The wheel carries the
+  # plain linux_<arch> tag of an unrepaired build, or the manylinux tag
+  # that maturin assigns inside a manylinux image; extract_deps.py matches
+  # the machine either way, and the per-libc directories keep a musl wheel
+  # away from a glibc image and a glibc wheel away from a musl image.
   #
   # Every row is best-effort at the job level (continue-on-error), so a
   # failed compile costs that platform its post-quantum suite (the image
@@ -2981,13 +2991,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { libc: musl, arch: i686, platform: linux/386, image: python:3.14-alpine3.23 }
-          - { libc: musl, arch: armv7, platform: linux/arm/v7, image: python:3.14-alpine3.23, qemu: true }
-          - { libc: musl, arch: ppc64le, platform: linux/ppc64le, image: python:3.14-alpine3.23, qemu: true }
-          - { libc: musl, arch: s390x, platform: linux/s390x, image: python:3.14-alpine3.23, qemu: true }
-          - { libc: musl, arch: riscv64, platform: linux/riscv64, image: python:3.14-alpine3.23, qemu: true }
-          - { libc: glibc, arch: i686, platform: linux/386, image: python:3.14-slim-trixie }
-          - { libc: glibc, arch: riscv64, platform: linux/riscv64, image: python:3.14-slim-trixie, qemu: true }
+          - { libc: musl, arch: i686, platform: linux/386, image: python:3.11-alpine3.23 }
+          - { libc: musl, arch: armv7, platform: linux/arm/v7, image: python:3.11-alpine3.23, qemu: true }
+          - { libc: musl, arch: ppc64le, platform: linux/ppc64le, image: python:3.11-alpine3.23, qemu: true }
+          - { libc: musl, arch: s390x, platform: linux/s390x, image: python:3.11-alpine3.23, qemu: true }
+          - { libc: musl, arch: riscv64, platform: linux/riscv64, image: python:3.11-alpine3.23, qemu: true }
+          - { libc: glibc, arch: i686, platform: linux/386, image: python:3.11-slim-trixie }
+          - { libc: glibc, arch: riscv64, platform: linux/riscv64, image: python:3.11-slim-trixie, qemu: true }
           - { libc: glibc, arch: s390x, platform: linux/s390x, image: quay.io/pypa/manylinux_2_28_s390x:2026.08.15-1, qemu: true, manylinux: '1' }
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -3026,14 +3036,16 @@ jobs:
           # fresh shell that inherits no function, so every string sources
           # retry.sh for itself, as RUST_SETUP_CMD does. The manylinux row
           # has no usable distro OpenSSL or Rust and takes the from-source
-          # route; what it installs is the two perl modules OpenSSL's
-          # Configure and its generated Makefile need that the image
-          # leaves out.
-          PQ_TOOLS: ${{ matrix.libc == 'musl' && '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && '. /src/.github/scripts/retry.sh && retry 5 yum install -y perl-IPC-Cmd perl-Time-Piece' || '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev zlib1g-dev libzstd-dev pkg-config' }}
+          # route; it installs the perl modules the image leaves out:
+          # IPC::Cmd for the OpenSSL Configure script, Time::Piece for the
+          # Makefile it writes, and bigint for the s390x assembler
+          # generators.
+          PQ_TOOLS: ${{ matrix.libc == 'musl' && '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && '. /src/.github/scripts/retry.sh && retry 5 yum install -y perl-IPC-Cmd perl-Time-Piece perl-bignum' || '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev zlib1g-dev libzstd-dev pkg-config' }}
           RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
           # The probe below installs the project, whose version comes from
-          # this rather than from git: the python images carry no git, and
-          # the manylinux image refuses the bind mount's ownership.
+          # this rather than from git: the python images carry no git (the
+          # manylinux image does, and the safe.directory line below lets
+          # its file finder read the bind mount).
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         run: |
           set -euo pipefail
@@ -3045,14 +3057,19 @@ jobs:
               . /src/.github/scripts/retry.sh
               sh -c "$PQ_TOOLS"
               if [ -n "${{ matrix.manylinux }}" ]; then
-                # The interpreter the wheel is built with only has to be
-                # any 3.11+: the result is an abi3 wheel. manylinux ships
-                # its own at /opt/python; the newest 3.14 there does.
-                PY=$(ls -d /opt/python/cp314-cp314 | head -1)/bin/python
-                # The checkout is the runner user and this container is
-                # root, so git calls the bind mount dubiously owned, and the
-                # project install below (setuptools_scm shells out to git
-                # for its file finder) dies on the refusal. The python
+                # The build interpreter sets the floor of the abi3 tag (a
+                # cp311-abi3 wheel loads on 3.11 and newer), so the row
+                # builds with the oldest interpreter any consumer image
+                # runs: the rhel image has 3.12 and opensuse 3.13.
+                # manylinux ships every CPython at /opt/python, and 3.11 is
+                # also the floor the PyPI wheels carry. extract_deps.py
+                # drops a wheel whose floor sits above the image
+                # interpreter rather than letting pip fail the image build.
+                PY=/opt/python/cp311-cp311/bin/python
+                # The checkout belongs to the runner user and this container
+                # runs as root, so git reports the bind mount as dubiously
+                # owned, and the project install below (setuptools_scm runs
+                # git for its file finder) fails on that refusal. The python
                 # images carry no git and never see this.
                 git config --global --add safe.directory /src
                 sh -c "$RUST_SETUP_CMD"
@@ -3081,12 +3098,13 @@ jobs:
                 RUSTFLAGS="-C link-arg=-lz -C link-arg=-lzstd"
                 export OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR RUSTFLAGS
               fi
-              # Static on every row, with the archives named outright: left
-              # to pkg-config, openssl-sys never links an archive that lives
-              # under /usr (the pkg-config crate treats a system root as
-              # dynamic-only), so OPENSSL_STATIC alone yields a wheel that
-              # loads only beside the libssl.so.3 it was built next to.
-              # These wheels go to eight images, so they carry their own.
+              # Static on every row, with the archive paths given outright:
+              # when pkg-config finds OpenSSL, openssl-sys never links an
+              # archive under /usr (the pkg-config crate treats a system
+              # root as dynamic-only), so OPENSSL_STATIC alone yields a
+              # wheel that loads only beside the libssl.so.3 it was built
+              # next to. These wheels go into every image build, so they
+              # carry their own.
               export OPENSSL_STATIC=1
               $PY -m pip install --upgrade pip
               rm -rf /src/wheelhouse
@@ -3101,11 +3119,14 @@ jobs:
               $PY pyinstaller/verify_extra.py cryptography
               # And prove the link: an extension that still names libssl or
               # libcrypto as a shared dependency is not self-contained. The
-              # full NEEDED list goes to the log first, so what the wheel
-              # does ask of an image is on record.
+              # full NEEDED list goes to the log first, so the log records
+              # what the wheel asks of an image. readelf writes to a file in
+              # a command of its own, so an image without readelf fails the
+              # row here instead of passing an unread gate.
               ext=$($PY -c "import cryptography.hazmat.bindings._rust as m; print(m.__file__)")
-              readelf -d "$ext" | grep NEEDED || true
-              if readelf -d "$ext" | grep -E "NEEDED.*lib(ssl|crypto)"; then
+              readelf -d "$ext" > /tmp/cryptography.dyn
+              grep NEEDED /tmp/cryptography.dyn || true
+              if grep -E "NEEDED.*lib(ssl|crypto)" /tmp/cryptography.dyn; then
                 echo "FAIL: the wheel links OpenSSL dynamically" >&2
                 exit 1
               fi

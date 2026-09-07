@@ -655,3 +655,48 @@ def test_apk_packages_are_built_from_the_musl_binaries():
     assert not recipe.get("overrides"), (
         "the apk recipe carries format overrides it cannot use"
     )
+
+
+def _single_quoted_scripts():
+    """Every (job, step, line) inside a `sh -euc '...'` container script.
+
+    The container lanes hand their whole build to `docker run ... sh -euc '`
+    as one single-quoted argument that closes on a line holding only the
+    quote.  Bash ends the argument at the first apostrophe, so one inside
+    (a comment that said "the interpreter's ssl module" did it) splits the
+    script: the container runs the head, and the runner's own bash runs
+    the tail, which fails on the first helper only the container provides
+    (`retry: command not found`).  Every row of the job fails.
+    """
+    opener = re.compile(r"\b(?:ba)?sh -[a-z]*c '$")
+    for name, job in _workflow()["jobs"].items():
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if not isinstance(run, str):
+                continue
+            inside = False
+            for line in run.splitlines():
+                if inside:
+                    if line.strip() == "'":
+                        inside = False
+                    else:
+                        yield name, step.get("name", "?"), line
+                elif opener.search(line.rstrip()):
+                    inside = True
+
+
+def test_container_scripts_carry_no_apostrophe():
+    offenders = [
+        "{} / {}: {}".format(job, step, line.strip())
+        for job, step, line in _single_quoted_scripts()
+        if "'" in line
+    ]
+    assert not offenders, (
+        "an apostrophe inside a single-quoted container script ends the "
+        "script early and runs the rest on the runner: {}".format(offenders)
+    )
+    # The fence must also find something to check: the container lanes
+    # still use this shape.
+    assert any(True for _ in _single_quoted_scripts()), (
+        "no single-quoted container script found; the fence is blind"
+    )

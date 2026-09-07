@@ -121,16 +121,43 @@ def wheelhouse_has_cryptography(wheelhouse, machine, pointer_size):
     The release workflow's pq-wheels job builds cryptography for the image
     platforms PyPI publishes no wheel for and the Dockerfiles COPY the
     result beside this script, one directory per libc, so the libc is
-    already decided by which directory this image was handed; only the
-    machine is matched, on the linux_<machine> tag an unrepaired build
-    carries (or a manylinux/musllinux tag, should one ever be repaired).
+    already decided by which directory this image was handed. The lookup
+    matches the machine against the linux_<machine> tag of an unrepaired
+    build (or the manylinux or musllinux tag of a repaired one), and the
+    python tag against the interpreter running this script: a wheel this
+    image cannot load is no wheel, and saying so here keeps it a dropped
+    requirement rather than a failed `pip install --only-binary`.
     """
     if not wheelhouse:
         return False
     wanted = wheel_machine(machine, pointer_size)
     for path in glob.glob(os.path.join(wheelhouse, "cryptography-*.whl")):
-        platform_tag = os.path.basename(path)[: -len(".whl")].split("-")[-1]
-        if platform_tag.endswith("_" + wanted):
+        name = os.path.basename(path)[: -len(".whl")]
+        python_tag, abi_tag, platform_tag = name.split("-")[-3:]
+        if platform_tag.endswith("_" + wanted) and python_tag_admits(
+            python_tag, abi_tag
+        ):
+            return True
+    return False
+
+
+def python_tag_admits(python_tag, abi_tag, version=None):
+    """Whether a wheel's python and abi tags admit this interpreter.
+
+    An abi3 wheel names its floor in the python tag (cp311-abi3 loads on
+    3.11 and newer); any other wheel names the exact interpreter. The
+    interpreter a pq-wheels row builds with sets that floor, and an image
+    interpreter can sit below it. `version` is a (major, minor) pair; it
+    defaults to the running interpreter.
+    """
+    major, minor = version or sys.version_info[:2]
+    for tag in python_tag.split("."):
+        match = re.fullmatch(r"cp(\d)(\d+)", tag)
+        if match and int(match.group(1)) == major:
+            tag_minor = int(match.group(2))
+            if tag_minor == minor or (abi_tag == "abi3" and tag_minor < minor):
+                return True
+        elif tag in ("py3", "py%d" % major) and abi_tag == "none":
             return True
     return False
 

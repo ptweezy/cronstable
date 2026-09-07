@@ -440,6 +440,43 @@ def test_a_wheelhouse_wheel_keeps_cryptography_where_pypi_has_none(
     assert "cryptography>=48" in written.splitlines()
 
 
+def test_a_wheelhouse_wheel_must_load_on_the_image_interpreter(tmp_path):
+    # The interpreter a pq-wheels row builds with sets the floor of the
+    # wheel's abi3 tag, and an image interpreter can sit below it (the rhel
+    # image runs 3.12). Such a wheel is no wheel for that image: keeping the
+    # requirement would end in a failed `pip install --only-binary` instead
+    # of the designed x25519-only fallback.
+    module = _extract_deps_module()
+    major, minor = sys.version_info[:2]
+    admits = module.python_tag_admits
+    assert admits("cp%d%d" % (major, minor), "abi3")
+    assert admits("cp%d%d" % (major, minor - 1), "abi3")
+    assert not admits("cp%d%d" % (major, minor + 1), "abi3")
+    # A wheel that is not abi3 names the exact interpreter.
+    assert admits("cp%d%d" % (major, minor), "cp%d%d" % (major, minor))
+    assert not admits(
+        "cp%d%d" % (major, minor - 1), "cp%d%d" % (major, minor - 1)
+    )
+    assert admits("py3", "none")
+    # The caller can pass the version, as the resolver in an image does.
+    assert not admits("cp314", "abi3", version=(3, 12))
+    assert admits("cp311", "abi3", version=(3, 12))
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    target = ("s390x", 8, "glibc")
+    line = "cryptography>=48; sys_platform == 'linux'"
+    too_new = "cryptography-50.0.1-cp%d%d-abi3-linux_s390x.whl" % (
+        major,
+        minor + 1,
+    )
+    (wheelhouse / too_new).touch()
+    assert module.resolve_cryptography(line, target, str(wheelhouse)) is None
+    (wheelhouse / "cryptography-50.0.1-cp311-abi3-linux_s390x.whl").touch()
+    assert module.resolve_cryptography(line, target, str(wheelhouse)) == (
+        "cryptography>=48"
+    )
+
+
 def test_another_platforms_cryptography_line_never_reaches_an_image():
     # pyproject carries a second, capped cryptography line for Intel macOS
     # and 32-bit Windows. Stripping its marker on a Linux image would pin
