@@ -698,7 +698,7 @@ jobs:
           restore-keys: |
             pip-manylinux-${{ matrix.arch }}-
       - if: ${{ matrix.qemu }}
-        uses: docker/setup-qemu-action@v4.2.0
+        uses: docker/setup-qemu-action@v4.3.0
       # Pulled in its own retried step, like every other container lane, so a
       # registry blip never re-runs the hour-long build below. NOT pull_base:
       # that helper's mirror failover rewrites the image into the Docker Hub
@@ -981,7 +981,7 @@ jobs:
       # Register binfmt/QEMU so `docker run --platform` can execute a foreign-arch
       # container. amd64/arm64/i686 run natively and skip this.
       - if: ${{ matrix.qemu }}
-        uses: docker/setup-qemu-action@v4.2.0
+        uses: docker/setup-qemu-action@v4.3.0
       # Pull the base image in its own retried step. Docker Hub times out often
       # enough to red a release on its own (a 15s connect timeout to
       # registry-1.docker.io took the s390x row down mid-release), and pulling
@@ -1173,7 +1173,7 @@ jobs:
       # is one 10 GB pool per repository and is already over it, so a new writer
       # would evict caches the other lanes depend on to buy time this lane does
       # not need.
-      - uses: docker/setup-qemu-action@v4.2.0
+      - uses: docker/setup-qemu-action@v4.3.0
       - name: Pull the build image
         run: |
           set -euo pipefail
@@ -1385,7 +1385,7 @@ jobs:
       # Deliberately NO pip cache, like binaries-mips: the Actions cache is one
       # 10 GB pool per repository and is already over it, so a new writer would
       # evict caches the other lanes depend on.
-      - uses: docker/setup-qemu-action@v4.2.0
+      - uses: docker/setup-qemu-action@v4.3.0
       - name: Pull the build image
         run: |
           set -euo pipefail
@@ -1528,7 +1528,7 @@ jobs:
       #
       # loong64 emulation is in the default binfmt install (tonistiigi/binfmt
       # has carried it since 2024, under the containerd architecture name).
-      - uses: docker/setup-qemu-action@v4.2.0
+      - uses: docker/setup-qemu-action@v4.3.0
       - name: Pull the build image
         run: |
           set -euo pipefail
@@ -1965,7 +1965,7 @@ jobs:
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
       - name: Build binary (OpenBSD 7.9 amd64)
-        uses: vmactions/openbsd-vm@v1.4.6
+        uses: vmactions/openbsd-vm@v1.4.7
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2075,7 +2075,7 @@ jobs:
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
       - name: Build binary (NetBSD 11.0 amd64)
-        uses: vmactions/netbsd-vm@v1.4.7
+        uses: vmactions/netbsd-vm@v1.4.9
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2171,7 +2171,7 @@ jobs:
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
       - name: Build binary (OmniOS r151054 amd64)
-        uses: vmactions/omnios-vm@v1.3.5
+        uses: vmactions/omnios-vm@v1.3.6
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2533,7 +2533,7 @@ jobs:
       # setuptools_scm never walks history inside the build (only a plain
       # local `docker build .` does, and that uses the builder's own git).
       - uses: actions/checkout@v7.0.1
-      - uses: docker/setup-qemu-action@v4.2.0
+      - uses: docker/setup-qemu-action@v4.3.0
       - uses: docker/setup-buildx-action@v4.3.0
       - name: Build image (build-only gate)
         uses: docker/build-push-action@v7.3.0
@@ -2952,7 +2952,7 @@ jobs:
           path: signdir
       - name: Log in to Azure (OIDC)
         if: steps.decide.outputs.signed == 'true'
-        uses: azure/login@v3.0.1
+        uses: azure/login@v3.0.2
         with:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -3374,7 +3374,7 @@ jobs:
           ls -l third-party
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3.0.2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           tag_name: ${{ needs.version.outputs.new }}
           name: ${{ needs.version.outputs.new }}
@@ -3552,7 +3552,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: docker/setup-qemu-action@v4.2.0
+      - uses: docker/setup-qemu-action@v4.3.0
       - uses: docker/setup-buildx-action@v4.3.0
 
       - name: Build and push
