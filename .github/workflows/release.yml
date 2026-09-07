@@ -352,8 +352,8 @@ jobs:
   # never slip in. scripts/check_licenses.py reads the INSTALLED dist metadata
   # (no third-party scanner) and fails on a disallowed license; weak file-scoped
   # copyleft (LGPL/MPL) is reported but allowed. It installs the runtime plus
-  # every distributable extra (`speedups`, `push-pq`, and `discovery`;
-  # `push-pq` carries `push`'s pynacl too) so nothing the artifacts can carry
+  # every distributable extra (`speedups`, `push`, and `discovery`; `push`
+  # carries both pynacl and cryptography) so nothing the artifacts can carry
   # escapes the scan. zeroconf (discovery) is LGPL-2.1: expected in the
   # report, and shipped with its compliance kit (in-binary notice, Release
   # source archive, public build recipe). See LICENSING.md.
@@ -372,7 +372,7 @@ jobs:
         run: |
           set -euo pipefail
           uv venv --python 3.14
-          uv pip install ".[speedups,push-pq,discovery]"
+          uv pip install ".[speedups,push,discovery]"
       - name: Check dependency licenses
         run: uv run python .github/scripts/check_licenses.py
 
@@ -832,7 +832,7 @@ jobs:
               # the sealed-box round trip is uninstalled, so push fails closed
               # rather than shipping a miscompiled libsodium.
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" ${{ matrix.nacl }} "push extra not bundled"
-              # Bundle cryptography (the `push-pq` extra) so the frozen daemon
+              # Bundle cryptography (the post-quantum half of the `push` extra) so the frozen daemon
               # seals post-quantum X-Wing push. NO APOSTROPHES BELOW: this
               # whole script is the argument of a single-quoted sh -euc, so
               # one would end it mid-comment. Every row declares `pq`. Where
@@ -1220,7 +1220,7 @@ jobs:
               # libsodium (push fails closed).
               ${{ matrix.nacl_tools }}
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
-              # Bundle cryptography (the `push-pq` extra) so the frozen daemon
+              # Bundle cryptography (the post-quantum half of the `push` extra) so the frozen daemon
               # seals post-quantum X-Wing push. The wheel rows take it hard;
               # the pq_src rows first install the distro Rust and OpenSSL
               # (pq_tools) and let pip build the sdist against the distro
@@ -1523,7 +1523,10 @@ jobs:
   #   during the build rather than on a user's hardware. elf_floor.py then
   #   asserts the float ABI and Tag_CPU_arch statically over the whole bundle.
   binaries-arm-legacy:
-    needs: version
+    # pq-wheel-armv6 runs with continue-on-error, so a wheel that failed
+    # to build never holds this job; the armv6 binary then seals
+    # x25519 only, as the armel one always does.
+    needs: [version, pq-wheel-armv6]
     strategy:
       fail-fast: false
       matrix:
@@ -1600,6 +1603,18 @@ jobs:
       # Deliberately NO pip cache, like binaries-mips: the Actions cache is one
       # 10 GB pool per repository and is already over it, so a new writer would
       # evict caches the other lanes depend on.
+      #
+      # The cryptography wheel pq-wheel-armv6 built for the armv6 row (no
+      # PyPI wheel exists for ARMv6, and the compile is hours under an
+      # emulated ARM1176, which is why it is its own continue-on-error job
+      # rather than a step here). A missing artifact leaves the row on x25519.
+      - name: Fetch the ARMv6 post-quantum wheel
+        if: ${{ matrix.arch == 'armv6' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v7.0.0
+        with:
+          name: pq-wheel-glibc-armv6
+          path: pq-wheels
       - uses: docker/setup-qemu-action@v4.3.0
       - name: Pull the build image
         run: |
@@ -1658,6 +1673,19 @@ jobs:
               sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
               sh pyinstaller/install_orjson.sh
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              # Bundle cryptography (the post-quantum half of the push extra)
+              # on the armv6 row, from the wheel pq-wheel-armv6 built and the
+              # preceding step fetched: PIP_ONLY_BINARY keeps pip off the sdist,
+              # which has no Rust to build with in here. Soft, like pynacl:
+              # verify_extra.py seals a real X-Wing probe on the emulated
+              # core and drops a build that cannot. armel has no Rust
+              # toolchain for its ABI at all and stays on x25519.
+              if [ "${{ matrix.arch }}" = armv6 ] && ls /src/pq-wheels/cryptography-*.whl >/dev/null 2>&1; then
+                PIP_FIND_LINKS=/src/pq-wheels PIP_ONLY_BINARY=cryptography \
+                  sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
+              else
+                echo "cryptography: no wheel for this row; post-quantum push not bundled"
+              fi
               sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
               /v/bin/pyinstaller pyinstaller/cronstable.spec
               # Smoke test on the emulated target core, so an instruction the
@@ -1668,6 +1696,16 @@ jobs:
               # only when both import inside the bundle.
               if /v/bin/python -c "import nacl" 2>/dev/null; then
                 dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+              fi
+              # And whenever it kept cryptography, the frozen bundle must seal
+              # xwing (see install_extra.sh header).
+              if /v/bin/python -c "import cryptography" 2>/dev/null; then
+                suites=$(dist/cronstable --sealable-suites)
+                echo "sealable suites: $suites"
+                echo "$suites" | grep -qx xwing || {
+                  echo "FAIL: the frozen binary cannot seal xwing" >&2
+                  exit 1
+                }
               fi
               # cli_job_smoke.sh is deliberately not run here: it needs a
               # daemon, loopback HTTP and curl, and this row is emulated. The
@@ -1792,7 +1830,7 @@ jobs:
               sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
               RUST_SETUP="${{ matrix.rust_setup }}" sh pyinstaller/install_orjson.sh
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
-              # Bundle cryptography (the `push-pq` extra): no loong64 wheel
+              # Bundle cryptography (the post-quantum half of the `push` extra): no loong64 wheel
               # exists, so it builds from its sdist against the distro
               # OpenSSL 3.5 (pq_tools) with the rustup Rust the orjson step
               # installed (fetched here if that step never got to it). The
@@ -1932,7 +1970,7 @@ jobs:
           # ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
-          # Bundle cryptography (the `push-pq` extra) so the frozen daemon
+          # Bundle cryptography (the post-quantum half of the `push` extra) so the frozen daemon
           # seals post-quantum X-Wing push. Every row declares `pq`: the
           # arm64 rows take the newest release, and the Intel rows cap at
           # `pqcap` (below 49, the last line with a universal2 wheel; see the
@@ -2050,9 +2088,9 @@ jobs:
   # (verify_extra.py drops a miscompiled build and the binary falls back),
   # hard only for pure-Python zeroconf.
   #
-  # timeout-minutes caps a runaway emulated row well below the 6h default:
-  # the native row lands in well under an hour, and a row that has not
-  # finished in three is wedged, not slow.
+  # timeout-minutes is the 6h ceiling: the native row lands in well under an
+  # hour, and the emulated row compiles cryptography's Rust crate on top of
+  # everything else it builds, which is hours under full-system QEMU.
   binaries-freebsd:
     needs: version
     strategy:
@@ -2080,15 +2118,19 @@ jobs:
             # design, so this row skips it outright and the binary uses the
             # stdlib json fallback (cronstable/_json). uvloop stays: it is
             # a plain C build against bundled libuv, and the event loop is
-            # the win that actually matters for a scheduler. cryptography is
-            # a Rust extension too and skips this row for the same reason,
-            # so the arm64 build refuses xwing pairings (x25519 still seals).
-            pkgs: python314 gmake pkgconf libsodium
+            # the win that actually matters for a scheduler. cryptography
+            # is a Rust extension too, but it is the whole post-quantum
+            # push channel rather than a speedup, so this row does pay for
+            # it: the port rust (prebuilt, so only cryptography's own crate
+            # compiles here) and the port OpenSSL 3.5, under the job
+            # timeout sized for the emulated compile. Soft: a build that
+            # fails the X-Wing probe is dropped and the binary seals x25519.
+            pkgs: python314 rust gmake pkgconf libsodium openssl35
             orjson: '0'
-            pq: '0'
+            pq: '1'
             cflags: -I/usr/local/include -include sys/cdefs.h
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
       # setuptools_scm never walks history here, and its git file-finder (which
@@ -2178,7 +2220,7 @@ jobs:
             # fails closed rather than shipping a miscompiled libsodium.
             SODIUM_INSTALL=system \
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
-            # Bundle cryptography (the `push-pq` extra) from its sdist on
+            # Bundle cryptography (the post-quantum half of the `push` extra) from its sdist on
             # the row that attempts it (see the matrix): the port OpenSSL
             # 3.5 under /usr/local is the library, linked statically so the
             # bundle carries no libssl, and the port rust the compiler. Soft
@@ -2340,7 +2382,7 @@ jobs:
             export CFLAGS LDFLAGS
             SODIUM_INSTALL=system \
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
-            # Bundle cryptography (the `push-pq` extra) from its sdist: no
+            # Bundle cryptography (the post-quantum half of the `push` extra) from its sdist: no
             # OpenBSD wheel exists. The base LibreSSL is no use to it (its
             # ML-KEM compiles only against OpenSSL 3.5 or newer), so the
             # openssl%3.5 port installed above is the library, at the
@@ -2467,7 +2509,7 @@ jobs:
             # closed rather than shipping a miscompiled libsodium.
             SODIUM_INSTALL=system \
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
-            # Bundle cryptography (the `push-pq` extra) from its sdist: no
+            # Bundle cryptography (the post-quantum half of the `push` extra) from its sdist: no
             # NetBSD wheel exists. pkgsrc's openssl (3.6, past the 3.5 that
             # ML-KEM needs) and rust (past the 1.83 MSRV), both installed
             # above under /usr/pkg, are the library and the compiler. Static
@@ -2520,7 +2562,9 @@ jobs:
   binaries-illumos:
     needs: version
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # The Rust compile of cryptography is the largest cost here; the VM is
+    # host-native (KVM), so it is minutes rather than the hour QEMU takes.
+    timeout-minutes: 180
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
       # setuptools_scm never walks history here, and its git file-finder (which
@@ -2537,7 +2581,13 @@ jobs:
           copyback: true
           envs: 'SETUPTOOLS_SCM_PRETEND_VERSION'
           prepare: |
-            pkg install runtime/python-313 developer/build-essential
+            pkg install runtime/python-313 developer/build-essential library/security/openssl-3
+            # libsodium (the push extra) and rust (its post-quantum half)
+            # live in the OmniOS `extra` publisher rather than core. Neither
+            # can fail the job, like every extra on this lane: a publisher
+            # that cannot be reached costs the binary push and nothing else.
+            pkg publisher extra.omnios >/dev/null 2>&1 || pkg set-publisher -g https://pkg.omnios.org/r151054/extra/ extra.omnios || echo "extra publisher unavailable; push not bundled"
+            pkg install ooce/library/libsodium ooce/developer/rust || echo "libsodium or rust unavailable; push or post-quantum push not bundled"
           run: |
             set -eu
 
@@ -2559,13 +2609,30 @@ jobs:
 
             # Nothing is prebuilt for illumos, so every extra is a source build
             # against the gcc14 toolchain installed above, and all of them are
-            # best-effort. orjson needs Rust and pynacl needs libsodium; both
-            # live in the OmniOS `extra` publisher rather than core, so neither
-            # is installed here and both fall back as designed: stdlib json
-            # (cronstable/_json) and push disabled.
+            # best-effort. orjson stays on the stdlib json fallback
+            # (cronstable/_json): its build backend needs more than the
+            # `extra` rust gives it here. pynacl links the `extra`
+            # libsodium under /opt/ooce (SODIUM_INSTALL=system, found through
+            # the pkg-config path and the flags that follow; -R so the bundled
+            # extension resolves the library at run time), and cryptography
+            # builds from its sdist with that rust against the core OpenSSL
+            # 3.5, which the interpreter already links, so the bundle carries
+            # one OpenSSL. Both are soft: verify_extra.py proves a sealed-box
+            # round trip and a real X-Wing seal, and drops a build that fails.
             sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
             sh pyinstaller/install_orjson.sh
-            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+            PKG_CONFIG_PATH=/opt/ooce/lib/amd64/pkgconfig \
+              CFLAGS="-I/opt/ooce/include" \
+              LDFLAGS="-L/opt/ooce/lib/amd64 -R/opt/ooce/lib/amd64" \
+              SODIUM_INSTALL=system \
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+            if [ -x /opt/ooce/bin/cargo ]; then
+              PATH="/opt/ooce/bin:$PATH" \
+                OPENSSL_LIB_DIR=/usr/lib/amd64 OPENSSL_INCLUDE_DIR=/usr/include \
+                sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
+            else
+              echo "cryptography: no rust on this host; post-quantum push not bundled"
+            fi
             # Bundle zeroconf (the `discovery` extra): pure Python with
             # optional speedups, so a HARD install. LGPL-2.1; see LICENSING.md.
             sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
@@ -2574,6 +2641,16 @@ jobs:
             dist/cronstable --version           # smoke test: fails the job if the bundle is broken
             if $PY -c "import nacl" 2>/dev/null; then
               dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+            fi
+            # And whenever the build env kept cryptography, the frozen bundle
+            # must seal xwing (see install_extra.sh header).
+            if $PY -c "import cryptography" 2>/dev/null; then
+              suites=$(dist/cronstable --sealable-suites)
+              echo "sealable suites: $suites"
+              echo "$suites" | grep -qx xwing || {
+                echo "FAIL: the frozen binary cannot seal xwing" >&2
+                exit 1
+              }
             fi
             # 64-bit, little-endian, EM_X86_64.
             $PY .github/scripts/assert_arch.py dist/cronstable elf:2:1:62
@@ -2700,7 +2777,7 @@ jobs:
           # silently ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
-          # Bundle cryptography (the `push-pq` extra) so the frozen daemon
+          # Bundle cryptography (the post-quantum half of the `push` extra) so the frozen daemon
           # seals post-quantum X-Wing push. amd64 and i686 take a wheel
           # (i686 capped by `pqcap` at the last release with a win32 wheel);
           # arm64 has none and builds from source (pq_src, see the matrix).
@@ -3161,6 +3238,142 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The cryptography wheel for the glibc ARMv6 binary (binaries-arm-legacy),
+  # the Raspberry Pi 1 and Zero. Its own job rather than a pq-wheels row
+  # because the docker gate waits on every pq-wheels row, and this one is
+  # the slowest compile in the workflow: the whole Rust build runs under an
+  # emulated ARM1176, which is hours. Here it holds up nothing but the
+  # armv6 binary, and with continue-on-error it cannot fail a release; a
+  # row that times out leaves the binary on x25519.
+  #
+  # Built in the same Raspbian image, under the same QEMU_CPU pin and the
+  # same _PYTHON_HOST_PLATFORM, as the binary it goes into, so the wheel
+  # carries the linux_armv6l tag the lane resolves and was compiled by the
+  # toolchain that produced everything else in that bundle. The Rust comes
+  # from rustup for the arm-unknown-linux-gnueabihf host (ARMv6 + VFPv2,
+  # the Pi 1 target), fetched by that name: the generic installer reads
+  # uname, which says armv7l under QEMU, and would pick a toolchain whose
+  # own binaries fault on this core. OpenSSL 3.5 is built from source with
+  # no-asm (see build_openssl.sh) and linked statically, and the extension
+  # is checked for its ARM tags before it ships: the lane's elf_floor gate
+  # would fail the whole binary on a v7 member, and this job is where a
+  # bad wheel must stop instead. Cached across pushes like the others.
+  pq-wheel-armv6:
+    needs: version
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Restore a cached wheel
+        # A release rebuilds, as pq-wheels does.
+        if: ${{ needs.version.outputs.release != 'true' }}
+        id: wheel-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: wheelhouse
+          key: pq-wheel-glibc-armv6-${{ hashFiles('pyproject.toml', 'pyinstaller/build_openssl.sh', '.github/workflows/release.yml') }}
+      - if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
+        uses: docker/setup-qemu-action@v4.3.0
+      - name: Pull the build image
+        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/retry.sh
+          # NOT pull_base: a third-party image (see binaries-arm-legacy).
+          retry 5 docker pull --platform linux/arm/v6 tianon/raspbian:bookworm-slim
+      - name: Build the cryptography wheel (glibc armv6)
+        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm/v6 \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e PIP_RETRIES -e PIP_TIMEOUT \
+            -e QEMU_CPU=arm1176 \
+            -e _PYTHON_HOST_PLATFORM=linux-armv6l \
+            -v "$PWD:/src" -w /src \
+            tianon/raspbian:bookworm-slim sh -euc '
+              . /src/.github/scripts/retry.sh
+              export DEBIAN_FRONTEND=noninteractive
+              retry 5 apt-get -o Acquire::Retries=5 -qq update
+              # A C toolchain for OpenSSL and the crate build, perl for the
+              # OpenSSL Configure script, binutils for the readelf checks.
+              retry 5 apt-get -o Acquire::Retries=5 -qq install -y --no-install-recommends \
+                python3 python3-venv python3-dev build-essential libffi-dev pkg-config \
+                perl make curl ca-certificates binutils
+              python3 -VV
+              python3 -c "import sysconfig; print(\"wheel platform:\", sysconfig.get_platform())"
+              python3 -m venv /v
+              retry 5 /v/bin/pip install --upgrade pip setuptools wheel
+              retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup-init https://static.rust-lang.org/rustup/dist/arm-unknown-linux-gnueabihf/rustup-init
+              chmod +x /tmp/rustup-init
+              env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup /tmp/rustup-init -y \
+                --default-host arm-unknown-linux-gnueabihf --default-toolchain stable \
+                --profile minimal --no-modify-path
+              PATH=/opt/cargo/bin:$PATH
+              CARGO_HOME=/opt/cargo
+              RUSTUP_HOME=/opt/rustup
+              export PATH CARGO_HOME RUSTUP_HOME
+              rustc -vV
+              BUILD_OPENSSL_CONFIG_EXTRA=no-asm sh pyinstaller/build_openssl.sh /opt/openssl
+              OPENSSL_DIR=/opt/openssl
+              OPENSSL_STATIC=1
+              export OPENSSL_DIR OPENSSL_STATIC
+              rm -rf /src/wheelhouse
+              # tests/test_extra_pins_parity.py checks this floor against
+              # pyproject: bump them together.
+              /v/bin/pip wheel --no-deps --wheel-dir /src/wheelhouse "cryptography>=48"
+              # Prove the wheel seals X-Wing through the daemon itself, on
+              # the emulated target core, before it is handed to the binary.
+              /v/bin/pip install /src/wheelhouse/cryptography-*.whl
+              /v/bin/pip install .
+              /v/bin/python pyinstaller/verify_extra.py cryptography
+              ext=$(/v/bin/python -c "import cryptography.hazmat.bindings._rust as m; print(m.__file__)")
+              # Self-contained: no libssl or libcrypto as a shared dependency.
+              readelf -d "$ext" > /tmp/cryptography.dyn
+              grep NEEDED /tmp/cryptography.dyn || true
+              if grep -E "NEEDED.*lib(ssl|crypto)" /tmp/cryptography.dyn; then
+                echo "FAIL: the wheel links OpenSSL dynamically" >&2
+                exit 1
+              fi
+              # And within the ARMv6 ceiling elf_floor.py holds the binary to
+              # (v6, v6KZ or v6K; VFPv2 at most), read from the same
+              # .ARM.attributes it reads.
+              readelf -A "$ext" | grep -E "Tag_CPU_arch:|Tag_FP_arch:" > /tmp/cryptography.arm
+              cat /tmp/cryptography.arm
+              if grep -E "Tag_CPU_arch: v(7|8|6T2)" /tmp/cryptography.arm; then
+                echo "FAIL: the wheel needs an instruction set above ARMv6" >&2
+                exit 1
+              fi
+              if grep -E "Tag_FP_arch: (VFPv3|VFPv4|FP-ARMv8)" /tmp/cryptography.arm; then
+                echo "FAIL: the wheel needs a floating-point unit above VFPv2" >&2
+                exit 1
+              fi
+              chmod -R a+rX /src/wheelhouse
+              ls -l /src/wheelhouse
+            '
+      - name: Make the wheelhouse readable by the cache save
+        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+          if [ -d wheelhouse ]; then
+            sudo chown -R "$(id -u):$(id -g)" wheelhouse
+          fi
+      - name: Save the wheel (trunk only)
+        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: wheelhouse
+          key: pq-wheel-glibc-armv6-${{ hashFiles('pyproject.toml', 'pyinstaller/build_openssl.sh', '.github/workflows/release.yml') }}
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: pq-wheel-glibc-armv6
+          path: wheelhouse/cryptography-*.whl
+          if-no-files-found: error
+          retention-days: 7
+
   # Build EVERY container image (8 distros, full published arch set) build-only,
   # no push -- the Docker half of the gate. Proves every Dockerfile still builds
   # for every arch on every commit; `docker-push` re-runs these with a push once
@@ -3197,6 +3410,11 @@ jobs:
       - name: Sort the wheelhouse by libc
         run: |
           set -euo pipefail
+          # The ARMv6 wheel is for the binaries-arm-legacy lane, not the
+          # images (no image targets ARMv6). Keeping it out means the gate
+          # build and the release build see the same wheelhouse, so the
+          # layers the gate cached are the layers the release pushes.
+          rm -rf pq-wheels/pq-wheel-glibc-armv6
           for d in pq-wheels/pq-wheel-*; do
             [ -d "$d" ] || continue
             case "$(basename "$d")" in
@@ -4207,6 +4425,11 @@ jobs:
       - name: Sort the wheelhouse by libc
         run: |
           set -euo pipefail
+          # The ARMv6 wheel is for the binaries-arm-legacy lane, not the
+          # images (no image targets ARMv6). Keeping it out means the gate
+          # build and the release build see the same wheelhouse, so the
+          # layers the gate cached are the layers the release pushes.
+          rm -rf pq-wheels/pq-wheel-glibc-armv6
           for d in pq-wheels/pq-wheel-*; do
             [ -d "$d" ] || continue
             case "$(basename "$d")" in

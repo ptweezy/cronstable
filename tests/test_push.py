@@ -7,8 +7,8 @@ and /whoami handlers, scope enforcement on the new routes, the
 start_stop_push lifecycle, and the Bonjour advertiser (with a fake
 zeroconf).
 
-PyNaCl (x25519 sealed boxes, the push extra) and cryptography (X-Wing
-HPKE, the push-pq extra) are dev dependencies: PyNaCl has wheels on
+PyNaCl (x25519 sealed boxes) and cryptography (X-Wing HPKE), both
+carried by the push extra, are dev dependencies: PyNaCl has wheels on
 every CI cell, cryptography on every cell except win-arm64 (see
 requirements_dev.txt). Only the tests that actually touch key material
 skip without them (the ``requires_pynacl`` and ``requires_xwing``
@@ -738,7 +738,7 @@ async def test_refresh_warns_once_about_records_it_cannot_seal(
     assert len(warnings) == 1
     assert "cannot seal" in warnings[0]
     assert "phone (dev-1, xwing)" in warnings[0]
-    assert "push-pq" in warnings[0]
+    assert "cryptography>=48" in warnings[0]
 
     # a standing mismatch does not re-warn on every refresh
     caplog.clear()
@@ -888,7 +888,7 @@ def test_a_backend_without_mlkem_is_blamed_on_the_library_not_the_key(
     with pytest.raises(push.PushError) as excinfo:
         push.validate_public_key(public_b64, push.SUITE_XWING)
     assert "cannot seal X-Wing" in str(excinfo.value)
-    assert "push-pq" in str(excinfo.value)
+    assert "cryptography>=48" in str(excinfo.value)
     with pytest.raises(push.PushError) as excinfo:
         push.seal_to_device(public_b64, b"{}", push.SUITE_XWING)
     assert "cannot seal X-Wing" in str(excinfo.value)
@@ -986,8 +986,8 @@ def test_capability_log_separates_an_old_cryptography_from_none(
     monkeypatch, caplog
 ):
     # The `push` extra is a start-refusing gate, so a daemon that reaches
-    # start() always seals x25519. `push-pq` is not: on a platform with
-    # no cryptography wheel the extra installs PyNaCl alone, which costs
+    # start() always seals x25519. cryptography is not: on a platform with
+    # no wheel the push extra installs PyNaCl alone, which costs
     # no page and therefore no ConfigError. Start-up is where an operator
     # who asked for post-quantum sealing and did not get it finds out, so
     # the capability line is pinned in every direction it can take.
@@ -1023,7 +1023,7 @@ def test_capability_log_separates_an_old_cryptography_from_none(
     # daemon cannot seal that the probe exists to keep out.
     assert any("push: sealing suites: x25519" == m for m in messages)
     reason = [m for m in messages if "post-quantum xwing sealing is off" in m]
-    assert reason and "push-pq" in reason[0]
+    assert reason and "cryptography>=48" in reason[0]
     assert "too old" in reason[0]
     assert "no cryptography" not in reason[0]
 
@@ -1091,7 +1091,7 @@ def test_pairing_refuses_a_suite_the_daemon_cannot_seal_to(monkeypatch):
         )
     assert "not sealable" in str(excinfo.value)
     # the refusal names what would lift it
-    assert "push-pq" in str(excinfo.value)
+    assert "cryptography>=48" in str(excinfo.value)
 
 
 def test_pairing_checks_key_length_against_its_own_suite():
@@ -1153,7 +1153,7 @@ def test_seal_rejects_a_suite_with_no_implementation(monkeypatch):
     with pytest.raises(push.PushError) as excinfo:
         push.seal_to_device(key, b"{}", push.SUITE_XWING)
     assert "cannot seal" in str(excinfo.value)
-    assert "push-pq" in str(excinfo.value)
+    assert "cryptography>=48" in str(excinfo.value)
 
 
 def test_fit_payload_honors_a_narrower_suite_budget():

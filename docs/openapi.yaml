@@ -1131,10 +1131,10 @@ paths:
                     Sealing suite the key belongs to. Optional; omitted
                     means `x25519`. Known values: `x25519`
                     (libsodium sealed box), `xwing` (X-Wing, ML-KEM-768 +
-                    X25519, sealed via HPKE). A suite the daemon's
-                    install cannot seal to is refused at pairing rather
-                    than stored; `GET /whoami` lists the sealable set as
-                    `sealableSuites`.
+                    X25519, sealed with HPKE). The daemon refuses a suite
+                    its install cannot seal to at pairing rather than
+                    storing a record; `GET /whoami` lists the sealable set
+                    as `sealableSuites`.
                   default: x25519
                 pushToken: { type: string, maxLength: 512 }
               required: [name, platform, publicKey, pushToken]
@@ -1566,9 +1566,10 @@ components:
           items: { type: string }
           description: >-
             The suites this daemon can seal push alerts under: `x25519`
-            always, `xwing` when the install can seal post-quantum (the
-            `push-pq` extra). The app pairs under `xwing` when it is
-            listed. The field stays outside `required` on purpose:
+            always, `xwing` when the install can seal post-quantum
+            (cryptography 48 or newer, which the `push` extra carries
+            wherever a wheel exists). The app pairs under `xwing` when it
+            is listed. The field stays outside `required` on purpose:
             a daemon that omits it seals `x25519` only, so generated
             clients decode it as optional and read absence as
             `["x25519"]`.
@@ -1588,7 +1589,7 @@ components:
           type: string
           description: >-
             Sealing suite the key belongs to: `x25519` (libsodium sealed
-            box) or `xwing` (X-Wing, ML-KEM-768 + X25519, sealed via
+            box) or `xwing` (X-Wing, ML-KEM-768 + X25519, sealed with
             HPKE). The field stays outside `required`: a record naming no
             suite is `x25519`, the only suite such a record can hold.
         sealableHere:
@@ -1597,8 +1598,9 @@ components:
             Whether the daemon answering this request can seal `suite`.
             The device registry is shared by every node on one state
             store while the sealing libraries are per node, so a record
-            that paired against a `push-pq` node reads as false on a node
-            without it, and alerts raised there never reach that device.
+            that paired against a node with cryptography reads as false on
+            a node without it, and alerts raised there never reach that
+            device.
             False is a per-node fact and says nothing about the others.
             The field stays outside `required`: a daemon that omits it
             seals every suite it stores.

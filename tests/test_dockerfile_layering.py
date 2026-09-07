@@ -294,7 +294,7 @@ def _extract_deps_module():
 
 
 def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
-    # The push-pq+discovery extras pair lives in exactly one place, so pin
+    # The push+discovery extras pair lives in exactly one place, so pin
     # what the script writes against a straight read of pyproject.toml, and
     # that everything it writes is echoed to stdout (the build-log
     # visibility the old `cat` provided). tomllib is 3.11+; every image venv
@@ -319,7 +319,7 @@ def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
     project = data["project"]
     declared = (
         project["dependencies"]
-        + project["optional-dependencies"]["push-pq"]
+        + project["optional-dependencies"]["push"]
         + project["optional-dependencies"]["discovery"]
     )
     written = (

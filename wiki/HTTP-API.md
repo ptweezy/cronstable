@@ -977,8 +977,8 @@ its `label`, the scopes it grants (with the implied `view` expanded),
 whether it is an all-scopes token, the base URL of the pairing QR's deep
 link (the origin of `push.relay.url` plus `/pair`, the hosted landing while
 no `push:` section is applied), and the push sealing suites this daemon can
-seal under. `sealableSuites` is `["x25519"]` on a daemon without the
-`push-pq` extra and adds `xwing` with it; a daemon that omits the field
+seal under. `sealableSuites` is `["x25519"]` on a daemon without
+`cryptography` and adds `xwing` with it; a daemon that omits the field
 seals `x25519` only. A client picks a fresh pairing's suite from it.
 
 A companion app uses it to show what it may do. The dashboard uses it to warn
@@ -1008,7 +1008,7 @@ Each record carries `suite`, the sealing suite its key belongs to, and
 `sealableHere`, whether the daemon answering this request can seal that
 suite. The registry is shared by every node on one state store while the
 sealing libraries are per node, so a device that paired against a
-`push-pq` node reads `sealableHere: false` on a node without it, and
+node with `cryptography` reads `sealableHere: false` on a node without it, and
 alerts raised there never reach that device. A `false` on one node says
 nothing about the other nodes.
 

@@ -2,38 +2,40 @@
 
 ## 1.2.50
 
-- Push alerts can be sealed with post-quantum encryption. Every alert is
-  end-to-end encrypted, so the relay that forwards it never sees
-  plaintext, but the `x25519` sealing behind that is the kind a future
-  quantum computer could break, and traffic recorded today could be
+- Push alerts are sealed with post-quantum encryption wherever the daemon
+  can. Every alert is end-to-end encrypted, so the relay that forwards it
+  never sees plaintext, but the `x25519` sealing behind that is the kind a
+  future quantum computer could break, and traffic recorded today could be
   decrypted then. A device paired under the `xwing` suite closes that
   window: its alerts are sealed with X-Wing (ML-KEM-768 + X25519), a
   hybrid of post-quantum and classical key exchange, through HPKE in base
-  mode (HKDF-SHA256, AES-256-GCM). The daemon needs the `cryptography`
-  library, installed by the `push-pq` extra. `GET /whoami` names the
-  suites a daemon can seal to as `sealableSuites`, and the app pairs
-  under `xwing` on its own when it is listed. The post-quantum key
+  mode (HKDF-SHA256, AES-256-GCM). The `push` extra carries the
+  `cryptography` library that seals it on every platform with a wheel, so
+  post-quantum sealing needs no further install step. `GET /whoami` names
+  the suites a daemon can seal to as `sealableSuites`; the app pairs under
+  `xwing` when it is listed, moves an existing `x25519` pairing up on its
+  own once a daemon starts advertising `xwing`, and moves an `xwing`
+  pairing back down if its daemon stops sealing it. The post-quantum key
   material costs 1136 bytes of the fixed notification budget, so an
   `xwing` alert carries a shorter log tail. A daemon without the library
-  refuses `xwing` pairings, `x25519` pairings are unchanged, and the wire
-  construction is normative in `docs/relay-protocol.md`.
-- The `push-pq` extra and the release binaries carry post-quantum sealing on
-  every platform `cryptography` publishes a wheel for. Intel macOS and
-  32-bit Windows take `cryptography` 48.x, the last release line with a
-  wheel for them, and the `linux-ppc64le` binary now needs glibc 2.28
-  (RHEL 8 onward) rather than 2.17, the floor of the only ppc64le wheel.
+  refuses `xwing` pairings and says so at startup, `x25519` pairings are
+  unchanged, and the wire construction is normative in
+  `docs/relay-protocol.md`.
 - Post-quantum sealing ships in every release binary and container image
-  whose platform can compile it, not only where PyPI publishes a
-  `cryptography` wheel: CI builds the library from source, against an
-  OpenSSL 3.5 it installs or builds, for the musl and glibc Linux builds
-  without a wheel, for `windows-arm64`, `freebsd-amd64`, `openbsd-amd64`
-  and `netbsd-amd64`, and for every image platform. Those builds are best
-  effort and each proves itself with a real X-Wing seal before it is frozen
-  in. Intel macOS and 32-bit Windows carry `cryptography` 48.x, the last
-  line with a wheel for them. The `linux-ppc64le` binary now needs glibc
-  2.28 rather than 2.17, the floor of the only ppc64le wheel. Left out:
-  `linux-mips64le`, `linux-armel`, the glibc `linux-armv6`, `freebsd-arm64`
-  and `illumos-amd64`, which seal `x25519` only.
+  whose platform can compile it. Where PyPI publishes no `cryptography`
+  wheel, CI builds the library from source against an OpenSSL 3.5 it
+  installs or builds: for the Linux builds without a wheel (including the
+  glibc `linux-armv6` for the Raspberry Pi 1 and Zero), for
+  `windows-arm64`, for the FreeBSD, OpenBSD, NetBSD, and illumos builds,
+  and for every image platform. A build that fails to compile the library
+  ships without the suite, and each one that succeeds proves itself with a
+  real X-Wing seal before it is frozen in. Intel
+  macOS and 32-bit Windows carry `cryptography` 48.x, the last line with a
+  wheel for them. The `linux-ppc64le` binary needs glibc 2.28 rather than
+  2.17, the floor of the only ppc64le wheel. The `illumos-amd64` binary
+  also carries the push reporter itself, with libsodium from the OmniOS
+  extra publisher. `linux-mips64le` and `linux-armel` seal `x25519` only,
+  because no Rust toolchain exists for their architectures.
 - A daemon event alert whose subject or message is empty leaves that field
   out of the sealed plaintext instead of sending it as `null`, which is what
   the relay protocol's field contract specifies.

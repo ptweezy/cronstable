@@ -26,14 +26,14 @@ Three pieces live here:
   reach the daemon's service through this module seam, the same way
   the loop reaches the daemon's config).
 
-The crypto libraries are optional extras.  PyNaCl
-(``pip install "cronstable[push]"``) seals X25519; cryptography
-(``pip install "cronstable[push-pq]"``) adds X-Wing.  Both imports are
-guarded and both gates fail closed: config validation refuses a
-``push:`` block when PyNaCl is absent, and pairing refuses a suite the
-running daemon cannot seal.  On purpose: an alerting channel that
-silently self-disables is a missed page, the one failure mode a paging
-feature must never have.
+Both crypto libraries ride the ``push`` extra
+(``pip install "cronstable[push]"``): PyNaCl seals X25519 on every
+platform, and cryptography adds X-Wing wherever it publishes a wheel.
+Both imports are guarded and both gates fail closed: config validation
+refuses a ``push:`` block when PyNaCl is absent, and pairing refuses a
+suite the running daemon cannot seal.  On purpose: an alerting channel
+that silently self-disables is a missed page, the one failure mode a
+paging feature must never have.
 """
 
 import asyncio
@@ -143,10 +143,10 @@ CIPHERTEXT_B64_FLOOR = 3000
 #: envelope and (via the relay) the APNs payload, so daemon, relay and app
 #: never have to infer a key's algorithm from its length.
 #:
-#: ``x25519`` seals as a libsodium sealed box (PyNaCl, the ``push``
-#: extra).  ``xwing`` seals as single-shot HPKE base mode over the
-#: X-Wing hybrid KEM, ML-KEM-768 + X25519 (cryptography, the
-#: ``push-pq`` extra).  Each entry's ``sealable`` flag records what this
+#: ``x25519`` seals as a libsodium sealed box (PyNaCl).  ``xwing`` seals
+#: as single-shot HPKE base mode over the X-Wing hybrid KEM, ML-KEM-768 +
+#: X25519 (cryptography, which the ``push`` extra carries wherever a
+#: wheel exists).  Each entry's ``sealable`` flag records what this
 #: runtime can actually do, and pairing refuses a suite whose flag is
 #: down: a paging channel accepting a device it cannot deliver to would
 #: be a silently missed page, so the gate fails closed.
@@ -440,8 +440,8 @@ _XWING_INFO = b"cronstable-push-xwing"
 #: verbatim; the library's own reason goes to the log instead.
 _XWING_BROKEN = (
     "cryptography is installed but cannot seal X-Wing; the reason is in "
-    "the cronstable log (reinstall the post-quantum push extra: "
-    'pip install "cronstable[push-pq]")'
+    "the cronstable log (reinstall cryptography 48 or newer: "
+    'pip install "cryptography>=48")'
 )
 
 
@@ -596,10 +596,8 @@ def validate_public_key(value: Any, suite: str = DEFAULT_SUITE) -> str:
         # :class:`_Suite`.
         raise PushError(
             "suite {} is not sealable by this daemon; pair with suite "
-            "{} instead, or install the post-quantum push extra "
-            '(pip install "cronstable[push-pq]")'.format(
-                spec.name, DEFAULT_SUITE
-            )
+            "{} instead, or install cryptography 48 or newer "
+            '(pip install "cryptography>=48")'.format(spec.name, DEFAULT_SUITE)
         )
     if HAVE_PYNACL and spec.name == SUITE_X25519:
         # Length is one check of two: libsodium refuses to seal to
@@ -691,8 +689,8 @@ def seal_to_device(
     if not spec.sealable:
         raise PushError(
             "cannot seal to suite {}: no implementation in this daemon; "
-            "install the post-quantum push extra "
-            '(pip install "cronstable[push-pq]")'.format(spec.name)
+            "install cryptography 48 or newer "
+            '(pip install "cryptography>=48")'.format(spec.name)
         )
     try:
         raw = base64.b64decode(public_key_b64, validate=True)
@@ -1478,13 +1476,14 @@ class PushService:
     def _log_sealing_capability() -> None:
         """Report the suites this daemon can seal, once, at start-up.
 
-        The ``push`` extra is a start-refusing gate, so its absence is
-        impossible by the time this runs.  ``push-pq`` cannot be: a platform
-        with no ``cryptography`` wheel installs the extra as PyNaCl alone,
-        and the daemon then seals ``x25519`` and refuses ``xwing`` pairings.
-        That costs no page, so it is not a ConfigError, but an operator who
-        asked for post-quantum sealing and did not get it must hear it from
-        the daemon rather than from a pairing 400 weeks later.
+        PyNaCl is a start-refusing gate, so its absence is impossible by
+        the time this runs.  cryptography cannot be one: the ``push``
+        extra carries it only where a wheel exists, so a platform without
+        one installs PyNaCl alone, and the daemon then seals ``x25519``
+        and refuses ``xwing`` pairings.  That costs no page, so it is not
+        a ConfigError, but an operator expecting post-quantum sealing and
+        not getting it must hear it from the daemon rather than from a
+        pairing 400 weeks later.
         """
         suites = sealable_suites()
         logger.info("push: sealing suites: %s", ", ".join(suites))
@@ -1499,14 +1498,14 @@ class PushService:
                 # cryptography, which the log must not call absent.
                 reason = (
                     "the installed cryptography is too old to seal it "
-                    "(X-Wing needs cryptography 48 or newer; reinstall "
-                    'the push-pq extra: pip install "cronstable[push-pq]")'
+                    "(X-Wing needs cryptography 48 or newer: "
+                    'pip install "cryptography>=48")'
                 )
             else:
                 reason = (
-                    "this install has no cryptography; it comes with "
-                    'the push-pq extra (pip install "cronstable[push-pq]"), '
-                    "which carries no wheel on some platforms"
+                    "this install has no cryptography; the push extra "
+                    "carries it wherever a wheel exists, and pip install "
+                    '"cryptography>=48" builds it from source elsewhere'
                 )
             logger.info(
                 "push: post-quantum xwing sealing is off (%s); x25519 "
@@ -1587,8 +1586,8 @@ class PushService:
         against*.  It cannot make one impossible anywhere else: the
         registry is one shared document set (see :class:`StateDeviceStore`)
         while the libraries are per node, so a device that paired against
-        a ``push-pq`` node is invisible to a node without it, and every
-        alert that node fires to that device dies in
+        a node that seals ``xwing`` is stranded on a node that cannot, and
+        every alert that node fires to that device dies in
         :func:`seal_to_device`.  Nothing else surfaces it: the listing
         marks the row ``sealableHere`` false, but only for a reader who
         goes looking.
@@ -1614,10 +1613,11 @@ class PushService:
         logger.warning(
             "push: %d paired device(s) use a suite this node cannot seal, "
             "so alerts raised HERE will not reach them: %s. Install the "
-            "matching extra on this node (post-quantum xwing needs "
-            '"cronstable[push-pq]"), or re-pair those devices under a '
-            "suite every node shares. Nodes sharing a device registry "
-            "must carry the same sealing libraries.",
+            "matching library on this node (post-quantum xwing needs "
+            'cryptography 48 or newer: pip install "cryptography>=48"), '
+            "or re-pair those devices under a suite every node shares. "
+            "Nodes sharing a device registry must carry the same sealing "
+            "libraries.",
             len(stranded),
             ", ".join(
                 sorted(

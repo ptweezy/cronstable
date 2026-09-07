@@ -4,7 +4,7 @@
 # floor). It publishes wheels for a subset of the platforms cronstable
 # targets, and a CI runner off that list has neither the Rust toolchain nor
 # the OpenSSL headers to build the sdist, so the markers are the same two
-# lines the push-pq extra carries: Linux x86_64/aarch64, macOS arm64 and
+# lines the push extra carries: Linux x86_64/aarch64, macOS arm64 and
 # Windows amd64 take the newest release; Intel macOS and 32-bit Windows take
 # 48.x, the last line with a wheel for them (pyproject.toml says why the cap
 # is acceptable). Both test arms importorskip it, so the win-arm64 cell

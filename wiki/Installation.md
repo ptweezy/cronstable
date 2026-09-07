@@ -166,10 +166,10 @@ client library (`cluster.kubernetes.clientLibrary: native`), install the extra:
 dependency. See
 [clustering and leader election](Clustering-and-Leader-Election).
 
-On a 32-bit userland with a 64-bit kernel, install the post-quantum push
-extra as `linux32 pip install "cronstable[push-pq]"`. Under `linux32`,
-`uname` reports the 32-bit machine, so pip skips `cryptography`, which has
-no 32-bit wheel, rather than failing to build it from source.
+On a 32-bit userland with a 64-bit kernel, install the push extra as
+`linux32 pip install "cronstable[push]"`. Under `linux32`, `uname` reports
+the 32-bit machine, so pip skips `cryptography`, which has no 32-bit wheel,
+rather than failing to build it from source.
 
 ## Install using pipx
 
@@ -377,7 +377,7 @@ assets, each built for its own platform and architecture:
 | `cronstable-linux-armv7` | Linux | glibc, 32-bit ARM | 32-bit ARM (armv7), glibc 2.31 or newer: Raspberry Pi OS bullseye, Debian 11, Ubuntu 20.04 onward. Raspberry Pi 2 and newer. |
 | `cronstable-linux-armv6` | Linux | glibc, 32-bit ARM | ARMv6 hard-float, glibc 2.36 or newer: the Raspberry Pi 1, Zero and Zero W running Raspberry Pi OS. |
 | `cronstable-linux-armel` | Linux | glibc, 32-bit ARM | ARMv5 soft-float (Debian armel), glibc 2.36 or newer: Kirkwood devices such as the SheevaPlug, QNAP TS-x1x, D-Link DNS-320, Zyxel NSA325 and Pogoplug. |
-| `cronstable-linux-ppc64le` | Linux | glibc, ppc64le | 64-bit little-endian POWER (IBM POWER), glibc 2.28 or newer: RHEL, Alma and Rocky 8 onward, Debian 10 onward, Ubuntu 18.10 onward. |
+| `cronstable-linux-ppc64le` | Linux | glibc, ppc64le | 64-bit little-endian POWER (IBM POWER), glibc 2.28 or newer: RHEL, Alma, and Rocky 8 onward, Debian 10 onward, Ubuntu 18.10 onward. |
 | `cronstable-linux-s390x` | Linux | glibc, s390x | IBM Z (s390x, big-endian), glibc 2.17 or newer. |
 | `cronstable-linux-riscv64` | Linux | glibc, riscv64 | 64-bit RISC-V, glibc 2.41 or newer: Debian 13 onward. |
 | `cronstable-linux-loong64` | Linux | glibc, loongarch64 | LoongArch, glibc 2.41 or newer. New-world ABI only; the older Loongnix, Kylin and UOS fleets run a different, incompatible ABI. |
@@ -419,14 +419,14 @@ whether it starts is the oldest glibc or musl it accepts. Each build declares
 that number, and CI re-derives it from the frozen bytes on every release, so the
 table above is measured rather than estimated.
 
-`amd64`, `arm64` and `s390x` need glibc 2.17, which reaches every glibc
+`amd64`, `arm64`, and `s390x` need glibc 2.17, which reaches every glibc
 distribution still in production, including the RHEL family from 7 onward
 and Amazon Linux 2. They are built inside manylinux2014 containers against a
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
 interpreter, which is where that number comes from. `ppc64le` needs 2.28: it
 is built inside a manylinux_2_28 container so that it can carry the
 `cryptography` wheel behind post-quantum push sealing, which exists for
-POWER only at that floor. `armv7` needs glibc 2.31; `i686`, `armv6`, `armel`
+POWER only at that floor. `armv7` needs glibc 2.31; `i686`, `armv6`, `armel`,
 and `mips64le` need 2.36; `riscv64` and `loong64` need 2.41. Each is set by
 the oldest base image carrying a working toolchain for that architecture.
 
@@ -462,15 +462,15 @@ The `i686`, `armv7`, `ppc64le` and `s390x` builds, both glibc and musl, extend
 the 64-bit `amd64`/`arm64` binaries to 32-bit x86, 32-bit ARM, POWER, and IBM Z
 hosts. They build inside a container: `amd64`, `arm64` and `i686` natively on
 their runners, the rest under QEMU emulation. The `riscv64` builds cover 64-bit
-RISC-V for both glibc and musl. The musl-only `armv6` build extends to older
-32-bit ARM, such as a Raspberry Pi 1 or Zero. There is no glibc `armv6` build.
+RISC-V for both glibc and musl. The musl `armv6` build extends to older
+32-bit ARM, such as a Raspberry Pi 1 or Zero; its glibc twin comes from the
+separate lane described later on this page, beside `armel`.
 
 Each build bundles the optional extras its build lane can take a wheel for
 or compile. `cryptography`, which carries post-quantum push sealing, takes a
 wheel where PyPI has one and is built from source everywhere else, so every
-build seals the `xwing` suite except `linux-mips64le`, `linux-armel`, the
-glibc `linux-armv6`, `freebsd-arm64` and `illumos-amd64`, which seal
-`x25519` only. The `macos-amd64` and `windows-i686` builds carry
+build seals the `xwing` suite except `linux-mips64le` and `linux-armel`,
+which seal `x25519` only. The `macos-amd64` and `windows-i686` builds carry
 `cryptography` 48.x, the last release line with a wheel for those platforms.
 See [Push notifications](Push-Notifications) for what the source builds
 promise and how to check a binary.
@@ -492,7 +492,10 @@ The glibc `armv6` and `armel` builds compile from source too, on Raspbian
 bookworm and Debian bookworm armel respectively, against the Python 3.11 those
 suites package. Both run under an emulator pinned to the real target core, an
 ARM1176 for `armv6` and an ARM926 for `armel`, so an instruction the hardware
-lacks faults during the build rather than on a user's machine.
+lacks faults during the build rather than on a user's machine. The `armv6`
+build takes its `cryptography` from a wheel that a separate job compiles
+ahead of it in the same image, because that one compile runs for
+hours under emulation; when that job fails, the binary seals `x25519` only.
 
 macOS builds cover both Apple Silicon and Intel.
 

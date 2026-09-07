@@ -308,7 +308,7 @@ except (ImportError, ValueError):  # pragma: no cover - no cryptography
 #: seal.
 requires_xwing = pytest.mark.skipif(
     not _xwing_findable,
-    reason="cryptography with HPKE (the push-pq extra) is not installed",
+    reason="cryptography 48 or newer (its HPKE module) is not installed",
 )
 
 

@@ -18,6 +18,12 @@
 #
 # Usage: build_openssl.sh PREFIX
 #
+# BUILD_OPENSSL_CONFIG_EXTRA, when set, is appended to the Configure line.
+# The ARMv6 wheel build passes `no-asm`: the ARM assembly paths carry code
+# for newer cores behind run-time dispatch, and the assembler tags every
+# object that holds them above the ARMv6 ceiling the lane enforces, so the
+# C paths alone go in there.
+#
 # Needs perl with IPC::Cmd, Time::Piece, and bigint, plus make, a C
 # compiler, and curl or wget. Configure, the Makefile it generates, and the
 # s390x assembler generators import those three modules; RHEL-family
@@ -101,9 +107,9 @@ fi
 # here reads them and under emulation they cost real time.
 set -e
 if [ -n "$target" ]; then
-    ./Configure "$target" --prefix="$prefix" --libdir=lib no-shared no-docs no-tests -fPIC
+    ./Configure "$target" --prefix="$prefix" --libdir=lib no-shared no-docs no-tests -fPIC ${BUILD_OPENSSL_CONFIG_EXTRA:-}
 else
-    ./config --prefix="$prefix" --libdir=lib no-shared no-docs no-tests -fPIC
+    ./config --prefix="$prefix" --libdir=lib no-shared no-docs no-tests -fPIC ${BUILD_OPENSSL_CONFIG_EXTRA:-}
 fi
 jobs=$(nproc 2>/dev/null || echo 2)
 make -j"$jobs" build_libs

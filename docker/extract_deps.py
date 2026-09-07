@@ -6,11 +6,11 @@ dependency layer, so the extraction logic lives once instead of being
 hand-mirrored per image. Given the path to pyproject.toml, it writes two
 files next to it:
 
-- requirements.txt: the core dependencies plus the push-pq and discovery
+- requirements.txt: the core dependencies plus the push and discovery
   extras, so the images and pyproject.toml can never drift and a renamed
   extra fails the build loudly (KeyError) instead of silently shipping
-  without it.  push-pq rather than push so the images seal post-quantum
-  `xwing` push as well as `x25519`; it carries push's PyNaCl too.
+  without it.  push carries both sealing libraries, PyNaCl for `x25519`
+  and cryptography for post-quantum `xwing`.
 - build-requires.txt: build-system.requires, for the throwaway buildenv
   the project install builds its wheel with.
 
@@ -48,7 +48,7 @@ import struct
 import sys
 import tomllib
 
-EXTRAS = ("push-pq", "discovery")
+EXTRAS = ("push", "discovery")
 
 #: The (machine, libc) pairs cryptography publishes a Linux wheel for, keyed
 #: on the machine name pip resolves wheels UNDER rather than the one uname

@@ -290,7 +290,7 @@ binaries for Linux (glibc and musl builds for `amd64`, `arm64`, `i686`,
 `mips64le` and `armel`), macOS (`amd64` and `arm64`, signed and notarized by
 Apple), FreeBSD (`amd64` and `arm64`), OpenBSD, NetBSD, illumos (`amd64`) and
 Windows (`amd64`, `arm64` and `i686`), plus `.deb`, `.rpm`, Alpine `.apk` and
-FreeBSD `.pkg` packages. The `amd64`, `arm64` and `s390x` glibc builds need
+FreeBSD `.pkg` packages. The `amd64`, `arm64`, and `s390x` glibc builds need
 only glibc 2.17, so they run on everything from RHEL 7 onward; `ppc64le`
 needs 2.28 (RHEL 8 onward). Python is not required on the target
 system. It is embedded in the executable:
@@ -1157,13 +1157,14 @@ ciphertext and routing metadata, never job names, hostnames, or log lines.
 
 The reporter needs the `push` extra (`pip install "cronstable[push]"`), a
 daemon-global `push:` section, and an opt-in on the reporting hooks. The
-`push-pq` extra (`pip install "cronstable[push-pq]"`) adds X-Wing sealing on
-the platforms with a `cryptography` wheel (see
+extra carries both sealing libraries: PyNaCl for X25519 on every platform,
+and `cryptography` for X-Wing on every platform it publishes a wheel for
+(see
 [Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
-for the list), and the app pairs under it on its own when the daemon lists
-it in `sealableSuites` on `GET /whoami`. If a config enables push without
-any of those, cronstable refuses to start rather than silently not
-alerting:
+for the list). The daemon lists what it can seal in `sealableSuites` on
+`GET /whoami`, and the app pairs under `xwing` on its own whenever that
+list carries it. If a config enables push without the extra or the
+section, cronstable refuses to start rather than silently dropping alerts:
 
 ```yaml
 push:

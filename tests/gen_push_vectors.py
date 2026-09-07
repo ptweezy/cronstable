@@ -5,7 +5,7 @@ proves only that a side can open what that side sealed, so the two can
 drift apart while both stay green.  One frozen fixture closes that gap: a
 32-byte X-Wing seed, the 1216-byte public key both libraries derive from it,
 and one alert plaintext sealed to that key by the daemon's own seal path.
-Install the post-quantum push extra (``pip install -e ".[push-pq]"``) and run
+Install the push extra (``pip install -e ".[push]"``) and run
 this script to print the constant blocks for ``tests/test_push_vectors.py``
 and the app's ``XWingVectorTests.swift``.  The keypair is a pure function of
 ``--seed``, so re-running reproduces the committed key exactly; the sealed
@@ -26,8 +26,8 @@ try:
     from cryptography.hazmat.primitives.asymmetric import mlkem, x25519
 except ImportError:
     sys.exit(
-        "cryptography is required (install the post-quantum push extra: "
-        'pip install -e ".[push-pq]")'
+        "cryptography is required (install the push extra: "
+        'pip install -e ".[push]")'
     )
 
 import cronstable.push as push
