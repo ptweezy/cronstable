@@ -419,13 +419,34 @@ def test_oci_merge_keeps_all_platforms_and_original_manifest_digests(tmp_path):
     assert merged["manifests"][2]["platform"]["variant"] == "v7"
 
 
+@pytest.mark.parametrize("flat", [False, True])
+def test_oci_merge_single_platform_download(tmp_path, flat):
+    oci = load("oci_images")
+    archive = image_archive(tmp_path)
+    if flat:
+        archive = archive.replace(tmp_path / "image.tar")
+    with tarfile.open(archive) as tar:
+        original = json.load(tar.extractfile("index.json"))["manifests"][0]
+    output = tmp_path / "merged"
+    oci.merge(tmp_path, "debian", "linux/amd64", output, "1.2.3", "abc")
+    top = json.loads((output / "index.json").read_text())["manifests"][0]
+    merged = json.loads(oci.blob(output, top).read_text())
+    assert len(merged["manifests"]) == 1
+    assert merged["manifests"][0]["digest"] == original["digest"]
+    assert merged["manifests"][0]["platform"] == {
+        "os": "linux",
+        "architecture": "amd64",
+    }
+
+
 @pytest.mark.parametrize(
     "case",
     ["corrupt", "version", "revision", "missing", "wrong-arch", "duplicate"],
 )
-def test_oci_assembly_blocks_invalid_release_images(tmp_path, case):
+@pytest.mark.parametrize("flat", [False, True])
+def test_oci_assembly_blocks_invalid_release_images(tmp_path, case, flat):
     oci = load("oci_images")
-    image_archive(
+    archive = image_archive(
         tmp_path,
         version="9.9.9" if case == "version" else "1.2.3",
         revision="wrong" if case == "revision" else "abc",
@@ -436,10 +457,11 @@ def test_oci_assembly_blocks_invalid_release_images(tmp_path, case):
         platforms += ",linux/arm64"
     if case == "duplicate":
         platforms += ",linux/amd64"
+    if flat:
+        archive.replace(tmp_path / "image.tar")
     if case == "wrong-arch":
-        (tmp_path / "image-debian-linux-amd64").rename(
-            tmp_path / "image-debian-linux-arm64"
-        )
+        if not flat:
+            archive.parent.rename(tmp_path / "image-debian-linux-arm64")
         platforms = "linux/arm64"
     with pytest.raises((ValueError, FileNotFoundError)):
         oci.merge(

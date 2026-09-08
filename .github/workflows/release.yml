@@ -4226,19 +4226,29 @@ jobs:
         if: steps.decide.outputs.signed == 'true'
         timeout-minutes: 10
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
-            Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser
-            Repair-WinGetPackageManager
-          }
+          $wingetVersion = '1.29.290'
+          # The pinned client supports the generated manifest schema.
+          Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser
+          Repair-WinGetPackageManager -Version $wingetVersion -Force
           $client = Get-Command winget.exe -ErrorAction SilentlyContinue
           if ($client) {
-            & $client.Source validate --manifest winget-manifests --disable-interactivity
+            $clientPath = $client.Source
           } else {
             $package = Get-AppxPackage Microsoft.DesktopAppInstaller
-            & (Join-Path $package.InstallLocation 'winget.exe') validate --manifest winget-manifests --disable-interactivity
+            if (-not $package) { throw 'WinGet executable unavailable after repair' }
+            $clientPath = Join-Path $package.InstallLocation 'winget.exe'
           }
+          $actualVersion = (& $clientPath --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "winget --version failed ($LASTEXITCODE)" }
+          Write-Host "WinGet client: $actualVersion ($clientPath)"
+          if ($actualVersion -ne "v$wingetVersion") {
+            throw "Expected WinGet v$wingetVersion, found $actualVersion"
+          }
+          & $clientPath validate --manifest winget-manifests --disable-interactivity
           if ($LASTEXITCODE -ne 0) { throw "winget validate failed ($LASTEXITCODE)" }
       - name: Preserve winget validation evidence
         if: always() && steps.decide.outputs.signed == 'true'

@@ -117,6 +117,9 @@ def merge(inputs, distro, platforms, output, version, revision):
             / f"image-{distro}-{platform.replace('/', '-')}"
             / "image.tar"
         )
+        # download-artifact extracts a single match directly into inputs.
+        if len(expected) == 1 and not archive.exists():
+            archive = inputs / "image.tar"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             unpack(archive, root)
