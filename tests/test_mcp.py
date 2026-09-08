@@ -293,6 +293,8 @@ async def test_mutating_tool_annotations_are_declared_correctly():
         # a backfill and a gate decision both overwrite run state
         "cron_backfill_dag": (False, True, False),
         "cron_decide_gate": (False, True, False),
+        "cron_recover_dag": (False, False, True),
+        "cron_cancel_queued": (False, True, True),
     }
     for name, triple in expected.items():
         assert name in tools, "{} is gone; update this table".format(name)

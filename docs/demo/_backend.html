@@ -516,6 +516,11 @@ window.CRONSTABLE_BRAND = "cronstable demo";
         host: NODES[i % 9], startedAt: state === "pending" ? null : started / 1000, finishedAt: (state === "success" || state === "failed" || state === "upstream_failed") ? fin / 1000 : null,
         exitCode: state === "success" ? 0 : state === "failed" ? 1 : null, failReason: state === "failed" ? "quality gate breached" : null, resources: null, updatedAt: Math.min(now, fin) / 1000 };
       if (tk.type === "sensor" && state === "running") { tasks[tk.id].pokeCount = Math.floor(elapsed / 10); tasks[tk.id].nextPokeAt = (now + 10000) / 1000; tasks[tk.id].firstPokeAt = started / 1000; }
+      if (name === "data-quality-gate" && tk.id === "check-volume" && !running) tasks[tk.id].verification = {
+        outcome: bad ? "failure" : "success", exit_code: bad ? 1 : 0,
+        fail_reason: bad ? "row count below threshold" : null,
+        stdout: bad ? "Expected at least 1000 rows; found 42." : "Row count and freshness checks passed.", stderr: ""
+      };
     });
     return { dag: name, runKey: rk, runId: "01J" + Math.floor(hash(name + rk) * 1e9).toString(36).toUpperCase(), logicalDate: rk, kind: "scheduled",
       state: running ? "running" : (st.state === "failed" ? "failed" : "success"), createdAt: t / 1000, updatedAt: now / 1000, mapped: {}, tasks: tasks };
@@ -581,6 +586,41 @@ window.CRONSTABLE_BRAND = "cronstable demo";
   //  user-action overlay (start / trigger / backfill / approve)
   // =================================================================
   var OVERLAY = { started: {}, dagRuns: [], created: 0, paused: {} };
+  var POOLS = [{ name: "warehouse", slots: 2, maxQueued: 100, used: 2, queued: 1, entries: [
+    { id: "demo-active", job: "orders-etl.load", state: "running", slots: 2, priority: 0, queuedAt: T0 / 1000, expiresAt: nowMs() / 1000 + 3600 },
+    { id: "demo-waiting", job: "nightly-billing-export", state: "queued", slots: 1, priority: 10, queuedAt: T0 / 1000 + 1, expiresAt: nowMs() / 1000 + 3600 }
+  ] }];
+
+  function recoveryToken(value) { return Math.floor(hash(JSON.stringify(value)) * 0xffffffff).toString(16).padStart(8, "0").repeat(8); }
+  function recoveryPlan(name, key, request) {
+    var source = buildDagRun(name, key);
+    if (!source || source.state === "running") throw new Error("Select a finished run");
+    var selected = new Set(request.mode === "from" ? request.tasks : Object.keys(source.tasks).filter(function (k) { return ["failed", "upstream_failed"].includes(source.tasks[k].state); }));
+    if (!selected.size) throw new Error("No tasks to recover");
+    var size;
+    do { size = selected.size; DAGS[name].tasks.forEach(function (t) { if (t.dependsOn.some(function (d) { return selected.has(d); })) selected.add(t.id); }); } while (selected.size !== size);
+    var plan = { sourceRunKey: key, sourceRunId: source.runId, mode: request.mode || "failed", requestedTasks: request.tasks || [],
+      tasks: Array.from(selected).sort(), preserved: Object.keys(source.tasks).filter(function (k) { return !selected.has(k); }), resetMappings: [], artifacts: [],
+      configurationRevision: "demo-configuration", sourceConfigurationRevision: "demo-configuration", configurationChanged: false };
+    plan.planToken = recoveryToken(plan);
+    return plan;
+  }
+  function executeDemoRecovery(name, plan) {
+    var key = "recovery-" + plan.planToken;
+    if (OVERLAY.dagRuns.some(function (r) { return r.runKey === key; })) return key;
+    var source = buildDagRun(name, plan.sourceRunKey), created = nowMs();
+    var rec = { dag: name, runKey: key, createdAt: created, doc: function () {
+      var body = JSON.parse(JSON.stringify(source)), done = nowMs() - created > 8000;
+      body.runKey = key; body.runId = plan.planToken; body.kind = "recovery"; body.createdAt = created / 1000; body.updatedAt = nowMs() / 1000;
+      body.state = done ? "success" : "running"; body.recovery = Object.assign({ status: "ready" }, plan);
+      plan.preserved.forEach(function (k) { body.tasks[k].reusedFrom = plan.sourceRunKey; });
+      plan.tasks.forEach(function (k, i) { body.tasks[k] = { id: k, state: done ? "success" : i ? "pending" : "running", attempt: 0,
+        exitCode: done ? 0 : null, startedAt: created / 1000, finishedAt: done ? nowMs() / 1000 : null }; });
+      return body;
+    } };
+    OVERLAY.dagRuns.push(rec);
+    return key;
+  }
   function applyOverlay(now) {
     // clear manual "started" runs whose synthetic duration elapsed
     Object.keys(OVERLAY.started).forEach(function (n) { if (now - OVERLAY.started[n].at > OVERLAY.started[n].dur) delete OVERLAY.started[n]; });
@@ -620,7 +660,7 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     return rec;
   }
   function runSummary(rec) { var doc = rec.doc(), hist = {}; Object.keys(doc.tasks).forEach(function (k) { var s = doc.tasks[k].state; hist[s] = (hist[s] || 0) + 1; });
-    return { runKey: rec.runKey, runId: doc.runId, state: doc.state, kind: "manual", logicalDate: null, createdAt: rec.createdAt / 1000, updatedAt: nowMs() / 1000, taskStates: hist }; }
+    return { runKey: rec.runKey, runId: doc.runId, state: doc.state, kind: doc.kind, logicalDate: doc.logicalDate, createdAt: rec.createdAt / 1000, updatedAt: nowMs() / 1000, taskStates: hist }; }
 
   // =================================================================
   //  SSE log stream
@@ -821,6 +861,27 @@ window.CRONSTABLE_BRAND = "cronstable demo";
       return J200({ paused: null });
     }
 
+    if (url === "/pools") return J200(POOLS);
+    if ((m = /^\/pools\/([^/]+)\/queue\/([^/]+)\/cancel$/.exec(url)) && method === "POST") {
+      var pool = POOLS.find(function (p) { return p.name === decodeURIComponent(m[1]); });
+      var entry = pool && pool.entries.find(function (e) { return e.id === decodeURIComponent(m[2]); });
+      if (!entry || entry.state !== "queued") return E(409, "Only waiting work can be cancelled");
+      entry.state = "cancelled"; entry.reason = "cancelled by operator"; pool.queued--;
+      return J200({ id: entry.id, state: entry.state });
+    }
+    if ((m = /^\/dags\/([^/]+)(?:\/runs\/([^/]+))?\/recover$/.exec(url)) && method === "POST") {
+      try {
+        var recoveryName = decodeURIComponent(m[1]), request = JSON.parse(opts.body || "{}");
+        var plans = m[2] ? [recoveryPlan(recoveryName, decodeURIComponent(m[2]), request)] : dagRuns(recoveryName).filter(function (r) {
+          return r.state === "failed" && Date.parse(r.logicalDate) >= Date.parse(request.from) && Date.parse(r.logicalDate) <= Date.parse(request.to);
+        }).map(function (r) { return recoveryPlan(recoveryName, r.runKey, {}); });
+        var token = m[2] ? plans[0].planToken : recoveryToken(plans);
+        if (request.dryRun !== false) return J200(m[2] ? Object.assign({ dryRun: true }, plans[0]) : { dryRun: true, plans: plans, planToken: token, dates: plans.length });
+        if (request.planToken !== token) return E(409, "Recovery preview is stale; preview again");
+        var keys = plans.map(function (p) { return executeDemoRecovery(recoveryName, p); });
+        return J200({ dryRun: false, planToken: token, runKey: m[2] ? keys[0] : undefined, runs: keys, complete: true });
+      } catch (err) { return E(409, err.message); }
+    }
     if ((m = /^\/dags\/([^/]+)\/runs\/([^/]+)\/tasks\/([^/]+)\/logs$/.exec(url))) return new Response(sseStream(decodeURIComponent(m[3]), "task", opts), { status: 200, headers: { "Content-Type": "text/event-stream" } });
     if ((m = /^\/dags\/([^/]+)\/runs\/([^/]+)\/tasks\/([^/]+)\/decision$/.exec(url)) && method === "POST") {
       var dn = decodeURIComponent(m[1]), rk = decodeURIComponent(m[2]); var rec = OVERLAY.dagRuns.filter(function (x) { return x.dag === dn && x.runKey === rk; })[0];

@@ -294,6 +294,7 @@ class DagScheduler:
         # costing one extra rebuild is cheap.
         self._summaries_gen = 0
         self._next_full_adopt = 0.0
+        self._pool_waiting: set[RunRef] = set()
         # in-memory forward next-fire index per scheduled dag (like the job
         # next-fire index); catch-up of missed runs is a one-time seed step.
         self._next_logical: dict[str, datetime.datetime] = {}
@@ -1020,6 +1021,9 @@ class DagScheduler:
         run_id = os.urandom(16).hex()
         now = _now()
         spec = dagcfg.spec
+        from cronstable.recovery import configuration_revision
+
+        revision = configuration_revision(dagcfg)
 
         def _create(current):
             if current is not None:
@@ -1033,6 +1037,7 @@ class DagScheduler:
                 now=now,
                 spec=spec,
             )
+            body["configurationRevision"] = revision
             return body, True
 
         _stored, created = await self._mutate(dagcfg.name, run_key, _create)
@@ -1386,6 +1391,11 @@ class DagScheduler:
         return False
 
     async def _do_advance(self, dagcfg: Any, ref: RunRef) -> None:
+        self._pool_waiting.discard(ref)
+        if ref[1].startswith(
+            "recovery-"
+        ) and not await self._prepare_recovery_or_fail(ref):
+            return
         spec = dagcfg.spec
         now = _now()
         proc = self._cron._proc_token
@@ -1515,6 +1525,8 @@ class DagScheduler:
                 self._wake[ref] = min(
                     self._wake[ref], now + ADVANCE_RETRY_DELAY
                 )
+            if ref in self._pool_waiting:
+                self._wake[ref] = now + 1.0
 
     def _register_launches(self, ref: RunRef, launches: list[Any]) -> None:
         if not launches:
@@ -1891,9 +1903,69 @@ class DagScheduler:
     ) -> Optional[tuple[str, str, Optional[int], Optional[int]]]:
         template = dagcfg.task_templates[intent.task_id]
         taskkey = intent.taskkey
-        token, env = await self._prepare_task_run(
-            dagcfg, run_id, ref[1], intent, template
-        )
+        pool_ticket = None
+        if template.pool is not None:
+            from cronstable.pools import PoolError
+
+            try:
+                pool_ticket, queued = await self._cron._pools.admit_task(
+                    template, ref, run_id, intent
+                )
+            except PoolError as ex:
+                await self._finish_task(
+                    dagcfg,
+                    ref,
+                    taskkey,
+                    intent.task_id,
+                    success=False,
+                    exit_code=None,
+                    fail_reason=str(ex),
+                    proc=self._cron._proc_token,
+                    attempt=intent.attempt,
+                    poke=intent.poke_number if intent.is_sensor else None,
+                )
+                await self._cron._pools.acknowledge_task(ex)
+                return None
+            if pool_ticket is None:
+                release = dag.release_lost_claims(
+                    dagcfg.spec,
+                    [
+                        (
+                            taskkey,
+                            self._cron._proc_token,
+                            intent.attempt,
+                            intent.poke_number,
+                        )
+                    ],
+                    _now(),
+                )
+
+                def defer(body):
+                    updated, released = release(body)
+                    if released:
+                        updated["tasks"][taskkey]["queued"] = {
+                            "pool": template.pool,
+                            "id": queued["id"],
+                            "since": queued["queuedAt"],
+                            "reason": "waiting for pool capacity",
+                        }
+                    return updated, released
+
+                await self._mutate(ref[0], ref[1], self._wrap(defer))
+                self._settle_launch(
+                    ref, taskkey, intent.attempt, intent.poke_number
+                )
+                self._pool_waiting.add(ref)
+                return None
+        try:
+            token, env = await self._prepare_task_run(
+                dagcfg, run_id, ref[1], intent, template
+            )
+        except BaseException:
+            await self._cron._pools.finish(
+                pool_ticket, "queued", "launch interrupted"
+            )
+            raise
         dref = _DagRef(
             dag_name=dagcfg.name,
             run_key=ref[1],
@@ -1912,12 +1984,18 @@ class DagScheduler:
             run_id=env.get(dag.ENV_DAG_RUN_ID),
             dag_ref=dref,
         )
+        running.pool_ticket = pool_ticket
+        running.on_verifying = lambda: self.on_task_verifying(running)
+        if pool_ticket is not None:
+            pool_ticket.running = running
         try:
             # a mapped fan-out launches up to MAX_CLAIMS_PER_PASS instances
             # back to back: share the daemon-wide spawn gate so the burst's
             # synchronous fork/exec work interleaves with other loop work
             # (see cron._SPAWN_BURST_LIMIT).
             async with self._cron._spawn_gate:
+                if pool_ticket is not None:
+                    self._cron._pools.check_ticket(pool_ticket)
                 await running.start()
         except asyncio.CancelledError:
             # Shutdown/restart while queued behind the spawn gate (the
@@ -1932,6 +2010,9 @@ class DagScheduler:
             # (_repair_lost_claims).  A cancel that lands after the
             # subprocess spawned keeps the key: that launch is live.
             if running.proc is None:
+                await self._cron._pools.finish(
+                    pool_ticket, "queued", "launch interrupted"
+                )
                 self._settle_launch(
                     ref, taskkey, intent.attempt, intent.poke_number
                 )
@@ -1939,6 +2020,9 @@ class DagScheduler:
                 await self._cron._job_api.finish_run(token)
             raise
         except BaseException:  # noqa: BLE001 - mirror maybe_launch_job cleanup
+            await self._cron._pools.finish(
+                pool_ticket, "cancelled", "launch failed"
+            )
             if token is not None and self._cron._job_api is not None:
                 await self._cron._job_api.finish_run(token)
             await self._finish_task(
@@ -2042,6 +2126,25 @@ class DagScheduler:
     # Completion (called by the reaper via cron._handle_finished_job)
     # =====================================================================
 
+    async def on_task_verifying(self, running: RunningJob) -> None:
+        dref = running.dag_ref
+        assert dref is not None
+
+        def update(body):
+            entry = (body or {}).get("tasks", {}).get(dref.taskkey, {})
+            if (
+                entry.get("state") != "running"
+                or entry.get("proc") != dref.proc
+                or entry.get("attempt") != dref.attempt
+                or entry.get("pokeCount") != dref.poke
+            ):
+                return DOC_KEEP, None
+            entry["verification"] = {"outcome": "running"}
+            body["updatedAt"] = _now()
+            return body, None
+
+        await self._mutate(dref.dag_name, dref.run_key, update)
+
     async def on_task_finished(self, running: RunningJob) -> None:
         dref = running.dag_ref
         assert dref is not None  # only called for a DAG-task RunningJob
@@ -2073,6 +2176,7 @@ class DagScheduler:
                 "attempt": dref.attempt,
                 "poke": dref.poke,
                 "resources": usage.to_dict() if usage is not None else None,
+                "verification": running.verification,
             }
         )
 
@@ -2145,6 +2249,7 @@ class DagScheduler:
                     "expected_attempt": entry["attempt"],
                     "expected_poke": entry["poke"],
                     "resources": entry.get("resources"),
+                    "verification": entry.get("verification"),
                 }
             )
             live.append(entry)
@@ -2486,6 +2591,336 @@ class DagScheduler:
         if result and result.get("ok"):
             self._spawn_advance((dag_name, run_key))
         return result or {"ok": False, "reason": "no such run"}
+
+    async def recovery_plan(self, name, run_key, *, mode="failed", tasks=()):
+        from cronstable import recovery
+
+        config = self._dags().get(name)
+        source = await self._read(name, run_key)
+        backend = self._backend()
+        if config is None or source is None or backend is None:
+            raise recovery.RecoveryError("DAG run not found")
+        records = await asyncio.wait_for(
+            backend.list_records(
+                jobstate.ARTIFACT_STREAM_PREFIX
+                + dag.xcom_scope(name, source["runId"]),
+                newest_first=True,
+                strict=True,
+                limit=10001,
+            ),
+            STATE_OP_TIMEOUT,
+        )
+        if len(records) > 10000:
+            raise recovery.RecoveryError(
+                "recovery supports at most 10000 artifact records"
+            )
+        newest = {}
+        for record in records:
+            newest.setdefault(record["name"], record)
+        plan = recovery.plan(
+            config,
+            source,
+            mode=mode,
+            tasks=tasks,
+            artifacts=[newest[k] for k in sorted(newest)],
+        )
+        return plan, source
+
+    async def recover(
+        self,
+        name,
+        run_key,
+        *,
+        mode="failed",
+        tasks=(),
+        plan_token=None,
+        allow_config_change=False,
+    ):
+        from cronstable import recovery
+
+        if plan_token is None:
+            plan, _ = await self.recovery_plan(
+                name, run_key, mode=mode, tasks=tasks
+            )
+            return {"dryRun": True, **plan}
+        accepted_key = "recovery-" + plan_token
+        accepted = await self._read(name, accepted_key)
+        if accepted is not None:
+            detail = accepted.get("recovery") or {}
+            if (
+                detail.get("sourceRunKey") != run_key
+                or detail.get("mode") != mode
+                or detail.get("requestedTasks") != sorted(tasks)
+            ):
+                raise recovery.RecoveryError(
+                    "selection differs from the accepted preview"
+                )
+            config = self._dags().get(name)
+            if config is not None:
+                await self._try_own(config, (name, accepted_key))
+            return {
+                **{
+                    k: v
+                    for k, v in detail.items()
+                    if k not in ("status", "error")
+                },
+                "dryRun": False,
+                "runKey": accepted_key,
+                "created": False,
+            }
+        backend = self._backend()
+        if backend is None:
+            raise recovery.RecoveryError("state is unavailable")
+        holder = self._cron._proc_token + ":recovery:" + os.urandom(12).hex()
+        lease = await asyncio.wait_for(
+            backend.acquire_lease(
+                self._lease_name((name, run_key)), holder, 60
+            ),
+            STATE_OP_TIMEOUT,
+        )
+        if lease is None:
+            raise recovery.RecoveryError("source run is busy; retry shortly")
+        try:
+            plan, source = await self.recovery_plan(
+                name, run_key, mode=mode, tasks=tasks
+            )
+            if plan_token != plan["planToken"]:
+                raise recovery.RecoveryError(
+                    "recovery preview is stale; preview again"
+                )
+            if plan["configurationChanged"] and not allow_config_change:
+                raise recovery.RecoveryError(
+                    "configuration differs; acknowledge the current "
+                    "revision to recover"
+                )
+            config = self._dags()[name]
+            for record in plan["artifacts"]:
+                if not await asyncio.wait_for(
+                    backend.blob_exists(record["sha256"], record["size"]),
+                    STATE_OP_TIMEOUT,
+                ):
+                    raise recovery.RecoveryError(
+                        "recovery artifact is missing: " + record["name"]
+                    )
+            body = recovery.new_run(config, source, plan, _now())
+            key = body["runKey"]
+
+            def create(current):
+                if current is not None:
+                    return DOC_KEEP, False
+                return body, True
+
+            _, created = await self._mutate(name, key, create)
+        finally:
+            await asyncio.wait_for(
+                backend.release_lease(lease), STATE_OP_TIMEOUT
+            )
+        await self._try_own(config, (name, key))
+        return {
+            "dryRun": False,
+            "runKey": key,
+            "created": bool(created),
+            **plan,
+        }
+
+    async def recover_range(
+        self,
+        name,
+        start_iso,
+        end_iso,
+        *,
+        plan_token=None,
+        allow_config_change=False,
+    ):
+        from cronstable import recovery
+
+        backend = self._backend()
+        start, end = _parse_iso(start_iso), _parse_iso(end_iso)
+        if backend is None or name not in self._dags():
+            raise recovery.RecoveryError("DAG or state is unavailable")
+        if start is None or end is None or end < start:
+            raise recovery.RecoveryError("invalid recovery date range")
+        ns = "recoverybatch/" + name
+        request = {"from": start.isoformat(), "to": end.isoformat()}
+        existing = None
+        if plan_token is not None:
+            existing = await asyncio.wait_for(
+                backend.read_document(ns, plan_token), STATE_OP_TIMEOUT
+            )
+        if existing is not None:
+            if existing["request"] != request:
+                raise recovery.RecoveryError(
+                    "date range differs from the preview"
+                )
+            plans = existing["plans"]
+            token = plan_token
+        else:
+            docs = await asyncio.wait_for(
+                backend.list_documents(self._ns(name)), STATE_OP_TIMEOUT
+            )
+            latest = {}
+            for body in docs:
+                logical = _parse_iso(body.get("logicalDate") or "")
+                if logical is None or not start <= logical <= end:
+                    continue
+                previous = latest.get(logical)
+                if (
+                    previous is None
+                    or body["createdAt"] > previous["createdAt"]
+                ):
+                    latest[logical] = body
+            failed = [
+                body
+                for _, body in sorted(latest.items())
+                if body["state"] == dag.FAILED
+            ]
+            if len(failed) > 100:
+                raise recovery.RecoveryError(
+                    "select at most 100 failed dates per recovery"
+                )
+            plans = []
+            for body in failed:
+                plan, _ = await self.recovery_plan(name, body["runKey"])
+                plans.append(plan)
+            token = recovery.digest({"request": request, "plans": plans})
+            if plan_token is not None and token != plan_token:
+                raise recovery.RecoveryError(
+                    "recovery preview is stale; preview again"
+                )
+        if plan_token is None:
+            return {
+                "dryRun": True,
+                "planToken": token,
+                "plans": plans,
+                "dates": len(plans),
+                **request,
+            }
+        if (
+            any(p["configurationChanged"] for p in plans)
+            and not allow_config_change
+        ):
+            raise recovery.RecoveryError(
+                "configuration differs; acknowledge the current revision"
+            )
+
+        def create(current):
+            if current is not None:
+                return DOC_KEEP, current
+            body = {
+                "request": request,
+                "plans": plans,
+                "results": {},
+                "createdAt": _now(),
+                "expiresAt": _now() + 7 * 86400,
+                "planToken": token,
+                "complete": not plans,
+            }
+            return body, body
+
+        _, batch = await asyncio.wait_for(
+            backend.mutate_document(ns, token, create), STATE_OP_TIMEOUT
+        )
+        for plan in plans:
+            source = plan["sourceRunKey"]
+            if source in batch["results"]:
+                continue
+            result = await self.recover(
+                name,
+                source,
+                plan_token=plan["planToken"],
+                allow_config_change=allow_config_change,
+            )
+
+            def record(current, source=source, run_key=result["runKey"]):
+                current["results"][source] = run_key
+                current["complete"] = len(current["results"]) == len(
+                    current["plans"]
+                )
+                return current, current
+
+            _, batch = await asyncio.wait_for(
+                backend.mutate_document(ns, token, record), STATE_OP_TIMEOUT
+            )
+        return {
+            "dryRun": False,
+            "planToken": token,
+            "dates": len(plans),
+            "runs": list(batch["results"].values()),
+            "complete": True,
+        }
+
+    async def _prepare_recovery_or_fail(self, ref: RunRef) -> bool:
+        from cronstable.recovery import RecoveryError
+
+        try:
+            await self._prepare_recovery(ref)
+        except RecoveryError as ex:
+            reason = str(ex)
+
+            def preparation_failed(body):
+                if body is None:
+                    return DOC_KEEP, None
+                now = _now()
+                body["recovery"].update(status="failed", error=reason)
+                body.update(state=dag.FAILED, updatedAt=now)
+                for entry in body["tasks"].values():
+                    if entry["state"] not in dag.TERMINAL_STATES | {
+                        dag.EXPANDED
+                    }:
+                        entry.update(
+                            state=dag.FAILED, failReason=reason, finishedAt=now
+                        )
+                return body, None
+
+            await self._mutate(*ref, preparation_failed)
+            await self._release(ref)
+            return False
+        return True
+
+    async def _prepare_recovery(self, ref):
+        from cronstable.recovery import RecoveryError, configuration_revision
+
+        body = await self._read(*ref)
+        if body is None:
+            raise RecoveryError("recovery run disappeared")
+        detail = body.get("recovery") or {}
+        if detail.get("status") != "preparing":
+            return
+        config = self._dags()[ref[0]]
+        if configuration_revision(config) != body.get("configurationRevision"):
+            raise RecoveryError(
+                "recovery configuration changed before preparation"
+            )
+        backend = self._backend()
+        if backend is None:
+            raise RecoveryError("state is unavailable")
+        scope = dag.xcom_scope(ref[0], body["runId"])
+        for record in detail["artifacts"]:
+            present = await asyncio.wait_for(
+                backend.blob_exists(record["sha256"], record["size"]),
+                STATE_OP_TIMEOUT,
+            )
+            if not present:
+                raise RecoveryError(
+                    "recovery artifact is missing: " + record["name"]
+                )
+            await asyncio.wait_for(
+                backend.append_record(
+                    jobstate.ARTIFACT_STREAM_PREFIX + scope,
+                    {**record, "at": _now()},
+                    prune_latest_by="name",
+                ),
+                STATE_OP_TIMEOUT,
+            )
+
+        def prepared(current):
+            if current is None or current["recovery"]["status"] != "preparing":
+                return DOC_KEEP, None
+            current["recovery"]["status"] = "ready"
+            current["updatedAt"] = _now()
+            return current, None
+
+        await self._mutate(ref[0], ref[1], prepared)
 
     async def trigger_run(
         self, dag_name: str, *, logical_date: Optional[str] = None
@@ -2917,6 +3352,27 @@ class DagScheduler:
             backend.list_documents(self._ns(name)),
             timeout=STATE_OP_TIMEOUT,
         )
+        protected = {
+            b["recovery"]["sourceRunKey"]
+            for b in docs
+            if (b.get("recovery") or {}).get("status") == "preparing"
+        }
+        batches = await asyncio.wait_for(
+            backend.list_documents("recoverybatch/" + name), STATE_OP_TIMEOUT
+        )
+        for batch in batches:
+            if batch.get("planToken") and batch.get("expiresAt", 0) < _now():
+                await asyncio.wait_for(
+                    backend.delete_document(
+                        "recoverybatch/" + name, batch["planToken"]
+                    ),
+                    STATE_OP_TIMEOUT,
+                )
+                continue
+            if not batch.get("complete"):
+                protected.update(
+                    p["sourceRunKey"] for p in batch.get("plans", [])
+                )
         terminal = [b for b in docs if dag.is_terminal_run(b)]
         # this pass parsed every body anyway: rebuild the adopt scan's
         # terminal-key cache from truth (its periodic self-heal).
@@ -2929,11 +3385,58 @@ class DagScheduler:
             return
         for body in terminal[:excess]:
             run_key = body.get("runKey")
-            if not run_key:
+            if not run_key or run_key in protected:
                 continue
             await self._delete_run(backend, name, run_key, body.get("runId"))
 
     async def _delete_run(
+        self,
+        backend: StateBackend,
+        name: str,
+        run_key: str,
+        run_id: Any,
+    ) -> None:
+        lease = await asyncio.wait_for(
+            backend.acquire_lease(
+                self._lease_name((name, run_key)),
+                self._cron._proc_token + ":gc:" + os.urandom(12).hex(),
+                60,
+            ),
+            STATE_OP_TIMEOUT,
+        )
+        if lease is None:
+            return
+        try:
+            references = await asyncio.wait_for(
+                backend.list_documents(self._ns(name)), STATE_OP_TIMEOUT
+            )
+            if any(
+                (b.get("recovery") or {}).get("status") == "preparing"
+                and b["recovery"].get("sourceRunKey") == run_key
+                for b in references
+            ):
+                return
+            batches = await asyncio.wait_for(
+                backend.list_documents("recoverybatch/" + name),
+                STATE_OP_TIMEOUT,
+            )
+            if any(
+                not batch.get("complete")
+                and batch.get("expiresAt", float("inf")) > _now()
+                and any(
+                    p.get("sourceRunKey") == run_key
+                    for p in batch.get("plans", [])
+                )
+                for batch in batches
+            ):
+                return
+            await self._delete_run_locked(backend, name, run_key, run_id)
+        finally:
+            await asyncio.wait_for(
+                backend.release_lease(lease), STATE_OP_TIMEOUT
+            )
+
+    async def _delete_run_locked(
         self,
         backend: StateBackend,
         name: str,

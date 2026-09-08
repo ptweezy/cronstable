@@ -1,6 +1,7 @@
 import asyncio
 import asyncio.subprocess
 import atexit
+import copy
 import html
 import itertools
 import logging
@@ -12,7 +13,7 @@ import threading
 import time
 import weakref
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import format_datetime
@@ -37,6 +38,7 @@ from cronstable.config import (
     _resolve_secret,
     schedule_object_to_crontab,
 )
+from cronstable.redact import redact_secrets
 from cronstable.resources import ResourceMonitor, ResourceUsage
 from cronstable.statsd import StatsdJobMetricWriter
 
@@ -1967,6 +1969,7 @@ STANDARD_TEMPLATE_VARS = (
     "cpu_user_seconds",
     "cpu_system_seconds",
     "max_rss_bytes",
+    "verification",
 )
 
 
@@ -2005,6 +2008,7 @@ def _base_template_vars(
         "cpu_user_seconds": usage.cpu_user_seconds if usage else None,
         "cpu_system_seconds": usage.cpu_system_seconds if usage else None,
         "max_rss_bytes": usage.max_rss_bytes if usage else None,
+        "verification": getattr(ctx, "verification", None),
     }
 
 
@@ -2085,12 +2089,15 @@ class RunningJob:
         state_token: Optional[str] = None,
         run_id: Optional[str] = None,
         dag_ref: Optional[Any] = None,
+        output: Optional[JobOutputStream] = None,
+        output_prefix: str = "",
     ) -> None:
         self.config = config
         # when set, this run is one DAG task instance: the reaper routes
         # its completion to cronstable.dagrun instead of the record/retry
         # path. An opaque marker carrying (dag, run_key, taskkey, ...).
         self.dag_ref = dag_ref
+        self.on_verifying: Optional[Callable[[], Awaitable[None]]] = None
         # environment the daemon injects on top of the job's own (loopback
         # state-API URL, per-run bearer token, run context); applied after
         # config.environment so it wins over a same-named user override.
@@ -2106,7 +2113,11 @@ class RunningJob:
         # set in start() so even a failed launch carries a timestamp.
         self.started_at: datetime | None = None
         # live, broadcastable view of this run's captured output (web UI tail)
-        self.output = JobOutputStream()
+        self.output = output if output is not None else JobOutputStream()
+        self._output_prefix = output_prefix
+        self.verification: Optional[dict[str, Any]] = None
+        self._verifier: Optional[RunningJob] = None
+        self.pool_ticket: Any = None
         self._stderr_reader: StreamReader | None = None
         self._stdout_reader: StreamReader | None = None
         self.stderr: str | None = None
@@ -2389,7 +2400,7 @@ class RunningJob:
             assert self.proc.stderr is not None
             self._stderr_reader = StreamReader(
                 config.name,
-                "stderr",
+                self._output_prefix + "stderr",
                 self.proc.stderr,
                 config.streamPrefix,
                 config.saveLimit,
@@ -2400,7 +2411,7 @@ class RunningJob:
             assert self.proc.stdout is not None
             self._stdout_reader = StreamReader(
                 config.name,
-                "stdout",
+                self._output_prefix + "stdout",
                 self.proc.stdout,
                 config.streamPrefix,
                 config.saveLimit,
@@ -2467,12 +2478,16 @@ class RunningJob:
                 # (exit code 127, "command not found") rather than raising
                 # RuntimeError, which the reaper logs as a bug.
                 self.retcode = 127
+                if self.config.verify is not None:
+                    self.verification = {
+                        "outcome": "skipped",
+                        "fail_reason": "command did not start",
+                    }
                 await self._read_job_streams()
                 return
             raise RuntimeError("process is not running")
         if self.execution_deadline is None:
             self.retcode = await self.proc.wait()
-            await self._on_stop()
         else:
             timeout = self.execution_deadline - time.perf_counter()
             try:
@@ -2480,7 +2495,6 @@ class RunningJob:
                     self.retcode = await asyncio.wait_for(
                         self.proc.wait(), timeout
                     )
-                    await self._on_stop()
                 else:
                     raise asyncio.TimeoutError
             except asyncio.TimeoutError:
@@ -2492,9 +2506,101 @@ class RunningJob:
                 )
                 self.retcode = -100
                 await self.cancel()
-        await self._read_job_streams()
+        await self._read_job_streams(close_output=self.config.verify is None)
+        try:
+            if self.config.verify is not None and not self._terminated:
+                if self.failed:
+                    self.verification = {
+                        "outcome": "skipped",
+                        "fail_reason": "command failed",
+                    }
+                else:
+                    await self._verify_result()
+        finally:
+            self.output.close()
+            await self._on_stop()
 
-    async def _read_job_streams(self):
+    async def _verify_result(self) -> None:
+        spec = self.config.verify
+        assert spec is not None
+        config = copy.copy(self.config)
+        config.command = spec["command"]
+        config.verify = None
+        config.executionTimeout = None
+        config.captureStdout = config.captureStderr = True
+        config.saveLimit = 64
+        config.maxLineLength = min(config.maxLineLength, 16384)
+        config.statsd = None
+        config.failsWhen = {
+            "always": False,
+            "nonzeroReturn": True,
+            "producesStdout": False,
+            "producesStderr": False,
+        }
+        check = RunningJob(
+            config,
+            None,
+            extra_env=self.extra_env,
+            output=self.output,
+            output_prefix="verify.",
+        )
+        self._verifier = check
+        self.verification = {"outcome": "running"}
+
+        async def verify() -> None:
+            await check.start()
+            if self.on_verifying is not None:
+                try:
+                    await self.on_verifying()
+                except (OSError, asyncio.TimeoutError):
+                    logger.warning("Could not publish verification status")
+            if self._terminated:
+                await check.cancel()
+            await check.wait()
+
+        try:
+            await asyncio.wait_for(verify(), spec["timeout"])
+        except asyncio.TimeoutError:
+            check.retcode = -100
+            await check.cancel()
+            await check._read_job_streams()
+        except BaseException:
+            await check.cancel()
+            await check._read_job_streams()
+            self.verification = {
+                "outcome": "failure",
+                "fail_reason": "verification interrupted",
+            }
+            raise
+        finally:
+            self._verifier = None
+        finished = datetime.now(timezone.utc)
+        self.verification = {
+            "outcome": "failure" if check.failed else "success",
+            "exit_code": check.retcode,
+            "fail_reason": check.fail_reason,
+            "started_at": check.started_at.isoformat()
+            if check.started_at is not None
+            else None,
+            "finished_at": finished.isoformat(),
+            "duration": (finished - check.started_at).total_seconds()
+            if check.started_at is not None
+            else None,
+            "stdout": redact_secrets(check.stdout)[:16384]
+            if check.stdout
+            else check.stdout,
+            "stderr": redact_secrets(check.stderr)[:16384]
+            if check.stderr
+            else check.stderr,
+            "stdout_discarded": check.stdout_discarded,
+            "stderr_discarded": check.stderr_discarded,
+            "output_truncated": any(
+                len(s or "") > 16384 for s in (check.stdout, check.stderr)
+            )
+            or bool(check.stdout_discarded or check.stderr_discarded),
+        }
+
+    async def _read_job_streams(self, *, close_output: bool = True):
         # Pipe EOF needs EVERY write-end closed, including any a
         # descendant inherited; one that escaped the group kill would hold
         # the pipe open and strand the run in running_jobs forever (the
@@ -2514,7 +2620,8 @@ class RunningJob:
             ) = await self._stdout_reader.join(timeout)
         # signal end-of-output to any live web log subscribers; their read
         # loops terminate on the sentinel this delivers.
-        self.output.close()
+        if close_output:
+            self.output.close()
         # Close our end of the subprocess pipes now both readers are
         # joined. A no-op after a normal EOF, but a KILLED run whose
         # descendant escaped the group never reaches EOF, and its pipe
@@ -2532,6 +2639,10 @@ class RunningJob:
 
     @property
     def fail_reason(self) -> Optional[str]:
+        if self.verification and self.verification["outcome"] == "failure":
+            return "verification failed: {}".format(
+                self.verification.get("fail_reason") or "check failed"
+            )
         fails_when = self.config.failsWhen
         if fails_when["always"]:
             return "failsWhen=always"
@@ -2564,6 +2675,10 @@ class RunningJob:
         The reaper still completes such a run through ``wait()``'s
         ``start_failed`` path, so nothing is left stranded.
         """
+        if self._verifier is not None:
+            self._terminated = True
+            await self._verifier.cancel()
+            return
         if self.proc is None:
             logger.info(
                 "Job %s: cancel is a no-op, no process was ever spawned "

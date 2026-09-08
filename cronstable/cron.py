@@ -70,6 +70,7 @@ from cronstable.config import (
     parse_config_string,
     parse_config_with_sources,
     resolve_bonjour_config,
+    validate_pools,
 )
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import (
@@ -101,12 +102,14 @@ from cronstable.job import (
     schedule_string,
 )
 from cronstable.leadership import LeadershipBackend, make_backend
+from cronstable.pools import PoolError, PoolScheduler, Ticket
 from cronstable.prometheus import (
     CONTENT_TYPE_OPENMETRICS,
     CONTENT_TYPE_TEXT,
     PrometheusMetrics,
     resolve_metrics_config,
 )
+from cronstable.recovery import RecoveryError
 from cronstable.redact import redact_lines
 from cronstable.resources import (
     NodeResourceSampler,
@@ -412,6 +415,10 @@ WEB_ROUTES: "tuple[tuple[str, str, str, Optional[str]], ...]" = (
     ),
     ("POST", "/dags/{name}/trigger", "_web_dag_trigger", None),
     ("POST", "/dags/{name}/backfill", "_web_dag_backfill", None),
+    ("GET", "/pools", "_web_pools", None),
+    ("POST", "/pools/{name}/queue/{key}/cancel", "_web_pool_cancel", None),
+    ("POST", "/dags/{name}/runs/{run_key}/recover", "_web_dag_recover", None),
+    ("POST", "/dags/{name}/recover", "_web_dag_recover_range", None),
     (
         "POST",
         "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
@@ -809,6 +816,7 @@ class JobRunInfo:
     # sampled CPU time + peak RSS when the job opted into monitorResources;
     # None otherwise. The reaper fills it from the finished RunningJob.
     resource_usage: Optional[ResourceUsage] = None
+    verification: Optional[dict[str, Any]] = None
     # why a synthetic "skipped" row exists ("paused"); None for real runs.
     skip_reason: Optional[str] = None
     # Elapsed seconds, derived once at construction (both operands are
@@ -860,6 +868,8 @@ class JobRunInfo:
         }
         if self.outcome != "skipped":
             data["ranAt"] = finished
+        if self.verification is not None:
+            data["verification"] = self.verification
         return data
 
 
@@ -1307,6 +1317,9 @@ def _job_run_info_from_dict(
         # (returns None), so a pre-monitoring or hand-edited record rehydrates
         # cleanly with no resource stats.
         resource_usage=ResourceUsage.from_dict(rec.get("resources")),
+        verification=rec.get("verification")
+        if isinstance(rec.get("verification"), dict)
+        else None,
     )
 
 
@@ -1974,6 +1987,7 @@ class Cron:
         self.cron_jobs: dict[str, JobConfig] = {}
         # orchestration DAGs; empty keeps the classic no-DAG behaviour.
         self.cron_dags: dict[str, DagConfig] = {}
+        self.pool_config: dict[str, dict[str, int]] = {}
         # Memo caches (these four plus _memo_gen and friends below): pure
         # functions of cron_jobs, computed lazily; ALL must be invalidated
         # at every point cron_jobs is reassigned (reload).
@@ -2147,6 +2161,8 @@ class Cron:
         if config_yaml is not None:
             # config_yaml is for unit testing
             config = parse_config_string(config_yaml, "")
+            validate_pools(config)
+            self.pool_config = config.pools
             self.cron_jobs = {job.name: job for job in config.jobs}
             self.cron_dags = {d.name: d for d in config.dags}
             self._notify_config = config.notify_config
@@ -2358,6 +2374,7 @@ class Cron:
         # the durable DAG orchestrator; inert until `dags:` plus a state
         # backend are configured. Constructed here so every path has it.
         self._dag = DagScheduler(self)
+        self._pools = PoolScheduler(self)
         # whether the last _sleep_interval() was shortened by a DAG wake;
         # read via _wakes_subminute. False until the first sleep, the safe
         # direction (the startup pass housekeeps unconditionally).
@@ -2519,6 +2536,7 @@ class Cron:
         for task in list(self._catchup_tasks) + list(self._notify_tasks):
             task.cancel()
 
+        await self._pools.close()
         if self.state_backend is not None:
             # one last unthrottled counter snapshot; joins the pending
             # writes and is flushed (bounded) below.
@@ -2822,6 +2840,7 @@ class Cron:
         # DagScheduler reads this live each pass; in-flight runs of a
         # removed DAG finish and are GC'd.
         self.cron_dags = {d.name: d for d in config.dags}
+        self.pool_config = config.pools
         # read live by _dispatch_notify, so a reload takes effect at once.
         self._notify_config = config.notify_config
         # Retire the Event Log writer of a source this config no longer
@@ -4361,7 +4380,7 @@ class Cron:
             request.match_info["name"], request
         )
 
-    async def start_job_by_name(self, name: str) -> None:
+    async def start_job_by_name(self, name: str) -> Optional[str]:
         """Launch a job now (`POST /jobs/{name}/start`, MCP `cron_run_job`).
 
         Raises :class:`ApiActionError` for an unknown (404) or disabled (409)
@@ -4419,7 +4438,22 @@ class Cron:
                 # marker write (the survivor skip records nothing).
                 self._boot_survivors.pop(name, None)
                 await self._reboot_boot_gate(job)
-        await self.maybe_launch_job(job)
+        if getattr(job, "pool", None) is not None:
+            try:
+                entry = await self._pools.enqueue(
+                    job,
+                    payload={
+                        "kind": "job",
+                        "withRetries": True,
+                        "manual": True,
+                    },
+                )
+                return str(entry["id"])
+            except PoolError as ex:
+                raise ApiActionError(str(ex), status=409) from ex
+        else:
+            await self.maybe_launch_job(job)
+        return None
 
     async def cancel_job_by_name(self, name: str) -> int:
         """Cancel a job's running instances; return how many were signalled.
@@ -5148,7 +5182,17 @@ class Cron:
     @_maps_action_errors
     async def _web_start_job(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
-        await self.start_job_by_name(name)
+        queued = await self.start_job_by_name(name)
+        if queued is not None:
+            return _json_response(
+                {
+                    "queued": name,
+                    "queueId": queued,
+                    "pool": self.cron_jobs[name].pool,
+                },
+                status=202,
+                headers=self._web_headers(),
+            )
         # a minimal JSON ack in the MCP cron_run_job shape; this route once
         # returned an empty 200 while every sibling action returned JSON.
         return _json_response({"started": name}, headers=self._web_headers())
@@ -5470,6 +5514,21 @@ class Cron:
                 else None
             ),
         }
+        if job.verify is not None:
+            result["verification"] = {
+                "configured": True,
+                "running": any(
+                    r.verification
+                    and r.verification.get("outcome") == "running"
+                    for r in running
+                ),
+            }
+        if job.pool is not None:
+            result["pool"] = {
+                "name": job.pool,
+                "slots": job.poolSlots,
+                "priority": job.queuePriority,
+            }
         if job.schedule_resolved_or_none is not None:
             # the H hash form: also ship the plain-dialect spelling it
             # resolved to, so the dashboards display the H the user wrote
@@ -5629,6 +5688,7 @@ class Cron:
         # ABSOLUTE next-fire, not the relative scheduled_in, so it stays
         # put while the countdown ticks and moves when a fire lands.
         payload = self.jobs_payload()
+        await self._attach_job_queues(payload)
         # A plain snapshot of the index, NOT a per-job isoformat sweep:
         # the instants change at most once per job per fire. The
         # canonical dump renders them itself, inside the executor.
@@ -5640,6 +5700,27 @@ class Cron:
                 None, _jobs_response_product, payload, next_fire
             )
         return _jobs_response_product(payload, next_fire)
+
+    async def _attach_job_queues(self, jobs):
+        if not self.pool_config:
+            return
+        try:
+            pools = {p["name"]: p for p in await self._pools.snapshot()}
+        except (PoolError, OSError, asyncio.TimeoutError):
+            for job in jobs:
+                if "pool" in job:
+                    job["pool"]["queueUnavailable"] = True
+            return
+        for job in jobs:
+            if "pool" in job:
+                pool = pools.get(job["pool"]["name"], {})
+                job["pool"]["queued"] = [
+                    e
+                    for e in pool.get("entries", [])
+                    if e["state"] == "queued"
+                    and e.get("job") == job["name"]
+                    and not e.get("task")
+                ]
 
     def _bust_response_memos(self) -> None:
         """Drop the shared endpoint products so a local change renders now.
@@ -5672,6 +5753,7 @@ class Cron:
             raise _api_error(
                 web.HTTPNotFound, "job {!r} not found".format(name)
             )
+        await self._attach_job_queues([payload])
         return _json_response(payload, headers=self._web_headers())
 
     # --- DAG introspection + control --------------------------------------
@@ -5946,6 +6028,109 @@ class Cron:
             {"dag": name, "name": name, "runKey": run_key},
             headers=self._web_headers(),
         )
+
+    async def _web_pools(self, request: web.Request) -> web.Response:
+        try:
+            payload = await self._pools.snapshot()
+        except PoolError as ex:
+            raise _api_error(web.HTTPServiceUnavailable, str(ex)) from ex
+        except (OSError, asyncio.TimeoutError) as ex:
+            raise _api_error(
+                web.HTTPServiceUnavailable, "pool state is unavailable"
+            ) from ex
+        return _json_response(payload, headers=self._web_headers())
+
+    async def _web_pool_cancel(self, request: web.Request) -> web.Response:
+        try:
+            payload = await self._pools.cancel(
+                request.match_info["name"], request.match_info["key"]
+            )
+        except PoolError as ex:
+            raise _api_error(web.HTTPConflict, str(ex)) from ex
+        except (OSError, asyncio.TimeoutError) as ex:
+            raise _api_error(
+                web.HTTPServiceUnavailable, "pool state is unavailable"
+            ) from ex
+        return _json_response(
+            {"id": payload["id"], "state": payload["state"]},
+            headers=self._web_headers(),
+        )
+
+    async def _web_dag_recover(self, request: web.Request) -> web.Response:
+        payload = await self._web_json_body(request)
+        mode = payload.get("mode", "failed")
+        tasks = payload.get("tasks", [])
+        dry_run = payload.get("dryRun", True)
+        allow_change = payload.get("allowConfigChange", False)
+        token = payload.get("planToken")
+        if (
+            not isinstance(mode, str)
+            or not isinstance(tasks, list)
+            or len(tasks) > 2000
+            or any(not isinstance(t, str) for t in tasks)
+            or not isinstance(dry_run, bool)
+            or not isinstance(allow_change, bool)
+            or (
+                not dry_run
+                and (not isinstance(token, str) or len(token) != 64)
+            )
+        ):
+            raise _api_error(web.HTTPBadRequest, "invalid recovery request")
+        try:
+            result = await self._dag.recover(
+                request.match_info["name"],
+                request.match_info["run_key"],
+                mode=mode,
+                tasks=tasks,
+                plan_token=None if dry_run else token,
+                allow_config_change=allow_change,
+            )
+        except RecoveryError as ex:
+            raise _api_error(web.HTTPConflict, str(ex)) from ex
+        except (OSError, asyncio.TimeoutError) as ex:
+            raise _api_error(
+                web.HTTPServiceUnavailable, "recovery state is unavailable"
+            ) from ex
+        return _json_response(result, headers=self._web_headers())
+
+    async def _web_dag_recover_range(
+        self, request: web.Request
+    ) -> web.Response:
+        payload = await self._web_json_body(request)
+        start, end = payload.get("from"), payload.get("to")
+        dry_run = payload.get("dryRun", True)
+        allow_change = payload.get("allowConfigChange", False)
+        token = payload.get("planToken")
+        if (
+            not isinstance(start, str)
+            or not isinstance(end, str)
+            or payload.get("mode", "failed") != "failed"
+            or payload.get("tasks", []) != []
+            or not isinstance(dry_run, bool)
+            or not isinstance(allow_change, bool)
+            or (
+                not dry_run
+                and (not isinstance(token, str) or len(token) != 64)
+            )
+        ):
+            raise _api_error(
+                web.HTTPBadRequest, "invalid recovery date range request"
+            )
+        try:
+            result = await self._dag.recover_range(
+                request.match_info["name"],
+                start,
+                end,
+                plan_token=None if dry_run else token,
+                allow_config_change=allow_change,
+            )
+        except RecoveryError as ex:
+            raise _api_error(web.HTTPConflict, str(ex)) from ex
+        except (OSError, asyncio.TimeoutError) as ex:
+            raise _api_error(
+                web.HTTPServiceUnavailable, "recovery state is unavailable"
+            ) from ex
+        return _json_response(result, headers=self._web_headers())
 
     async def _web_dag_backfill(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
@@ -9388,6 +9573,7 @@ class Cron:
         # DAG scheduler: single-flight and self-gated, so a pass with no
         # DAG work due is a couple of cheap in-memory checks.
         self._dag.service()
+        self._pools.service()
 
     async def spawn_jobs(
         self, startup: bool, now: Optional[datetime.datetime] = None
@@ -10277,24 +10463,45 @@ class Cron:
         await self.maybe_launch_job(job)
 
     async def maybe_launch_job(
-        self, job: JobConfig, *, with_retries: bool = True
+        self,
+        job: JobConfig,
+        *,
+        with_retries: bool = True,
+        pool_ticket: Optional[Ticket] = None,
     ) -> bool:
-        """Launch ``job`` unless concurrencyPolicy forbids it.
+        """Accept a job into its pool queue or launch it immediately.
 
-        Returns whether a new instance was launched (False only for the
-        Forbid skip). with_retries=False (catch-up backfills) launches
-        WITHOUT the retry state: a backfill must not attach to a live
-        retry ladder and burn its budget. The whole method holds the
-        per-job launch lock: the concurrency gate reads running_jobs
-        several awaits before the launch appends to it, so two concurrent
-        entries for the same job would otherwise double-launch a Forbid
-        job. Distinct jobs still launch concurrently.
+        Return True when accepted or launched. Concurrency rules apply at
+        launch under a per-job lock. with_retries=False keeps catch-up
+        work independent of the job's retry ladder.
         """
+        if job.pool is not None and pool_ticket is None:
+            slot = self._last_run_slot.get(job.name)
+            retry = self.retry_state.get(job.name) if with_retries else None
+            await self._pools.enqueue(
+                job,
+                payload={
+                    "kind": "job",
+                    "withRetries": with_retries,
+                    "retry": {"count": retry.count, "delay": retry.delay}
+                    if retry is not None and not retry.cancelled
+                    else None,
+                    "scheduledAt": slot.isoformat()
+                    if slot is not None
+                    else None,
+                },
+            )
+            return True
         async with self._launch_locks[job.name]:
-            return await self._launch_job_locked(job, with_retries)
+            return await self._launch_job_locked(
+                job, with_retries, pool_ticket
+            )
 
     async def _launch_job_locked(
-        self, job: JobConfig, with_retries: bool
+        self,
+        job: JobConfig,
+        with_retries: bool,
+        pool_ticket: Optional[Ticket] = None,
     ) -> bool:
         """The body of :meth:`maybe_launch_job`, under its per-job lock."""
         # .get(), not a bare subscript: subscripting this defaultdict
@@ -10337,6 +10544,17 @@ class Cron:
                 return False
         logger.info("Starting job %s", job.name)
         retry_state = self.retry_state.get(job.name) if with_retries else None
+        if pool_ticket is not None and with_retries:
+            saved = pool_ticket.payload.get("retry")
+            policy = job.onFailure["retry"]
+            if saved is not None:
+                retry_state = JobRetryState(
+                    saved["delay"],
+                    policy["backoffMultiplier"],
+                    policy["maximumDelay"],
+                )
+                retry_state.count = saved["count"]
+                self.retry_state[job.name] = retry_state
         run_token: Optional[str] = None
         try:
             # register with the loopback state API BEFORE the child
@@ -10347,7 +10565,13 @@ class Cron:
             # spawn. Cancellation cannot strand a registered token: the
             # await in _prepare_job_api_run precedes register_run.
             run_token, extra_env = await self._prepare_job_api_run(
-                job, retry_state
+                job,
+                retry_state,
+                **(
+                    {"pool_ticket": pool_ticket}
+                    if pool_ticket is not None
+                    else {}
+                ),
             )
             running_job = RunningJob(
                 job,
@@ -10356,9 +10580,14 @@ class Cron:
                 state_token=run_token,
                 run_id=extra_env.get("CRONSTABLE_RUN_ID"),
             )
+            running_job.pool_ticket = pool_ticket
+            if pool_ticket is not None:
+                pool_ticket.running = running_job
             # the gate releases before the except arm runs, so cleanup
             # below never holds a spawn permit.
             async with self._spawn_gate:
+                if pool_ticket is not None:
+                    self._pools.check_ticket(pool_ticket)
                 await running_job.start()
         except BaseException:
             # start() handles expected spawn failures itself; anything
@@ -10401,7 +10630,11 @@ class Cron:
         return "{}#{}".format(self._state_host, self._proc_token)
 
     async def _prepare_job_api_run(
-        self, job: JobConfig, retry_state: Optional[JobRetryState]
+        self,
+        job: JobConfig,
+        retry_state: Optional[JobRetryState],
+        *,
+        pool_ticket: Optional[Ticket] = None,
     ) -> tuple[Optional[str], dict[str, str]]:
         """Register this run with the loopback state API; return its env.
 
@@ -10425,7 +10658,13 @@ class Cron:
             run_id=os.urandom(16).hex(),
             job_name=job.name,
             attempt=retry_state.count if retry_state is not None else 0,
-            scheduled_at=slot.isoformat() if slot is not None else None,
+            scheduled_at=(
+                pool_ticket.payload.get("scheduledAt")
+                if pool_ticket is not None
+                else slot.isoformat()
+                if slot is not None
+                else None
+            ),
             host=self._state_host,
             default_scope=job.name,
             allowed_scopes=set(job.stateAllowedScopes),
@@ -12537,6 +12776,7 @@ class Cron:
         return latest[1] == "success"
 
     async def _handle_finished_job(self, job: RunningJob) -> None:
+        await self._pools.finish(getattr(job, "pool_ticket", None))
         if getattr(job, "dag_ref", None) is not None:
             # a DAG task instance: route to the DAG scheduler and skip
             # the job record/retry/inflight/cluster-slot path; a task's
@@ -12620,6 +12860,7 @@ class Cron:
                 fail_reason=fail_reason,
                 output=job.output,
                 resource_usage=getattr(job, "resource_usage", None),
+                verification=getattr(job, "verification", None),
             ),
         )
         self._queue_job_completion(job, failed=fail_reason is not None)

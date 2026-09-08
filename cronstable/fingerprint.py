@@ -396,6 +396,15 @@ def canonical_job(
         # priority class it resolves to on one platform.  Only when set, per
         # the same rule, so no existing digest moves.
         out["priority"] = job.priority
+    if job.verify is not None:
+        out["verify"] = job.verify
+    if job.pool is not None:
+        out["pool"] = {
+            "name": job.pool,
+            "slots": job.poolSlots,
+            "priority": job.queuePriority,
+            "timeout": job.queueTimeout,
+        }
     return out
 
 

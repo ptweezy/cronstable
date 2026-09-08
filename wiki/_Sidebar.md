@@ -22,12 +22,15 @@
   - [Logging Configuration](Logging-Configuration)
 - **Job Behavior**
   - [Concurrency and Timeouts](Concurrency-and-Timeouts)
+  - [Resource Pools](Resource-Pools)
+  - [Result Verification](Result-Verification)
   - [Failure Detection and Retries](Failure-Detection-and-Retries)
   - [Pausing Jobs](Pausing-Jobs)
   - [Late-Run Detection (SLA)](Late-Run-Detection)
   - [Resource Monitoring](Resource-Monitoring)
   - [Durable State](Durable-State)
   - [Orchestration and DAGs](Orchestration-and-DAGs)
+  - [Workflow Recovery](Workflow-Recovery)
   - [Clustering and Leader Election](Clustering-and-Leader-Election)
   - [Job-Set ID](Job-Set-ID)
 - **Integrations**

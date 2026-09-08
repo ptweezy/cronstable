@@ -376,6 +376,17 @@ paths:
                 properties:
                   started: { type: string }
                 required: [started]
+        "202":
+          description: Accepted into a resource pool queue.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [queued, queueId, pool]
+                properties:
+                  queued: { type: string }
+                  queueId: { type: string }
+                  pool: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1384,6 +1395,126 @@ paths:
             text/html:
               schema: { type: string }
 
+  /pools:
+    get:
+      tags: [jobs]
+      summary: Inspect shared resource pools and waiting work
+      operationId: listPools
+      responses:
+        "200":
+          description: Pool capacity, queue entries, and recent outcomes.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ResourcePool"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503":
+          description: Pool state is unavailable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /pools/{name}/queue/{key}/cancel:
+    post:
+      tags: [jobs]
+      summary: Cancel a waiting pool entry
+      operationId: cancelQueuedWork
+      x-required-scope: control
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: key, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Queued work cancelled.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  state: { type: string, enum: [cancelled] }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: The entry is absent or has already left the queue.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dags/{name}/runs/{run_key}/recover:
+    post:
+      tags: [dags]
+      summary: Preview or execute selective recovery
+      operationId: recoverDagRun
+      x-required-scope: control
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: run_key, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RecoveryRequest" }
+      responses:
+        "200":
+          description: A replay preview or the new recovery run and its plan.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400":
+          description: Invalid request fields.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: The source, configuration, or preview cannot be used.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dags/{name}/recover:
+    post:
+      tags: [dags]
+      summary: Preview or recover failed logical dates
+      operationId: recoverDagDates
+      x-required-scope: control
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/RecoveryRequest"
+                - type: object
+                  required: [from, to]
+                  properties:
+                    from: { type: string, format: date-time }
+                    to: { type: string, format: date-time }
+      responses:
+        "200":
+          description: Plans for failed dates, or the resulting recovery run keys.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400":
+          description: Invalid request fields.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: The range or its preview cannot be used.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1690,6 +1821,8 @@ components:
       type: object
       description: One job's full state (an entry of `GET /jobs`, or `GET /jobs/{name}`).
       properties:
+        pool: { $ref: "#/components/schemas/JobPool" }
+        verification: { $ref: "#/components/schemas/VerificationStatus" }
         name: { type: string }
         enabled: { type: boolean }
         schedule: { type: string }
@@ -1723,10 +1856,96 @@ components:
       required: [name, enabled, schedule, running]
       additionalProperties: true
 
+    ResourcePool:
+      type: object
+      required: [name, slots, used, queued, entries]
+      properties:
+        name: { type: string }
+        slots: { type: integer }
+        configuredSlots: { type: integer }
+        used: { type: integer }
+        queued: { type: integer }
+        maxQueued: { type: integer }
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/PoolEntry" }
+
+    PoolEntry:
+      type: object
+      required: [id, state, slots, priority, queuedAt, expiresAt]
+      properties:
+        id: { type: string }
+        state: { type: string }
+        slots: { type: integer }
+        priority: { type: integer }
+        queuedAt: { type: number }
+        expiresAt: { type: number }
+        position: { type: integer }
+        waitingReason: { type: string }
+        reason: { type: string }
+        job: { type: string }
+        dag: { type: string }
+        runKey: { type: string }
+        task: { type: string }
+
+    JobPool:
+      type: object
+      required: [name, slots, priority]
+      properties:
+        name: { type: string }
+        slots: { type: integer }
+        priority: { type: integer }
+        queueUnavailable: { type: boolean }
+        queued:
+          type: array
+          items: { $ref: "#/components/schemas/PoolEntry" }
+
+    VerificationStatus:
+      type: object
+      properties:
+        configured: { type: boolean }
+        running: { type: boolean }
+
+    RecoveryRequest:
+      type: object
+      properties:
+        mode: { type: string, enum: [failed, from], default: failed }
+        tasks:
+          type: array
+          maxItems: 2000
+          items: { type: string }
+          description: Task instance names for mode from, including mapped names such as process#2.
+        dryRun: { type: boolean, default: true }
+        planToken:
+          type: string
+          minLength: 64
+          maxLength: 64
+          description: Token returned by the preview; required when dryRun is false.
+        allowConfigChange:
+          type: boolean
+          default: false
+          description: Acknowledge using the current configuration when it differs from the source run.
+
+    VerificationResult:
+      type: object
+      properties:
+        outcome: { type: string }
+        exit_code: { type: integer, nullable: true }
+        fail_reason: { type: string, nullable: true }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time }
+        duration: { type: number, nullable: true }
+        stdout: { type: string, nullable: true }
+        stderr: { type: string, nullable: true }
+        stdout_discarded: { type: integer }
+        stderr_discarded: { type: integer }
+        output_truncated: { type: boolean }
+
     JobRun:
       type: object
       description: One finished run.
       properties:
+        verification: { $ref: "#/components/schemas/VerificationResult" }
         outcome:
           # Open enum (enum + bare string under anyOf): generated clients keep
           # decoding when a newer daemon ships an outcome this list has not

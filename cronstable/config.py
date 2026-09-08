@@ -664,6 +664,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "statsd": None,
     "streamPrefix": "[{job_name} {stream_name}] ",
     "enabled": True,
+    "verify": None,
+    "pool": None,
+    "poolSlots": 1,
+    "queuePriority": 0,
+    "queueTimeout": 3600.0,
 }
 
 # An SLA breach has no run to report on, so the onLate defaults swap the
@@ -962,6 +967,12 @@ _job_defaults_common = {
     Opt("group"): Int() | Str(),
     Opt("streamPrefix"): Str(),
     Opt("enabled"): Bool(),
+    Opt("verify"): EmptyNone()
+    | Map({"command": Str() | Seq(Str()), Opt("timeout"): Float()}),
+    Opt("pool"): EmptyNone() | Str(),
+    Opt("poolSlots"): Int(),
+    Opt("queuePriority"): Int(),
+    Opt("queueTimeout"): Float(),
 }
 
 _job_schema_dict = dict(_job_defaults_common)
@@ -1004,6 +1015,11 @@ _DAG_TASK_LAUNCH_KEYS = frozenset(
         "secrets",
         "stateAllowedScopes",
         "onSuccess",
+        "verify",
+        "pool",
+        "poolSlots",
+        "queuePriority",
+        "queueTimeout",
     }
 )
 _dag_task_launch_fields = {
@@ -1069,6 +1085,9 @@ CONFIG_SCHEMA = EmptyDict() | Map(
         Opt("defaults"): Map(_job_defaults_common),
         Opt("jobs"): Seq(Map(_job_schema_dict)),
         Opt("dags"): Seq(Map(_dag_schema_dict)),
+        Opt("pools"): MapPattern(
+            Str(), Map({"slots": Int(), Opt("maxQueued"): Int()})
+        ),
         Opt("web"): Map(
             {
                 "listen": Seq(Str()),
@@ -1677,6 +1696,11 @@ class JobConfig:
         # Memoized job digest, filled on demand by
         # cronstable.fingerprint.job_digest_cached (never by this class).
         "_digest",
+        "verify",
+        "pool",
+        "poolSlots",
+        "queuePriority",
+        "queueTimeout",
     )
 
     def __init__(
@@ -1751,6 +1775,30 @@ class JobConfig:
             )
 
         self.failsWhen = config.pop("failsWhen")
+        self.verify = config.pop("verify")
+        self.pool = config.pop("pool")
+        self.poolSlots = config.pop("poolSlots")
+        self.queuePriority = config.pop("queuePriority")
+        self.queueTimeout = config.pop("queueTimeout")
+        if self.poolSlots < 1:
+            raise ConfigError("poolSlots must be >= 1")
+        if not math.isfinite(self.queueTimeout) or self.queueTimeout <= 0:
+            raise ConfigError("queueTimeout must be finite and > 0")
+        if self.pool is None and (
+            self.poolSlots != 1
+            or self.queuePriority != 0
+            or self.queueTimeout != 3600.0
+        ):
+            raise ConfigError(
+                "poolSlots, queuePriority and queueTimeout need pool"
+            )
+        if self.verify is not None:
+            self.verify = {"timeout": 60.0, **self.verify}
+            if not self.verify["command"]:
+                raise ConfigError("verify.command must be non-empty")
+            timeout = self.verify["timeout"]
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ConfigError("verify.timeout must be finite and > 0")
         self.onFailure = config.pop("onFailure")
         self.onPermanentFailure = config.pop("onPermanentFailure")
         self.onSuccess = config.pop("onSuccess")
@@ -2332,6 +2380,20 @@ class DagTaskConfig:
                 "tasks)".format(dag_name, self.id)
             )
         job_dict = mergedicts(base, merged)
+        if self.type == "approval":
+            if (
+                raw_task.get("pool") is not None
+                or raw_task.get("verify") is not None
+            ):
+                raise ConfigError("approval gates cannot use pool or verify")
+            for key in (
+                "pool",
+                "poolSlots",
+                "queuePriority",
+                "queueTimeout",
+                "verify",
+            ):
+                job_dict[key] = DEFAULT_CONFIG[key]
         job_dict["name"] = "{}.{}".format(dag_name, self.id)
         # never auto-fires: task templates are not in the scheduler's job set,
         # so this placeholder schedule is only there to satisfy JobConfig.
@@ -4127,6 +4189,45 @@ def _validate_push_config(config: "CronstableConfig") -> None:
             )
 
 
+def _merge_pools(base, extra):
+    pools = dict(base)
+    for name, raw in extra.items():
+        if name in pools:
+            raise ConfigError("duplicate pool {!r}".format(name))
+        if not name or any(ord(c) < 32 or ord(c) == 127 for c in name):
+            raise ConfigError("pool names must be non-empty and printable")
+        conf = {"maxQueued": 1000, **raw}
+        if not 1 <= conf["slots"] <= 10000:
+            raise ConfigError("pool slots must be between 1 and 10000")
+        if not 1 <= conf["maxQueued"] <= 10000:
+            raise ConfigError("pool maxQueued must be between 1 and 10000")
+        pools[name] = conf
+    return pools
+
+
+def validate_pools(config: "CronstableConfig") -> None:
+    jobs = list(config.jobs)
+    for dag_config in config.dags:
+        jobs.extend(dag_config.task_templates.values())
+    if config.pools and config.state_config is None:
+        raise ConfigError("pools require durable state")
+    for job in jobs:
+        if job.pool is None:
+            continue
+        if job.pool not in config.pools:
+            raise ConfigError(
+                "job {!r}: unknown pool {!r}".format(job.name, job.pool)
+            )
+        if job.poolSlots > config.pools[job.pool]["slots"]:
+            raise ConfigError(
+                "job {!r}: poolSlots exceeds pool capacity".format(job.name)
+            )
+    for dag_config in config.dags:
+        for task in dag_config.tasks:
+            if task.type == "approval" and task.job_template.pool is not None:
+                raise ConfigError("approval gates cannot occupy a pool")
+
+
 @dataclass(slots=True)
 class CronstableConfig:
     jobs: list[JobConfig]
@@ -4143,6 +4244,7 @@ class CronstableConfig:
     mcp_config: Optional[MCPConfig] = None
     notify_config: Optional[dict[str, Any]] = None
     push_config: Optional[dict[str, Any]] = None
+    pools: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.dags:
@@ -4281,7 +4383,7 @@ def _interpolate_env_value(raw: str, path: str, location: str) -> str:
 
 
 # Map "kinds" whose ``command`` / ``shell`` keys are runtime-shell territory.
-_ENV_SHELL_MAP_KINDS = frozenset({"job", "task", "defaults"})
+_ENV_SHELL_MAP_KINDS = frozenset({"job", "task", "defaults", "verify"})
 # How a sequence's kind names the kind of each of its elements.
 _ENV_SEQ_ELEM_KIND = {
     "job-seq": "job",
@@ -4311,6 +4413,8 @@ def _env_child_kind(kind: str, key: str) -> str:
         return "other"
     if kind == "dag" and key == "tasks":
         return "task-seq"
+    if kind in ("job", "task", "defaults") and key == "verify":
+        return "verify"
     return "other"
 
 
@@ -4504,6 +4608,7 @@ def _config_from_doc(
         _build_notify_config(doc["notify"]) if "notify" in doc else None
     )
     pushconf = _build_push_config(doc["push"]) if "push" in doc else None
+    pools = _merge_pools({}, doc.get("pools", {}))
     for include in doc.get("include", ()):
         inc_path = os.path.join(os.path.dirname(path), include)
         # Included jobs arrive already fully constructed, so they carry only
@@ -4516,6 +4621,7 @@ def _config_from_doc(
         )
         jobs.extend(inc_config.jobs)
         dags.extend(inc_config.dags)
+        pools = _merge_pools(pools, inc_config.pools)
         if inc_config.web_config:
             if webconf:
                 raise ConfigError("multiple web configs")
@@ -4574,6 +4680,7 @@ def _config_from_doc(
         mcp_config=mcpconf,
         notify_config=notifyconf,
         push_config=pushconf,
+        pools=pools,
     )
 
 
@@ -4632,6 +4739,7 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
     where an included or config-dir sibling file is parsed standalone and
     the section a job depends on may legitimately live in another file.
     """
+    validate_pools(config)
     # The scheduler indexes jobs by name, so of two same-named jobs only the
     # later definition would ever run, silently. The usual source is the
     # same name in two config-dir/included files, or two crontab files
@@ -4948,6 +5056,7 @@ def _parse_config_dir(
     notify_config_source_fname: Optional[str] = None
     push_config: Optional[dict[str, Any]] = None
     push_config_source_fname: Optional[str] = None
+    pools: dict[str, dict[str, int]] = {}
     job_defaults: JobDefaults = JobDefaults({})
     # Sort by name so job order and the "first config found" error messages
     # are deterministic; os.scandir yields entries in arbitrary FS order.
@@ -4984,6 +5093,7 @@ def _parse_config_dir(
             _sources.update(file_sources)
         jobs.extend(config.jobs)
         dags.extend(config.dags)
+        pools = _merge_pools(pools, config.pools)
         web_config, web_config_source_fname = _claim_config_dir_section(
             "web",
             config.web_config,
@@ -5056,4 +5166,5 @@ def _parse_config_dir(
         mcp_config=mcp_config,
         notify_config=notify_config,
         push_config=push_config,
+        pools=pools,
     )

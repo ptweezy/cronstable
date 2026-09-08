@@ -22,6 +22,17 @@ minimal-dependency stance as the rest of cronstable), targets MCP revision
 
 ## Enabling it
 
+`cron_list_pools` inspects shared capacity and waiting work.
+`cron_cancel_queued` cancels a waiting entry using its `pool` and `id`.
+`cron_preview_recovery` previews selected tasks or failed dates;
+`cron_recover_dag` executes that preview with its `plan_token`. Cancellation
+and recovery execution require `confirm: true` and a writable MCP setup.
+Recovery also requires `allow_config_change: true` when the preview reports
+a configuration change. See [resource pools](Resource-Pools) and
+[workflow recovery](Workflow-Recovery) for behavior and limits.
+
+### Server configuration
+
 The server is **off by default**. Add an [`mcp`](Configuration-Reference#mcp)
 section (it uses the [`web`](HTTP-API) listeners, so a `web` section is
 required):

@@ -1427,6 +1427,10 @@ async def test_decide_gate_enforces_the_approve_scope():
 #: None; the guard below fails on an unclassified tool, so a new one cannot
 #: land without someone deciding which it is.
 _TOOL_REST_TWINS = {
+    "cron_list_pools": (("GET", "/pools"),),
+    "cron_cancel_queued": (("POST", "/pools/{name}/queue/{key}/cancel"),),
+    "cron_preview_recovery": (("POST", "/dags/{name}/runs/{run_key}/recover"), ("POST", "/dags/{name}/recover")),
+    "cron_recover_dag": (("POST", "/dags/{name}/runs/{run_key}/recover"), ("POST", "/dags/{name}/recover")),
     "cron_get_status": (("GET", "/status"),),
     "cron_list_jobs": (("GET", "/jobs"),),
     "cron_get_job": (("GET", "/jobs/{name}"),),

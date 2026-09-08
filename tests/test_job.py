@@ -4265,6 +4265,7 @@ def test_sla_breach_context_full_template_var_contract(monkeypatch):
     ctx = _breach_ctx(conf.jobs[0])
     tv = ctx.template_vars
     assert set(tv) == {
+        "verification",
         "name",
         "success",
         "fail_reason",

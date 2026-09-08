@@ -836,6 +836,10 @@ class StateBackend(abc.ABC):
 
     # --- advisory-lock TTL lease -----------------------------------------
 
+    async def blob_exists(self, digest: str, size: int) -> bool:
+        data = await self.get_blob(digest)
+        return data is not None and len(data) == size
+
     @abc.abstractmethod
     async def acquire_lease(
         self, name: str, holder: str, ttl: float
@@ -2775,6 +2779,15 @@ class FilesystemStateBackend(StateBackend):
 
     async def get_blob(self, digest: str) -> Optional[bytes]:
         return await self._call("blob-get", self._get_blob_sync, digest)
+
+    async def blob_exists(self, digest: str, size: int) -> bool:
+        def check():
+            try:
+                return os.stat(self._blob_path(digest)).st_size == size
+            except FileNotFoundError:
+                return False
+
+        return await self._call("blob-stat", check)
 
     def _get_blob_sync(self, digest: str) -> Optional[bytes]:
         try:
