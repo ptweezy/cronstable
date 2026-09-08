@@ -9,7 +9,7 @@
 #
 #     sh .github/scripts/build_msi.sh <arch> <version> <payload> <out> [bump-patch]
 #
-#     arch      amd64 | arm64 | i686 (the release asset spelling)
+#     arch      amd64 | amd64v3 | arm64 | i686 (the release asset spelling)
 #     version   full version; a setuptools_scm dev/local suffix is
 #               stripped here (ProductVersion must be numeric X.Y.Z)
 #     payload   the PyInstaller one-directory build (dist/cronstable)
@@ -58,7 +58,7 @@ fi
 # ProgramFiles6432Folder, and its RegistrySearch reads back through the same
 # view its RegistryValue wrote.
 case "$arch" in
-  amd64) wixarch=x64 ;;
+  amd64|amd64v3) wixarch=x64 ;;
   arm64) wixarch=arm64 ;;
   i686)  wixarch=x86 ;;
   *) echo "build_msi.sh: unknown arch '$arch'" >&2; exit 2 ;;

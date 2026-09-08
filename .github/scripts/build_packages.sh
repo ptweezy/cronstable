@@ -42,8 +42,11 @@ NFPM_VERSION=2.47.0
 NFPM_SHA256=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
 
 # arch | nfpm arch | expected Debian architecture | glibc floor
+# amd64v3 is a CPU variant, not a package-manager architecture. Keep its ABI
+# metadata identical to amd64; the asset name and description identify it.
 ROWS="
 amd64   amd64   amd64   2.17
+amd64v3 amd64   amd64   2.17
 arm64   arm64   arm64   2.17
 i686    386     i386    2.36
 armv7   arm7    armhf   2.31
@@ -64,6 +67,7 @@ riscv64 riscv64 riscv64 2.41
 # loongarch64 port since 3.21.
 APK_ROWS="
 amd64   x86_64
+amd64v3 x86_64
 arm64   aarch64
 i686    x86
 armv7   armv7
@@ -89,6 +93,14 @@ echo "${NFPM_SHA256}  ${tarball}" | sha256sum -c -
 tar -xzf "$tarball" -C "$work" nfpm
 NFPM="$work/nfpm"
 "$NFPM" --version
+
+cpu_note() {
+    PKG_CPU_NOTE=""
+    if [ "$1" = amd64v3 ]; then
+        PKG_CPU_NOTE="Requires an x86-64-v3 CPU (including AVX2); alternative to the baseline amd64 build."
+    fi
+    export PKG_CPU_NOTE
+}
 
 # Read the architecture back out of an .apk. There is no dpkg-deb equivalent, so
 # this reads .PKGINFO out of the control segment directly: an apk is
@@ -123,6 +135,7 @@ while read -r arch nfpm_arch deb_arch floor; do
     export PKG_ARCH="$nfpm_arch"
     export PKG_GLIBC="$floor"
     export PKG_BINARY="$binary"
+    cpu_note "$arch"
 
     deb="$BINARIES/cronstable-linux-$arch.deb"
     rpm="$BINARIES/cronstable-linux-$arch.rpm"
@@ -157,6 +170,7 @@ while read -r arch alpine_arch; do
     export PKG_VERSION="$VERSION"
     export PKG_ARCH="$alpine_arch"
     export PKG_BINARY="$binary"
+    cpu_note "$arch"
 
     apk="$BINARIES/cronstable-linux-$arch.apk"
     "$NFPM" package -f packaging/nfpm/apk.yaml -p apk -t "$apk"

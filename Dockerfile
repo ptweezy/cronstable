@@ -51,6 +51,12 @@ RUN set -eux; \
 # Only pyproject.toml and the shared extraction helper reach the dependency
 # layer: its cache key is the dependency metadata plus the small script that
 # reads it, never the rest of the tree.
+# Opt-in v3 runtime; baseline records the distro interpreter without a download.
+# This layer is independent of VERSION and is copied with the venv at runtime.
+ARG PYTHON_VARIANT=baseline
+COPY docker/python_runtime.py /tmp/deps/python_runtime.py
+RUN python /tmp/deps/python_runtime.py --variant "$PYTHON_VARIANT" --libc gnu --prefix /opt/python-runtime
+
 COPY pyproject.toml /tmp/deps/pyproject.toml
 COPY docker/extract_deps.py /tmp/deps/extract_deps.py
 # The cryptography wheels the release workflow's pq-wheels job built for the
@@ -76,11 +82,11 @@ COPY docker/wheelhouse/glibc/ /tmp/deps/pqwheels/
 # the KERNEL arch, not the userland bitness and libc that decide the wheel.
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
-    python -m venv /opt/venv; \
+    "$(cat /opt/python-runtime/python-path)" -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
     /opt/venv/bin/python /tmp/deps/extract_deps.py /tmp/deps/pyproject.toml /tmp/deps/pqwheels; \
     retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 --find-links /tmp/deps/pqwheels --only-binary cryptography -r /tmp/deps/requirements.txt; \
-    python -m venv /tmp/deps/buildenv; \
+    "$(cat /opt/python-runtime/python-path)" -m venv /tmp/deps/buildenv; \
     retry /tmp/deps/buildenv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/build-requires.txt
 
 # The push (PyNaCl + cryptography) and discovery (zeroconf) extras above
@@ -174,7 +180,10 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH"
 
+COPY --from=builder /opt/python-runtime /opt/python-runtime
 COPY --from=builder /opt/venv /opt/venv
+# Prove the final stage can load the selected interpreter and its libraries.
+RUN ["/opt/venv/bin/python", "-m", "cronstable", "--version"]
 
 # Run as an unprivileged, non-root user (65534 = "nobody"). Per-job user/group
 # switching is unavailable in this mode; dropping root gives a fully

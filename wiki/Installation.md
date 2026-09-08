@@ -16,7 +16,7 @@ Windows-specific details, see [running on Windows](Running-on-Windows).
 | --- | --- |
 | Python (pip/pipx) | `>= 3.10` (`requires-python = ">=3.10"`). Versions 3.10, 3.11, 3.12, 3.13, and 3.14 are supported and tested. For an older Python, use the standalone binary instead. |
 | Operating system | Linux, macOS, and Windows. `cronstable/platform.py` isolates OS-specific behavior. `grp` and `pwd` are imported only on POSIX. A few features differ on Windows; see [running on Windows](Running-on-Windows). |
-| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), for both the container image and the prebuilt binaries. The prebuilt binaries also cover `armv6` and `riscv64` and `loong64` (LoongArch) in both libcs, plus `mips64le` and `armel` (glibc). macOS: `amd64` and `arm64`. Windows: `amd64` (x64), `arm64` (ARM64) and `i686`. Also FreeBSD (`amd64`, `arm64`), OpenBSD, NetBSD and illumos (`amd64`). |
+| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), for both the container image and the prebuilt binaries. The prebuilt binaries also cover `armv6` and `riscv64` and `loong64` (LoongArch) in both libcs, plus `mips64le` and `armel` (glibc). macOS: `amd64` and `arm64`. Windows: `amd64` (x64), `arm64` (ARM64) and `i686`. Also FreeBSD (`amd64`, `arm64`), OpenBSD, NetBSD and illumos (`amd64`). Every amd64 release binary/package and Docker distro has an `amd64v3` counterpart, recommended for compatible CPUs; `amd64` is the compatibility build; see [CPU requirements](#amd64v3-cpu-requirements). |
 
 Python is required only for the `pip`/`pipx` installs. The container image
 bundles its own interpreter, and the standalone binaries embed Python, so
@@ -80,6 +80,11 @@ docker run --rm \
   -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
   ghcr.io/ptweezy/cronstable:latest
 ```
+
+For an x86-64-v3-capable host, **`latest-amd64v3` is recommended**; substitute
+it for `latest` in the command above. Existing tags keep their current platform
+coverage and CPU requirements. See [variant selection](#amd64v3-cpu-requirements)
+before choosing a v3 image, including inside a VM.
 
 The image runs as the non-root user `65534:65534`. Its entrypoint is
 `cronstable` with default arguments `-c /etc/cronstable.d`, so it reads
@@ -245,7 +250,7 @@ whichever architecture you are on. Upgrade later with `scoop update cronstable`.
 
 ## Install using a .deb or .rpm package
 
-Releases attach a Debian package and an RPM for `amd64`, `arm64`, `i686`,
+Releases attach a Debian package and an RPM for `amd64`, `amd64v3`, `arm64`, `i686`,
 `armv7`, `ppc64le`, `s390x` and `riscv64`. Each installs the same self-contained
 binary as `/usr/bin/cronstable`, plus a systemd unit and a starter
 configuration:
@@ -257,14 +262,18 @@ configuration:
 | `/etc/cronstable.d/cronstable.yaml` | Starter configuration, marked as a config file, so your edits survive an upgrade. |
 | `/var/lib/cronstable` | The durable store, created by systemd on first start. |
 
+The examples use **amd64v3, recommended for compatible CPUs**. Use `amd64`
+in the filenames for the **compatibility build**, or choose your other
+architecture. See [CPU requirements](#amd64v3-cpu-requirements).
+
 ```shell
 # Debian, Ubuntu and derivatives
-curl -fsSLO https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64.deb
-sudo apt install ./cronstable-linux-amd64.deb
+curl -fsSLO https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64v3.deb
+sudo apt install ./cronstable-linux-amd64v3.deb
 
 # RHEL, Alma, Rocky, Fedora, SLES and derivatives
-curl -fsSLO https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64.rpm
-sudo dnf install ./cronstable-linux-amd64.rpm
+curl -fsSLO https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64v3.rpm
+sudo dnf install ./cronstable-linux-amd64v3.rpm
 ```
 
 Installing creates the `cronstable` service account and leaves the service
@@ -297,9 +306,13 @@ installs the binary, an OpenRC service and a starter configuration:
 | `/etc/cronstable.d/cronstable.yaml` | Starter configuration. |
 | `/var/lib/cronstable` | The durable store, created by the service on first start. |
 
+The example uses **amd64v3, recommended for compatible CPUs**. Use `amd64`
+for the **compatibility build** if the CPU or VM lacks v3 or you are unsure.
+See [CPU requirements](#amd64v3-cpu-requirements).
+
 ```shell
-curl -fsSLO https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64.apk
-apk add --allow-untrusted ./cronstable-linux-amd64.apk
+curl -fsSLO https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64v3.apk
+apk add --allow-untrusted ./cronstable-linux-amd64v3.apk
 ```
 
 `--allow-untrusted` is required: these packages are not signed with a key in
@@ -326,7 +339,7 @@ built on the same musl base.
 
 ## Install using a FreeBSD package
 
-Releases attach a `.pkg` for amd64 and arm64, built by FreeBSD's own `pkg` in a
+Releases attach a `.pkg` for amd64, amd64v3 and arm64, built by FreeBSD's own `pkg` in a
 FreeBSD 14 virtual machine and installed there as part of the build:
 
 | Path | Contents |
@@ -336,9 +349,13 @@ FreeBSD 14 virtual machine and installed there as part of the build:
 | `/usr/local/etc/cronstable.d/cronstable.yaml` | Starter configuration, installed from a `.sample` so your edits survive an upgrade. |
 | `/var/db/cronstable` | The durable store, created by the `rc.d` script on first start. |
 
+The example uses **amd64v3, recommended for compatible CPUs**. Use `amd64`
+for the **compatibility build**, or `arm64` for an ARM host.
+See [CPU requirements](#amd64v3-cpu-requirements).
+
 ```shell
-fetch https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-freebsd-amd64.pkg
-pkg add cronstable-freebsd-amd64.pkg
+fetch https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-freebsd-amd64v3.pkg
+pkg add cronstable-freebsd-amd64v3.pkg
 ```
 
 `pkg add` of a local file needs no repository. Installing creates the
@@ -389,11 +406,15 @@ The flake covers Linux and macOS on x86_64 and aarch64.
 A self-contained binary can be downloaded from
 <https://github.com/ptweezy/cronstable/releases>. Python is not required on the
 target system: the executable embeds it. Every release attaches the following
-assets, each built for its own platform and architecture:
+assets, each built for its own platform and architecture. For x64,
+**amd64v3 is recommended for compatible CPUs**; **amd64 is the compatibility
+build** for CPUs or VMs without v3, or when you are unsure.
+See [CPU requirements](#amd64v3-cpu-requirements).
 
 | Asset | Platform | libc / arch | Notes |
 | --- | --- | --- | --- |
-| `cronstable-linux-amd64` | Linux | glibc, x86_64 | glibc 2.17 or newer: RHEL, Alma and Rocky 7 onward, Debian 8 onward, Ubuntu 14.04 onward, Amazon Linux 2 and 2023, SLES 12 onward. |
+| `cronstable-linux-amd64v3` | Linux | glibc, x86_64 / v3 | **Recommended for compatible CPUs.** Requires x86-64-v3; otherwise the same format and OS requirement as the amd64 row. |
+| `cronstable-linux-amd64` | Linux | glibc, x86_64 | **Compatibility build.** glibc 2.17 or newer: RHEL, Alma and Rocky 7 onward, Debian 8 onward, Ubuntu 14.04 onward, Amazon Linux 2 and 2023, SLES 12 onward. |
 | `cronstable-linux-arm64` | Linux | glibc, arm64 | glibc 2.17 or newer on arm64. |
 | `cronstable-linux-i686` | Linux | glibc, 32-bit x86 | 32-bit x86 (i686), glibc 2.36 or newer: Debian 12 i386 onward. |
 | `cronstable-linux-armv7` | Linux | glibc, 32-bit ARM | 32-bit ARM (armv7), glibc 2.31 or newer: Raspberry Pi OS bullseye, Debian 11, Ubuntu 20.04 onward. Raspberry Pi 2 and newer. |
@@ -404,7 +425,8 @@ assets, each built for its own platform and architecture:
 | `cronstable-linux-riscv64` | Linux | glibc, riscv64 | 64-bit RISC-V, glibc 2.41 or newer: Debian 13 onward. |
 | `cronstable-linux-loong64` | Linux | glibc, loongarch64 | LoongArch, glibc 2.41 or newer. New-world ABI only; the older Loongnix, Kylin and UOS fleets run a different, incompatible ABI. |
 | `cronstable-linux-mips64le` | Linux | glibc, mips64el | 64-bit little-endian MIPS, glibc 2.36 or newer, such as Loongson and Cavium Octeon hardware. |
-| `cronstable-linux-amd64-musl` | Linux | musl, x86_64 | For Alpine and other musl hosts. |
+| `cronstable-linux-amd64v3-musl` | Linux | musl, x86_64 / v3 | **Recommended for compatible CPUs.** Requires x86-64-v3; otherwise the same format and OS requirement as the amd64 row. |
+| `cronstable-linux-amd64-musl` | Linux | musl, x86_64 | **Compatibility build.** For Alpine and other musl hosts. |
 | `cronstable-linux-arm64-musl` | Linux | musl, arm64 | For Alpine and other musl hosts. |
 | `cronstable-linux-i686-musl` | Linux | musl, 32-bit x86 | 32-bit x86 (i686) for Alpine and other musl hosts. |
 | `cronstable-linux-armv7-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv7) for Alpine and other musl hosts. |
@@ -413,26 +435,79 @@ assets, each built for its own platform and architecture:
 | `cronstable-linux-riscv64-musl` | Linux | musl, riscv64 | 64-bit RISC-V for Alpine and other musl hosts. |
 | `cronstable-linux-armv6-musl` | Linux | musl, 32-bit ARM | ARMv6 hard-float for Alpine on that hardware. On Raspberry Pi OS use the glibc `armv6` build instead. |
 | `cronstable-linux-loong64-musl` | Linux | musl, loongarch64 | LoongArch for Alpine and other musl hosts. New-world ABI only. |
-| `cronstable-linux-<arch>.deb` | Linux | glibc | Debian package for `amd64`, `arm64`, `i686`, `armv7`, `ppc64le`, `s390x` and `riscv64`. Installs the binary, a systemd unit and `/etc/cronstable.d`. |
-| `cronstable-linux-<arch>.rpm` | Linux | glibc | RPM package for the same seven architectures, with the same contents. |
-| `cronstable-linux-<arch>.apk` | Linux | musl | Alpine package for `amd64`, `arm64`, `i686`, `armv7`, `armv6`, `ppc64le`, `s390x`, `riscv64` and `loong64`. Installs the binary, an OpenRC service and `/etc/cronstable.d`. |
+| `cronstable-linux-<arch>.deb` | Linux | glibc | Debian package for `amd64`, `amd64v3`, `arm64`, `i686`, `armv7`, `ppc64le`, `s390x` and `riscv64`. Installs the binary, a systemd unit and `/etc/cronstable.d`. |
+| `cronstable-linux-<arch>.rpm` | Linux | glibc | RPM package for the same eight variants, with the same contents. |
+| `cronstable-linux-<arch>.apk` | Linux | musl | Alpine package for `amd64`, `amd64v3`, `arm64`, `i686`, `armv7`, `armv6`, `ppc64le`, `s390x`, `riscv64` and `loong64`. Installs the binary, an OpenRC service and `/etc/cronstable.d`. |
 | `cronstable-macos-arm64` | macOS | Apple Silicon (arm64) | Developer ID signed and notarized. |
-| `cronstable-macos-amd64` | macOS | Intel (x86_64) | Developer ID signed and notarized. |
-| `cronstable-freebsd-amd64` | FreeBSD | x86_64 | For FreeBSD 14 and 15 hosts, including TrueNAS, pfSense and OPNsense. |
+| `cronstable-macos-amd64v3` | macOS | Intel (x86_64) / v3 | **Recommended for compatible CPUs.** Requires x86-64-v3; otherwise the same format and OS requirement as the amd64 row. |
+| `cronstable-macos-amd64` | macOS | Intel (x86_64) | **Compatibility build.** Developer ID signed and notarized. |
+| `cronstable-freebsd-amd64v3` | FreeBSD | x86_64 / v3 | **Recommended for compatible CPUs.** Requires x86-64-v3; otherwise the same format and OS requirement as the amd64 row. |
+| `cronstable-freebsd-amd64` | FreeBSD | x86_64 | **Compatibility build.** For FreeBSD 14 and 15 hosts, including TrueNAS, pfSense and OPNsense. |
 | `cronstable-freebsd-arm64` | FreeBSD | arm64 | For FreeBSD 14 and 15 hosts on arm64. |
-| `cronstable-freebsd-<arch>.pkg` | FreeBSD | amd64, arm64 | FreeBSD package. Installs the binary, an `rc.d` script and `/usr/local/etc/cronstable.d`. |
-| `cronstable-openbsd-amd64` | OpenBSD | x86_64 | For OpenBSD 7.9. OpenBSD gives no cross-release ABI guarantee, so this asset tracks one release. |
-| `cronstable-netbsd-amd64` | NetBSD | x86_64 | For NetBSD 11.0. |
-| `cronstable-illumos-amd64` | illumos | x86_64 | Built on OmniOS r151054 LTS; the illumos ABI is shared, so it also runs on OpenIndiana and in SmartOS zones. |
-| `cronstable-windows-amd64.exe` | Windows | x64 (amd64) | Self-contained `.exe`. The target needs no Python. |
+| `cronstable-freebsd-<arch>.pkg` | FreeBSD | amd64, amd64v3, arm64 | FreeBSD package. Installs the binary, an `rc.d` script and `/usr/local/etc/cronstable.d`. |
+| `cronstable-openbsd-amd64v3` | OpenBSD | x86_64 / v3 | **Recommended for compatible CPUs.** Requires x86-64-v3; otherwise the same format and OS requirement as the amd64 row. |
+| `cronstable-openbsd-amd64` | OpenBSD | x86_64 | **Compatibility build.** For OpenBSD 7.9. OpenBSD gives no cross-release ABI guarantee, so this asset tracks one release. |
+| `cronstable-netbsd-amd64v3` | NetBSD | x86_64 / v3 | **Recommended for compatible CPUs.** Requires x86-64-v3; otherwise the same format and OS requirement as the amd64 row. |
+| `cronstable-netbsd-amd64` | NetBSD | x86_64 | **Compatibility build.** For NetBSD 11.0. |
+| `cronstable-illumos-amd64v3` | illumos | x86_64 / v3 | **Recommended for compatible CPUs.** Requires x86-64-v3; otherwise the same format and OS requirement as the amd64 row. |
+| `cronstable-illumos-amd64` | illumos | x86_64 | **Compatibility build.** Built on OmniOS r151054 LTS; the illumos ABI is shared, so it also runs on OpenIndiana and in SmartOS zones. |
+| `cronstable-windows-amd64v3.exe` | Windows | x64 (amd64) / v3 | **Recommended for compatible CPUs.** Requires x86-64-v3; otherwise the same format and OS requirement as the amd64 row. |
+| `cronstable-windows-amd64.exe` | Windows | x64 (amd64) | **Compatibility build.** Self-contained `.exe`. The target needs no Python. |
 | `cronstable-windows-arm64.exe` | Windows | ARM64 | Self-contained `.exe`. The target needs no Python. |
 | `cronstable-windows-i686.exe` | Windows | 32-bit x86 | Self-contained `.exe` for 32-bit Windows. |
-| `cronstable-windows-amd64.zip` | Windows | x64 (amd64) | One-directory build: a `cronstable\` folder with `cronstable.exe` and `_internal\`. Runs in place and can host the [Windows service](Windows-Service). |
+| `cronstable-windows-amd64v3.zip` | Windows | x64 (amd64) / v3 | **Recommended for compatible CPUs.** Requires x86-64-v3; otherwise the same format and OS requirement as the amd64 row. |
+| `cronstable-windows-amd64.zip` | Windows | x64 (amd64) | **Compatibility build.** One-directory build: a `cronstable\` folder with `cronstable.exe` and `_internal\`. Runs in place and can host the [Windows service](Windows-Service). |
 | `cronstable-windows-arm64.zip` | Windows | ARM64 | One-directory build. Runs in place and can host the [Windows service](Windows-Service). |
 | `cronstable-windows-i686.zip` | Windows | 32-bit x86 | One-directory build. Runs in place and can host the [Windows service](Windows-Service). |
-| `cronstable-windows-amd64.msi` | Windows | x64 (amd64) | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
+| `cronstable-windows-amd64v3.msi` | Windows | x64 (amd64) / v3 | **Recommended for compatible CPUs.** Requires x86-64-v3; otherwise the same format and OS requirement as the amd64 row. |
+| `cronstable-windows-amd64.msi` | Windows | x64 (amd64) | **Compatibility build.** Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
 | `cronstable-windows-arm64.msi` | Windows | ARM64 | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
 | `cronstable-windows-i686.msi` | Windows | 32-bit x86 | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
+
+### amd64v3 CPU requirements
+
+| x64 download | When to choose it |
+| --- | --- |
+| **`amd64v3` — Recommended for compatible CPUs** | The CPU and guest OS expose the full x86-64-v3 feature set. |
+| **`amd64` — Compatibility build** | The CPU or VM lacks v3, or its capabilities are uncertain. |
+
+`amd64v3` means the **x86-64-v3 microarchitecture level**, not a different
+operating-system ABI. It requires the complete v3 feature set, including AVX,
+AVX2, BMI1/BMI2, F16C, FMA, LZCNT and MOVBE, with OS support for AVX register
+state. Typical compatible CPUs include Intel Haswell and newer Core/Xeon
+models and AMD Excavator/Zen, but model age or AVX2 alone is not a complete
+compatibility check. Virtual machines must expose those features to the guest.
+The [upstream runtime documentation](https://github.com/astral-sh/python-build-standalone/blob/main/docs/running.rst)
+explains the CPU levels. An incompatible CPU can terminate the binary with an
+illegal-instruction error; choose baseline `amd64` when unsure.
+
+To select the recommended build on a compatible CPU, replace `amd64` with
+`amd64v3` in the asset name, keeping its suffix. Examples are
+`cronstable-linux-amd64v3`, `cronstable-linux-amd64v3-musl`,
+`cronstable-linux-amd64v3.deb`, `cronstable-freebsd-amd64v3.pkg` and
+`cronstable-windows-amd64v3.msi`. The `.rpm`, `.apk`, Windows `.exe`/`.zip`,
+and macOS, OpenBSD, NetBSD and illumos binaries follow the same rule.
+The macOS source build targets macOS 15 and newer.
+
+The Linux packages still declare `amd64`/`x86_64`, FreeBSD retains its native
+ABI and the Windows MSI remains x64. Package managers do not enforce the CPU
+requirement. These are alternative builds of the same `cronstable` package,
+with the same install paths and services; choose one variant per installation.
+Homebrew, Scoop and winget keep their baseline downloads.
+
+The optimized component is the embedded CPython runtime. Linux uses pinned
+python-build-standalone v3 builds; the other operating systems compile CPython
+with a v3 target (MSVC AVX2 on Windows). Compatible dependency wheels retain
+their upstream build settings. This is not a promise that every bundled library
+is rebuilt for v3 or that every workload becomes faster.
+
+For compatible hosts, the recommended Docker tags are `latest-amd64v3` (Debian),
+`latest-debian-amd64v3`, and `latest-<distro>-amd64v3` for the other distros.
+Replace `latest` with the release version to pin one. They use the normal
+`linux/amd64` container platform and require a compatible host CPU. The bare
+`latest` and existing distro tags keep their current platform coverage.
+To build locally, add `--platform linux/amd64 --build-arg PYTHON_VARIANT=amd64v3`
+to the selected Dockerfile's build command.
 
 ### Which libc version each build needs
 
@@ -441,7 +516,7 @@ whether it starts is the oldest glibc or musl it accepts. Each build declares
 that number, and CI re-derives it from the frozen bytes on every release, so the
 table above is measured rather than estimated.
 
-`amd64`, `arm64`, and `s390x` need glibc 2.17, which reaches every glibc
+`amd64`, `amd64v3`, `arm64`, and `s390x` need glibc 2.17, which reaches every glibc
 distribution still in production, including the RHEL family from 7 onward
 and Amazon Linux 2. They are built inside manylinux2014 containers against a
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
@@ -540,24 +615,28 @@ without `orjson` and without the push extra.
 The Windows binaries are self-contained `.exe` files for x64 (`amd64`),
 ARM64, and 32-bit x86 (`i686`). Like the other binaries they embed Python,
 so Python is not required on the target. Use `i686` only on a 32-bit
-Windows install; on 64-bit Windows, choose `amd64` or `arm64`.
+Windows install. On x64, choose `amd64v3` for compatible CPUs or `amd64`
+for compatibility; on ARM64, choose `arm64`.
 
-Download and run (glibc amd64 Linux shown; append `-musl` on Alpine, or use
-`cronstable-macos-<arch>` on a Mac or `cronstable-freebsd-<arch>` on FreeBSD):
+Download and run (recommended amd64v3 build for a compatible Linux CPU,
+glibc shown). Use `amd64` for the compatibility build if v3 support is absent
+or uncertain. Append `-musl` on Alpine, or use `cronstable-macos-<arch>` on a
+Mac or `cronstable-freebsd-<arch>` on FreeBSD:
 
 ```shell
 curl -fsSL -o cronstable \
-  https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64
+  https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64v3
 chmod +x cronstable
 ./cronstable --version
 ```
 
-On Windows, download `cronstable-windows-amd64.exe` (or
+On Windows, download `cronstable-windows-amd64v3.exe` for a compatible x64
+CPU, `cronstable-windows-amd64.exe` for compatibility,
 `cronstable-windows-arm64.exe` on ARM64, or `cronstable-windows-i686.exe` on
-32-bit Windows) and run it directly; no `chmod` is needed:
+32-bit Windows. Run it directly; no `chmod` is needed:
 
 ```powershell
-.\cronstable-windows-amd64.exe --version
+.\cronstable-windows-amd64v3.exe --version
 ```
 
 The Windows binaries carry a version resource and are Authenticode-signed
@@ -566,12 +645,14 @@ the first run of a browser-downloaded copy can still be blocked by SmartScreen.
 Choose **More info**, then **Run anyway**. If your policy calls for it,
 verify the download against the release's `SHA256SUMS`.
 
-The WinGet release workflow submits MSIs with a one-directory payload. See the
+The WinGet release workflow submits MSIs with a one-directory payload, using
+the compatibility build on x64. See the
 [WinGet installation instructions](#install-using-winget) for package availability
 and steps to switch from a portable install. For Windows deployment details,
 see [running on Windows](Running-on-Windows).
 
-Windows releases also attach `cronstable-windows-amd64.zip`,
+Windows releases also attach `cronstable-windows-amd64v3.zip` (recommended
+for compatible CPUs), `cronstable-windows-amd64.zip` (compatibility build),
 `cronstable-windows-arm64.zip` and `cronstable-windows-i686.zip`,
 one-directory builds of the same program.
 Each extracts to a single `cronstable\` folder and is the download that can
@@ -583,8 +664,8 @@ files do not each carry it. Writing into `C:\Program Files` needs an elevated
 PowerShell, so use one:
 
 ```powershell
-Unblock-File .\cronstable-windows-amd64.zip
-Expand-Archive .\cronstable-windows-amd64.zip -DestinationPath 'C:\Program Files'
+Unblock-File .\cronstable-windows-amd64v3.zip
+Expand-Archive .\cronstable-windows-amd64v3.zip -DestinationPath 'C:\Program Files'
 & 'C:\Program Files\cronstable\cronstable.exe' --version
 ```
 

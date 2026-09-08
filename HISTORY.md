@@ -1,5 +1,25 @@
 # History
 
+## 1.2.51
+
+- Release downloads add `amd64v3` builds for CPUs with the full x86-64-v3
+  feature set, including AVX2. Every existing amd64 binary and package
+  format has a counterpart: Linux glibc and musl binaries, `.deb`, `.rpm`
+  and `.apk` packages, macOS binaries, FreeBSD binaries and `.pkg` packages,
+  OpenBSD, NetBSD and illumos binaries, and Windows `.exe`, `.zip` and
+  `.msi` downloads. All eight Docker distros add explicit `-amd64v3` tags,
+  such as `latest-amd64v3` and `latest-alpine-amd64v3`, with versioned tags
+  too. These builds optimize the embedded CPython runtime: Linux uses
+  digest-pinned python-build-standalone v3 runtimes, and the other systems
+  compile CPython from source. Dependency wheels keep their upstream
+  build settings. The download guides recommend `amd64v3` for compatible
+  CPUs and call `amd64` the compatibility build for other or uncertain
+  hosts. Existing asset URLs, Docker tag defaults, and Homebrew, Scoop
+  and WinGet downloads keep their current CPU requirements. The packages
+  retain the same native architecture metadata, install paths and services;
+  package managers do not check v3 support, so choose one variant per
+  installation.
+
 ## 1.2.50
 
 - Push alerts are sealed with post-quantum encryption wherever the daemon
