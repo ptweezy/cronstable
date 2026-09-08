@@ -14,6 +14,7 @@ from strictyaml.ruamel import YAML
 PACKAGE = "ptweezy.cronstable"
 REPO = "https://github.com/ptweezy/cronstable"
 ARCHES = {"amd64": "x64", "arm64": "arm64"}
+MANIFEST_VERSION = "1.12.0"
 
 
 def render(version, metadata, output):
@@ -99,7 +100,14 @@ def render(version, metadata, output):
         with (output / filename).open(
             "w", encoding="utf-8", newline="\n"
         ) as f:
-            yaml.dump({**common, **body, "ManifestVersion": "1.12.0"}, f)
+            f.write(
+                "# yaml-language-server: $schema="
+                "https://aka.ms/winget-manifest."
+                f"{body['ManifestType']}.{MANIFEST_VERSION}.schema.json\n"
+            )
+            yaml.dump(
+                {**common, **body, "ManifestVersion": MANIFEST_VERSION}, f
+            )
 
 
 if __name__ == "__main__":

@@ -45,6 +45,27 @@ def read_manifests(tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    "filename,manifest_type",
+    [
+        ("ptweezy.cronstable.installer.yaml", "installer"),
+        ("ptweezy.cronstable.locale.en-US.yaml", "defaultLocale"),
+        ("ptweezy.cronstable.yaml", "version"),
+    ],
+)
+def test_schema_header_matches_manifest(
+    metadata, tmp_path, filename, manifest_type
+):
+    renderer.render("1.2.50", metadata, tmp_path)
+    content = (tmp_path / filename).read_text("utf-8")
+    manifest = YAML(typ="safe").load(content)
+    assert manifest["ManifestType"] == manifest_type
+    assert content.splitlines()[0] == (
+        "# yaml-language-server: $schema=https://aka.ms/winget-manifest."
+        f"{manifest_type}.{manifest['ManifestVersion']}.schema.json"
+    )
+
+
 def test_published_msi_metadata_and_identity(metadata, tmp_path):
     renderer.render("1.2.50", metadata, tmp_path)
     manifests = read_manifests(tmp_path)
