@@ -4578,27 +4578,16 @@ jobs:
           git commit -m "cronstable ${VERSION}"
           git push
 
-  # Update the winget manifest (ptweezy.cronstable) in microsoft/winget-pkgs so
-  # `winget install ptweezy.cronstable` / `winget upgrade` track releases with no
-  # manual step. Unlike the Homebrew formula, there is no template to render here:
-  # wingetcreate fetches the previous manifest from winget-pkgs itself, bumps the
-  # version, and re-detects each installer's architecture straight from the PE
-  # header of the downloaded .exe (not from the filename), then opens a PR.
-  # windows-latest is required -- wingetcreate.exe is a native Windows tool.
+  # Submit the ptweezy.cronstable manifest to microsoft/winget-pkgs for each
+  # release. wingetcreate fetches the published manifest, updates the version,
+  # and detects each installer's architecture from its PE header. The tool
+  # requires Windows.
   #
-  # Cross-repo PRs need a token the default GITHUB_TOKEN can't provide: set a repo
-  # secret WINGET_TOKEN to a PAT (classic, public_repo scope is enough) that can
-  # fork microsoft/winget-pkgs and open a PR under that account. An unset token
-  # fails loudly rather than silently leaving the manifest stale (see the
-  # homebrew job above for why silent-skip is the wrong default here).
+  # WINGET_TOKEN is a classic PAT with public_repo scope. Its account creates
+  # the fork and PRs. After submission succeeds, cleanup closes that account's
+  # PRs for older versions that have no approval.
   #
-  # Failures here are FATAL, deliberately. This job spent its bootstrap phase
-  # warning-only (the initial ptweezy.cronstable submission had to merge into
-  # microsoft/winget-pkgs before `wingetcreate update` could work at all); the
-  # published manifests then sat two releases stale while every run stayed
-  # green, exactly the failure mode the homebrew tap already demonstrated. The
-  # three suppressions (job-level continue-on-error, the missing-token exit 0,
-  # the wrapped update) are gone; do not restore any of them.
+  # A missing token, failed submission, or cleanup error fails the job.
   winget:
     needs: [version, release]
     if: needs.version.outputs.release == 'true'
@@ -4626,6 +4615,66 @@ jobs:
               "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/cronstable-windows-arm64.exe" \
             --submit --no-open --token "$WINGET_TOKEN" \
             --prtitle "New version: ptweezy.cronstable version ${VERSION}"
+
+      - name: Close superseded unapproved winget PRs
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          VERSION: ${{ needs.version.outputs.new }}
+        shell: python {0}
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+
+          def api(endpoint, *args):
+              result = subprocess.run(
+                  ["gh", "api", "--hostname", "github.com", endpoint, *args],
+                  check=True, stdout=subprocess.PIPE, text=True, encoding="utf-8",
+              )
+              return json.loads(result.stdout)
+
+          version = os.environ["VERSION"]
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+              raise ValueError(f"Invalid release version: {version!r}")
+          current = tuple(map(int, version.split(".")))
+          author = api("user")
+          repo = "repos/microsoft/winget-pkgs"
+          title = re.compile(
+              r"New version: ptweezy\.cronstable version ([0-9]+\.[0-9]+\.[0-9]+)"
+          )
+
+          def older_submission(pr):
+              match = title.fullmatch(pr["title"])
+              return (
+                  pr["state"] == "open"
+                  and pr["user"]["id"] == author["id"]
+                  and match is not None
+                  and tuple(map(int, match[1].split("."))) < current
+              )
+
+          # Fetch all candidates before closing any PRs so pagination stays stable.
+          pages = api(
+              f"{repo}/issues", "--method", "GET",
+              "-f", f"creator={author['login']}", "-f", "state=open",
+              "-f", "per_page=100", "--paginate", "--slurp",
+          )
+          for issue in (issue for page in pages for issue in page):
+              if "pull_request" not in issue or not older_submission(issue):
+                  continue
+              endpoint = f"{repo}/pulls/{issue['number']}"
+              pr = api(endpoint)
+              if pr["merged"] or not older_submission(pr):
+                  continue
+              reviews = api(
+                  f"{endpoint}/reviews?per_page=100", "--paginate", "--slurp",
+              )
+              # Preserve any approval, including one on an earlier commit.
+              if any(r["state"] == "APPROVED" for page in reviews for r in page):
+                  print(f"Keeping approved PR #{pr['number']}.")
+                  continue
+              api(endpoint, "--method", "PATCH", "-f", "state=closed")
+              print(f"Closed PR #{pr['number']}: superseded by {version}.")
 
   # ---------------------------------------------------------------------------
   # Docs. Runs on an ordinary commit and is NOT gated on the build+test matrix:
