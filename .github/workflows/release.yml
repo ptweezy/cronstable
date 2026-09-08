@@ -2680,7 +2680,10 @@ jobs:
           copyback: true
           envs: 'SETUPTOOLS_SCM_PRETEND_VERSION'
           prepare: |
-            pkg install runtime/python-313 developer/build-essential library/security/openssl-3
+            # CPython's source build needs pkg-config to find ncurses headers
+            # under /usr/include/ncurses and the matching 64-bit libraries.
+            # Its fallback finds the library but misses term.h (setupterm).
+            pkg install runtime/python-313 developer/build-essential developer/pkg-config library/security/openssl-3
             # libsodium (the push extra) and rust (its post-quantum half)
             # live in the OmniOS `extra` publisher rather than core. Neither
             # can fail the job, like every extra on this lane: a publisher
