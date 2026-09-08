@@ -19,6 +19,7 @@ import asyncio
 import datetime
 import json
 import math
+import sys
 import time
 from typing import Any, Optional
 
@@ -2511,6 +2512,19 @@ def test_rewrite_sgr_intensity_and_default_codes():
     out2 = rewrite_sgr("\x1b[91mbright\x1b[39mdefault", theme)
     assert strip_ansi(out2) == "brightdefault"
     assert theme.fg("fg") in out2  # code 39 -> the theme default ink
+
+
+def test_rewrite_sgr_ignores_oversized_parameters():
+    theme = Theme("carolina", light=False)
+    limit = getattr(sys, "get_int_max_str_digits", lambda: 4300)()
+    oversized = "9" * (max(limit, 4300) + 1)
+    for params, expected in (
+        (oversized, "hello"),
+        ("1;" + oversized + ";31", "\x1b[1m" + theme.fg("fail") + "hello"),
+    ):
+        line = sanitize_log_line("\x1b[" + params + "mhello")
+        assert rewrite_sgr(line, theme) == expected
+        assert rewrite_sgr(line, theme) == expected
 
 
 def test_rewrite_sgr_memo_is_per_theme_and_bounded(monkeypatch):
