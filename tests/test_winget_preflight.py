@@ -19,16 +19,41 @@ $ErrorActionPreference = 'Stop'
 $global:ErrorView = 'NormalView'
 $global:case = $Case
 $global:scans = 0
+$global:updates = 0
+$global:delays = @()
 $env:ProgramData = '/mock'
 function Get-MpComputerStatus {
+    if ($global:case -eq 'readiness-rpc' -and $global:updates -eq 1) {
+        throw 'The remote procedure call failed.'
+    }
     @{ AMServiceEnabled = ($global:case -ne 'disabled')
        AntivirusEnabled = $true }
 }
 function Update-MpSignature {
-    if ($global:case -eq 'update') { throw 'signature update failed' }
+    throw 'Unexpected PowerShell update cmdlet call'
+}
+function Start-Sleep {
+    param($Seconds)
+    $global:delays += $Seconds
 }
 function Invoke-FakeScan {
+    if ('-SignatureUpdate' -in $args) {
+        $global:updates++
+        Write-Host "UPDATE $global:updates"
+        if ('-MMPC' -notin $args) { throw 'expected direct update source' }
+        $global:LASTEXITCODE = 0
+        if ($global:case -eq 'update' -or
+            ($global:case -eq 'update-retry' -and $global:updates -lt 3)) {
+            $global:LASTEXITCODE = 1726
+        }
+        if ($global:case -eq 'update-rpc' -and $global:updates -eq 1) {
+            throw 'The remote procedure call failed.'
+        }
+        return
+    }
+    if ($global:updates -eq 0) { throw 'scan before signature update' }
     $global:scans++
+    Write-Host "SCAN $global:scans"
     if ('-DisableRemediation' -notin $args) { throw 'remediation enabled' }
     if ('-ScanType' -notin $args -or 3 -notin $args) {
         throw 'not custom scan'
@@ -125,8 +150,12 @@ function Invoke-FakeWix {
     Set-Content $authoring "<Wix>$file</Wix>"
     $global:LASTEXITCODE = $(if ($global:case -eq 'extract') { 1 } else { 0 })
 }
-& $Script -AssetDirectory $Assets -OutputDirectory $Output `
-    -WixCommand Invoke-FakeWix
+try {
+    & $Script -AssetDirectory $Assets -OutputDirectory $Output `
+        -WixCommand Invoke-FakeWix
+} finally {
+    Write-Host "DELAYS $($global:delays -join ',')"
+}
 if ($global:scans -ne 4) { throw 'must scan both MSIs and both payloads' }
 """
 
@@ -135,6 +164,9 @@ if ($global:scans -ne 4) { throw 'must scan both MSIs and both payloads' }
     "case,success",
     [
         ("clean", True),
+        ("update-retry", True),
+        ("update-rpc", True),
+        ("readiness-rpc", True),
         ("disabled", False),
         ("update", False),
         ("hash", False),
@@ -184,7 +216,7 @@ def test_preflight(tmp_path, case, success):
     if not success:
         expected = {
             "disabled": "Microsoft Defender is unavailable",
-            "update": "signature update failed",
+            "update": "signature update failed after 3 attempts",
             "hash": "SHA256SUMS mismatch",
             "unsigned": "Authenticode signature",
             "untimestamped": "Authenticode signature",
@@ -196,6 +228,16 @@ def test_preflight(tmp_path, case, success):
             "missing-payload": "expected one payload executable",
         }
         assert expected[case] in result.stdout + result.stderr
+    if case in {"update", "update-retry"}:
+        assert result.stdout.count("UPDATE ") == 3
+        assert "DELAYS 5,10" in result.stdout
+    elif case in {"update-rpc", "readiness-rpc"}:
+        assert result.stdout.count("UPDATE ") == 2
+        assert "DELAYS 5" in result.stdout
+    if case == "update":
+        assert "SCAN " not in result.stdout
+    if case in {"detected", "scan-error"}:
+        assert result.stdout.count("SCAN ") == 1
     if success:
         data = json.loads((output / "metadata.json").read_text("utf-8-sig"))
         assert data["amd64"]["Architecture"] == "x64"

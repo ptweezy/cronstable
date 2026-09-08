@@ -46,6 +46,7 @@ import platform
 import re
 import struct
 import sys
+
 import tomllib
 
 EXTRAS = ("push", "discovery")
@@ -224,6 +225,21 @@ def main(pyproject_path, wheelhouse=None):
     target = detect_target()
     resolved = []
     for line in requirements:
+        if requirement_name(line) == "zeroconf" and os.environ.get(
+            "ZEROCONF_VERSION"
+        ):
+            # CI resolves the source offer once, before any image or binary.
+            # Keep local Docker builds on pyproject's normal fresh resolution.
+            try:
+                from packaging.requirements import Requirement
+            except ImportError:
+                from pip._vendor.packaging.requirements import Requirement
+            version = os.environ["ZEROCONF_VERSION"]
+            if version not in Requirement(line).specifier:
+                raise ValueError(
+                    "Resolved zeroconf does not satisfy pyproject"
+                )
+            line = "zeroconf==" + version
         if requirement_name(line) == "cryptography":
             if target is not None and not marker_can_hold_on_linux(line):
                 continue  # another OS's line; no image is built for it

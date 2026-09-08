@@ -1,0 +1,189 @@
+name: Build optional cryptography wheels
+on:
+  workflow_call:
+    inputs:
+      matrix: {type: string, required: true}
+      version: {type: string, required: true}
+      release: {type: boolean, required: true}
+      cryptography: {type: string, required: true}
+      crypto-sha: {type: string, required: true}
+permissions:
+  contents: read
+env:
+  PIP_RETRIES: '5'
+  PIP_TIMEOUT: '60'
+jobs:
+  wheel:
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.matrix) }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Download resolved cryptography source
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: release-inputs
+          path: release-inputs
+      - name: Restore the OpenSSL build (manylinux rows)
+        if: ${{ matrix.manylinux }}
+        id: openssl-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .openssl-${{ matrix.arch }}
+          key: openssl-pqwheel-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
+        continue-on-error: true
+      - if: ${{ matrix.qemu }}
+        uses: docker/setup-qemu-action@v4.3.0
+      - name: Pull the build image
+        run: |
+          set -euo pipefail
+          . .github/scripts/retry.sh
+          retry 5 docker pull --platform ${{ matrix.platform }} ${{ matrix.image }}
+          echo "digest=$(docker image inspect --format '{{.Id}}' '${{ matrix.image }}')" >> "$GITHUB_OUTPUT"
+        id: image
+      - name: Restore compiler work
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .pq-cache
+          key: pq-work-${{ matrix.libc }}-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ inputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/build-pq-wheels.yml') }}
+        continue-on-error: true
+      - name: Build the cryptography wheel (${{ matrix.libc }} ${{ matrix.arch }})
+        env:
+          # Per-libc toolchain, spliced in as env so the single-quoted script
+          # below stays free of quote characters. It runs under `sh -c`, a
+          # fresh shell that inherits no function, so every string sources
+          # retry.sh for itself, as RUST_SETUP_CMD does. The manylinux row
+          # has no usable distro OpenSSL or Rust and takes the from-source
+          # route; it installs the perl modules the image leaves out:
+          # IPC::Cmd for the OpenSSL Configure script, Time::Piece for the
+          # Makefile it writes, and bigint for the s390x assembler
+          # generators.
+          PQ_TOOLS: ${{ matrix.libc == 'musl' && '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && '. /src/.github/scripts/retry.sh && retry 5 yum install -y perl-IPC-Cmd perl-Time-Piece perl-bignum' || '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev zlib1g-dev libzstd-dev pkg-config' }}
+          RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/src/.pq-cache/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+          # The probe below installs the project, whose version comes from
+          # this rather than from git: the python images carry no git (the
+          # manylinux image does, and the safe.directory line below lets
+          # its file finder read the bind mount).
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -e PIP_RETRIES -e PIP_TIMEOUT -e PQ_TOOLS -e RUST_SETUP_CMD \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -v "$PWD:/src" -w /src \
+            ${{ matrix.image }} sh -euc '
+              . /src/.github/scripts/retry.sh
+              sh -c "$PQ_TOOLS"
+              if [ -n "${{ matrix.manylinux }}" ]; then
+                # The build interpreter sets the floor of the abi3 tag (a
+                # cp311-abi3 wheel loads on 3.11 and newer), so the row
+                # builds with the oldest interpreter any consumer image
+                # runs: the rhel image has 3.12 and opensuse 3.13.
+                # manylinux ships every CPython at /opt/python, and 3.11 is
+                # also the floor the PyPI wheels carry. extract_deps.py
+                # drops a wheel whose floor sits above the image
+                # interpreter rather than letting pip fail the image build.
+                PY=/opt/python/cp311-cp311/bin/python
+                # The checkout belongs to the runner user and this container
+                # runs as root, so git reports the bind mount as dubiously
+                # owned, and the project install below (setuptools_scm runs
+                # git for its file finder) fails on that refusal. The python
+                # images carry no git and never see this.
+                git config --global --add safe.directory /src
+                sh -c "$RUST_SETUP_CMD"
+                sh pyinstaller/build_openssl.sh /src/.openssl-${{ matrix.arch }}
+                PATH=/src/.pq-cache/cargo/bin:$PATH
+                CARGO_HOME=/src/.pq-cache/cargo
+                RUSTUP_HOME=/opt/rustup
+                OPENSSL_DIR=/src/.openssl-${{ matrix.arch }}
+                export PATH CARGO_HOME RUSTUP_HOME OPENSSL_DIR
+              elif [ "${{ matrix.libc }}" = musl ]; then
+                PY=python
+                # openssl-libs-static puts the archives under /usr/lib.
+                OPENSSL_DIR=/usr
+                export OPENSSL_DIR
+              else
+                PY=python
+                # Debian keeps them in the multiarch library directory, and
+                # builds libcrypto with zlib and zstd compression, so its
+                # archive needs both at link time. openssl-sys names
+                # neither, so RUSTFLAGS adds them as shared libraries (the
+                # two -dev packages in PQ_TOOLS supply the link names).
+                # Every consumer of these wheels is a Debian-family image,
+                # where dpkg and Python already need both.
+                OPENSSL_LIB_DIR=/usr/lib/$(gcc -print-multiarch)
+                OPENSSL_INCLUDE_DIR=/usr/include
+                RUSTFLAGS="-C link-arg=-lz -C link-arg=-lzstd"
+                export OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR RUSTFLAGS
+              fi
+              # Static on every row, with the archive paths given outright:
+              # when pkg-config finds OpenSSL, openssl-sys never links an
+              # archive under /usr (the pkg-config crate treats a system
+              # root as dynamic-only), so OPENSSL_STATIC alone yields a
+              # wheel that loads only beside the libssl.so.3 it was built
+              # next to. These wheels go into every image build, so they
+              # carry their own.
+              export OPENSSL_STATIC=1
+              toolchain=$($PY .github/scripts/compiler_fingerprint.py)
+              export CARGO_TARGET_DIR="/src/.pq-cache/target/$toolchain"
+              export CARGO_HOME=/src/.pq-cache/cargo
+              $PY -m pip install --upgrade pip
+              rm -rf /src/wheelhouse
+              # The preflight resolves this source from pyproject and checks its hash.
+              $PY -m pip wheel --no-deps --wheel-dir /src/wheelhouse /src/release-inputs/cryptography-${{ inputs.cryptography }}.tar.gz
+              # Prove the wheel seals X-Wing through the daemon itself, the
+              # same probe the binary lanes run, before it is handed to an
+              # image build.
+              $PY -m pip install /src/wheelhouse/cryptography-*.whl
+              $PY -m pip install .
+              $PY pyinstaller/verify_extra.py cryptography
+              # And prove the link: an extension that still names libssl or
+              # libcrypto as a shared dependency is not self-contained. The
+              # full NEEDED list goes to the log first, so the log records
+              # what the wheel asks of an image. readelf writes to a file in
+              # a command of its own, so an image without readelf fails the
+              # row here instead of passing an unread gate.
+              ext=$($PY -c "import cryptography.hazmat.bindings._rust as m; print(m.__file__)")
+              readelf -d "$ext" > /tmp/cryptography.dyn
+              grep NEEDED /tmp/cryptography.dyn || true
+              if grep -E "NEEDED.*lib(ssl|crypto)" /tmp/cryptography.dyn; then
+                echo "FAIL: the wheel links OpenSSL dynamically" >&2
+                exit 1
+              fi
+              chmod -R a+rX /src/wheelhouse
+              ls -l /src/wheelhouse
+            '
+      - name: Make the caches readable by the cache save
+        run: |
+          set -euo pipefail
+          for d in .pq-cache wheelhouse .openssl-${{ matrix.arch }}; do
+            if [ -d "$d" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$d"
+            fi
+          done
+          python3 .github/scripts/cache_size.py .pq-cache
+        id: cache-size
+      - name: Save compiler work (trunk only)
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .pq-cache
+          key: pq-work-${{ matrix.libc }}-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ inputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/build-pq-wheels.yml') }}
+        if: github.ref == 'refs/heads/main' && steps.cache-size.outputs.fits == 'true'
+        continue-on-error: true
+      - name: Save the OpenSSL build (manylinux rows, trunk only)
+        if: ${{ matrix.manylinux && steps.openssl-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .openssl-${{ matrix.arch }}
+          key: openssl-pqwheel-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
+        continue-on-error: true
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: pq-wheel-${{ matrix.libc }}-${{ matrix.arch }}
+          path: wheelhouse/cryptography-*.whl
+          if-no-files-found: error
+          retention-days: 7

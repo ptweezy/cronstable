@@ -48,10 +48,9 @@ name: CI
 # (RELEASE_TOKEN so the tag can point at a commit that touches
 # .github/workflows/), cuts a GitHub Release with ALL prebuilt binaries + a
 # single SHA256SUMS, pushes every Docker image, and updates the Homebrew tap.
-# Because the Release is gated on all binaries AND the Docker build, a broken or
-# flaky arch (or Dockerfile) fails the run BEFORE anything is published -- never
-# a half release. A failed publish leaves no orphan tag (tagged only after PyPI
-# accepts), so a re-run cleanly retries.
+# Build, packaging, manifest and checksum validation finish before publication.
+# External publishing services can still fail; PyPI precedes tag creation so a
+# failed PyPI upload leaves no orphan tag.
 #
 # This file replaces the former build.yml + docker.yml + tox.yml + release.yml,
 # whose binary/tox builds it deduplicates into one definition each.
@@ -130,6 +129,7 @@ env:
   UV_PYTHON_DOWNLOADS: "never"
 
 jobs:
+
   # ---------------------------------------------------------------------------
   # Decide + version (run on every event; feed both the gate and the publish).
   # ---------------------------------------------------------------------------
@@ -161,6 +161,9 @@ jobs:
       perf-source: ${{ steps.d.outputs.perf_source }}
       new: ${{ steps.ver.outputs.new }}
       docker-matrix: ${{ steps.distros.outputs.matrix }}
+      docker-none: ${{ steps.distros.outputs.docker-none }}
+      docker-glibc: ${{ steps.distros.outputs.docker-glibc }}
+      docker-musl: ${{ steps.distros.outputs.docker-musl }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -311,19 +314,97 @@ jobs:
         id: distros
         run: |
           set -euo pipefail
-          {
-            echo 'matrix<<JSON'
-            python3 .github/scripts/docker_matrix.py
-            echo 'JSON'
-          } >> "$GITHUB_OUTPUT"
+          matrix="$(python3 .github/scripts/docker_matrix.py)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Gate: tests + all binaries + all Docker images. Runs on EVERY event, in
   # parallel. The publish jobs below need every one of these to succeed.
   # ---------------------------------------------------------------------------
 
-  # lint + mypy + bandit in one job: each env finishes in well under a minute,
-  # so a second runner spin-up costs more wall clock than running them serially.
+  # Cheap static, configuration and packaging checks precede the build fan-out.
+  preflight:
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    needs:
+      - version
+      - tox-static
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      zeroconf: ${{ steps.inputs.outputs.zeroconf }}
+      cryptography: ${{ steps.inputs.outputs.cryptography }}
+      crypto-sha: ${{ steps.inputs.outputs.crypto-sha }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Check release credentials and version
+        if: needs.version.outputs.release == 'true'
+        env:
+          VERSION: ${{ needs.version.outputs.new }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: python .github/scripts/release_preflight.py
+      - name: Check Azure signing login
+        if: needs.version.outputs.release == 'true'
+        uses: azure/login@v3.0.2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Check optional Docker Hub login
+        if: needs.version.outputs.release == 'true' && env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Resolve dependency sources
+        id: inputs
+        run: |
+          python -m pip install packaging pytest strictyaml
+          python .github/scripts/release_inputs.py
+          python -m pytest tests/test_ci_release_pipeline.py -q
+      - name: Validate Linux package recipes
+        run: bash .github/scripts/build_packages.sh 1.2.3 "$RUNNER_TEMP/package-check" --check
+      - name: Validate package-manager templates
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/template-check"
+          mkdir -p "$work"
+          for asset in macos-arm64 macos-amd64 linux-arm64 linux-amd64 windows-amd64.exe windows-arm64.exe windows-i686.exe; do
+            printf '%064d  cronstable-%s\n' 0 "$asset"
+          done > "$work/SHA256SUMS"
+          bash packaging/homebrew/render-formula.sh 1.2.3 "$work/SHA256SUMS" packaging/homebrew/cronstable.rb.tmpl > "$work/cronstable.rb"
+          ruby -c "$work/cronstable.rb"
+          python .github/scripts/render_scoop.py 1.2.3 "$work/SHA256SUMS" "$work/cronstable.json"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-inputs
+          path: release-inputs/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
   tox-static:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -333,6 +414,8 @@ jobs:
       # tracked blob ever reaches the index with CRLF or mixed line endings,
       # e.g. one that slipped past `text=auto` normalization by being marked
       # binary or committed by a client that ignored .gitattributes.
+      - name: Validate workflow syntax
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -shellcheck='' -pyflakes=''
       - name: Guard against CRLF line endings
         run: |
           crlf="$(git ls-files --eol | grep -E 'i/(crlf|mixed)' || true)"
@@ -346,7 +429,7 @@ jobs:
           python-version: '3.14'
       # tox-uv pulls in uv and makes tox provision envs + install deps with it.
       - run: pip install tox tox-uv
-      - run: tox -e lint,mypy,bandit,openapi
+      - run: tox -p auto -e lint,mypy,bandit,openapi
 
   # Dependency-license gate. cronstable's core is MIT and it BUNDLES its deps
   # (the PyInstaller binaries and Docker images vendor the whole tree), so a
@@ -374,13 +457,19 @@ jobs:
         run: |
           set -euo pipefail
           uv venv --python 3.14
-          uv pip install ".[speedups,push,discovery]"
+          uv pip install ".[speedups,push,discovery]" "zeroconf==${{ needs.preflight.outputs.zeroconf }}"
       - name: Check dependency licenses
-        run: uv run python .github/scripts/check_licenses.py
+        run: |-
+          uv run python .github/scripts/check_licenses.py
+
+
+    needs:
+      - version
+      - preflight
 
   tox:
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         os: [ubuntu-latest, windows-latest]  # macOS is POSIX like Linux; add macos-latest to cover it too
         python: ['3.10', '3.11', '3.12', '3.13', '3.14']
@@ -391,25 +480,21 @@ jobs:
           - os: windows-11-arm
             python: '3.14'
             experimental: false
-          # Python 3.15 is in beta. Run it for early signal, but never let it
-          # gate CI -> continue-on-error. allow-prereleases lets setup-python
-          # pick up the beta (a no-op for the stable rows).
-          - os: ubuntu-latest
-            python: '3.15'
-            experimental: true
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
     # The suite runs in 2-9 min per cell (Windows is the slow end); 30 still
     # bounds a hung asyncio test while leaving headroom for a degraded
     # runner VM, which has cost us whole runs at 20.
     timeout-minutes: 30
-    steps:
+    steps: &tox-steps
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python }}
           allow-prereleases: true
-      - run: pip install tox tox-uv
+      - run: |-
+          pip install tox tox-uv
+
       # requirements_dev.txt installs the playwright LIBRARY into the tox env,
       # but pip cannot fetch a browser, and without one the client/daemon cron
       # engine differential (tests/test_web_engine_parity.py) self-skips, which
@@ -441,7 +526,9 @@ jobs:
       # (a pass, no venv), so ubuntu-latest, windows-latest and
       # windows-11-arm all take the same line and each measures the coverage
       # profile for the OS it is on. See tox.ini's `platform` key.
-      - run: tox -e py-windows,py-posix
+      - run: |-
+          tox -e py-windows,py-posix
+
       # The differential self-skips wherever Chromium is missing (every other
       # cell, by design), so THIS cell must prove it actually ran: re-drive it
       # through the tox env's own interpreter (and therefore the env's own
@@ -492,11 +579,35 @@ jobs:
           flags: ${{ matrix.os }}-py${{ matrix.python }}
           fail_ci_if_error: false
 
+    needs:
+      - version
+      - preflight
+
+  tox-experimental:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ['3.15']
+        experimental: [true]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    # The suite runs in 2-9 min per cell (Windows is the slow end); 30 still
+    # bounds a hung asyncio test while leaving headroom for a degraded
+    # runner VM, which has cost us whole runs at 20.
+    timeout-minutes: 30
+    steps: *tox-steps
+    needs:
+      - version
+      - preflight
+
   # Wheel + sdist, built and `twine check`ed exactly as it will be published to
   # PyPI. Uploaded as an artifact the `release` job publishes verbatim (so the
   # exact bytes that were checked here are what ship).
   dist:
-    needs: version
+    needs:
+      - version
+      - preflight
     runs-on: ubuntu-latest
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
@@ -542,6 +653,8 @@ jobs:
             fi
           done
           exit "$status"
+      - name: Smoke-test the installed wheel
+        run: python .github/scripts/smoke_dist.py
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: dist
@@ -605,9 +718,11 @@ jobs:
   # elf_floor.py, which re-derives the floor from the frozen bytes and fails
   # the job if a dependency raised it.
   binaries:
-    needs: version
+    needs:
+      - version
+      - preflight
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         include:
           - arch: amd64
@@ -746,6 +861,7 @@ jobs:
       # Keyed on the script, which pins the OpenSSL version, and on the
       # image, whose toolchain produced the objects. Saved trunk-only like
       # the pip cache above, and for the same quota reason.
+        continue-on-error: true
       - name: Restore the OpenSSL build (pq_src rows)
         if: ${{ matrix.pq_src }}
         id: openssl-cache
@@ -753,6 +869,7 @@ jobs:
         with:
           path: .openssl-${{ matrix.arch }}
           key: openssl-manylinux-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
+        continue-on-error: true
       - if: ${{ matrix.qemu }}
         uses: docker/setup-qemu-action@v4.3.0
       # Pulled in its own retried step, like every other container lane, so a
@@ -907,7 +1024,7 @@ jobs:
               # optional speedups, so a HARD install on every row. LGPL-2.1;
               # the in-binary notice, Release source archive and public build
               # recipe are the compliance kit (see LICENSING.md).
-              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version          # smoke test, on CentOS 7 itself
               # Whenever the build env kept pynacl, the frozen binary must
@@ -973,18 +1090,24 @@ jobs:
         with:
           path: .pip-cache
           key: pip-manylinux-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
+        continue-on-error: true
       - name: Save the OpenSSL build (pq_src rows, trunk only)
         if: ${{ matrix.pq_src && steps.openssl-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v6.1.0
         with:
           path: .openssl-${{ matrix.arch }}
           key: openssl-manylinux-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
+        continue-on-error: true
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python3 .github/scripts/check_artifacts.py "dist/cronstable-linux-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-linux-${{ matrix.arch }}
           path: dist/cronstable-linux-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   # Self-contained container-built Linux binaries, one per arch x libc pair.
   # PyInstaller is not a cross-compiler and the runners are glibc, so every
@@ -1005,9 +1128,11 @@ jobs:
   # newest Alpine still on musl 1.2.5, so it is the pin. tests/test_ci_fences.py
   # holds the images to a dated tag.
   binaries-container:
-    needs: version
+    needs:
+      - version
+      - preflight
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         libc: [musl, glibc]
         arch: [amd64, amd64v3, arm64, i686, armv7, armv6, ppc64le, s390x, riscv64]
@@ -1015,13 +1140,13 @@ jobs:
           # These glibc rows build in the manylinux `binaries` job, which
           # reaches GLIBC_2.17 (2.31 on armv7) instead of this lane's Debian
           # floor; armv6 is musl-only (Debian ships no arm32v6).
-          - { libc: glibc, arch: amd64 }
-          - { libc: glibc, arch: amd64v3 }
-          - { libc: glibc, arch: arm64 }
-          - { libc: glibc, arch: armv7 }
-          - { libc: glibc, arch: ppc64le }
-          - { libc: glibc, arch: s390x }
-          - { libc: glibc, arch: armv6 }
+          - {libc: glibc, arch: amd64}
+          - {libc: glibc, arch: amd64v3}
+          - {libc: glibc, arch: arm64}
+          - {libc: glibc, arch: armv7}
+          - {libc: glibc, arch: ppc64le}
+          - {libc: glibc, arch: s390x}
+          - {libc: glibc, arch: armv6}
         include:
           # per-libc: base image, artifact suffix, and the package-manager
           # commands the build script splices in (no quote characters in any
@@ -1056,10 +1181,10 @@ jobs:
             pq_tools: 'retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends rustc cargo libssl-dev pkg-config'
           # per-arch: docker platform, runner, and whether QEMU is needed
           # (amd64/arm64/i686 execute natively on the runners)
-          - { arch: amd64, platform: linux/amd64, runner: ubuntu-24.04 }
-          - { arch: amd64v3, platform: linux/amd64, runner: ubuntu-24.04 }
-          - { arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
-          - { arch: i686, platform: linux/386, runner: ubuntu-24.04 }
+          - {arch: amd64, platform: linux/amd64, runner: ubuntu-24.04}
+          - {arch: amd64v3, platform: linux/amd64, runner: ubuntu-24.04}
+          - {arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm}
+          - {arch: i686, platform: linux/386, runner: ubuntu-24.04}
           # Post-quantum sealing on every row. `pq: hard` where cryptography
           # publishes a musllinux_1_2 wheel (x86_64 and aarch64): the wheel
           # is always there, so absence is a broken build. `pq: soft` with
@@ -1074,15 +1199,15 @@ jobs:
           # per cryptography bump. Keyed on both libc and arch because the
           # glibc twins of several arches build in the manylinux `binaries`
           # job instead.
-          - { libc: musl, arch: amd64, pq: hard }
-          - { libc: musl, arch: amd64v3, pq: hard }
-          - { libc: musl, arch: arm64, pq: hard }
-          - { libc: musl, arch: i686, pq: soft, pq_src: '1' }
-          - { libc: musl, arch: armv7, pq: soft, pq_src: '1' }
-          - { libc: musl, arch: armv6, pq: soft, pq_src: '1' }
-          - { libc: musl, arch: ppc64le, pq: soft, pq_src: '1' }
-          - { libc: musl, arch: s390x, pq: soft, pq_src: '1' }
-          - { libc: musl, arch: riscv64, pq: soft, pq_src: '1' }
+          - {libc: musl, arch: amd64, pq: hard}
+          - {libc: musl, arch: amd64v3, pq: hard}
+          - {libc: musl, arch: arm64, pq: hard}
+          - {libc: musl, arch: i686, pq: soft, pq_src: '1'}
+          - {libc: musl, arch: armv7, pq: soft, pq_src: '1'}
+          - {libc: musl, arch: armv6, pq: soft, pq_src: '1'}
+          - {libc: musl, arch: ppc64le, pq: soft, pq_src: '1'}
+          - {libc: musl, arch: s390x, pq: soft, pq_src: '1'}
+          - {libc: musl, arch: riscv64, pq: soft, pq_src: '1'}
           # `armgate` is the ABI assertion elf_floor.py makes on 32-bit ARM,
           # which no functional test can make for itself: the float ABI, and
           # the newest instruction set anything in the bundle needs.
@@ -1098,11 +1223,11 @@ jobs:
           # tags, so those wheels stop being candidates and the C extensions
           # compile in-container against Alpine's ARMv6 gcc instead. armgate
           # then holds the result to it.
-          - { arch: armv7, platform: linux/arm/v7, runner: ubuntu-24.04, qemu: true, armgate: '--arm-float hard --max-arm-arch v7 --max-arm-fp 4' }
-          - { arch: armv6, platform: linux/arm/v6, runner: ubuntu-24.04, qemu: true, armgate: '--arm-float hard --max-arm-arch v6 --max-arm-fp 2', hostplat: linux-armv6l }
-          - { arch: ppc64le, platform: linux/ppc64le, runner: ubuntu-24.04, qemu: true }
-          - { arch: s390x, platform: linux/s390x, runner: ubuntu-24.04, qemu: true }
-          - { arch: riscv64, platform: linux/riscv64, runner: ubuntu-24.04, qemu: true }
+          - {arch: armv7, platform: linux/arm/v7, runner: ubuntu-24.04, qemu: true, armgate: '--arm-float hard --max-arm-arch v7 --max-arm-fp 4'}
+          - {arch: armv6, platform: linux/arm/v6, runner: ubuntu-24.04, qemu: true, armgate: '--arm-float hard --max-arm-arch v6 --max-arm-fp 2', hostplat: linux-armv6l}
+          - {arch: ppc64le, platform: linux/ppc64le, runner: ubuntu-24.04, qemu: true}
+          - {arch: s390x, platform: linux/s390x, runner: ubuntu-24.04, qemu: true}
+          - {arch: riscv64, platform: linux/riscv64, runner: ubuntu-24.04, qemu: true}
           # per-libc-and-arch, so these land on the two glibc rows only and
           # leave the musl rows of the same arches alone. `floor` is the glibc
           # version elf_floor.py holds the frozen bundle to; the musl rows set
@@ -1129,7 +1254,7 @@ jobs:
             pq_openssl: '1'
             pq_tools: 'retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates perl make pkg-config'
             rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --default-host i686-unknown-linux-gnu --profile minimal --no-modify-path'
-          - { libc: glibc, arch: riscv64, image: python:3.14-slim-trixie, floor: '2.41', pq: soft, pq_src: '1' }
+          - {libc: glibc, arch: riscv64, image: python:3.14-slim-trixie, floor: '2.41', pq: soft, pq_src: '1'}
     runs-on: ${{ matrix.runner }}
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
@@ -1164,6 +1289,7 @@ jobs:
             pip-${{ matrix.libc }}-${{ matrix.arch }}-
       # Register binfmt/QEMU so `docker run --platform` can execute a foreign-arch
       # container. amd64/arm64/i686 run natively and skip this.
+        continue-on-error: true
       - if: ${{ matrix.qemu }}
         uses: docker/setup-qemu-action@v4.3.0
       # Pull the base image in its own retried step. Docker Hub times out often
@@ -1300,7 +1426,7 @@ jobs:
               # is LGPL-2.1; the in-binary notice, Release source
               # archive, and public build recipe are the compliance kit
               # (see LICENSING.md).
-              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version            # smoke test, native or emulated on its own libc
               # Whenever the build env kept pynacl, the frozen binary
@@ -1370,12 +1496,17 @@ jobs:
         with:
           path: .pip-cache
           key: pip-${{ matrix.libc }}-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
+        continue-on-error: true
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python3 .github/scripts/check_artifacts.py "dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
           path: dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   # Self-contained MIPS binaries. Its own job rather than a `binaries-container`
   # row because every assumption that job makes is different here: there is no
@@ -1398,9 +1529,11 @@ jobs:
   # its `mips` machine tag. That is deliberate. Build time is not the constraint
   # on this lane, and the binary it produces is smaller than the amd64 one.
   binaries-mips:
-    needs: version
+    needs:
+      - version
+      - preflight
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         include:
           - arch: mips64le
@@ -1419,10 +1552,7 @@ jobs:
       # setuptools_scm never walks history here, and its git file-finder (which
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
-      # Deliberately NO pip cache, unlike binaries-container. The Actions cache
-      # is one 10 GB pool per repository and is already over it, so a new writer
-      # would evict caches the other lanes depend on to buy time this lane does
-      # not need.
+      # Persist source wheels with an image/recipe key and a bounded cache.
       - uses: docker/setup-qemu-action@v4.3.0
       - name: Pull the build image
         run: |
@@ -1432,6 +1562,14 @@ jobs:
           # namespace for its mirror failover, and this is a per-architecture
           # repository the mirrors do not carry. Plain retried pull instead.
           retry 5 docker pull --platform ${{ matrix.platform }} ${{ matrix.image }}
+          echo "digest=$(docker image inspect --format '{{.Id}}' '${{ matrix.image }}')" >> "$GITHUB_OUTPUT"
+        id: image
+      - name: Restore source wheels
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .pip-cache
+          key: slow-pip-binaries-mips-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyproject.toml', 'pyinstaller/*.sh', '.github/workflows/release.yml') }}
+        continue-on-error: true
       - name: Build binary (${{ matrix.arch }} container)
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -1439,7 +1577,7 @@ jobs:
           set -euo pipefail
           docker run --rm --platform ${{ matrix.platform }} \
             -e SETUPTOOLS_SCM_PRETEND_VERSION \
-            -e PIP_RETRIES -e PIP_TIMEOUT \
+            -e PIP_RETRIES -e PIP_TIMEOUT -e PIP_CACHE_DIR=/src/.pip-cache \
             -v "$PWD:/src" -w /src \
             ${{ matrix.image }} sh -euc '
               # The checkout is mounted at /src, so the runner-side retry helper
@@ -1490,7 +1628,7 @@ jobs:
               sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
               sh pyinstaller/install_orjson.sh
               sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
-              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
               /v/bin/pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version          # smoke test: fails the job if the bundle is broken
               # Whenever the build env kept pynacl, the frozen binary must reach
@@ -1524,12 +1662,28 @@ jobs:
               /v/bin/python /src/.github/scripts/elf_floor.py dist/cronstable --max-glibc 2.36
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
             '
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python3 .github/scripts/check_artifacts.py "dist/cronstable-linux-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-linux-${{ matrix.arch }}
           path: dist/cronstable-linux-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
+      - name: Bound the source-wheel cache
+        id: cache-size
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" .pip-cache
+          python3 .github/scripts/cache_size.py .pip-cache
+      - name: Save source wheels (trunk only)
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .pip-cache
+          key: slow-pip-binaries-mips-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyproject.toml', 'pyinstaller/*.sh', '.github/workflows/release.yml') }}
+        if: github.ref == 'refs/heads/main' && steps.cache-size.outputs.fits == 'true'
+        continue-on-error: true
 
   # Self-contained binaries for the two legacy 32-bit ARM ABIs: glibc hard-float
   # ARMv6 (Raspberry Pi 1, Zero, Zero W) and glibc soft-float armel (Kirkwood
@@ -1561,9 +1715,12 @@ jobs:
     # pq-wheel-armv6 runs with continue-on-error, so a wheel that failed
     # to build never holds this job; the armv6 binary then seals
     # x25519 only, as the armel one always does.
-    needs: [version, pq-wheel-armv6]
+    needs:
+      - version
+      - pq-wheel-armv6
+      - preflight
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         include:
           - arch: armv6
@@ -1588,56 +1745,18 @@ jobs:
             hostplat: linux-armv6l
             armgate: '--arm-float hard --max-arm-arch v6 --max-arm-fp 2'
             floor: '2.36'
-          - arch: armel
-            platform: linux/arm/v5
-            # Pinned by digest on purpose: arm32v5 was dropped from the
-            # bookworm official-images stanza in August 2026, so this tag is
-            # frozen at its final build and will never be rebuilt. Neither will
-            # the OS layer be patched, because bookworm-security carries no
-            # armel component at all. That is the price of serving this
-            # hardware; the alternative is not shipping the row.
-            image: arm32v5/debian:bookworm-slim@sha256:cf9397e3198b2c002eb360586d341ba89154634198a26c578eb096b533b212cd
-            # ARM926EJ-S, the Kirkwood core: ARMv5TE, no VFP, so soft-float.
-            qemu_cpu: arm926
-            hostplat: linux-armv5tel
-            # Rewrite sources to bookworm main only. The image's default list
-            # includes bookworm-security, whose Release file dropped armel when
-            # bookworm entered LTS (its Architectures line is amd64 arm64 armhf
-            # i386 ppc64el), so apt spends the build warning about a component
-            # that cannot exist. main itself is alive and still serving armel;
-            # snapshot.debian.org has a frozen slice if that ever changes.
-            sources: 'deb http://deb.debian.org/debian bookworm main'
-            # libatomic is the only member exempted from the v5 ceiling.
-            # Debian armel libatomic1 declares Tag_CPU_arch v7 because the
-            # linker MAX-merges that tag over every input object, and the
-            # library contains ldrex and dmb implementations built for v7
-            # alongside v5 ones. A v5 core reaches none of them. All 68 IFUNC
-            # resolvers, the load-time constructor, and all 51 fallback
-            # implementations contain only ARMv5TE instructions, and each of
-            # the 440 instructions for newer cores belongs to a variant that
-            # the resolver selects only when the HWCAP byte reports that the
-            # processor supports it. On this hardware, the library uses the
-            # __kuser_cmpxchg kernel helper instead. libcrypto links against
-            # libatomic, which is how it enters the bundle. elf_floor.py
-            # applies the exemption only when the member dispatches through
-            # IFUNC, so a plain v7 build substituted later still fails this
-            # row.
-            armgate: '--arm-float soft --max-arm-arch v5 --max-arm-fp 0
-              --arm-arch-except libatomic.so.1'
-            floor: '2.36'
+            sources: ''
     runs-on: ubuntu-24.04
     # Emulating an ARM1176 while compiling the whole dependency stack plus a
     # bootloader is slow even by this workflow's standards. Generous on purpose;
     # a row still going at this point is wedged, not slow.
     timeout-minutes: 360
-    steps:
+    steps: &legacy-arm-steps
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
       # setuptools_scm never walks history here, and its git file-finder (which
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
-      # Deliberately NO pip cache, like binaries-mips: the Actions cache is one
-      # 10 GB pool per repository and is already over it, so a new writer would
-      # evict caches the other lanes depend on.
+      # Persist source wheels with an image/recipe key and a bounded cache.
       #
       # The cryptography wheel pq-wheel-armv6 built for the armv6 row (no
       # PyPI wheel exists for ARMv6, and the compile is hours under an
@@ -1721,7 +1840,7 @@ jobs:
               else
                 echo "cryptography: no wheel for this row; post-quantum push not bundled"
               fi
-              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
               /v/bin/pyinstaller pyinstaller/cronstable.spec
               # Smoke test on the emulated target core, so an instruction the
               # real hardware lacks faults here.
@@ -1753,12 +1872,68 @@ jobs:
                 --max-glibc ${{ matrix.floor }} --no-exec-stack ${{ matrix.armgate }}
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
             '
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python3 .github/scripts/check_artifacts.py "dist/cronstable-linux-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-linux-${{ matrix.arch }}
           path: dist/cronstable-linux-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
+
+  # This ABI has no PQ wheel dependency and can start immediately.
+  binaries-armel:
+    needs:
+      - version
+      - preflight
+    strategy:
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
+      matrix:
+        include:
+          - arch: armel
+            platform: linux/arm/v5
+            # Pinned by digest on purpose: arm32v5 was dropped from the
+            # bookworm official-images stanza in August 2026, so this tag is
+            # frozen at its final build and will never be rebuilt. Neither will
+            # the OS layer be patched, because bookworm-security carries no
+            # armel component at all. That is the price of serving this
+            # hardware; the alternative is not shipping the row.
+            image: arm32v5/debian:bookworm-slim@sha256:cf9397e3198b2c002eb360586d341ba89154634198a26c578eb096b533b212cd
+            # ARM926EJ-S, the Kirkwood core: ARMv5TE, no VFP, so soft-float.
+            qemu_cpu: arm926
+            hostplat: linux-armv5tel
+            # Rewrite sources to bookworm main only. The image's default list
+            # includes bookworm-security, whose Release file dropped armel when
+            # bookworm entered LTS (its Architectures line is amd64 arm64 armhf
+            # i386 ppc64el), so apt spends the build warning about a component
+            # that cannot exist. main itself is alive and still serving armel;
+            # snapshot.debian.org has a frozen slice if that ever changes.
+            sources: 'deb http://deb.debian.org/debian bookworm main'
+            # libatomic is the only member exempted from the v5 ceiling.
+            # Debian armel libatomic1 declares Tag_CPU_arch v7 because the
+            # linker MAX-merges that tag over every input object, and the
+            # library contains ldrex and dmb implementations built for v7
+            # alongside v5 ones. A v5 core reaches none of them. All 68 IFUNC
+            # resolvers, the load-time constructor, and all 51 fallback
+            # implementations contain only ARMv5TE instructions, and each of
+            # the 440 instructions for newer cores belongs to a variant that
+            # the resolver selects only when the HWCAP byte reports that the
+            # processor supports it. On this hardware, the library uses the
+            # __kuser_cmpxchg kernel helper instead. libcrypto links against
+            # libatomic, which is how it enters the bundle. elf_floor.py
+            # applies the exemption only when the member dispatches through
+            # IFUNC, so a plain v7 build substituted later still fails this
+            # row.
+            armgate: '--arm-float soft --max-arm-arch v5 --max-arm-fp 0 --arm-arch-except libatomic.so.1'
+            floor: '2.36'
+    runs-on: ubuntu-24.04
+    # Emulating an ARM926 while compiling the whole dependency stack plus a
+    # bootloader is slow even by this workflow's standards. Generous on purpose;
+    # a row still going at this point is wedged, not slow.
+    timeout-minutes: 360
+    steps: *legacy-arm-steps
 
   # Self-contained LoongArch binaries, glibc and musl. Its own job rather than
   # two binaries-container rows because neither base image comes from a family
@@ -1777,9 +1952,11 @@ jobs:
   # loong64 wheels, so the bootloader is built onto its `loongarch` machine tag
   # in both libc flavours.
   binaries-loong64:
-    needs: version
+    needs:
+      - version
+      - preflight
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         include:
           - libc: glibc
@@ -1816,9 +1993,7 @@ jobs:
       # setuptools_scm never walks history here, and its git file-finder (which
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
-      # Deliberately NO pip cache, like binaries-mips: the Actions cache is one
-      # 10 GB pool per repository and is already over it, so a new writer would
-      # evict caches the other lanes depend on.
+      # Persist source wheels with an image/recipe key and a bounded cache.
       #
       # loong64 emulation is in the default binfmt install (tonistiigi/binfmt
       # has carried it since 2024, under the containerd architecture name).
@@ -1831,6 +2006,14 @@ jobs:
           # `library/` namespace for its mirror failover, and neither of these
           # images lives there. Plain retried pull instead.
           retry 5 docker pull --platform linux/loong64 ${{ matrix.image }}
+          echo "digest=$(docker image inspect --format '{{.Id}}' '${{ matrix.image }}')" >> "$GITHUB_OUTPUT"
+        id: image
+      - name: Restore source wheels
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .pip-cache
+          key: slow-pip-binaries-loong64-${{ matrix.libc }}-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyproject.toml', 'pyinstaller/*.sh', '.github/workflows/release.yml') }}
+        continue-on-error: true
       - name: Build binary (loong64 ${{ matrix.libc }})
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -1838,7 +2021,7 @@ jobs:
           set -euo pipefail
           docker run --rm --platform linux/loong64 \
             -e SETUPTOOLS_SCM_PRETEND_VERSION \
-            -e PIP_RETRIES -e PIP_TIMEOUT \
+            -e PIP_RETRIES -e PIP_TIMEOUT -e PIP_CACHE_DIR=/src/.pip-cache \
             -e PIP_BREAK_SYSTEM_PACKAGES=1 \
             -v "$PWD:/src" -w /src \
             ${{ matrix.image }} sh -euc '
@@ -1882,7 +2065,7 @@ jobs:
               else
                 echo "cryptography: source-build toolchain setup failed; post-quantum push not bundled"
               fi
-              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version          # smoke test, emulated on its own libc
               # Whenever the build env kept pynacl, the frozen binary must
@@ -1912,12 +2095,28 @@ jobs:
               fi
               mv dist/cronstable dist/cronstable-linux-loong64${{ matrix.suffix }}
             '
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python3 .github/scripts/check_artifacts.py "dist/cronstable-linux-loong64${{ matrix.suffix }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-linux-loong64${{ matrix.suffix }}
           path: dist/cronstable-linux-loong64${{ matrix.suffix }}
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
+      - name: Bound the source-wheel cache
+        id: cache-size
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" .pip-cache
+          python3 .github/scripts/cache_size.py .pip-cache
+      - name: Save source wheels (trunk only)
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .pip-cache
+          key: slow-pip-binaries-loong64-${{ matrix.libc }}-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyproject.toml', 'pyinstaller/*.sh', '.github/workflows/release.yml') }}
+        if: github.ref == 'refs/heads/main' && steps.cache-size.outputs.fits == 'true'
+        continue-on-error: true
 
   # Self-contained macOS binaries. The shipped pair is macOS 15 (arm64 + amd64),
   # signed + notarized on a release. macOS 26 (Tahoe) is built too for early
@@ -1926,9 +2125,11 @@ jobs:
   # `ship` picks the shipped rows; `asset` names the artifact (the shipped ones
   # keep the bare `macos-<arch>` names the Release + Homebrew formula expect).
   binaries-macos:
-    needs: version
+    needs:
+      - version
+      - preflight
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         include:
           - arch: arm64
@@ -1959,27 +2160,10 @@ jobs:
             asset: macos-amd64v3
             pq: hard
             pqcap: ',<49'
-          - arch: arm64
-            runner: macos-26          # macOS 26 (Tahoe), Apple Silicon -- CI only
-            ship: false
-            asset: macos26-arm64
-            pq: hard   # see the macOS 15 arm64 row
-          - arch: amd64
-            runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
-            ship: false
-            asset: macos26-amd64
-            pq: hard   # see the macOS 15 Intel row
-            pqcap: ',<49'
-          - arch: amd64v3
-            runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
-            ship: false
-            asset: macos26-amd64v3
-            pq: hard   # see the macOS 15 Intel row
-            pqcap: ',<49'
     runs-on: ${{ matrix.runner }}
     # The macOS 26 rows are coverage-only: never let them gate a release.
     continue-on-error: ${{ !matrix.ship }}
-    steps:
+    steps: &macos-steps
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
       # setuptools_scm never walks history here, and its git file-finder (which
       # the wheel/sdist build does use) only needs the checked-out tree.
@@ -1990,6 +2174,44 @@ jobs:
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           version: "0.12.5"
+      - name: Prepare macOS signing credentials
+        if: ${{ needs.version.outputs.release == 'true' && matrix.ship }}
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERT_P12_BASE64:-}" ]; then
+            echo "::warning::macOS signing secrets not set; shipping an unsigned, unnotarized binary."
+            exit 0
+          fi
+
+          # Import the Developer ID cert into a throwaway, randomly-keyed
+          # keychain scoped to this runner (never the login keychain).
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" \
+            -t cert -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+          # Let codesign use the key non-interactively.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          # Exercise the configured identity/private key before compilation.
+          cp /usr/bin/true "$RUNNER_TEMP/signing-probe"
+          codesign --force --options runtime --timestamp --keychain "$KEYCHAIN" \
+            --sign "$MACOS_SIGN_IDENTITY" "$RUNNER_TEMP/signing-probe"
+
+          echo "$MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          xcrun notarytool history --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID"
       - name: Build amd64v3 Python
         if: matrix.arch == 'amd64v3'
         id: runtime
@@ -2042,7 +2264,7 @@ jobs:
           # on both arches, HARD failure. LGPL-2.1; in-binary notice +
           # Release source archive + public build recipe (LICENSING.md).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
@@ -2085,26 +2307,8 @@ jobs:
           MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
         run: |
           set -euo pipefail
-          if [ -z "${MACOS_CERT_P12_BASE64:-}" ]; then
-            echo "::warning::macOS signing secrets not set; shipping an unsigned, unnotarized binary."
-            exit 0
-          fi
-
-          # Import the Developer ID cert into a throwaway, randomly-keyed
-          # keychain scoped to this runner (never the login keychain).
+          if [ -z "${MACOS_CERT_P12_BASE64:-}" ]; then exit 0; fi
           KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
-          KEYCHAIN_PW="$(uuidgen)"
-          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" \
-            -t cert -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
-          # Let codesign use the key non-interactively.
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-
           # Sign with the hardened runtime + secure timestamp (both required for
           # notarization) and the PyInstaller entitlements, then verify.
           codesign --force --options runtime --timestamp \
@@ -2122,14 +2326,50 @@ jobs:
             --key-id "$MACOS_NOTARY_KEY_ID" \
             --issuer "$MACOS_NOTARY_ISSUER_ID" \
             --wait
+        timeout-minutes: 20
       - name: Rename binary
-        run: mv dist/cronstable "dist/cronstable-${{ matrix.asset }}"
+        run: |-
+          mv dist/cronstable "dist/cronstable-${{ matrix.asset }}"
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python3 .github/scripts/check_artifacts.py "dist/cronstable-${{ matrix.asset }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-${{ matrix.asset }}
           path: dist/cronstable-${{ matrix.asset }}
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
+
+  binaries-macos-experimental:
+    needs:
+      - version
+      - preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-26          # macOS 26 (Tahoe), Apple Silicon -- CI only
+            ship: false
+            asset: macos26-arm64
+            pq: hard   # see the macOS 15 arm64 row
+          - arch: amd64
+            runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
+            ship: false
+            asset: macos26-amd64
+            pq: hard   # see the macOS 15 Intel row
+            pqcap: ',<49'
+          - arch: amd64v3
+            runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
+            ship: false
+            asset: macos26-amd64v3
+            pq: hard   # see the macOS 15 Intel row
+            pqcap: ',<49'
+    runs-on: ${{ matrix.runner }}
+    # The macOS 26 rows are coverage-only: never let them gate a release.
+    continue-on-error: ${{ !matrix.ship }}
+    steps: *macos-steps
 
   # Self-contained FreeBSD binaries (amd64, arm64). PyInstaller is not a
   # cross-compiler and GitHub hosts no FreeBSD runner, so both rows build
@@ -2149,9 +2389,11 @@ jobs:
   # hour, and the emulated row compiles cryptography's Rust crate on top of
   # everything else it builds, which is hours under full-system QEMU.
   binaries-freebsd:
-    needs: version
+    needs:
+      - version
+      - preflight
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         include:
           - arch: amd64
@@ -2307,7 +2549,7 @@ jobs:
             # optional speedups, so a HARD install even here. LGPL-2.1; the
             # in-binary notice, Release source archive and public build
             # recipe are the compliance kit (see LICENSING.md).
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
 
             venv/bin/pyinstaller pyinstaller/cronstable.spec
             dist/cronstable --version           # smoke test: fails the job if the bundle is broken
@@ -2361,6 +2603,9 @@ jobs:
             # work tree are hundreds of megabytes of rsync the host has no
             # use for.
             rm -rf venv build get-pip.py freebsd-pkg-work dist/pkgout
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python3 .github/scripts/check_artifacts.py "dist/cronstable-freebsd-${{ matrix.arch }}" "dist/cronstable-freebsd-${{ matrix.arch }}.pkg"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-freebsd-${{ matrix.arch }}
@@ -2369,6 +2614,7 @@ jobs:
             dist/cronstable-freebsd-${{ matrix.arch }}.pkg
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   # Self-contained OpenBSD binary, amd64. PyInstaller cannot cross-compile and
   # no runner offers OpenBSD, so this builds in an OpenBSD 7.9 virtual machine
@@ -2384,9 +2630,11 @@ jobs:
   # self-locates through argv[0] plus $PATH rather than a /proc path, which
   # breaks under a supervisor that rewrites argv[0].
   binaries-openbsd:
-    needs: version
+    needs:
+      - version
+      - preflight
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         arch: [amd64, amd64v3]
     runs-on: ubuntu-latest
@@ -2482,7 +2730,7 @@ jobs:
             # optional speedups, so a HARD install here too. LGPL-2.1; the
             # in-binary notice, Release source archive and public build recipe
             # are the compliance kit (see LICENSING.md).
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
 
             pyinstaller pyinstaller/cronstable.spec
             dist/cronstable --version           # smoke test: fails the job if the bundle is broken
@@ -2514,12 +2762,16 @@ jobs:
             # Keep the copyback to the artifact: PyInstaller's work tree is
             # hundreds of megabytes of rsync the host has no use for.
             rm -rf build
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python3 .github/scripts/check_artifacts.py "dist/cronstable-openbsd-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-openbsd-${{ matrix.arch }}
           path: dist/cronstable-openbsd-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   # Self-contained NetBSD binary, amd64, built in a NetBSD 11.0 virtual machine
   # on the Linux runner (KVM-accelerated, no emulation).
@@ -2529,9 +2781,11 @@ jobs:
   # ldd's output format for it, because NetBSD's default ldd output yields
   # library names PyInstaller cannot parse.
   binaries-netbsd:
-    needs: version
+    needs:
+      - version
+      - preflight
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         arch: [amd64, amd64v3]
     runs-on: ubuntu-latest
@@ -2616,7 +2870,7 @@ jobs:
               sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
             # Bundle zeroconf (the `discovery` extra): pure Python with
             # optional speedups, so a HARD install. LGPL-2.1; see LICENSING.md.
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
 
             venv/bin/pyinstaller pyinstaller/cronstable.spec
             dist/cronstable --version           # smoke test: fails the job if the bundle is broken
@@ -2637,12 +2891,16 @@ jobs:
             $PY .github/scripts/assert_arch.py dist/cronstable elf:2:1:62
             mv dist/cronstable dist/cronstable-netbsd-${{ matrix.arch }}
             rm -rf venv build get-pip.py
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python3 .github/scripts/check_artifacts.py "dist/cronstable-netbsd-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-netbsd-${{ matrix.arch }}
           path: dist/cronstable-netbsd-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   # Self-contained illumos binary, amd64, built in an OmniOS r151054 LTS
   # virtual machine (supported to 2028-05-01) on the Linux runner.
@@ -2656,9 +2914,11 @@ jobs:
   # bootloader wscript carries a Solaris branch, compat.py folds is_solar into
   # is_unix, and bindepend.py has its own ldd branch for it.
   binaries-illumos:
-    needs: version
+    needs:
+      - version
+      - preflight
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         arch: [amd64, amd64v3]
     runs-on: ubuntu-latest
@@ -2746,7 +3006,7 @@ jobs:
             fi
             # Bundle zeroconf (the `discovery` extra): pure Python with
             # optional speedups, so a HARD install. LGPL-2.1; see LICENSING.md.
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
 
             venv/bin/pyinstaller pyinstaller/cronstable.spec
             dist/cronstable --version           # smoke test: fails the job if the bundle is broken
@@ -2767,12 +3027,16 @@ jobs:
             $PY .github/scripts/assert_arch.py dist/cronstable elf:2:1:62
             mv dist/cronstable dist/cronstable-illumos-${{ matrix.arch }}
             rm -rf venv build
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python3 .github/scripts/check_artifacts.py "dist/cronstable-illumos-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-illumos-${{ matrix.arch }}
           path: dist/cronstable-illumos-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   # Self-contained Windows binaries: amd64 on the hosted runner, arm64 on the
   # windows-11-arm runner. Any C-extension dep lacking a win_arm64 wheel (parts
@@ -2783,14 +3047,16 @@ jobs:
   # (the shape that can host the Windows service; the one-file bootloader runs
   # the app in a child process the SCM never sees), and the WiX MSI
   # cronstable-windows-<arch>.msi carrying the same one-directory payload.
-  # These six artifacts are the unsigned gate set: on a release, the
+  # These twelve artifacts are the unsigned gate set: on a release, the
   # sign-windows job signs and repackages them and the release ships
   # that set.
   # Steps use bash (git bash ships on the Windows runners).
   binaries-windows:
-    needs: version
+    needs:
+      - version
+      - preflight
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         include:
           # pyarch is setup-python's `architecture`. It is EMPTY on the two
@@ -2949,7 +3215,7 @@ jobs:
           # notice + Release source archive + public build recipe
           # (LICENSING.md).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.149.16" hard
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           ./dist/cronstable.exe --version      # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
@@ -2998,12 +3264,16 @@ jobs:
             Write-Host "FAIL: the frozen binary cannot seal xwing"
             exit 1
           }
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python .github/scripts/check_artifacts.py "dist/cronstable-windows-${{ matrix.arch }}.exe"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-windows-${{ matrix.arch }}
           path: dist/cronstable-windows-${{ matrix.arch }}.exe
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
       - name: Smoke-test and zip the one-directory bundle
         run: |
           set -euo pipefail
@@ -3033,6 +3303,9 @@ jobs:
           # documentation uses. root_dir/base_dir keep the folder prefix on
           # every entry.
           uv run python -c "import shutil; shutil.make_archive('dist/cronstable-windows-${{ matrix.arch }}', 'zip', root_dir='dist', base_dir='cronstable')"
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python .github/scripts/check_artifacts.py "dist/cronstable-windows-${{ matrix.arch }}.zip"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-windows-${{ matrix.arch }}-zip
@@ -3043,6 +3316,7 @@ jobs:
       # rebuilds the MSIs with the SAME script: one recipe is what makes
       # "the gate already proved this MSI" true. test_ci_fences pins
       # both call sites.
+          compression-level: 0
       - name: Build MSI
         env:
           VERSION: ${{ needs.version.outputs.new }}
@@ -3149,16 +3423,20 @@ jobs:
             echo "service still registered after upgrade uninstall" >&2
             exit 1
           fi
+      - name: Check every declared binary artifact
+        shell: bash
+        run: python .github/scripts/check_artifacts.py "dist/cronstable-windows-${{ matrix.arch }}.msi"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-windows-${{ matrix.arch }}-msi
           path: dist/cronstable-windows-${{ matrix.arch }}.msi
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   # cryptography wheels for the image platforms PyPI publishes none for, so
   # every image seals post-quantum push on every arch it ships. Built once
-  # per (libc, arch) here and handed to both docker jobs as a wheelhouse
+  # per (libc, arch) here and handed to Docker platform jobs as a wheelhouse
   # (docker/wheelhouse/<libc>/, which the Dockerfiles COPY beside
   # pyproject.toml and pip reads with --find-links), rather than compiled
   # inside each image build: six images build s390x, and one QEMU Rust
@@ -3183,231 +3461,59 @@ jobs:
   # Every row is best-effort at the job level (continue-on-error), so a
   # failed compile costs that platform its post-quantum suite (the image
   # then seals x25519 only, which extract_deps.py reports) rather than the
-  # release. The wheel is cached across pushes and rebuilt on a release,
-  # matching the freshness the image dependency layers get from
-  # DEPS_REFRESH. Saved trunk-only, like every other cache writer.
+  # release. Every run resolves fresh sources; compiler work is reused only
+  # within a matching source, image and installed toolchain. Cache writes are
+  # bounded and trunk-only. libc groups release their Docker consumers separately.
   pq-wheels:
-    needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { libc: musl, arch: i686, platform: linux/386, image: python:3.11-alpine3.23 }
-          - { libc: musl, arch: armv7, platform: linux/arm/v7, image: python:3.11-alpine3.23, qemu: true }
-          - { libc: musl, arch: ppc64le, platform: linux/ppc64le, image: python:3.11-alpine3.23, qemu: true }
-          - { libc: musl, arch: s390x, platform: linux/s390x, image: python:3.11-alpine3.23, qemu: true }
-          - { libc: musl, arch: riscv64, platform: linux/riscv64, image: python:3.11-alpine3.23, qemu: true }
-          - { libc: glibc, arch: i686, platform: linux/386, image: python:3.11-slim-trixie }
-          - { libc: glibc, arch: riscv64, platform: linux/riscv64, image: python:3.11-slim-trixie, qemu: true }
-          - { libc: glibc, arch: s390x, platform: linux/s390x, image: quay.io/pypa/manylinux_2_28_s390x:2026.08.15-1, qemu: true, manylinux: '1' }
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    timeout-minutes: 300
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - name: Restore a cached wheel
-        # A release rebuilds: the wheel then carries the newest cryptography
-        # the index has, as the image dependency layers do under DEPS_REFRESH.
-        if: ${{ needs.version.outputs.release != 'true' }}
-        id: wheel-cache
-        uses: actions/cache/restore@v6.1.0
-        with:
-          path: wheelhouse
-          key: pq-wheel-${{ matrix.libc }}-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', 'pyinstaller/build_openssl.sh', '.github/workflows/release.yml') }}
-      - name: Restore the OpenSSL build (manylinux rows)
-        if: ${{ matrix.manylinux && steps.wheel-cache.outputs.cache-hit != 'true' }}
-        id: openssl-cache
-        uses: actions/cache/restore@v6.1.0
-        with:
-          path: .openssl-${{ matrix.arch }}
-          key: openssl-pqwheel-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
-      - if: ${{ matrix.qemu && steps.wheel-cache.outputs.cache-hit != 'true' }}
-        uses: docker/setup-qemu-action@v4.3.0
-      - name: Pull the build image
-        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
-        run: |
-          set -euo pipefail
-          . .github/scripts/retry.sh
-          retry 5 docker pull --platform ${{ matrix.platform }} ${{ matrix.image }}
-      - name: Build the cryptography wheel (${{ matrix.libc }} ${{ matrix.arch }})
-        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
-        env:
-          # Per-libc toolchain, spliced in as env so the single-quoted script
-          # below stays free of quote characters. It runs under `sh -c`, a
-          # fresh shell that inherits no function, so every string sources
-          # retry.sh for itself, as RUST_SETUP_CMD does. The manylinux row
-          # has no usable distro OpenSSL or Rust and takes the from-source
-          # route; it installs the perl modules the image leaves out:
-          # IPC::Cmd for the OpenSSL Configure script, Time::Piece for the
-          # Makefile it writes, and bigint for the s390x assembler
-          # generators.
-          PQ_TOOLS: ${{ matrix.libc == 'musl' && '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && '. /src/.github/scripts/retry.sh && retry 5 yum install -y perl-IPC-Cmd perl-Time-Piece perl-bignum' || '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev zlib1g-dev libzstd-dev pkg-config' }}
-          RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
-          # The probe below installs the project, whose version comes from
-          # this rather than from git: the python images carry no git (the
-          # manylinux image does, and the safe.directory line below lets
-          # its file finder read the bind mount).
-          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
-        run: |
-          set -euo pipefail
-          docker run --rm --platform ${{ matrix.platform }} \
-            -e PIP_RETRIES -e PIP_TIMEOUT -e PQ_TOOLS -e RUST_SETUP_CMD \
-            -e SETUPTOOLS_SCM_PRETEND_VERSION \
-            -v "$PWD:/src" -w /src \
-            ${{ matrix.image }} sh -euc '
-              . /src/.github/scripts/retry.sh
-              sh -c "$PQ_TOOLS"
-              if [ -n "${{ matrix.manylinux }}" ]; then
-                # The build interpreter sets the floor of the abi3 tag (a
-                # cp311-abi3 wheel loads on 3.11 and newer), so the row
-                # builds with the oldest interpreter any consumer image
-                # runs: the rhel image has 3.12 and opensuse 3.13.
-                # manylinux ships every CPython at /opt/python, and 3.11 is
-                # also the floor the PyPI wheels carry. extract_deps.py
-                # drops a wheel whose floor sits above the image
-                # interpreter rather than letting pip fail the image build.
-                PY=/opt/python/cp311-cp311/bin/python
-                # The checkout belongs to the runner user and this container
-                # runs as root, so git reports the bind mount as dubiously
-                # owned, and the project install below (setuptools_scm runs
-                # git for its file finder) fails on that refusal. The python
-                # images carry no git and never see this.
-                git config --global --add safe.directory /src
-                sh -c "$RUST_SETUP_CMD"
-                sh pyinstaller/build_openssl.sh /src/.openssl-${{ matrix.arch }}
-                PATH=/opt/cargo/bin:$PATH
-                CARGO_HOME=/opt/cargo
-                RUSTUP_HOME=/opt/rustup
-                OPENSSL_DIR=/src/.openssl-${{ matrix.arch }}
-                export PATH CARGO_HOME RUSTUP_HOME OPENSSL_DIR
-              elif [ "${{ matrix.libc }}" = musl ]; then
-                PY=python
-                # openssl-libs-static puts the archives under /usr/lib.
-                OPENSSL_DIR=/usr
-                export OPENSSL_DIR
-              else
-                PY=python
-                # Debian keeps them in the multiarch library directory, and
-                # builds libcrypto with zlib and zstd compression, so its
-                # archive needs both at link time. openssl-sys names
-                # neither, so RUSTFLAGS adds them as shared libraries (the
-                # two -dev packages in PQ_TOOLS supply the link names).
-                # Every consumer of these wheels is a Debian-family image,
-                # where dpkg and Python already need both.
-                OPENSSL_LIB_DIR=/usr/lib/$(gcc -print-multiarch)
-                OPENSSL_INCLUDE_DIR=/usr/include
-                RUSTFLAGS="-C link-arg=-lz -C link-arg=-lzstd"
-                export OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR RUSTFLAGS
-              fi
-              # Static on every row, with the archive paths given outright:
-              # when pkg-config finds OpenSSL, openssl-sys never links an
-              # archive under /usr (the pkg-config crate treats a system
-              # root as dynamic-only), so OPENSSL_STATIC alone yields a
-              # wheel that loads only beside the libssl.so.3 it was built
-              # next to. These wheels go into every image build, so they
-              # carry their own.
-              export OPENSSL_STATIC=1
-              $PY -m pip install --upgrade pip
-              rm -rf /src/wheelhouse
-              # tests/test_extra_pins_parity.py checks this floor against
-              # pyproject: bump them together.
-              $PY -m pip wheel --no-deps --wheel-dir /src/wheelhouse "cryptography>=48"
-              # Prove the wheel seals X-Wing through the daemon itself, the
-              # same probe the binary lanes run, before it is handed to an
-              # image build.
-              $PY -m pip install /src/wheelhouse/cryptography-*.whl
-              $PY -m pip install .
-              $PY pyinstaller/verify_extra.py cryptography
-              # And prove the link: an extension that still names libssl or
-              # libcrypto as a shared dependency is not self-contained. The
-              # full NEEDED list goes to the log first, so the log records
-              # what the wheel asks of an image. readelf writes to a file in
-              # a command of its own, so an image without readelf fails the
-              # row here instead of passing an unread gate.
-              ext=$($PY -c "import cryptography.hazmat.bindings._rust as m; print(m.__file__)")
-              readelf -d "$ext" > /tmp/cryptography.dyn
-              grep NEEDED /tmp/cryptography.dyn || true
-              if grep -E "NEEDED.*lib(ssl|crypto)" /tmp/cryptography.dyn; then
-                echo "FAIL: the wheel links OpenSSL dynamically" >&2
-                exit 1
-              fi
-              chmod -R a+rX /src/wheelhouse
-              ls -l /src/wheelhouse
-            '
-      - name: Make the caches readable by the cache save
-        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
-        run: |
-          set -euo pipefail
-          for d in wheelhouse .openssl-${{ matrix.arch }}; do
-            if [ -d "$d" ]; then
-              sudo chown -R "$(id -u):$(id -g)" "$d"
-            fi
-          done
-      - name: Save the wheel (trunk only)
-        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
-        uses: actions/cache/save@v6.1.0
-        with:
-          path: wheelhouse
-          key: pq-wheel-${{ matrix.libc }}-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', 'pyinstaller/build_openssl.sh', '.github/workflows/release.yml') }}
-      - name: Save the OpenSSL build (manylinux rows, trunk only)
-        if: ${{ matrix.manylinux && steps.wheel-cache.outputs.cache-hit != 'true' && steps.openssl-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
-        uses: actions/cache/save@v6.1.0
-        with:
-          path: .openssl-${{ matrix.arch }}
-          key: openssl-pqwheel-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: pq-wheel-${{ matrix.libc }}-${{ matrix.arch }}
-          path: wheelhouse/cryptography-*.whl
-          if-no-files-found: error
-          retention-days: 7
+    needs: [version, preflight]
+    uses: ./.github/workflows/build-pq-wheels.yml
+    with:
+      matrix: '[{"libc": "glibc", "arch": "i686", "platform": "linux/386", "image": "python:3.11-slim-trixie"}, {"libc": "glibc", "arch": "riscv64", "platform": "linux/riscv64", "image": "python:3.11-slim-trixie", "qemu": true}, {"libc": "glibc", "arch": "s390x", "platform": "linux/s390x", "image": "quay.io/pypa/manylinux_2_28_s390x:2026.08.15-1", "qemu": true, "manylinux": "1"}]'
+      version: ${{ needs.version.outputs.new }}
+      release: ${{ needs.version.outputs.release == 'true' }}
+      cryptography: ${{ needs.preflight.outputs.cryptography }}
+      crypto-sha: ${{ needs.preflight.outputs.crypto-sha }}
 
-  # The cryptography wheel for the glibc ARMv6 binary (binaries-arm-legacy),
-  # the Raspberry Pi 1 and Zero. Its own job rather than a pq-wheels row
-  # because the docker gate waits on every pq-wheels row, and this one is
-  # the slowest compile in the workflow: the whole Rust build runs under an
-  # emulated ARM1176, which is hours. Here it holds up nothing but the
-  # armv6 binary, and with continue-on-error it cannot fail a release; a
-  # row that times out leaves the binary on x25519.
-  #
-  # Built in the same Raspbian image, under the same QEMU_CPU pin and the
-  # same _PYTHON_HOST_PLATFORM, as the binary it goes into, so the wheel
-  # carries the linux_armv6l tag the lane resolves and was compiled by the
-  # toolchain that produced everything else in that bundle. The Rust comes
-  # from rustup for the arm-unknown-linux-gnueabihf host (ARMv6 + VFPv2,
-  # the Pi 1 target), fetched by that name: the generic installer reads
-  # uname, which says armv7l under QEMU, and would pick a toolchain whose
-  # own binaries fault on this core. OpenSSL 3.5 is built from source with
-  # no-asm (see build_openssl.sh) and linked statically, and the extension
-  # is checked for its ARM tags before it ships: the lane's elf_floor gate
-  # would fail the whole binary on a v7 member, and this job is where a
-  # bad wheel must stop instead. Cached across pushes like the others.
+  pq-wheels-musl:
+    needs: [version, preflight]
+    uses: ./.github/workflows/build-pq-wheels.yml
+    with:
+      matrix: '[{"libc": "musl", "arch": "i686", "platform": "linux/386", "image": "python:3.11-alpine3.23"}, {"libc": "musl", "arch": "armv7", "platform": "linux/arm/v7", "image": "python:3.11-alpine3.23", "qemu": true}, {"libc": "musl", "arch": "ppc64le", "platform": "linux/ppc64le", "image": "python:3.11-alpine3.23", "qemu": true}, {"libc": "musl", "arch": "s390x", "platform": "linux/s390x", "image": "python:3.11-alpine3.23", "qemu": true}, {"libc": "musl", "arch": "riscv64", "platform": "linux/riscv64", "image": "python:3.11-alpine3.23", "qemu": true}]'
+      version: ${{ needs.version.outputs.new }}
+      release: ${{ needs.version.outputs.release == 'true' }}
+      cryptography: ${{ needs.preflight.outputs.cryptography }}
+      crypto-sha: ${{ needs.preflight.outputs.crypto-sha }}
+
   pq-wheel-armv6:
-    needs: version
+    needs:
+      - version
+      - preflight
     runs-on: ubuntu-24.04
     continue-on-error: true
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Restore a cached wheel
-        # A release rebuilds, as pq-wheels does.
-        if: ${{ needs.version.outputs.release != 'true' }}
-        id: wheel-cache
-        uses: actions/cache/restore@v6.1.0
+      - name: Download resolved cryptography source
+        uses: actions/download-artifact@v8.0.1
         with:
-          path: wheelhouse
-          key: pq-wheel-glibc-armv6-${{ hashFiles('pyproject.toml', 'pyinstaller/build_openssl.sh', '.github/workflows/release.yml') }}
-      - if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
-        uses: docker/setup-qemu-action@v4.3.0
+          name: release-inputs
+          path: release-inputs
+      - uses: docker/setup-qemu-action@v4.3.0
       - name: Pull the build image
-        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
           . .github/scripts/retry.sh
           # NOT pull_base: a third-party image (see binaries-arm-legacy).
           retry 5 docker pull --platform linux/arm/v6 tianon/raspbian:bookworm-slim
+          echo "digest=$(docker image inspect --format '{{.Id}}' tianon/raspbian:bookworm-slim)" >> "$GITHUB_OUTPUT"
+        id: image
+      - name: Restore ARMv6 compiler work
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .pq-cache
+          key: armv6-work-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/release.yml') }}
+        continue-on-error: true
       - name: Build the cryptography wheel (glibc armv6)
-        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         run: |
@@ -3433,22 +3539,23 @@ jobs:
               retry 5 /v/bin/pip install --upgrade pip setuptools wheel
               retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup-init https://static.rust-lang.org/rustup/dist/arm-unknown-linux-gnueabihf/rustup-init
               chmod +x /tmp/rustup-init
-              env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup /tmp/rustup-init -y \
+              env CARGO_HOME=/src/.pq-cache/cargo RUSTUP_HOME=/opt/rustup /tmp/rustup-init -y \
                 --default-host arm-unknown-linux-gnueabihf --default-toolchain stable \
                 --profile minimal --no-modify-path
-              PATH=/opt/cargo/bin:$PATH
-              CARGO_HOME=/opt/cargo
+              PATH=/src/.pq-cache/cargo/bin:$PATH
+              CARGO_HOME=/src/.pq-cache/cargo
               RUSTUP_HOME=/opt/rustup
               export PATH CARGO_HOME RUSTUP_HOME
               rustc -vV
-              BUILD_OPENSSL_CONFIG_EXTRA=no-asm sh pyinstaller/build_openssl.sh /opt/openssl
-              OPENSSL_DIR=/opt/openssl
+              BUILD_OPENSSL_CONFIG_EXTRA=no-asm sh pyinstaller/build_openssl.sh /src/.pq-cache/openssl
+              OPENSSL_DIR=/src/.pq-cache/openssl
               OPENSSL_STATIC=1
               export OPENSSL_DIR OPENSSL_STATIC
+              toolchain=$(/v/bin/python .github/scripts/compiler_fingerprint.py)
+              export CARGO_TARGET_DIR="/src/.pq-cache/target/$toolchain"
               rm -rf /src/wheelhouse
-              # tests/test_extra_pins_parity.py checks this floor against
-              # pyproject: bump them together.
-              /v/bin/pip wheel --no-deps --wheel-dir /src/wheelhouse "cryptography>=48"
+              # The preflight resolves this source from pyproject and checks its hash.
+              /v/bin/pip wheel --no-deps --wheel-dir /src/wheelhouse /src/release-inputs/cryptography-${{ needs.preflight.outputs.cryptography }}.tar.gz
               # Prove the wheel seals X-Wing through the daemon itself, on
               # the emulated target core, before it is handed to the binary.
               /v/bin/pip install /src/wheelhouse/cryptography-*.whl
@@ -3479,18 +3586,18 @@ jobs:
               ls -l /src/wheelhouse
             '
       - name: Make the wheelhouse readable by the cache save
-        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
-          if [ -d wheelhouse ]; then
-            sudo chown -R "$(id -u):$(id -g)" wheelhouse
-          fi
-      - name: Save the wheel (trunk only)
-        if: ${{ steps.wheel-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
+          sudo chown -R "$(id -u):$(id -g)" .pq-cache wheelhouse
+          python3 .github/scripts/cache_size.py .pq-cache
+        id: cache-size
+      - name: Save ARMv6 compiler work (trunk only)
         uses: actions/cache/save@v6.1.0
         with:
-          path: wheelhouse
-          key: pq-wheel-glibc-armv6-${{ hashFiles('pyproject.toml', 'pyinstaller/build_openssl.sh', '.github/workflows/release.yml') }}
+          path: .pq-cache
+          key: armv6-work-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/release.yml') }}
+        if: github.ref == 'refs/heads/main' && steps.cache-size.outputs.fits == 'true'
+        continue-on-error: true
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: pq-wheel-glibc-armv6
@@ -3498,126 +3605,100 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Build EVERY container image (8 distros, full published arch set) build-only,
-  # no push -- the Docker half of the gate. Proves every Dockerfile still builds
-  # for every arch on every commit; `docker-push` re-runs these with a push once
-  # the whole gate passes. Uniform across PRs and releases (no secrets, no
-  # login), so a fork PR exercises it too.
-  docker:
-    # pq-wheels is best-effort (continue-on-error), so a failed wheel never
-    # holds the gate; the image then seals x25519 only on that platform.
-    needs: [version, pq-wheels]
+  # Cache maintenance is best-effort and never gates publication.
+  compiler-cache-budget:
+    needs: [pq-wheels, pq-wheels-musl, pq-wheel-armv6, binaries-mips, binaries-loong64]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'ptweezy/cronstable' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Bound compiler cache storage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/prune_ci_caches.py
+
+  # Each platform builds once. Native/wheel-independent platforms start at
+  # once; foreign platforms wait only for their libc wheel group. Assembly
+  # checks every image before the release; publishing copies those same bytes.
+  docker:
+    needs: [version, preflight]
+    uses: ./.github/workflows/build-docker.yml
+    with:
+      matrix: ${{ needs.version.outputs.docker-none }}
+      version: ${{ needs.version.outputs.new }}
+      release: ${{ needs.version.outputs.release == 'true' }}
+      zeroconf: ${{ needs.preflight.outputs.zeroconf }}
+
+  docker-glibc:
+    needs: [version, preflight, pq-wheels]
+    uses: ./.github/workflows/build-docker.yml
+    with:
+      matrix: ${{ needs.version.outputs.docker-glibc }}
+      version: ${{ needs.version.outputs.new }}
+      release: ${{ needs.version.outputs.release == 'true' }}
+      zeroconf: ${{ needs.preflight.outputs.zeroconf }}
+
+  docker-musl:
+    needs: [version, preflight, pq-wheels-musl]
+    uses: ./.github/workflows/build-docker.yml
+    with:
+      matrix: ${{ needs.version.outputs.docker-musl }}
+      version: ${{ needs.version.outputs.new }}
+      release: ${{ needs.version.outputs.release == 'true' }}
+      zeroconf: ${{ needs.preflight.outputs.zeroconf }}
+
+  docker-assemble:
+    needs: [version, docker, docker-glibc, docker-musl]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
-      fail-fast: false  # one distro failing must not cancel the others
-      # the canonical rows live in .github/docker-matrix.json (emitted by the
-      # `version` job so `docker-push` consumes the identical list); notes on
-      # per-distro platform coverage (e.g. distroless being amd64/arm64 only:
-      # its base publishes no ppc64le/s390x manifest) live beside the rows.
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
+      max-parallel: 8
       matrix:
         include: ${{ fromJSON(needs.version.outputs.docker-matrix) }}
     steps:
-      # Shallow on purpose: CI always passes the VERSION build-arg, so
-      # setuptools_scm never walks history inside the build (only a plain
-      # local `docker build .` does, and that uses the builder's own git).
       - uses: actions/checkout@v7.0.1
-      # The cryptography wheels pq-wheels built for the platforms PyPI has
-      # none for, sorted into docker/wheelhouse/<libc>/ for the Dockerfiles
-      # to COPY. A missing artifact (that row failed) leaves its platform
-      # on x25519; nothing here may fail the gate over it.
-      - name: Fetch the post-quantum wheelhouse
-        continue-on-error: true
-        uses: actions/download-artifact@v7.0.0
+      - uses: actions/setup-python@v7.0.0
         with:
-          pattern: pq-wheel-*
-          path: pq-wheels
-      - name: Sort the wheelhouse by libc
+          python-version: '3.14'
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: image-${{ matrix.distro }}-linux-*
+          path: images
+      - name: Validate and assemble OCI manifests
+        env:
+          VERSION: ${{ needs.version.outputs.new }}
+          DISTRO: ${{ matrix.distro }}
+          PLATFORMS: ${{ matrix.platforms }}
         run: |
           set -euo pipefail
-          # The ARMv6 wheel is for the binaries-arm-legacy lane, not the
-          # images (no image targets ARMv6). Keeping it out means the gate
-          # build and the release build see the same wheelhouse, so the
-          # layers the gate cached are the layers the release pushes.
-          rm -rf pq-wheels/pq-wheel-glibc-armv6
-          for d in pq-wheels/pq-wheel-*; do
-            [ -d "$d" ] || continue
-            case "$(basename "$d")" in
-              pq-wheel-musl-*) dest=docker/wheelhouse/musl ;;
-              *) dest=docker/wheelhouse/glibc ;;
-            esac
-            cp "$d"/cryptography-*.whl "$dest"/
-          done
-          ls -lR docker/wheelhouse
-      - uses: docker/setup-qemu-action@v4.3.0
-      - uses: docker/setup-buildx-action@v4.3.0
-      - name: Build image (build-only gate)
-        uses: docker/build-push-action@v7.3.0
+          python .github/scripts/oci_images.py --inputs images --distro "$DISTRO" \
+            --platforms "$PLATFORMS" --version "$VERSION" --revision "$GITHUB_SHA" --output layout
+          tar -cf image.tar -C layout .
+          sha256sum image.tar > image.sha256
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y skopeo
+          skopeo copy --all --preserve-digests oci-archive:image.tar:release oci:verified:release
+      - uses: actions/upload-artifact@v7.0.1
+        if: needs.version.outputs.release == 'true'
         with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          platforms: ${{ matrix.platforms }}
-          push: false
-          tags: cronstable:ci-${{ matrix.distro }}
-          # DEPS_REFRESH: every Dockerfile keeps its toolchain + dependency
-          # layers independent of the source tree (keyed on pyproject.toml
-          # plus the shared extraction helper), so on an ordinary commit the
-          # QEMU-expensive dependency compiles come out of the layer cache
-          # and only the project install rebuilds. On a RELEASE this arg (the
-          # run id) misses those layers on purpose: a release re-resolves
-          # every dependency fresh from the index, exactly the freshness
-          # releases had when each push rebuilt the whole builder stage, and
-          # `docker-push` below (same run, same arg) then reuses these fresh
-          # layers instead of rebuilding them.
-          build-args: |
-            VERSION=${{ needs.version.outputs.new }}
-            PYTHON_VARIANT=${{ matrix.python_variant }}
-            DEPS_REFRESH=${{ needs.version.outputs.release == 'true' && github.run_id || '' }}
-          provenance: false
-          # Scope the GHA cache per distro so the builds don't clobber each
-          # other's layers (and warm the cache for the release `docker-push`).
-          cache-from: type=gha,scope=${{ matrix.distro }}
-          # Only the two long-lived branches WRITE cache; every other branch and
-          # every PR reads. The GHA cache is 10 GB per repository and 8 distros
-          # at mode=max is most of that on its own, so with every branch
-          # exporting too the repo sat over quota (11.4 GB across 429 entries)
-          # and GitHub evicted entries continuously. That eviction is what broke
-          # the 1.2.31 release: an export references blobs a concurrent eviction
-          # has already removed, and buildx then fails the whole build with
-          # `not_found`, after every layer has already built successfully. A
-          # branch that writes nothing still reads, falling back to the default
-          # branch's entries, so the only thing given up here is the quota.
-          #
-          # The Dockerfiles' layer split (dependencies keyed on pyproject.toml
-          # plus the shared extraction helper, source copied only at the
-          # bottom) also calms the quota: the fat dependency layers are stable
-          # across commits, so an export mostly re-references blobs that are
-          # already stored instead of writing a fresh multi-GB set per push
-          # the way the old source-first layout did.
-          #
-          # ignore-error is the second line of defence. A cache export is an
-          # optimization; it must never be able to red a build that succeeded.
-          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope={0},ignore-error=true', matrix.distro) || '' }}
+          name: docker-release-${{ matrix.distro }}
+          path: |
+            image.tar
+            image.sha256
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
 
-  # Paired performance benchmark. The suite in benchmarks/ runs against BOTH
-  # this commit and the latest published release tag, interleaved on one
-  # runner so machine noise cancels out of the comparison, and
-  # benchmarks/compare.py then diffs the two sides and enforces each metric's
-  # declared regression limit (a regression must also clear the metric's
-  # measured round-to-round noise band to gate, so jitter cannot fail a
-  # release). It runs on every event, in the same fan-out as
-  # the builds. Enforcement is release-only: the `release` job needs this one,
-  # so a gated regression blocks publishing, while on an ordinary commit the
-  # identical comparison merely warns (a branch experiment is never blocked by
-  # a perf cost its author already knows about). An intentional regression
-  # ships by starting a pushed commit's SUBJECT with [perf:accept] (scanned
-  # exactly like the [release] marker: subjects only, never bodies), and a
-  # release that must go out whatever the numbers say starts one with
-  # [perf:ignore] or picks perf=ignore on the dispatch form; the `version`
-  # job resolves both into one mode (see its decide step). The artifact this
-  # job uploads (chart + summary + raw results) is what the `release` job
-  # attaches to the GitHub Release and appends to its notes.
   perf:
-    needs: version
+    needs:
+      - version
+      - preflight
     runs-on: ubuntu-latest
     # perf=ignore: a perf job that fails for ANY reason (a gated regression
     # is already a warning under that mode, so this covers a crashed bench,
@@ -3903,10 +3984,8 @@ jobs:
   # is not the path this step asserts, and binaries-windows' native smoke
   # already proved the .wxs semantics this same run on each unsigned twin.
   #
-  # Missing secrets warn and the release ships unsigned, the macOS
-  # lane's rule. A signing failure with the secrets present fails the
-  # release: shipping unsigned silently while signing is configured is
-  # the stale-tap failure mode.
+  # Preflight requires all six signing secrets. Missing credentials or a
+  # signing/scan failure block publication, as WinGet requires signed MSIs.
   sign-windows:
     needs: [version, binaries-windows]
     if: needs.version.outputs.release == 'true'
@@ -3951,12 +4030,12 @@ jobs:
             [ -n "${!name:-}" ] || missing="$missing $name"
           done
           if [ -n "$missing" ]; then
-            echo "::warning::Windows signing secrets not configured (missing:$missing); shipping unsigned Windows binaries. See wiki/Contributing-and-Releasing.md."
-            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Windows signing secrets missing:$missing; WinGet requires signed installers."
+            exit 1
           else
             echo "signed=true" >> "$GITHUB_OUTPUT"
           fi
-      # The six Windows artifacts, flattened. The MSIs ride along for
+      # The twelve Windows artifacts, flattened. The MSIs ride along for
       # the pattern but are rebuilt below; an MSI's payload cannot be
       # swapped after the fact.
       - name: Download Windows artifacts
@@ -4119,6 +4198,57 @@ jobs:
             "/c/Program Files/cronstable/cronstable.exe" --version
             msi_uninstall "$msi" signed-uninstall.log
           done
+      # Validate WinGet artifacts while the other platform builds run.
+      # A failure blocks publication through release's sign-windows dependency.
+      - name: Prepare winget checksums
+        if: steps.decide.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum cronstable-windows-amd64.msi cronstable-windows-arm64.msi > SHA256SUMS
+      - name: Verify and Defender-scan winget installers
+        if: steps.decide.outputs.signed == 'true'
+        timeout-minutes: 20
+        shell: pwsh
+        run: ./.github/scripts/prepare_winget.ps1 -AssetDirectory out -OutputDirectory winget-validation -WixCommand "$env:USERPROFILE/.dotnet/tools/wix.exe"
+      - name: Generate winget manifests
+        if: steps.decide.outputs.signed == 'true'
+        env:
+          VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          python -m pip install strictyaml==1.7.3
+          python .github/scripts/render_winget.py "$VERSION" winget-validation/metadata.json winget-manifests
+      - name: Validate with the winget client
+        if: steps.decide.outputs.signed == 'true'
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+            Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser
+            Repair-WinGetPackageManager
+          }
+          $client = Get-Command winget.exe -ErrorAction SilentlyContinue
+          if ($client) {
+            & $client.Source validate --manifest winget-manifests --disable-interactivity
+          } else {
+            $package = Get-AppxPackage Microsoft.DesktopAppInstaller
+            & (Join-Path $package.InstallLocation 'winget.exe') validate --manifest winget-manifests --disable-interactivity
+          }
+          if ($LASTEXITCODE -ne 0) { throw "winget validate failed ($LASTEXITCODE)" }
+      - name: Preserve winget validation evidence
+        if: always() && steps.decide.outputs.signed == 'true'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: winget-validation
+          path: |
+            winget-validation/*.log
+            winget-validation/*.wxs
+            winget-validation/metadata.json
+            winget-manifests/*.yaml
+          if-no-files-found: warn
+          retention-days: 14
       - name: Upload the signed set
         if: steps.decide.outputs.signed == 'true'
         uses: actions/upload-artifact@v7.0.1
@@ -4145,12 +4275,39 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  release:
+  packages:
+    needs: [version, binaries, binaries-container, binaries-loong64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: cronstable-linux-*
+          merge-multiple: true
+          path: binaries
+      - name: Build .deb, .rpm and .apk packages
+        run: |
+          set -euo pipefail
+          # Development artifacts use the same numeric package version as the MSIs.
+          package_version="$(printf '%s' "$VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+          bash .github/scripts/build_packages.sh "$package_version" binaries
+        env:
+          VERSION: ${{ needs.version.outputs.new }}
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: linux-packages
+          path: |
+            binaries/*.deb
+            binaries/*.rpm
+            binaries/*.apk
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
+  release-prepare:
     needs:
       - version
-      - tox
-      - tox-static
-      - licenses
       - dist
       - binaries
       - binaries-container
@@ -4164,13 +4321,12 @@ jobs:
       - binaries-illumos
       - binaries-windows
       - sign-windows
-      - docker
       - perf
+      - preflight
+      - packages
+      - binaries-armel
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   # push the tag and create the GitHub Release
-      id-token: write   # PyPI Trusted Publishing (OIDC)
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -4184,60 +4340,6 @@ jobs:
           name: dist
           path: dist
 
-      - name: Publish to PyPI (Trusted Publishing)
-        uses: pypa/gh-action-pypi-publish@v1.14.2
-        with:
-          # Idempotent re-runs: the publish precedes the tag/Release below, so if
-          # a later step fails (e.g. the tag push) the version is already on PyPI.
-          # skip-existing makes re-running the workflow a no-op on the upload
-          # instead of a hard "file already exists" failure, so the tag + Release
-          # can be completed on a retry without burning the version.
-          skip-existing: true
-
-      # Everything below runs only after PyPI has accepted the upload.
-      - name: Tag the release
-        env:
-          NEW: ${{ needs.version.outputs.new }}
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # On a re-run the tag is already on the remote: skip it when it names
-          # HEAD, fail when it names another commit. ls-remote peels the annotated
-          # tag to its commit, which a shallow checkout cannot do locally.
-          existing="$(git ls-remote --tags origin "refs/tags/$NEW^{}" "refs/tags/$NEW" | tail -n1 | cut -f1)"
-          if [ -n "$existing" ]; then
-            if [ "$existing" = "$(git rev-parse HEAD)" ]; then
-              echo "tag $NEW already points at HEAD; skipping"
-              exit 0
-            fi
-            echo "::error::tag $NEW already exists at $existing, not HEAD $(git rev-parse HEAD)"
-            exit 1
-          fi
-          git tag -a "$NEW" -m "Release $NEW"
-          # The default GITHUB_TOKEN is the GitHub Actions *App*, and GitHub
-          # forbids an App from pushing a ref that creates/updates any file under
-          # .github/workflows/ unless the token carries the `workflows` scope --
-          # which is NOT grantable to GITHUB_TOKEN. This release tag points at a
-          # commit that may itself modify this workflow, so pushing it with
-          # GITHUB_TOKEN is rejected. Push instead with RELEASE_TOKEN -- a PAT or
-          # GitHub App token with `workflow` scope (fine-grained: Contents +
-          # Workflows: write) -- exactly like the cross-repo Homebrew push uses
-          # HOMEBREW_TAP_TOKEN. If it is unset we fall back to GITHUB_TOKEN with a
-          # warning (works only when the tagged commit doesn't touch
-          # .github/workflows/).
-          if [ -n "${RELEASE_TOKEN:-}" ]; then
-            git push "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$NEW"
-          else
-            echo "::warning::RELEASE_TOKEN not set; pushing the tag with the default GITHUB_TOKEN. This FAILS if the tagged commit modifies .github/workflows/ -- set RELEASE_TOKEN (Contents + Workflows: write) to fix."
-            git push origin "refs/tags/$NEW"
-          fi
-
-      # Pull in every per-arch binary the gate built (fast + slow). The pattern
-      # is broad and flattens them into ./binaries; the CI-only macOS 26 assets
-      # (cronstable-macos26-*) land here too but are neither hashed nor attached
-      # below (the lists are explicit).
       - name: Download release binaries
         uses: actions/download-artifact@v8.0.1
         with:
@@ -4245,7 +4347,7 @@ jobs:
           pattern: cronstable-*
           merge-multiple: true
 
-      # On a signed release, replace the six Windows files before
+      # Replace the twelve Windows files with their signed versions before
       # anything hashes or attaches them, so SHA256SUMS, the Release
       # assets and the winget manifests describe the signed bytes.
       # Gated on the sign job's output because this job cannot see the
@@ -4258,19 +4360,13 @@ jobs:
           name: signed-windows
           path: binaries
 
-      # Distro packages for the glibc Linux binaries, built from the exact
-      # bytes above (the signed-Windows overlay does not touch these). One
-      # second for the whole set: nfpm never executes the payload, so no
-      # emulation is involved and this needs no job of its own. It comes
-      # AFTER the overlay and BEFORE the hashing so SHA256SUMS and the
-      # Release describe the same files.
-      - name: Build .deb, .rpm and .apk packages
-        run: bash .github/scripts/build_packages.sh "${{ needs.version.outputs.new }}" binaries
-
-      # One SHA256SUMS over the dist + every SHIPPED binary (bare filenames, so
-      # `sha256sum -c` works from any directory). Enumerated explicitly -- a
-      # `cronstable-*` glob would fold the CI-only macOS 26 binaries into the
-      # shipped manifest.
+      # Packaging ran as soon as its Linux inputs finished. Hash the exact
+      # prebuilt files that will be attached to the release.
+      - name: Download Linux packages
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: linux-packages
+          path: binaries
       - name: Generate SHA256SUMS
         run: |
           set -euo pipefail
@@ -4407,17 +4503,128 @@ jobs:
       # (same requirement the binary lanes installed, resolved within this
       # run) plus the notice file, so the Release page itself provides the
       # license text and equivalent access to the library source next to
-      # the binaries that bundle it. --no-deps on purpose: only zeroconf is
+      # the binaries that bundle it. Only zeroconf is
       # LGPL; its dependencies are permissive and covered by the licenses
       # gate. See LICENSING.md.
-      - name: Fetch python-zeroconf source (LGPL source offer)
+      - name: Download resolved source archives
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: release-inputs
+          path: release-inputs
+      - name: Prepare source offer and Homebrew formula
         run: |
           set -euo pipefail
-          mkdir -p third-party
-          python3 -m pip download "zeroconf>=0.149.16" --no-deps --no-binary :all: -d third-party
-          cp cronstable/licenses/THIRD-PARTY-NOTICES.txt third-party/
-          ls -l third-party
+          cp -R release-inputs/third-party .
+          mkdir -p homebrew
+          bash packaging/homebrew/render-formula.sh "${{ needs.version.outputs.new }}" SHA256SUMS \
+            packaging/homebrew/cronstable.rb.tmpl > homebrew/cronstable.rb
+          ruby -c homebrew/cronstable.rb
+      - name: Preserve prepared release
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: prepared-release
+          path: |
+            dist/
+            binaries/
+            SHA256SUMS
+            scoop/
+            homebrew/
+            perf/
+            third-party/
+            release-notes.md
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve validated Homebrew formula
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: homebrew-formula
+          path: homebrew/cronstable.rb
+          if-no-files-found: error
+          retention-days: 7
+    timeout-minutes: 20
 
+  release:
+    needs:
+      - version
+      - tox
+      - tox-static
+      - licenses
+      - release-prepare
+      - docker-assemble
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the tag and create the GitHub Release
+      id-token: write   # PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      # The wheel + sdist built (and twine-checked) by `dist`: publish these
+      # exact bytes rather than rebuilding.
+      - name: Download prepared release
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: prepared-release
+          path: .
+      - name: Verify prepared artifact checksums
+        run: python3 .github/scripts/verify_release_checksums.py
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          # Idempotent re-runs: the publish precedes the tag/Release below, so if
+          # a later step fails (e.g. the tag push) the version is already on PyPI.
+          # skip-existing makes re-running the workflow a no-op on the upload
+          # instead of a hard "file already exists" failure, so the tag + Release
+          # can be completed on a retry without burning the version.
+          skip-existing: true
+
+      # Everything below runs only after PyPI has accepted the upload.
+      - name: Tag the release
+        env:
+          NEW: ${{ needs.version.outputs.new }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # On a re-run the tag is already on the remote: skip it when it names
+          # HEAD, fail when it names another commit. ls-remote peels the annotated
+          # tag to its commit, which a shallow checkout cannot do locally.
+          existing="$(git ls-remote --tags origin "refs/tags/$NEW^{}" "refs/tags/$NEW" | tail -n1 | cut -f1)"
+          if [ -n "$existing" ]; then
+            if [ "$existing" = "$(git rev-parse HEAD)" ]; then
+              echo "tag $NEW already points at HEAD; skipping"
+              exit 0
+            fi
+            echo "::error::tag $NEW already exists at $existing, not HEAD $(git rev-parse HEAD)"
+            exit 1
+          fi
+          git tag -a "$NEW" -m "Release $NEW"
+          # The default GITHUB_TOKEN is the GitHub Actions *App*, and GitHub
+          # forbids an App from pushing a ref that creates/updates any file under
+          # .github/workflows/ unless the token carries the `workflows` scope --
+          # which is NOT grantable to GITHUB_TOKEN. This release tag points at a
+          # commit that may itself modify this workflow, so pushing it with
+          # GITHUB_TOKEN is rejected. Push instead with RELEASE_TOKEN -- a PAT or
+          # GitHub App token with `workflow` scope (fine-grained: Contents +
+          # Workflows: write) -- exactly like the cross-repo Homebrew push uses
+          # HOMEBREW_TAP_TOKEN. If it is unset we fall back to GITHUB_TOKEN with a
+          # warning (works only when the tagged commit doesn't touch
+          # .github/workflows/).
+          if [ -n "${RELEASE_TOKEN:-}" ]; then
+            git push "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$NEW"
+          else
+            echo "::warning::RELEASE_TOKEN not set; pushing the tag with the default GITHUB_TOKEN. This FAILS if the tagged commit modifies .github/workflows/ -- set RELEASE_TOKEN (Contents + Workflows: write) to fix."
+            git push origin "refs/tags/$NEW"
+          fi
+
+      # Pull in every per-arch binary the gate built (fast + slow). The pattern
+      # is broad and flattens them into ./binaries; the CI-only macOS 26 assets
+      # (cronstable-macos26-*) land here too but are neither hashed nor attached
+      # below (the lists are explicit).
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3.0.3
         with:
@@ -4526,17 +4733,17 @@ jobs:
             binaries/cronstable-windows-arm64.msi
             binaries/cronstable-windows-i686.msi
 
-  # Build + push the multi-arch container images at the just-released version.
-  # Runs after `release` (so the tag it checks out exists) and is thus gated on
-  # the whole build+test gate, including the `docker` build-only job, via
+    timeout-minutes: 20
+
+  # Copy the validated multi-arch images at the just-released version.
+  # Runs after `release` and is gated on all build/assembly validation via
   # `needs: release`. Pushes one image per distro to GHCR (and Docker Hub when
   # the DOCKERHUB_* secrets are set); the Debian image owns the bare
   # `latest`/`<version>` tags, the variants get `-<distro>` suffixes.
   docker-push:
-    # pq-wheels for the wheelhouse artifacts (best-effort there, so it
-    # never blocks this job through `needs`; a row that failed just leaves
-    # its platform on x25519, as it did in the gate build).
-    needs: [version, release, pq-wheels]
+    needs:
+      - version
+      - release
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -4560,11 +4767,7 @@ jobs:
           set -euo pipefail
           images="ghcr.io/${REPO,,}"   # GHCR image names must be lowercase
           dockerhub=false
-          # Require BOTH secrets before enabling Docker Hub. Gating on the
-          # username alone would, in the half-configured case, still try the
-          # Docker Hub login -- which fails and aborts the whole job, taking the
-          # otherwise-safe GHCR push down with it. Demanding both degrades
-          # cleanly to GHCR-only.
+          # Preflight requires a complete pair when Docker Hub is configured.
           if [ -n "${DOCKERHUB_USERNAME:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
             images="${images}"$'\n'"docker.io/${DOCKERHUB_USERNAME}/cronstable"
             dockerhub=true
@@ -4575,38 +4778,6 @@ jobs:
             echo "$images"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-
-      # Shallow on purpose: the VERSION build-arg pins the version, so
-      # setuptools_scm never walks history inside the build.
-      - uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ needs.version.outputs.new }}  # the tag `release` just pushed
-
-      # The same wheelhouse the gate `docker` job built with, so the layers
-      # this run cached are the layers pushed (see that job).
-      - name: Fetch the post-quantum wheelhouse
-        continue-on-error: true
-        uses: actions/download-artifact@v7.0.0
-        with:
-          pattern: pq-wheel-*
-          path: pq-wheels
-      - name: Sort the wheelhouse by libc
-        run: |
-          set -euo pipefail
-          # The ARMv6 wheel is for the binaries-arm-legacy lane, not the
-          # images (no image targets ARMv6). Keeping it out means the gate
-          # build and the release build see the same wheelhouse, so the
-          # layers the gate cached are the layers the release pushes.
-          rm -rf pq-wheels/pq-wheel-glibc-armv6
-          for d in pq-wheels/pq-wheel-*; do
-            [ -d "$d" ] || continue
-            case "$(basename "$d")" in
-              pq-wheel-musl-*) dest=docker/wheelhouse/musl ;;
-              *) dest=docker/wheelhouse/glibc ;;
-            esac
-            cp "$d"/cryptography-*.whl "$dest"/
-          done
-          ls -lR docker/wheelhouse
 
       - name: Docker metadata
         id: meta
@@ -4640,51 +4811,26 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: docker/setup-qemu-action@v4.3.0
-      - uses: docker/setup-buildx-action@v4.3.0
-
-      - name: Build and push
-        uses: docker/build-push-action@v7.3.0
+      - name: Download validated OCI image
+        uses: actions/download-artifact@v8.0.1
         with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          platforms: ${{ matrix.platforms }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # DEPS_REFRESH matches the gate `docker` job's release-run value
-          # (this job only runs on releases, where the gate passed the run
-          # id), so the freshly resolved dependency layers built minutes ago
-          # in this same run are what get pushed, not older cached ones.
-          build-args: |
-            VERSION=${{ needs.version.outputs.new }}
-            PYTHON_VARIANT=${{ matrix.python_variant }}
-            DEPS_REFRESH=${{ github.run_id }}
-          provenance: false
-          # Reuse the layers the gate `docker` job just cached (same per-distro
-          # scope), so this is mostly manifest assembly + push.
-          cache-from: type=gha,scope=${{ matrix.distro }}
-          # Read-only on purpose. The gate `docker` job exported these exact
-          # layers to this exact scope minutes ago in this same run, so an
-          # export here rewrites bytes that are already cached, at the cost of
-          # more pressure on a 10 GB quota whose overflow is what broke the
-          # previous release (see that job for the full story). This is also the
-          # publish path, the worst possible place to keep a step that can fail
-          # on something as incidental as a cache write.
-          cache-to: ""
+          name: docker-release-${{ matrix.distro }}
+          path: .
+      - name: Publish the validated image without rebuilding
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          sha256sum -c image.sha256
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y skopeo
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            skopeo copy --all --preserve-digests --retry-times 3 \
+              --authfile "$HOME/.docker/config.json" oci-archive:image.tar:release "docker://$tag"
+          done <<< "$TAGS"
+    timeout-minutes: 30
 
-  # Push the just-released version to the Homebrew tap (ptweezy/homebrew-tap) so
-  # `brew install ptweezy/tap/cronstable` and `brew upgrade` track releases with
-  # no manual step. Re-renders Formula/cronstable.rb from the template in this
-  # repo, pinning each binary's SHA256 from the SHA256SUMS the `release` job
-  # published (it covers the macOS + linux glibc amd64/arm64 sums this formula
-  # needs).
-  #
-  # Cross-repo pushes need a token the default GITHUB_TOKEN can't provide: set a
-  # repo secret HOMEBREW_TAP_TOKEN to a PAT (fine-grained, Contents: read/write
-  # on ptweezy/homebrew-tap is enough). If it is unset the job fails loudly
-  # rather than leaving the tap stale (the step below says why); this header
-  # described the older warn-and-skip behaviour long after it changed.
   homebrew:
     needs: [version, release]
     if: needs.version.outputs.release == 'true'
@@ -4692,6 +4838,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1    # for the formula template + render script
 
+      - name: Download validated Homebrew formula
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: homebrew-formula
+          path: prepared
       - name: Update Homebrew tap formula
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -4708,11 +4859,6 @@ jobs:
             exit 1
           fi
 
-          # Fetch the checksums this release just published (retry: the asset can
-          # lag the API by a few seconds after the release is created).
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o SHA256SUMS \
-            "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/SHA256SUMS"
-
           # Retried through a function, not inline: the helper names the failed
           # command in its warning, and the clone URL carries the tap token.
           # The rm makes a retry idempotent (git refuses a non-empty target, so
@@ -4725,8 +4871,7 @@ jobs:
           }
           retry 5 clone_tap
           mkdir -p tap/Formula
-          bash packaging/homebrew/render-formula.sh \
-            "$VERSION" SHA256SUMS packaging/homebrew/cronstable.rb.tmpl > tap/Formula/cronstable.rb
+          cp prepared/cronstable.rb tap/Formula/cronstable.rb
 
           cd tap
           git config user.name  "github-actions[bot]"
@@ -4744,8 +4889,8 @@ jobs:
           git push
 
   # Submit the ptweezy.cronstable manifest to microsoft/winget-pkgs for each
-  # release. Generate manifests from the published signed MSIs and scan the
-  # installers and their payloads with Defender before submitting them.
+  # release. Use the manifests validated by sign-windows and verify that the
+  # published installer hashes match the scanned files before submission.
   #
   # WINGET_TOKEN is a classic PAT with public_repo scope. Its account creates
   # the fork and PRs. After submission succeeds, cleanup closes that account's
@@ -4780,50 +4925,17 @@ jobs:
             --dir winget-assets --pattern SHA256SUMS \
             --pattern cronstable-windows-amd64.msi \
             --pattern cronstable-windows-arm64.msi
-      - name: Install the MSI extractor
-        run: |
-          set -euo pipefail
-          wix_version="$(sed -n 's/^WIX_TOOL_VERSION=//p' .github/scripts/build_msi.sh)"
-          test -n "$wix_version"
-          dotnet tool install wix --tool-path .winget-tools --version "$wix_version"
-      - name: Verify and Defender-scan winget installers
-        shell: pwsh
-        run: ./.github/scripts/prepare_winget.ps1 -AssetDirectory winget-assets -OutputDirectory winget-validation -WixCommand ./.winget-tools/wix.exe
-      - name: Generate and validate winget manifests
+      - name: Download validated winget manifests
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: winget-validation
+          path: .
+      - name: Verify published winget installers match the scanned files
         env:
           VERSION: ${{ needs.version.outputs.new }}
         run: |
           set -euo pipefail
-          python -m pip install strictyaml==1.7.3
-          python .github/scripts/render_winget.py "$VERSION" winget-validation/metadata.json winget-manifests
-      - name: Validate with the winget client
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
-            Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser
-            Repair-WinGetPackageManager
-          }
-          $client = Get-Command winget.exe -ErrorAction SilentlyContinue
-          if ($client) {
-            & $client.Source validate --manifest winget-manifests --disable-interactivity
-          } else {
-            $package = Get-AppxPackage Microsoft.DesktopAppInstaller
-            & (Join-Path $package.InstallLocation 'winget.exe') validate --manifest winget-manifests --disable-interactivity
-          }
-          if ($LASTEXITCODE -ne 0) { throw "winget validate failed ($LASTEXITCODE)" }
-      - name: Preserve winget validation evidence
-        if: always()
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: winget-validation
-          path: |
-            winget-validation/*.log
-            winget-validation/*.wxs
-            winget-validation/metadata.json
-            winget-manifests/*.yaml
-          if-no-files-found: warn
-          retention-days: 14
+          python .github/scripts/verify_winget_release.py "$VERSION" winget-validation/metadata.json winget-assets
       - name: Submit winget manifest
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}

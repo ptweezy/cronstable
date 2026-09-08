@@ -51,6 +51,7 @@ ARG PYTHON_VARIANT=baseline
 COPY docker/python_runtime.py /tmp/deps/python_runtime.py
 RUN python3 /tmp/deps/python_runtime.py --variant "$PYTHON_VARIANT" --libc gnu --prefix /opt/python-runtime
 
+ARG ZEROCONF_VERSION=""
 COPY pyproject.toml /tmp/deps/pyproject.toml
 COPY docker/extract_deps.py /tmp/deps/extract_deps.py
 # The cryptography wheels the release workflow's pq-wheels job built for the

@@ -121,17 +121,23 @@ def test_docker_variants_have_separate_tags_and_caches():
         assert v3["dockerfile"] == baseline["dockerfile"]
         assert v3["platforms"] == "linux/amd64"
         assert v3["python_variant"] == "amd64v3"
-    for name in ("docker", "docker-push"):
-        build = next(
-            s
-            for s in workflow()["jobs"][name]["steps"]
-            if s.get("uses", "").startswith("docker/build-push-action@")
-        )
-        assert (
-            "PYTHON_VARIANT=${{ matrix.python_variant }}"
-            in build["with"]["build-args"]
-        )
-        assert "matrix.distro" in build["with"]["cache-from"]
+    builds = YAML(typ="safe").load(
+        (ROOT / ".github/workflows/build-docker.yml").read_text()
+    )
+    build = next(
+        s
+        for s in builds["jobs"]["build"]["steps"]
+        if s.get("uses", "").startswith("docker/build-push-action@")
+    )
+    assert (
+        "PYTHON_VARIANT=${{ matrix.python_variant }}"
+        in build["with"]["build-args"]
+    )
+    assert "matrix.distro" in build["with"]["cache-from"]
+    assert "matrix.platform_id" in build["with"]["cache-from"]
+    push = workflow()["jobs"]["docker-push"]
+    assert "docker-release-${{ matrix.distro }}" in str(push["steps"])
+    assert "docker/build-push-action" not in str(push["steps"])
 
 
 def test_docker_runtime_survives_the_final_stage():

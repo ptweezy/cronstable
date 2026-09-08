@@ -123,13 +123,40 @@ def test_submission_requires_signed_scanned_validated_msis():
     )
     job = workflow["jobs"]["winget"]
     assert {"release", "sign-windows"} <= set(job["needs"])
+    signing = workflow["jobs"]["sign-windows"]
+    assert set(signing["needs"]) == {"version", "binaries-windows"}
+    assert "sign-windows" in workflow["jobs"]["release-prepare"]["needs"]
+    assert "release-prepare" in workflow["jobs"]["release"]["needs"]
+    assert not signing.get("continue-on-error", False)
+    early = {s.get("name"): s for s in signing["steps"]}
+    early_names = list(early)
+    early_gates = [
+        "Rebuild the MSIs from the signed payload",
+        "Sign the MSIs",
+        "Verify every signature",
+        "Prepare winget checksums",
+        "Verify and Defender-scan winget installers",
+        "Generate winget manifests",
+        "Validate with the winget client",
+        "Upload the signed set",
+    ]
+    assert [early_names.index(n) for n in early_gates] == sorted(
+        early_names.index(n) for n in early_gates
+    )
+    for name in early_gates:
+        assert early[name]["if"] == "steps.decide.outputs.signed == 'true'"
+        assert not early[name].get("continue-on-error", False)
+    scan = early["Verify and Defender-scan winget installers"]["run"]
+    assert "-AssetDirectory out" in scan
+    assert ".dotnet/tools/wix.exe" in scan
+    assert "cd out" in early["Prepare winget checksums"]["run"]
+    assert "sha256sum" in early["Prepare winget checksums"]["run"]
     steps = {s.get("name"): s for s in job["steps"]}
     names = list(steps)
     gates = [
         "Download signed winget installers",
-        "Verify and Defender-scan winget installers",
-        "Generate and validate winget manifests",
-        "Validate with the winget client",
+        "Download validated winget manifests",
+        "Verify published winget installers match the scanned files",
         "Submit winget manifest",
     ]
     assert [names.index(n) for n in gates] == sorted(
@@ -144,13 +171,23 @@ def test_submission_requires_signed_scanned_validated_msis():
     assert "cronstable-windows-amd64.msi" in download["run"]
     assert "cronstable-windows-arm64.msi" in download["run"]
     assert "SHA256SUMS" in download["run"]
-    evidence = steps["Preserve winget validation evidence"]
-    assert evidence["if"] == "always()"
+    evidence = early["Preserve winget validation evidence"]
+    assert evidence["if"] == (
+        "always() && steps.decide.outputs.signed == 'true'"
+    )
     assert "*.log" in evidence["with"]["path"]
+    assert "winget-validation/metadata.json" in evidence["with"]["path"]
+    assert "winget-manifests/*.yaml" in evidence["with"]["path"]
+    download = steps["Download validated winget manifests"]["with"]
+    assert download["name"] == evidence["with"]["name"]
+    assert download["path"] == "."
     assert "wingetcreate.exe update" not in steps[gates[-1]]["run"]
-    extractor = steps["Install the MSI extractor"]["run"]
-    assert "WIX_TOOL_VERSION" in extractor
-    assert ".github/scripts/build_msi.sh" in extractor
+    verify = steps[gates[-2]]["run"]
+    assert "verify_winget_release.py" in verify
+    assert "winget-validation/metadata.json winget-assets" in verify
+    assert not any(
+        "prepare_winget.ps1" in s.get("run", "") for s in job["steps"]
+    )
 
 
 def test_preflight_payload_id_matches_msi_authoring():
