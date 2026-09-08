@@ -129,6 +129,26 @@ async def test_linear_dag_runs_to_success(tmp_path, dag_cron):
     assert _states(body) == {"a": dag.SUCCESS, "b": dag.SUCCESS}
 
 
+async def test_settle_dag_cron_drains_downstream_launches(dag_cron):
+    cron = await dag_cron(
+        _LINEAR
+        + "      - id: c\n        command: 'x'\n"
+        "        dependsOn:\n          - b\n"
+    )
+    for task_id in ("a", "b", "c"):
+        _set_cmd(cron, "lin", task_id, [_PY, "-c", "pass"])
+    run_key = await cron._dag.trigger_run("lin")
+    try:
+        await _settle_dag_cron(cron)
+        assert not any(cron.running_jobs.values())
+        assert not any(not t.done() for t in cron._pending_state_writes)
+        body = await cron._dag.get_run("lin", run_key)
+        assert body["state"] == dag.SUCCESS
+        assert _states(body) == dict.fromkeys(("a", "b", "c"), dag.SUCCESS)
+    finally:
+        await _drive(cron, "lin", run_key)
+
+
 async def test_failure_propagates_downstream(tmp_path, dag_cron):
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "import sys; sys.exit(3)"])

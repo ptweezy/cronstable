@@ -2497,6 +2497,10 @@ class Cron:
             await self.observability_mesh.stop()
             self.observability_mesh = None
         await self._wait_for_running_jobs_task
+        # Shutdown can wake an idle reaper while a scheduled job is still
+        # inside start(), before it enters running_jobs. The scheduler has
+        # finished launching by this point, so drain any such late arrivals.
+        await self._wait_for_running_jobs()
         # drain the reaper-spawned completion tasks so failure/success
         # reports still go out on a graceful stop.
         await self._drain_completions()

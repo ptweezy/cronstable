@@ -297,6 +297,7 @@ async def test_concurrency_policy(policy):
         await cron.maybe_launch_job(job)  # first instance
         first = cron.running_jobs["test"][0]
         assert first.proc.returncode is None
+        await _wait_until(lambda: bool(first.output.lines))
 
         await cron.maybe_launch_job(job)  # second launch, subject to policy
         running = cron.running_jobs["test"]
@@ -321,7 +322,10 @@ async def test_concurrency_policy(policy):
     finally:
         for rj in list(cron.running_jobs.get("test", [])):
             if rj.proc is not None and rj.proc.returncode is None:
+                # Wait for Python initialization before sending CTRL_BREAK.
+                await _wait_until(lambda: bool(rj.output.lines))
                 await rj.cancel()
+            await rj.wait()
 
 
 @pytest.mark.asyncio
@@ -365,7 +369,9 @@ async def test_concurrent_launches_cannot_double_start_a_forbid_job(
     finally:
         for rj in list(cron.running_jobs.get("test", [])):
             if rj.proc is not None and rj.proc.returncode is None:
+                await _wait_until(lambda: bool(rj.output.lines))
                 await rj.cancel()
+            await rj.wait()
 
 
 FAILED_SPAWN_REPLACE_JOB = (
@@ -2587,7 +2593,13 @@ async def test_run_drains_pending_retry_on_shutdown(run_cron):
     cron = cronstable.cron.Cron(None, config_yaml=_RETRY_DRAIN_JOB)
 
     task = run_cron(cron)
-    await _wait_until(lambda: bool(cron.retry_state))
+    await _wait_until(
+        lambda: any(
+            state.task is not None for state in cron.retry_state.values()
+        )
+    )
+    retry_task = cron.retry_state["test"].task
+    assert not retry_task.done()
     # stop here (not in teardown): the shutdown drain is what's under test
     cron.signal_shutdown()
     await asyncio.wait_for(task, timeout=5)
@@ -2595,6 +2607,43 @@ async def test_run_drains_pending_retry_on_shutdown(run_cron):
     # graceful shutdown must cancel and drain the pending retry, not orphan a
     # task or leave retry_state populated.
     assert cron.retry_state == {}
+    assert retry_task.cancelled()
+
+
+async def test_shutdown_drains_a_job_still_starting(monkeypatch, run_cron):
+    cron = Cron(
+        None, config_yaml=JOB_THAT_SUCCEEDS + "    captureStdout: true\n"
+    )
+    starting = asyncio.Event()
+    release = asyncio.Event()
+    launched = []
+    real_start = RunningJob.start
+
+    async def paused_start(job):
+        starting.set()
+        await release.wait()
+        await real_start(job)
+        launched.append(job)
+
+    monkeypatch.setattr(RunningJob, "start", paused_start)
+    task = run_cron(cron)
+    try:
+        await asyncio.wait_for(starting.wait(), timeout=5)
+        cron.signal_shutdown()
+        await asyncio.wait_for(cron._wait_for_running_jobs_task, timeout=5)
+        release.set()
+        await asyncio.wait_for(task, timeout=5)
+
+        assert len(launched) == 1
+        assert not cron.running_jobs
+        assert launched[0].retcode == 0
+        assert launched[0].stdout.strip() == "foobar"
+        assert launched[0].proc._transport.is_closing()
+    finally:
+        release.set()
+        await asyncio.wait_for(task, timeout=5)
+        for job in launched:
+            await job.wait()
 
 
 _GATED_CLUSTER_BAD_WEB_TOKEN = """
@@ -2686,6 +2735,7 @@ async def test_shutdown_stops_cluster_manager_before_job_drain():
     await cron.maybe_launch_job(cron.cron_jobs["test"])
     running_job = cron.running_jobs["test"][0]
     try:
+        await _wait_until(lambda: bool(running_job.output.lines))
         assert running_job.proc.returncode is None
         # Enter shutdown with a running job and an installed manager.
         cron.signal_shutdown()

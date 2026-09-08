@@ -1506,6 +1506,7 @@ async def test_web_cancel_running_job_terminates_and_records():
     await cron.maybe_launch_job(job)
     rj = cron.running_jobs["test"][0]
     assert rj.proc.returncode is None
+    await _wait_until(lambda: bool(rj.output.lines))
 
     resp = await cron._web_cancel_job(Req(match={"name": "test"}))
     assert resp.status == 200
@@ -1521,6 +1522,7 @@ async def test_web_cancel_running_job_terminates_and_records():
     assert rj.proc.returncode is not None  # process actually terminated
 
     # the reaper would normally do this once the process exits; drive it here
+    await rj.wait()
     await cron._handle_finished_job(rj)
     assert "test" not in cron.running_jobs
     assert cron.last_run["test"].outcome == "cancelled"

@@ -342,6 +342,8 @@ jobs:
             exit 1
           fi
       - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
       # tox-uv pulls in uv and makes tox provision envs + install deps with it.
       - run: pip install tox tox-uv
       - run: tox -e lint,mypy,bandit,openapi

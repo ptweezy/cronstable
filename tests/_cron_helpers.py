@@ -11,7 +11,7 @@ import datetime
 import pytest
 
 import cronstable.cron
-from tests._commands import cmd_print, cmd_sleep, yaml_command
+from tests._commands import cmd_print, cmd_print_sleep_print, yaml_command
 from tests._configs import job_yaml
 
 
@@ -57,7 +57,7 @@ JOB_THAT_SUCCEEDS = (
 
 CONCURRENT_JOB = (
     "jobs:\n  - name: test\n"
-    + yaml_command(cmd_sleep(30))
+    + yaml_command(cmd_print_sleep_print("ready", 30, "done"))
     + """
     schedule: "@reboot"
     captureStdout: true

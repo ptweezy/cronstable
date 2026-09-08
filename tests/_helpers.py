@@ -160,8 +160,13 @@ async def _settle_dag_cron(cron):
     records.
     """
     await _drain_pending(cron)
-    await _reap_running(cron)
-    await _drain_pending(cron)
+    while True:
+        await _reap_running(cron)
+        await _drain_pending(cron)
+        # Completion writes can launch downstream tasks that also need
+        # reaping before the event loop closes.
+        if not any(cron.running_jobs.values()):
+            return
 
 
 # --- polling ----------------------------------------------------------------

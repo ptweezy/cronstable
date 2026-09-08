@@ -30,7 +30,12 @@ from cronstable.prometheus import (
     render_families,
     resolve_metrics_config,
 )
-from tests._commands import cmd_print, cmd_sleep, yaml_command
+from tests._commands import (
+    cmd_print,
+    cmd_print_sleep_print,
+    cmd_sleep,
+    yaml_command,
+)
 from tests._helpers import _wait_until
 from tests.conftest import Req, _cron
 
@@ -915,13 +920,16 @@ async def test_metrics_count_start_failures():
 async def test_metrics_count_cancelled_runs():
     config = (
         "jobs:\n"
-        "  - name: slow\n" + yaml_command(cmd_sleep(60)) + "\n"
+        "  - name: slow\n"
+        + yaml_command(cmd_print_sleep_print("ready", 60, "done"))
+        + "\n    captureStdout: true\n"
         '    schedule: "* * * * *"\n'
         "    killTimeout: 5\n"
     )
     cron = Cron(None, config_yaml=config)
     await cron.maybe_launch_job(cron.cron_jobs["slow"])
     running_job = cron.running_jobs["slow"][0]
+    await _wait_until(lambda: bool(running_job.output.lines))
     running_job.cancelled = True  # what _web_cancel_job sets
     await running_job.cancel()
     await running_job.wait()
@@ -935,7 +943,9 @@ async def test_metrics_count_cancelled_runs():
 async def test_retry_swallowed_by_forbid_is_not_counted():
     config = (
         "jobs:\n"
-        "  - name: busy\n" + yaml_command(cmd_sleep(60)) + "\n"
+        "  - name: busy\n"
+        + yaml_command(cmd_print_sleep_print("ready", 60, "done"))
+        + "\n    captureStdout: true\n"
         '    schedule: "* * * * *"\n'
         "    concurrencyPolicy: Forbid\n"
         "    killTimeout: 5\n"
@@ -953,6 +963,7 @@ async def test_retry_swallowed_by_forbid_is_not_counted():
     await cron.maybe_launch_job(cron.cron_jobs["busy"])
     running_job = cron.running_jobs["busy"][0]
     try:
+        await _wait_until(lambda: bool(running_job.output.lines))
         await cron.schedule_retry_job("busy", 0, 1)
         text = cron.metrics.render(cron)
         assert _retries(text, job_name="busy") == 0

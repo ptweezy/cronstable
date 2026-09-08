@@ -27,6 +27,7 @@ from tests._commands import (
     cmd_write_env,
     yaml_command,
 )
+from tests._helpers import _wait_until
 
 
 def _argv(*parts):
@@ -1827,14 +1828,18 @@ async def test_untouched_job_drain_is_not_bounded(monkeypatch):
 async def test_error1():
     job = _running_job(
         "jobs:\n  - name: test\n"
-        + yaml_command(cmd_sleep(5))
-        + '\n    schedule: "* * * * *"\n'
+        + yaml_command(cmd_print_sleep_print("ready", 5, "done"))
+        + '\n    schedule: "* * * * *"\n    captureStdout: true\n'
     )
 
     await job.start()
-    with pytest.raises(RuntimeError):
-        await job.start()
-    await job.cancel()
+    try:
+        await _wait_until(lambda: bool(job.output.lines))
+        with pytest.raises(RuntimeError):
+            await job.start()
+    finally:
+        await job.cancel()
+        await job.wait()
 
 
 @pytest.mark.asyncio
