@@ -46,6 +46,7 @@ import logging
 import math
 import os
 import queue
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -106,6 +107,13 @@ PROTECTED_STREAMS = frozenset({"meta", "manifests"})
 # Age (seconds) past which an orphaned write-temp file is swept by GC; no
 # legitimate in-flight write lives near this long, so older is crash debris.
 TMP_MAX_AGE = 86400.0
+
+#: Open flags of the temp file behind :meth:`FilesystemStateBackend.
+#: _atomic_write`.  ``O_BINARY`` keeps the descriptor in binary mode on
+#: Windows; the mask is 0 elsewhere.
+_ATOMIC_WRITE_FLAGS = (
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+)
 
 # Subdirectories under a namespace root: per-stream records, leases,
 # quarantined corrupt records, write-temp files, mutable job-facing
@@ -506,6 +514,26 @@ def _local_lock_reason(path: str) -> Optional[str]:
         ):
             return "the NFS mount is mounted with '{}'".format(opt)
     return None
+
+
+_REPARSE_POINT = stat.FILE_ATTRIBUTE_REPARSE_POINT if os.name == "nt" else 0
+
+
+def _entry_is_dir(entry: "os.DirEntry[str]") -> bool:
+    """``os.path.isdir`` for a scandir entry: False on any error, and a
+    Windows reparse point (a junction) answered through its target."""
+    try:
+        if not entry.is_dir():
+            return False
+        if _REPARSE_POINT:
+            attrs = getattr(
+                entry.stat(follow_symlinks=False), "st_file_attributes", 0
+            )
+            if attrs & _REPARSE_POINT:
+                return os.path.isdir(entry.path)
+        return True
+    except OSError:
+        return False
 
 
 def detect_topology(path: str) -> Optional[str]:
@@ -1351,7 +1379,7 @@ class FilesystemStateBackend(StateBackend):
         stream_dir = self._stream_dir("meta")
         try:
             names = sorted(
-                n for n in os.listdir(stream_dir) if n.endswith(".json")
+                [n for n in os.listdir(stream_dir) if n.endswith(".json")]
             )
         except OSError:
             names = []
@@ -1485,11 +1513,19 @@ class FilesystemStateBackend(StateBackend):
         """
         tmp = self._tmp_path()
         try:
-            fdesc = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fdesc, "wb") as fobj:
-                fobj.write(payload)
-                fobj.flush()
-                os.fsync(fobj.fileno())
+            fdesc = os.open(tmp, _ATOMIC_WRITE_FLAGS, 0o600)
+            try:
+                # Raw descriptor writes: the payload is one finished bytes
+                # object, so a buffered writer adds only overhead.  The
+                # descriptor is in binary mode (_ATOMIC_WRITE_FLAGS), so
+                # the bytes land as given on every platform; os.write may
+                # write short (a signal, an odd mount), hence the loop.
+                view = memoryview(payload)
+                while view:
+                    view = view[os.write(fdesc, view) :]
+                os.fsync(fdesc)
+            finally:
+                os.close(fdesc)
             self._replace(tmp, dest)
         except BaseException:
             # never leave the temp file behind on a failed write/rename
@@ -1548,9 +1584,10 @@ class FilesystemStateBackend(StateBackend):
         prune_keep: Optional[int] = None,
         prune_latest_by: Optional[str] = None,
     ) -> str:
-        stream_dir = self._stream_dir(stream)
+        token = _fs_safe(stream)
+        # _stream_dir(stream), spelled out to keep the token in hand
+        stream_dir = os.path.join(self._records_root, token)
         self._makedirs_durable(stream_dir)
-        token = os.path.basename(stream_dir)
         if _FS_TRUNCATION_MARKER in token:
             # a truncated token cannot round-trip through enumeration on its
             # own; land (or lazily repair) the logical-name sidecar so
@@ -1567,8 +1604,10 @@ class FilesystemStateBackend(StateBackend):
             {"schemaVersion": SCHEMA_VERSION, "data": data}, sort_keys=True
         )
         self._atomic_write(os.path.join(stream_dir, rec_id + ".json"), payload)
-        want_keep = prune_keep is not None and prune_keep > 0
-        if want_keep or prune_latest_by:
+        # None and a non-positive keep both mean no bounded prune, folded to
+        # one int so the gate and the prune call below test it once.
+        keep = prune_keep if prune_keep is not None and prune_keep > 0 else 0
+        if keep or prune_latest_by:
             # The folded, amortised prune (every K-th append per stream).
             # Best-effort by construction: the append HAS landed, so a
             # prune failure must never make the whole call read as failed
@@ -1578,8 +1617,8 @@ class FilesystemStateBackend(StateBackend):
             # once.
             if self._append_prune_due(token):
                 try:
-                    if prune_keep is not None and prune_keep > 0:
-                        self._prune_sync(stream, prune_keep)
+                    if keep:
+                        self._prune_sync(stream, keep)
                     if prune_latest_by:
                         self._prune_latest_by_sync(stream, prune_latest_by)
                 except OSError as ex:
@@ -1765,7 +1804,11 @@ class FilesystemStateBackend(StateBackend):
         record it cannot read RIGHT NOW must fail the caller closed, so it
         always goes to the store and never substitutes a remembered body.
         """
-        path = os.path.join(stream_dir, name)
+        # Byte-identical to os.path.join without its checks, on a path
+        # built once per record read: every stream_dir comes from
+        # _stream_dir (a root joined to a non-empty token, so it never
+        # ends in a separator) and every name from a listing of it.
+        path = stream_dir + os.sep + name
         raw = None if strict else self._record_cache_get(path)
         cached = raw is not None
         if raw is None:
@@ -1937,7 +1980,10 @@ class FilesystemStateBackend(StateBackend):
         records_root = self._records_root
         token_prefix = _fs_safe_fragment(prefix)
         try:
-            tokens = os.listdir(records_root)
+            # scandir: the directory test below rides on the entry's own
+            # d_type; only a link pays a stat call.
+            with os.scandir(records_root) as listing:
+                entries = list(listing)
         except FileNotFoundError:
             # no store written yet: exhaustively empty, not unreadable.
             return [], True
@@ -1945,12 +1991,13 @@ class FilesystemStateBackend(StateBackend):
             return [], False
         names: list[str] = []
         complete = True
-        for token in tokens:
+        for entry in entries:
+            token = entry.name
             if not token.startswith(token_prefix):
                 continue
-            stream_dir = os.path.join(records_root, token)
-            if not os.path.isdir(stream_dir):
+            if not _entry_is_dir(entry):
                 continue
+            stream_dir = entry.path
             if _FS_TRUNCATION_MARKER in token:
                 # only the sidecar knows a truncated token's logical name.
                 # A stream without a verifiable sidecar is SKIPPED, never
@@ -1986,13 +2033,14 @@ class FilesystemStateBackend(StateBackend):
     ) -> list[dict[str, Any]]:
         stream_dir = self._stream_dir(stream)
         try:
+            # one descending sort: the names are distinct, so reverse=
+            # gives exactly the reversed ascending order
             names = sorted(
-                n for n in os.listdir(stream_dir) if n.endswith(".json")
+                [n for n in os.listdir(stream_dir) if n.endswith(".json")],
+                reverse=newest_first,
             )
         except FileNotFoundError:
             return []
-        if newest_first:
-            names.reverse()
         out: list[dict[str, Any]] = []
         # `limit` bounds the WINDOW of readable records considered;
         # `predicate` filters which of that window is returned;
@@ -2035,8 +2083,8 @@ class FilesystemStateBackend(StateBackend):
                 del self._derive_memo[key]
 
     def _derive_max_sync(self, stream: str, field: str) -> Optional[Any]:
-        stream_dir = self._stream_dir(stream)
-        token = os.path.basename(stream_dir)
+        token = _fs_safe(stream)
+        stream_dir = os.path.join(self._records_root, token)  # _stream_dir
         memo_key = (token, field)
         try:
             # Unsorted: the anchor is max(listing) and the scan set is
@@ -2059,10 +2107,16 @@ class FilesystemStateBackend(StateBackend):
             cached = self._derive_memo.get(memo_key)
         best: Optional[Any] = None
         to_scan = listing
+        # The fold's anchor and the one comparison the warm path needs:
+        # the watermark survives or something newer exists exactly when
+        # the newest name is at least the watermark.
+        newest = max(listing)
         if cached is not None:
             watermark, best = cached
-            newer = [n for n in listing if n > watermark]
-            if watermark in listing or newer:
+            if newest == watermark:
+                # unchanged stream: nothing to parse.
+                to_scan = []
+            elif newest > watermark:
                 # Incremental fold, correct because names are floor-clamped
                 # (appends only create names above the watermark, even
                 # across a backward clock step) and a bounded prune only
@@ -2071,7 +2125,7 @@ class FilesystemStateBackend(StateBackend):
                 # itself may have been pruned once newer records landed,
                 # so a surviving newer name is as good as the watermark
                 # surviving.
-                to_scan = newer
+                to_scan = [n for n in listing if n > watermark]
             else:
                 # Watermark gone AND nothing newer: not a prune (a bounded
                 # prune leaves the newest record standing), the stream was
@@ -2103,17 +2157,18 @@ class FilesystemStateBackend(StateBackend):
             if self._derive_wipe_gen.get(token, 0) == gen:
                 # unchanged generation: no wipe raced this scan; anchor
                 # the fold to the newest filename (listing is non-empty).
-                self._derive_memo[memo_key] = (max(listing), best)
+                self._derive_memo[memo_key] = (newest, best)
         return best
 
     async def prune_records(self, stream: str, *, keep: int) -> int:
         return await self._call("prune", self._prune_sync, stream, keep)
 
     def _prune_sync(self, stream: str, keep: int) -> int:
-        stream_dir = self._stream_dir(stream)
+        token = _fs_safe(stream)
+        stream_dir = os.path.join(self._records_root, token)  # _stream_dir
         try:
             names = sorted(
-                n for n in os.listdir(stream_dir) if n.endswith(".json")
+                [n for n in os.listdir(stream_dir) if n.endswith(".json")]
             )
         except FileNotFoundError:
             return 0
@@ -2123,9 +2178,7 @@ class FilesystemStateBackend(StateBackend):
         for name in reversed(names):
             stem = name[: -len(".json")]
             if _record_name_epoch_str(stem) is not None:
-                self._record_name_floor_raise(
-                    os.path.basename(stream_dir), stem
-                )
+                self._record_name_floor_raise(token, stem)
                 break
         # names sort chronologically (write-epoch filename prefix); keep the
         # newest ``keep`` (the tail), delete the rest.  keep <= 0 -> all.
@@ -2141,7 +2194,7 @@ class FilesystemStateBackend(StateBackend):
         if keep <= 0:
             # A wholesale wipe: the derive_max memo must not survive it,
             # see _derive_max_invalidate.
-            self._derive_max_invalidate(os.path.basename(stream_dir))
+            self._derive_max_invalidate(token)
         return deleted
 
     def _prune_latest_by_sync(self, stream: str, field: str) -> int:
@@ -2157,12 +2210,14 @@ class FilesystemStateBackend(StateBackend):
         """
         stream_dir = self._stream_dir(stream)
         try:
+            # newest first: the first record kept per value wins (distinct
+            # filenames, so the descending sort is the reversed ascending)
             names = sorted(
-                n for n in os.listdir(stream_dir) if n.endswith(".json")
+                [n for n in os.listdir(stream_dir) if n.endswith(".json")],
+                reverse=True,
             )
         except FileNotFoundError:
             return 0
-        names.reverse()  # newest first: the first record kept per value wins
         seen: set = set()
         deleted = 0
         for name in names:
@@ -2187,7 +2242,11 @@ class FilesystemStateBackend(StateBackend):
 
     @contextlib.contextmanager
     def _locked(
-        self, lock_path: str, *, touch: bool = False
+        self,
+        lock_path: str,
+        *,
+        touch: bool = False,
+        blocking: bool = True,
     ) -> Iterator[None]:
         """Hold the advisory exclusive lock on ``lock_path`` for the block.
 
@@ -2204,6 +2263,10 @@ class FilesystemStateBackend(StateBackend):
         ``touch`` (the document lane only) refreshes the lock file's mtime
         after acquiring: flock never updates mtime, and the orphan-lock
         sweep uses mtime as the activity signal.
+
+        ``blocking=False`` is :meth:`_try_locked`'s lane: contention raises
+        ``OSError`` at once, and the wait-time stats are left alone (a
+        try-lock never waits, so counting it dilutes the signal).
         """
         self._makedirs_durable(os.path.dirname(lock_path))
         began = time.perf_counter()
@@ -2211,20 +2274,22 @@ class FilesystemStateBackend(StateBackend):
             fdesc = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
             try:
                 # msvcrt.locking needs a byte present to lock; guarantee one.
-                if os.fstat(fdesc).st_size == 0:
+                # The same fstat serves the re-verify after acquiring: an
+                # open descriptor's inode never changes.
+                ours = os.fstat(fdesc)
+                if ours.st_size == 0:
                     try:
                         os.write(fdesc, b"\0")
                     except PermissionError:
                         # Windows: a rival won the bootstrap and holds the
                         # byte-range lock over the byte it wrote.  The
                         # byte exists now; fall through and contend
-                        # normally.
+                        # normally (a non-blocking attempt reports that
+                        # contention as ``OSError``).
                         pass
-                with exclusive_file_lock(fdesc):
+                with exclusive_file_lock(fdesc, blocking=blocking):
                     try:
-                        same = os.path.samestat(
-                            os.fstat(fdesc), os.stat(lock_path)
-                        )
+                        same = os.path.samestat(ours, os.stat(lock_path))
                     except OSError:
                         same = False
                     if not same:
@@ -2238,20 +2303,22 @@ class FilesystemStateBackend(StateBackend):
                                 os.utime(fdesc)
                             else:
                                 os.utime(lock_path)
-                    # time-to-acquire is the contention signal: near zero on
-                    # an idle store, and the cross-host wait on a fought-over
-                    # lease.
-                    waited = time.perf_counter() - began
-                    with self._stats_lock:
-                        self._lock_acquisitions += 1
-                        self._lock_wait_seconds += waited
+                    if blocking:
+                        # time-to-acquire is the contention signal: near
+                        # zero on an idle store, and the cross-host wait on
+                        # a fought-over lease.
+                        waited = time.perf_counter() - began
+                        with self._stats_lock:
+                            self._lock_acquisitions += 1
+                            self._lock_wait_seconds += waited
                     yield
                     return
             finally:
                 os.close(fdesc)
 
-    @contextlib.contextmanager
-    def _try_locked(self, lock_path: str) -> Iterator[None]:
+    def _try_locked(
+        self, lock_path: str
+    ) -> "contextlib.AbstractContextManager[None]":
         """Non-blocking :meth:`_locked`: contention raises ``OSError``.
 
         The GC sweep's lane: a peer wedged mid-claim can hold a document
@@ -2261,32 +2328,7 @@ class FilesystemStateBackend(StateBackend):
         re-verify as :meth:`_locked`; no wait-time stats (a try-lock never
         waits).
         """
-        self._makedirs_durable(os.path.dirname(lock_path))
-        while True:
-            fdesc = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-            try:
-                # msvcrt.locking needs a byte present to lock; guarantee one.
-                if os.fstat(fdesc).st_size == 0:
-                    try:
-                        os.write(fdesc, b"\0")
-                    except PermissionError:
-                        # Windows: a rival holds the byte-range lock over
-                        # the bootstrap byte; the non-blocking attempt
-                        # below reports that contention as ``OSError``.
-                        pass
-                with exclusive_file_lock(fdesc, blocking=False):
-                    try:
-                        same = os.path.samestat(
-                            os.fstat(fdesc), os.stat(lock_path)
-                        )
-                    except OSError:
-                        same = False
-                    if not same:
-                        continue  # ghost inode: re-open and try afresh
-                    yield
-                    return
-            finally:
-                os.close(fdesc)
+        return self._locked(lock_path, blocking=False)
 
     def _read_lease_file(
         self, lease_path: str, *, strict: bool = False
@@ -2536,7 +2578,8 @@ class FilesystemStateBackend(StateBackend):
             if strict:
                 raise _DocumentUnreadable("unknown-schema-or-not-a-document")
             return None
-        return cast(dict[str, Any], obj["data"])
+        data: dict[str, Any] = obj["data"]
+        return data
 
     async def read_document(
         self, namespace: str, key: str
@@ -2661,7 +2704,8 @@ class FilesystemStateBackend(StateBackend):
         docs_root = self._docs_root
         token_prefix = _fs_safe_fragment(prefix)
         try:
-            tokens = os.listdir(docs_root)
+            with os.scandir(docs_root) as listing:
+                entries = list(listing)
         except FileNotFoundError:
             # no document ever written: exhaustively empty, not unreadable.
             return [], True
@@ -2669,10 +2713,11 @@ class FilesystemStateBackend(StateBackend):
             return [], False
         names: list[str] = []
         complete = True
-        for token in tokens:
+        for entry in entries:
+            token = entry.name
             if not token.startswith(token_prefix):
                 continue
-            if not os.path.isdir(os.path.join(docs_root, token)):
+            if not _entry_is_dir(entry):
                 continue
             if _FS_TRUNCATION_MARKER in token:
                 # truncated namespace tokens have no name sidecar: report
@@ -2693,7 +2738,9 @@ class FilesystemStateBackend(StateBackend):
     def _list_documents_sync(self, namespace: str) -> list[dict[str, Any]]:
         ns_dir = self._doc_dir(namespace)
         try:
-            names = sorted(n for n in os.listdir(ns_dir) if n.endswith(".doc"))
+            names = sorted(
+                [n for n in os.listdir(ns_dir) if n.endswith(".doc")]
+            )
         except FileNotFoundError:
             return []
         out: list[dict[str, Any]] = []
@@ -2872,13 +2919,18 @@ class FilesystemStateBackend(StateBackend):
         kept_streams = 0
         records_root = self._records_root
         try:
-            entries = sorted(os.listdir(records_root))
+            # scandir: the directory test below rides on the entry's own
+            # d_type; only a link pays a stat call.  Sorted by name, so
+            # the walk order is deterministic.
+            with os.scandir(records_root) as listing:
+                entries = sorted(listing, key=lambda e: e.name)
         except OSError:
             entries = []
-        for token in entries:
-            stream_dir = os.path.join(records_root, token)
-            if not os.path.isdir(stream_dir):
+        for entry in entries:
+            if not _entry_is_dir(entry):
                 continue
+            token = entry.name
+            stream_dir = entry.path
             if token in keep_tokens or not token.startswith(prefix_tokens):
                 # referenced, protected, or unrecognised: never delete what
                 # is still wanted or cannot be classified.
@@ -2984,15 +3036,16 @@ class FilesystemStateBackend(StateBackend):
         docs_root = self._docs_root
         idem_token_prefix = _fs_safe_fragment(_IDEM_DOC_NS_PREFIX)
         try:
-            ns_tokens = os.listdir(docs_root)
+            with os.scandir(docs_root) as listing:
+                ns_entries = list(listing)
         except OSError:
             return 0
-        for ns_token in ns_tokens:
-            if not ns_token.startswith(idem_token_prefix):
+        for ns_entry in ns_entries:
+            if not ns_entry.name.startswith(idem_token_prefix):
                 continue
-            ns_dir = os.path.join(docs_root, ns_token)
-            if not os.path.isdir(ns_dir):
+            if not _entry_is_dir(ns_entry):
                 continue
+            ns_dir = ns_entry.path
             try:
                 names = os.listdir(ns_dir)
             except OSError:
@@ -3187,13 +3240,14 @@ class FilesystemStateBackend(StateBackend):
         removed = 0
         docs_root = self._docs_root
         try:
-            ns_tokens = os.listdir(docs_root)
+            with os.scandir(docs_root) as listing:
+                ns_entries = list(listing)
         except OSError:
-            ns_tokens = []
-        for ns_token in ns_tokens:
-            ns_dir = os.path.join(docs_root, ns_token)
-            if not os.path.isdir(ns_dir):
+            ns_entries = []
+        for ns_entry in ns_entries:
+            if not _entry_is_dir(ns_entry):
                 continue
+            ns_dir = ns_entry.path
             try:
                 names = os.listdir(ns_dir)
             except OSError:
@@ -3284,9 +3338,11 @@ class FilesystemStateBackend(StateBackend):
         for name in names:
             full = os.path.join(path, name)
             try:
-                if not os.path.isfile(full):
-                    continue
-                if os.stat(full).st_mtime >= cutoff:
+                # one stat answers both the regular-file test and the age
+                # gate; a directory fails S_ISREG, a broken symlink
+                # raises, and either skips the entry
+                info = os.stat(full)
+                if not stat.S_ISREG(info.st_mode) or info.st_mtime >= cutoff:
                     continue
                 if not dry_run:
                     os.unlink(full)
@@ -3313,16 +3369,17 @@ class FilesystemStateBackend(StateBackend):
         current = converted = unknown = unreadable = failed = 0
         records_root = self._records_root
         try:
-            streams = sorted(os.listdir(records_root))
+            with os.scandir(records_root) as listing:
+                streams = sorted(listing, key=lambda e: e.name)
         except OSError:
             streams = []
-        for token in streams:
-            stream_dir = os.path.join(records_root, token)
-            if not os.path.isdir(stream_dir):
+        for entry in streams:
+            if not _entry_is_dir(entry):
                 continue
+            stream_dir = entry.path
             try:
                 names = sorted(
-                    n for n in os.listdir(stream_dir) if n.endswith(".json")
+                    [n for n in os.listdir(stream_dir) if n.endswith(".json")]
                 )
             except OSError:
                 continue
@@ -3507,6 +3564,9 @@ class FilesystemStateBackend(StateBackend):
         def walk(root: str, suffix: str) -> dict[str, Any]:
             # group per first path segment: {prefix: {count, streams, scopes}}
             groups: dict[str, dict[str, Any]] = {}
+            # os.listdir here, not scandir: the test that pins `cronstable
+            # state check` degrading an unreadable root to zero streams
+            # injects the failure through os.listdir.
             try:
                 tokens = sorted(os.listdir(root))
             except OSError:

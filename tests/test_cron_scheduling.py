@@ -1547,6 +1547,28 @@ async def test_sla_dropped_check_latch_is_cleared(monkeypatch):
     await cron._drain_completions()
 
 
+@pytest.mark.asyncio
+async def test_sla_dropped_block_latch_is_cleared(tmp_path, monkeypatch):
+    # a reload can drop the whole sla block of a latched job; the walk
+    # visits SLA jobs only, so the pre-scan over the latch map is what
+    # clears that latch and its gauge
+    holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_SLA_STALE_JOB)
+    cron = cronstable.cron.Cron(str(cfg))
+    _sla_report_recorder(monkeypatch)
+    cron._sla_state[("s", STALE)] = DT(2020, 1, 1, 11, 0, 0, tzinfo=UTC)
+    cron.metrics.job_sla_late("s", STALE, True)
+    cfg.write_text(job_yaml("s", "echo hi"))
+    cron.update_config()
+    assert not cron.cron_jobs["s"].has_sla
+    cron._sla_periodic()
+    assert ("s", STALE) not in cron._sla_state
+    assert cron.metrics._job("s").sla_late[STALE] == 0
+    await cron._drain_completions()
+
+
 def test_reload_prunes_sla_trackers(tmp_path, monkeypatch):
     holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
     _set_now(monkeypatch, holder)

@@ -478,6 +478,19 @@ def test_status_payload_running_dead_schedule_keeps_never_fires():
     assert "never_fires" not in rows["live"]
 
 
+def test_summary_payload_running_dead_schedule_counts_never_fires():
+    # /summary agrees with /status: a RUNNING job whose schedule has no
+    # future occurrence counts as both running and never_fires.
+    class _Run:
+        proc = None
+
+    cron = _cron(_DEAD_JOB)
+    cron.running_jobs["parked"] = [_Run()]
+    jobs = cron.summary_payload()["jobs"]
+    assert jobs["running"] == 1
+    assert jobs["never_fires"] == 1
+
+
 async def test_web_status_text_says_never_fires():
     cron = _cron(_DEAD_JOB)
     resp = await cron._web_get_status(Req())

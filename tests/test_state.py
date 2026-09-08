@@ -2887,6 +2887,7 @@ async def test_gc_idem_sweep_skips_doc_whose_lock_is_held(fs_backend):
         def _sweep():
             result["removed"] = backend._gc_idem_docs_sync(cutoff, False)
 
+        stats_before = (backend._lock_acquisitions, backend._lock_wait_seconds)
         fd = os.open(held_lock, os.O_RDWR)
         try:
             with exclusive_file_lock(fd, blocking=False):
@@ -2903,6 +2904,12 @@ async def test_gc_idem_sweep_skips_doc_whose_lock_is_held(fs_backend):
             os.close(fd)
 
         assert result["removed"] == 1  # the uncontended doc only
+        # the try-lock lane skips the wait stats: neither the contended
+        # attempt nor the won one counts as an acquisition.
+        assert (
+            backend._lock_acquisitions,
+            backend._lock_wait_seconds,
+        ) == stats_before
         assert os.path.exists(held_doc)
         assert not os.path.exists(free_doc)
 
@@ -5303,3 +5310,129 @@ async def test_shutdown_completes_despite_hung_state_write(
     pending.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await pending
+
+
+async def test_atomic_write_opens_its_temp_file_in_binary_mode(
+    fs_backend, monkeypatch
+):
+    # On Windows a descriptor from os.open is in text mode unless O_BINARY
+    # is in its flags, and text mode rewrites LF as CRLF on write.  POSIX
+    # has no text mode, so the byte check passes there whatever the flags;
+    # the flag check gates every platform by asserting that the platform's
+    # mask (0 on POSIX) is in every _atomic_write open.
+    backend = fs_backend
+    binary = getattr(os, "O_BINARY", 0)
+    opens = []
+    real_open = os.open
+
+    def recording_open(path, flags, *args, **kwargs):
+        opens.append((os.fspath(path), flags))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    dest = os.path.join(backend._records_root, "probe.bin")
+    payload = b"a,b\n\r\nc\n"
+    backend._atomic_write(dest, payload)
+    with open(dest, "rb") as fobj:
+        assert fobj.read() == payload
+    tmp_flags = [flags for path, flags in opens if path.endswith(".tmp")]
+    assert tmp_flags, "the write did not go through a temp file"
+    assert all(flags & binary == binary for flags in tmp_flags)
+
+
+def _plant_dir_link(link, target):
+    """A directory link at ``link``: a junction on Windows, else a symlink."""
+    if state.IS_WINDOWS:
+        import _winapi
+
+        _winapi.CreateJunction(target, link)
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+async def test_directory_test_skips_links_with_unreachable_targets(
+    fs_backend,
+):
+    # The directory test of every scandir walk answers like os.path.isdir:
+    # a link is followed, and a link whose target cannot be reached (gone,
+    # a symlink loop, or behind a mode-000 directory) reads as a
+    # non-directory rather than raising.  DirEntry.is_dir swallows only
+    # FileNotFoundError, and on Windows it answers a junction from the
+    # listing's own attribute without following it.
+    from cronstable import jobstate
+
+    backend = fs_backend
+    await backend.append_record("runs/job-a", {"n": 1})
+    await jobstate.idempotency_claim(backend, "scope", "k", ttl=5.0)
+    records_root = backend._records_root
+    docs_root = backend._docs_root
+    cutoff = time.time() - 3600.0
+    keep = {"runs/": {"job-a", "linked"}}
+
+    # a real directory reached through a readable link is listed: the
+    # walks follow links.
+    target = os.path.join(backend.base, "link-target")
+    os.mkdir(target)
+    _plant_dir_link(
+        os.path.join(records_root, _fs_safe("runs/linked")), target
+    )
+    _plant_dir_link(os.path.join(docs_root, _fs_safe("idem/linked")), target)
+
+    def sweeps():
+        return (
+            backend._gc_sync(keep, 3600.0, (), False),
+            backend._gc_idem_docs_sync(cutoff, False),
+            backend._gc_orphan_locks_sync(cutoff, False),
+            backend._migrate_sync(False),
+        )
+
+    streams, complete = backend._list_stream_names_audit_sync("")
+    assert complete is True
+    assert {"runs/job-a", "runs/linked"} <= set(streams)
+    namespaces, complete = backend._list_document_namespaces_sync("")
+    assert complete is True
+    assert {"idem/scope", "idem/linked"} <= set(namespaces)
+    clean = sweeps()
+    assert clean[0]["removed"] == []
+
+    restore = []
+    try:
+        planted = []
+        for root, prefix in ((records_root, "runs/"), (docs_root, "idem/")):
+            gone = os.path.join(backend.base, "gone-" + prefix[:-1])
+            os.mkdir(gone)
+            _plant_dir_link(
+                os.path.join(root, _fs_safe(prefix + "gone")), gone
+            )
+            os.rmdir(gone)
+            planted.append(prefix + "gone")
+            if state.IS_WINDOWS:
+                continue
+            loop = os.path.join(root, _fs_safe(prefix + "loop"))
+            os.symlink(os.path.basename(loop), loop, target_is_directory=True)
+            planted.append(prefix + "loop")
+            if os.geteuid() == 0:
+                continue  # root reads through any mode
+            denied = os.path.join(backend.base, "denied-" + prefix[:-1])
+            os.makedirs(os.path.join(denied, "inner"))
+            os.symlink(
+                os.path.join(denied, "inner"),
+                os.path.join(root, _fs_safe(prefix + "denied")),
+                target_is_directory=True,
+            )
+            os.chmod(denied, 0)
+            restore.append(denied)
+            planted.append(prefix + "denied")
+
+        streams, complete = backend._list_stream_names_audit_sync("")
+        assert complete is True
+        assert "runs/linked" in streams
+        assert not [n for n in streams if n in planted], streams
+        namespaces, complete = backend._list_document_namespaces_sync("")
+        assert complete is True
+        assert "idem/linked" in namespaces
+        assert not [n for n in namespaces if n in planted], namespaces
+        assert sweeps() == clean
+    finally:
+        for path in restore:
+            os.chmod(path, 0o700)

@@ -31,6 +31,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from itertools import islice
 from typing import (
     Any,
     ClassVar,
@@ -251,9 +252,23 @@ def _finite_number(value: Any) -> Optional[float]:
     module re-emits ``Infinity``/``NaN``, which JSON.parse rejects, so one
     planted value would blank the dashboard's fleet view cluster-wide.
     """
+    kind = type(value)
+    if kind is float:
+        # a float, the common wire shape, needs no isinstance chain
+        exact: float = value
+        return exact if math.isfinite(exact) else None
+    if kind is int:
+        # A JSON integer can exceed the float range.
+        try:
+            return float(value)
+        except OverflowError:
+            return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    out = float(value)
+    try:
+        out = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
     return out if math.isfinite(out) else None
 
 
@@ -290,7 +305,8 @@ def _parse_job_summaries(raw: Any) -> Optional[dict[str, dict[str, Any]]]:
             finished_at = last.get("finished_at")
             exit_code = last.get("exit_code")
             if (
-                outcome in _SUMMARY_OUTCOMES
+                isinstance(outcome, str)
+                and outcome in _SUMMARY_OUTCOMES
                 and isinstance(finished_at, str)
                 and len(finished_at) <= MAX_JOB_SUMMARY_TS_LEN
                 and finished_at.isprintable()
@@ -518,15 +534,20 @@ def _hrw_owner_bytes(
     :func:`_hrw_score`'s ordering and the name tie-break).
     """
     seed = hashlib.sha256(job_name.encode("utf-8") + b"\x00")
-    first = seed.copy()
+    copy = seed.copy
+    first = copy()
     first.update(member_bytes[0])
     best_name = members[0]
     best_score = first.digest()[:8]
-    for name, name_bytes in zip(members[1:], member_bytes[1:], strict=True):
-        digest = seed.copy()
+    # islice: no list copies; the strict zip raises on a length mismatch
+    for name, name_bytes in islice(
+        zip(members, member_bytes, strict=True), 1, None
+    ):
+        digest = copy()
         digest.update(name_bytes)
         score = digest.digest()[:8]
-        if (score, name) > (best_score, best_name):
+        # (score, name) > (best_score, best_name), without the tuples
+        if score > best_score or (score == best_score and name > best_name):
             best_score, best_name = score, name
     return best_name
 
@@ -1320,22 +1341,21 @@ class ClusterManager(LeadershipBackend):
         factored out so :meth:`_handle_peer` builds it once per cached
         (payload, etag) pair.
         """
-        return {
-            name: {
-                key: (
-                    value
-                    if key != "scheduled_in"
-                    else (
-                        round(now_epoch + value)
-                        if isinstance(value, (int, float))
-                        and not isinstance(value, bool)
-                        else None
-                    )
+        stable: dict[str, Any] = {}
+        for name, entry in job_summaries.items():
+            # copy, then rewrite the one key; an entry without
+            # scheduled_in stays without it
+            copy = dict(entry)
+            if "scheduled_in" in copy:
+                value = copy["scheduled_in"]
+                copy["scheduled_in"] = (
+                    round(now_epoch + value)
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    else None
                 )
-                for key, value in entry.items()
-            }
-            for name, entry in job_summaries.items()
-        }
+            stable[name] = copy
+        return stable
 
     @staticmethod
     def _encode_peer_body(payload: dict[str, Any]) -> bytes:
@@ -1709,9 +1729,20 @@ class ClusterManager(LeadershipBackend):
             if isinstance(result, asyncio.CancelledError):
                 raise result
             if isinstance(result, BaseException):
+                host = peers[index]["host"]
+                prev_status = self.view.peers[host].status
+                self.view.record_failure(
+                    host,
+                    "unexpected error polling peer: {!r}".format(result),
+                    untrusted=False,
+                )
+                # Require a full response after a failed observation so a
+                # cached 304 cannot restore its earlier agreement.
+                self._peer_observation_cache.pop(host, None)
+                self._log_peer_status_change(host, prev_status)
                 logger.error(
                     "cluster: unexpected error polling %s: %r",
-                    peers[index]["host"],
+                    host,
                     result,
                 )
         # one full round completed: every configured peer now carries a real
@@ -2697,6 +2728,7 @@ class ClusterManager(LeadershipBackend):
                 )
         return sorted(conflicts)
 
+    @_memoized_derived
     def has_conflict(self) -> bool:
         """Whether any conflict that makes the election unsafe is visible here.
 
@@ -2710,6 +2742,9 @@ class ClusterManager(LeadershipBackend):
         closes. Accepted cost: one hostile CA-vouched member can wedge the
         gate closed cluster-wide (an availability DoS, never a double-run);
         see :func:`build_server_ssl_context`.
+
+        Memoized like its three inputs: the Leader gate asks once per job
+        per tick.
         """
         return (
             bool(self.conflict_names())

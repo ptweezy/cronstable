@@ -1403,6 +1403,65 @@ def test_claims_are_batched_per_pass(monkeypatch):
     assert all(_state(body, "t{}".format(i)) == dag.RUNNING for i in range(5))
 
 
+def _retry_after_pending(next_retry_at, pending):
+    # ``pending`` claimable PENDING tasks, then (in spec order) task "r"
+    # parked UP_FOR_RETRY with the given retry instant
+    spec = _spec(
+        *[TaskSpec("p{}".format(i)) for i in range(pending)],
+        TaskSpec("r", max_attempts=3, retry_delay=0.0),
+    )
+    body = _body(spec)
+    body["tasks"]["r"]["state"] = dag.UP_FOR_RETRY
+    body["tasks"]["r"]["attempt"] = 1
+    body["tasks"]["r"]["nextRetryAt"] = next_retry_at
+    return spec, body
+
+
+def _spy_claims(monkeypatch):
+    # records the task ids _claim_task is called for, then delegates
+    real_claim = dag._claim_task
+    claimed = []
+
+    def spy(task, *args, **kwargs):
+        claimed.append(task.id)
+        return real_claim(task, *args, **kwargs)
+
+    monkeypatch.setattr(dag, "_claim_task", spy)
+    return claimed
+
+
+def test_retry_arm_skips_claim_once_quota_spent(monkeypatch):
+    # _claims_full marks the result on the first over-quota claim (p1), so
+    # the UP_FOR_RETRY arm sees deferred and returns without calling
+    # _claim_task; the entry stays claimable for the next pass
+    monkeypatch.setattr(dag, "MAX_CLAIMS_PER_PASS", 1)
+    claimed = _spy_claims(monkeypatch)
+    spec, body = _retry_after_pending(0.0, pending=2)
+    body, res = _apply(dag.plan_and_claim(spec, 10.0, "p", "h", {}), body)
+    assert [i.task_id for i in res.launches] == ["p0"]
+    assert res.deferred is True
+    assert claimed == ["p0", "p1"]
+    assert _state(body, "r") == dag.UP_FOR_RETRY
+    assert body["tasks"]["r"].get("proc") is None
+    monkeypatch.setattr(dag, "MAX_CLAIMS_PER_PASS", 2)
+    body, res = _apply(dag.plan_and_claim(spec, 11.0, "p", "h", {}), body)
+    assert [i.task_id for i in res.launches] == ["p1", "r"]
+    assert res.deferred is False
+    assert _state(body, "r") == dag.RUNNING
+
+
+def test_retry_arm_waits_for_future_retry_instant(monkeypatch):
+    monkeypatch.setattr(dag, "MAX_CLAIMS_PER_PASS", 1)
+    claimed = _spy_claims(monkeypatch)
+    spec, body = _retry_after_pending(1000.0, pending=1)
+    body, res = _apply(dag.plan_and_claim(spec, 10.0, "p", "h", {}), body)
+    assert [i.task_id for i in res.launches] == ["p0"]
+    assert res.deferred is False
+    assert claimed == ["p0"]
+    assert _state(body, "r") == dag.UP_FOR_RETRY
+    assert body["tasks"]["r"].get("proc") is None
+
+
 def test_reload_added_dependency_does_not_wedge_run():
     # A run is created for A -> B (all_success). A config reload then adds task
     # C and repoints B at [A, C]. C is absent from the already-created run

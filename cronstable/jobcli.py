@@ -24,7 +24,6 @@ import argparse
 import json
 import os
 import ssl
-import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -642,6 +641,11 @@ def _cmd_lock(args: argparse.Namespace) -> int:
             raise _CliError(
                 "lock run needs a command to run (put it after `--`)"
             )
+        # lazy import: only this branch spawns, and subprocess drags in
+        # threading, selectors, and signal, a startup cost every other
+        # verb (`cronstable state get` inside a job) skips.
+        import subprocess
+
         acquired, token = _lock_acquire(args)
         if not acquired:
             print("lock not acquired: {}".format(args.name), file=sys.stderr)

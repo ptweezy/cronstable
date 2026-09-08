@@ -746,8 +746,8 @@ class FilesystemBackend(ElectionReadsBase):
             )
         )
         live_id = self.get_job_set_id()
-        jobs = {
-            str(rec["job"])
+        jobs: set[str] = {
+            rec["job"]
             for rec in records
             if isinstance(rec.get("job"), str)
             and rec.get("jobSetId") == live_id

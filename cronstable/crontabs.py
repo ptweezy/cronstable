@@ -203,13 +203,14 @@ def parse_crontab(data: str, path: str) -> list[dict[str, Any]]:
         line carrying a control character), with a ``path:line`` prefix.
     """
     label = os.path.basename(path) or CRONTAB_BASENAME
+    prefix = path or label  # what every ``file:line`` below opens with
     environment: dict[str, str] = {}
     jobs: list[dict[str, Any]] = []
     for lineno, raw in enumerate(_physical_lines(data), start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        where = "{}:{}".format(path or label, lineno)
+        where = "{}:{}".format(prefix, lineno)
         control = _CONTROL_CHARS.search(line)
         if control is not None:
             raise CrontabError(

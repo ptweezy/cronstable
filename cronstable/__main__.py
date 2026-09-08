@@ -368,6 +368,18 @@ def _init_restrict(target: str) -> None:
         )
 
 
+def _answer_bare_version() -> None:
+    """Print the version and exit when argv is exactly ``--version``.
+
+    Runs before main_loop builds its parser, whose subparsers cost about
+    a fifth of the command's wall time (startup.version is a gated
+    metric). Any other argv takes the full parse.
+    """
+    if sys.argv[1:] == ["--version"]:
+        print(cronstable.version.version)
+        sys.exit(0)
+
+
 def _print_build_facts(args) -> None:
     """Answer the flags that describe the build itself, then exit.
 
@@ -411,6 +423,7 @@ def main_loop(loop=None):
     omitting it defers building a loop -- and importing asyncio at all -- to
     :func:`_run_daemon`, the only branch that needs either.
     """
+    _answer_bare_version()
     parser = argparse.ArgumentParser(prog="cronstable")
     parser.add_argument(
         "-c",

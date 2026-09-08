@@ -19,9 +19,11 @@ import asyncio
 import datetime
 import json
 import math
+import sys
 import time
 from typing import Any, Optional
 
+import pytest
 from aiohttp import web
 
 from cronstable import tui
@@ -466,6 +468,18 @@ def test_rewrite_sgr_reinks_log_colors():
     # 256-color foregrounds collapse to the bright ink, not garbage
     out = rewrite_sgr("\x1b[38;5;196mX", theme)
     assert strip_ansi(out) == "X"
+    assert theme.fg("bright") in out
+    # background requests (256-color and truecolor) are dropped whole:
+    # the TUI owns the background
+    for bg in ("\x1b[48;5;196mX", "\x1b[48;2;1;2;3mX"):
+        out = rewrite_sgr(bg, theme)
+        assert strip_ansi(out) == "X"
+        assert theme.fg("bright") not in out
+        assert "48;" not in out
+    # an unknown code emits nothing
+    assert rewrite_sgr("\x1b[5mX", theme) == "X"
+    # a trailing 38 with no colour spec after it emits nothing
+    assert rewrite_sgr("\x1b[38mX", theme) == "X"
 
 
 def test_oneline_flattens_multiline_commands():
@@ -2499,6 +2513,86 @@ def test_rewrite_sgr_intensity_and_default_codes():
     out2 = rewrite_sgr("\x1b[91mbright\x1b[39mdefault", theme)
     assert strip_ansi(out2) == "brightdefault"
     assert theme.fg("fg") in out2  # code 39 -> the theme default ink
+
+
+def test_rewrite_sgr_ignores_oversized_parameters():
+    theme = Theme("carolina", light=False)
+    limit = getattr(sys, "get_int_max_str_digits", lambda: 4300)()
+    oversized = "9" * (max(limit, 4300) + 1)
+    for params, expected in (
+        (oversized, "hello"),
+        ("1;" + oversized + ";31", "\x1b[1m" + theme.fg("fail") + "hello"),
+    ):
+        line = sanitize_log_line("\x1b[" + params + "mhello")
+        assert rewrite_sgr(line, theme) == expected
+        assert rewrite_sgr(line, theme) == expected
+
+
+def test_rewrite_sgr_memo_is_per_theme_and_bounded(monkeypatch):
+    """Common SGR tokens share a cache bounded by entry count per theme."""
+    theme = Theme("carolina", light=False)
+    line = "\x1b[31mred\x1b[0m plain"
+    first = rewrite_sgr(line, theme)
+    memo = theme._sgr_memo
+    assert set(memo) == {"\x1b[31m", "\x1b[0m"}
+    # the warm call is served from the memo: the dispatch closure reads
+    # the module-level _rewrite_sgr_token, so a counting wrapper sees
+    # every miss
+    real_token = tui._rewrite_sgr_token
+    misses: list[str] = []
+
+    def counting(token, theme_):
+        misses.append(token)
+        return real_token(token, theme_)
+
+    monkeypatch.setattr(tui, "_rewrite_sgr_token", counting)
+    assert rewrite_sgr(line, theme) == first
+    assert misses == []
+    # the memo holds this theme's ink only: a fresh theme starts empty
+    assert Theme("carolina", light=True)._sgr_memo == {}
+    monkeypatch.setattr(tui, "_SGR_MEMO_MAX", 4)
+    for n in range(40):
+        out = rewrite_sgr("\x1b[38;5;%dmx" % n, theme)
+        assert strip_ansi(out) == "x" and theme.fg("bright") in out
+        assert len(memo) <= 4
+    # re-inks correctly after a clear-and-refill
+    assert theme.fg("fail") in rewrite_sgr("\x1b[31mred", theme)
+
+
+@pytest.mark.parametrize("prefix", ["\x1b]52;c;", "\x1bP"])
+def test_rewrite_sgr_discards_large_log_escapes_without_caching(prefix):
+    theme = Theme("carolina", light=False)
+    for n in range(8):
+        payload = prefix + str(n) + "a" * 32768 + "\x1b\\"
+        line = sanitize_log_line("before" + payload + "after\x1b[31mred")
+        assert rewrite_sgr(line, theme) == (
+            "beforeafter" + theme.fg("fail") + "red"
+        )
+    assert theme._sgr_memo == {"\x1b[31m": theme.fg("fail")}
+
+
+def test_rewrite_sgr_renders_large_valid_tokens_without_caching():
+    theme = Theme("carolina", light=False)
+    # A long color parameter produces a short rewrite; repeated bold
+    # parameters produce a large rewrite. Both keep their rendering.
+    for token, expected in (
+        ("\x1b[38;5;" + "0" * 32768 + "m", theme.fg("bright")),
+        ("\x1b[" + "1;" * 16384 + "31m", "\x1b[1m" * 16384 + theme.fg("fail")),
+    ):
+        line = sanitize_log_line(token + "message")
+        assert rewrite_sgr(line, theme) == expected + "message"
+        assert theme._sgr_memo == {}
+
+
+def test_rewrite_sgr_does_not_cache_expanded_reset_sequences():
+    theme = Theme("carolina", light=False)
+    token = "\x1b[" + ";" * (tui._SGR_MEMO_TOKEN_MAX - 3) + "m"
+    expected = (tui.RESET + theme.fg("fg")) * (len(token) - 2)
+    assert len(token) <= tui._SGR_MEMO_TOKEN_MAX
+    assert len(expected) > tui._SGR_MEMO_TEXT_MAX
+    line = sanitize_log_line(token + "message")
+    assert rewrite_sgr(line, theme) == expected + "message"
+    assert theme._sgr_memo == {}
 
 
 def test_sparkline_returns_a_plain_string():

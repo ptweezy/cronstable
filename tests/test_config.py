@@ -2686,6 +2686,20 @@ jobs:
     assert (
         conf.jobs[0].streamPrefix == "price $5, $VAR, ${unclosed and a{brace}"
     )
+    # A `${` followed by anything but a name (a digit, a `}`, a `-`, or a
+    # `:-` with no name) is literal too, even with a `}` in reach.
+    conf = config.parse_config_string(
+        """
+jobs:
+  - name: n
+    command: c
+    schedule:
+      minute: "*"
+    streamPrefix: "${5} ${} ${-x} ${:-d}"
+""",
+        "test.yaml",
+    )
+    assert conf.jobs[0].streamPrefix == "${5} ${} ${-x} ${:-d}"
 
 
 def test_env_interp_expands_state_path_and_include_path(monkeypatch, tmp_path):
@@ -2937,6 +2951,100 @@ def test_duplicate_job_names_rejected(tmp_path):
         config.parse_config(str(cfg))
     assert "duplicate job name" in str(exc.value)
     assert "backup" in str(exc.value)
+
+
+_DAG_X = """
+dags:
+  - name: x
+    schedule: "0 1 * * *"
+    tasks:
+      - id: a
+        command: echo a
+"""
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_job_name_colliding_with_dag_schedule_rejected(enabled):
+    dag_section = _DAG_X.replace(
+        "  - name: x", "  - name: x\n    enabled: " + str(enabled).lower()
+    )
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config_string(
+            "jobs:\n"
+            "  - name: 'dag:x'\n"
+            '    schedule: "0 1 * * *"\n'
+            "    command: echo one\n" + dag_section,
+            "test.yaml",
+        )
+    assert "'dag:x'" in str(exc.value)
+    assert "schedule of dag 'x'" in str(exc.value)
+    assert "rename" in str(exc.value)
+
+
+@pytest.mark.parametrize("name", ["dagx", "mydag:x", "dag:x", "dag:"])
+def test_job_name_without_dag_schedule_collision_loads(name):
+    conf = config.parse_config_string(
+        "jobs:\n"
+        "  - name: '{}'\n"
+        '    schedule: "0 1 * * *"\n'
+        "    command: echo one\n".format(name),
+        "test.yaml",
+    )
+    assert conf.jobs[0].name == name
+
+
+@pytest.mark.parametrize(
+    "dag_section",
+    [
+        _DAG_X.replace("name: x", "name: other"),
+        _DAG_X.replace('    schedule: "0 1 * * *"\n', ""),
+    ],
+    ids=["different-name", "manual-dag"],
+)
+def test_prefixed_job_with_unrelated_dag_loads(dag_section):
+    conf = config.parse_config_string(
+        "jobs:\n  - name: 'dag:x'\n    command: echo ok\n"
+        '    schedule: "0 1 * * *"\n' + dag_section,
+        "test.yaml",
+    )
+    assert conf.jobs[0].name == "dag:x"
+
+
+def test_classic_crontab_named_dag_keeps_its_job_identity(tmp_path):
+    path = tmp_path / "dag"
+    path.write_text("* * * * * echo ok\n", encoding="utf-8")
+    assert config.parse_config(str(path)).jobs[0].name == "dag:1"
+
+
+@pytest.mark.parametrize("assembly", ["directory", "include"])
+def test_dag_schedule_collision_across_files_rejected(tmp_path, assembly):
+    jobs = tmp_path / "jobs.yaml"
+    jobs.write_text(
+        "jobs:\n  - name: 'dag:x'\n    command: echo ok\n"
+        '    schedule: "0 1 * * *"\n',
+        encoding="utf-8",
+    )
+    dags = tmp_path / "dags.yaml"
+    dags.write_text(_DAG_X, encoding="utf-8")
+    if assembly == "include":
+        parent = tmp_path / "config.yaml"
+        parent.write_text(
+            "include:\n  - jobs.yaml\n  - dags.yaml\n", encoding="utf-8"
+        )
+    else:
+        parent = tmp_path
+    with pytest.raises(ConfigError, match="schedule of dag 'x'"):
+        config.parse_config(str(parent))
+
+
+def test_classic_crontab_dag_schedule_collision_names_the_source_fix(tmp_path):
+    (tmp_path / "dag").write_text("* * * * * echo ok\n", encoding="utf-8")
+    (tmp_path / "dags.yaml").write_text(
+        "include:\n  - dag\n" + _DAG_X.replace("name: x", "name: '1'"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="rename its source file"):
+        config.parse_config(str(tmp_path))
 
 
 # ---------------------------------------------------------------------------

@@ -39,7 +39,7 @@ from strictyaml import (
 from strictyaml import Optional as Opt
 from strictyaml.ruamel.error import YAMLError
 
-from cronstable import crontabs, dag, platform
+from cronstable import crontabs, platform
 from cronstable.cronexpr import LOCAL_ZONE, CronTab
 from cronstable.croninfo import Finding, lint_schedule
 
@@ -108,6 +108,82 @@ def _patch_strictyaml_seq_deepcopy() -> None:
 
 
 _patch_strictyaml_seq_deepcopy()
+
+
+def _patch_strictyaml_pointer_copy() -> None:
+    """Make strictyaml's chunk navigation fork a pointer without deepcopy.
+
+    strictyaml derives each child ``YAMLPointer`` (``val``/``key``/
+    ``index``/``textslice``/``parent``) with ``copy.deepcopy(self)``.  A
+    pointer's only state is ``_indices``, a list of tuples of strings and
+    ints, so the generic deepcopy spends some 40 Python calls producing
+    what one list copy produces; the walk runs once per key and element,
+    about a quarter of a 300-job parse.
+
+    A pure cost change: nothing mutates ``_indices`` in place, the tuples
+    are immutable, and the argument assertions are kept.  Error rendering
+    is unaffected (``_slice_segment`` deep-copies the document, not a
+    pointer).
+
+    Probed like the Seq shim: the rebinding happens only while upstream's
+    methods deep-copy and a pointer carries ``_indices`` alone, so a
+    strictyaml with a fix or added pointer state, or a second import of
+    this module, is left alone.
+    """
+    try:
+        from strictyaml.yamlpointer import YAMLPointer
+    except Exception:  # pragma: no cover - vendored layout changed
+        return
+    try:
+        stock_names = YAMLPointer.val.__code__.co_names
+        state = set(vars(YAMLPointer()))
+    except Exception:  # pragma: no cover - vendored layout changed
+        return
+    if "deepcopy" not in stock_names or state != {"_indices"}:
+        return
+
+    def _fork(pointer: Any) -> Any:
+        new = pointer.__class__.__new__(pointer.__class__)
+        new._indices = list(pointer._indices)
+        return new
+
+    def val(self: Any, regularkey: Any, strictkey: Any) -> Any:
+        assert isinstance(regularkey, str), type(regularkey)
+        assert isinstance(strictkey, str), type(strictkey)
+        new = _fork(self)
+        new._indices.append(("val", (regularkey, strictkey)))
+        return new
+
+    def key(self: Any, regularkey: Any, strictkey: Any) -> Any:
+        assert isinstance(regularkey, str), type(regularkey)
+        assert isinstance(strictkey, str), type(strictkey)
+        new = _fork(self)
+        new._indices.append(("key", (regularkey, strictkey)))
+        return new
+
+    def index(self: Any, index: Any) -> Any:
+        new = _fork(self)
+        new._indices.append(("index", index))
+        return new
+
+    def textslice(self: Any, start: Any, end: Any) -> Any:
+        new = _fork(self)
+        new._indices.append(("textslice", (start, end)))
+        return new
+
+    def parent(self: Any) -> Any:
+        new = _fork(self)
+        new._indices = new._indices[:-1]
+        return new
+
+    YAMLPointer.val = val
+    YAMLPointer.key = key
+    YAMLPointer.index = index
+    YAMLPointer.textslice = textslice
+    YAMLPointer.parent = parent
+
+
+_patch_strictyaml_pointer_copy()
 
 logger = logging.getLogger("cronstable.config")
 WebConfig = NewType("WebConfig", dict[str, Any])
@@ -1528,6 +1604,14 @@ LintCache = dict[tuple[str, str, Optional[datetime.tzinfo]], list[Finding]]
 #: sharing safe by construction (an accidental edit fails loudly).
 _NO_SLA_THRESHOLDS: Mapping[str, Any] = types.MappingProxyType({})
 
+#: The findings of a clean schedule, shared by every such job.  A list,
+#: the type lint_schedule returns and the annotation promises, so every
+#: caller sees one shape.  Read-only by convention, like
+#: _NO_SLA_THRESHOLDS, and shared because a fresh empty list per job is a
+#: tracked container every full collection walks.
+_NO_FINDINGS: list[Finding] = []
+_NO_FINDINGS_JSON: list[dict[str, Any]] = []
+
 
 class JobConfig:
     # __slots__ cuts steady-state memory (one JobConfig per job, rebuilt on
@@ -1739,9 +1823,12 @@ class JobConfig:
         self.command_display: str = (
             command if isinstance(command, str) else " ".join(command)
         )
-        self.schedule_findings_json: list[dict[str, Any]] = [
-            finding._asdict() for finding in self.schedule_findings
-        ]
+        findings = self.schedule_findings
+        self.schedule_findings_json: list[dict[str, Any]] = (
+            [finding._asdict() for finding in findings]
+            if findings
+            else _NO_FINDINGS_JSON
+        )
         # The plain-dialect spelling an ``H`` schedule resolved to, else None
         # (the common case; the payload builder just tests for None).
         schedule = self.schedule
@@ -1771,16 +1858,17 @@ class JobConfig:
         """
         tab = self.schedule
         if not isinstance(tab, CronTab):
-            return []
+            return _NO_FINDINGS
         if lint_cache is None:
-            return lint_schedule(timezone=self.frame, tab=tab)
+            return lint_schedule(timezone=self.frame, tab=tab) or _NO_FINDINGS
         key = (str(tab), tab.resolved_source, self.frame)
         findings = lint_cache.get(key)
         if findings is None:
             findings = lint_schedule(timezone=self.frame, tab=tab)
             lint_cache[key] = findings
-        # a copy, so every job owns its own list
-        return list(findings)
+        # a copy, so every job with findings owns its own list; a clean
+        # schedule shares the one empty list
+        return list(findings) if findings else _NO_FINDINGS
 
     def _parse_schedule(
         self, schedule_unparsed, prebuilt: Optional[CronTab] = None
@@ -2204,6 +2292,12 @@ class DagTaskConfig:
         raw_task: dict,
         defaults: Optional[dict[str, Any]] = None,
     ) -> None:
+        # Imported at the point of use: only a config with a dags: section
+        # needs the DAG state machine, and this module is on the
+        # --validate-config and --job-set-id import paths (the daemon
+        # imports dag anyway, through cron.py).
+        from cronstable import dag
+
         # `defaults` is the assembled job-defaults base, the same base a
         # regular job is merged over (falls back to DEFAULT_CONFIG when a
         # DagConfig is built directly, e.g. in a test).  The DAG-node fields
@@ -2269,6 +2363,10 @@ class DagTaskConfig:
         )
 
 
+#: Prefix of a scheduled DAG's synthetic schedule job, ``dag:<dag name>``.
+DAG_SCHEDULE_JOB_PREFIX = "dag:"
+
+
 class DagConfig:
     """A whole DAG: its scheduling frame, its tasks, and the validated graph.
 
@@ -2293,6 +2391,9 @@ class DagConfig:
     def __init__(
         self, raw_dag: dict, defaults: Optional[dict[str, Any]] = None
     ) -> None:
+        # deferred for the reason DagTaskConfig gives
+        from cronstable import dag
+
         raw = dict(raw_dag)
         self.name: str = raw.pop("name")
         self.enabled: bool = bool(raw.pop("enabled", True))
@@ -2324,7 +2425,7 @@ class DagConfig:
 
     def _build_schedule_job(self, raw: dict, schedule: Any) -> JobConfig:
         overrides: dict[str, Any] = {
-            "name": "dag:" + self.name,
+            "name": DAG_SCHEDULE_JOB_PREFIX + self.name,
             "command": "true",
             "schedule": schedule,
             "enabled": self.enabled,
@@ -4043,6 +4144,21 @@ class CronstableConfig:
     notify_config: Optional[dict[str, Any]] = None
     push_config: Optional[dict[str, Any]] = None
 
+    def __post_init__(self) -> None:
+        if not self.dags:
+            return
+        job_names = {job.name for job in self.jobs}
+        for dag_config in self.dags:
+            schedule_job = dag_config.schedule_job
+            if schedule_job is not None and schedule_job.name in job_names:
+                raise ConfigError(
+                    "job {!r} collides with the schedule of dag {!r}; "
+                    "rename the job or the dag (for a classic crontab "
+                    "job, rename its source file)".format(
+                        schedule_job.name, dag_config.name
+                    )
+                )
+
 
 # Environment-variable interpolation over the validated config document.
 #
@@ -4076,13 +4192,9 @@ class CronstableConfig:
 # The scanner is hand-rolled and single-pass: ``re.sub`` with a
 # ``:-([^}]*)`` default is O(n^2) on a value carrying many unterminated
 # ``${x:-`` fragments, which would stall config load and hot-reload.  Names
-# are ASCII ``[A-Za-z_][A-Za-z0-9_]*``.
-_ENV_NAME_START = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
-)
-_ENV_NAME_CHARS = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
-)
+# are ASCII ``[A-Za-z_][A-Za-z0-9_]*``, read by one anchored match that
+# consumes the name and nothing else, so it can never rescan the tail.
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _resolve_env(
@@ -4138,13 +4250,10 @@ def _interpolate_env_value(raw: str, path: str, location: str) -> str:
             i = j + 2
             continue
         if braces_possible and nxt == "{":
-            k = j + 2
-            if k < n and raw[k] in _ENV_NAME_START:
-                start = k
-                k += 1
-                while k < n and raw[k] in _ENV_NAME_CHARS:
-                    k += 1
-                name = raw[start:k]
+            match = _ENV_NAME_RE.match(raw, j + 2)
+            if match is not None:
+                k = match.end()
+                name = match.group()
                 if raw[k : k + 2] == ":-":
                     close = raw.find("}", k + 2)
                     if close < 0:
@@ -4215,6 +4324,12 @@ def _interpolate_env(doc: Any, path: str) -> Any:
     """
 
     def walk(node: Any, location: str, kind: str) -> Any:
+        if isinstance(node, str):
+            # leaves outnumber containers: test for them first, and answer
+            # a $-free one (nearly all of them) without a call
+            if "$" not in node:
+                return node
+            return _interpolate_env_value(node, path, location)
         if isinstance(node, dict):
             out = {}
             for key, value in node.items():
@@ -4237,8 +4352,6 @@ def _interpolate_env(doc: Any, path: str) -> Any:
                 walk(item, "{}[{}]".format(location, index), elem)
                 for index, item in enumerate(node)
             ]
-        if isinstance(node, str):
-            return _interpolate_env_value(node, path, location)
         return node
 
     return walk(doc, "", "root")

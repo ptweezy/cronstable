@@ -132,8 +132,27 @@ def escape_help(text: str, openmetrics: bool = False) -> str:
 _EXACT_INT_MIN = -9007199254740992.0  # -2**53
 _EXACT_INT_MAX = 9007199254740992.0  # 2**53
 
+#: Every integral value from 0 to 4095, rendered.  An int, an integral
+#: float, or a bool of that value all hit (they hash and compare equal,
+#: and the tail below renders each as the same digits), so nearly every
+#: sample of a scrape (counters, 0/1 gauges, bucket counts, exit codes)
+#: is one dict probe.  The table holds about 0.45 MB, so it is filled on
+#: the first scrape (see :func:`_fill_small_integral_strs`) and a daemon
+#: that is never scraped does not hold it; while empty, every probe
+#: misses into the general path, which renders the same digits.
+_SMALL_INTEGRAL_STRS: dict[float, str] = {}
+
+
+def _fill_small_integral_strs() -> None:
+    """Fill :data:`_SMALL_INTEGRAL_STRS` when it is empty."""
+    if not _SMALL_INTEGRAL_STRS:
+        _SMALL_INTEGRAL_STRS.update((float(i), str(i)) for i in range(4096))
+
 
 def format_value(value: int | float) -> str:
+    text = _SMALL_INTEGRAL_STRS.get(value)
+    if text is not None:
+        return text
     # Almost every sample is a small integral float (MetricFamily.add coerces
     # with float()), so lead with the bounds test that case needs anyway:
     # one comparison pair and ONE int() replace isinf + isnan + an int() for
@@ -198,30 +217,72 @@ def _sample_base(family: MetricFamily) -> str:
     return family.name
 
 
-#: Ceiling on the entries a persistent label-block memo will hold.  The
-#: label universe is a pure function of the job set (job_name crossed with
-#: a fixed static label), so it is bounded but proportional to fleet size:
-#: about 16 blocks per job, i.e. 8k entries at 500 jobs and 32k at 2000,
-#: both of which stay fully warm under this cap.  A cap is needed at all
-#: because the memo outlives the scrape: uncapped it would be ~1.6M
-#: entries of permanent RSS on a six-figure fleet.
-#:
-#: At the cap the memo STOPS ACCEPTING new entries rather than dropping
-#: what it holds.  Clearing it wholesale looked cheaper (one operation, no
-#: eviction bookkeeping) but it thrashes: the pass that overflows destroys
-#: the blocks it just built, refills, overflows again, and ends holding a
-#: fraction of a working set, so the NEXT scrape starts cold too and the
-#: memo stops paying for itself entirely.  Measured at 2000 vs 2100 jobs,
-#: 100 extra jobs cost 22.6ms -> 62.7ms per render (0.45 -> 1.19us per
-#: sample) crossing that edge.  Refusing the overflow instead keeps a
-#: stable warm set: the pass builds blocks in a deterministic order, so
-#: the same prefix is served warm on every scrape and only the tail is
-#: rebuilt, which degrades smoothly with fleet size instead of falling off
-#: a cliff.  Nothing goes stale in the pinned set: a block's key contains
-#: its values, and prune() clears the memo whenever the job set can shrink.
+#: Ceiling on the entries the persistent label-block memo holds.  The memo
+#: serves the plain label dicts a scrape builds fresh each time (the SLA
+#: dicts with a ``check`` label, the info families, the non-job families);
+#: each job's own label sets carry their rendered block on the dict (see
+#: :class:`_SharedLabels`) and never enter the memo.  At the cap the memo
+#: stops accepting new entries and keeps what it holds.  A wholesale clear
+#: on overflow thrashes: the pass that overflows destroys the blocks it
+#: just built, and the next scrape starts cold again.  Nothing in the
+#: pinned set goes stale, because a block's key contains its values, and
+#: prune() clears the memo whenever the job set can shrink.
 LABEL_BLOCK_CACHE_MAX = 32768
 
 _LabelBlockCache = dict[tuple[tuple[str, str], ...], str]
+
+
+class _SharedLabels(dict[str, str]):
+    """A per-job label dict shared across scrapes, carrying its own block.
+
+    :meth:`PrometheusMetrics._label_sets` hands every job one read-only
+    set of these, reused by nearly all of its samples per scrape.  The
+    builder renders such a dict's block once, pins it on ``block``, and
+    answers from there on every later scrape; the dict never touches the
+    memo, so the memo and its cap cover only the per-scrape plain dicts.
+    A block lives as long as ``_job_label_dicts`` holds its dict, which
+    prune() and set_duration_buckets() clear; the per-job cost is about
+    1.1 KB of block text.
+    """
+
+    __slots__ = ("block",)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.block: Optional[str] = None
+
+
+def _render_label_block(key: tuple[tuple[str, str], ...]) -> str:
+    """Render ``{k="v",...}`` from a label items tuple.
+
+    The one- and two-label shapes, which are nearly every sample
+    (``job_name`` alone, or with ``le``/``status``), concatenate directly
+    and skip the generator machinery.
+    """
+    if len(key) == 1:
+        name, val = key[0]
+        return "{" + name + '="' + escape_label_value(val) + '"}'
+    if len(key) == 2:
+        (n1, v1), (n2, v2) = key
+        return (
+            "{"
+            + n1
+            + '="'
+            + escape_label_value(v1)
+            + '",'
+            + n2
+            + '="'
+            + escape_label_value(v2)
+            + '"}'
+        )
+    return (
+        "{"
+        + ",".join(
+            '{}="{}"'.format(name, escape_label_value(val))
+            for name, val in key
+        )
+        + "}"
+    )
 
 
 def _make_label_block_builder(
@@ -229,77 +290,43 @@ def _make_label_block_builder(
 ) -> Callable[[dict[str, str]], str]:
     """A builder for the ``{k="v",...}`` block that memoizes whole blocks.
 
-    Escaping alone was memoized before, but the *assembly* (a generator
-    expression, a ``str.join`` and a ``format`` per label) ran again for
-    every sample.  One job's label set recurs across ~9 families in a
-    scrape (each counter, each gauge), so the same block was rebuilt nine
-    times; keying the memo on the label items collapses that to once.  The
-    one- and two-label shapes, which are nearly every sample (``job_name``
-    alone, or with ``le``/``outcome``), skip the generator machinery
-    entirely on a miss and concatenate directly.
+    One label set recurs across several families in a scrape (each
+    counter, each gauge), so the memo is keyed on the label items and a
+    block is assembled once per pass.  A :class:`_SharedLabels` dict is
+    answered from the block pinned on the dict itself and never enters
+    the memo.
 
-    ``cache`` lets the caller supply a memo that OUTLIVES the pass, which
+    ``cache`` lets the caller supply a memo that outlives the pass, which
     :class:`PrometheusMetrics` does, so a scrape does not re-escape and
-    re-assemble every block from cold every 15 to 60 seconds.  A stale hit
-    is impossible by construction: the key is the label items tuple, so
-    every value is part of its own key and a changed value is a different
-    key, never a hit on the old block.  Only growth needs managing, hence
-    the cap above and the clears in :meth:`PrometheusMetrics.prune` and
+    re-assemble every plain-dict block from cold every 15 to 60 seconds.
+    A stale hit is impossible by construction: the key is the label items
+    tuple, so a changed value is a different key.  Only growth needs
+    managing, hence the cap above and the clears in
+    :meth:`PrometheusMetrics.prune` and
     :meth:`PrometheusMetrics.set_duration_buckets`.  Without a ``cache``
-    the memo is private to the returned closure, i.e. to one pass.  Label
-    values are always strings here (the families build them that way), so
-    the items tuple is hashable.
+    the memo is private to the returned closure, that is, to one pass.
+    Label values are always strings here (the families build them that
+    way), so the items tuple is hashable.
     """
     memo: _LabelBlockCache = {} if cache is None else cache
 
     def block_for(labels: dict[str, str]) -> str:
+        if isinstance(labels, _SharedLabels):
+            block = labels.block
+            if block is None:
+                block = labels.block = _render_label_block(
+                    tuple(labels.items())
+                )
+            return block
         key = tuple(labels.items())
         block = memo.get(key)
         if block is None:
-            if len(key) == 1:
-                name, val = key[0]
-                block = "{" + name + '="' + escape_label_value(val) + '"}'
-            elif len(key) == 2:
-                (n1, v1), (n2, v2) = key
-                block = (
-                    "{"
-                    + n1
-                    + '="'
-                    + escape_label_value(v1)
-                    + '",'
-                    + n2
-                    + '="'
-                    + escape_label_value(v2)
-                    + '"}'
-                )
-            else:
-                block = (
-                    "{"
-                    + ",".join(
-                        '{}="{}"'.format(name, escape_label_value(val))
-                        for name, val in key
-                    )
-                    + "}"
-                )
+            block = _render_label_block(key)
             if len(memo) < LABEL_BLOCK_CACHE_MAX:
                 memo[key] = block
         return block
 
     return block_for
-
-
-def _sample_fields(
-    sample_base: str,
-    suffix: str,
-    labels: dict[str, str],
-    block_for: Callable[[dict[str, str]], str],
-) -> tuple[str, str]:
-    """One sample's ``(name, label_block)`` where ``label_block`` is the
-    brace-wrapped ``{k="v",...}`` string, or ``""`` when unlabelled."""
-    name = sample_base + suffix
-    if not labels:
-        return name, ""
-    return name, block_for(labels)
 
 
 def iter_family_samples(
@@ -321,14 +348,17 @@ def iter_family_samples(
     :func:`_make_label_block_builder`); without one the memo is per pass
     and starts cold.
     """
+    _fill_small_integral_strs()
     block_for = _make_label_block_builder(label_cache)
     for family in families:
         if not family.samples:
             continue
         base = _sample_base(family)
+        # inlined like render_families' loop: no helper frame or tuple
+        # per sample
         for suffix, labels, value in family.samples:
-            name, block = _sample_fields(base, suffix, labels, block_for)
-            yield name, block, format_value(value)
+            block = block_for(labels) if labels else ""
+            yield base + suffix, block, format_value(value)
 
 
 def render_families(
@@ -348,6 +378,7 @@ def render_families(
     :func:`_make_label_block_builder`); without one the memo is per render
     and every block is re-escaped and re-assembled from cold.
     """
+    _fill_small_integral_strs()
     out: list[str] = []
     block_for = _make_label_block_builder(label_cache)
     for family in families:
@@ -365,16 +396,18 @@ def render_families(
             )
         )
         out.append("# TYPE {} {}".format(type_name, mtype))
-        # The per-sample line is built inline rather than through
-        # _sample_fields: this is the innermost loop of a scrape (one pass
-        # per sample, tens of thousands of them on a large fleet), and the
-        # helper's call frame plus the (name, block) tuple it allocates
-        # cost more than the two-line body they save.  Formatting stays
-        # identical: same stem, same block builder, same format_value.
+        # The per-sample line is built inline: this is the innermost loop
+        # of a scrape (tens of thousands of samples on a large fleet),
+        # where a helper's call frame and its (name, block) tuple cost
+        # more than the two-line body they save.  Formatting is the same
+        # as iter_family_samples': same stem, block builder, and
+        # format_value.
         append = out.append
         for suffix, labels, value in family.samples:
             block = block_for(labels) if labels else ""
-            append(sample_base + suffix + block + " " + format_value(value))
+            # one f-string build per line: chained concatenation allocates
+            # an intermediate string per operator
+            append(f"{sample_base}{suffix}{block} {format_value(value)}")
     if openmetrics:
         out.append("# EOF")
     return "\n".join(out) + "\n"
@@ -490,6 +523,10 @@ class PrometheusMetrics:
 
     def __init__(self) -> None:
         self._jobs: dict[str, _JobMetrics] = {}
+        # the scrape's job order, memoized (a sort per scrape grows with
+        # the fleet, about 14 ms at 100,000 jobs) and dropped wherever
+        # _jobs gains or loses a name (_job, prune)
+        self._sorted_job_names: Optional[list[str]] = None
         self._buckets: tuple[float, ...] = DEFAULT_DURATION_BUCKETS
         # The histogram "le" label strings are a pure function of the (fixed
         # between config changes) bucket bounds, so render them once here (and
@@ -506,17 +543,15 @@ class PrometheusMetrics:
         # durable-state writes that failed and were dropped, by kind
         # (run-record, checkpoint, retry, reboot-marker, counters, manifest)
         self._state_dropped: dict[str, int] = {}
-        # Whole {k="v",...} label blocks, kept ACROSS scrapes: the label
-        # universe is a pure function of the job set and a fixed set of
-        # static labels, so a scrape that rebuilds it from cold re-escapes
-        # and re-concatenates every block for nothing. Cleared wholesale
-        # wherever that universe can change (prune, set_duration_buckets)
-        # and capped at LABEL_BLOCK_CACHE_MAX so it cannot grow into
-        # permanent RSS on a six-figure fleet.
+        # Whole {k="v",...} label blocks for the plain label dicts a scrape
+        # builds fresh each time, kept across scrapes and capped at
+        # LABEL_BLOCK_CACHE_MAX. Cleared wholesale wherever the label
+        # universe can change (prune, set_duration_buckets).
         self._label_blocks: _LabelBlockCache = {}
         # Per-job label dicts for phase 1 (see _label_sets): one shared set
-        # per job instead of fresh dicts per sample per scrape.  Cleared
-        # wherever _label_blocks is cleared, for the same reasons.
+        # per job, each dict carrying its own rendered block (about 1.1 KB
+        # of block text per job). Cleared wherever _label_blocks is
+        # cleared, which drops the blocks with the dicts.
         self._job_label_dicts: dict[
             str,
             tuple[
@@ -586,6 +621,7 @@ class PrometheusMetrics:
         for name in list(self._jobs):
             if name not in keep:
                 del self._jobs[name]
+        self._sorted_job_names = None
         # Unconditionally, not only when a job actually went away: the memo
         # is keyed on label items, not on job name, so there is nothing to
         # delete selectively, and a reload is the one moment the label
@@ -598,6 +634,7 @@ class PrometheusMetrics:
         if job is None:
             job = _JobMetrics(len(self._buckets))
             self._jobs[name] = job
+            self._sorted_job_names = None
         return job
 
     def _label_sets(
@@ -622,19 +659,19 @@ class PrometheusMetrics:
         entry = self._job_label_dicts.get(name)
         if entry is None:
             entry = self._job_label_dicts[name] = (
-                {"job_name": name},
+                _SharedLabels({"job_name": name}),
                 tuple(
-                    {"job_name": name, "status": outcome}
+                    _SharedLabels({"job_name": name, "status": outcome})
                     for outcome in RUN_OUTCOMES
                 ),
                 tuple(
-                    {"job_name": name, "le": le}
+                    _SharedLabels({"job_name": name, "le": le})
                     for le in self._bucket_bound_strs
                 ),
-                {"job_name": name, "le": "+Inf"},
+                _SharedLabels({"job_name": name, "le": "+Inf"}),
                 (
-                    {"job_name": name, "mode": "user"},
-                    {"job_name": name, "mode": "system"},
+                    _SharedLabels({"job_name": name, "mode": "user"}),
+                    _SharedLabels({"job_name": name, "mode": "system"}),
                 ),
             )
         return entry
@@ -1116,19 +1153,32 @@ class PrometheusMetrics:
             families.append(reload_time)
         return families
 
+    def _scrape_job_names(self, cron: "Cron") -> list[str]:
+        """Every configured job's accumulator ensured; the names in order.
+
+        Ensuring gives each job zero-filled counters from the first scrape
+        (prune keeps the set aligned with the config on reload); in the
+        steady state it is one C-level superset test.  The sorted names
+        are memoized in _sorted_job_names: a sort per scrape runs on the
+        loop and grows with the fleet (about 14 ms at 100,000 jobs).
+        """
+        if not (self._jobs.keys() >= cron.cron_jobs.keys()):
+            for name in cron.cron_jobs:
+                self._job(name)
+        names = self._sorted_job_names
+        if names is None:
+            names = self._sorted_job_names = sorted(self._jobs)
+        return names
+
     def _job_families(self, cron: "Cron") -> list[MetricFamily]:
         # Local import: cron.py imports this module, so the cycle can only
         # be broken at call time (mirrors the deferred imports elsewhere).
         # get_now/datetime are only touched by the next-fire fallback below.
         import datetime
 
-        from cronstable.cron import get_now, schedule_str
+        from cronstable.cron import get_now
 
-        # Ensure every configured job has an accumulator so its counters
-        # are emitted zero-filled from the first scrape (prune keeps this
-        # aligned with the loaded config on reload).
-        for name in cron.cron_jobs:
-            self._job(name)
+        names = self._scrape_job_names(cron)
 
         runs = MetricFamily(
             "cronstable_job_runs",
@@ -1197,7 +1247,7 @@ class PrometheusMetrics:
             "SLA breaches detected for the job, by check "
             "(absent unless the job has an sla block).",
         )
-        for name in sorted(self._jobs):
+        for name in names:
             job = self._jobs[name]
             labels, outcome_labels, le_labels, inf_labels, mode_labels = (
                 self._label_sets(name)
@@ -1310,7 +1360,8 @@ class PrometheusMetrics:
             info.add(
                 {
                     "job_name": name,
-                    "schedule": schedule_str(job_config),
+                    # schedule_str's string, precomputed on the JobConfig
+                    "schedule": job_config.schedule_display,
                     "cluster_policy": job_config.clusterPolicy,
                 },
                 1,

@@ -20,7 +20,7 @@ import os
 import socket
 import ssl
 import zlib
-from collections import OrderedDict, defaultdict, deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from functools import lru_cache, partial, wraps
 from typing import (  # noqa
@@ -945,6 +945,24 @@ def _run_finish_key(info: "JobRunInfo") -> datetime.datetime:
     return finished
 
 
+_MapValueT = TypeVar("_MapValueT")
+
+
+def _kept(
+    mapping: dict[str, _MapValueT], keep: set[str]
+) -> dict[str, _MapValueT]:
+    """``mapping`` without the entries whose key is not in ``keep``.
+
+    Returns the mapping itself when nothing is dropped (the ordinary
+    reload), so only the maps that change are rebuilt; otherwise a fresh
+    dict, never an in-place delete, so an iteration parked at an await
+    keeps its snapshot.
+    """
+    if mapping.keys() <= keep:
+        return mapping
+    return {name: value for name, value in mapping.items() if name in keep}
+
+
 def _run_stats(runs: list[JobRunInfo]) -> dict[str, Any]:
     """Aggregate stats over a job's retained run history, for the web UI.
 
@@ -1068,7 +1086,7 @@ def _activity_jobs(
                     "finished_at": r.finished_at.isoformat(),
                     "outcome": r.outcome,
                 }
-                for r in rows[-limit:]
+                for r in (rows if len(rows) <= limit else rows[-limit:])
             ]
             for name, rows in histories.items()
         }
@@ -1953,16 +1971,16 @@ class Cron:
         # stay primed. Yields None without psutil.
         self._node_sampler = NodeResourceSampler()
         # list of cron jobs we /want/ to run
-        self.cron_jobs: dict[str, JobConfig] = OrderedDict()
+        self.cron_jobs: dict[str, JobConfig] = {}
         # orchestration DAGs; empty keeps the classic no-DAG behaviour.
-        self.cron_dags: dict[str, DagConfig] = OrderedDict()
+        self.cron_dags: dict[str, DagConfig] = {}
         # Memo caches (these four plus _memo_gen and friends below): pure
         # functions of cron_jobs, computed lazily; ALL must be invalidated
         # at every point cron_jobs is reassigned (reload).
         self._job_set_id_cache: str | None = None
         self._needs_subminute_cache: bool | None = None
         self._job_pos_cache: dict[str, int] | None = None
-        self._any_sla_cache: bool | None = None
+        self._sla_jobs_cache: list[tuple[str, JobConfig]] | None = None
         # list of cron jobs already running
         # name -> list of RunningJob
         self.running_jobs: dict[str, list[RunningJob]] = defaultdict(list)
@@ -2129,15 +2147,13 @@ class Cron:
         if config_yaml is not None:
             # config_yaml is for unit testing
             config = parse_config_string(config_yaml, "")
-            self.cron_jobs = OrderedDict(
-                (job.name, job) for job in config.jobs
-            )
-            self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
+            self.cron_jobs = {job.name: job for job in config.jobs}
+            self.cron_dags = {d.name: d for d in config.dags}
             self._notify_config = config.notify_config
             self._job_set_id_cache = None
             self._needs_subminute_cache = None
             self._job_pos_cache = None
-            self._any_sla_cache = None
+            self._sla_jobs_cache = None
 
         self._wait_for_running_jobs_task: asyncio.Task | None = None
         # Every wake source for the run loop's sleep feeds this one
@@ -2798,10 +2814,10 @@ class Cron:
         """
         self.metrics.config_parse(True)
         old_jobs = self.cron_jobs
-        self.cron_jobs = OrderedDict((job.name, job) for job in config.jobs)
+        self.cron_jobs = {job.name: job for job in config.jobs}
         # DagScheduler reads this live each pass; in-flight runs of a
         # removed DAG finish and are GC'd.
-        self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
+        self.cron_dags = {d.name: d for d in config.dags}
         # read live by _dispatch_notify, so a reload takes effect at once.
         self._notify_config = config.notify_config
         # Retire the Event Log writer of a source this config no longer
@@ -2815,51 +2831,32 @@ class Cron:
         self._job_set_id_cache = None
         self._needs_subminute_cache = None
         self._job_pos_cache = None
-        self._any_sla_cache = None
+        self._sla_jobs_cache = None
         # Drop metric series for removed jobs. A removed-but-still-running
         # job keeps its accumulator until the run finishes: pruning it
         # mid-run would let the finishing run recreate the series from zero
-        # (a phantom counter reset).
-        self.metrics.prune(set(self.cron_jobs) | set(self.running_jobs))
+        # (a phantom counter reset). The per-job maps below prune on the
+        # same keep-set through _kept.
+        keep = set(self.cron_jobs) | set(self.running_jobs)
+        self.metrics.prune(keep)
         # Drop last-run slots for removed jobs (churning names must not
         # grow the map); a still-running job keeps its slot until a later
         # reload, matching the metrics prune above.
-        keep = set(self.cron_jobs) | set(self.running_jobs)
-        self._last_run_slot = {
-            name: slot
-            for name, slot in self._last_run_slot.items()
-            if name in keep
-        }
+        self._last_run_slot = _kept(self._last_run_slot, keep)
         # a REMOVED job never runs again under that name, so its trends
         # entry would orphan forever; prune with the other per-job maps.
-        self._trends_cache = {
-            name: entry
-            for name, entry in self._trends_cache.items()
-            if name in keep
-        }
+        self._trends_cache = _kept(self._trends_cache, keep)
         # a removed job's survivor entry must not outlive its job (and a
         # re-added name must not inherit a stale pid).
-        self._boot_survivors = {
-            name: entry
-            for name, entry in self._boot_survivors.items()
-            if name in keep
-        }
+        self._boot_survivors = _kept(self._boot_survivors, keep)
         # the job set itself changed: the shared /jobs product is stale
         self._bust_response_memos()
         # Pause state survives a job-config edit (deliberately no digest
         # check, unlike retries: the operator paused the NAME, not one
         # definition of it); only a job the reload removed is pruned.
-        self._paused = {
-            name: info for name, info in self._paused.items() if name in keep
-        }
-        self._pause_gen = {
-            name: gen for name, gen in self._pause_gen.items() if name in keep
-        }
-        self._pause_pending_writes = {
-            name: rec
-            for name, rec in self._pause_pending_writes.items()
-            if name in keep
-        }
+        self._paused = _kept(self._paused, keep)
+        self._pause_gen = _kept(self._pause_gen, keep)
+        self._pause_pending_writes = _kept(self._pause_pending_writes, keep)
         # Slot mutex prune is narrower: handing out a second Lock for a
         # slot somebody still holds would defeat the mutual exclusion, so
         # forget a name only when nothing can still take its mutex (no
@@ -2887,62 +2884,30 @@ class Cron:
                 if name in keep or lock.locked()
             },
         )
-        self._last_real_outcome = {
-            name: outcome
-            for name, outcome in self._last_real_outcome.items()
-            if name in keep
-        }
-        self._last_completed_at = {
-            name: at
-            for name, at in self._last_completed_at.items()
-            if name in keep
-        }
+        self._last_real_outcome = _kept(self._last_real_outcome, keep)
+        self._last_completed_at = _kept(self._last_completed_at, keep)
         # SLA trackers survive a job edit (history did not change); only
         # removed jobs are pruned. A check dropped from a surviving job's
         # sla block is cleared by the next _sla_periodic pass instead.
-        self._sla_last_success = {
-            name: at
-            for name, at in self._sla_last_success.items()
-            if name in keep
-        }
-        self._sla_due = {
-            name: at for name, at in self._sla_due.items() if name in keep
-        }
-        self._sla_last_start = {
-            name: at
-            for name, at in self._sla_last_start.items()
-            if name in keep
-        }
+        self._sla_last_success = _kept(self._sla_last_success, keep)
+        self._sla_due = _kept(self._sla_due, keep)
+        self._sla_last_start = _kept(self._sla_last_start, keep)
         self._sla_state = {
             key: since
             for key, since in self._sla_state.items()
             if key[0] in keep
         }
-        self._sla_pause_windows = {
-            name: spans
-            for name, spans in self._sla_pause_windows.items()
-            if name in keep
-        }
-        self._sla_disabled_since = {
-            name: at
-            for name, at in self._sla_disabled_since.items()
-            if name in keep
-        }
+        self._sla_pause_windows = _kept(self._sla_pause_windows, keep)
+        self._sla_disabled_since = _kept(self._sla_disabled_since, keep)
         # first-seen is the one tracker this pass also SEEDS: a just-added
         # job ages into maxTimeSinceSuccess from now, not process start.
-        self._sla_first_seen = {
-            name: at
-            for name, at in self._sla_first_seen.items()
-            if name in keep
-        }
+        self._sla_first_seen = _kept(self._sla_first_seen, keep)
         seen_at = get_now(datetime.timezone.utc)
         for name in self.cron_jobs:
             self._sla_first_seen.setdefault(name, seen_at)
         # a removed job's last_run/run_history is unreachable (payload
         # builders iterate cron_jobs only), so keeping it is leaked memory.
-        self.last_run = {
-            name: info for name, info in self.last_run.items() if name in keep
-        }
+        self.last_run = _kept(self.last_run, keep)
         for name in [n for n in self.run_history if n not in keep]:
             del self.run_history[name]
         # Re-sync the next-fire index: drop removed jobs, reseed changed
@@ -3415,9 +3380,20 @@ class Cron:
             # failing-count badge), not a count of jobs mid-retry.
             if last is not None and last.outcome == "failure":
                 failing += 1
-            if self._schedule_never_fires(name, job):
-                never_fires += 1
             scheduled_in = self._scheduled_in(name, job, is_running, now)
+            # a dead schedule's None means never, distinct from the
+            # running/disabled Nones. For a non-running job scheduled_in
+            # answers (as _job_to_dict derives it); a running job needs
+            # the direct probe.
+            if is_running:
+                if self._schedule_never_fires(name, job):
+                    never_fires += 1
+            elif (
+                job.enabled
+                and isinstance(job.schedule, CronTab)
+                and scheduled_in is None
+            ):
+                never_fires += 1
             if scheduled_in is not None and pause is not None:
                 # a fire the pause window covers is skipped at the gate, so
                 # it must not be reported as the fleet's next fire; a fire
@@ -4254,12 +4230,20 @@ class Cron:
     def _avg_duration(self, name: str) -> Optional[float]:
         """Mean runtime in seconds over retained history, or ``None``.
 
-        The dashboard's own definition (:func:`_run_stats`), so the .ics
-        feed's event lengths can never disagree with the run drawer.
+        The dashboard's own definition (:func:`_run_stats`'s
+        ``avg_duration``: ``sum`` over ``len`` of the rows with a
+        duration), so the .ics feed's event lengths match the run drawer.
+        Folded here directly: _run_stats computes 15 other fields the
+        feed never reads, and the fleet feed calls this once per job.
         """
-        runs = list(self.run_history.get(name) or [])
-        avg = _run_stats(runs)["avg_duration"]
-        return float(avg) if avg is not None else None
+        durations = [
+            duration
+            for duration in (
+                r.duration for r in self.run_history.get(name) or ()
+            )
+            if duration is not None
+        ]
+        return sum(durations) / len(durations) if durations else None
 
     def _calendar_entries(
         self, name: Optional[str] = None
@@ -4267,23 +4251,25 @@ class Cron:
         """The calendar renderer's rows: the fleet, or one job when ``name``.
 
         ``None`` for an unknown job; a known job with no timetable or a
-        fleet of none is an empty list. Both feeds filter the same
-        _schedule_entries snapshot, so they cannot disagree. Reads live
-        state, so it runs on the loop; the render walks the immutable
-        result on an executor.
+        fleet of none is an empty list. Both feeds apply the
+        _schedule_entries filter (enabled, cron-scheduled), so they cannot
+        disagree; the per-job feed applies it to the one job in hand
+        rather than to a fleet snapshot. Reads live state, so it runs on
+        the loop; the render walks the immutable result on an executor.
         """
         if name is None:
             schedule_entries = sorted(
                 self._schedule_entries(), key=lambda entry: entry.name
             )
         else:
-            if self._job_or_dag_schedule(name) is None:
+            sched = self._job_or_dag_schedule(name)
+            if sched is None:
                 return None
-            schedule_entries = [
-                entry
-                for entry in self._schedule_entries()
-                if entry.name == name
-            ]
+            schedule_entries = (
+                [ScheduleEntry(name, sched.schedule, sched.timezone)]
+                if sched.enabled and isinstance(sched.schedule, CronTab)
+                else []
+            )
         return [
             CalendarEntry(
                 entry.name,
@@ -4337,18 +4323,9 @@ class Cron:
         per_job = self._web_int_query(
             request, "limit", default=100, lo=1, hi=1000, alias="per_job"
         )
-        # the entries snapshot reads live state, so it is taken on the
-        # loop; the walk (jobs x fires, pure CPU) then runs on the
-        # executor over the immutable snapshot, like the pressure/suggest
-        # builders
+        # Snapshot live state on the event loop, then render in a worker.
         entries = self._calendar_entries(name)
         if entries is None:
-            # Only the per-job feed reaches this: _calendar_entries(None)
-            # builds a list from the fleet snapshot and never returns
-            # None, so `name` is a real path segment here even though
-            # mypy sees Optional[str]. The lookup is _job_or_dag_schedule,
-            # so /jobs/dag:mydag/calendar.ics is a legitimate 200 and the
-            # reason must not claim a job was the only thing searched.
             raise _api_error(
                 web.HTTPNotFound,
                 "no job or DAG schedule named {!r}".format(name),
@@ -4814,16 +4791,19 @@ class Cron:
         if not self._any_sla() and not self._sla_state:
             # nothing declares an sla and nothing is latched: the walk
             # below would be a no-op, so skip it. The reload that adds an
-            # sla block clears _any_sla_cache, so the next pass walks.
+            # sla block clears _sla_jobs_cache, so the next pass walks.
             return
         now = get_now(datetime.timezone.utc)
-        for name, job in self.cron_jobs.items():
-            if not job.has_sla:
-                # no sla block (or a reload blanked it): latches must not
-                # stay stuck at breached. has_sla is precomputed, so a
-                # no-SLA deployment pays O(1) per job per pass.
-                self._sla_clear_latches(name)
-                continue
+        if self._sla_state:
+            # A latch of a job with no sla block (or one a reload blanked)
+            # must not stay stuck at breached; the walk below visits SLA
+            # jobs only, so such latches are found from the latch map.
+            jobs = self.cron_jobs
+            for latched in {name for name, _check in self._sla_state}:
+                holder = jobs.get(latched)
+                if holder is not None and not holder.has_sla:
+                    self._sla_clear_latches(latched)
+        for name, job in self._sla_jobs():
             if not job.enabled or self._pause_active(name, now) is not None:
                 # excused: a pre-pause/disable breach would otherwise pin
                 # the gauge, sla block and OVERDUE chip for the window.
@@ -5439,7 +5419,9 @@ class Cron:
         recent = (
             [
                 {"outcome": r.outcome, "duration": r.duration}
-                for r in list(history)[-JOBS_INLINE_HISTORY:]
+                for r in itertools.islice(
+                    history, max(0, len(history) - JOBS_INLINE_HISTORY), None
+                )
             ]
             if history
             else []
@@ -6468,9 +6450,11 @@ class Cron:
             # opening on a chatty job replays up to LIVE_LOG_LIMIT lines, and
             # each awaited write is a coroutine step plus a transport write
             # (and potentially its own small TCP segment).
+            # the ring is appended on the loop thread only and the join
+            # is synchronous, so no copy is needed
             replay = b"".join(
                 _sse_frame(stream_name, line)
-                for stream_name, line in list(output.lines)
+                for stream_name, line in output.lines
             )
             if replay:
                 await resp.write(replay)
@@ -8487,17 +8471,25 @@ class Cron:
             self._job_pos_cache = cached
         return cached
 
-    def _any_sla(self) -> bool:
-        """Whether any loaded job carries an ``sla`` block.
+    def _sla_jobs(self) -> list[tuple[str, JobConfig]]:
+        """The ``(name, job)`` pairs of every loaded job with an ``sla`` block.
 
-        Memoized alongside _job_pos; lets the SLA pass skip the walk when
-        nothing declares an SLA.
+        Memoized like _job_pos, so the SLA pass walks only the jobs it
+        evaluates.
         """
-        cached = self._any_sla_cache
+        cached = self._sla_jobs_cache
         if cached is None:
-            cached = any(job.has_sla for job in self.cron_jobs.values())
-            self._any_sla_cache = cached
+            cached = [
+                (name, job)
+                for name, job in self.cron_jobs.items()
+                if job.has_sla
+            ]
+            self._sla_jobs_cache = cached
         return cached
+
+    def _any_sla(self) -> bool:
+        """Whether any loaded job carries an ``sla`` block."""
+        return bool(self._sla_jobs())
 
     # ---- next-fire index: each enabled CronTab job's next fire (aware
     # UTC) lives in _next_fire, mirrored into the _fire_heap min-heap; the
@@ -8532,20 +8524,29 @@ class Cron:
         Seeds strictly-future (the next boundary after ``now``), so a job just
         added on a reload (or every job at start-up) skips the in-progress
         slot rather than firing once for the partial period already under way.
+
+        The fires are collected and mirrored into the heap in one go: a
+        bulk seed (boot, or a reload that adds more jobs than the index
+        holds) pays one O(n) heapify rather than a push per job, and the
+        pop order is the same either way (entries are unique by name).
         """
+        next_fire = self._next_fire
+        dead = self._dead_schedules
+        fresh: list[tuple[datetime.datetime, str]] = []
         for name, job in self.cron_jobs.items():
-            if name in self._next_fire:
+            if name in next_fire:
                 continue
             if job.enabled and isinstance(job.schedule, CronTab):
                 nxt = self._compute_next_fire(job, now)
                 if nxt is not None:
-                    self._set_next_fire(name, nxt)
-                    self._dead_schedules.discard(name)
-                elif name not in self._dead_schedules:
+                    next_fire[name] = nxt
+                    fresh.append((nxt, name))
+                    dead.discard(name)
+                elif name not in dead:
                     # without this, a schedule with no future occurrence
                     # (Feb 30, a past year) would just never enter the fire
                     # index and vanish without a trace
-                    self._dead_schedules.add(name)
+                    dead.add(name)
                     logger.warning(
                         "job %r: schedule %r has no future occurrence and "
                         "will NEVER fire; fix the schedule or disable the "
@@ -8553,6 +8554,15 @@ class Cron:
                         name,
                         schedule_str(job),
                     )
+        if not fresh:
+            return
+        heap = self._fire_heap
+        if len(fresh) > len(heap):
+            heap.extend(fresh)
+            heapq.heapify(heap)
+        else:
+            for entry in fresh:
+                heapq.heappush(heap, entry)
 
     @staticmethod
     def _same_schedule(a: JobConfig, b: JobConfig) -> bool:
@@ -11422,19 +11432,32 @@ class Cron:
     async def _wait_for_running_jobs(self) -> None:
         # job -> wait task
         wait_tasks: dict[RunningJob, asyncio.Task] = {}
-        # standing wait on _jobs_running in the busy branch's wait set: a
-        # launch or the shutdown signal wakes the reaper immediately, so
-        # the loop is fully event-driven (no poll timeout).
+        # The wait task's done callback files the job here and sets
+        # `completed`: O(1) per finish. asyncio.wait over every wait task
+        # would register and remove a waiter per running job per
+        # completion, quadratic in the running count
+        # (loop.stall_completions_500 measures it).
+        finished: list[RunningJob] = []
+        completed = asyncio.Event()
+
+        def _on_done(job: RunningJob, _task: asyncio.Task) -> None:
+            finished.append(job)
+            completed.set()
+
+        # standing waits on _jobs_running and `completed`: a launch, the
+        # shutdown signal, or a finished job wakes the reaper at once,
+        # with no poll timeout.
         event_wait: asyncio.Task | None = None
+        completion_wait: asyncio.Task | None = None
         try:
             while self.running_jobs or not self._stop_event.is_set():
                 try:
                     for jobs in self.running_jobs.values():
                         for job in jobs:
                             if job not in wait_tasks:
-                                wait_tasks[job] = asyncio.create_task(
-                                    job.wait()
-                                )
+                                task = asyncio.create_task(job.wait())
+                                wait_tasks[job] = task
+                                task.add_done_callback(partial(_on_done, job))
                     if not wait_tasks:
                         # Nothing running: block until a launch or shutdown
                         # (the only events that change the loop condition).
@@ -11445,18 +11468,26 @@ class Cron:
                     # cannot swallow a launch notification for a job the
                     # wait set does not cover.
                     self._jobs_running.clear()
-                    if event_wait is None or event_wait.done():
-                        event_wait = asyncio.create_task(
-                            self._jobs_running.wait()
+                    if not finished:
+                        if event_wait is None or event_wait.done():
+                            event_wait = asyncio.create_task(
+                                self._jobs_running.wait()
+                            )
+                        if completion_wait is None or completion_wait.done():
+                            completion_wait = asyncio.create_task(
+                                completed.wait()
+                            )
+                        await asyncio.wait(
+                            [event_wait, completion_wait],
+                            return_when=asyncio.FIRST_COMPLETED,
                         )
-                    done_tasks, _ = await asyncio.wait(
-                        [event_wait, *wait_tasks.values()],
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    done_jobs = set()
-                    for job, task in list(wait_tasks.items()):
-                        if task in done_tasks:
-                            done_jobs.add(job)
+                    # one batch: every job filed so far. No await between
+                    # the copy and the clear, so nothing slips between
+                    # them; a completion during the batch is filed for
+                    # the next.
+                    done_jobs = finished[:]
+                    finished.clear()
+                    completed.clear()
                     try:
                         for job in done_jobs:
                             task = wait_tasks.pop(job)
@@ -11497,8 +11528,9 @@ class Cron:
                     logger.exception("please report this as a bug (3)")
                     await asyncio.sleep(1)
         finally:
-            if event_wait is not None and not event_wait.done():
-                event_wait.cancel()
+            for waiter in (event_wait, completion_wait):
+                if waiter is not None and not waiter.done():
+                    waiter.cancel()
 
     def _add_running_instance(self, running_job: RunningJob) -> bool:
         """Register a launched instance; the ONE writer adding to
@@ -12490,13 +12522,7 @@ class Cron:
                 if outcome not in ("success", "failure"):
                     continue
                 finished = _parse_iso_utc(rec.get("finished_at"))
-                candidate = (
-                    finished
-                    or datetime.datetime.min.replace(
-                        tzinfo=datetime.timezone.utc
-                    ),
-                    str(outcome),
-                )
+                candidate = (finished or _OLDEST_INSTANT, str(outcome))
                 # Fold over ALL real records, max by finished_at, NOT
                 # first-by-sequence: an out-of-order write could clear
                 # the gate on a stale success ahead of a newer failure.
