@@ -11,6 +11,11 @@ See [Windows service](Windows-Service) for the service the MSI registers,
 [running on Windows](Running-on-Windows) for the platform behavior, and
 [installation](Installation) for every other install method.
 
+The WinGet release workflow submits these signed MSIs to winget-pkgs. You can
+install an MSI through WinGet when the catalog includes its manifest. See
+[the installation instructions](Installation#install-using-winget) for package
+availability and steps to switch from a portable install.
+
 ## What the MSI installs
 
 * The program in `C:\Program Files\cronstable` (`cronstable.exe` beside its

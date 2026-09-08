@@ -138,7 +138,7 @@ The `version` job's decide step performs the marker match with `grep -oiE '^\[re
 
 ### What the pipeline does
 
-The `release.yml` jobs run in dependency order. Top-level `permissions` default to `contents: read`. Only these jobs opt up to the write scopes they need: the `release` job (`contents: write` + `id-token: write`), the `sign-windows` job (`id-token: write`, for OIDC to Azure), the `docker-push` job (`packages: write`), and the `wiki` job (`contents: write`). `version` and the whole build+test gate run on **every** event. Only the publish jobs (`release`, `docker-push`, `homebrew`, and the best-effort `winget`) are guarded by `needs.version.outputs.release == 'true'`. The `wiki` job (9) is the one exception to "no software is published on an ordinary commit": it publishes documentation, so it is gated on the branch rather than on a release, and on nothing else.
+The `release.yml` jobs run in dependency order. Top-level `permissions` default to `contents: read`. Only these jobs opt up to the write scopes they need: the `release` job (`contents: write` + `id-token: write`), the `sign-windows` job (`id-token: write`, for OIDC to Azure), the `docker-push` job (`packages: write`), and the `wiki` job (`contents: write`). `version` and the whole build+test gate run on **every** event. Only the publish jobs (`release`, `docker-push`, `homebrew`, and `winget`) are guarded by `needs.version.outputs.release == 'true'`. The `wiki` job (9) is the one exception to "no software is published on an ordinary commit": it publishes documentation, so it is gated on the branch rather than on a release, and on nothing else.
 
 1. **`version`, the decide step**: determines `release` (true/false) and `bump`. Trigger logic lives in a real shell script rather than a fuzzy `contains()` expression. It releases **only** on a `workflow_dispatch` or a push to `main` carrying a marker (a marker on any other branch, or in a PR, never releases). The same scan resolves the perf gate override (`perf`: `gate`, `accept` or `ignore`) from the `perf` dispatch input and the `[perf:accept]` / `[perf:ignore]` subject markers, strongest request winning, so the `perf` and `release` jobs read one answer.
 2. **`version`, the compute step**: computes the version once, so every builder (and the publish job) use the same number. On a release it finds the latest tag matching `^[0-9]+\.[0-9]+\.[0-9]+$` (with `git tag -l | … | sort -V | tail -n1`, defaulting to `0.0.0`), applies the bump, and **refuses with an error if the computed tag already exists** (`refs/tags/$new`). Otherwise it emits the natural `setuptools_scm` dev version for the build-only run. The job also emits the one Docker distro matrix (`.github/docker-matrix.json`) that both the `docker` gate and `docker-push` expand from.
@@ -186,6 +186,46 @@ On a release, the `sign-windows` job Authenticode-signs the Windows assets with 
 The job runs on the x64 runner because the signing client does not support Windows ARM runners. Authenticode is architecture-agnostic, so one runner signs both arches. It signs the one-file exes and each zip's inner `cronstable.exe`, re-zips, rebuilds both MSIs from the signed payload with the same shared build script the gate used (`.github/scripts/build_msi.sh`), signs those, verifies every signature, and installs and uninstalls the signed amd64 MSI for real. The `release` job then overlays the signed set before `SHA256SUMS`, so the sums, the Release assets, and the winget manifests describe the signed bytes. Every signature carries an RFC 3161 timestamp because Artifact Signing rotates its leaf certificates within days. `tests/test_ci_fences.py` pins the wiring.
 
 With the secrets present, a signing failure that survives three attempts fails the release. To ship unsigned in an emergency (say an Azure outage on release day), remove one of the six secrets and re-run.
+
+### WinGet submission and Defender failures
+
+Configure Windows signing before you submit a release to WinGet. The `winget`
+job requires signed artifacts, including when you publish an unsigned emergency
+release. It downloads the published amd64 and arm64 MSIs and `SHA256SUMS`,
+verifies their hashes and timestamped Authenticode signatures, and updates
+Microsoft Defender's signatures before scanning each MSI and its extracted
+payload. WiX extracts both architectures as data and uses the build script's
+version pin. The inner `cronstable.exe` also requires a valid timestamped
+signature.
+
+The scan uses `-DisableRemediation` to preserve detected files for inspection.
+Detections fail the job. Missing Defender, a signature update failure, or a scan
+error also blocks submission. These checks run after GitHub Release publication;
+the published release stays available if WinGet validation fails. The build and
+signing jobs test MSI installation and uninstallation.
+
+The manifest renderer reads `ProductCode`, `UpgradeCode`, display version,
+publisher, and architecture from the MSIs. It sets the installer type to `wix`
+and the scope to `machine` independently of the manifest in winget-pkgs. The job
+runs `winget validate` before `wingetcreate submit`. After submission succeeds,
+cleanup closes the submitting account's unapproved PRs for lower versions.
+You can find scan and extraction logs, MSI metadata, and generated manifests in
+the `winget-validation` Actions artifact for 14 days, including on failure.
+
+Defender can flag a signed MSI or its payload. If validation fails, follow the
+[Microsoft validation guide](https://github.com/microsoft/winget-pkgs/blob/master/doc/ValidationFailureGuide.md).
+Record the asset URL, SHA256, detection name, and scan engine and signature
+versions. Submit the exact flagged files to
+[Microsoft's file analysis portal](https://www.microsoft.com/en-us/wdsi/filesubmission)
+for false-positive analysis.
+Request revalidation on the affected PR after Microsoft resolves the detection.
+If you cannot reproduce the detection, ask the WinGet maintainers to investigate.
+
+Keep Defender enabled and preserve the files at each release URL. If you change
+a binary, publish a new release with matching manifest hashes. Rebuilding to
+change a hash leaves the detection unresolved. A clean local scan provides
+evidence for your report; the upstream PR requires revalidation or a validated
+MSI manifest replacement.
 
 ### Release notes
 

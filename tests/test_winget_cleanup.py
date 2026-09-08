@@ -21,7 +21,9 @@ def winget_steps():
 @pytest.fixture
 def cleanup(monkeypatch, winget_steps):
     step = next(
-        s for s in winget_steps if s["name"].startswith("Close superseded")
+        s
+        for s in winget_steps
+        if s.get("name", "").startswith("Close superseded")
     )
     script = compile(step["run"], str(WORKFLOW), "exec")
 
@@ -102,8 +104,16 @@ def github(monkeypatch):
 
 
 def test_cleanup_requires_successful_submission(winget_steps):
-    submit, cleanup = winget_steps
-    assert "--submit" in submit["run"]
+    submit = next(
+        s for s in winget_steps if s.get("name") == "Submit winget manifest"
+    )
+    cleanup = next(
+        s
+        for s in winget_steps
+        if s.get("name", "").startswith("Close superseded")
+    )
+    assert winget_steps.index(submit) < winget_steps.index(cleanup)
+    assert "submit winget-manifests" in submit["run"]
     assert not submit.get("continue-on-error", False)
     assert cleanup.get("if", "success()") == "success()"
     assert cleanup["env"]["GH_TOKEN"] == submit["env"]["WINGET_TOKEN"]

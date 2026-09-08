@@ -19,3 +19,12 @@ sh .github/scripts/build_msi.sh amd64 0.0.1 dist/cronstable dist/cronstable-test
 The service values in `cronstable.wxs` mirror `cronstable service install`
 and are fenced by `tests/test_msi_parity.py`; change either side only in
 lockstep. User-facing behavior is documented in `wiki/Windows-MSI.md`.
+
+The WinGet release job submits the published signed amd64 and arm64 MSIs.
+`.github/scripts/prepare_winget.ps1` verifies release hashes and signatures,
+reads MSI product metadata, and scans each installer and its extracted payload
+with current Microsoft Defender signatures. `render_winget.py` generates the
+manifests from that metadata, including each MSI's `ProductCode`. The renderer
+sets the installer type to `wix` and the scope to `machine` independently of the
+manifest in winget-pkgs. See `wiki/Contributing-and-Releasing.md` for steps to
+investigate validation failures and resubmit a package.
