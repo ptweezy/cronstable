@@ -198,6 +198,13 @@ MSI and its extracted payload. WiX extracts both architectures as data and uses
 the build script's version pin. The inner `cronstable.exe` also requires a valid
 timestamped signature.
 
+The preflight updates signatures with `MpCmdRun.exe -SignatureUpdate -MMPC`,
+which downloads from Microsoft's update service. It makes up to three attempts,
+waiting 5 seconds before the second attempt and 10 seconds before the third.
+Each attempt checks Defender's readiness. If all attempts fail, the job stops
+before scanning. You can inspect the update commands, exit codes, and retry
+messages in `winget-validation/defender.log`.
+
 The scan uses `-DisableRemediation` to preserve detected files for inspection.
 Detections fail the job. Missing Defender, a signature update failure, or a scan
 error also fails the signing job and blocks release publication. The other
@@ -216,7 +223,7 @@ and verifies that both match the scanned hashes. It submits the validated
 manifests with `wingetcreate submit`. After submission succeeds, cleanup closes
 the submitting account's unapproved PRs for lower versions. Release downloads,
 GitHub submission, and Microsoft's upstream validation depend on published
-assets and run at this stage. Missing signing credentials now fail preflight;
+assets and run at this stage. Missing signing credentials fail preflight;
 the `winget` job also requires signed MSIs as a final check.
 
 Defender can flag a signed MSI or its payload. If validation fails, follow the
