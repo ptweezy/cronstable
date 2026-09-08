@@ -194,12 +194,13 @@ def test_perf_gate_override_is_resolved_once_and_honoured_everywhere():
     assert '"$PERF_MODE" = "accept"' in compare["run"]
     assert "Performance gate overridden" in compare["run"]
 
-    release = wf["jobs"]["release"]
+    release = wf["jobs"]["release-prepare"]
     steps = _named_steps(release)
     download = steps["Download performance report"]
     assert ignore in str(download.get("continue-on-error")), download
     notes = steps["Build release notes from HISTORY.md"]
     assert "if [ -f perf/perf-summary.md ]" in notes["run"], notes["run"]
+
 
 def test_every_browser_backed_test_module_is_fenced():
     # The enforcement step is the ONLY thing standing between a
@@ -236,8 +237,9 @@ def test_release_hashes_exactly_what_it_attaches():
     # so a name present in one list and missing from the other ships an
     # unhashed asset or a hashed-but-unattached one with no red anywhere.
     steps = _named_steps(_workflow()["jobs"]["release"])
+    prepared = _named_steps(_workflow()["jobs"]["release-prepare"])
     hashed = set(
-        re.findall(r"binaries/\S+", steps["Generate SHA256SUMS"]["run"])
+        re.findall(r"binaries/\S+", prepared["Generate SHA256SUMS"]["run"])
     )
     attached = set(
         re.findall(
@@ -298,7 +300,10 @@ def test_msi_smoke_steps_share_the_msiexec_helpers():
             "binaries-windows",
             "Smoke-test MSI upgrade (remembered properties, restart, reload)",
         ),
-        ("sign-windows", "Smoke-test the signed amd64 MSI (install, uninstall)"),
+        (
+            "sign-windows",
+            "Smoke-test the signed amd64 MSI (install, uninstall)",
+        ),
     ]:
         run = _named_steps(_workflow()["jobs"][job_name])[step_name]["run"]
         assert ".github/scripts/msi_smoke.sh" in run, step_name
@@ -323,7 +328,7 @@ def test_signed_upload_name_dodges_the_broad_release_download():
     # artifact the sign job uploads.
     upload = _named_steps(_workflow()["jobs"][SIGN_JOB])[UPLOAD_STEP]
     name = str(upload["with"]["name"])
-    release_steps = _named_steps(_workflow()["jobs"]["release"])
+    release_steps = _named_steps(_workflow()["jobs"]["release-prepare"])
     broad = str(release_steps["Download release binaries"]["with"]["pattern"])
     assert not fnmatch.fnmatch(name, broad), (
         "signed artifact name {!r} matches the broad download pattern "
@@ -338,7 +343,7 @@ def test_release_overlays_the_signed_set_before_hashing():
     # are not attached). Its gate reads the sign job's output, which
     # requires sign-windows in needs; without that the expression is
     # silently empty and a signed release ships unsigned.
-    job = _workflow()["jobs"]["release"]
+    job = _workflow()["jobs"]["release-prepare"]
     assert SIGN_JOB in job["needs"]
     names = [step.get("name") for step in job["steps"]]
     assert (
@@ -413,7 +418,9 @@ def test_refusal_message_assets_are_release_assets():
 
 
 def _sign_action():
-    path = os.path.join(ROOT, ".github", "actions", "sign-artifacts", "action.yml")
+    path = os.path.join(
+        ROOT, ".github", "actions", "sign-artifacts", "action.yml"
+    )
     with open(path, encoding="utf-8") as fobj:
         return YAML(typ="safe").load(fobj.read())
 
@@ -640,9 +647,11 @@ def test_apk_packages_are_built_from_the_musl_binaries():
     assert "cronstable-linux-$arch-musl" in apk_loop, (
         "the apk loop no longer reads the musl binaries"
     )
-    assert "cronstable-linux-$arch-musl" not in body.split(
-        "while read -r arch alpine_arch"
-    )[0], "the deb/rpm loop reads a musl binary"
+    deb_loop = body.split("while read -r arch nfpm_arch deb_arch floor")[-1]
+    assert (
+        "cronstable-linux-$arch-musl"
+        not in deb_loop.split("while read -r arch alpine_arch")[0]
+    ), "the deb/rpm loop reads a musl binary"
     # And the recipe must declare no libc dependency: a musl binary carries its
     # own requirement, and a glibc floor here would be both wrong and untested.
     with open(
@@ -650,7 +659,9 @@ def test_apk_packages_are_built_from_the_musl_binaries():
     ) as fobj:
         recipe = _yaml_load(fobj.read())
     assert not recipe.get("depends"), (
-        "the apk recipe declares dependencies: {}".format(recipe.get("depends"))
+        "the apk recipe declares dependencies: {}".format(
+            recipe.get("depends")
+        )
     )
     assert not recipe.get("overrides"), (
         "the apk recipe carries format overrides it cannot use"

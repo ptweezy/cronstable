@@ -85,12 +85,12 @@ def test_hand_spelled_extra_pins_match_pyproject_floors():
                     "%s pins %s%s but pyproject's extra floor is %s%s"
                     % (rel, name, spelled, name, floors[name])
                 )
-    # self-check: the five extras the lanes actually bundle must be visible
-    # to the scan, or the pin idiom changed and the regex needs updating
+    # zeroconf is resolved directly from pyproject by release_inputs.py and
+    # pinned through every binary/image lane; test_ci_release_pipeline covers
+    # that handoff. The other hand-spelled floors must remain visible here.
     assert {
         "uvloop",
         "pynacl",
-        "zeroconf",
         "orjson",
         "cryptography",
     } <= found, (
@@ -121,7 +121,9 @@ def test_docker_inline_orjson_probe_matches_verify_extra():
     ) as f:
         script = f.read()
     probe = re.search(r"python -c '([^']*)'", script)
-    assert probe, "inline python -c probe not found in docker/install_orjson.sh"
+    assert probe, (
+        "inline python -c probe not found in docker/install_orjson.sh"
+    )
     # the probe rides through docker build argv as-is; it stays ASCII on
     # purpose (its own comment) so no build-stage locale can mangle it
     assert probe.group(1).isascii(), "the inline probe is no longer ASCII"

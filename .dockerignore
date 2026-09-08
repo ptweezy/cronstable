@@ -8,6 +8,9 @@
 .mypy_cache
 .ruff_cache
 .pytest_cache
+.pip-cache
+.pq-cache
+release-inputs
 dist
 build
 *.egg-info

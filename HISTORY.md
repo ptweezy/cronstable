@@ -2,6 +2,13 @@
 
 ## 1.2.51
 
+- Release CI validates credentials, package recipes and dependency sources
+  before the expensive builds, and prepares packages, checksums, manifests
+  and the source offer before publishing. Docker platforms build independently,
+  use native ARM64 runners, and publish the exact images validated by CI
+  without rebuilding. Experimental coverage runs separately from the release
+  gate; bounded compiler caches speed up repeated emulated builds.
+
 - Release downloads add `amd64v3` builds for CPUs with the full x86-64-v3
   feature set, including AVX2. Every existing amd64 binary and package
   format has a counterpart: Linux glibc and musl binaries, `.deb`, `.rpm`

@@ -125,7 +125,8 @@ def test_submission_requires_signed_scanned_validated_msis():
     assert {"release", "sign-windows"} <= set(job["needs"])
     signing = workflow["jobs"]["sign-windows"]
     assert set(signing["needs"]) == {"version", "binaries-windows"}
-    assert "sign-windows" in workflow["jobs"]["release"]["needs"]
+    assert "sign-windows" in workflow["jobs"]["release-prepare"]["needs"]
+    assert "release-prepare" in workflow["jobs"]["release"]["needs"]
     assert not signing.get("continue-on-error", False)
     early = {s.get("name"): s for s in signing["steps"]}
     early_names = list(early)
