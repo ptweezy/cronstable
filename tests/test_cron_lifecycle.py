@@ -2658,14 +2658,12 @@ async def test_web_config_error_does_not_disengage_cluster_gate(
 
 @pytest.mark.asyncio
 async def test_shutdown_stops_cluster_manager_before_job_drain():
-    # run() used to stop the cluster manager only AFTER awaiting all running
-    # jobs, so a draining leader kept its gossip liveness / lease renewal
-    # alive for the whole (unbounded) drain and every Leader job cluster-wide
-    # stalled until the slowest local job finished. Leadership must be
-    # released after retries are cancelled but BEFORE the drain, so failover
-    # proceeds while the jobs finish.
+    # Shutdown cancels retries and releases leadership before waiting for
+    # running jobs, so a slow local job does not delay failover.
     cron = cronstable.cron.Cron(
-        None, config_yaml=CONCURRENT_JOB.format(policy="Allow")
+        None,
+        config_yaml=CONCURRENT_JOB.format(policy="Allow")
+        + "    killTimeout: 1\n",
     )
     events = []
 
@@ -2686,11 +2684,25 @@ async def test_shutdown_stops_cluster_manager_before_job_drain():
 
     cron.cluster_manager = _Mgr()
     await cron.maybe_launch_job(cron.cron_jobs["test"])
-    assert cron.running_jobs["test"][0].proc.returncode is None
-    # stop before the loop's first iteration: run() goes straight to the
-    # shutdown sequence with a job still running and a manager installed.
-    cron.signal_shutdown()
-    await asyncio.wait_for(cron.run(), timeout=10)
+    running_job = cron.running_jobs["test"][0]
+    try:
+        assert running_job.proc.returncode is None
+        # Enter shutdown with a running job and an installed manager.
+        cron.signal_shutdown()
+        await asyncio.wait_for(cron.run(), timeout=10)
+    finally:
+        # The sleep command has no children; reap it even if ordering fails.
+        proc = running_job.proc
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+        if cron._wait_for_running_jobs_task is not None:
+            await asyncio.gather(
+                cron._wait_for_running_jobs_task, return_exceptions=True
+            )
     # the manager was stopped while the job was still draining...
     assert events == [("cluster-stopped", True)]
     assert cron.cluster_manager is None

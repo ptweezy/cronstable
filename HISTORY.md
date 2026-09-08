@@ -84,14 +84,21 @@
   in its place for a pattern that doesn't compile. Counting the matches in
   a 5,000-line buffer measures 0.04 ms locally against 0.28 ms, and a cold
   week walk over 500 schedules 1.75 ms against 4.2 ms.
-- The terminal dashboard inks each escape token once per theme and serves
-  it from the theme's memo after that, and the log drawer, the DAG log tab,
-  and the tail view bind their style helpers and stream markers once per
-  frame. Restyling a 5,000-line drawer measures 17 ms locally against
-  25 ms, and a drawer scroll walk with steady repaints 67 ms against
-  101 ms.
-- Config load rejects a job name that starts with `dag:`, the prefix of a
-  DAG's schedule job.
+- The terminal dashboard caches short SGR sequences and their bounded
+  rewrites per theme. Discarded control sequences and oversized rewrites
+  stay out of the cache. The log drawer, the DAG log tab, and the tail view
+  bind their style helpers and stream markers once per frame. Restyling a
+  5,000-line drawer measures 17 ms locally against 25 ms, and a drawer
+  scroll walk with steady repaints 67 ms against 101 ms.
+- Config load rejects a job whose name matches a DAG's schedule job
+  (`dag:<dag name>`), including collisions across files and includes.
+  Other `dag:` job names and classic crontabs named `dag` are valid.
+- A failed cluster peer poll removes the peer from agreement, including
+  failures while parsing telemetry. Invalid telemetry fields are discarded
+  while the peer's membership observation is processed.
+- Calendar exports are limited to 10,000 events and 4 MiB of UTF-8 text.
+  An export over either limit returns `422`. The daemon admits two renders
+  at a time; further requests receive `503` with `Retry-After: 1`.
 
 ## 1.2.49
 

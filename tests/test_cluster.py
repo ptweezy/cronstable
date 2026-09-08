@@ -4898,6 +4898,22 @@ def test_parse_job_summaries_hostile_fields_degrade_not_poison():
     }
 
 
+@pytest.mark.parametrize("outcome", [[], {}, ["success"], 1, True, None])
+def test_parse_job_summaries_drops_nonstring_outcomes(outcome):
+    from cronstable.cluster import _parse_job_summaries
+
+    parsed = _parse_job_summaries(
+        {
+            "job": {
+                "running": True,
+                "last": {"outcome": outcome, "finished_at": "2026-09-07"},
+            }
+        }
+    )
+    assert parsed["job"]["running"] is True
+    assert parsed["job"]["last"] is None
+
+
 def test_finite_number_subclasses_take_the_generic_arm():
     # exact int and float take the fast paths; every subclass (IntEnum,
     # bool, a float or int subclass) and every non-number goes through the
@@ -4922,6 +4938,9 @@ def test_finite_number_subclasses_take_the_generic_arm():
     assert _finite_number(Wide("inf")) is None
     assert _finite_number(Narrow(7)) == 7.0
     assert type(_finite_number(Narrow(7))) is float
+    assert _finite_number(10**400) is None
+    assert _finite_number(-(10**400)) is None
+    assert _finite_number(Narrow(10**400)) is None
     assert _finite_number(True) is None
     assert _finite_number(False) is None
     assert _finite_number("1") is None
@@ -4980,6 +4999,93 @@ def test_parse_node_stats_drops_nonfinite_and_bools():
         }
     )
     assert parsed == {"mem_used_bytes": 1234.0}
+
+
+@pytest.mark.parametrize("value", [10**400, -(10**400)])
+@pytest.mark.parametrize("field", ["cpu_percent", "cpu_count"])
+def test_node_stats_header_drops_integers_outside_float_range(field, value):
+    from cronstable.cluster import (
+        MAX_NODE_STATS_HEADER_LEN,
+        _parse_node_stats_header,
+    )
+
+    header = json.dumps({field: value, "mem_percent": 12.5})
+    assert len(header) < MAX_NODE_STATS_HEADER_LEN
+    assert _parse_node_stats_header(header) == {"mem_percent": 12.5}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("telemetry", ["outcome-list", "outcome-map", "stats"])
+async def test_malformed_telemetry_cannot_preserve_stale_quorum(
+    no_tls, telemetry
+):
+    # A can poll B, but B can only poll C. B's response must remove the
+    # earlier mutual attestation of A even when its telemetry is malformed.
+    a = _mgr(["b:1", "c:1"], electLeader=True)
+    b = _mgr(["a:1", "c:1"], node="node-b", electLeader=True)
+    initial = _peer_body(
+        instance_id=b.instance_id,
+        members=[_me(a)],
+        cluster_size=3,
+        distribution="single-leader",
+        elect_leader=True,
+    )
+    await a._observe_peer(_peer_session(initial), "b:1", "v1:mine")
+    a.view.record_failure("c:1", "partition", untrusted=False)
+    peer = a.view.peers["b:1"]
+    peer.last_seen = NOW - datetime.timedelta(days=30)
+    stale_seen = peer.last_seen
+    assert a.is_leader() is True
+    assert a.has_conflict() is False
+
+    b.view.record_failure("a:1", "reverse direction blocked", untrusted=False)
+    _seed_agree(b, "c:1", "node-c", instance="instance-c")
+    assert b.is_leader() is True
+    assert b.has_conflict() is False
+
+    fresh = dict(
+        initial,
+        members=[
+            {
+                "node_name": "node-c",
+                "instance_id": "instance-c",
+                "agreed": True,
+            }
+        ],
+    )
+    headers = {}
+    if telemetry == "stats":
+        headers[NODE_STATS_HEADER] = json.dumps(
+            {"cpu_percent": 10**400, "cpu_count": 2}
+        )
+    else:
+        fresh["job_summaries"] = {
+            "job": {
+                "last": {
+                    "outcome": [] if telemetry == "outcome-list" else {},
+                    "finished_at": "2026-09-07",
+                }
+            }
+        }
+    a._session = _FakeSeqSession(
+        _FakeGet(
+            resp=_FakeResp(
+                body=json.dumps(fresh).encode("utf-8"), headers=headers
+            )
+        ),
+        _FakeGet(exc=OSError("partition")),
+    )
+    await a._poll_all()
+    assert peer.status == STATUS_AGREED
+    assert peer.last_seen > stale_seen
+    assert a.is_quorate() is False
+    assert a.is_leader() is False
+    assert a.has_conflict() is False
+    assert b.is_leader() is True
+    if telemetry == "stats":
+        assert peer.node_stats == {"cpu_count": 2}
+    else:
+        assert peer.job_summaries["job"]["last"] is None
 
 
 def test_parse_job_summaries_caps_cardinality():
@@ -6362,28 +6468,51 @@ async def test_handle_reboot_ran_truncates_persistent_set(tmp_path):
     assert "pre-000" not in mgr._ran_reboot_jobs
 
 
-async def test_poll_all_logs_unexpected_peer_error(tmp_path, caplog):
-    # an *unexpected* exception from one peer coroutine (a bug, not a network
-    # failure) is logged and does not abort the round.
-    tls = _write_tls(tmp_path)
-    mgr = _mgr(
-        ["p:1"],
-        job_set="v1:x",
-        tls=tls,
-        listen="127.0.0.1:{}".format(_free_port()),
+async def test_poll_all_unexpected_error_invalidates_agreement(no_tls, caplog):
+    mgr = _mgr(["b:1", "c:1"], electLeader=True)
+    initial = _peer_body(instance_id="instance-b", members=[_me(mgr)])
+    await mgr._observe_peer(
+        _peer_session(initial, headers={"ETag": '"good"'}), "b:1", "v1:mine"
     )
-    mgr._session = object()  # non-None so _poll_all does real work
+    mgr.view.record_failure("c:1", "offline", untrusted=False)
+    assert mgr.is_quorate() is True
+    assert mgr.is_leader() is True
+    poll_peer = mgr._poll_peer
 
-    async def boom(_session, _host, _my_id):
-        raise ValueError("simulated bug")
+    async def boom(session, host, my_id):
+        if host == "b:1":
+            raise ValueError("simulated bug")
+        await poll_peer(session, host, my_id)
 
     mgr._poll_peer = boom
-    with caplog.at_level(logging.ERROR, logger="cronstable.cluster"):
+    mgr._session = _peer_session(exc=OSError("offline"))
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
         await mgr._poll_all()
     assert mgr._poll_rounds == 1
+    peer = mgr.view.peers["b:1"]
+    assert peer.status == STATUS_UNREACHABLE
+    assert peer.members is None
+    assert "simulated bug" in peer.last_error
+    assert "b:1" not in mgr._peer_observation_cache
+    assert mgr.is_quorate() is False
+    assert mgr.is_leader() is False
+    assert any(
+        "b:1 became unreachable" in r.getMessage() for r in caplog.records
+    )
     assert any(
         "unexpected error polling" in r.getMessage() for r in caplog.records
     )
+
+    # Recovery requires a full response. A 304 has no cached observation
+    # to replay after the failed poll.
+    replay = _peer_session(body=b"", status=304)
+    await mgr._observe_peer(replay, "b:1", "v1:mine")
+    assert replay.request_headers == [None]
+    assert peer.status == STATUS_UNREACHABLE
+    assert mgr.is_quorate() is False
+    await mgr._observe_peer(_peer_session(initial), "b:1", "v1:mine")
+    assert peer.status == STATUS_AGREED
+    assert mgr.is_quorate() is True
 
 
 async def test_poll_all_reraises_cancellation(tmp_path):

@@ -23,6 +23,7 @@ import sys
 import time
 from typing import Any, Optional
 
+import pytest
 from aiohttp import web
 
 from cronstable import tui
@@ -2528,15 +2529,12 @@ def test_rewrite_sgr_ignores_oversized_parameters():
 
 
 def test_rewrite_sgr_memo_is_per_theme_and_bounded(monkeypatch):
-    """Each distinct escape token is re-inked once per theme and served
-    from the theme's memo after that; the memo is capped and reset like
-    _CHAR_W because job output picks the token set."""
+    """Common SGR tokens share a cache bounded by entry count per theme."""
     theme = Theme("carolina", light=False)
-    line = "\x1b[31mred\x1b[0m \x1b]0;title\x07plain"
+    line = "\x1b[31mred\x1b[0m plain"
     first = rewrite_sgr(line, theme)
     memo = theme._sgr_memo
-    assert set(memo) == {"\x1b[31m", "\x1b[0m", "\x1b]0;title\x07"}
-    assert memo["\x1b]0;title\x07"] == ""  # a stripped escape is a hit too
+    assert set(memo) == {"\x1b[31m", "\x1b[0m"}
     # the warm call is served from the memo: the dispatch closure reads
     # the module-level _rewrite_sgr_token, so a counting wrapper sees
     # every miss
@@ -2559,6 +2557,42 @@ def test_rewrite_sgr_memo_is_per_theme_and_bounded(monkeypatch):
         assert len(memo) <= 4
     # re-inks correctly after a clear-and-refill
     assert theme.fg("fail") in rewrite_sgr("\x1b[31mred", theme)
+
+
+@pytest.mark.parametrize("prefix", ["\x1b]52;c;", "\x1bP"])
+def test_rewrite_sgr_discards_large_log_escapes_without_caching(prefix):
+    theme = Theme("carolina", light=False)
+    for n in range(8):
+        payload = prefix + str(n) + "a" * 32768 + "\x1b\\"
+        line = sanitize_log_line("before" + payload + "after\x1b[31mred")
+        assert rewrite_sgr(line, theme) == (
+            "beforeafter" + theme.fg("fail") + "red"
+        )
+    assert theme._sgr_memo == {"\x1b[31m": theme.fg("fail")}
+
+
+def test_rewrite_sgr_renders_large_valid_tokens_without_caching():
+    theme = Theme("carolina", light=False)
+    # A long color parameter produces a short rewrite; repeated bold
+    # parameters produce a large rewrite. Both keep their rendering.
+    for token, expected in (
+        ("\x1b[38;5;" + "0" * 32768 + "m", theme.fg("bright")),
+        ("\x1b[" + "1;" * 16384 + "31m", "\x1b[1m" * 16384 + theme.fg("fail")),
+    ):
+        line = sanitize_log_line(token + "message")
+        assert rewrite_sgr(line, theme) == expected + "message"
+        assert theme._sgr_memo == {}
+
+
+def test_rewrite_sgr_does_not_cache_expanded_reset_sequences():
+    theme = Theme("carolina", light=False)
+    token = "\x1b[" + ";" * (tui._SGR_MEMO_TOKEN_MAX - 3) + "m"
+    expected = (tui.RESET + theme.fg("fg")) * (len(token) - 2)
+    assert len(token) <= tui._SGR_MEMO_TOKEN_MAX
+    assert len(expected) > tui._SGR_MEMO_TEXT_MAX
+    line = sanitize_log_line(token + "message")
+    assert rewrite_sgr(line, theme) == expected + "message"
+    assert theme._sgr_memo == {}
 
 
 def test_sparkline_returns_a_plain_string():

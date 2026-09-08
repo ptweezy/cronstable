@@ -12,6 +12,7 @@ import pytest
 from cronstable.cronexpr import CronTab
 from cronstable.ical import (
     CalendarEntry,
+    CalendarLimitError,
     _block_seconds,
     _duration_text,
     _escape,
@@ -207,6 +208,65 @@ def test_shared_schedules_describe_alike_and_h_slots_apart():
     assert together == [line for lines in alone for line in lines]
     assert len(together) == 2 * len(entries)  # two fires per entry
     assert alone[3] != alone[4]  # h1 and h2 hash to different minutes
+
+
+def test_calendar_event_budget_counts_across_jobs():
+    entries = [
+        CalendarEntry(name, CronTab("* * * * *"), _UTC)
+        for name in ("a", "b", "c")
+    ]
+    expected = _render(entries, days=1, per_job_cap=2)
+    assert expected.count("BEGIN:VEVENT") == 6
+    assert _render(entries, days=1, per_job_cap=2, max_events=6) == expected
+    with pytest.raises(CalendarLimitError, match="5 events"):
+        _render(entries, days=1, per_job_cap=2, max_events=5)
+
+
+def test_calendar_byte_budget_counts_utf8_folding_and_final_crlf():
+    entries = [CalendarEntry("\U0001f600;," * 50, CronTab("* * * * *"), _UTC)]
+    kwargs = {"days": 1, "per_job_cap": 2, "calname": "Caf\u00e9"}
+    expected = _render(entries, **kwargs)
+    byte_count = len(expected.encode("utf-8"))
+    assert byte_count > len(expected)
+    assert "\r\n " in expected
+    assert _render(entries, max_bytes=byte_count, **kwargs) == expected
+    for limit in (byte_count - 1, len(expected)):
+        with pytest.raises(CalendarLimitError, match="UTF-8 bytes"):
+            _render(entries, max_bytes=limit, **kwargs)
+
+
+@pytest.mark.parametrize("field", ["name", "schedule", "calname", "version"])
+def test_calendar_rejects_oversized_text_before_folding(monkeypatch, field):
+    from cronstable import ical
+
+    large = "x" * 5000
+    name = large if field == "name" else "job"
+    expression = ",".join(["0"] * 2500) + " * * * *"
+    tab = CronTab(expression if field == "schedule" else "* * * * *")
+    folded = []
+    original = ical._fold
+
+    def folding(line):
+        folded.append(line)
+        return original(line)
+
+    monkeypatch.setattr(ical, "_fold", folding)
+    with pytest.raises(CalendarLimitError, match="UTF-8 bytes"):
+        _render(
+            [CalendarEntry(name, tab, _UTC)],
+            days=1,
+            calname=large if field == "calname" else "cronstable",
+            prodid_version=large if field == "version" else "1",
+            max_bytes=1024,
+        )
+    assert all(len(line) <= 1024 for line in folded)
+
+
+def test_calendar_skips_oversized_metadata_for_schedules_without_fires():
+    entries = [CalendarEntry("x" * 5000, CronTab("0 0 30 2 *"), _UTC)]
+    assert _render(entries, days=1, max_bytes=1024) == _render(
+        [], days=1, max_bytes=1024
+    )
 
 
 # ---------------------------------------------------------------------------

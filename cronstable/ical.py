@@ -30,6 +30,7 @@ Rendering choices, all deliberate:
 
 import datetime
 import hashlib
+import itertools
 import math
 from collections.abc import Sequence
 from typing import NamedTuple, Optional
@@ -37,7 +38,10 @@ from typing import NamedTuple, Optional
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import _local_tzinfo, _walk_fires, describe_cron
 
-__all__ = ["CalendarEntry", "render_calendar"]
+__all__ = ["CalendarEntry", "CalendarLimitError", "render_calendar"]
+
+MAX_CALENDAR_EVENTS = 10_000
+MAX_CALENDAR_BYTES = 4 * 1024 * 1024
 
 _CRLF = "\r\n"
 
@@ -47,6 +51,10 @@ _MIN_BLOCK = 5 * 60
 #: longest event block rendered, seconds: a runaway average (a backfill
 #: that once took a day) must not paint whole days solid
 _MAX_BLOCK = 24 * 3600
+
+
+class CalendarLimitError(ValueError):
+    """A calendar exceeds its event or UTF-8 byte budget."""
 
 
 class CalendarEntry(NamedTuple):
@@ -92,12 +100,13 @@ def _fold(line: str) -> str:
     data = line.encode("utf-8")
     chunks: list[str] = []
     limit = 75
-    while data:
-        cut = min(limit, len(data))
-        while 0 < cut < len(data) and (data[cut] & 0xC0) == 0x80:
+    offset = 0
+    while offset < len(data):
+        cut = min(offset + limit, len(data))
+        while offset < cut < len(data) and (data[cut] & 0xC0) == 0x80:
             cut -= 1
-        chunks.append(data[:cut].decode("utf-8"))
-        data = data[cut:]
+        chunks.append(data[offset:cut].decode("utf-8"))
+        offset = cut
         limit = 74
     return (_CRLF + " ").join(chunks)
 
@@ -143,6 +152,9 @@ def render_calendar(
     calname: str = "cronstable",
     now: Optional[datetime.datetime] = None,
     prodid_version: str = "",
+    *,
+    max_events: int = MAX_CALENDAR_EVENTS,
+    max_bytes: int = MAX_CALENDAR_BYTES,
 ) -> str:
     """The complete ``.ics`` text for ``entries`` over ``[start, start+days)``.
 
@@ -152,10 +164,42 @@ def render_calendar(
     per event-starved entry via ``X-CRONSTABLE-TRUNCATED``).  ``now``
     fixes ``DTSTAMP`` for determinism in tests and defaults to the wall
     clock.  Entries render in the order given; pass them name-sorted for
-    a stable feed.
+    a stable feed. Exceeding ``max_events`` or ``max_bytes`` raises
+    :class:`CalendarLimitError`; the byte budget includes UTF-8 encoding,
+    line folding, and the final CRLF.
     """
     if start.tzinfo is None:
         raise ValueError("render_calendar needs an aware start")
+
+    def checked_size(text: str) -> int:
+        if len(text) > max_bytes:
+            raise CalendarLimitError(
+                "Calendar exceeds {} UTF-8 bytes".format(max_bytes)
+            )
+        size = len(text) if text.isascii() else len(text.encode("utf-8"))
+        if size > max_bytes:
+            raise CalendarLimitError(
+                "Calendar exceeds {} UTF-8 bytes".format(max_bytes)
+            )
+        return size
+
+    def checked_fold(line: str) -> str:
+        checked_size(line)
+        return _fold(line)
+
+    byte_count = 0
+
+    def reserve(size: int) -> None:
+        nonlocal byte_count
+        if size > max_bytes - byte_count:
+            raise CalendarLimitError(
+                "Calendar exceeds {} UTF-8 bytes".format(max_bytes)
+            )
+        byte_count += size
+
+    checked_size(calname)
+    checked_size(prodid_version)
+    reserve(len("END:VCALENDAR" + _CRLF))
     utc = datetime.timezone.utc
     if now is None:
         now = datetime.datetime.now(utc)
@@ -168,18 +212,21 @@ def render_calendar(
     parts = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        _fold(
+        checked_fold(
             "PRODID:-//cronstable//{}//EN".format(
                 prodid_version or "unversioned"
             )
         ),
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        _fold("X-WR-CALNAME:" + _escape(calname)),
+        checked_fold("X-WR-CALNAME:" + _escape(calname)),
         # subscription clients honour one of these two refresh hints
         "REFRESH-INTERVAL;VALUE=DURATION:PT1H",
         "X-PUBLISHED-TTL:PT1H",
     ]
+    for part in parts:
+        reserve(checked_size(part) + len(_CRLF))
+    events = 0
     dtstamp_line = "DTSTAMP:" + _stamp(now)
     # the host clock walks on a fixed offset wherever the window and the
     # engine's look-back hold no transition (croninfo._walk_fires)
@@ -192,7 +239,13 @@ def render_calendar(
     for entry in entries:
         tab = entry.tab
         zone = entry.timezone or local_tz
+        fires = iter(_walk_fires(tab, zone, start, end_utc))
+        first_fire = next(fires, None)
+        if first_fire is None:
+            continue
         source = str(tab)
+        checked_size(source)
+        checked_size(entry.name)
         if tab.resolved_differs:
             text = describe_cron(source, hash_key=entry.name, tab=tab)
         else:
@@ -202,6 +255,7 @@ def render_calendar(
                     source, hash_key=entry.name, tab=tab
                 )
             text = memo
+        checked_size(text)
         description = "Schedule: {}\n{}\nTimezone: {}".format(
             source,
             text,
@@ -211,6 +265,7 @@ def render_calendar(
             description += "\nTypical runtime: {}".format(
                 _runtime_phrase(entry.avg_duration)
             )
+        checked_size(description)
         uid_ns = hashlib.sha256(entry.name.encode("utf-8")).hexdigest()[:12]
         summary = _escape(entry.name)
         # The event block with the fire's stamp cut out: the UID (44
@@ -224,19 +279,34 @@ def render_calendar(
                 "",
                 "DURATION:"
                 + _duration_text(_block_seconds(entry.avg_duration)),
-                _fold("SUMMARY:" + summary),
-                _fold("DESCRIPTION:" + _escape(description)),
+                checked_fold("SUMMARY:" + summary),
+                checked_fold("DESCRIPTION:" + _escape(description)),
                 "STATUS:CONFIRMED",
                 "TRANSP:TRANSPARENT",
                 "END:VEVENT",
             )
         )
+        # Both stamps contain 16 ASCII bytes. Check the repeated event's
+        # size before constructing it, and account for its trailing CRLF.
+        event_bytes = (
+            checked_size(head)
+            + checked_size(middle)
+            + checked_size(tail)
+            + 32
+            + len(_CRLF)
+        )
         count = 0
         truncated = False
-        for fire in _walk_fires(tab, zone, start, end_utc):
+        for fire in itertools.chain((first_fire,), fires):
             if count >= per_job_cap:
                 truncated = True
                 break
+            if events >= max_events:
+                raise CalendarLimitError(
+                    "Calendar exceeds {} events".format(max_events)
+                )
+            reserve(event_bytes)
+            events += 1
             count += 1
             fire_utc = fire.astimezone(utc)
             # the same text strftime("%Y%m%dT%H%M%SZ") produces, at a
@@ -255,12 +325,10 @@ def render_calendar(
             # the cap rides as a property parameter, not in the value: a
             # raw ';' inside a TEXT value is illegal per RFC 5545, and the
             # job name (the value) must stay unambiguous
-            parts.append(
-                _fold(
-                    "X-CRONSTABLE-TRUNCATED;CAP={}:{}".format(
-                        per_job_cap, summary
-                    )
-                )
+            marker = checked_fold(
+                "X-CRONSTABLE-TRUNCATED;CAP={}:{}".format(per_job_cap, summary)
             )
+            reserve(checked_size(marker) + len(_CRLF))
+            parts.append(marker)
     parts.append("END:VCALENDAR")
     return _CRLF.join(parts) + _CRLF

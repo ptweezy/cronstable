@@ -2364,7 +2364,6 @@ class DagTaskConfig:
 
 
 #: Prefix of a scheduled DAG's synthetic schedule job, ``dag:<dag name>``.
-#: Reserved: a configured job may not carry it (see _config_from_doc).
 DAG_SCHEDULE_JOB_PREFIX = "dag:"
 
 
@@ -4145,6 +4144,21 @@ class CronstableConfig:
     notify_config: Optional[dict[str, Any]] = None
     push_config: Optional[dict[str, Any]] = None
 
+    def __post_init__(self) -> None:
+        if not self.dags:
+            return
+        job_names = {job.name for job in self.jobs}
+        for dag_config in self.dags:
+            schedule_job = dag_config.schedule_job
+            if schedule_job is not None and schedule_job.name in job_names:
+                raise ConfigError(
+                    "job {!r} collides with the schedule of dag {!r}; "
+                    "rename the job or the dag (for a classic crontab "
+                    "job, rename its source file)".format(
+                        schedule_job.name, dag_config.name
+                    )
+                )
+
 
 # Environment-variable interpolation over the validated config document.
 #
@@ -4540,17 +4554,6 @@ def _config_from_doc(
     lint_cache: LintCache = {}
     for config_job in doc.get("jobs", []):
         job_dict = mergedicts(defaults, config_job)
-        # A DAG's schedule job is named 'dag:<dag name>', and the calendar
-        # feed, /schedule/why, and the jobs list resolve a name to a job
-        # first, so a configured job under the prefix would shadow the
-        # DAG's. Rejected whether or not such a DAG exists.
-        if job_dict["name"].startswith(DAG_SCHEDULE_JOB_PREFIX):
-            raise ConfigError(
-                "{}: job {!r}: names starting with {!r} belong to a DAG's "
-                "schedule job; rename the job".format(
-                    path, job_dict["name"], DAG_SCHEDULE_JOB_PREFIX
-                )
-            )
         jobs.append(
             JobConfig(job_dict, env_cache=env_cache, lint_cache=lint_cache)
         )

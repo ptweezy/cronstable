@@ -258,11 +258,17 @@ def _finite_number(value: Any) -> Optional[float]:
         exact: float = value
         return exact if math.isfinite(exact) else None
     if kind is int:
-        # bool is excluded (type(True) is bool); float(int) is finite
-        return float(value)
+        # A JSON integer can exceed the float range.
+        try:
+            return float(value)
+        except OverflowError:
+            return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    out = float(value)
+    try:
+        out = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
     return out if math.isfinite(out) else None
 
 
@@ -299,7 +305,8 @@ def _parse_job_summaries(raw: Any) -> Optional[dict[str, dict[str, Any]]]:
             finished_at = last.get("finished_at")
             exit_code = last.get("exit_code")
             if (
-                outcome in _SUMMARY_OUTCOMES
+                isinstance(outcome, str)
+                and outcome in _SUMMARY_OUTCOMES
                 and isinstance(finished_at, str)
                 and len(finished_at) <= MAX_JOB_SUMMARY_TS_LEN
                 and finished_at.isprintable()
@@ -1722,9 +1729,20 @@ class ClusterManager(LeadershipBackend):
             if isinstance(result, asyncio.CancelledError):
                 raise result
             if isinstance(result, BaseException):
+                host = peers[index]["host"]
+                prev_status = self.view.peers[host].status
+                self.view.record_failure(
+                    host,
+                    "unexpected error polling peer: {!r}".format(result),
+                    untrusted=False,
+                )
+                # Require a full response after a failed observation so a
+                # cached 304 cannot restore its earlier agreement.
+                self._peer_observation_cache.pop(host, None)
+                self._log_peer_status_change(host, prev_status)
                 logger.error(
                     "cluster: unexpected error polling %s: %r",
-                    peers[index]["host"],
+                    host,
                     result,
                 )
         # one full round completed: every configured peer now carries a real

@@ -959,9 +959,11 @@ class Theme:
         return got if got is not None else self._bg["bg"]
 
     def _make_sgr_dispatch(self) -> Callable[["re.Match[str]"], str]:
-        """The ``_ANSI_RE.sub`` callback for :func:`rewrite_sgr`, built
-        once per theme: a memo hit is one dict lookup, and a miss runs
-        :func:`_rewrite_sgr_token`."""
+        """Translate log escapes with a bounded cache of SGR rewrites.
+
+        A cache hit uses one lookup. Empty rewrites and oversized tokens
+        or results remain uncached.
+        """
         memo = self._sgr_memo
         get = memo.get
 
@@ -970,9 +972,14 @@ class Theme:
             hit = get(token)
             if hit is None:
                 hit = _rewrite_sgr_token(token, self)
-                if len(memo) >= _SGR_MEMO_MAX:
-                    memo.clear()
-                memo[token] = hit
+                if (
+                    hit
+                    and len(token) <= _SGR_MEMO_TOKEN_MAX
+                    and len(hit) <= _SGR_MEMO_TEXT_MAX
+                ):
+                    if len(memo) >= _SGR_MEMO_MAX:
+                        memo.clear()
+                    memo[token] = hit
             return hit
 
         return dispatch
@@ -1241,9 +1248,12 @@ _sgr_match = _SGR_TOKEN_RE.match
 _ansi_match = _ANSI_RE.match
 
 
-#: bound on a theme's escape-token memo (see Theme._make_sgr_dispatch):
-#: the token set is job-controlled, so it is capped and reset like _CHAR_W
+#: The SGR cache limits entry count and the ASCII lengths of keys and
+#: rewrites. Repeated reset parameters can expand a short token, so both
+#: the input and the result have a length limit.
 _SGR_MEMO_MAX = 4096
+_SGR_MEMO_TOKEN_MAX = 128
+_SGR_MEMO_TEXT_MAX = 512
 
 
 def _rewrite_sgr_token(token: str, theme: Theme) -> str:
@@ -1288,9 +1298,8 @@ def rewrite_sgr(line: str, theme: Theme) -> str:
     Bold/dim/reset survive; the 16-colour and 256/truecolour foregrounds
     are mapped onto the theme's log palette (background requests are
     dropped: the TUI owns the background).  All non-SGR escapes are
-    stripped.  The ink is a function of the token and the theme alone,
-    so each distinct token is rewritten once per theme (the memo lives
-    on the Theme, see :meth:`Theme._make_sgr_dispatch`).
+    stripped. Each theme caches nonempty SGR rewrites within its entry
+    and text limits (see :meth:`Theme._make_sgr_dispatch`).
     """
     if "\x1b" not in line:
         # every _ANSI_RE alternative is anchored on an ESC, so the sub is

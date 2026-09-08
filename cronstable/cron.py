@@ -84,7 +84,7 @@ from cronstable.croninfo import (
 )
 from cronstable.dagrun import DAG_CATCHUP_STREAM_PREFIX, DagScheduler
 from cronstable.fingerprint import job_digest_cached, job_set_id
-from cronstable.ical import CalendarEntry, render_calendar
+from cronstable.ical import CalendarEntry, CalendarLimitError, render_calendar
 from cronstable.job import (
     JobOutputStream,
     JobRetryState,
@@ -208,6 +208,8 @@ _SPAWN_BURST_LIMIT = 16
 DEPENDS_GATE_PROBE = 8
 # Run summaries inlined per job in /jobs; full history at /jobs/{name}/runs.
 JOBS_INLINE_HISTORY = 20
+# Calendar workers retain admission through cancellation until they finish.
+_CALENDAR_RENDER_LIMIT = 2
 # Durable finished-run ledger, one stream per job, scoped by JOB NAME so
 # history survives an ordinary config reload.
 RUN_STREAM_PREFIX = "runs/"
@@ -2002,6 +2004,7 @@ class Cron:
         # bounds concurrently-executing subprocess spawns (job and DAG-task
         # launches share it); see _SPAWN_BURST_LIMIT for the why.
         self._spawn_gate = asyncio.Semaphore(_SPAWN_BURST_LIMIT)
+        self._calendar_renders = 0
         # Per-endpoint response-product memos; policy lives in
         # _shared_response_product, busting in _bust_response_memos.
         # /metrics keeps one memo per exposition format.
@@ -4323,28 +4326,51 @@ class Cron:
         per_job = self._web_int_query(
             request, "limit", default=100, lo=1, hi=1000, alias="per_job"
         )
+        if self._calendar_renders >= _CALENDAR_RENDER_LIMIT:
+            error = _api_error(
+                web.HTTPServiceUnavailable,
+                "Calendar exports are busy; retry shortly",
+            )
+            error.headers["Retry-After"] = "1"
+            raise error
+        self._calendar_renders += 1
         # the entries snapshot reads live state, so it is taken on the
         # loop; the walk (jobs x fires, pure CPU) then runs on the
         # executor over the immutable snapshot, like the pressure/suggest
         # builders
-        entries = self._calendar_entries(name)
-        if entries is None:
-            # Only the per-job feed reaches this: _calendar_entries(None)
-            # builds a list from the fleet snapshot and never returns
-            # None, so `name` is a real path segment here even though
-            # mypy sees Optional[str]. The lookup is _job_or_dag_schedule,
-            # so /jobs/dag:mydag/calendar.ics is a legitimate 200 and the
-            # reason must not claim a job was the only thing searched.
-            raise _api_error(
-                web.HTTPNotFound,
-                "no job or DAG schedule named {!r}".format(name),
+        try:
+            entries = self._calendar_entries(name)
+            if entries is None:
+                raise _api_error(
+                    web.HTTPNotFound,
+                    "no job or DAG schedule named {!r}".format(name),
+                )
+            pending = asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(
+                    self.calendar_payload, name, days, per_job, entries=entries
+                ),
             )
-        text = await asyncio.get_running_loop().run_in_executor(
-            None,
-            partial(
-                self.calendar_payload, name, days, per_job, entries=entries
-            ),
-        )
+        except BaseException:
+            self._calendar_renders -= 1
+            raise
+        completed = asyncio.Event()
+        if pending.done():
+            self._calendar_render_done(pending, completed)
+        else:
+            pending.add_done_callback(
+                partial(self._calendar_render_done, completed=completed)
+            )
+        try:
+            # A disconnected client can cancel this handler while its
+            # thread continues. The worker's callback releases admission.
+            await completed.wait()
+            text = pending.result()
+        except CalendarLimitError as ex:
+            raise _api_error(
+                web.HTTPUnprocessableEntity,
+                "{}. Reduce days or limit, or export one job.".format(ex),
+            ) from ex
         # the feed's own Content-Type wins, in any spelling: see
         # _strip_content_type
         headers = _strip_content_type(self._web_headers())
@@ -4355,6 +4381,15 @@ class Cron:
             charset="utf-8",
             headers=headers,
         )
+
+    def _calendar_render_done(
+        self, pending: asyncio.Future, completed: asyncio.Event
+    ) -> None:
+        self._calendar_renders -= 1
+        if not pending.cancelled():
+            # Retrieve failures even when the requesting client has left.
+            pending.exception()
+        completed.set()
 
     async def _web_calendar(self, request: web.Request) -> web.Response:
         """The fleet-wide iCal feed (``GET /calendar.ics``)."""
