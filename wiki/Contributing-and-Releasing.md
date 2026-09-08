@@ -173,7 +173,7 @@ Because no file is committed back to *this* repo, a release never re-triggers th
 
 ### macOS signing and notarization
 
-The macOS binaries are Developer ID signed (hardened runtime) and notarized **when the signing secrets are configured**. If all are absent, the release ships unsigned macOS binaries. A partially configured set fails preflight. When configured, each shipped macOS lane imports the certificate and checks notarization authentication before compiling. The secrets are `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY`, `MACOS_NOTARY_KEY_BASE64`, `MACOS_NOTARY_KEY_ID`, `MACOS_NOTARY_ISSUER_ID`.
+The macOS binaries are Developer ID signed (hardened runtime) and notarized **when the signing secrets are configured**. If all are absent, the release ships unsigned macOS binaries. A partially configured set fails preflight. When configured, each shipped macOS lane imports the certificate, signs a small probe with the configured identity, and checks notarization authentication before compiling. The secrets are `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY`, `MACOS_NOTARY_KEY_BASE64`, `MACOS_NOTARY_KEY_ID`, `MACOS_NOTARY_ISSUER_ID`.
 
 Signing imports the cert into a throwaway randomly-keyed keychain, signs with `codesign --options runtime --timestamp --entitlements pyinstaller/entitlements.plist`, verifies, then notarizes with `xcrun notarytool submit … --wait`. Because a one-file binary cannot be stapled, notarization publishes the ticket online and Gatekeeper validates on first run, so end users do not need `xattr -d com.apple.quarantine`.
 
