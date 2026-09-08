@@ -201,7 +201,7 @@ This installs the self-contained release binary for your platform (signed and
 notarized on macOS; glibc `amd64`/`arm64` from Homebrew on Linux), so no Python
 is required. Upgrade later with `brew upgrade cronstable`.
 
-## Install using winget
+## Install using WinGet
 
 On Windows, install the
 [winget package](https://github.com/microsoft/winget-pkgs/tree/master/manifests/p/ptweezy/cronstable):
@@ -210,9 +210,31 @@ On Windows, install the
 winget install ptweezy.cronstable
 ```
 
-This installs the self-contained release binary (`amd64` or `arm64`, matching
-your system), so no Python is required. Upgrade later with
-`winget upgrade ptweezy.cronstable`.
+WinGet installs the package available in its catalog. The release workflow
+submits signed [Windows MSIs](Windows-MSI) for `amd64` and `arm64`. If the catalog
+lacks an MSI manifest, download the MSI from the GitHub Release directly.
+
+The MSI needs administrator approval, adds the program to the system `PATH`,
+and registers the Windows service. It includes Python. Open a new shell after
+installation. The service stays stopped until you initialize its configuration
+and start it; follow the [MSI quick start](Windows-MSI#quick-start).
+
+To switch from a portable install to an MSI, back up any configuration stored
+beside the portable executable, then uninstall the portable package:
+
+```shell
+winget uninstall --exact --id ptweezy.cronstable
+```
+
+Install the MSI from the catalog:
+
+```shell
+winget install --exact --id ptweezy.cronstable --installer-type wix --scope machine
+```
+
+Point the service at your job configuration as described in
+[Windows MSI](Windows-MSI). You manage the configuration separately from
+WinGet. To upgrade an MSI installation, run `winget upgrade ptweezy.cronstable`.
 
 ## Install using Scoop
 
@@ -623,10 +645,11 @@ the first run of a browser-downloaded copy can still be blocked by SmartScreen.
 Choose **More info**, then **Run anyway**. If your policy calls for it,
 verify the download against the release's `SHA256SUMS`.
 
-`winget install ptweezy.cronstable` installs the compatibility build on x64
-through the Windows Package Manager. For the full Windows install and
-deployment details, see
-[running on Windows](Running-on-Windows).
+The WinGet release workflow submits MSIs with a one-directory payload, using
+the compatibility build on x64. See the
+[WinGet installation instructions](#install-using-winget) for package availability
+and steps to switch from a portable install. For Windows deployment details,
+see [running on Windows](Running-on-Windows).
 
 Windows releases also attach `cronstable-windows-amd64v3.zip` (recommended
 for compatible CPUs), `cronstable-windows-amd64.zip` (compatibility build),

@@ -4740,9 +4740,8 @@ jobs:
           git push
 
   # Submit the ptweezy.cronstable manifest to microsoft/winget-pkgs for each
-  # release. wingetcreate fetches the published manifest, updates the version,
-  # and detects each installer's architecture from its PE header. The tool
-  # requires Windows.
+  # release. Generate manifests from the published signed MSIs and scan the
+  # installers and their payloads with Defender before submitting them.
   #
   # WINGET_TOKEN is a classic PAT with public_repo scope. Its account creates
   # the fork and PRs. After submission succeeds, cleanup closes that account's
@@ -4750,14 +4749,78 @@ jobs:
   #
   # A missing token, failed submission, or cleanup error fails the job.
   winget:
-    needs: [version, release]
+    needs: [version, release, sign-windows]
     if: needs.version.outputs.release == 'true'
     runs-on: windows-latest
+    timeout-minutes: 20
     defaults:
       run:
         shell: bash
     steps:
-      - name: Update winget manifest
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Download signed winget installers
+        env:
+          SIGNED: ${{ needs.sign-windows.outputs.signed }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          if [ "$SIGNED" != true ]; then
+            echo "::error::WinGet requires signed MSIs. Configure the Windows signing secrets; see wiki/Contributing-and-Releasing.md."
+            exit 1
+          fi
+          gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" \
+            --dir winget-assets --pattern SHA256SUMS \
+            --pattern cronstable-windows-amd64.msi \
+            --pattern cronstable-windows-arm64.msi
+      - name: Install the MSI extractor
+        run: |
+          set -euo pipefail
+          wix_version="$(sed -n 's/^WIX_TOOL_VERSION=//p' .github/scripts/build_msi.sh)"
+          test -n "$wix_version"
+          dotnet tool install wix --tool-path .winget-tools --version "$wix_version"
+      - name: Verify and Defender-scan winget installers
+        shell: pwsh
+        run: ./.github/scripts/prepare_winget.ps1 -AssetDirectory winget-assets -OutputDirectory winget-validation -WixCommand ./.winget-tools/wix.exe
+      - name: Generate and validate winget manifests
+        env:
+          VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          python -m pip install strictyaml==1.7.3
+          python .github/scripts/render_winget.py "$VERSION" winget-validation/metadata.json winget-manifests
+      - name: Validate with the winget client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+            Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser
+            Repair-WinGetPackageManager
+          }
+          $client = Get-Command winget.exe -ErrorAction SilentlyContinue
+          if ($client) {
+            & $client.Source validate --manifest winget-manifests --disable-interactivity
+          } else {
+            $package = Get-AppxPackage Microsoft.DesktopAppInstaller
+            & (Join-Path $package.InstallLocation 'winget.exe') validate --manifest winget-manifests --disable-interactivity
+          }
+          if ($LASTEXITCODE -ne 0) { throw "winget validate failed ($LASTEXITCODE)" }
+      - name: Preserve winget validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: winget-validation
+          path: |
+            winget-validation/*.log
+            winget-validation/*.wxs
+            winget-validation/metadata.json
+            winget-manifests/*.yaml
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Submit winget manifest
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
           VERSION: ${{ needs.version.outputs.new }}
@@ -4769,12 +4832,8 @@ jobs:
           fi
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o wingetcreate.exe \
             https://github.com/microsoft/winget-create/releases/latest/download/wingetcreate.exe
-          ./wingetcreate.exe update ptweezy.cronstable \
-            --version "$VERSION" \
-            --urls \
-              "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/cronstable-windows-amd64.exe" \
-              "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/cronstable-windows-arm64.exe" \
-            --submit --no-open --token "$WINGET_TOKEN" \
+          ./wingetcreate.exe submit winget-manifests \
+            --no-open --token "$WINGET_TOKEN" \
             --prtitle "New version: ptweezy.cronstable version ${VERSION}"
 
       - name: Close superseded unapproved winget PRs
