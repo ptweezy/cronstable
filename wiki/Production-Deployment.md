@@ -32,8 +32,11 @@ Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386`,
 `linux/arm/v7`, `linux/ppc64le`, and `linux/s390x`) images are published to the
 GitHub Container Registry on every release.
 
-For compatible x86-64-v3 hosts, every distro also has an explicit
-`-amd64v3` tag (for example, `latest-amd64v3` and `latest-alpine-amd64v3`).
+For compatible x86-64-v3 hosts, **the explicit `-amd64v3` tags are recommended**
+(for example, `latest-amd64v3` and `latest-alpine-amd64v3`). Existing tags
+retain their current platform coverage and CPU requirements. The deployment
+examples below use those existing tags; select the v3 tag for a compatible
+host, including the CPU features exposed to a VM.
 See [CPU requirements and variant selection](Installation#amd64v3-cpu-requirements).
 
 | Property | Value |

@@ -193,6 +193,11 @@ The "Build release notes from HISTORY.md" step extracts this version's section f
 
 ### amd64v3 runtimes
 
+Downloads present `amd64v3` as **Recommended for compatible CPUs** and `amd64`
+as the **Compatibility build**. Existing asset URLs, Docker tags and the
+Homebrew/Scoop/winget defaults retain their current requirements. Recommendation
+labels do not rename or retarget published artifacts.
+
 Every amd64 binary and package also ships as `amd64v3`. These rows reuse the
 existing build, smoke, architecture, package, signing and publication steps.
 The Linux glibc row uses the same manylinux2014 base and enforced GLIBC_2.17

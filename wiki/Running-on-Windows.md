@@ -19,27 +19,31 @@ same on every platform.
 cronstable supports Windows on three CPU architectures: `amd64` (x64),
 `arm64` (ARM64), and `i686` (32-bit x86). You can install it as a normal
 Python package or as a self-contained executable. Use `i686` only on a
-32-bit Windows install; on 64-bit Windows, choose `amd64` or `arm64`.
+32-bit Windows install; on ARM64, choose `arm64`. For x64 downloads,
+**amd64v3 is recommended for compatible CPUs**. Choose **amd64, the
+compatibility build**, when the CPU or VM lacks v3 or its capabilities are
+uncertain. See [CPU requirements](Installation#amd64v3-cpu-requirements).
 
 | Architecture | pip / pipx | Standalone binary | Zip (one-directory) | MSI |
 | --- | --- | --- | --- | --- |
-| `amd64` (x64) | `pip install cronstable` | `cronstable-windows-amd64.exe` | `cronstable-windows-amd64.zip` | `cronstable-windows-amd64.msi` |
-| `amd64v3` (x64, v3 CPU) | Use the release binary for the optimized runtime | `cronstable-windows-amd64v3.exe` | `cronstable-windows-amd64v3.zip` | `cronstable-windows-amd64v3.msi` |
+| `amd64v3` (x64) — Recommended for compatible CPUs | Use the release binary for the optimized runtime | `cronstable-windows-amd64v3.exe` | `cronstable-windows-amd64v3.zip` | `cronstable-windows-amd64v3.msi` |
+| `amd64` (x64) — Compatibility build | `pip install cronstable` | `cronstable-windows-amd64.exe` | `cronstable-windows-amd64.zip` | `cronstable-windows-amd64.msi` |
 | `arm64` (ARM64) | `pip install cronstable` | `cronstable-windows-arm64.exe` | `cronstable-windows-arm64.zip` | `cronstable-windows-arm64.msi` |
 | `i686` (32-bit x86) | `pip install cronstable` | `cronstable-windows-i686.exe` | `cronstable-windows-i686.zip` | `cronstable-windows-i686.msi` |
 
 The test suite runs on Windows (both x64 and ARM64) in CI on every commit. A
 small set of POSIX-only tests is skipped there, each with a stated reason: the
 tests for per-job user/group switching, privilege drop, POSIX signal delivery,
-and POSIX file modes. Every release builds all three Windows architectures plus the optional amd64v3 variant.
-See [amd64v3 CPU requirements](Installation#amd64v3-cpu-requirements) before selecting it.
-See
-[contributing and releasing](Contributing-and-Releasing) for the build and
-release workflow.
+and POSIX file modes. Every release builds all three Windows architectures
+plus the amd64v3 variant. See [contributing and releasing](Contributing-and-Releasing)
+for the build and release workflow.
 
 ## Installation
 
-There are five ways to install cronstable on Windows.
+There are five ways to install cronstable on Windows. The direct-download
+examples use amd64v3 for compatible x64 CPUs; substitute `amd64` in the
+filenames for the compatibility build. winget keeps its baseline x64 download,
+and pip/pipx use your installed Python runtime.
 
 ### MSI (machine-wide, hosts the service)
 
@@ -52,7 +56,7 @@ system `PATH`. It is the path for managed deployment through GPO, Intune, or
 SCCM:
 
 ```shell
-msiexec /i cronstable-windows-amd64.msi /qn
+msiexec /i cronstable-windows-amd64v3.msi /qn
 ```
 
 See [Windows MSI](Windows-MSI) for the silent-install properties, upgrade
@@ -87,14 +91,15 @@ cronstable --version
 
 Every release attaches self-contained executables on the
 [releases page](https://github.com/ptweezy/cronstable/releases):
-`cronstable-windows-amd64.exe` (x64), `cronstable-windows-arm64.exe`
+`cronstable-windows-amd64v3.exe` (recommended for compatible x64 CPUs),
+`cronstable-windows-amd64.exe` (compatibility build), `cronstable-windows-arm64.exe`
 (ARM64), and `cronstable-windows-i686.exe` (32-bit x86). Python is **not**
 required on the target system, because the
 executable embeds the interpreter. Download the asset for your architecture,
 then run it:
 
 ```shell
-cronstable-windows-amd64.exe --version
+cronstable-windows-amd64v3.exe --version
 ```
 
 The binaries are built natively on Windows runners (the ARM64 binary on a
@@ -118,7 +123,8 @@ per-release hash rules.
 
 ### One-directory zip (hosts the service)
 
-`cronstable-windows-amd64.zip`, `cronstable-windows-arm64.zip` and
+`cronstable-windows-amd64v3.zip` (recommended for compatible CPUs),
+`cronstable-windows-amd64.zip` (compatibility build), `cronstable-windows-arm64.zip` and
 `cronstable-windows-i686.zip` hold the same program as the standalone binary
 in a one-directory layout: a single
 `cronstable\` folder with `cronstable.exe` beside an `_internal\` directory,
@@ -133,8 +139,8 @@ from the zip before extraction clears it for everything at once. From an
 elevated PowerShell (writing into `C:\Program Files` needs one):
 
 ```powershell
-Unblock-File .\cronstable-windows-amd64.zip
-Expand-Archive .\cronstable-windows-amd64.zip -DestinationPath 'C:\Program Files'
+Unblock-File .\cronstable-windows-amd64v3.zip
+Expand-Archive .\cronstable-windows-amd64v3.zip -DestinationPath 'C:\Program Files'
 & 'C:\Program Files\cronstable\cronstable.exe' --version
 ```
 

@@ -1,11 +1,14 @@
 # Windows MSI
 
-The optional `cronstable-windows-amd64v3.msi` uses an optimized embedded Python
-runtime and requires an x86-64-v3-capable CPU. It is an x64 alternative to the
-baseline MSI, with the same service, install paths and upgrade identity.
+**`cronstable-windows-amd64v3.msi` is recommended for compatible x64 CPUs.**
+It uses an optimized embedded Python runtime and requires the full x86-64-v3
+feature set. **`cronstable-windows-amd64.msi` is the compatibility build**
+for CPUs or VMs without v3, or when support is uncertain. Both use the same
+service, install paths and upgrade identity.
 
-Every release attaches `cronstable-windows-amd64.msi` and
-`cronstable-windows-arm64.msi`: per-machine Windows Installer packages for
+Every release attaches `cronstable-windows-amd64v3.msi`,
+`cronstable-windows-amd64.msi`, `cronstable-windows-arm64.msi` and
+`cronstable-windows-i686.msi`: per-machine Windows Installer packages for
 managed deployment through GPO, Intune, SCCM, or a plain elevated
 `msiexec`. The MSI carries the same one-directory build the zip asset
 holds, so nothing self-extracts at startup and Python is not required on
@@ -34,10 +37,13 @@ configuration and logs under `C:\ProgramData\cronstable`.
 
 ## Quick start
 
-From an elevated prompt:
+The examples use amd64v3 for a compatible x64 CPU; substitute `amd64` in
+the filenames for the compatibility build. Check the
+[CPU requirements](Installation#amd64v3-cpu-requirements), then use an elevated
+prompt:
 
 ```shell
-msiexec /i cronstable-windows-amd64.msi /qn
+msiexec /i cronstable-windows-amd64v3.msi /qn
 "C:\Program Files\cronstable\cronstable.exe" init C:\ProgramData\cronstable
 "C:\Program Files\cronstable\cronstable.exe" service start
 ```
@@ -76,7 +82,7 @@ the configuration files first (or in the same policy) and install with
 `STARTSERVICE=1`:
 
 ```shell
-msiexec /i cronstable-windows-amd64.msi /qn STARTSERVICE=1
+msiexec /i cronstable-windows-amd64v3.msi /qn STARTSERVICE=1
 ```
 
 When a deployment misbehaves, log the install with `/l*v install.log`. The

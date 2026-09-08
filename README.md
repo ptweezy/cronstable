@@ -296,17 +296,24 @@ only glibc 2.17, so they run on everything from RHEL 7 onward; `ppc64le`
 needs 2.28 (RHEL 8 onward). Python is not required on the target
 system; it is embedded in the executable.
 
-`amd64v3` is an opt-in build with an optimized embedded Python runtime for
-**x86-64-v3-capable CPUs**. Every amd64 binary and package format has a v3
-counterpart; all eight Docker distros also have explicit `-amd64v3` tags
-(for example, `latest-amd64v3` and `latest-alpine-amd64v3`). Baseline `amd64`
-remains the default. See [CPU requirements and variant selection](https://github.com/ptweezy/cronstable/wiki/Installation#amd64v3-cpu-requirements).
+For x64 downloads, choose:
+
+- **`amd64v3` — Recommended for compatible CPUs.** Uses an optimized embedded
+  Python runtime and requires the full x86-64-v3 feature set.
+- **`amd64` — Compatibility build.** Choose this when the CPU or VM does not
+  support v3, or when you are unsure.
+
+Every amd64 binary and package format has a v3 counterpart. All eight Docker
+distros offer explicit `-amd64v3` tags, recommended for compatible hosts
+(for example, `latest-amd64v3` and `latest-alpine-amd64v3`). Existing `amd64`
+asset URLs and Docker tags retain their current requirements; Homebrew, Scoop
+and winget keep their baseline downloads. See [CPU requirements and variant selection](https://github.com/ptweezy/cronstable/wiki/Installation#amd64v3-cpu-requirements).
 
 ```shell
-# pick the asset for your OS and architecture (glibc amd64 Linux shown; append
-# -musl on Alpine, or use cronstable-macos-<arch> on a Mac)
+# Recommended for an x86-64-v3-capable Linux CPU (glibc).
+# Use amd64 instead of amd64v3 for compatibility; append -musl on Alpine.
 curl -fsSL -o cronstable \
-  https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64
+  https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64v3
 chmod +x cronstable
 ./cronstable --version
 ```
@@ -332,7 +339,9 @@ MSI](https://github.com/ptweezy/cronstable/wiki/Windows-MSI) wiki page).
 cronstable runs natively on Windows (x64, ARM64 and 32-bit x86). Install it
 with `pip install cronstable`, or take one of the builds on the
 [releases page](https://github.com/ptweezy/cronstable/releases), none of which
-need Python: the self-contained `cronstable-windows-amd64.exe` /
+need Python: the self-contained `cronstable-windows-amd64v3.exe`
+(recommended for compatible x64 CPUs), `cronstable-windows-amd64.exe`
+(compatibility build), or
 `cronstable-windows-arm64.exe` / `cronstable-windows-i686.exe`, the
 one-directory
 `cronstable-windows-<arch>.zip` (the shape that can host the Windows service),
