@@ -292,6 +292,13 @@ winget install ptweezy.cronstable
 Upgrade later with `brew upgrade cronstable` or
 `winget upgrade ptweezy.cronstable`.
 
+The WinGet release workflow submits signed, per-machine MSIs. When you install
+an MSI, approve the administrator prompt and open a new shell to use `cronstable`
+from `PATH`. The installer registers the Windows service, which stays stopped
+until you configure and start it. See the
+[WinGet installation guide](https://github.com/ptweezy/cronstable/wiki/Installation#install-using-winget)
+for package availability and instructions to switch from a portable install.
+
 ### Install using binary
 
 Alternatively, download a self-contained binary from GitHub:
