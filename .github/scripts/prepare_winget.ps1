@@ -15,15 +15,41 @@ try {
     if (-not $status.AMServiceEnabled -or -not $status.AntivirusEnabled) {
         throw 'Microsoft Defender is unavailable; refusing an unscanned submission.'
     }
-    Update-MpSignature
-    Get-MpComputerStatus | Select-Object AMProductVersion, AMEngineVersion,
-        AntivirusSignatureVersion, AntivirusSignatureLastUpdated | Format-List
-    $scanner = Get-ChildItem "$env:ProgramData\Microsoft\Windows Defender\Platform\*\MpCmdRun.exe" -ErrorAction SilentlyContinue |
-        Sort-Object { [version]$_.Directory.Name.Split('-')[0] } -Descending |
-        Select-Object -First 1
-    if (-not $scanner) {
-        $scanner = Get-Item "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+    function Get-DefenderScanner {
+        $command = Get-ChildItem "$env:ProgramData\Microsoft\Windows Defender\Platform\*\MpCmdRun.exe" -ErrorAction SilentlyContinue |
+            Sort-Object { [version]$_.Directory.Name.Split('-')[0] } -Descending |
+            Select-Object -First 1
+        if (-not $command) {
+            $command = Get-Item "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+        }
+        return $command
     }
+    # Use Defender's native updater with Microsoft's direct update source.
+    # Each attempt resolves the executable and checks service readiness.
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            $scanner = Get-DefenderScanner
+            Write-Host "Updating Defender signatures (attempt $attempt/3): $($scanner.FullName)"
+            & $scanner.FullName -SignatureUpdate -MMPC
+            if ($LASTEXITCODE -ne 0) {
+                throw "MpCmdRun signature update exited with $LASTEXITCODE"
+            }
+            $status = Get-MpComputerStatus
+            if (-not $status.AMServiceEnabled -or -not $status.AntivirusEnabled) {
+                throw 'Microsoft Defender is unavailable after signature update'
+            }
+            break
+        } catch {
+            if ($attempt -eq 3) {
+                throw "Defender signature update failed after 3 attempts; scanning is blocked. $($_.Exception.Message)"
+            }
+            Write-Warning "Defender update attempt $attempt failed: $($_.Exception.Message). Retrying."
+            Start-Sleep -Seconds (5 * $attempt)
+        }
+    }
+    $status | Select-Object AMProductVersion, AMEngineVersion,
+        AntivirusSignatureVersion, AntivirusSignatureLastUpdated | Format-List
+    $scanner = Get-DefenderScanner
     function Scan-Path([string]$Path) {
         # A scan that remediates malware can return 0. DisableRemediation
         # retains detected files and makes detections fail the scan.

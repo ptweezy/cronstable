@@ -427,9 +427,12 @@ def test_a_wheelhouse_wheel_keeps_cryptography_where_pypi_has_none(
     )
     # A 32-bit userland matches on the machine pip resolves under.
     (wheelhouse / "cryptography-50.0.1-cp311-abi3-linux_i686.whl").touch()
-    assert module.resolve_cryptography(
-        line, ("x86_64", 4, "glibc"), str(wheelhouse)
-    ) == "cryptography>=48"
+    assert (
+        module.resolve_cryptography(
+            line, ("x86_64", 4, "glibc"), str(wheelhouse)
+        )
+        == "cryptography>=48"
+    )
     # And main() threads the directory through from its second argument.
     monkeypatch.setattr(module, "detect_target", lambda: target)
     shutil.copy(
@@ -497,3 +500,33 @@ def test_another_platforms_cryptography_line_never_reaches_an_image():
     assert module.marker_can_hold_on_linux(linux)
     # A line with no marker is everyone's.
     assert module.marker_can_hold_on_linux("cryptography>=48")
+
+
+def test_source_offer_version_controls_docker_dependency(
+    tmp_path, monkeypatch
+):
+    module = _extract_deps_module()
+    shutil.copy(
+        os.path.join(ROOT, "pyproject.toml"), tmp_path / "pyproject.toml"
+    )
+    monkeypatch.setattr(
+        module, "detect_target", lambda: ("x86_64", 64, "glibc")
+    )
+    project = module.tomllib.loads((tmp_path / "pyproject.toml").read_text())
+    from packaging.requirements import Requirement
+
+    req = next(
+        Requirement(line)
+        for line in project["project"]["optional-dependencies"]["discovery"]
+        if Requirement(line).name == "zeroconf"
+    )
+    version = next(s.version for s in req.specifier if s.operator == ">=")
+    monkeypatch.setenv("ZEROCONF_VERSION", version)
+    module.main(str(tmp_path / "pyproject.toml"))
+    assert (
+        "zeroconf==" + version
+        in (tmp_path / "requirements.txt").read_text().splitlines()
+    )
+    monkeypatch.setenv("ZEROCONF_VERSION", "0.0.0")
+    with pytest.raises(ValueError, match="Resolved zeroconf"):
+        module.main(str(tmp_path / "pyproject.toml"))

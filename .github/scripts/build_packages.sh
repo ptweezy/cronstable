@@ -78,6 +78,22 @@ riscv64 riscv64
 loong64 loongarch64
 "
 
+# Exercise the real recipes and package metadata checks before any emulated
+# build starts. nfpm does not execute payloads; these fixtures stay temporary.
+if [ "${3:-}" = --check ]; then
+    mkdir -p "$BINARIES"
+    while read -r arch rest; do
+        [ -n "$arch" ] || continue
+        printf '#!/bin/sh\nexit 0\n' > "$BINARIES/cronstable-linux-$arch"
+        chmod +x "$BINARIES/cronstable-linux-$arch"
+    done <<< "$ROWS"
+    while read -r arch rest; do
+        [ -n "$arch" ] || continue
+        printf '#!/bin/sh\nexit 0\n' > "$BINARIES/cronstable-linux-$arch-musl"
+        chmod +x "$BINARIES/cronstable-linux-$arch-musl"
+    done <<< "$APK_ROWS"
+fi
+
 here="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 . "$here/retry.sh"
