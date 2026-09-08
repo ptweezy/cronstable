@@ -71,7 +71,7 @@ def plist(path):
         handle.write("@sample /" + CONFIG_SAMPLE + "\n")
 
 
-def manifest(path, version):
+def manifest(path, version, amd64v3=False):
     data = {
         "name": "cronstable",
         "version": version,
@@ -100,6 +100,8 @@ def manifest(path, version):
             "pre-deinstall": read("preremove.sh"),
         },
     }
+    if amd64v3:
+        data["desc"] += " Requires an x86-64-v3 CPU (including AVX2)."
     with open(path, "w", encoding="utf-8", newline="\n") as handle:
         json.dump(data, handle, indent=2)
         handle.write("\n")
@@ -118,7 +120,7 @@ def main(argv):
 
     meta = os.path.join(work, "meta")
     os.makedirs(meta)
-    manifest(os.path.join(meta, "+MANIFEST"), version)
+    manifest(os.path.join(meta, "+MANIFEST"), version, binary.endswith("-amd64v3"))
     plist_path = os.path.join(work, "plist")
     plist(plist_path)
 

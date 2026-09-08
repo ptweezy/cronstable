@@ -8,6 +8,7 @@
 #                measured from the frozen bytes rather than read off the base
 #                image, because the two disagree
 #   PKG_BINARY   path to the built binary for that architecture
+#   PKG_CPU_NOTE CPU requirement for an opt-in variant; empty for baseline
 #
 # Packaging is metadata plus payload: nfpm never executes the binary, so every
 # architecture builds on the amd64 runner with no emulation.
@@ -24,6 +25,7 @@ description: |
   questions cron cannot: what runs next, why a job did not run, which schedules
   collide, and what happened on the last run. It has a dashboard, an HTTP API,
   durable run history, dependency graphs, clustering and reporting.
+  ${PKG_CPU_NOTE}
 vendor: Parker Loflin
 homepage: https://github.com/ptweezy/cronstable
 license: MIT

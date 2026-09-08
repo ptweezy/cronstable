@@ -6,7 +6,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/cronstable.svg?logo=python&logoColor=ffd343&color=306998)](https://pypi.org/project/cronstable/)
 [![PyPI status](https://img.shields.io/pypi/status/cronstable.svg?color=2ea44f)](https://pypi.org/project/cronstable/)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-00bcd4)](https://github.com/ptweezy/cronstable/releases/latest)
-[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7%20%7C%20armv6%20%7C%20i686%20%7C%20ppc64le%20%7C%20s390x%20%7C%20riscv64%20%7C%20loong64%20%7C%20mips64le%20%7C%20armel-c2185b)](https://github.com/ptweezy/cronstable/releases/latest)
+[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20amd64v3%20%7C%20arm64%20%7C%20armv7%20%7C%20armv6%20%7C%20i686%20%7C%20ppc64le%20%7C%20s390x%20%7C%20riscv64%20%7C%20loong64%20%7C%20mips64le%20%7C%20armel-c2185b)](https://github.com/ptweezy/cronstable/releases/latest)
 [![CI](https://github.com/ptweezy/cronstable/actions/workflows/release.yml/badge.svg)](https://github.com/ptweezy/cronstable/actions/workflows/release.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/ptweezy/cronstable?logo=codecov&logoColor=white&color=f01f7a)](https://codecov.io/gh/ptweezy/cronstable)
 [![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fcronstable-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/cronstable/pkgs/container/cronstable)
@@ -303,21 +303,35 @@ for package availability and instructions to switch from a portable install.
 
 Alternatively, download a self-contained binary from GitHub:
 <https://github.com/ptweezy/cronstable/releases>. Every release attaches
-binaries for Linux (glibc and musl builds for `amd64`, `arm64`, `i686`,
+binaries for Linux (glibc and musl builds for `amd64`, `amd64v3`, `arm64`, `i686`,
 `armv7`, `armv6`, `ppc64le`, `s390x`, `riscv64` and `loong64`, plus a glibc-only
-`mips64le` and `armel`), macOS (`amd64` and `arm64`, signed and notarized by
-Apple), FreeBSD (`amd64` and `arm64`), OpenBSD, NetBSD, illumos (`amd64`) and
-Windows (`amd64`, `arm64` and `i686`), plus `.deb`, `.rpm`, Alpine `.apk` and
-FreeBSD `.pkg` packages. The `amd64`, `arm64`, and `s390x` glibc builds need
+`mips64le` and `armel`), macOS (`amd64`, `amd64v3` and `arm64`, signed and notarized by
+Apple), FreeBSD (`amd64`, `amd64v3` and `arm64`), OpenBSD, NetBSD, illumos
+(`amd64` and `amd64v3`) and
+Windows (`amd64`, `amd64v3`, `arm64` and `i686`), plus `.deb`, `.rpm`, Alpine `.apk` and
+FreeBSD `.pkg` packages. The `amd64`, `amd64v3`, `arm64`, and `s390x` glibc builds need
 only glibc 2.17, so they run on everything from RHEL 7 onward; `ppc64le`
 needs 2.28 (RHEL 8 onward). Python is not required on the target
-system. It is embedded in the executable:
+system; it is embedded in the executable.
+
+For x64 downloads, choose:
+
+- **`amd64v3` — Recommended for compatible CPUs.** Uses an optimized embedded
+  Python runtime and requires the full x86-64-v3 feature set.
+- **`amd64` — Compatibility build.** Choose this when the CPU or VM does not
+  support v3, or when you are unsure.
+
+Every amd64 binary and package format has a v3 counterpart. All eight Docker
+distros offer explicit `-amd64v3` tags, recommended for compatible hosts
+(for example, `latest-amd64v3` and `latest-alpine-amd64v3`). Existing `amd64`
+asset URLs and Docker tags retain their current requirements; Homebrew, Scoop
+and winget keep their baseline downloads. See [CPU requirements and variant selection](https://github.com/ptweezy/cronstable/wiki/Installation#amd64v3-cpu-requirements).
 
 ```shell
-# pick the asset for your OS and architecture (glibc amd64 Linux shown; append
-# -musl on Alpine, or use cronstable-macos-<arch> on a Mac)
+# Recommended for an x86-64-v3-capable Linux CPU (glibc).
+# Use amd64 instead of amd64v3 for compatibility; append -musl on Alpine.
 curl -fsSL -o cronstable \
-  https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64
+  https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64v3
 chmod +x cronstable
 ./cronstable --version
 ```
@@ -343,7 +357,9 @@ MSI](https://github.com/ptweezy/cronstable/wiki/Windows-MSI) wiki page).
 cronstable runs natively on Windows (x64, ARM64 and 32-bit x86). Install it
 with `pip install cronstable`, or take one of the builds on the
 [releases page](https://github.com/ptweezy/cronstable/releases), none of which
-need Python: the self-contained `cronstable-windows-amd64.exe` /
+need Python: the self-contained `cronstable-windows-amd64v3.exe`
+(recommended for compatible x64 CPUs), `cronstable-windows-amd64.exe`
+(compatibility build), or
 `cronstable-windows-arm64.exe` / `cronstable-windows-i686.exe`, the
 one-directory
 `cronstable-windows-<arch>.zip` (the shape that can host the Windows service),
