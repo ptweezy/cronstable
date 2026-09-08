@@ -32,6 +32,10 @@ Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386`,
 `linux/arm/v7`, `linux/ppc64le`, and `linux/s390x`) images are published to the
 GitHub Container Registry on every release.
 
+For compatible x86-64-v3 hosts, every distro also has an explicit
+`-amd64v3` tag (for example, `latest-amd64v3` and `latest-alpine-amd64v3`).
+See [CPU requirements and variant selection](Installation#amd64v3-cpu-requirements).
+
 | Property | Value |
 | --- | --- |
 | Registry/image | `ghcr.io/ptweezy/cronstable` |

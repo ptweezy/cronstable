@@ -313,7 +313,7 @@ jobs:
           set -euo pipefail
           {
             echo 'matrix<<JSON'
-            cat .github/docker-matrix.json
+            python3 .github/scripts/docker_matrix.py
             echo 'JSON'
           } >> "$GITHUB_OUTPUT"
 
@@ -594,7 +594,7 @@ jobs:
   # configures them --disable-shared, and PyInstaller hard-requires a shared
   # libpython (PythonLibraryNotFoundError, no fallback). Hence install_pbs.sh.
   #
-  # amd64 and arm64 build natively; armv7, ppc64le and s390x run under QEMU.
+  # amd64, amd64v3 and arm64 build natively; armv7, ppc64le and s390x run under QEMU.
   # armv7 has no manylinux2014 image, so it builds on manylinux_2_31_armv7l
   # (Ubuntu 20.04) and declares GLIBC_2.31, which covers Raspberry Pi OS
   # bullseye and Debian 11 armhf. ppc64le builds on manylinux_2_28_ppc64le
@@ -624,6 +624,18 @@ jobs:
             nacl: hard
             # A manylinux2014_x86_64 wheel always exists for cryptography, so
             # this row bundles post-quantum sealing and fails if it cannot.
+            pq: hard
+            rust: '1'
+            native: '1'
+          - arch: amd64v3
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            image: quay.io/pypa/manylinux2014_x86_64:2026.08.15-1
+            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.14.7+20260814-x86_64_v3-unknown-linux-gnu-install_only.tar.gz'
+            pysha: '8fc4a6bd7422364d815844616de31bfb5c38743815810fd9a8a4bc278684f6fc'
+            floor: '2.17'
+            archspec: elf:2:1:62
+            nacl: hard
             pq: hard
             rust: '1'
             native: '1'
@@ -795,6 +807,11 @@ jobs:
               PATH=/opt/pbs/bin:$PATH
               LD_LIBRARY_PATH=/opt/pbs/lib
               export PATH LD_LIBRARY_PATH
+              if [ "${{ matrix.arch }}" = amd64v3 ]; then
+                python3 docker/python_runtime.py --check
+                RUSTFLAGS="-C target-cpu=x86-64-v3"
+                export RUSTFLAGS
+              fi
               # python-build-standalone bakes the toolchain it was built with
               # into sysconfig (CC=/usr/bin/<triple>-gcc), and that path does
               # not exist in this image, so every source build dies with "No
@@ -992,12 +1009,13 @@ jobs:
       fail-fast: false
       matrix:
         libc: [musl, glibc]
-        arch: [amd64, arm64, i686, armv7, armv6, ppc64le, s390x, riscv64]
+        arch: [amd64, amd64v3, arm64, i686, armv7, armv6, ppc64le, s390x, riscv64]
         exclude:
-          # These five glibc rows build in the manylinux `binaries` job, which
+          # These glibc rows build in the manylinux `binaries` job, which
           # reaches GLIBC_2.17 (2.31 on armv7) instead of this lane's Debian
           # floor; armv6 is musl-only (Debian ships no arm32v6).
           - { libc: glibc, arch: amd64 }
+          - { libc: glibc, arch: amd64v3 }
           - { libc: glibc, arch: arm64 }
           - { libc: glibc, arch: armv7 }
           - { libc: glibc, arch: ppc64le }
@@ -1038,6 +1056,7 @@ jobs:
           # per-arch: docker platform, runner, and whether QEMU is needed
           # (amd64/arm64/i686 execute natively on the runners)
           - { arch: amd64, platform: linux/amd64, runner: ubuntu-24.04 }
+          - { arch: amd64v3, platform: linux/amd64, runner: ubuntu-24.04 }
           - { arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
           - { arch: i686, platform: linux/386, runner: ubuntu-24.04 }
           # Post-quantum sealing on every row. `pq: hard` where cryptography
@@ -1055,6 +1074,7 @@ jobs:
           # glibc twins of several arches build in the manylinux `binaries`
           # job instead.
           - { libc: musl, arch: amd64, pq: hard }
+          - { libc: musl, arch: amd64v3, pq: hard }
           - { libc: musl, arch: arm64, pq: hard }
           - { libc: musl, arch: i686, pq: soft, pq_src: '1' }
           - { libc: musl, arch: armv7, pq: soft, pq_src: '1' }
@@ -1187,6 +1207,12 @@ jobs:
               # i686 aiohttp stack; propcache on armv7). The full-wheel arches
               # leave the toolchain unused.
               ${{ matrix.toolchain }}
+              if [ "${{ matrix.arch }}" = amd64v3 ]; then
+                python docker/python_runtime.py --variant amd64v3 --libc musl --prefix /opt/pbs
+                PATH=/opt/pbs/bin:$PATH
+                RUSTFLAGS="-C target-cpu=x86-64-v3"
+                export PATH RUSTFLAGS
+              fi
               # See the hostplat comment in the matrix: this is what stops pip
               # selecting armv7l wheels inside an ARMv6 container.
               if [ -n "${{ matrix.hostplat }}" ]; then
@@ -1312,6 +1338,10 @@ jobs:
               fi
               if [ -n "$gate" ] || [ -n "${{ matrix.armgate }}" ]; then
                 python /src/.github/scripts/elf_floor.py dist/cronstable $gate ${{ matrix.armgate }}
+              fi
+              if [ "${{ matrix.arch }}" = amd64v3 ]; then
+                python /src/.github/scripts/assert_arch.py dist/cronstable elf:2:1:62
+                python /src/.github/scripts/elf_floor.py dist/cronstable --max-glibc 0.0 --no-exec-stack
               fi
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
             '
@@ -1922,6 +1952,12 @@ jobs:
             # on Intel Macs at all.
             pq: hard
             pqcap: ',<49'
+          - arch: amd64v3
+            runner: macos-15-intel    # macOS 15, Intel -- shipped
+            ship: true
+            asset: macos-amd64v3
+            pq: hard
+            pqcap: ',<49'
           - arch: arm64
             runner: macos-26          # macOS 26 (Tahoe), Apple Silicon -- CI only
             ship: false
@@ -1931,6 +1967,12 @@ jobs:
             runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
             ship: false
             asset: macos26-amd64
+            pq: hard   # see the macOS 15 Intel row
+            pqcap: ',<49'
+          - arch: amd64v3
+            runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
+            ship: false
+            asset: macos26-amd64v3
             pq: hard   # see the macOS 15 Intel row
             pqcap: ',<49'
     runs-on: ${{ matrix.runner }}
@@ -1947,6 +1989,16 @@ jobs:
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           version: "0.12.5"
+      - name: Build amd64v3 Python
+        if: matrix.arch == 'amd64v3'
+        id: runtime
+        run: |
+          set -euo pipefail
+          brew install openssl@3 libffi sqlite xz pkgconf
+          CPPFLAGS="-I$(brew --prefix libffi)/include -I$(brew --prefix sqlite)/include" \
+          LDFLAGS="-L$(brew --prefix libffi)/lib -L$(brew --prefix sqlite)/lib" \
+            python3 docker/python_runtime.py --variant amd64v3 \
+              --prefix "$RUNNER_TEMP/python-amd64v3" --openssl "$(brew --prefix openssl@3)"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -1954,7 +2006,7 @@ jobs:
           set -euo pipefail
           # Runner-native, all-wheels arch: install into a throwaway uv venv and
           # freeze from it with `uv run` (uv discovers the setup-python 3.14).
-          uv venv --python 3.14
+          uv venv --python "${{ steps.runtime.outputs.python-path || '3.14' }}"
           uv pip install pyinstaller==6.22.1  # pin matches the Linux jobs
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) for the faster event loop; macOS
@@ -2012,7 +2064,7 @@ jobs:
           # run an x86_64 build on the arm64 runner and let the smoke test pass,
           # silently producing a mislabelled asset. `file` reports x86_64/arm64.
           case "${{ matrix.arch }}" in
-            amd64) want=x86_64 ;;
+            amd64|amd64v3) want=x86_64 ;;
             arm64) want=arm64 ;;
           esac
           file dist/cronstable | grep -q "$want"
@@ -2113,6 +2165,12 @@ jobs:
             orjson: '1'
             pq: '1'
             cflags: -I/usr/local/include
+          - arch: amd64v3
+            vmarch: x86_64
+            pkgs: python314 rust gmake pkgconf libsodium openssl35 libffi sqlite3
+            orjson: '1'
+            pq: '1'
+            cflags: -I/usr/local/include
           - arch: arm64
             vmarch: aarch64
             # Full-system QEMU. orjson is a Rust extension whose own build
@@ -2167,7 +2225,15 @@ jobs:
             # all and the usual `python -m venv` line silently yields an
             # unusable environment. Bootstrap pip explicitly; `fetch` is in
             # the base system, and only the network hop is retried.
-            python3.14 -m venv --without-pip venv
+            runtime=python3.14
+            if [ "${{ matrix.arch }}" = amd64v3 ]; then
+              CFLAGS="-I/usr/local/include" LDFLAGS="-L/usr/local/lib" \
+                python3.14 docker/python_runtime.py --variant amd64v3 --prefix /tmp/cronstable-python-amd64v3
+              runtime=/tmp/cronstable-python-amd64v3/bin/python3
+              RUSTFLAGS="-C target-cpu=x86-64-v3"
+              export RUSTFLAGS
+            fi
+            "$runtime" -m venv --without-pip venv
             retry 5 fetch -o get-pip.py https://bootstrap.pypa.io/get-pip.py
             venv/bin/python get-pip.py
 
@@ -2271,7 +2337,7 @@ jobs:
             # rather than grepping `file`, whose prose differs between
             # versions and across arches.
             case "${{ matrix.arch }}" in
-              amd64) spec=elf:2:1:62 ;;    # 64-bit LE, EM_X86_64
+              amd64|amd64v3) spec=elf:2:1:62 ;;    # 64-bit LE, EM_X86_64
               arm64) spec=elf:2:1:183 ;;   # 64-bit LE, EM_AARCH64
             esac
             venv/bin/python .github/scripts/assert_arch.py dist/cronstable "$spec"
@@ -2318,8 +2384,12 @@ jobs:
   # breaks under a supervisor that rewrites argv[0].
   binaries-openbsd:
     needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, amd64v3]
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
       # setuptools_scm never walks history here, and its git file-finder (which
@@ -2340,7 +2410,7 @@ jobs:
           # Only NAMED host variables cross into the guest.
           envs: 'SETUPTOOLS_SCM_PRETEND_VERSION'
           prepare: |
-            pkg_add -I python%3.13 py3-pip libsodium py3-psutil py3-multidict py3-yarl py3-propcache py3-aiohappyeyeballs py3-jinja2 py3-uvloop rust openssl%3.5
+            pkg_add -I python%3.13 py3-pip libsodium py3-psutil py3-multidict py3-yarl py3-propcache py3-aiohappyeyeballs py3-jinja2 py3-uvloop rust openssl%3.5 gmake pkgconf libffi sqlite3 xz bzip2
           run: |
             set -eu
 
@@ -2359,6 +2429,15 @@ jobs:
             PIP="python3.13 -m pip"
             PY="python3.13"
             export PIP PY
+            if [ "${{ matrix.arch }}" = amd64v3 ]; then
+              CFLAGS="-I/usr/local/include" LDFLAGS="-L/usr/local/lib" \
+                python3.13 docker/python_runtime.py --variant amd64v3 --prefix /tmp/cronstable-python-amd64v3
+              PY=/tmp/cronstable-python-amd64v3/bin/python3
+              PIP="$PY -m pip"
+              PATH=/tmp/cronstable-python-amd64v3/bin:$PATH
+              RUSTFLAGS="-C target-cpu=x86-64-v3"
+              export PY PIP PATH RUSTFLAGS
+            fi
 
             # Deliberately NOT wrapped in retry: no OpenBSD wheel exists, so
             # this COMPILES the bootloader rather than downloading one, and
@@ -2430,14 +2509,14 @@ jobs:
             # image would otherwise pass every smoke above and ship a
             # mislabelled asset.
             $PY .github/scripts/assert_arch.py dist/cronstable elf:2:1:62
-            mv dist/cronstable dist/cronstable-openbsd-amd64
+            mv dist/cronstable dist/cronstable-openbsd-${{ matrix.arch }}
             # Keep the copyback to the artifact: PyInstaller's work tree is
             # hundreds of megabytes of rsync the host has no use for.
             rm -rf build
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: cronstable-openbsd-amd64
-          path: dist/cronstable-openbsd-amd64
+          name: cronstable-openbsd-${{ matrix.arch }}
+          path: dist/cronstable-openbsd-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
 
@@ -2450,8 +2529,12 @@ jobs:
   # library names PyInstaller cannot parse.
   binaries-netbsd:
     needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, amd64v3]
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
       # setuptools_scm never walks history here, and its git file-finder (which
@@ -2470,7 +2553,7 @@ jobs:
           # pkgin is not in NetBSD base and is not on this image; pkg_add from
           # base is the package manager here, with PKG_PATH already set.
           prepare: |
-            /usr/sbin/pkg_add python313 libsodium py313-psutil py313-multidict py313-yarl py313-propcache py313-aiohappyeyeballs py313-jinja2 py313-uvloop py313-orjson rust openssl
+            /usr/sbin/pkg_add python313 libsodium py313-psutil py313-multidict py313-yarl py313-propcache py313-aiohappyeyeballs py313-jinja2 py313-uvloop py313-orjson rust openssl gmake pkgconf libffi sqlite3 xz bzip2
           run: |
             set -eu
             . .github/scripts/retry.sh
@@ -2481,7 +2564,15 @@ jobs:
             # --system-site-packages on purpose: the pkg_add'd C extensions
             # above live in the system site-packages, and a plain venv would
             # hide exactly what that step exists to provide.
-            python3.13 -m venv --system-site-packages --without-pip venv
+            if [ "${{ matrix.arch }}" = amd64v3 ]; then
+              CFLAGS="-I/usr/pkg/include" LDFLAGS="-L/usr/pkg/lib -Wl,-R/usr/pkg/lib" \
+                python3.13 docker/python_runtime.py --variant amd64v3 --prefix /tmp/cronstable-python-amd64v3
+              /tmp/cronstable-python-amd64v3/bin/python3 -m venv --without-pip venv
+              RUSTFLAGS="-C target-cpu=x86-64-v3"
+              export RUSTFLAGS
+            else
+              python3.13 -m venv --system-site-packages --without-pip venv
+            fi
             retry 5 ftp -o get-pip.py https://bootstrap.pypa.io/get-pip.py
             venv/bin/python get-pip.py
 
@@ -2543,12 +2634,12 @@ jobs:
             fi
             # 64-bit, little-endian, EM_X86_64.
             $PY .github/scripts/assert_arch.py dist/cronstable elf:2:1:62
-            mv dist/cronstable dist/cronstable-netbsd-amd64
+            mv dist/cronstable dist/cronstable-netbsd-${{ matrix.arch }}
             rm -rf venv build get-pip.py
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: cronstable-netbsd-amd64
-          path: dist/cronstable-netbsd-amd64
+          name: cronstable-netbsd-${{ matrix.arch }}
+          path: dist/cronstable-netbsd-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
 
@@ -2565,6 +2656,10 @@ jobs:
   # is_unix, and bindepend.py has its own ldd branch for it.
   binaries-illumos:
     needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, amd64v3]
     runs-on: ubuntu-latest
     # The Rust compile of cryptography is the largest cost here; the VM is
     # host-native (KVM), so it is minutes rather than the hour QEMU takes.
@@ -2599,7 +2694,15 @@ jobs:
             # a working pip and needs no get-pip.py hop. (Do not copy the
             # FreeBSD lane's block here: it calls `fetch`, which does not exist
             # on illumos.)
-            python3.13 -m venv venv
+            runtime=python3.13
+            if [ "${{ matrix.arch }}" = amd64v3 ]; then
+              LDFLAGS="-L/usr/lib/amd64 -Wl,-R/usr/lib/amd64" \
+                python3.13 docker/python_runtime.py --variant amd64v3 --prefix /tmp/cronstable-python-amd64v3 --openssl /usr
+              runtime=/tmp/cronstable-python-amd64v3/bin/python3
+              RUSTFLAGS="-C target-cpu=x86-64-v3"
+              export RUSTFLAGS
+            fi
+            "$runtime" -m venv venv
 
             # install_extra.sh / install_orjson.sh read these.
             PIP="venv/bin/pip"
@@ -2658,12 +2761,12 @@ jobs:
             fi
             # 64-bit, little-endian, EM_X86_64.
             $PY .github/scripts/assert_arch.py dist/cronstable elf:2:1:62
-            mv dist/cronstable dist/cronstable-illumos-amd64
+            mv dist/cronstable dist/cronstable-illumos-${{ matrix.arch }}
             rm -rf venv build
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: cronstable-illumos-amd64
-          path: dist/cronstable-illumos-amd64
+          name: cronstable-illumos-${{ matrix.arch }}
+          path: dist/cronstable-illumos-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
 
@@ -2709,6 +2812,12 @@ jobs:
             # Every cryptography release ships win_amd64, so this row takes
             # the newest.
             pq: hard
+          - arch: amd64v3
+            runner: windows-latest
+            pyarch: ''
+            pfsuffix: ''
+            regflag: /reg:64
+            pq: hard
           - arch: arm64
             runner: windows-11-arm
             pyarch: ''
@@ -2751,6 +2860,13 @@ jobs:
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           version: "0.12.5"
+      - name: Build amd64v3 Python
+        if: matrix.arch == 'amd64v3'
+        id: runtime
+        shell: pwsh
+        run: |
+          python docker/python_runtime.py --variant amd64v3 --prefix "$env:RUNNER_TEMP/python-amd64v3"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -2766,7 +2882,7 @@ jobs:
           # bare version against everything it can discover, and the x64
           # 3.14 also present on that runner would satisfy it, silently
           # producing a 64-bit build under a 32-bit name.
-          uv venv --python "${{ steps.py.outputs.python-path }}"
+          uv venv --python "${{ steps.runtime.outputs.python-path || steps.py.outputs.python-path }}"
           uv pip install pyinstaller==6.22.1  # pin matches the Linux/macOS jobs
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle orjson (the `speedups` extra) for the durable-state / cluster
@@ -2846,7 +2962,7 @@ jobs:
           # Machine field rather than grepping `file`, whose prose differs
           # between versions and across these three arches.
           case "${{ matrix.arch }}" in
-            amd64) spec=pe:8664 ;;   # IMAGE_FILE_MACHINE_AMD64
+            amd64|amd64v3) spec=pe:8664 ;;   # IMAGE_FILE_MACHINE_AMD64
             arm64) spec=pe:aa64 ;;   # IMAGE_FILE_MACHINE_ARM64
             i686)  spec=pe:014c ;;   # IMAGE_FILE_MACHINE_I386
           esac
@@ -3450,6 +3566,7 @@ jobs:
           # layers instead of rebuilding them.
           build-args: |
             VERSION=${{ needs.version.outputs.new }}
+            PYTHON_VARIANT=${{ matrix.python_variant }}
             DEPS_REFRESH=${{ needs.version.outputs.release == 'true' && github.run_id || '' }}
           provenance: false
           # Scope the GHA cache per distro so the builds don't clobber each
@@ -3857,7 +3974,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out exes
-          for arch in amd64 arm64 i686; do
+          for arch in amd64 amd64v3 arm64 i686; do
             python -c "import zipfile; zipfile.ZipFile('signdir/cronstable-windows-${arch}.zip').extractall('work/${arch}')"
             test -f "work/${arch}/cronstable/cronstable.exe"
             cp "signdir/cronstable-windows-${arch}.exe" exes/
@@ -3891,6 +4008,16 @@ jobs:
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
           files-folder: ${{ github.workspace }}\work\amd64\cronstable
           files-folder-filter: exe
+      - name: Sign the amd64v3 payload exe
+        if: steps.decide.outputs.signed == 'true'
+        uses: ./.github/actions/sign-artifacts
+        with:
+          label: the amd64v3 payload exe
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\work\amd64v3\cronstable
+          files-folder-filter: exe
       - name: Sign the arm64 payload exe
         if: steps.decide.outputs.signed == 'true'
         uses: ./.github/actions/sign-artifacts
@@ -3918,7 +4045,7 @@ jobs:
           # Same shape the build lane produced: a single top-level
           # cronstable/ folder, so extracting into C:\Program Files
           # yields the documented path.
-          for arch in amd64 arm64 i686; do
+          for arch in amd64 amd64v3 arm64 i686; do
             python -c "import shutil; shutil.make_archive('out/cronstable-windows-${arch}', 'zip', root_dir='work/${arch}', base_dir='cronstable')"
             cp "exes/cronstable-windows-${arch}.exe" out/
           done
@@ -3933,7 +4060,7 @@ jobs:
           # cannot drift from the MSI the gate's msiexec smoke proved.
           # -arch is metadata, so this x64 runner builds the arm64
           # package too.
-          for arch in amd64 arm64 i686; do
+          for arch in amd64 amd64v3 arm64 i686; do
             sh .github/scripts/build_msi.sh "$arch" "$VERSION" \
               "work/${arch}/cronstable" "out/cronstable-windows-${arch}.msi"
           done
@@ -3960,8 +4087,8 @@ jobs:
         run: |
           $files = @(Get-ChildItem out -File | Where-Object Extension -ne '.zip') +
                    @(Get-ChildItem work\*\cronstable\*.exe -File)
-          if ($files.Count -lt 9) {
-            throw "expected at least 9 signed files (3 exes, 3 MSIs, 3 payload exes), found $($files.Count)"
+          if ($files.Count -lt 12) {
+            throw "expected at least 12 signed files (4 exes, 4 MSIs, 4 payload exes), found $($files.Count)"
           }
           foreach ($f in $files) {
             $sig = Get-AuthenticodeSignature $f.FullName
@@ -3980,12 +4107,14 @@ jobs:
         run: |
           set -euo pipefail
           . .github/scripts/msi_smoke.sh
-          msi="out/cronstable-windows-amd64.msi"
-          trap 'msi_uninstall "$msi" signed-cleanup.log >/dev/null 2>&1 || true' EXIT
-          msi_install "$msi" signed-install.log
-          sc query cronstable | grep -q 'STOPPED'
-          "/c/Program Files/cronstable/cronstable.exe" --version
-          msi_uninstall "$msi" signed-uninstall.log
+          for arch in amd64 amd64v3; do
+            msi="out/cronstable-windows-${arch}.msi"
+            trap 'msi_uninstall "$msi" signed-cleanup.log >/dev/null 2>&1 || true' EXIT
+            msi_install "$msi" signed-install.log
+            sc query cronstable | grep -q 'STOPPED'
+            "/c/Program Files/cronstable/cronstable.exe" --version
+            msi_uninstall "$msi" signed-uninstall.log
+          done
       - name: Upload the signed set
         if: steps.decide.outputs.signed == 'true'
         uses: actions/upload-artifact@v7.0.1
@@ -3998,12 +4127,15 @@ jobs:
           name: signed-windows
           path: |
             out/cronstable-windows-amd64.exe
+            out/cronstable-windows-amd64v3.exe
             out/cronstable-windows-arm64.exe
             out/cronstable-windows-i686.exe
             out/cronstable-windows-amd64.zip
+            out/cronstable-windows-amd64v3.zip
             out/cronstable-windows-arm64.zip
             out/cronstable-windows-i686.zip
             out/cronstable-windows-amd64.msi
+            out/cronstable-windows-amd64v3.msi
             out/cronstable-windows-arm64.msi
             out/cronstable-windows-i686.msi
           if-no-files-found: error
@@ -4128,7 +4260,7 @@ jobs:
       # emulation is involved and this needs no job of its own. It comes
       # AFTER the overlay and BEFORE the hashing so SHA256SUMS and the
       # Release describe the same files.
-      - name: Build .deb and .rpm packages
+      - name: Build .deb, .rpm and .apk packages
         run: bash .github/scripts/build_packages.sh "${{ needs.version.outputs.new }}" binaries
 
       # One SHA256SUMS over the dist + every SHIPPED binary (bare filenames, so
@@ -4141,38 +4273,52 @@ jobs:
           work="$(mktemp -d)"
           cp dist/*.whl dist/*.tar.gz \
              binaries/cronstable-linux-amd64 binaries/cronstable-linux-arm64 \
+             binaries/cronstable-linux-amd64v3 \
              binaries/cronstable-linux-i686 binaries/cronstable-linux-armv7 \
              binaries/cronstable-linux-armv6 binaries/cronstable-linux-armel \
              binaries/cronstable-linux-ppc64le binaries/cronstable-linux-s390x \
              binaries/cronstable-linux-riscv64 binaries/cronstable-linux-loong64 \
              binaries/cronstable-linux-mips64le \
              binaries/cronstable-linux-amd64-musl binaries/cronstable-linux-arm64-musl \
+             binaries/cronstable-linux-amd64v3-musl \
              binaries/cronstable-linux-i686-musl binaries/cronstable-linux-armv7-musl \
              binaries/cronstable-linux-armv6-musl binaries/cronstable-linux-loong64-musl \
              binaries/cronstable-linux-ppc64le-musl binaries/cronstable-linux-s390x-musl \
              binaries/cronstable-linux-riscv64-musl \
              binaries/cronstable-linux-amd64.deb binaries/cronstable-linux-arm64.deb \
+             binaries/cronstable-linux-amd64v3.deb \
              binaries/cronstable-linux-i686.deb binaries/cronstable-linux-armv7.deb \
              binaries/cronstable-linux-ppc64le.deb binaries/cronstable-linux-s390x.deb \
              binaries/cronstable-linux-riscv64.deb \
              binaries/cronstable-linux-amd64.rpm binaries/cronstable-linux-arm64.rpm \
+             binaries/cronstable-linux-amd64v3.rpm \
              binaries/cronstable-linux-i686.rpm binaries/cronstable-linux-armv7.rpm \
              binaries/cronstable-linux-ppc64le.rpm binaries/cronstable-linux-s390x.rpm \
              binaries/cronstable-linux-riscv64.rpm \
              binaries/cronstable-linux-amd64.apk binaries/cronstable-linux-arm64.apk \
+             binaries/cronstable-linux-amd64v3.apk \
              binaries/cronstable-linux-i686.apk binaries/cronstable-linux-armv7.apk \
              binaries/cronstable-linux-armv6.apk binaries/cronstable-linux-ppc64le.apk \
              binaries/cronstable-linux-s390x.apk binaries/cronstable-linux-riscv64.apk binaries/cronstable-linux-loong64.apk \
              binaries/cronstable-macos-amd64 binaries/cronstable-macos-arm64 \
+             binaries/cronstable-macos-amd64v3 \
              binaries/cronstable-freebsd-amd64 binaries/cronstable-freebsd-arm64 \
+             binaries/cronstable-freebsd-amd64v3 \
              binaries/cronstable-freebsd-amd64.pkg binaries/cronstable-freebsd-arm64.pkg \
+             binaries/cronstable-freebsd-amd64v3.pkg \
              binaries/cronstable-openbsd-amd64 binaries/cronstable-netbsd-amd64 \
+             binaries/cronstable-netbsd-amd64v3 \
+             binaries/cronstable-openbsd-amd64v3 \
              binaries/cronstable-illumos-amd64 \
+             binaries/cronstable-illumos-amd64v3 \
              binaries/cronstable-windows-amd64.exe binaries/cronstable-windows-arm64.exe \
+             binaries/cronstable-windows-amd64v3.exe \
              binaries/cronstable-windows-i686.exe \
              binaries/cronstable-windows-amd64.zip binaries/cronstable-windows-arm64.zip \
+             binaries/cronstable-windows-amd64v3.zip \
              binaries/cronstable-windows-i686.zip \
              binaries/cronstable-windows-amd64.msi binaries/cronstable-windows-arm64.msi \
+             binaries/cronstable-windows-amd64v3.msi \
              binaries/cronstable-windows-i686.msi \
              "$work"/
           ( cd "$work" && sha256sum -- * ) > SHA256SUMS
@@ -4301,6 +4447,7 @@ jobs:
             dist/*.whl
             dist/*.tar.gz
             binaries/cronstable-linux-amd64
+            binaries/cronstable-linux-amd64v3
             binaries/cronstable-linux-arm64
             binaries/cronstable-linux-i686
             binaries/cronstable-linux-armv7
@@ -4312,6 +4459,7 @@ jobs:
             binaries/cronstable-linux-loong64
             binaries/cronstable-linux-mips64le
             binaries/cronstable-linux-amd64-musl
+            binaries/cronstable-linux-amd64v3-musl
             binaries/cronstable-linux-arm64-musl
             binaries/cronstable-linux-i686-musl
             binaries/cronstable-linux-armv7-musl
@@ -4321,6 +4469,7 @@ jobs:
             binaries/cronstable-linux-s390x-musl
             binaries/cronstable-linux-riscv64-musl
             binaries/cronstable-linux-amd64.deb
+            binaries/cronstable-linux-amd64v3.deb
             binaries/cronstable-linux-arm64.deb
             binaries/cronstable-linux-i686.deb
             binaries/cronstable-linux-armv7.deb
@@ -4328,6 +4477,7 @@ jobs:
             binaries/cronstable-linux-s390x.deb
             binaries/cronstable-linux-riscv64.deb
             binaries/cronstable-linux-amd64.rpm
+            binaries/cronstable-linux-amd64v3.rpm
             binaries/cronstable-linux-arm64.rpm
             binaries/cronstable-linux-i686.rpm
             binaries/cronstable-linux-armv7.rpm
@@ -4335,6 +4485,7 @@ jobs:
             binaries/cronstable-linux-s390x.rpm
             binaries/cronstable-linux-riscv64.rpm
             binaries/cronstable-linux-amd64.apk
+            binaries/cronstable-linux-amd64v3.apk
             binaries/cronstable-linux-arm64.apk
             binaries/cronstable-linux-i686.apk
             binaries/cronstable-linux-armv7.apk
@@ -4344,21 +4495,30 @@ jobs:
             binaries/cronstable-linux-riscv64.apk
             binaries/cronstable-linux-loong64.apk
             binaries/cronstable-macos-amd64
+            binaries/cronstable-macos-amd64v3
             binaries/cronstable-macos-arm64
             binaries/cronstable-freebsd-amd64
+            binaries/cronstable-freebsd-amd64v3
             binaries/cronstable-freebsd-arm64
             binaries/cronstable-freebsd-amd64.pkg
+            binaries/cronstable-freebsd-amd64v3.pkg
             binaries/cronstable-freebsd-arm64.pkg
             binaries/cronstable-openbsd-amd64
+            binaries/cronstable-openbsd-amd64v3
             binaries/cronstable-netbsd-amd64
+            binaries/cronstable-netbsd-amd64v3
             binaries/cronstable-illumos-amd64
+            binaries/cronstable-illumos-amd64v3
             binaries/cronstable-windows-amd64.exe
+            binaries/cronstable-windows-amd64v3.exe
             binaries/cronstable-windows-arm64.exe
             binaries/cronstable-windows-i686.exe
             binaries/cronstable-windows-amd64.zip
+            binaries/cronstable-windows-amd64v3.zip
             binaries/cronstable-windows-arm64.zip
             binaries/cronstable-windows-i686.zip
             binaries/cronstable-windows-amd64.msi
+            binaries/cronstable-windows-amd64v3.msi
             binaries/cronstable-windows-arm64.msi
             binaries/cronstable-windows-i686.msi
 
@@ -4459,8 +4619,8 @@ jobs:
             type=raw,value=latest
             # Explicit -debian alias so the default base is pinnable by name too
             # (latest-debian / <version>-debian), mirroring the other variants.
-            type=raw,value=${{ needs.version.outputs.new }}-debian,enable=${{ matrix.distro == 'debian' }}
-            type=raw,value=latest-debian,enable=${{ matrix.distro == 'debian' }}
+            type=raw,value=${{ needs.version.outputs.new }}-debian,enable=${{ startsWith(matrix.distro, 'debian') }}
+            type=raw,value=latest-debian,enable=${{ startsWith(matrix.distro, 'debian') }}
 
       - name: Log in to GHCR
         uses: docker/login-action@v4.6.0
@@ -4494,6 +4654,7 @@ jobs:
           # in this same run are what get pushed, not older cached ones.
           build-args: |
             VERSION=${{ needs.version.outputs.new }}
+            PYTHON_VARIANT=${{ matrix.python_variant }}
             DEPS_REFRESH=${{ github.run_id }}
           provenance: false
           # Reuse the layers the gate `docker` job just cached (same per-distro

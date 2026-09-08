@@ -5,6 +5,7 @@
 #   PKG_ARCH     Alpine's own architecture name (x86_64, aarch64, x86, armv7,
 #                armhf, ppc64le, s390x, riscv64), passed straight through
 #   PKG_BINARY   path to the MUSL binary for that architecture
+#   PKG_CPU_NOTE CPU requirement for an opt-in variant; empty for baseline
 #
 # Separate from nfpm.yaml rather than an override, and for two reasons that both
 # ship broken packages if ignored:
@@ -31,6 +32,7 @@ description: |
   questions cron cannot: what runs next, why a job did not run, which schedules
   collide, and what happened on the last run. It has a dashboard, an HTTP API,
   durable run history, dependency graphs, clustering and reporting.
+  ${PKG_CPU_NOTE}
 homepage: https://github.com/ptweezy/cronstable
 license: MIT
 

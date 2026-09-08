@@ -24,13 +24,15 @@ Python package or as a self-contained executable. Use `i686` only on a
 | Architecture | pip / pipx | Standalone binary | Zip (one-directory) | MSI |
 | --- | --- | --- | --- | --- |
 | `amd64` (x64) | `pip install cronstable` | `cronstable-windows-amd64.exe` | `cronstable-windows-amd64.zip` | `cronstable-windows-amd64.msi` |
+| `amd64v3` (x64, v3 CPU) | Use the release binary for the optimized runtime | `cronstable-windows-amd64v3.exe` | `cronstable-windows-amd64v3.zip` | `cronstable-windows-amd64v3.msi` |
 | `arm64` (ARM64) | `pip install cronstable` | `cronstable-windows-arm64.exe` | `cronstable-windows-arm64.zip` | `cronstable-windows-arm64.msi` |
 | `i686` (32-bit x86) | `pip install cronstable` | `cronstable-windows-i686.exe` | `cronstable-windows-i686.zip` | `cronstable-windows-i686.msi` |
 
 The test suite runs on Windows (both x64 and ARM64) in CI on every commit. A
 small set of POSIX-only tests is skipped there, each with a stated reason: the
 tests for per-job user/group switching, privilege drop, POSIX signal delivery,
-and POSIX file modes. Every release builds all three Windows architectures.
+and POSIX file modes. Every release builds all three Windows architectures plus the optional amd64v3 variant.
+See [amd64v3 CPU requirements](Installation#amd64v3-cpu-requirements) before selecting it.
 See
 [contributing and releasing](Contributing-and-Releasing) for the build and
 release workflow.

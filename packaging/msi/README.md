@@ -1,5 +1,9 @@
 # Building the cronstable MSI
 
+The optional `cronstable-windows-amd64v3.msi` uses an optimized embedded Python
+runtime and requires an x86-64-v3-capable CPU. It is an x64 alternative to the
+baseline MSI, with the same service, install paths and upgrade identity.
+
 The MSI carries a PyInstaller one-directory build and registers the Windows
 service. CI builds it in the `binaries-windows` job of
 `.github/workflows/release.yml`; to build one locally:

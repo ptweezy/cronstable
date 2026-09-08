@@ -16,7 +16,7 @@ Windows-specific details, see [running on Windows](Running-on-Windows).
 | --- | --- |
 | Python (pip/pipx) | `>= 3.10` (`requires-python = ">=3.10"`). Versions 3.10, 3.11, 3.12, 3.13, and 3.14 are supported and tested. For an older Python, use the standalone binary instead. |
 | Operating system | Linux, macOS, and Windows. `cronstable/platform.py` isolates OS-specific behavior. `grp` and `pwd` are imported only on POSIX. A few features differ on Windows; see [running on Windows](Running-on-Windows). |
-| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), for both the container image and the prebuilt binaries. The prebuilt binaries also cover `armv6` and `riscv64` and `loong64` (LoongArch) in both libcs, plus `mips64le` and `armel` (glibc). macOS: `amd64` and `arm64`. Windows: `amd64` (x64), `arm64` (ARM64) and `i686`. Also FreeBSD (`amd64`, `arm64`), OpenBSD, NetBSD and illumos (`amd64`). |
+| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), for both the container image and the prebuilt binaries. The prebuilt binaries also cover `armv6` and `riscv64` and `loong64` (LoongArch) in both libcs, plus `mips64le` and `armel` (glibc). macOS: `amd64` and `arm64`. Windows: `amd64` (x64), `arm64` (ARM64) and `i686`. Also FreeBSD (`amd64`, `arm64`), OpenBSD, NetBSD and illumos (`amd64`). Every amd64 release binary/package and Docker distro has an opt-in `amd64v3` counterpart; see [CPU requirements](#amd64v3-cpu-requirements). |
 
 Python is required only for the `pip`/`pipx` installs. The container image
 bundles its own interpreter, and the standalone binaries embed Python, so
@@ -223,7 +223,7 @@ whichever architecture you are on. Upgrade later with `scoop update cronstable`.
 
 ## Install using a .deb or .rpm package
 
-Releases attach a Debian package and an RPM for `amd64`, `arm64`, `i686`,
+Releases attach a Debian package and an RPM for `amd64`, `amd64v3`, `arm64`, `i686`,
 `armv7`, `ppc64le`, `s390x` and `riscv64`. Each installs the same self-contained
 binary as `/usr/bin/cronstable`, plus a systemd unit and a starter
 configuration:
@@ -304,7 +304,7 @@ built on the same musl base.
 
 ## Install using a FreeBSD package
 
-Releases attach a `.pkg` for amd64 and arm64, built by FreeBSD's own `pkg` in a
+Releases attach a `.pkg` for amd64, amd64v3 and arm64, built by FreeBSD's own `pkg` in a
 FreeBSD 14 virtual machine and installed there as part of the build:
 
 | Path | Contents |
@@ -372,6 +372,7 @@ assets, each built for its own platform and architecture:
 | Asset | Platform | libc / arch | Notes |
 | --- | --- | --- | --- |
 | `cronstable-linux-amd64` | Linux | glibc, x86_64 | glibc 2.17 or newer: RHEL, Alma and Rocky 7 onward, Debian 8 onward, Ubuntu 14.04 onward, Amazon Linux 2 and 2023, SLES 12 onward. |
+| `cronstable-linux-amd64v3` | Linux | glibc, x86_64 / v3 | Requires an x86-64-v3 CPU; otherwise the same format and OS requirement as the amd64 row. |
 | `cronstable-linux-arm64` | Linux | glibc, arm64 | glibc 2.17 or newer on arm64. |
 | `cronstable-linux-i686` | Linux | glibc, 32-bit x86 | 32-bit x86 (i686), glibc 2.36 or newer: Debian 12 i386 onward. |
 | `cronstable-linux-armv7` | Linux | glibc, 32-bit ARM | 32-bit ARM (armv7), glibc 2.31 or newer: Raspberry Pi OS bullseye, Debian 11, Ubuntu 20.04 onward. Raspberry Pi 2 and newer. |
@@ -383,6 +384,7 @@ assets, each built for its own platform and architecture:
 | `cronstable-linux-loong64` | Linux | glibc, loongarch64 | LoongArch, glibc 2.41 or newer. New-world ABI only; the older Loongnix, Kylin and UOS fleets run a different, incompatible ABI. |
 | `cronstable-linux-mips64le` | Linux | glibc, mips64el | 64-bit little-endian MIPS, glibc 2.36 or newer, such as Loongson and Cavium Octeon hardware. |
 | `cronstable-linux-amd64-musl` | Linux | musl, x86_64 | For Alpine and other musl hosts. |
+| `cronstable-linux-amd64v3-musl` | Linux | musl, x86_64 / v3 | Requires an x86-64-v3 CPU; otherwise the same format and OS requirement as the amd64 row. |
 | `cronstable-linux-arm64-musl` | Linux | musl, arm64 | For Alpine and other musl hosts. |
 | `cronstable-linux-i686-musl` | Linux | musl, 32-bit x86 | 32-bit x86 (i686) for Alpine and other musl hosts. |
 | `cronstable-linux-armv7-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv7) for Alpine and other musl hosts. |
@@ -391,26 +393,74 @@ assets, each built for its own platform and architecture:
 | `cronstable-linux-riscv64-musl` | Linux | musl, riscv64 | 64-bit RISC-V for Alpine and other musl hosts. |
 | `cronstable-linux-armv6-musl` | Linux | musl, 32-bit ARM | ARMv6 hard-float for Alpine on that hardware. On Raspberry Pi OS use the glibc `armv6` build instead. |
 | `cronstable-linux-loong64-musl` | Linux | musl, loongarch64 | LoongArch for Alpine and other musl hosts. New-world ABI only. |
-| `cronstable-linux-<arch>.deb` | Linux | glibc | Debian package for `amd64`, `arm64`, `i686`, `armv7`, `ppc64le`, `s390x` and `riscv64`. Installs the binary, a systemd unit and `/etc/cronstable.d`. |
-| `cronstable-linux-<arch>.rpm` | Linux | glibc | RPM package for the same seven architectures, with the same contents. |
-| `cronstable-linux-<arch>.apk` | Linux | musl | Alpine package for `amd64`, `arm64`, `i686`, `armv7`, `armv6`, `ppc64le`, `s390x`, `riscv64` and `loong64`. Installs the binary, an OpenRC service and `/etc/cronstable.d`. |
+| `cronstable-linux-<arch>.deb` | Linux | glibc | Debian package for `amd64`, `amd64v3`, `arm64`, `i686`, `armv7`, `ppc64le`, `s390x` and `riscv64`. Installs the binary, a systemd unit and `/etc/cronstable.d`. |
+| `cronstable-linux-<arch>.rpm` | Linux | glibc | RPM package for the same eight variants, with the same contents. |
+| `cronstable-linux-<arch>.apk` | Linux | musl | Alpine package for `amd64`, `amd64v3`, `arm64`, `i686`, `armv7`, `armv6`, `ppc64le`, `s390x`, `riscv64` and `loong64`. Installs the binary, an OpenRC service and `/etc/cronstable.d`. |
 | `cronstable-macos-arm64` | macOS | Apple Silicon (arm64) | Developer ID signed and notarized. |
 | `cronstable-macos-amd64` | macOS | Intel (x86_64) | Developer ID signed and notarized. |
+| `cronstable-macos-amd64v3` | macOS | Intel (x86_64) / v3 | Requires an x86-64-v3 CPU; otherwise the same format and OS requirement as the amd64 row. |
 | `cronstable-freebsd-amd64` | FreeBSD | x86_64 | For FreeBSD 14 and 15 hosts, including TrueNAS, pfSense and OPNsense. |
+| `cronstable-freebsd-amd64v3` | FreeBSD | x86_64 / v3 | Requires an x86-64-v3 CPU; otherwise the same format and OS requirement as the amd64 row. |
 | `cronstable-freebsd-arm64` | FreeBSD | arm64 | For FreeBSD 14 and 15 hosts on arm64. |
-| `cronstable-freebsd-<arch>.pkg` | FreeBSD | amd64, arm64 | FreeBSD package. Installs the binary, an `rc.d` script and `/usr/local/etc/cronstable.d`. |
+| `cronstable-freebsd-<arch>.pkg` | FreeBSD | amd64, amd64v3, arm64 | FreeBSD package. Installs the binary, an `rc.d` script and `/usr/local/etc/cronstable.d`. |
 | `cronstable-openbsd-amd64` | OpenBSD | x86_64 | For OpenBSD 7.9. OpenBSD gives no cross-release ABI guarantee, so this asset tracks one release. |
+| `cronstable-openbsd-amd64v3` | OpenBSD | x86_64 / v3 | Requires an x86-64-v3 CPU; otherwise the same format and OS requirement as the amd64 row. |
 | `cronstable-netbsd-amd64` | NetBSD | x86_64 | For NetBSD 11.0. |
+| `cronstable-netbsd-amd64v3` | NetBSD | x86_64 / v3 | Requires an x86-64-v3 CPU; otherwise the same format and OS requirement as the amd64 row. |
 | `cronstable-illumos-amd64` | illumos | x86_64 | Built on OmniOS r151054 LTS; the illumos ABI is shared, so it also runs on OpenIndiana and in SmartOS zones. |
+| `cronstable-illumos-amd64v3` | illumos | x86_64 / v3 | Requires an x86-64-v3 CPU; otherwise the same format and OS requirement as the amd64 row. |
 | `cronstable-windows-amd64.exe` | Windows | x64 (amd64) | Self-contained `.exe`. The target needs no Python. |
+| `cronstable-windows-amd64v3.exe` | Windows | x64 (amd64) / v3 | Requires an x86-64-v3 CPU; otherwise the same format and OS requirement as the amd64 row. |
 | `cronstable-windows-arm64.exe` | Windows | ARM64 | Self-contained `.exe`. The target needs no Python. |
 | `cronstable-windows-i686.exe` | Windows | 32-bit x86 | Self-contained `.exe` for 32-bit Windows. |
 | `cronstable-windows-amd64.zip` | Windows | x64 (amd64) | One-directory build: a `cronstable\` folder with `cronstable.exe` and `_internal\`. Runs in place and can host the [Windows service](Windows-Service). |
+| `cronstable-windows-amd64v3.zip` | Windows | x64 (amd64) / v3 | Requires an x86-64-v3 CPU; otherwise the same format and OS requirement as the amd64 row. |
 | `cronstable-windows-arm64.zip` | Windows | ARM64 | One-directory build. Runs in place and can host the [Windows service](Windows-Service). |
 | `cronstable-windows-i686.zip` | Windows | 32-bit x86 | One-directory build. Runs in place and can host the [Windows service](Windows-Service). |
 | `cronstable-windows-amd64.msi` | Windows | x64 (amd64) | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
+| `cronstable-windows-amd64v3.msi` | Windows | x64 (amd64) / v3 | Requires an x86-64-v3 CPU; otherwise the same format and OS requirement as the amd64 row. |
 | `cronstable-windows-arm64.msi` | Windows | ARM64 | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
 | `cronstable-windows-i686.msi` | Windows | 32-bit x86 | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
+
+### amd64v3 CPU requirements
+
+`amd64v3` means the **x86-64-v3 microarchitecture level**, not a different
+operating-system ABI. It requires the complete v3 feature set, including AVX,
+AVX2, BMI1/BMI2, F16C, FMA, LZCNT and MOVBE, with OS support for AVX register
+state. Typical compatible CPUs include Intel Haswell and newer Core/Xeon
+models and AMD Excavator/Zen, but model age or AVX2 alone is not a complete
+compatibility check. Virtual machines must expose those features to the guest.
+The [upstream runtime documentation](https://github.com/astral-sh/python-build-standalone/blob/main/docs/running.rst)
+explains the CPU levels. An incompatible CPU can terminate the binary with an
+illegal-instruction error; choose baseline `amd64` when unsure.
+
+Every amd64 release format has an opt-in counterpart: replace `amd64` with
+`amd64v3` in the asset name, keeping its suffix. Examples are
+`cronstable-linux-amd64v3`, `cronstable-linux-amd64v3-musl`,
+`cronstable-linux-amd64v3.deb`, `cronstable-freebsd-amd64v3.pkg` and
+`cronstable-windows-amd64v3.msi`. The `.rpm`, `.apk`, Windows `.exe`/`.zip`,
+and macOS, OpenBSD, NetBSD and illumos binaries follow the same rule.
+The macOS source build targets macOS 15 and newer.
+
+The Linux packages still declare `amd64`/`x86_64`, FreeBSD retains its native
+ABI and the Windows MSI remains x64. Package managers do not enforce the CPU
+requirement. These are alternative builds of the same `cronstable` package,
+with the same install paths and services; choose one variant per installation.
+Homebrew, Scoop and winget keep their baseline downloads.
+
+The optimized component is the embedded CPython runtime. Linux uses pinned
+python-build-standalone v3 builds; the other operating systems compile CPython
+with a v3 target (MSVC AVX2 on Windows). Compatible dependency wheels retain
+their upstream build settings. This is not a promise that every bundled library
+is rebuilt for v3 or that every workload becomes faster.
+
+All eight Docker distros publish separate v3 tags: `latest-amd64v3` (Debian),
+`latest-debian-amd64v3`, and `latest-<distro>-amd64v3` for the other distros.
+Replace `latest` with the release version to pin one. They use the normal
+`linux/amd64` container platform and require a compatible host CPU. The bare
+`latest` and existing distro tags keep their current platform coverage.
+To build locally, add `--platform linux/amd64 --build-arg PYTHON_VARIANT=amd64v3`
+to the selected Dockerfile's build command.
 
 ### Which libc version each build needs
 
@@ -419,7 +469,7 @@ whether it starts is the oldest glibc or musl it accepts. Each build declares
 that number, and CI re-derives it from the frozen bytes on every release, so the
 table above is measured rather than estimated.
 
-`amd64`, `arm64`, and `s390x` need glibc 2.17, which reaches every glibc
+`amd64`, `amd64v3`, `arm64`, and `s390x` need glibc 2.17, which reaches every glibc
 distribution still in production, including the RHEL family from 7 onward
 and Amazon Linux 2. They are built inside manylinux2014 containers against a
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)

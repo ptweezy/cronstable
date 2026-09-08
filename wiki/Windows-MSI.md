@@ -1,5 +1,9 @@
 # Windows MSI
 
+The optional `cronstable-windows-amd64v3.msi` uses an optimized embedded Python
+runtime and requires an x86-64-v3-capable CPU. It is an x64 alternative to the
+baseline MSI, with the same service, install paths and upgrade identity.
+
 Every release attaches `cronstable-windows-amd64.msi` and
 `cronstable-windows-arm64.msi`: per-machine Windows Installer packages for
 managed deployment through GPO, Intune, SCCM, or a plain elevated
