@@ -29,16 +29,6 @@ curl http://localhost:8080/jobs/nightly-backup/calendar.ics
 
 Disabled jobs and `@reboot` jobs never become events (neither has upcoming scheduled fires). A job with no timetable renders as a valid, empty calendar rather than an error.
 
-Each export has a total limit of 10,000 events and 4 MiB of UTF-8 calendar text.
-An export that exceeds either limit returns `422` with a JSON error. Reduce
-`days` or `per_job`, or subscribe to individual jobs to keep each feed within
-the limits.
-
-The daemon renders at most two calendar exports at a time across both endpoints.
-A request arriving while both slots are occupied returns `503` with
-`Retry-After: 1`. Disconnecting a client leaves its slot occupied until its
-render finishes.
-
 ## What an event carries
 
 - **`DTSTART` in UTC** (`...Z` form). The fire instants are real instants. The calendar client localizes them, and no `VTIMEZONE` blocks need shipping.

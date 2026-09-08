@@ -13,7 +13,6 @@ real :class:`~cronstable.state.FilesystemStateBackend` in a temp dir like
 import asyncio
 import datetime
 import json
-import threading
 import types
 
 import pytest
@@ -1004,7 +1003,6 @@ async def test_job_calendar_endpoint_and_404():
     assert resp.text.count("BEGIN:VEVENT") >= 1
     with pytest.raises(web.HTTPNotFound):
         await cron._web_job_calendar(Req(match={"name": "nope"}))
-    assert cron._calendar_renders == 0
 
 
 async def test_calendar_query_params_are_clamped():
@@ -1014,117 +1012,6 @@ async def test_calendar_query_params_are_clamped():
         Req(query={"days": "junk", "per_job": "999999"})
     )
     assert resp.status == 200
-
-
-@pytest.mark.parametrize("budget", [{"max_events": 1}, {"max_bytes": 200}])
-async def test_calendar_endpoint_reports_budget_failure(monkeypatch, budget):
-    from functools import partial
-
-    from cronstable import cron as cron_module
-
-    cron = _cron(_FLEET_YAML)
-    monkeypatch.setattr(
-        cron_module,
-        "render_calendar",
-        partial(cron_module.render_calendar, **budget),
-    )
-    with pytest.raises(web.HTTPUnprocessableEntity) as error:
-        await cron._web_calendar(Req())
-    assert (
-        "Reduce days or limit, or export one job"
-        in json.loads(error.value.text)["error"]
-    )
-    assert cron._calendar_renders == 0
-
-
-async def test_calendar_admission_survives_request_cancellation(monkeypatch):
-    from cronstable.ical import CalendarLimitError
-
-    cron = _cron(_CAL_YAML)
-    loop = asyncio.get_running_loop()
-    logged = []
-    previous_handler = loop.get_exception_handler()
-    loop.set_exception_handler(lambda _loop, context: logged.append(context))
-    started = [asyncio.Event(), asyncio.Event()]
-    release = [threading.Event(), threading.Event()]
-    freed = asyncio.Queue()
-    snapshots = []
-    original_entries = cron._calendar_entries
-    original_done = cron._calendar_render_done
-
-    def snapshot(name):
-        snapshots.append(name)
-        return original_entries(name)
-
-    def finished(pending, completed):
-        original_done(pending, completed)
-        freed.put_nowait(pending)
-
-    def render(name, *args, **kwargs):
-        index = 0 if name is None else 1
-        loop.call_soon_threadsafe(started[index].set)
-        if not release[index].wait(5):
-            raise TimeoutError("test worker was not released")
-        if index == 0:
-            raise CalendarLimitError("Calendar exceeds its byte budget")
-        return "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"
-
-    monkeypatch.setattr(cron, "_calendar_entries", snapshot)
-    monkeypatch.setattr(cron, "_calendar_render_done", finished)
-    monkeypatch.setattr(cron, "calendar_payload", render)
-    tasks = [
-        asyncio.create_task(cron._web_calendar(Req())),
-        asyncio.create_task(
-            cron._web_job_calendar(Req(match={"name": "monthly-close"}))
-        ),
-    ]
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(*(event.wait() for event in started)), timeout=2
-        )
-        tasks[0].cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await tasks[0]
-        assert cron._calendar_renders == 2
-        for name in (None, "monthly-close"):
-            with pytest.raises(web.HTTPServiceUnavailable) as error:
-                await cron._web_calendar_response(name, Req())
-            assert error.value.headers["Retry-After"] == "1"
-            assert "busy" in json.loads(error.value.text)["error"]
-        assert snapshots == [None, "monthly-close"]
-
-        release[0].set()
-        pending = await asyncio.wait_for(freed.get(), timeout=2)
-        assert isinstance(pending.exception(), CalendarLimitError)
-        assert logged == []
-        assert cron._calendar_renders == 1
-        monkeypatch.setattr(
-            cron,
-            "calendar_payload",
-            lambda *a, **kw: "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n",
-        )
-        assert (await cron._web_calendar(Req())).status == 200
-        assert snapshots == [None, "monthly-close", None]
-        release[1].set()
-        assert (await asyncio.wait_for(tasks[1], timeout=2)).status == 200
-        assert cron._calendar_renders == 0
-    finally:
-        for event in release:
-            event.set()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        loop.set_exception_handler(previous_handler)
-
-
-async def test_calendar_snapshot_failure_releases_admission(monkeypatch):
-    cron = _cron(_CAL_YAML)
-
-    def fail(name):
-        raise RuntimeError("snapshot failed")
-
-    monkeypatch.setattr(cron, "_calendar_entries", fail)
-    with pytest.raises(RuntimeError, match="snapshot failed"):
-        await cron._web_calendar(Req())
-    assert cron._calendar_renders == 0
 
 
 # ---------------------------------------------------------------------------

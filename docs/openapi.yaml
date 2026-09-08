@@ -920,8 +920,6 @@ paths:
             text/calendar:
               schema: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "422": { $ref: "#/components/responses/CalendarLimitExceeded" }
-        "503": { $ref: "#/components/responses/CalendarBusy" }
 
   /jobs/{name}/calendar.ics:
     get:
@@ -954,8 +952,6 @@ paths:
               schema: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "422": { $ref: "#/components/responses/CalendarLimitExceeded" }
-        "503": { $ref: "#/components/responses/CalendarBusy" }
 
   /state:
     get:
@@ -1468,22 +1464,6 @@ components:
       schema: { type: string }
 
   responses:
-    CalendarLimitExceeded:
-      description: >-
-        The export exceeds 10,000 events or 4 MiB of UTF-8 calendar text.
-        Reduce `days` or `limit`, or request an individual job's feed.
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-    CalendarBusy:
-      description: Both calendar render slots are occupied. Retry later.
-      headers:
-        Retry-After:
-          description: Delay before retrying, in seconds.
-          schema: { type: integer, enum: [1] }
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
     Unauthorized:
       description: >-
         Missing or unrecognised bearer token (when `web.authToken` or any

@@ -96,9 +96,6 @@
 - A failed cluster peer poll removes the peer from agreement, including
   failures while parsing telemetry. Invalid telemetry fields are discarded
   while the peer's membership observation is processed.
-- Calendar exports are limited to 10,000 events and 4 MiB of UTF-8 text.
-  An export over either limit returns `422`. The daemon admits two renders
-  at a time; further requests receive `503` with `Retry-After: 1`.
 
 ## 1.2.49
 
