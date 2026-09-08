@@ -189,28 +189,35 @@ With the secrets present, a signing failure that survives three attempts fails t
 
 ### WinGet submission and Defender failures
 
-Configure Windows signing before you submit a release to WinGet. The `winget`
-job requires signed artifacts, including when you publish an unsigned emergency
-release. It downloads the published amd64 and arm64 MSIs and `SHA256SUMS`,
-verifies their hashes and timestamped Authenticode signatures, and updates
-Microsoft Defender's signatures before scanning each MSI and its extracted
-payload. WiX extracts both architectures as data and uses the build script's
-version pin. The inner `cronstable.exe` also requires a valid timestamped
-signature.
+Configure Windows signing before you submit a release to WinGet. On signed
+releases, `sign-windows` validates the amd64 and arm64 MSIs as soon as the
+Windows builds and signing finish, while the other platform builds run. It
+records the signed files' SHA256 hashes, verifies their timestamped Authenticode
+signatures, and updates Microsoft Defender's signatures before scanning each
+MSI and its extracted payload. WiX extracts both architectures as data and uses
+the build script's version pin. The inner `cronstable.exe` also requires a valid
+timestamped signature.
 
 The scan uses `-DisableRemediation` to preserve detected files for inspection.
 Detections fail the job. Missing Defender, a signature update failure, or a scan
-error also blocks submission. These checks run after GitHub Release publication;
-the published release stays available if WinGet validation fails. The build and
-signing jobs test MSI installation and uninstallation.
+error also fails the signing job and blocks release publication. The other
+build jobs continue independently. The build and signing jobs test MSI
+installation and uninstallation.
 
 The manifest renderer reads `ProductCode`, `UpgradeCode`, display version,
 publisher, and architecture from the MSIs. It sets the installer type to `wix`
-and the scope to `machine` independently of the manifest in winget-pkgs. The job
-runs `winget validate` before `wingetcreate submit`. After submission succeeds,
-cleanup closes the submitting account's unapproved PRs for lower versions.
-You can find scan and extraction logs, MSI metadata, and generated manifests in
-the `winget-validation` Actions artifact for 14 days, including on failure.
+and the scope to `machine` independently of the manifest in winget-pkgs.
+`sign-windows` runs `winget validate` and saves the manifests with the scan
+metadata. You can find these files and the scan and extraction logs in the
+`winget-validation` Actions artifact for 14 days, including on failure.
+
+After publication, the `winget` job downloads the release MSIs and `SHA256SUMS`
+and verifies that both match the scanned hashes. It submits the validated
+manifests with `wingetcreate submit`. After submission succeeds, cleanup closes
+the submitting account's unapproved PRs for lower versions. Release downloads,
+GitHub submission, and Microsoft's upstream validation depend on published
+assets and run at this stage. An unsigned emergency release skips the signing
+checks, and the `winget` job rejects submission because it requires signed MSIs.
 
 Defender can flag a signed MSI or its payload. If validation fails, follow the
 [Microsoft validation guide](https://github.com/microsoft/winget-pkgs/blob/master/doc/ValidationFailureGuide.md).

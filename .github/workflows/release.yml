@@ -4118,6 +4118,57 @@ jobs:
             "/c/Program Files/cronstable/cronstable.exe" --version
             msi_uninstall "$msi" signed-uninstall.log
           done
+      # Validate WinGet artifacts while the other platform builds run.
+      # A failure blocks publication through release's sign-windows dependency.
+      - name: Prepare winget checksums
+        if: steps.decide.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum cronstable-windows-amd64.msi cronstable-windows-arm64.msi > SHA256SUMS
+      - name: Verify and Defender-scan winget installers
+        if: steps.decide.outputs.signed == 'true'
+        timeout-minutes: 20
+        shell: pwsh
+        run: ./.github/scripts/prepare_winget.ps1 -AssetDirectory out -OutputDirectory winget-validation -WixCommand "$env:USERPROFILE/.dotnet/tools/wix.exe"
+      - name: Generate winget manifests
+        if: steps.decide.outputs.signed == 'true'
+        env:
+          VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          python -m pip install strictyaml==1.7.3
+          python .github/scripts/render_winget.py "$VERSION" winget-validation/metadata.json winget-manifests
+      - name: Validate with the winget client
+        if: steps.decide.outputs.signed == 'true'
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+            Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser
+            Repair-WinGetPackageManager
+          }
+          $client = Get-Command winget.exe -ErrorAction SilentlyContinue
+          if ($client) {
+            & $client.Source validate --manifest winget-manifests --disable-interactivity
+          } else {
+            $package = Get-AppxPackage Microsoft.DesktopAppInstaller
+            & (Join-Path $package.InstallLocation 'winget.exe') validate --manifest winget-manifests --disable-interactivity
+          }
+          if ($LASTEXITCODE -ne 0) { throw "winget validate failed ($LASTEXITCODE)" }
+      - name: Preserve winget validation evidence
+        if: always() && steps.decide.outputs.signed == 'true'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: winget-validation
+          path: |
+            winget-validation/*.log
+            winget-validation/*.wxs
+            winget-validation/metadata.json
+            winget-manifests/*.yaml
+          if-no-files-found: warn
+          retention-days: 14
       - name: Upload the signed set
         if: steps.decide.outputs.signed == 'true'
         uses: actions/upload-artifact@v7.0.1
@@ -4743,8 +4794,8 @@ jobs:
           git push
 
   # Submit the ptweezy.cronstable manifest to microsoft/winget-pkgs for each
-  # release. Generate manifests from the published signed MSIs and scan the
-  # installers and their payloads with Defender before submitting them.
+  # release. Use the manifests validated by sign-windows and verify that the
+  # published installer hashes match the scanned files before submission.
   #
   # WINGET_TOKEN is a classic PAT with public_repo scope. Its account creates
   # the fork and PRs. After submission succeeds, cleanup closes that account's
@@ -4779,50 +4830,17 @@ jobs:
             --dir winget-assets --pattern SHA256SUMS \
             --pattern cronstable-windows-amd64.msi \
             --pattern cronstable-windows-arm64.msi
-      - name: Install the MSI extractor
-        run: |
-          set -euo pipefail
-          wix_version="$(sed -n 's/^WIX_TOOL_VERSION=//p' .github/scripts/build_msi.sh)"
-          test -n "$wix_version"
-          dotnet tool install wix --tool-path .winget-tools --version "$wix_version"
-      - name: Verify and Defender-scan winget installers
-        shell: pwsh
-        run: ./.github/scripts/prepare_winget.ps1 -AssetDirectory winget-assets -OutputDirectory winget-validation -WixCommand ./.winget-tools/wix.exe
-      - name: Generate and validate winget manifests
+      - name: Download validated winget manifests
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: winget-validation
+          path: .
+      - name: Verify published winget installers match the scanned files
         env:
           VERSION: ${{ needs.version.outputs.new }}
         run: |
           set -euo pipefail
-          python -m pip install strictyaml==1.7.3
-          python .github/scripts/render_winget.py "$VERSION" winget-validation/metadata.json winget-manifests
-      - name: Validate with the winget client
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
-            Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser
-            Repair-WinGetPackageManager
-          }
-          $client = Get-Command winget.exe -ErrorAction SilentlyContinue
-          if ($client) {
-            & $client.Source validate --manifest winget-manifests --disable-interactivity
-          } else {
-            $package = Get-AppxPackage Microsoft.DesktopAppInstaller
-            & (Join-Path $package.InstallLocation 'winget.exe') validate --manifest winget-manifests --disable-interactivity
-          }
-          if ($LASTEXITCODE -ne 0) { throw "winget validate failed ($LASTEXITCODE)" }
-      - name: Preserve winget validation evidence
-        if: always()
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: winget-validation
-          path: |
-            winget-validation/*.log
-            winget-validation/*.wxs
-            winget-validation/metadata.json
-            winget-manifests/*.yaml
-          if-no-files-found: warn
-          retention-days: 14
+          python .github/scripts/verify_winget_release.py "$VERSION" winget-validation/metadata.json winget-assets
       - name: Submit winget manifest
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}

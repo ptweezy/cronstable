@@ -1,4 +1,4 @@
-"""Render MSI manifests from metadata read from the published installers.
+"""Render MSI manifests from metadata read from the signed installers.
 
 The renderer sets the installer type and scope independently of the manifest
 in winget-pkgs. Product codes and hashes come from the release MSIs.

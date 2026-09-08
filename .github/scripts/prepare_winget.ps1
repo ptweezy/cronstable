@@ -46,7 +46,7 @@ try {
         $path = Join-Path $assets $name
         $hash = (Get-FileHash $path -Algorithm SHA256).Hash
         if (-not $sums.ContainsKey($name) -or $sums[$name] -ne $hash) {
-            throw "Published SHA256SUMS mismatch: $name"
+            throw "SHA256SUMS mismatch: $name"
         }
         $signature = Get-AuthenticodeSignature $path
         if ($signature.Status -ne 'Valid' -or -not $signature.TimeStamperCertificate) {
