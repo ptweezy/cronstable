@@ -45,8 +45,8 @@ name: CI
 # On a release, once EVERY build + test job above has succeeded (the gate),
 # and ONLY then, the pipeline publishes: the wheel + sdist to PyPI via Trusted
 # Publishing (OIDC, skip-existing so a retry is a no-op), tags the commit
-# (RELEASE_TOKEN so the tag can point at a commit that touches
-# .github/workflows/), cuts a GitHub Release with ALL prebuilt binaries + a
+# (using optional RELEASE_TOKEN or the job GITHUB_TOKEN), cuts a GitHub
+# Release with ALL prebuilt binaries + a
 # single SHA256SUMS, pushes every Docker image, and updates the Homebrew tap.
 # Build, packaging, manifest and checksum validation finish before publication.
 # External publishing services can still fail; PyPI precedes tag creation so a
@@ -4602,21 +4602,15 @@ jobs:
             exit 1
           fi
           git tag -a "$NEW" -m "Release $NEW"
-          # The default GITHUB_TOKEN is the GitHub Actions *App*, and GitHub
-          # forbids an App from pushing a ref that creates/updates any file under
-          # .github/workflows/ unless the token carries the `workflows` scope --
-          # which is NOT grantable to GITHUB_TOKEN. This release tag points at a
-          # commit that may itself modify this workflow, so pushing it with
-          # GITHUB_TOKEN is rejected. Push instead with RELEASE_TOKEN -- a PAT or
-          # GitHub App token with `workflow` scope (fine-grained: Contents +
-          # Workflows: write) -- exactly like the cross-repo Homebrew push uses
-          # HOMEBREW_TAP_TOKEN. If it is unset we fall back to GITHUB_TOKEN with a
-          # warning (works only when the tagged commit doesn't touch
-          # .github/workflows/).
+          # RELEASE_TOKEN is an optional override. Ordinary main releases use
+          # the job's contents:write GITHUB_TOKEN, as release 1.2.50 did.
+          # Additional workflow authorization can be required for target commits
+          # with workflow changes relative to the default branch; it is not a
+          # blanket requirement for tagging commits already on main.
           if [ -n "${RELEASE_TOKEN:-}" ]; then
             git push "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$NEW"
           else
-            echo "::warning::RELEASE_TOKEN not set; pushing the tag with the default GITHUB_TOKEN. This FAILS if the tagged commit modifies .github/workflows/ -- set RELEASE_TOKEN (Contents + Workflows: write) to fix."
+            echo "::notice::RELEASE_TOKEN not set; pushing the tag with the job GITHUB_TOKEN (contents: write)."
             git push origin "refs/tags/$NEW"
           fi
 

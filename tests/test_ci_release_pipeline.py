@@ -183,6 +183,61 @@ def test_optional_channels_require_consistent_configuration(release_env):
         pre.validate("1.2.3", dict(release_env, DOCKERHUB_USERNAME="user"))
 
 
+@pytest.mark.parametrize("token", [None, "", "custom-release-token"])
+def test_release_token_override_is_optional(monkeypatch, release_env, token):
+    pre = load("release_preflight")
+    env = dict(release_env, GITHUB_REPOSITORY="ptweezy/cronstable")
+    if token is not None:
+        env["RELEASE_TOKEN"] = token
+    calls = []
+
+    def github(path, credential):
+        calls.append((path, credential))
+        return {"permissions": {"push": True}}, {
+            "X-OAuth-Scopes": "repo, workflow"
+        }
+
+    monkeypatch.setattr(pre, "github", github)
+    pre.validate("1.2.51", env)
+    pre.authenticate(env)
+    assert ("repos/ptweezy/homebrew-tap", env["HOMEBREW_TAP_TOKEN"]) in calls
+    assert ("user", env["WINGET_TOKEN"]) in calls
+    release_calls = [c for c in calls if c[0] == "repos/ptweezy/cronstable"]
+    assert release_calls == (
+        [("repos/ptweezy/cronstable", token)] if token else []
+    )
+    release = workflow()["jobs"]["release"]
+    assert release["permissions"]["contents"] == "write"
+    tag = next(
+        s for s in release["steps"] if s.get("name") == "Tag the release"
+    )
+    assert 'git push origin "refs/tags/$NEW"' in tag["run"]
+
+
+@pytest.mark.parametrize(
+    "push, scopes", [(False, "repo, workflow"), (True, "repo")]
+)
+def test_configured_release_token_still_requires_access(
+    monkeypatch, release_env, push, scopes
+):
+    pre = load("release_preflight")
+
+    def github(path, credential):
+        if credential == "invalid-release-token":
+            return {"permissions": {"push": push}}, {"X-OAuth-Scopes": scopes}
+        return {"permissions": {"push": True}}, {"X-OAuth-Scopes": "repo"}
+
+    monkeypatch.setattr(pre, "github", github)
+    with pytest.raises(ValueError, match="RELEASE_TOKEN"):
+        pre.authenticate(
+            dict(
+                release_env,
+                GITHUB_REPOSITORY="ptweezy/cronstable",
+                RELEASE_TOKEN="invalid-release-token",
+            )
+        )
+
+
 def test_pypi_preflight_exchanges_identity_without_publishing(monkeypatch):
     pre = load("release_preflight")
     calls = []
