@@ -1605,6 +1605,8 @@ jobs:
               retry 5 apt-get -o Acquire::Retries=5 -qq update
               retry 5 apt-get -o Acquire::Retries=5 -qq install -y --no-install-recommends \
                 python3 python3-venv python3-dev build-essential zlib1g-dev libffi-dev pkg-config
+              # pip runs as root; the mounted checkout belongs to the runner.
+              mkdir -p /src/.pip-cache && chown -R root:root /src/.pip-cache
               python3 -VV
               python3 -m venv /v
               retry 5 /v/bin/pip install --upgrade pip setuptools wheel
@@ -2031,6 +2033,8 @@ jobs:
               # 668), which PIP_BREAK_SYSTEM_PACKAGES answers without needing
               # a venv the way the Debian-packaged interpreters do.
               ${{ matrix.toolchain }}
+              # Own both newly created and restored caches before pip runs.
+              mkdir -p /src/.pip-cache && chown -R root:root /src/.pip-cache
               python3 -VV
               pip install --upgrade pip
               # Not wrapped in retry: with no loong64 wheel on PyPI this

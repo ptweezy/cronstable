@@ -474,6 +474,22 @@ def test_cache_budget_does_not_delete_other_cache_families_or_branches():
     assert prune.victims(caches, budget=100) == [1]
 
 
+@pytest.mark.parametrize("job", ["binaries-mips", "binaries-loong64"])
+def test_source_wheel_cache_is_owned_before_pip_runs(job):
+    steps = workflow()["jobs"][job]["steps"]
+    build = next(
+        step["run"]
+        for step in steps
+        if step.get("name", "").startswith("Build binary")
+    )
+    # A cache miss leaves no directory, and a hit restores runner ownership.
+    # Both must be handled inside the root container before its first pip.
+    create = build.index("mkdir -p /src/.pip-cache")
+    own = build.index("chown -R root:root /src/.pip-cache")
+    install = build.index("pip install")
+    assert build.index("sh -euc '") < create < own < install
+
+
 def test_compiler_cache_changes_with_toolchain_flags_and_openssl(
     tmp_path, monkeypatch
 ):

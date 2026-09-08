@@ -110,7 +110,10 @@ try {
         [xml]$xml = Get-Content $authoring -Raw
         $executables = @($xml.SelectNodes("//*[local-name()='File' and @Id='CronstableExe']"))
         if ($executables.Count -ne 1) { throw "${name}: expected one payload executable" }
-        $payloadPath = $executables[0].GetAttribute('Source')
+        # WiX writes SourceDir\File\CronstableExe into the authoring, but
+        # extracts cabinet entries by File id beneath the -x folder's File
+        # directory. SourceDir is a placeholder, not a filesystem path.
+        $payloadPath = Join-Path $target 'File/CronstableExe'
         if (-not (Test-Path $payloadPath -PathType Leaf)) {
             throw "$name missing extracted payload: $payloadPath"
         }

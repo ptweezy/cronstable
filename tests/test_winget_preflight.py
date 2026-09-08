@@ -78,7 +78,8 @@ function Get-ChildItem {
 function Get-AuthenticodeSignature {
     param($Path)
     $valid = $global:case -ne 'unsigned'
-    if ($global:case -eq 'payload-unsigned' -and $Path.EndsWith('.exe')) {
+    if ($global:case -eq 'payload-unsigned' -and
+        $Path.EndsWith('CronstableExe')) {
         $valid = $false
     }
     [pscustomobject]@{
@@ -142,10 +143,15 @@ function Invoke-FakeWix {
     New-Item -ItemType Directory -Force $target | Out-Null
     $file = ''
     if ($global:case -ne 'missing-payload') {
-        $payload = Join-Path $target 'cronstable.exe'
-        Set-Content $payload 'test payload'
-        $escaped = [System.Security.SecurityElement]::Escape($payload)
-        $file = "<File Id='CronstableExe' Source='$escaped' />"
+        # Match WiX's real cabinet extraction and authoring paths.
+        $files = Join-Path $target 'File'
+        New-Item -ItemType Directory -Force $files | Out-Null
+        $payload = Join-Path $files 'CronstableExe'
+        if ($global:case -ne 'missing-extracted-file') {
+            Set-Content $payload 'test payload'
+        }
+        $file = "<File Id='CronstableExe' " +
+            "Source='SourceDir\File\CronstableExe' />"
     }
     Set-Content $authoring "<Wix>$file</Wix>"
     $global:LASTEXITCODE = $(if ($global:case -eq 'extract') { 1 } else { 0 })
@@ -178,6 +184,7 @@ if ($global:scans -ne 4) { throw 'must scan both MSIs and both payloads' }
         ("payload-unsigned", False),
         ("extract", False),
         ("missing-payload", False),
+        ("missing-extracted-file", False),
     ],
 )
 def test_preflight(tmp_path, case, success):
@@ -226,6 +233,7 @@ def test_preflight(tmp_path, case, success):
             "payload-unsigned": "invalid payload executable",
             "extract": "MSI extraction failed",
             "missing-payload": "expected one payload executable",
+            "missing-extracted-file": "missing extracted payload",
         }
         assert expected[case] in result.stdout + result.stderr
     if case in {"update", "update-retry"}:
