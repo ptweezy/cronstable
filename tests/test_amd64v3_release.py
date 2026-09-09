@@ -7,7 +7,7 @@ import json
 import re
 import subprocess
 import sys
-import tarfile
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -273,12 +273,24 @@ def test_failed_runtime_verification_exposes_no_interpreter(
 def source_runtime(monkeypatch, tmp_path):
     runtime = load("docker/python_runtime.py")
 
-    def download(url, sha, target):
-        with tarfile.open(target, "w:xz") as archive:
-            entry = tarfile.TarInfo(f"Python-{runtime.VERSION}/configure")
-            archive.addfile(entry)
+    # Python 3.10.11 lacks tar extraction filters. Stub extraction so these
+    # tests reach the build and install commands on every test interpreter.
+    def extractall(path, *, filter):
+        assert filter == "data"
+        source = Path(path) / f"Python-{runtime.VERSION}"
+        source.mkdir()
+        (source / "configure").touch()
 
-    monkeypatch.setattr(runtime, "download", download)
+    monkeypatch.setattr(runtime, "download", lambda *args: None)
+    monkeypatch.setattr(
+        runtime,
+        "tarfile",
+        SimpleNamespace(
+            open=lambda path: nullcontext(
+                SimpleNamespace(extractall=extractall)
+            )
+        ),
+    )
     monkeypatch.setattr(
         runtime,
         "os",
