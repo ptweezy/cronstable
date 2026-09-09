@@ -207,7 +207,13 @@ def build_source(prefix, openssl=None):
     make = shutil.which("gmake") or "make"
     run(configure, cwd=source, env=env)
     run([make, f"-j{min(os.cpu_count() or 2, 4)}"], cwd=source, env=env)
-    run([make, "install"], cwd=source, env=env)
+    install = [make, "install"]
+    if system == "FreeBSD":
+        # Compile bytecode serially to avoid the multiprocessing pool.
+        # Bound installation and its children with FreeBSD's native timeout.
+        install = ["timeout", "-v", "-k", "30s", "15m", *install]
+        install.append("COMPILEALL_OPTS=-j1")
+    run(install, cwd=source, env=env)
     shutil.rmtree(source)
     return prefix / "bin/python3"
 

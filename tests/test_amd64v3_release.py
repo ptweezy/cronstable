@@ -7,7 +7,9 @@ import json
 import re
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from strictyaml.ruamel import YAML
@@ -265,3 +267,117 @@ def test_failed_runtime_verification_exposes_no_interpreter(
     with pytest.raises(RuntimeError, match="verification failed"):
         runtime.main()
     assert not (prefix / "python-path").exists()
+
+
+@pytest.fixture
+def source_runtime(monkeypatch, tmp_path):
+    runtime = load("docker/python_runtime.py")
+
+    def download(url, sha, target):
+        with tarfile.open(target, "w:xz") as archive:
+            entry = tarfile.TarInfo(f"Python-{runtime.VERSION}/configure")
+            archive.addfile(entry)
+
+    monkeypatch.setattr(runtime, "download", download)
+    monkeypatch.setattr(
+        runtime,
+        "os",
+        SimpleNamespace(
+            name="posix",
+            environ={"GITHUB_OUTPUT": str(tmp_path / "github-output")},
+            cpu_count=lambda: 8,
+        ),
+    )
+    monkeypatch.setattr(runtime.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(runtime.shutil, "which", lambda name: "gmake")
+    monkeypatch.setattr(runtime.sysconfig, "get_config_var", lambda name: "cc")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "python_runtime.py",
+            "--variant",
+            "amd64v3",
+            "--prefix",
+            str(tmp_path),
+        ],
+    )
+    return runtime
+
+
+@pytest.mark.parametrize("system", ["FreeBSD", "NetBSD"])
+def test_source_install_selects_bytecode_workers_and_verifies_runtime(
+    source_runtime, system, monkeypatch, tmp_path
+):
+    runtime = source_runtime
+    commands = []
+    checked = []
+    monkeypatch.setattr(runtime.platform, "system", lambda: system)
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda cmd, **kwargs: commands.append((cmd, kwargs)),
+    )
+    monkeypatch.setattr(
+        runtime, "verify", lambda python, **kwargs: checked.append(python)
+    )
+
+    runtime.main()
+
+    configure, compile_, install = [cmd for cmd, _ in commands]
+    assert configure[0] == "./configure"
+    assert compile_ == ["gmake", "-j4"]
+    if system == "FreeBSD":
+        assert install == [
+            "timeout",
+            "-v",
+            "-k",
+            "30s",
+            "15m",
+            "gmake",
+            "install",
+            "COMPILEALL_OPTS=-j1",
+        ]
+    else:
+        assert install == ["gmake", "install"]
+    assert all(options["check"] for _, options in commands)
+    assert all(
+        options["cwd"] == tmp_path / "source" for _, options in commands
+    )
+    assert all(
+        runtime.MARCH in options["env"]["CFLAGS"] for _, options in commands
+    )
+    python = tmp_path / "bin/python3"
+    assert checked == [python]
+    assert (tmp_path / "python-path").read_text().strip() == str(python)
+    assert (
+        tmp_path / "github-output"
+    ).read_text() == f"python-path={python}\n"
+    assert not (tmp_path / "source").exists()
+
+
+@pytest.mark.parametrize("exit_code", [2, 124, 137])
+def test_freebsd_install_failure_exposes_no_interpreter(
+    source_runtime, exit_code, monkeypatch, tmp_path
+):
+    runtime = source_runtime
+    checked = []
+    monkeypatch.setattr(runtime.platform, "system", lambda: "FreeBSD")
+
+    def run(cmd, **kwargs):
+        if "install" in cmd:
+            raise subprocess.CalledProcessError(exit_code, cmd)
+
+    monkeypatch.setattr(runtime.subprocess, "run", run)
+    monkeypatch.setattr(
+        runtime, "verify", lambda python, **kwargs: checked.append(python)
+    )
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        runtime.main()
+
+    assert error.value.returncode == exit_code
+    assert checked == []
+    assert not (tmp_path / "python-path").exists()
+    assert not (tmp_path / "github-output").exists()
+    assert (tmp_path / "source/configure").exists()
