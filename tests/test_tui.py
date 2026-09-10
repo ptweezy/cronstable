@@ -3850,6 +3850,165 @@ def test_dag_graph_no_task_metadata(tmp_path):
     assert "no task metadata" in _txt(app.render_dag_panel(paint, 70, 24))
 
 
+def test_dag_graph_reverse_chain_exceeds_recursion_limit(tmp_path):
+    app = _bare_app(tmp_path)
+    dag = {
+        "tasks": [
+            {
+                "id": "t%04d" % i,
+                "dependsOn": ["t%04d" % (i - 1)] if i else [],
+            }
+            for i in reversed(range(2000))
+        ]
+    }
+    rows = app._dag_graph_tab(_paint(app), dag, 70, 5)
+    assert len(rows) == 5
+    assert strip_ansi(rows[0]).strip() == "0 [t0000]"
+    assert strip_ansi(rows[1]).strip() == "1 [t0001]"
+    assert "t0000" in strip_ansi(rows[2])
+    assert "t0001" in strip_ansi(rows[2])
+    assert strip_ansi(rows[3]).strip() == "2 [t0002]"
+
+
+@pytest.mark.parametrize("shape", ["chain", "wide", "fanin"])
+def test_dag_graph_repaint_work_fits_viewport(tmp_path, monkeypatch, shape):
+    class CountedTasks(list):
+        visits = 0
+
+        def __iter__(self):
+            for task in super().__iter__():
+                self.visits += 1
+                yield task
+
+    count = 2000
+    tasks = CountedTasks(
+        {
+            "id": "t%04d" % i,
+            "dependsOn": ["t%04d" % (i - 1)] if i and shape == "chain" else [],
+        }
+        for i in range(count)
+    )
+    if shape == "fanin":
+        tasks[-1]["dependsOn"] = ["t%04d" % i for i in range(count - 1)]
+    run_tasks = CountedTasks(
+        {"key": "t%04d" % i, "state": "running"} for i in range(count)
+    )
+    app = _bare_app(tmp_path)
+    app.dag_run = {"tasks": run_tasks}
+    dag = {"tasks": tasks}
+    paint = _paint(app)
+    style_calls = 0
+    original_style = paint.style
+
+    def style(*args, **kwargs):
+        nonlocal style_calls
+        style_calls += 1
+        return original_style(*args, **kwargs)
+
+    monkeypatch.setattr(paint, "style", style)
+    width, height = 80, 20
+    first = app._dag_graph_tab(paint, dag, width, height)
+    assert 0 < len(first) <= height
+    assert style_calls <= 5 * height + 2 * width
+    visits = tasks.visits, run_tasks.visits
+    for _ in range(3):
+        style_calls = 0
+        assert app._dag_graph_tab(paint, dag, width, height) == first
+        assert style_calls <= 5 * height + 2 * width
+    assert (tasks.visits, run_tasks.visits) == visits
+
+
+@pytest.mark.parametrize("dict_form", [False, True])
+def test_dag_graph_preserves_layers_and_dependency_order(tmp_path, dict_form):
+    tasks = {
+        "sink": {"depends_on": ["middle", "root"]},
+        "orphan": {"dependsOn": "missing"},
+        "middle": {"dependsOn": "root"},
+        "root": {},
+        "alone": None,
+    }
+    if not dict_form:
+        tasks = [dict(value or {}, name=key) for key, value in tasks.items()]
+    app = _bare_app(tmp_path)
+    app.prefs["ascii"] = True
+    rows = app._dag_graph_tab(_paint(app), {"tasks": tasks}, 120, 20)
+    assert [strip_ansi(row).rstrip() for row in rows] == [
+        " 0 [alone] [root]",
+        " 1 [middle] [orphan]",
+        "     root -> middle",
+        "     missing -> orphan",
+        " 2 [sink]",
+        "     middle -> sink",
+        "     root -> sink",
+    ]
+
+
+@pytest.mark.parametrize("dict_form", [False, True])
+def test_dag_graph_cache_tracks_metadata_and_run_updates(tmp_path, dict_form):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    dag = {"tasks": [{"id": "root"}, {"id": "child", "dependsOn": "root"}]}
+    state = {"key": "root", "state": "running"}
+    app.dag_run = {"tasks": {"root": state} if dict_form else [state]}
+    assert "[root running]" in _txt(app._dag_graph_tab(paint, dag, 80, 20))
+    state["state"] = "success"
+    app.prefs["ascii"] = True
+    rows = app._dag_graph_tab(paint, dag, 80, 20)
+    assert "[root success]" in _txt(rows)
+    assert "root -> child" in _txt(rows)
+
+    state = {"key": "child", "state": "failed"}
+    app.dag_run = {"tasks": {"child": state} if dict_form else [state]}
+    dag["tasks"] = [{"id": "root", "dependsOn": "child"}, {"id": "child"}]
+    rows = app._dag_graph_tab(paint, dag, 80, 20)
+    assert strip_ansi(rows[0]).strip() == "0 [child failed]"
+    assert strip_ansi(rows[1]).strip() == "1 [root]"
+    assert "child -> root" in _txt(rows)
+
+
+@pytest.mark.parametrize("width,height", [(80, 0), (80, -1), (4, 20)])
+def test_dag_graph_empty_viewport(tmp_path, width, height):
+    app = _bare_app(tmp_path)
+    dag = {"tasks": [{"id": "root"}, {"id": "child", "dependsOn": "root"}]}
+    assert app._dag_graph_tab(_paint(app), dag, width, height) == []
+
+
+def test_dag_graph_bounds_wide_labels_and_edges(tmp_path):
+    app = _bare_app(tmp_path)
+    app.prefs["ascii"] = False
+    dag = {
+        "tasks": [
+            {"id": "根" * 12},
+            {"id": "終" * 12, "dependsOn": "根" * 12},
+        ]
+    }
+    rows = app._dag_graph_tab(_paint(app), dag, 24, 20)
+    assert len(rows) == 3
+    assert all(text_width(row) == 20 for row in rows)
+    assert "根" in _txt(rows)
+    assert "終" in _txt(rows)
+
+
+def test_dag_graph_closing_releases_cached_snapshots(tmp_path):
+    import gc
+    import weakref
+
+    class Tasks(list):
+        pass
+
+    app = _bare_app(tmp_path)
+    tasks = Tasks([{"id": "root"}])
+    run_tasks = Tasks([{"key": "root", "state": "running"}])
+    refs = weakref.ref(tasks), weakref.ref(run_tasks)
+    app.dag_run = {"tasks": run_tasks}
+    app._dag_graph_tab(_paint(app), {"tasks": tasks}, 80, 20)
+    app._close_dag_streams()
+    app.dag_run = None
+    del tasks, run_tasks
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+
+
 def test_render_tail_input_and_empty(tmp_path):
     app = _bare_app(tmp_path)
     paint = _paint(app)
