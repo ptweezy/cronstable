@@ -1961,7 +1961,6 @@ class DagScheduler:
             )
             return None
         self._cron._add_running_instance(running)
-        self._cron._jobs_running.set()
         pid = running.proc.pid if running.proc is not None else None
         # the pid is NOT stamped here: the caller collects every launched
         # (taskkey, proc, pid, attempt) and stamps the whole batch in one

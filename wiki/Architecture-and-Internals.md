@@ -538,24 +538,36 @@ wedge the loop. For the operator-facing trust boundary, see
 
 ## The reaper task: `_wait_for_running_jobs`
 
-A single long-lived task started by `Cron.run` owns all completion handling. It
-maintains a local `wait_tasks` map from `RunningJob` to an `asyncio.Task`
-wrapping `job.wait()`, and runs while `self.running_jobs` is non-empty or the
-stop event is not yet set. Each cycle:
+A single long-lived task started by `Cron.run` waits for running jobs and
+dispatches their completions. It maintains a local `wait_tasks` map from
+`RunningJob` to an `asyncio.Task` wrapping `job.wait()`. It runs until shutdown
+is signaled and `self.running_jobs` is empty.
 
-1. For every `RunningJob` in `self.running_jobs` that does not yet have a wait
-   task, it creates one with `asyncio.create_task(job.wait())`.
-2. If there are no wait tasks, it waits up to 1 second on the
-   `self._jobs_running` event (set by `maybe_launch_job` whenever a job is
-   spawned) and continues, avoiding a busy loop.
-3. Otherwise it clears `_jobs_running` and `await asyncio.wait(...,
-   timeout=1.0, return_when=FIRST_COMPLETED)`. Completed jobs are removed from
-   `wait_tasks`; `task.result()` is read (an unexpected exception is logged as
-   `"please report this as a bug (2)"`), then each finished job is passed to
-   `_handle_finished_job`.
+The reaper scans `self.running_jobs` once when it starts, including when
+`Cron.run` invokes it for the final shutdown drain. Regular jobs and DAG tasks
+register subsequent launches through `_add_running_instance`, which adds the
+instance to `_reaper_pending` and sets `_jobs_running`. Pending registrations
+are keyed by instance identity, so concurrent runs of the same job have separate
+entries. Removing an instance also removes its pending registration.
 
-`CancelledError` is re-raised; any other unexpected exception in the loop is
-logged as `"please report this as a bug (3)"` followed by a one-second sleep.
+Each cycle drains pending registrations into `wait_tasks`. A wait task's done
+callback files the completed job and sets a completion event. The reaper clears
+`_jobs_running` after registration, in the same event-loop turn. When idle, it
+waits on `_jobs_running`; while jobs are running, it waits on the launch and
+completion events with `asyncio.wait(..., return_when=FIRST_COMPLETED)`. These
+waits have no polling timeout. Registration work is proportional to new
+instances, and each completion callback takes constant time.
+
+The reaper handles completed jobs in batches. It removes each job from
+`wait_tasks`, reads `task.result()`, and passes the job to
+`_handle_finished_job`. An unexpected wait exception is logged as bug (2). A
+handler exception is logged as bug (6), and processing continues with the rest
+of the batch. If that instance remains in `running_jobs`, it is queued for
+another completion attempt. Each batch flushes buffered DAG completions in a
+`finally` block, including when cancellation interrupts the batch.
+
+`CancelledError` is re-raised. Other unexpected exceptions in the outer loop
+are logged as bug (3), followed by a one-second sleep.
 
 `_handle_finished_job` removes the job from `self.running_jobs[name]` (deleting
 the key when the list becomes empty), then:
@@ -569,8 +581,8 @@ the key when the list becomes empty), then:
 ## RunningJob lifecycle
 
 `maybe_launch_job` constructs `RunningJob(job, self.retry_state.get(job.name))`,
-calls `await running_job.start()`, appends it to `self.running_jobs[job.name]`,
-and sets `self._jobs_running`. The lifecycle inside `RunningJob`:
+calls `await running_job.start()`, and registers the instance with
+`_add_running_instance`. The lifecycle inside `RunningJob`:
 
 1. **`start()`** chooses the spawn function from the command form:
    `create_subprocess_exec` for a list command, or when `shell` is set the

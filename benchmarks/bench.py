@@ -4693,21 +4693,15 @@ class _BenchFinishedJob:
     gate_floor=0.005,
 )
 def bench_loop_stall_completions():
-    """The reaper's per-completion wait-set rebuild at fleet scale.
+    """Measure reaper bookkeeping across staggered job completions.
 
-    _wait_for_running_jobs re-enters asyncio.wait over the WHOLE running set
-    on every batch, so a fleet finishing its jobs one at a time pays
-    O(running) waiter registrations per completion, quadratic in the
-    number of concurrently running jobs, on the scheduler's own loop.
-    Nothing else measures the reaper: every job metric times one run's
-    pipeline, and the completions here are deliberately resolved ONE at a
-    time because a simultaneous burst is handled in a single batch and would
-    time the shape the quadratic does not have.
+    The fleet starts with all jobs running, then finishes them one at a
+    time. Two event-loop turns between finishes let the reaper process
+    completions as the running set shrinks.
 
-    _handle_finished_job is checked positively and then neutered: it is the
-    durable-record / report / retry pipeline, which has its own metrics and
-    would otherwise dominate (and would need a state backend to be
-    meaningful).  What is left is exactly the reaper's own bookkeeping.
+    A stub completion handler records handled jobs. Durable writes,
+    reports, and retries have separate metrics, so this measurement
+    isolates the reaper's bookkeeping.
     """
     import asyncio
     import inspect
@@ -4749,8 +4743,7 @@ def bench_loop_stall_completions():
         for job in jobs:
             job.finish()
             cron.running_jobs.pop(job.config.name, None)
-            # two turns: one for the reaper to observe the completion, one
-            # for it to rebuild its wait set before the next finish
+            # Give the reaper two event-loop turns between completions.
             await asyncio.sleep(0)
             await asyncio.sleep(0)
         # bounded: a wedged reaper must record as a broken benchmark, not
