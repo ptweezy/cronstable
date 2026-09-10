@@ -2,7 +2,11 @@
 
 import copy
 import importlib.util
+import json
+import subprocess
+import sys
 import xml.etree.ElementTree as ET
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -14,6 +18,12 @@ spec = importlib.util.spec_from_file_location(
 )
 renderer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(renderer)
+date_spec = importlib.util.spec_from_file_location(
+    "set_winget_release_date",
+    ROOT / ".github/scripts/set_winget_release_date.py",
+)
+date_setter = importlib.util.module_from_spec(date_spec)
+date_spec.loader.exec_module(date_setter)
 
 
 @pytest.fixture
@@ -98,6 +108,115 @@ def test_published_msi_metadata_and_identity(metadata, tmp_path):
         assert arp["InstallerType"] == "msi"
 
 
+def test_published_catalog_metadata_is_preserved(metadata, tmp_path):
+    renderer.render("1.2.50", metadata, tmp_path)
+    locale = read_manifests(tmp_path)["defaultLocale"]
+    assert locale["Copyright"].splitlines() == [
+        line
+        for line in (ROOT / "LICENSE").read_text("utf-8").splitlines()
+        if line.startswith("Copyright ")
+    ]
+    assert "cronstable contributors" in locale["Copyright"]
+    assert locale["CopyrightUrl"] == (
+        "https://github.com/ptweezy/cronstable/blob/1.2.50/LICENSE"
+    )
+    assert set(locale["Tags"]) >= {
+        "cron",
+        "crontab",
+        "scheduler",
+        "job-scheduler",
+        "task-scheduler",
+        "cronjob",
+        "container",
+        "docker",
+        "kubernetes",
+        "devops",
+        "sre",
+        "sysadmin",
+    }
+
+
+@pytest.mark.parametrize(
+    "published_at,expected",
+    [
+        ("2026-09-10T02:38:13Z", date(2026, 9, 10)),
+        ("2026-09-09T22:38:13-04:00", date(2026, 9, 10)),
+        ("2026-09-10T00:38:13+02:00", date(2026, 9, 9)),
+    ],
+)
+def test_release_date_preserves_validated_metadata(
+    metadata, tmp_path, published_at, expected
+):
+    renderer.render("1.2.50", metadata, tmp_path)
+    before = read_manifests(tmp_path)
+    path = tmp_path / "ptweezy.cronstable.installer.yaml"
+    header = path.read_text("utf-8").splitlines()[0]
+    date_setter.set_release_date("1.2.50", published_at, path)
+    after = read_manifests(tmp_path)
+    assert after["installer"].pop("ReleaseDate") == expected
+    assert after == before
+    first = path.read_text("utf-8")
+    assert first.splitlines()[0] == header
+    date_setter.set_release_date("1.2.50", published_at, path)
+    assert path.read_text("utf-8") == first
+
+
+@pytest.mark.parametrize(
+    "published_at", ["", "null", "2026-02-30T00:00:00Z", "2026-09-10"]
+)
+def test_invalid_publication_timestamp_preserves_manifest(
+    metadata, tmp_path, published_at
+):
+    renderer.render("1.2.50", metadata, tmp_path)
+    path = tmp_path / "ptweezy.cronstable.installer.yaml"
+    before = path.read_bytes()
+    with pytest.raises(ValueError):
+        date_setter.set_release_date("1.2.50", published_at, path)
+    assert path.read_bytes() == before
+
+
+def test_release_date_rejects_wrong_version(metadata, tmp_path):
+    renderer.render("1.2.50", metadata, tmp_path)
+    path = tmp_path / "ptweezy.cronstable.installer.yaml"
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="does not match the release"):
+        date_setter.set_release_date("1.2.51", "2026-09-10T02:38:13Z", path)
+    assert path.read_bytes() == before
+
+
+def test_manifest_generation_and_publication_cli(metadata, tmp_path):
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8-sig")
+    manifests = tmp_path / "manifests"
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github/scripts/render_winget.py"),
+            "1.2.50",
+            str(metadata_path),
+            str(manifests),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github/scripts/set_winget_release_date.py"),
+            "1.2.50",
+            "2026-09-10T02:38:13Z",
+            str(manifests / "ptweezy.cronstable.installer.yaml"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert read_manifests(manifests)["installer"]["ReleaseDate"] == date(
+        2026, 9, 10
+    )
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -178,6 +297,7 @@ def test_submission_requires_signed_scanned_validated_msis():
         "Download signed winget installers",
         "Download validated winget manifests",
         "Verify published winget installers match the scanned files",
+        "Set winget release date",
         "Submit winget manifest",
     ]
     assert [names.index(n) for n in gates] == sorted(
@@ -203,9 +323,22 @@ def test_submission_requires_signed_scanned_validated_msis():
     assert download["name"] == evidence["with"]["name"]
     assert download["path"] == "."
     assert "wingetcreate.exe update" not in steps[gates[-1]]["run"]
-    verify = steps[gates[-2]]["run"]
+    verify = steps[
+        "Verify published winget installers match the scanned files"
+    ]["run"]
     assert "verify_winget_release.py" in verify
     assert "winget-validation/metadata.json winget-assets" in verify
+    release_date = steps["Set winget release date"]
+    assert release_date["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert "--json publishedAt" in release_date["run"]
+    assert (
+        'set_winget_release_date.py "$VERSION" "$published_at"'
+        in release_date["run"]
+    )
+    assert (
+        "winget-manifests/ptweezy.cronstable.installer.yaml"
+        in release_date["run"]
+    )
     assert not any(
         "prepare_winget.ps1" in s.get("run", "") for s in job["steps"]
     )

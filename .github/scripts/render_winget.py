@@ -78,9 +78,30 @@ def render(version, metadata, output):
             "PackageUrl": REPO,
             "License": "MIT",
             "LicenseUrl": f"{REPO}/blob/{version}/LICENSE",
+            "Copyright": "\n".join(
+                line
+                for line in (Path(__file__).resolve().parents[2] / "LICENSE")
+                .read_text("utf-8")
+                .splitlines()
+                if line.startswith("Copyright ")
+            ),
+            "CopyrightUrl": f"{REPO}/blob/{version}/LICENSE",
             "ShortDescription": "A distributed cron replacement.",
             "Moniker": "cronstable",
-            "Tags": ["cron", "crontab", "scheduler", "job-scheduler"],
+            "Tags": [
+                "cron",
+                "crontab",
+                "scheduler",
+                "job-scheduler",
+                "task-scheduler",
+                "cronjob",
+                "container",
+                "docker",
+                "kubernetes",
+                "devops",
+                "sre",
+                "sysadmin",
+            ],
             "ReleaseNotesUrl": f"{REPO}/releases/tag/{version}",
             "Documentations": [
                 {

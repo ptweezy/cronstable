@@ -4898,6 +4898,7 @@ jobs:
   # Submit the ptweezy.cronstable manifest to microsoft/winget-pkgs for each
   # release. Use the manifests validated by sign-windows and verify that the
   # published installer hashes match the scanned files before submission.
+  # Set ReleaseDate from the release's publication timestamp in UTC.
   #
   # WINGET_TOKEN is a classic PAT with public_repo scope. Its account creates
   # the fork and PRs. After submission succeeds, cleanup closes that account's
@@ -4943,6 +4944,15 @@ jobs:
         run: |
           set -euo pipefail
           python .github/scripts/verify_winget_release.py "$VERSION" winget-validation/metadata.json winget-assets
+      - name: Set winget release date
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          python -m pip install strictyaml==1.7.3
+          published_at="$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq '.publishedAt')"
+          python .github/scripts/set_winget_release_date.py "$VERSION" "$published_at" winget-manifests/ptweezy.cronstable.installer.yaml
       - name: Submit winget manifest
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
