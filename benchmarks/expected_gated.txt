@@ -65,6 +65,7 @@ mcp.handle_200
 mem.crontab_10k
 mem.gc_pause_100k
 mem.jobconfig_2k
+mem.retired_output_1k
 mem.rss_daemon_import
 mem.rss_version
 prometheus.render_500

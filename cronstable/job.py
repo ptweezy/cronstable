@@ -376,59 +376,66 @@ class _MirrorWriter:
                 self._batches = deque()
                 self._pending_bytes = 0
                 self._wake.clear()
-            wrote = False
-            for job_name, stream_name, text in batch:
-                out = sys.stdout if stream_name == "stdout" else sys.stderr
-                if out is None:
-                    # A Windows service has no standard streams at all, so
-                    # there is nothing to mirror TO.  Without this guard the
-                    # write raises AttributeError on `out.buffer`, and the
-                    # arm below turns that into a WARNING plus a traceback
-                    # for every batch of every job's output, which is the
-                    # loudest log the daemon can produce for a condition
-                    # that holds for the whole run.  Log it once instead.
-                    # The saved lines still hold everything the job wrote:
-                    # capture, the log tail, the archive and every reporter
-                    # read those.
-                    self._log_no_stream()
-                    continue
-                try:
-                    StreamReader._emit(out, text)
-                    wrote = True
-                except Exception:  # noqa: BLE001 - this thread must survive
-                    # The daemon's own stream is broken or rejecting the
-                    # payload; an escaping exception would silently kill
-                    # the process's ONE mirror thread and end the
-                    # passthrough for the daemon's life, so log and keep
-                    # going, whatever the type.
-                    logger.warning(
-                        "job %s: could not mirror %s to the daemon's own "
-                        "stream",
-                        job_name,
-                        stream_name,
-                        exc_info=True,
-                    )
-            if wrote:
-                # a write just succeeded, so the consumer is draining and
-                # this cannot block behind a wedged fd (see class docstring)
-                with self._lock:
-                    warn = self._drop_warn_pending
-                    self._drop_warn_pending = False
-                    # re-arm: this episode is over (the consumer is
-                    # provably draining again), so the NEXT backup gets
-                    # its own warning. Without the reset the latch was
-                    # per-process and every later episode shed job output
-                    # silently.
-                    self._drop_logged = False
-                if warn:
-                    logger.warning(
-                        "passthrough mirror is backed up (its consumer is "
-                        "not reading the daemon's output); shedding oldest "
-                        "batches until it drains"
-                    )
+            self._write_batch(batch)
+            # A parked thread keeps its locals alive. Release the drained
+            # batch before waiting, including the deque's spare blocks.
+            del batch
             with self._lock:
                 if not self._batches:
                     self._idle.set()
+
+    def _write_batch(self, batch: deque[tuple[str, str, str]]) -> None:
+        # Keep the per-write locals in a separate frame so the last text
+        # and destination stream are also released when this batch drains.
+        wrote = False
+        for job_name, stream_name, text in batch:
+            out = sys.stdout if stream_name == "stdout" else sys.stderr
+            if out is None:
+                # A Windows service has no standard streams at all, so
+                # there is nothing to mirror TO.  Without this guard the
+                # write raises AttributeError on `out.buffer`, and the
+                # arm below turns that into a WARNING plus a traceback
+                # for every batch of every job's output, which is the
+                # loudest log the daemon can produce for a condition
+                # that holds for the whole run.  Log it once instead.
+                # The saved lines still hold everything the job wrote:
+                # capture, the log tail, the archive and every reporter
+                # read those.
+                self._log_no_stream()
+                continue
+            try:
+                StreamReader._emit(out, text)
+                wrote = True
+            except Exception:  # noqa: BLE001 - this thread must survive
+                # The daemon's own stream is broken or rejecting the
+                # payload; an escaping exception would silently kill
+                # the process's ONE mirror thread and end the
+                # passthrough for the daemon's life, so log and keep
+                # going, whatever the type.
+                logger.warning(
+                    "job %s: could not mirror %s to the daemon's own stream",
+                    job_name,
+                    stream_name,
+                    exc_info=True,
+                )
+        if wrote:
+            # a write just succeeded, so the consumer is draining and
+            # this cannot block behind a wedged fd (see class docstring)
+            with self._lock:
+                warn = self._drop_warn_pending
+                self._drop_warn_pending = False
+                # re-arm: this episode is over (the consumer is
+                # provably draining again), so the NEXT backup gets
+                # its own warning. Without the reset the latch was
+                # per-process and every later episode shed job output
+                # silently.
+                self._drop_logged = False
+            if warn:
+                logger.warning(
+                    "passthrough mirror is backed up (its consumer is "
+                    "not reading the daemon's output); shedding oldest "
+                    "batches until it drains"
+                )
 
 
 #: The one mirror writer for the process; see :class:`_MirrorWriter`.
@@ -447,9 +454,22 @@ class JobOutputStream:
     history record.
     """
 
+    __slots__ = (
+        "_limit",
+        "_lines",
+        "_subscribers",
+        "closed",
+        "published",
+        "dropped",
+    )
+
     def __init__(self, limit: int = LIVE_LOG_LIMIT) -> None:
+        if limit < 0:
+            raise ValueError("maxlen must be non-negative")
+        self._limit = limit
         # each item is (stream_name, line) with stream_name "stdout"/"stderr"
-        self.lines: deque[tuple[str, str]] = deque(maxlen=limit)
+        # Silent runs and rehydrated summaries need no ring at all.
+        self._lines: Optional[deque[tuple[str, str]]] = None
         self._subscribers: list["asyncio.Queue"] = []
         self.closed = False
         # total lines ever published: `published - len(lines)` is the
@@ -459,6 +479,11 @@ class JobOutputStream:
         # lines a stalled subscriber's bounded queue overflowed and dropped;
         # observability only (the live tail is best-effort).
         self.dropped = 0
+
+    @property
+    def lines(self) -> deque[tuple[str, str]] | tuple[()]:
+        """Retained lines for replay; consumers must not mutate the ring."""
+        return self._lines if self._lines is not None else ()
 
     @staticmethod
     def _offer(queue: "asyncio.Queue", item: Any) -> bool:
@@ -485,7 +510,10 @@ class JobOutputStream:
     def publish(self, stream_name: str, line: str) -> None:
         item = (stream_name, line)
         self.published += 1
-        self.lines.append(item)
+        if self._limit:
+            if self._lines is None:
+                self._lines = deque(maxlen=self._limit)
+            self._lines.append(item)
         for queue in self._subscribers:
             if self._offer(queue, item):
                 self.dropped += 1
@@ -527,7 +555,9 @@ class JobOutputStream:
         rows), and subscribers already got the end sentinel via
         :meth:`close`, so nothing observes the lines vanishing.
         """
-        self.lines.clear()
+        # deque.clear() retains spare blocks for reuse (up to a full
+        # default-size ring). Old history rows never need that capacity.
+        self._lines = None
 
 
 #: Bytes pulled from a job's pipe per read.  ``read`` returns as soon as
@@ -1740,6 +1770,9 @@ class _EventLogWriter:
                 except Exception:  # noqa: BLE001 - a writer thread never dies
                     logger.exception("eventlog: unexpected writer failure")
                 finally:
+                    # Do not pin the last event's strings while the worker
+                    # waits for the next record.
+                    record = None
                     self._queue.task_done()
         finally:
             # The thread owns the handle, so it can release it here with

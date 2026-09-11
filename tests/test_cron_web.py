@@ -2342,7 +2342,7 @@ def test_webloop_load_index_html_disk_fallback(monkeypatch):
     # force the importlib.resources lookup to fail so the on-disk fallback path
     # is exercised; clear the lru_cache on the way in and out so neither this
     # test nor its neighbours see a stale cached value.
-    cronstable.cron.load_index_html.cache_clear()
+    cronstable.cron._index_document.cache_clear()
 
     def boom(*a, **k):
         raise ModuleNotFoundError("no package data")
@@ -2351,7 +2351,7 @@ def test_webloop_load_index_html_disk_fallback(monkeypatch):
     try:
         html = cronstable.cron.load_index_html()
     finally:
-        cronstable.cron.load_index_html.cache_clear()
+        cronstable.cron._index_document.cache_clear()
     assert "<" in html and len(html) > 0
 
 

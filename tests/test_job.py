@@ -473,6 +473,56 @@ async def test_job_output_stream_ring_buffer_bounds():
     ]
 
 
+def test_job_output_stream_releases_ring_storage():
+    import gc
+    import weakref
+
+    out = cronstable.job.JobOutputStream(limit=1000)
+    assert not out.lines
+    assert out._lines is None  # a read of a silent run allocates no ring
+    for i in range(2000):
+        out.publish("stdout", str(i))
+    ring = weakref.ref(out._lines)
+    out.close()
+    out.release_lines()
+    gc.collect()
+    # Checking only len(lines) misses deque.clear()'s retained blocks.
+    assert ring() is None
+    assert list(out.lines) == []
+    assert out._lines is None
+    assert out.published == 2000
+    assert out.closed
+    out.release_lines()  # idempotent
+
+
+async def test_job_output_stream_release_preserves_subscribers_and_limit():
+    out = cronstable.job.JobOutputStream(limit=2)
+    queue = out.subscribe()
+    out.publish("stdout", "first")
+    out.release_lines()
+    for line in ("second", "third", "fourth"):
+        out.publish("stdout", line)
+    out.close()
+    assert list(out.lines) == [("stdout", "third"), ("stdout", "fourth")]
+    assert [queue.get_nowait() for _ in range(4)] == [
+        ("stdout", line) for line in ("first", "second", "third", "fourth")
+    ]
+    assert queue.get_nowait() is None
+    assert out.published == 4
+
+
+async def test_job_output_stream_zero_limit_still_broadcasts():
+    out = cronstable.job.JobOutputStream(limit=0)
+    queue = out.subscribe()
+    out.publish("stderr", "live only")
+    assert queue.get_nowait() == ("stderr", "live only")
+    assert out.published == 1
+    assert not out.lines
+    assert out._lines is None
+    with pytest.raises(ValueError):
+        cronstable.job.JobOutputStream(limit=-1)
+
+
 @pytest.mark.asyncio
 async def test_job_output_stream_subscriber_queue_drops_oldest_when_full(
     monkeypatch,

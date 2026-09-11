@@ -28,6 +28,85 @@ from cronstable.jobstate import JobStateError
 from tests._commands import cmd_print, yaml_command
 from tests._helpers import _backend, _drain_state_writes, _state_cfg
 
+
+def test_idle_mirror_releases_completed_output(monkeypatch):
+    import gc
+    import weakref
+
+    from cronstable.job import StreamReader, _MirrorWriter
+
+    class Text(str):
+        pass
+
+    monkeypatch.setattr(StreamReader, "_emit", lambda *args: None)
+    writer = _MirrorWriter()
+    payload = Text("x" * 1048576)
+    ref = weakref.ref(payload)
+    writer.submit("job", "stdout", payload)
+    del payload
+    assert writer.drain(5.0)
+    gc.collect()
+    assert ref() is None, "idle mirror retained a completed output batch"
+
+
+def test_idle_eventlog_writer_releases_completed_record(monkeypatch):
+    import gc
+    import weakref
+
+    from cronstable.job import _EventLogWriter
+
+    class Text(str):
+        pass
+
+    monkeypatch.setattr(_EventLogWriter, "_write", lambda *args: None)
+    writer = _EventLogWriter("memory-probe")
+    try:
+        payload = Text("x" * 32768)
+        ref = weakref.ref(payload)
+        assert writer.submit((1, 0, 1, [payload]))
+        del payload
+        writer._queue.join()
+        gc.collect()
+        assert ref() is None, "idle Event Log writer retained its last record"
+    finally:
+        writer.stop()
+        writer.join(5.0)
+
+
+def test_dashboard_caches_wire_bytes_without_decoding(monkeypatch):
+    import hashlib
+    import zlib
+
+    from cronstable import cron
+
+    raw = "<!doctype html><p>cronstable \U0001f550</p>".encode()
+    reads = []
+
+    class Page:
+        def joinpath(self, name):
+            assert name == "index.html"
+            return self
+
+        def read_bytes(self):
+            reads.append(1)
+            return raw
+
+    cron._index_document.cache_clear()
+    cron._index_gzip.cache_clear()
+    monkeypatch.setattr(cron.importlib.resources, "files", lambda _: Page())
+    try:
+        body, etag = cron._index_document()
+        assert body == raw
+        assert etag == '"' + hashlib.sha256(raw).hexdigest()[:32] + '"'
+        assert zlib.decompress(cron._index_gzip(), wbits=31) == raw
+        assert cron.load_index_html() == raw.decode()
+        assert cron._index_document()[0] is body
+        assert reads == [1]
+    finally:
+        cron._index_document.cache_clear()
+        cron._index_gzip.cache_clear()
+
+
 # --- 1. the fsync barrier protocol ----------------------------------------
 #
 # Each appended record must be made durable by exactly one file fsync AND

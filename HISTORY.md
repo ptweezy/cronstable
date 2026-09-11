@@ -1,5 +1,11 @@
 # History
 
+## 1.2.53
+
+- Reduce resident memory by releasing superseded log buffers and completed
+  output batches, allocating log rings only when output arrives, and caching
+  the dashboard directly as bytes without a duplicate decoded copy.
+
 ## 1.2.52
 
 - Add shared resource pools for jobs and DAG tasks, with weighted capacity,

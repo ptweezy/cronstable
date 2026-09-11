@@ -1323,9 +1323,8 @@ def _job_run_info_from_dict(
     )
 
 
-@lru_cache(maxsize=1)
-def load_index_html() -> str:
-    """Return the bundled single-page web UI, cached after first load.
+def _load_index_bytes() -> bytes:
+    """Read the bundled single-page web UI in its wire encoding.
 
     Read from package data so it works identically for pip installs and the
     PyInstaller binary; falls back to a path relative to this module if the
@@ -1335,26 +1334,32 @@ def load_index_html() -> str:
         return (
             importlib.resources.files("cronstable.web")
             .joinpath("index.html")
-            .read_text(encoding="utf-8")
+            .read_bytes()
         )
     except (FileNotFoundError, ModuleNotFoundError, OSError):
         here = os.path.dirname(os.path.abspath(__file__))
-        with open(
-            os.path.join(here, "web", "index.html"), encoding="utf-8"
-        ) as fobj:
+        with open(os.path.join(here, "web", "index.html"), "rb") as fobj:
             return fobj.read()
+
+
+def load_index_html() -> str:
+    """Return the dashboard source for callers that need text.
+
+    Serving the page uses the byte cache directly: keeping a decoded copy
+    too multiplies the resident size of this Unicode-heavy document.
+    """
+    return _index_document()[0].decode("utf-8")
 
 
 @lru_cache(maxsize=1)
 def _index_document() -> tuple[bytes, str]:
     """The dashboard as ``(utf-8 bytes, ETag)``, built once.
 
-    ``load_index_html`` caches the DECODE; this caches the encode, which
-    aiohttp's ``text=`` argument would otherwise redo per response. The tag
-    is fixed because the document is static package data with no per-request
-    or per-viewer content.
+    Cache only the wire bytes, without retaining a second decoded copy.
+    The tag is fixed because the document is static package data with no
+    per-request or per-viewer content.
     """
-    raw = load_index_html().encode("utf-8")
+    raw = _load_index_bytes()
     return raw, '"' + hashlib.sha256(raw).hexdigest()[:32] + '"'
 
 
@@ -1362,10 +1367,8 @@ def _index_document() -> tuple[bytes, str]:
 def _index_gzip() -> bytes:
     """The dashboard pre-compressed once, for clients that accept gzip.
 
-    NOTE the cache chain is three deep: ``load_index_html`` (decode),
-    ``_index_document`` (encode plus ETag) and this (compression). They are
-    independent lru_caches, so a test that swaps the page out must clear
-    ALL THREE to change what GET / actually serves.
+    Both this cache and ``_index_document`` must be cleared by a test that
+    swaps out the bundled page.
     """
     return _gzip_body(_index_document()[0])
 

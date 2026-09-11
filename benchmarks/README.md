@@ -46,6 +46,14 @@ Local numbers are only comparable to other runs on the same machine in the
 same session. The CI comparison is paired for exactly that reason: both
 versions run interleaved on one runner, in the same weather.
 
+`--only mem.retired_output_1k` measures memory retained by 1,000 completed
+log streams after their output is superseded. Each stream first fills a
+1,000-line ring, then releases it while its history summary stays alive.
+This catches deque storage that remains allocated after the lines are
+cleared, which a cold-start RSS measurement cannot see. The byte and
+object-lifetime checks for idle output writers and the dashboard cache
+live in `tests/test_perf_invariants.py`.
+
 ## What CI does with this
 
 The `perf` job in `.github/workflows/release.yml` runs on every push and PR,

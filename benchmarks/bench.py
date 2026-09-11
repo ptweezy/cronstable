@@ -6065,6 +6065,42 @@ def bench_mem_jobconfig():
     return (after - before) / 1048576.0
 
 
+@bench(
+    "mem.retired_output_1k",
+    "memory",
+    detail="traced MB retained by 1k superseded, formerly full log streams",
+    unit="MB",
+    gate_pct=15.0,
+    gate_floor=0.5,
+    compare="median",
+    repeats=(3, 2, 1),
+)
+def bench_mem_retired_output():
+    from cronstable.job import JobOutputStream
+
+    if not hasattr(JobOutputStream, "release_lines"):
+        raise Skip("JobOutputStream.release_lines unavailable")
+    n = _n(1000)
+    gc.collect()
+    tracemalloc.start()
+    try:
+        before, _ = tracemalloc.get_traced_memory()
+        streams = []
+        for _ in range(n):
+            stream = JobOutputStream(limit=1000)
+            for _ in range(1000):
+                stream.publish("stdout", "a captured line\n")
+            stream.close()
+            stream.release_lines()
+            streams.append(stream)
+        gc.collect()
+        after, _ = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    del streams
+    return (after - before) / 1048576.0
+
+
 _RSS_WRAPPER = (
     "import resource,subprocess,sys\n"
     "r=subprocess.run(sys.argv[1:],stdout=subprocess.DEVNULL,"
