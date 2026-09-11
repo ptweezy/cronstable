@@ -40,6 +40,8 @@ example
 scripts
 target
 tests
+acceptance
+acceptance-results
 .editorconfig
 .gitignore
 

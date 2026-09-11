@@ -97,6 +97,71 @@ def test_publication_consumes_only_prepared_artifacts():
     assert jobs["docker-push"]["strategy"]["fail-fast"] is False
 
 
+@pytest.mark.parametrize(
+    "name,layouts",
+    [
+        ("binaries", 1),
+        ("binaries-container", 1),
+        ("binaries-macos", 1),
+        ("binaries-windows", 2),
+    ],
+)
+def test_native_binary_acceptance_is_in_the_release_gate(name, layouts):
+    jobs = workflow()["jobs"]
+    assert name in ancestors(jobs, "release")
+    steps = jobs[name]["steps"]
+    acceptance = [s for s in steps if "--cronstable-bin" in s.get("run", "")]
+    assert len(acceptance) == layouts
+    for step in acceptance:
+        assert not step.get("continue-on-error", False)
+        run = step["run"]
+        assert "-m pytest -c acceptance/pytest.ini acceptance" in run
+        assert "--expected-version" in run
+        assert "--junitxml acceptance-results/" in run
+        assert "--acceptance-output acceptance-results" in run
+        # The test invocation must not be followed by shell error suppression.
+        invocation = run[run.index("-m pytest") :].split("--junitxml", 1)[1]
+        assert "||" not in invocation.splitlines()[0]
+    evidence = [
+        s
+        for s in steps
+        if s.get("name") == "Upload binary acceptance evidence"
+    ]
+    assert len(evidence) == 1
+    assert "always()" in evidence[0]["if"]
+    assert evidence[0]["with"]["path"] == "acceptance-results/"
+    assert evidence[0]["with"]["name"].startswith("acceptance-")
+    if name == "binaries-macos":
+        names = [s.get("name") for s in steps]
+        assert names.index("Sign and notarize") < names.index(
+            "Test binary acceptance"
+        )
+        assert names.index("Test binary acceptance") < names.index(
+            "Rename binary"
+        )
+    elif name == "binaries":
+        assert (
+            'if [ "${{ matrix.native }}" = "1" ]; then' in acceptance[0]["run"]
+        )
+        native = [
+            r["arch"]
+            for r in jobs[name]["strategy"]["matrix"]["include"]
+            if r.get("native") == "1"
+        ]
+        assert {"amd64", "amd64v3", "arm64"} <= set(native)
+    elif name == "binaries-container":
+        assert (
+            'if [ "${{ matrix.qemu }}" != "true" ]; then'
+            in acceptance[0]["run"]
+        )
+    else:
+        assert "--cronstable-bin dist/cronstable.exe" in acceptance[0]["run"]
+        assert (
+            "--cronstable-bin dist/cronstable/cronstable.exe"
+            in acceptance[1]["run"]
+        )
+
+
 def test_each_docker_platform_has_one_build_and_only_its_required_wheel():
     matrix = load("docker_matrix")
     source = json.loads((ROOT / ".github/docker-matrix.json").read_text())

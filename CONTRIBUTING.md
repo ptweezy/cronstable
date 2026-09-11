@@ -84,7 +84,13 @@ where they start at once and always run to completion.
 
 ## Running the checks
 
-`tox` drives everything CI runs:
+For tests of the actual packaged executable, see
+[binary acceptance](acceptance/README.md). That separate suite drives real
+scheduled jobs, state CLI calls, pending retries across restart, and graceful
+shutdown on native Linux, macOS, and Windows binary builds. It requires an
+explicit binary path and runs independently of the source coverage suite.
+
+`tox` drives the source tests and static checks:
 
 ```sh
 tox                # all envs: py310-py314 (each in a windows and a posix arm),

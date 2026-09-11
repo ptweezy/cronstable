@@ -1046,14 +1046,18 @@ jobs:
                   exit 1
                 }
               fi
-              # A job that shells out to the CLI, asserted on the KV side
-              # effect: proves the daemon PyInstaller env scrub against the
-              # real bootloader, which no venv test reaches. Native rows only;
-              # it needs a live daemon and loopback HTTP, and the rest of this
-              # matrix is emulated. The scrub it proves is shared Python code,
-              # identical on every lane.
+              # Black-box acceptance on native rows, inside the build libc:
+              # scheduled CLI state, restart durability, retry and drain.
+              # The driver imports no cronstable modules; jobs use only the
+              # frozen CLI and the native shell. Emulated rows keep smoke/ABI
+              # coverage until their runtime budgets are measured separately.
               if [ "${{ matrix.native }}" = "1" ]; then
-                bash /src/.github/scripts/cli_job_smoke.sh dist/cronstable
+                $PIP install -r acceptance/requirements.txt
+                $PY -m pytest -c acceptance/pytest.ini acceptance \
+                  --cronstable-bin dist/cronstable \
+                  --expected-version "$SETUPTOOLS_SCM_PRETEND_VERSION" \
+                  --acceptance-output acceptance-results \
+                  --junitxml acceptance-results/junit.xml
               fi
               # Assert the binary is the architecture this row claims: an image
               # that resolved to the wrong platform passes every smoke above and
@@ -1070,6 +1074,14 @@ jobs:
                 --max-glibc ${{ matrix.floor }} --no-exec-stack ${{ matrix.armgate }}
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
             '
+      - name: Upload binary acceptance evidence
+        if: ${{ always() && matrix.native == '1' }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: acceptance-linux-${{ matrix.arch }}
+          path: acceptance-results/
+          if-no-files-found: warn
+          retention-days: 7
       # The container runs as root and pip creates its cache files via
       # tempfile (mode 0600), so without this the runner-user tar in
       # actions/cache's save step cannot read them.
@@ -1448,10 +1460,16 @@ jobs:
                   exit 1
                 }
               fi
-              # The CLI-from-job smoke (cli_job_smoke.sh) runs on the native
-              # lanes only: it needs a daemon, loopback HTTP and curl, and
-              # most of these rows run under QEMU. The scrub it proves is
-              # shared Python code, identical on every lane.
+              # Exercise native musl and i686 glibc on their own libc. This
+              # needs no bash or curl in the container, only the driver deps.
+              if [ "${{ matrix.qemu }}" != "true" ]; then
+                python -m pip install -r acceptance/requirements.txt
+                python -m pytest -c acceptance/pytest.ini acceptance \
+                  --cronstable-bin dist/cronstable \
+                  --expected-version "$SETUPTOOLS_SCM_PRETEND_VERSION" \
+                  --acceptance-output acceptance-results \
+                  --junitxml acceptance-results/junit.xml
+              fi
               # Assert the glibc FLOOR on the rows that declare one, which no
               # functional test can see: the smoke ran on the same libc the
               # bundle was built against, so a dependency that starts
@@ -1501,6 +1519,14 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}"
+      - name: Upload binary acceptance evidence
+        if: ${{ always() && !matrix.qemu }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: acceptance-linux-${{ matrix.arch }}${{ matrix.suffix }}
+          path: acceptance-results/
+          if-no-files-found: warn
+          retention-days: 7
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
@@ -2284,10 +2310,6 @@ jobs:
               exit 1
             }
           fi
-          # A job that shells out to the CLI, asserted on the KV side effect:
-          # proves the daemon's PyInstaller env scrub against the real
-          # bootloader, which no venv test reaches (see the script header).
-          bash .github/scripts/cli_job_smoke.sh dist/cronstable
           # Assert the binary is the intended native arch: Rosetta would happily
           # run an x86_64 build on the arm64 runner and let the smoke test pass,
           # silently producing a mislabelled asset. `file` reports x86_64/arm64.
@@ -2332,6 +2354,27 @@ jobs:
             --issuer "$MACOS_NOTARY_ISSUER_ID" \
             --wait
         timeout-minutes: 20
+      # On a release this runs AFTER signing, against the executable we ship.
+      - name: Test binary acceptance
+        timeout-minutes: 10
+        env:
+          EXPECTED_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          uv pip install -r acceptance/requirements.txt
+          uv run python -m pytest -c acceptance/pytest.ini acceptance \
+            --cronstable-bin dist/cronstable \
+            --expected-version "$EXPECTED_VERSION" \
+            --acceptance-output acceptance-results \
+            --junitxml acceptance-results/junit.xml
+      - name: Upload binary acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: acceptance-${{ matrix.asset }}
+          path: acceptance-results/
+          if-no-files-found: warn
+          retention-days: 7
       - name: Rename binary
         run: |-
           mv dist/cronstable "dist/cronstable-${{ matrix.asset }}"
@@ -3226,10 +3269,14 @@ jobs:
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
           # fail closed at config validation when they cannot import).
           ./dist/cronstable.exe --validate-config -c pyinstaller/smoke-push.yaml
-          # A job that shells out to the CLI (through cmd.exe here), asserted
-          # on the KV side effect: proves the daemon's PyInstaller env scrub
-          # against the real bootloader (see the script header).
-          bash .github/scripts/cli_job_smoke.sh dist/cronstable.exe
+          # Both bootloader layouts get the same black-box scenarios. Install
+          # driver dependencies after freezing so pytest never enters a bundle.
+          uv pip install -r acceptance/requirements.txt
+          uv run python -m pytest -c acceptance/pytest.ini acceptance \
+            --cronstable-bin dist/cronstable.exe \
+            --expected-version "$SETUPTOOLS_SCM_PRETEND_VERSION" \
+            --acceptance-output acceptance-results/onefile \
+            --junitxml acceptance-results/onefile/junit.xml
           # Assert the PE is the arch this row claims. The i686 row builds on
           # the same x64 runner as amd64, where a 64-bit interpreter would
           # pass every smoke above and still ship under the 32-bit name; the
@@ -3287,10 +3334,11 @@ jobs:
           # share one Analysis and cannot drift.
           ./dist/cronstable/cronstable.exe --version
           ./dist/cronstable/cronstable.exe --validate-config -c pyinstaller/smoke-push.yaml
-          # The CLI-from-job smoke again, on the one-directory bootloader: a
-          # different runtime shape (single process, the one the service
-          # hosts), so it gets its own pass.
-          bash .github/scripts/cli_job_smoke.sh dist/cronstable/cronstable.exe
+          uv run python -m pytest -c acceptance/pytest.ini acceptance \
+            --cronstable-bin dist/cronstable/cronstable.exe \
+            --expected-version "${{ needs.version.outputs.new }}" \
+            --acceptance-output acceptance-results/onedir \
+            --junitxml acceptance-results/onedir/junit.xml
           # A real SCM round trip, because hosting a service is this
           # artifact's whole point and the hosted runners are elevated.
           # `service install` only needs the -c path to exist (it is baked
@@ -3438,6 +3486,15 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+
+      - name: Upload binary acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: acceptance-windows-${{ matrix.arch }}
+          path: acceptance-results/
+          if-no-files-found: warn
+          retention-days: 7
 
   # cryptography wheels for the image platforms PyPI publishes none for, so
   # every image seals post-quantum push on every arch it ships. Built once
