@@ -87,7 +87,11 @@ def artifact(request):
         shutil.copy2(source, binary)
         binary.chmod(binary.stat().st_mode | 0o111)
         if (source.parent / "_internal").is_dir():
-            shutil.copytree(source.parent / "_internal", bindir / "_internal")
+            shutil.copytree(
+                source.parent / "_internal",
+                bindir / "_internal",
+                symlinks=True,
+            )
         yield binary, root, output
 
 

@@ -224,7 +224,8 @@ class Daemon:
         self._remember_children()
         shutdown_error = None
         if self.process is not None and self.process.poll() is None:
-            (self.work / "drain.release").touch()
+            for barrier in ("drain.release", "retry.release"):
+                (self.work / barrier).touch()
             try:
                 self.stop()
             except (AssertionError, OSError, urllib.error.URLError) as exc:
