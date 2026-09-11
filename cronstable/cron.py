@@ -1984,6 +1984,9 @@ class Cron:
         # list of cron jobs already running
         # name -> list of RunningJob
         self.running_jobs: dict[str, list[RunningJob]] = defaultdict(list)
+        # Instances awaiting reaper registration, keyed by identity so a
+        # removal can release a pending instance in constant time.
+        self._reaper_pending: dict[int, RunningJob] = {}
         # name -> lock serialising maybe_launch_job per job: the
         # Forbid/Replace gate reads running_jobs several awaits before the
         # launch appends, so unserialized entries could double-launch.
@@ -10386,7 +10389,6 @@ class Cron:
                 lambda: self._persist_inflight_open(job, running_job),
             )
         logger.info("Job %s spawned", job.name)
-        self._jobs_running.set()
         return True
 
     # --- cluster-wide concurrency slots (concurrencyScope: cluster) -------
@@ -11432,15 +11434,18 @@ class Cron:
                 ex,
             )
 
-    # continually watches for the running jobs, clean them up when they exit
     async def _wait_for_running_jobs(self) -> None:
-        # job -> wait task
+        """Register waits for launched jobs and handle their completions."""
         wait_tasks: dict[RunningJob, asyncio.Task] = {}
-        # The wait task's done callback files the job here and sets
-        # `completed`: O(1) per finish. asyncio.wait over every wait task
-        # would register and remove a waiter per running job per
-        # completion, quadratic in the running count
-        # (loop.stall_completions_500 measures it).
+        # One scan covers jobs already running when this reaper starts,
+        # including the final shutdown drain. Later launches register
+        # through _add_running_instance.
+        self._reaper_pending.update(
+            (id(job), job)
+            for jobs in self.running_jobs.values()
+            for job in jobs
+        )
+        # Each wait task files its completion in constant time.
         finished: list[RunningJob] = []
         completed = asyncio.Event()
 
@@ -11456,22 +11461,21 @@ class Cron:
         try:
             while self.running_jobs or not self._stop_event.is_set():
                 try:
-                    for jobs in self.running_jobs.values():
-                        for job in jobs:
-                            if job not in wait_tasks:
-                                task = asyncio.create_task(job.wait())
-                                wait_tasks[job] = task
-                                task.add_done_callback(partial(_on_done, job))
+                    for job in list(self._reaper_pending.values()):
+                        if job not in wait_tasks:
+                            task = asyncio.create_task(job.wait())
+                            wait_tasks[job] = task
+                            task.add_done_callback(partial(_on_done, job))
+                        self._reaper_pending.pop(id(job), None)
+                    # Registration and clearing share one event-loop turn.
+                    # Clear even when empty: a pending job can be removed
+                    # before the reaper consumes its launch notification.
+                    self._jobs_running.clear()
                     if not wait_tasks:
                         # Nothing running: block until a launch or shutdown
                         # (the only events that change the loop condition).
                         await self._jobs_running.wait()
                         continue
-                    # Every job now running has its wait task registered
-                    # above, with no await in between, so clearing here
-                    # cannot swallow a launch notification for a job the
-                    # wait set does not cover.
-                    self._jobs_running.clear()
                     if not finished:
                         if event_wait is None or event_wait.done():
                             event_wait = asyncio.create_task(
@@ -11518,6 +11522,16 @@ class Cron:
                                     "please report this as a bug (6)",
                                     job.config.name,
                                 )
+                                # A handler can fail before removing the
+                                # instance. Keep it eligible for another
+                                # completion attempt.
+                                if any(
+                                    instance is job
+                                    for instance in self.running_jobs.get(
+                                        job.config.name, ()
+                                    )
+                                ):
+                                    self._reaper_pending[id(job)] = job
                     finally:
                         # Flush buffered DAG-task completions in one RMW
                         # per run. In a finally: the buffer holds
@@ -11537,17 +11551,17 @@ class Cron:
                     waiter.cancel()
 
     def _add_running_instance(self, running_job: RunningJob) -> bool:
-        """Register a launched instance; the ONE writer adding to
-        ``running_jobs``.
+        """Register a launched instance and notify the reaper.
 
-        Every launch funnels through here so the memo bust cannot be
-        forgotten (running must flip on the next poll, not age out by
-        TTL). The source-shape test pins the funnel.
+        Every launch adds to ``running_jobs`` through this helper, which
+        queues its wait registration and invalidates response memos.
         """
         # returns True when this is the job's first live instance
         name = running_job.config.name
         first = not self.running_jobs.get(name)
         self.running_jobs[name].append(running_job)
+        self._reaper_pending[id(running_job)] = running_job
+        self._jobs_running.set()
         self._bust_response_memos()
         return first
 
@@ -11565,6 +11579,7 @@ class Cron:
         # _handle_finished_job's strict KeyError/ValueError crash-on-bug
         # behavior
         name = running_job.config.name
+        self._reaper_pending.pop(id(running_job), None)
         if missing_ok:
             jobs_list = self.running_jobs.get(name)
             if jobs_list is None:

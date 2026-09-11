@@ -3932,6 +3932,60 @@ def bench_tui_drawer_paint():
     return dt
 
 
+@bench(
+    "tui.dag_graph_paint_2k",
+    "tui",
+    detail="2k-task chain and fan-in graphs, 500 frames each",
+    repeats=(3, 2, 1),
+    gate_floor=0.005,
+)
+def bench_tui_dag_graph_paint():
+    """Measure DAG layout and repeated rendering within a terminal viewport.
+
+    A chain exercises the row limit; a wide fan-in exercises the column
+    limit and edge rows. Each graph starts with a cold layout and is
+    painted repeatedly from the same metadata and run-state snapshots.
+    """
+    tui = _tui_module()
+    if not hasattr(tui.TuiApp, "_dag_graph_tab"):
+        raise Skip("TuiApp._dag_graph_tab not present")
+    try:
+        app = tui.TuiApp(None, None, None, dict(tui.PREF_DEFAULTS))
+    except TypeError as exc:
+        raise Skip("TuiApp construction changed: %r" % exc) from None
+    n = _n(2000, floor=2)
+    paints = _n(500)
+    names = ["t%05d" % i for i in range(n)]
+    chain = [
+        {"id": name, "dependsOn": [names[i - 1]] if i else []}
+        for i, name in enumerate(names)
+    ]
+    fanin = [{"id": name} for name in names]
+    fanin[-1]["dependsOn"] = names[:-1]
+    run_tasks = [{"key": name, "state": "running"} for name in names]
+    graphs = [
+        ({"tasks": chain}, {"tasks": run_tasks}),
+        (
+            {"tasks": fanin},
+            {"tasks": {task["key"]: task for task in run_tasks}},
+        ),
+    ]
+    paint = tui.Painter(app.theme)
+    width, body_lines = 120, 40
+    t0 = time.perf_counter()
+    for dag, run in graphs:
+        app.dag_run = run
+        for _ in range(paints):
+            rows = app._dag_graph_tab(paint, dag, width, body_lines)
+        if (
+            not rows
+            or len(rows) > body_lines
+            or "t00000 running" not in tui.strip_ansi(rows[0])
+        ):
+            raise RuntimeError("DAG graph paint did not render the fixture")
+    return time.perf_counter() - t0
+
+
 # ---------------------------------------------------------------------------
 # webui: the browser dashboard's render hot paths, timed inside a headless
 # Chromium via the page's ?perf=1 __perf hook.  The whole group skips unless
@@ -4693,21 +4747,15 @@ class _BenchFinishedJob:
     gate_floor=0.005,
 )
 def bench_loop_stall_completions():
-    """The reaper's per-completion wait-set rebuild at fleet scale.
+    """Measure reaper bookkeeping across staggered job completions.
 
-    _wait_for_running_jobs re-enters asyncio.wait over the WHOLE running set
-    on every batch, so a fleet finishing its jobs one at a time pays
-    O(running) waiter registrations per completion, quadratic in the
-    number of concurrently running jobs, on the scheduler's own loop.
-    Nothing else measures the reaper: every job metric times one run's
-    pipeline, and the completions here are deliberately resolved ONE at a
-    time because a simultaneous burst is handled in a single batch and would
-    time the shape the quadratic does not have.
+    The fleet starts with all jobs running, then finishes them one at a
+    time. Two event-loop turns between finishes let the reaper process
+    completions as the running set shrinks.
 
-    _handle_finished_job is checked positively and then neutered: it is the
-    durable-record / report / retry pipeline, which has its own metrics and
-    would otherwise dominate (and would need a state backend to be
-    meaningful).  What is left is exactly the reaper's own bookkeeping.
+    A stub completion handler records handled jobs. Durable writes,
+    reports, and retries have separate metrics, so this measurement
+    isolates the reaper's bookkeeping.
     """
     import asyncio
     import inspect
@@ -4749,8 +4797,7 @@ def bench_loop_stall_completions():
         for job in jobs:
             job.finish()
             cron.running_jobs.pop(job.config.name, None)
-            # two turns: one for the reaper to observe the completion, one
-            # for it to rebuild its wait set before the next finish
+            # Give the reaper two event-loop turns between completions.
             await asyncio.sleep(0)
             await asyncio.sleep(0)
         # bounded: a wedged reaper must record as a broken benchmark, not

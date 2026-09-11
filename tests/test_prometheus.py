@@ -682,6 +682,37 @@ async def test_next_run_reads_seeded_next_fire_index():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("schedule", ["0 0 31W 2 *", "0 0 0 1 1 * 2025"])
+async def test_next_run_skips_known_dead_schedules(monkeypatch, schedule):
+    cron = Cron(
+        None,
+        config_yaml=_NEXT_RUN_GATE
+        + f"""
+  - name: dead
+    command: echo hi
+    schedule: "{schedule}"
+""",
+    )
+    now = datetime.datetime(2026, 9, 9, tzinfo=datetime.timezone.utc)
+    cron._ensure_seeded(now)
+    assert "dead" in cron._dead_schedules
+    assert "dead" not in cron._next_fire
+    when = cron._next_fire["cron-on"]
+
+    def unexpected_next_delay(*args, **kwargs):
+        pytest.fail("metrics recomputed a seeded schedule")
+
+    monkeypatch.setattr(
+        "cronstable.config.JobConfig.next_delay", unexpected_next_delay
+    )
+    for openmetrics in (False, True):
+        text = cron.metrics.render(cron, openmetrics=openmetrics)
+        assert _next_run_ts(text, job_name="dead") is None
+        assert _next_run_ts(text, job_name="cron-on") == when.timestamp()
+        assert _job_enabled(text, job_name="dead") == 1
+
+
+@pytest.mark.asyncio
 async def test_web_metrics_handler_reports_pause_state():
     # the configured-job warm-up gives every job a paused sample from the
     # first scrape (0 until the scheduler pushes a pause), and no SLA

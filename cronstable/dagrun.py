@@ -284,6 +284,12 @@ class DagScheduler:
         self._summaries_memo: dict[
             str, tuple[float, list[dict[str, Any]]]
         ] = {}
+        # Requests for the same store, DAG and generation share a refresh.
+        # Each caller shields the task from its own cancellation.
+        self._summaries_inflight: dict[
+            tuple[StateBackend, str, int],
+            asyncio.Task[Optional[list[dict[str, Any]]]],
+        ] = {}
         # Bumped whenever the memo above is popped or cleared. The pop alone
         # cannot uphold the pop-on-local-write contract: an uncached rebuild
         # spans awaits, and a write landing in that window pops an entry that
@@ -1955,7 +1961,6 @@ class DagScheduler:
             )
             return None
         self._cron._add_running_instance(running)
-        self._cron._jobs_running.set()
         pid = running.proc.pid if running.proc is not None else None
         # the pid is NOT stamped here: the caller collects every launched
         # (taskkey, proc, pid, attempt) and stamps the whole batch in one
@@ -2654,6 +2659,7 @@ class DagScheduler:
         for the cold cache / large-delta case and when the backend cannot list
         keys only. Returns None on a hiccup, matching the old degrade
         behaviour."""
+        gen = self._summaries_gen
         try:
             docs = await asyncio.wait_for(
                 backend.list_documents(ns), timeout=STATE_OP_TIMEOUT
@@ -2662,14 +2668,15 @@ class DagScheduler:
             raise
         except Exception:  # noqa: BLE001 - degrade, never fail /dags
             return None
-        cache = self._dag_summary_cache.setdefault(name, {})
-        cache.clear()
+        cache = {}
         summaries = []
         for body in docs:
             s = self._summarize_run(body)
             summaries.append(s)
             if isinstance(s["runKey"], str):
                 cache[s["runKey"]] = s
+        if gen == self._summaries_gen and backend is self._backend():
+            self._dag_summary_cache[name] = cache
         return summaries
 
     async def _bulk_rollup(
@@ -2686,13 +2693,12 @@ class DagScheduler:
     ) -> Optional[list[dict[str, Any]]]:
         """Every retained run's summary, memoized for DAG_SUMMARY_LIST_TTL.
 
-        The memo serves the poll traffic of a QUIESCENT dag from memory:
-        without it the keys listing below still hit the store once per dag
-        per /dags poll (and per run-drawer refresh) per viewer.  A fresh
-        shallow copy is returned each time because list_runs sorts its
-        result in place.  Failures are never memoized, and local writes pop
-        the entry (see _mutate), so the TTL delays only remote nodes'
-        changes.
+        Concurrent requests share a refresh for the same store, DAG and
+        generation. Cancelling a request leaves the shared refresh running.
+        Each caller gets a shallow copy because list_runs sorts in place.
+        Failed reads are shared with waiting callers but remain uncached.
+        Local writes invalidate the memo and start a new generation, so
+        requests arriving after a write read fresh state.
         """
         memo = self._summaries_memo.get(name)
         if (
@@ -2700,18 +2706,38 @@ class DagScheduler:
             and time.monotonic() - memo[0] < DAG_SUMMARY_LIST_TTL
         ):
             return list(memo[1])
-        # sampled before the rebuild's first await: a local write landing
-        # mid-rebuild pops a memo entry that does not exist yet, so only a
-        # moved generation can flag that the rebuild below saw pre-write
-        # state which must not be memoized, or the pop-on-local-write
-        # contract breaks for a full TTL (see _summaries_gen).
         gen = self._summaries_gen
+        key = (backend, name, gen)
+        pending = self._summaries_inflight.get(key)
+        if pending is None:
+            pending = asyncio.create_task(
+                self._refresh_run_summaries(backend, name, gen)
+            )
+            self._summaries_inflight[key] = pending
+
+            def finished(done: asyncio.Task) -> None:
+                if self._summaries_inflight.get(key) is done:
+                    del self._summaries_inflight[key]
+                # Retrieve unexpected errors even if every caller cancelled.
+                if not done.cancelled():
+                    done.exception()
+
+            pending.add_done_callback(finished)
+        summaries = await asyncio.shield(pending)
+        return list(summaries) if summaries is not None else None
+
+    async def _refresh_run_summaries(
+        self, backend: StateBackend, name: str, gen: int
+    ) -> Optional[list[dict[str, Any]]]:
+        """Cache a shared result while its generation is current."""
         summaries = await self._run_summaries_uncached(backend, name)
-        if summaries is not None:
-            if gen == self._summaries_gen:
-                self._summaries_memo[name] = (time.monotonic(), summaries)
-            return list(summaries)
-        return None
+        if (
+            summaries is not None
+            and gen == self._summaries_gen
+            and backend is self._backend()
+        ):
+            self._summaries_memo[name] = (time.monotonic(), summaries)
+        return summaries
 
     async def _run_summaries_uncached(
         self, backend: StateBackend, name: str
@@ -2726,6 +2752,10 @@ class DagScheduler:
         need reading at once (cold cache). Best-effort: returns None (the
         caller degrades) rather than failing the request.
         """
+        gen = self._summaries_gen
+        # Build privately: an older read must not overwrite a newer
+        # generation's terminal summaries or restore a deleted run.
+        cache = dict(self._dag_summary_cache.get(name, {}))
         ns = self._ns(name)
         try:
             keys = await asyncio.wait_for(
@@ -2738,7 +2768,6 @@ class DagScheduler:
         if keys is None:
             # backend has no keys-only listing: one full parse, no caching win
             return await self._bulk_summaries(backend, ns, name)
-        cache = self._dag_summary_cache.setdefault(name, {})
         keyset = set(keys)
         for gone in [k for k in cache if k not in keyset]:
             del cache[gone]
@@ -2760,6 +2789,8 @@ class DagScheduler:
                 cache.pop(key, None)  # deleted since the listing
                 continue
             cache[key] = self._summarize_run(body)
+        if gen == self._summaries_gen and backend is self._backend():
+            self._dag_summary_cache[name] = cache
         return list(cache.values())
 
     async def _dag_run_rollup(
@@ -3040,6 +3071,11 @@ class DagScheduler:
 
     async def shutdown(self) -> None:
         """Release every held advance lease and stop the renewers."""
+        refreshes = list(self._summaries_inflight.values())
+        for refresh in refreshes:
+            refresh.cancel()
+        if refreshes:
+            await asyncio.gather(*refreshes, return_exceptions=True)
         if self._service_task is not None and not self._service_task.done():
             self._service_task.cancel()
         for task in list(self._catchup_tasks):
@@ -3065,6 +3101,9 @@ class DagScheduler:
         move they are dropped, but never settled: their launch keys stay,
         so a still-RUNNING entry of ours is not read as a lost claim.
         """
+        for refresh in self._summaries_inflight.values():
+            refresh.cancel()
+        self._summaries_inflight.clear()
         if self._service_task is not None and not self._service_task.done():
             self._service_task.cancel()
         self._service_task = None

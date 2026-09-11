@@ -2844,6 +2844,7 @@ INPUT_HOMES = {
 _TimelineEntry = tuple[str, Optional[str], str, Any, str, Any]
 _PaletteRow = tuple[str, str, Callable[[], Any]]
 _FleetMatrix = tuple[list[dict[str, Any]], int, int, int, list[str]]
+_DagGraphLayer = tuple[int, list[str], list[tuple[str, list[str]]]]
 
 
 class App:
@@ -2954,6 +2955,12 @@ class App:
         self.dag_xcom: Optional[dict[str, Any]] = None
         self.dag_sel = 0
         self.dag_task_tail: Optional[LogTail] = None
+        # Each memo holds one task snapshot. API refreshes replace the
+        # task containers; closing the drawer releases the snapshots.
+        self._dag_graph_memo: Optional[tuple[Any, list[_DagGraphLayer]]] = None
+        self._dag_graph_run_memo: Optional[
+            tuple[list[Any], dict[str, Any]]
+        ] = None
 
         # ---- multi-tail ----
         self.tails: list[LogTail] = []
@@ -4162,6 +4169,8 @@ class AppActions(App):
             self.dag_task_tail.stop()
             self.dag_task_tail = None
         self.dag_name = None
+        self._dag_graph_memo = None
+        self._dag_graph_run_memo = None
 
     def open_tail(self, names: list[str]) -> None:
         self.open("tail")
@@ -8139,15 +8148,11 @@ class AppDrawers(AppOverlays):
             rows.append(paint.style("  no runs yet — t to trigger one", "dim"))
         return rows
 
-    def _dag_graph_tab(
-        self,
-        paint: Painter,
-        dag: dict[str, Any],
-        width: int,
-        body_lines: int,
-    ) -> list[str]:
-        """The task graph as topological layers with edge lists."""
-        tasks = dag.get("tasks")
+    def _dag_graph_layout(self, tasks: Any) -> list[_DagGraphLayer]:
+        """Cache each layer's depth, sorted task keys, and dependencies."""
+        cached = self._dag_graph_memo
+        if cached is not None and cached[0] is tasks:
+            return cached[1]
         if isinstance(tasks, dict):
             task_list = [
                 dict(v, key=k) if isinstance(v, dict) else {"key": k}
@@ -8157,69 +8162,135 @@ class AppDrawers(AppOverlays):
             task_list = [t for t in tasks if isinstance(t, dict)]
         else:
             task_list = []
-        if not task_list:
-            return [paint.style("  no task metadata", "dim")]
         # config entries name a task "id" (see dags_payload); run docs
         # key their tasks dict by the same string
         by_key = {
             str(t.get("id") or t.get("key") or t.get("name", "")): t
             for t in task_list
         }
-        depth_cache: dict[str, int] = {}
-
-        def depth(key: str, seen: tuple[str, ...] = ()) -> int:
-            if key in depth_cache:
-                return depth_cache[key]
-            if key in seen:  # cycle guard; the daemon validates anyway
-                return 0
-            task = by_key.get(key) or {}
+        dependencies: dict[str, list[str]] = {}
+        for key, task in by_key.items():
             deps = task.get("dependsOn") or task.get("depends_on") or []
             if isinstance(deps, str):
                 deps = [deps]
-            level = (
-                1 + max(depth(str(d), seen + (key,)) for d in deps)
-                if deps
-                else 0
-            )
-            depth_cache[key] = level
-            return level
+            dependencies[key] = [str(dep) for dep in deps]
+
+        # Enter and finish tasks on an explicit stack. Active ancestors
+        # break malformed cycles at depth zero; missing dependencies also
+        # have depth zero. Traversal visits each task and edge a constant
+        # number of times.
+        depth_cache: dict[str, int] = {}
+        active: set[str] = set()
+        for root in by_key:
+            if root in depth_cache:
+                continue
+            stack = [(root, False)]
+            while stack:
+                key, expanded = stack.pop()
+                if key in depth_cache:
+                    continue
+                deps = dependencies.get(key, [])
+                if expanded:
+                    depth_cache[key] = max(
+                        (depth_cache.get(dep, 0) + 1 for dep in deps),
+                        default=0,
+                    )
+                    active.remove(key)
+                elif key not in active:
+                    active.add(key)
+                    stack.append((key, True))
+                    stack.extend(
+                        (dep, False)
+                        for dep in reversed(deps)
+                        if dep not in active and dep not in depth_cache
+                    )
 
         layers: dict[int, list[str]] = {}
         for key in by_key:
-            layers.setdefault(depth(key), []).append(key)
-        run_states: dict[str, str] = {}
-        for task in self.dag_run_tasks():
-            run_states[str(task.get("key", ""))] = str(task.get("state", ""))
+            layers.setdefault(depth_cache[key], []).append(key)
+        layout: list[_DagGraphLayer] = []
+        for level in sorted(layers):
+            names = sorted(layers[level])
+            # A wide root layer can skip all its empty edge lists on paint.
+            incoming = [
+                (name, dependencies[name])
+                for name in names
+                if dependencies[name]
+            ]
+            layout.append((level, names, incoming))
+        self._dag_graph_memo = (tasks, layout)
+        return layout
+
+    def _dag_graph_tab(
+        self,
+        paint: Painter,
+        dag: dict[str, Any],
+        width: int,
+        body_lines: int,
+    ) -> list[str]:
+        """Render the task graph within the visible rows and columns."""
+        content_width = width - 4
+        if body_lines <= 0 or content_width <= 0:
+            return []
+        layout = self._dag_graph_layout(dag.get("tasks"))
+        if not layout:
+            return [paint.style("  no task metadata", "dim")]
+
+        run_tasks = (self.dag_run or {}).get("tasks")
+        if isinstance(run_tasks, list):
+            cached = self._dag_graph_run_memo
+            if cached is None or cached[0] is not run_tasks:
+                cached = (
+                    run_tasks,
+                    {
+                        str(task.get("key", "")): task
+                        for task in run_tasks
+                        if isinstance(task, dict)
+                    },
+                )
+                self._dag_graph_run_memo = cached
+            run_lookup = cached[1]
+        else:
+            self._dag_graph_run_memo = None
+            run_lookup = run_tasks if isinstance(run_tasks, dict) else {}
+
         rows: list[str] = []
         ascii_mode = bool(self.prefs["ascii"])
         arrow = "->" if ascii_mode else "─▶"
-        for level in sorted(layers):
-            names = sorted(layers[level])
-            spans = [paint.style(" %d " % level, "dim")]
+        for level, names, incoming in layout:
+            if len(rows) >= body_lines:
+                break
+            label = " %d " % level
+            used = len(label)
+            spans = [paint.style(label, "dim")]
             for name in names:
-                state = run_states.get(name, "")
-                color = self._dag_state_color(state) if state else "fg"
-                spans.append(
-                    paint.style(
-                        "[%s%s]" % (name, (" " + state) if state else ""),
-                        color,
-                        bold=bool(state),
-                    )
+                if used >= content_width:
+                    break
+                task = run_lookup.get(name)
+                state = (
+                    str(task.get("state", ""))
+                    if isinstance(task, dict)
+                    else ""
                 )
+                color = self._dag_state_color(state) if state else "fg"
+                label = "[%s%s]" % (name, (" " + state) if state else "")
+                spans.append(paint.style(label, color, bold=bool(state)))
                 spans.append(paint.style(" ", "fg"))
-            rows.append(cut_to_width("".join(spans), width - 4))
-            for name in names:
-                task = by_key[name] or {}
-                deps = task.get("dependsOn") or task.get("depends_on") or []
-                if isinstance(deps, str):
-                    deps = [deps]
+                used += text_width(label) + 1
+            rows.append(cut_to_width("".join(spans), content_width))
+            for name, deps in incoming:
                 for dep in deps:
+                    if len(rows) >= body_lines:
+                        return rows
                     rows.append(
-                        paint.style(
-                            "     %s %s %s" % (dep, arrow, name), "dim"
+                        cut_to_width(
+                            paint.style(
+                                "     %s %s %s" % (dep, arrow, name), "dim"
+                            ),
+                            content_width,
                         )
                     )
-        return rows[:body_lines]
+        return rows
 
     def _dag_tasks_tab(
         self, paint: Painter, width: int, body_lines: int

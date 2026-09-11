@@ -685,10 +685,196 @@ class _EventRunningJob:
         self.config = SimpleNamespace(name=name)
         self.exit = asyncio.Event()
         self.filed = asyncio.Event()
+        self.waiting = asyncio.Event()
+        self.wait_calls = 0
 
     async def wait(self):
+        self.wait_calls += 1
+        self.waiting.set()
         await self.exit.wait()
         asyncio.current_task().add_done_callback(lambda _t: self.filed.set())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [100, 200])
+async def test_reaper_registration_work_is_linear(monkeypatch, count):
+    cron = Cron(None)
+    visits = 0
+
+    class CountedJobs(list):
+        def __iter__(self):
+            nonlocal visits
+            for job in super().__iter__():
+                visits += 1
+                yield job
+
+    jobs = [_EventRunningJob(str(i // 2)) for i in range(count)]
+    for job in jobs:
+        cron.running_jobs.setdefault(job.config.name, CountedJobs()).append(
+            job
+        )
+
+    handled = asyncio.Queue()
+
+    async def finish(job):
+        cron._remove_running_instance(job)
+        handled.put_nowait(job)
+
+    monkeypatch.setattr(cron, "_handle_finished_job", finish)
+    reaper = asyncio.create_task(cron._wait_for_running_jobs())
+    try:
+        await asyncio.wait_for(jobs[-1].waiting.wait(), timeout=2)
+        for job in jobs:
+            job.exit.set()
+            assert await asyncio.wait_for(handled.get(), timeout=2) is job
+    finally:
+        for job in jobs:
+            job.exit.set()
+        cron.signal_shutdown()
+        await asyncio.wait_for(reaper, timeout=2)
+
+    assert all(job.wait_calls == 1 for job in jobs)
+    assert not cron.running_jobs
+    assert visits <= count, (
+        f"{count} staggered completions visited {visits} running instances; "
+        "registration must scan the running set at most once"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_registers_launches_while_idle_and_busy(monkeypatch):
+    cron = Cron(None)
+    parked = asyncio.Event()
+    original_wait = cron._jobs_running.wait
+
+    async def wait_for_launch():
+        parked.set()
+        return await original_wait()
+
+    monkeypatch.setattr(cron._jobs_running, "wait", wait_for_launch)
+    handled = asyncio.Queue()
+
+    async def finish(job):
+        cron._remove_running_instance(job)
+        handled.put_nowait(job)
+
+    monkeypatch.setattr(cron, "_handle_finished_job", finish)
+    jobs = [_EventRunningJob("same-name") for _ in range(2)]
+    reaper = asyncio.create_task(cron._wait_for_running_jobs())
+    try:
+        await asyncio.wait_for(parked.wait(), timeout=2)
+        for job in jobs:
+            cron._add_running_instance(job)
+            await asyncio.wait_for(job.waiting.wait(), timeout=2)
+        for job in jobs:
+            job.exit.set()
+            assert await asyncio.wait_for(handled.get(), timeout=2) is job
+    finally:
+        for job in jobs:
+            job.exit.set()
+        cron.signal_shutdown()
+        await asyncio.wait_for(reaper, timeout=2)
+
+    assert all(job.wait_calls == 1 for job in jobs)
+    assert not cron.running_jobs
+    assert not cron._reaper_pending
+
+
+@pytest.mark.asyncio
+async def test_reaper_drains_launch_during_completion_handler(monkeypatch):
+    cron = Cron(None)
+    first, second = (
+        _EventRunningJob("same-name"),
+        _EventRunningJob("same-name"),
+    )
+    cron._add_running_instance(first)
+    handled = asyncio.Queue()
+    release = asyncio.Event()
+
+    async def finish(job):
+        cron._remove_running_instance(job)
+        handled.put_nowait(job)
+        if job is first:
+            await release.wait()
+
+    monkeypatch.setattr(cron, "_handle_finished_job", finish)
+    reaper = asyncio.create_task(cron._wait_for_running_jobs())
+    try:
+        first.exit.set()
+        assert await asyncio.wait_for(handled.get(), timeout=2) is first
+        cron._add_running_instance(second)
+        second.exit.set()
+        cron.signal_shutdown()
+        release.set()
+        assert await asyncio.wait_for(handled.get(), timeout=2) is second
+    finally:
+        first.exit.set()
+        second.exit.set()
+        release.set()
+        cron.signal_shutdown()
+        await asyncio.wait_for(reaper, timeout=2)
+
+    assert first.wait_calls == second.wait_calls == 1
+    assert not cron.running_jobs
+    assert not cron._reaper_pending
+
+
+@pytest.mark.asyncio
+async def test_reaper_releases_removed_pending_instance_and_parks(monkeypatch):
+    import gc
+    import weakref
+
+    cron = Cron(None)
+    job = _EventRunningJob("removed")
+    ref = weakref.ref(job)
+    cron._add_running_instance(job)
+    cron._remove_running_instance(job, missing_ok=True)
+    del job
+    gc.collect()
+    assert ref() is None
+
+    idle_states = asyncio.Queue()
+    original_wait = cron._jobs_running.wait
+
+    async def wait_for_launch():
+        idle_states.put_nowait(cron._jobs_running.is_set())
+        await asyncio.sleep(0)
+        return await original_wait()
+
+    monkeypatch.setattr(cron._jobs_running, "wait", wait_for_launch)
+    reaper = asyncio.create_task(cron._wait_for_running_jobs())
+    try:
+        assert await asyncio.wait_for(idle_states.get(), timeout=2) is False
+        assert not reaper.done()
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(reaper, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_reaper_retries_handler_failure_before_instance_removal(
+    monkeypatch, caplog
+):
+    cron = Cron(None)
+    job = _EventRunningJob("retry-cleanup")
+    job.exit.set()
+    cron._add_running_instance(job)
+    cron.signal_shutdown()
+    attempts = 0
+
+    async def finish(job):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("cleanup failed")
+        cron._remove_running_instance(job)
+
+    monkeypatch.setattr(cron, "_handle_finished_job", finish)
+    await asyncio.wait_for(cron._wait_for_running_jobs(), timeout=2)
+    assert attempts == 2
+    assert not cron.running_jobs
+    assert not cron._reaper_pending
+    assert "bug (6)" in caplog.text
 
 
 @pytest.mark.asyncio
