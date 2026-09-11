@@ -2,6 +2,13 @@
 
 ## 1.2.52
 
+- Add shared resource pools for jobs and DAG tasks, with weighted capacity,
+  durable priority queues, deadlines, and dashboard/API/MCP controls.
+- Add result verification before recording success or starting downstream
+  tasks, with diagnostics and the job's existing failure and retry handling.
+- Add workflow recovery previews for retrying failed tasks, restarting from
+  selected tasks, or replaying failed dates while reusing retained results
+  and artifacts.
 - Reduce overhead for staggered job starts and completions, concurrent
   workflow status reads, and large workflow graphs in the terminal UI.
   Prometheus skips repeated searches for schedules with no future runs.
