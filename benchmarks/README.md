@@ -210,12 +210,18 @@ directions, on every platform, in milliseconds.
 
 The dashboards have their own hot paths, and both are measured.
 
-The **terminal UI** (`tui.*`) is pure Python, so it is benchmarked in process
-like everything else: the log drawer re-measures, re-cuts and re-inks its whole
-buffer each frame and the log search re-scans it, so `tui.log_restyle_5k` and
-`tui.log_search_20k` drive `text_width` / `cut_to_width` / `rewrite_sgr` /
-`strip_ansi` over a realistic buffer (coloured, plain, wide-glyph and
-control-character lines). No terminal and no app loop.
+The terminal UI (`tui.*`) is benchmarked in process, without a terminal or app
+loop. `tui.log_restyle_5k` and `tui.log_search_20k` measure text transforms and
+search across buffers containing ANSI colors, wide glyphs, and control
+characters. `tui.drawer_paint_5k` measures the log drawer's scroll and redraw
+paths, including its ANSI cache.
+
+`tui.dag_graph_paint_2k` paints a 2,000-task chain and a wide fan-in graph
+500 times each. Each graph starts with a cold layout cache. The renderer
+computes dependency layers iteratively and caches them for the current task
+snapshot. Redraws build visible rows and stop styling task labels at the right
+edge of the viewport. Run-state snapshots use a task lookup so redraws can
+read the states of visible tasks directly.
 
 The **web UI** (`webui.*`) is browser JavaScript, so it is timed inside a
 headless Chromium via Playwright. The page exposes a `window.__perf` hook ONLY

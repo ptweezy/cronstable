@@ -45,8 +45,8 @@ name: CI
 # On a release, once EVERY build + test job above has succeeded (the gate),
 # and ONLY then, the pipeline publishes: the wheel + sdist to PyPI via Trusted
 # Publishing (OIDC, skip-existing so a retry is a no-op), tags the commit
-# (RELEASE_TOKEN so the tag can point at a commit that touches
-# .github/workflows/), cuts a GitHub Release with ALL prebuilt binaries + a
+# (using optional RELEASE_TOKEN or the job GITHUB_TOKEN), cuts a GitHub
+# Release with ALL prebuilt binaries + a
 # single SHA256SUMS, pushes every Docker image, and updates the Homebrew tap.
 # Build, packaging, manifest and checksum validation finish before publication.
 # External publishing services can still fail; PyPI precedes tag creation so a
@@ -1606,6 +1606,8 @@ jobs:
               retry 5 apt-get -o Acquire::Retries=5 -qq update
               retry 5 apt-get -o Acquire::Retries=5 -qq install -y --no-install-recommends \
                 python3 python3-venv python3-dev build-essential zlib1g-dev libffi-dev pkg-config
+              # pip runs as root; the mounted checkout belongs to the runner.
+              mkdir -p /src/.pip-cache && chown -R root:root /src/.pip-cache
               python3 -VV
               python3 -m venv /v
               retry 5 /v/bin/pip install --upgrade pip setuptools wheel
@@ -2032,6 +2034,8 @@ jobs:
               # 668), which PIP_BREAK_SYSTEM_PACKAGES answers without needing
               # a venv the way the Debian-packaged interpreters do.
               ${{ matrix.toolchain }}
+              # Own both newly created and restored caches before pip runs.
+              mkdir -p /src/.pip-cache && chown -R root:root /src/.pip-cache
               python3 -VV
               pip install --upgrade pip
               # Not wrapped in retry: with no loong64 wheel on PyPI this
@@ -4223,19 +4227,29 @@ jobs:
         if: steps.decide.outputs.signed == 'true'
         timeout-minutes: 10
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
-            Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser
-            Repair-WinGetPackageManager
-          }
+          $wingetVersion = '1.29.290'
+          # The pinned client supports the generated manifest schema.
+          Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser
+          Repair-WinGetPackageManager -Version $wingetVersion -Force
           $client = Get-Command winget.exe -ErrorAction SilentlyContinue
           if ($client) {
-            & $client.Source validate --manifest winget-manifests --disable-interactivity
+            $clientPath = $client.Source
           } else {
             $package = Get-AppxPackage Microsoft.DesktopAppInstaller
-            & (Join-Path $package.InstallLocation 'winget.exe') validate --manifest winget-manifests --disable-interactivity
+            if (-not $package) { throw 'WinGet executable unavailable after repair' }
+            $clientPath = Join-Path $package.InstallLocation 'winget.exe'
           }
+          $actualVersion = (& $clientPath --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "winget --version failed ($LASTEXITCODE)" }
+          Write-Host "WinGet client: $actualVersion ($clientPath)"
+          if ($actualVersion -ne "v$wingetVersion") {
+            throw "Expected WinGet v$wingetVersion, found $actualVersion"
+          }
+          & $clientPath validate --manifest winget-manifests --disable-interactivity
           if ($LASTEXITCODE -ne 0) { throw "winget validate failed ($LASTEXITCODE)" }
       - name: Preserve winget validation evidence
         if: always() && steps.decide.outputs.signed == 'true'
@@ -4603,21 +4617,15 @@ jobs:
             exit 1
           fi
           git tag -a "$NEW" -m "Release $NEW"
-          # The default GITHUB_TOKEN is the GitHub Actions *App*, and GitHub
-          # forbids an App from pushing a ref that creates/updates any file under
-          # .github/workflows/ unless the token carries the `workflows` scope --
-          # which is NOT grantable to GITHUB_TOKEN. This release tag points at a
-          # commit that may itself modify this workflow, so pushing it with
-          # GITHUB_TOKEN is rejected. Push instead with RELEASE_TOKEN -- a PAT or
-          # GitHub App token with `workflow` scope (fine-grained: Contents +
-          # Workflows: write) -- exactly like the cross-repo Homebrew push uses
-          # HOMEBREW_TAP_TOKEN. If it is unset we fall back to GITHUB_TOKEN with a
-          # warning (works only when the tagged commit doesn't touch
-          # .github/workflows/).
+          # RELEASE_TOKEN is an optional override. Ordinary main releases use
+          # the job's contents:write GITHUB_TOKEN, as release 1.2.50 did.
+          # Additional workflow authorization can be required for target commits
+          # with workflow changes relative to the default branch; it is not a
+          # blanket requirement for tagging commits already on main.
           if [ -n "${RELEASE_TOKEN:-}" ]; then
             git push "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$NEW"
           else
-            echo "::warning::RELEASE_TOKEN not set; pushing the tag with the default GITHUB_TOKEN. This FAILS if the tagged commit modifies .github/workflows/ -- set RELEASE_TOKEN (Contents + Workflows: write) to fix."
+            echo "::notice::RELEASE_TOKEN not set; pushing the tag with the job GITHUB_TOKEN (contents: write)."
             git push origin "refs/tags/$NEW"
           fi
 
@@ -4891,6 +4899,7 @@ jobs:
   # Submit the ptweezy.cronstable manifest to microsoft/winget-pkgs for each
   # release. Use the manifests validated by sign-windows and verify that the
   # published installer hashes match the scanned files before submission.
+  # Set ReleaseDate from the release's publication timestamp in UTC.
   #
   # WINGET_TOKEN is a classic PAT with public_repo scope. Its account creates
   # the fork and PRs. After submission succeeds, cleanup closes that account's
@@ -4936,6 +4945,15 @@ jobs:
         run: |
           set -euo pipefail
           python .github/scripts/verify_winget_release.py "$VERSION" winget-validation/metadata.json winget-assets
+      - name: Set winget release date
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          python -m pip install strictyaml==1.7.3
+          published_at="$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq '.publishedAt')"
+          python .github/scripts/set_winget_release_date.py "$VERSION" "$published_at" winget-manifests/ptweezy.cronstable.installer.yaml
       - name: Submit winget manifest
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}

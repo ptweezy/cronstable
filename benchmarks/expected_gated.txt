@@ -104,6 +104,7 @@ state.list_records_2k
 state.list_records_warm
 state.mutate_document_1k
 statsd.emit_2k
+tui.dag_graph_paint_2k
 tui.drawer_paint_5k
 tui.log_restyle_5k
 tui.log_search_20k

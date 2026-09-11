@@ -14,6 +14,7 @@ from strictyaml.ruamel import YAML
 PACKAGE = "ptweezy.cronstable"
 REPO = "https://github.com/ptweezy/cronstable"
 ARCHES = {"amd64": "x64", "arm64": "arm64"}
+MANIFEST_VERSION = "1.12.0"
 
 
 def render(version, metadata, output):
@@ -77,9 +78,30 @@ def render(version, metadata, output):
             "PackageUrl": REPO,
             "License": "MIT",
             "LicenseUrl": f"{REPO}/blob/{version}/LICENSE",
+            "Copyright": "\n".join(
+                line
+                for line in (Path(__file__).resolve().parents[2] / "LICENSE")
+                .read_text("utf-8")
+                .splitlines()
+                if line.startswith("Copyright ")
+            ),
+            "CopyrightUrl": f"{REPO}/blob/{version}/LICENSE",
             "ShortDescription": "A distributed cron replacement.",
             "Moniker": "cronstable",
-            "Tags": ["cron", "crontab", "scheduler", "job-scheduler"],
+            "Tags": [
+                "cron",
+                "crontab",
+                "scheduler",
+                "job-scheduler",
+                "task-scheduler",
+                "cronjob",
+                "container",
+                "docker",
+                "kubernetes",
+                "devops",
+                "sre",
+                "sysadmin",
+            ],
             "ReleaseNotesUrl": f"{REPO}/releases/tag/{version}",
             "Documentations": [
                 {
@@ -99,7 +121,14 @@ def render(version, metadata, output):
         with (output / filename).open(
             "w", encoding="utf-8", newline="\n"
         ) as f:
-            yaml.dump({**common, **body, "ManifestVersion": "1.12.0"}, f)
+            f.write(
+                "# yaml-language-server: $schema="
+                "https://aka.ms/winget-manifest."
+                f"{body['ManifestType']}.{MANIFEST_VERSION}.schema.json\n"
+            )
+            yaml.dump(
+                {**common, **body, "ManifestVersion": MANIFEST_VERSION}, f
+            )
 
 
 if __name__ == "__main__":

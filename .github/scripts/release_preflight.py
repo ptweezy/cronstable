@@ -6,7 +6,6 @@ import re
 import urllib.request
 
 REQUIRED = (
-    "RELEASE_TOKEN",
     "HOMEBREW_TAP_TOKEN",
     "WINGET_TOKEN",
     "AZURE_TENANT_ID",
@@ -65,10 +64,16 @@ def github(path, token):
 
 
 def authenticate(env):
-    for secret, repo in (
-        ("RELEASE_TOKEN", env["GITHUB_REPOSITORY"]),
-        ("HOMEBREW_TAP_TOKEN", "ptweezy/homebrew-tap"),
-    ):
+    repositories = [("HOMEBREW_TAP_TOKEN", "ptweezy/homebrew-tap")]
+    if env.get("RELEASE_TOKEN"):
+        repositories.append(("RELEASE_TOKEN", env["GITHUB_REPOSITORY"]))
+    else:
+        # The publishing job has its own contents:write GITHUB_TOKEN. Its
+        # established fallback does not require a separately stored PAT.
+        print(
+            "RELEASE_TOKEN not configured; tag publication uses GITHUB_TOKEN"
+        )
+    for secret, repo in repositories:
         result, headers = github("repos/" + repo, env[secret])
         if not result.get("permissions", {}).get("push", False):
             raise ValueError(f"{secret} does not report push access to {repo}")

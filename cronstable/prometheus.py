@@ -1368,22 +1368,18 @@ class PrometheusMetrics:
             )
             enabled.add(labels, 1 if job_config.enabled else 0)
             running.add(labels, len(cron.running_jobs.get(name) or ()))
-            # Reuse the scheduler's authoritative next-fire instant instead of
-            # re-walking the crontab and building two aware datetimes per job
-            # per scrape: cron._next_fire holds the aware-UTC next fire for
-            # exactly the enabled CronTab jobs, maintained incrementally by the
-            # loop (and computed the same way the fallback below does). This is
-            # the steady-state path.
+            # Read scheduled jobs from the next-fire index. Jobs in
+            # _dead_schedules have no future occurrence and need no search.
             when = cron._next_fire.get(name)
             if when is not None:
                 next_run.add(labels, when.timestamp())
-            elif job_config.enabled and isinstance(
-                job_config.schedule, CronTab
+            elif (
+                job_config.enabled
+                and isinstance(job_config.schedule, CronTab)
+                and name not in cron._dead_schedules
             ):
-                # Index not yet seeded: a scrape in the startup window before
-                # the loop's first tick, or metrics rendered on a Cron whose
-                # loop never ran. Compute the next fire directly so the gauge
-                # is still emitted (absent for disabled/@reboot jobs).
+                # Before the scheduler seeds the index, compute the next fire
+                # directly so enabled cron jobs can expose a timestamp.
                 seconds = job_config.next_delay(get_now(datetime.timezone.utc))
                 if seconds is not None:
                     next_run.add(

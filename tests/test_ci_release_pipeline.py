@@ -183,6 +183,61 @@ def test_optional_channels_require_consistent_configuration(release_env):
         pre.validate("1.2.3", dict(release_env, DOCKERHUB_USERNAME="user"))
 
 
+@pytest.mark.parametrize("token", [None, "", "custom-release-token"])
+def test_release_token_override_is_optional(monkeypatch, release_env, token):
+    pre = load("release_preflight")
+    env = dict(release_env, GITHUB_REPOSITORY="ptweezy/cronstable")
+    if token is not None:
+        env["RELEASE_TOKEN"] = token
+    calls = []
+
+    def github(path, credential):
+        calls.append((path, credential))
+        return {"permissions": {"push": True}}, {
+            "X-OAuth-Scopes": "repo, workflow"
+        }
+
+    monkeypatch.setattr(pre, "github", github)
+    pre.validate("1.2.51", env)
+    pre.authenticate(env)
+    assert ("repos/ptweezy/homebrew-tap", env["HOMEBREW_TAP_TOKEN"]) in calls
+    assert ("user", env["WINGET_TOKEN"]) in calls
+    release_calls = [c for c in calls if c[0] == "repos/ptweezy/cronstable"]
+    assert release_calls == (
+        [("repos/ptweezy/cronstable", token)] if token else []
+    )
+    release = workflow()["jobs"]["release"]
+    assert release["permissions"]["contents"] == "write"
+    tag = next(
+        s for s in release["steps"] if s.get("name") == "Tag the release"
+    )
+    assert 'git push origin "refs/tags/$NEW"' in tag["run"]
+
+
+@pytest.mark.parametrize(
+    "push, scopes", [(False, "repo, workflow"), (True, "repo")]
+)
+def test_configured_release_token_still_requires_access(
+    monkeypatch, release_env, push, scopes
+):
+    pre = load("release_preflight")
+
+    def github(path, credential):
+        if credential == "invalid-release-token":
+            return {"permissions": {"push": push}}, {"X-OAuth-Scopes": scopes}
+        return {"permissions": {"push": True}}, {"X-OAuth-Scopes": "repo"}
+
+    monkeypatch.setattr(pre, "github", github)
+    with pytest.raises(ValueError, match="RELEASE_TOKEN"):
+        pre.authenticate(
+            dict(
+                release_env,
+                GITHUB_REPOSITORY="ptweezy/cronstable",
+                RELEASE_TOKEN="invalid-release-token",
+            )
+        )
+
+
 def test_pypi_preflight_exchanges_identity_without_publishing(monkeypatch):
     pre = load("release_preflight")
     calls = []
@@ -364,13 +419,34 @@ def test_oci_merge_keeps_all_platforms_and_original_manifest_digests(tmp_path):
     assert merged["manifests"][2]["platform"]["variant"] == "v7"
 
 
+@pytest.mark.parametrize("flat", [False, True])
+def test_oci_merge_single_platform_download(tmp_path, flat):
+    oci = load("oci_images")
+    archive = image_archive(tmp_path)
+    if flat:
+        archive = archive.replace(tmp_path / "image.tar")
+    with tarfile.open(archive) as tar:
+        original = json.load(tar.extractfile("index.json"))["manifests"][0]
+    output = tmp_path / "merged"
+    oci.merge(tmp_path, "debian", "linux/amd64", output, "1.2.3", "abc")
+    top = json.loads((output / "index.json").read_text())["manifests"][0]
+    merged = json.loads(oci.blob(output, top).read_text())
+    assert len(merged["manifests"]) == 1
+    assert merged["manifests"][0]["digest"] == original["digest"]
+    assert merged["manifests"][0]["platform"] == {
+        "os": "linux",
+        "architecture": "amd64",
+    }
+
+
 @pytest.mark.parametrize(
     "case",
     ["corrupt", "version", "revision", "missing", "wrong-arch", "duplicate"],
 )
-def test_oci_assembly_blocks_invalid_release_images(tmp_path, case):
+@pytest.mark.parametrize("flat", [False, True])
+def test_oci_assembly_blocks_invalid_release_images(tmp_path, case, flat):
     oci = load("oci_images")
-    image_archive(
+    archive = image_archive(
         tmp_path,
         version="9.9.9" if case == "version" else "1.2.3",
         revision="wrong" if case == "revision" else "abc",
@@ -381,10 +457,11 @@ def test_oci_assembly_blocks_invalid_release_images(tmp_path, case):
         platforms += ",linux/arm64"
     if case == "duplicate":
         platforms += ",linux/amd64"
+    if flat:
+        archive.replace(tmp_path / "image.tar")
     if case == "wrong-arch":
-        (tmp_path / "image-debian-linux-amd64").rename(
-            tmp_path / "image-debian-linux-arm64"
-        )
+        if not flat:
+            archive.parent.rename(tmp_path / "image-debian-linux-arm64")
         platforms = "linux/arm64"
     with pytest.raises((ValueError, FileNotFoundError)):
         oci.merge(
@@ -417,6 +494,22 @@ def test_cache_budget_does_not_delete_other_cache_families_or_branches():
         dict(base, id=4, key="pq-work-other", ref="refs/heads/feature"),
     ]
     assert prune.victims(caches, budget=100) == [1]
+
+
+@pytest.mark.parametrize("job", ["binaries-mips", "binaries-loong64"])
+def test_source_wheel_cache_is_owned_before_pip_runs(job):
+    steps = workflow()["jobs"][job]["steps"]
+    build = next(
+        step["run"]
+        for step in steps
+        if step.get("name", "").startswith("Build binary")
+    )
+    # A cache miss leaves no directory, and a hit restores runner ownership.
+    # Both must be handled inside the root container before its first pip.
+    create = build.index("mkdir -p /src/.pip-cache")
+    own = build.index("chown -R root:root /src/.pip-cache")
+    install = build.index("pip install")
+    assert build.index("sh -euc '") < create < own < install
 
 
 def test_compiler_cache_changes_with_toolchain_flags_and_openssl(
