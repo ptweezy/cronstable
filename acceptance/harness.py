@@ -58,7 +58,7 @@ class Daemon:
             if scheduled
             else (
                 f'      year: "{datetime.now(timezone.utc).year + 1}"\n'
-                '      month: "1"\n      day: "1"\n'
+                '      month: "1"\n      dayOfMonth: "1"\n'
                 '      hour: "0"\n      minute: "0"\n      second: "0"\n'
             )
         )
