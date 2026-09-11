@@ -97,10 +97,15 @@ def test_publication_consumes_only_prepared_artifacts():
     assert jobs["docker-push"]["strategy"]["fail-fast"] is False
 
 
-@pytest.mark.parametrize("name,layouts", [
-    ("binaries", 1), ("binaries-container", 1),
-    ("binaries-macos", 1), ("binaries-windows", 2),
-])
+@pytest.mark.parametrize(
+    "name,layouts",
+    [
+        ("binaries", 1),
+        ("binaries-container", 1),
+        ("binaries-macos", 1),
+        ("binaries-windows", 2),
+    ],
+)
 def test_native_binary_acceptance_is_in_the_release_gate(name, layouts):
     jobs = workflow()["jobs"]
     assert name in ancestors(jobs, "release")

@@ -1,3 +1,4 @@
+import time
 import urllib.error
 from datetime import datetime
 
@@ -66,6 +67,7 @@ def test_scheduled_cli_state_survives_restart(daemon):
 def test_pending_retry_survives_restart(daemon):
     daemon.configure("retry", "retry", retry=True)
     daemon.start()
+    (daemon.work / "retry.release").touch()
 
     def pending_failure():
         job = daemon.request("/jobs/retry")
@@ -112,8 +114,13 @@ def test_shutdown_drains_running_job(daemon):
     )
     assert not daemon.lines("finished.log")
     daemon.begin_shutdown()
-    assert daemon.process.poll() is None, (
-        "Daemon exited before the active job finished"
+    # Hold the barrier long enough to observe an early-exit regression before
+    # allowing the workload to complete. wait() checks liveness every poll.
+    requested = time.monotonic()
+    daemon.wait(
+        "keeping the daemon alive while the job is draining",
+        lambda: time.monotonic() - requested >= 1,
+        timeout=5,
     )
     (daemon.work / "drain.release").touch()
     daemon.finish_shutdown()

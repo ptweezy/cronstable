@@ -246,5 +246,6 @@ class Daemon:
         assert not alive, f"Acceptance processes survived cleanup: {alive}"
         if shutdown_error is not None:
             raise AssertionError(
-                f"Graceful cleanup failed; forced teardown; logs: {self.evidence}"
+                "Graceful cleanup failed; forced teardown; "
+                f"logs: {self.evidence}"
             ) from shutdown_error

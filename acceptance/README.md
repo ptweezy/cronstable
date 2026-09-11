@@ -51,7 +51,8 @@ teardown tracks and kills surviving descendants across process groups.
 | Pending retry and restart | A scheduled `@reboot` run fails with exit 23; a pending retry is visible; the daemon stops before retrying; restart alone produces exactly one successful retry at or after its saved deadline and retains both outcomes. |
 | Graceful drain | A real job blocks on a file controlled by the driver; shutdown acknowledges the drain; releasing the file lets the job finish; the daemon exits successfully and closes its listener. |
 
-The retry's 30-second delay leaves time for shutdown and restart. Other
+The driver releases the initial failure only after daemon readiness; the
+retry's 30-second delay then leaves time for shutdown and restart. Other
 scenarios synchronize on observable events, not assumed startup durations.
 The drain workload also has its own deadline so it cannot wait forever if
 the driver disappears. Forced termination, crash recovery, and service
