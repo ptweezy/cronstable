@@ -34,7 +34,9 @@ class Daemon:
         # The target cannot find an editable install or another cronstable on
         # the driver's PATH. Native scripts use only the OS shell/utilities.
         if os.name == "nt":
-            system = Path(self.env["SystemRoot"])
+            # Windows os.environ normalizes keys to uppercase. Its plain
+            # dict copy above no longer supports case-insensitive lookups.
+            system = Path(self.env["SYSTEMROOT"])
             search = os.pathsep.join(map(str, [system / "System32", system]))
         else:
             search = os.defpath
