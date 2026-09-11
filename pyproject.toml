@@ -168,7 +168,7 @@ speedups = [
 # `pynacl` and `cryptography>=48,<49` by hand there.
 push = [
     "pynacl>=1.6.2",
-    "cryptography>=48; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "cryptography>=48,<51; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     "cryptography>=48,<49; (sys_platform == 'darwin' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'x86')",
 ]
 # Zero-config LAN discovery (the opt-in `web.bonjour` mDNS advert; see
@@ -181,7 +181,7 @@ dev = [
     # push extra (the second is the capped Intel macOS and 32-bit
     # Windows line); see requirements_dev.txt for what the tests do where
     # they resolve to nothing.
-    "cryptography>=48; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+    "cryptography>=48,<51; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     "cryptography>=48,<49; (sys_platform == 'darwin' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'x86')",
     # The optional-extra deps the tests must really exercise (orjson, pynacl,
     # zeroconf); requirements_dev.txt documents why each is here.  Without
