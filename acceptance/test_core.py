@@ -1,4 +1,5 @@
 import urllib.error
+from datetime import datetime
 
 import pytest
 
@@ -65,7 +66,6 @@ def test_scheduled_cli_state_survives_restart(daemon):
 def test_pending_retry_survives_restart(daemon):
     daemon.configure("retry", "retry", retry=True)
     daemon.start()
-    daemon.request("/jobs/retry/start", method="POST")
 
     def pending_failure():
         job = daemon.request("/jobs/retry")
@@ -77,12 +77,13 @@ def test_pending_retry_survives_restart(daemon):
         "arming a retry after a deliberate failure", pending_failure
     )
     assert retry["attempt"] == 1 and retry["nextRetryAt"]
+    not_before = datetime.fromisoformat(retry["nextRetryAt"])
     assert daemon.lines("attempts.log") == ["attempt"]
     daemon.stop()
     assert daemon.lines("attempts.log") == ["attempt"], (
         "Retry ran before restart"
     )
-    daemon.start()  # No second POST: only the durable retry can start work.
+    daemon.start()  # The durable @reboot marker prevents a fresh boot run.
     assert daemon.runs("retry")[0]["exit_code"] == 23
     daemon.wait(
         "completing the restored retry",
@@ -92,10 +93,12 @@ def test_pending_retry_survives_restart(daemon):
         "settling the retry ladder",
         lambda: not daemon.request("/jobs/retry").get("retry"),
     )
-    assert [(r["outcome"], r["exit_code"]) for r in daemon.runs("retry")] == [
+    runs = daemon.runs("retry")
+    assert [(r["outcome"], r["exit_code"]) for r in runs] == [
         ("failure", 23),
         ("success", 0),
     ]
+    assert datetime.fromisoformat(runs[1]["started_at"]) >= not_before
     daemon.stop()
     assert daemon.lines("attempts.log") == ["attempt", "attempt"]
 

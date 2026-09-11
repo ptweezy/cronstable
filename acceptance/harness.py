@@ -67,8 +67,13 @@ class Daemon:
             "  jobApi:\n    enabled: true\n"
             f"web:\n  listen:\n    - {self.url}\n"
             f"  authToken:\n    value: {self.token}\n"
-            f"jobs:\n  - name: {name}\n    schedule:\n{schedule}"
-            f"    command: {json.dumps(command)}\n"
+            f"jobs:\n  - name: {name}\n"
+            + (
+                '    schedule: "@reboot"\n'
+                if retry
+                else f"    schedule:\n{schedule}"
+            )
+            + f"    command: {json.dumps(command)}\n"
             "    captureStdout: true\n    captureStderr: true\n"
             "    concurrencyPolicy: Forbid\n    executionTimeout: 90\n"
         )
@@ -93,7 +98,11 @@ class Daemon:
             stderr=subprocess.STDOUT,
         )
         self.processes.append(proc)
-        self.descendants.add(psutil.Process(proc.pid))
+        try:
+            self.descendants.add(psutil.Process(proc.pid))
+        except psutil.NoSuchProcess:
+            # A tiny CLI command can already have exited on Windows.
+            pass
         return proc
 
     def _remember_children(self):
@@ -213,11 +222,13 @@ class Daemon:
         # Remember descendants before killing their parent: jobs create their
         # own process groups, so killing only the daemon's group leaks jobs.
         self._remember_children()
+        shutdown_error = None
         if self.process is not None and self.process.poll() is None:
             (self.work / "drain.release").touch()
             try:
                 self.stop()
             except (AssertionError, OSError, urllib.error.URLError) as exc:
+                shutdown_error = exc
                 (self.evidence / "cleanup.log").write_text(
                     str(exc), encoding="utf-8"
                 )
@@ -233,3 +244,7 @@ class Daemon:
         for log in self.logs:
             log.close()
         assert not alive, f"Acceptance processes survived cleanup: {alive}"
+        if shutdown_error is not None:
+            raise AssertionError(
+                f"Graceful cleanup failed; forced teardown; logs: {self.evidence}"
+            ) from shutdown_error

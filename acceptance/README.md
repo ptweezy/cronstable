@@ -48,7 +48,7 @@ teardown tracks and kills surviving descendants across process groups.
 | --- | --- |
 | Startup and public surfaces | Exact version when specified; valid config accepted and invalid config rejected; authenticated API; unauthenticated request denied; bundled dashboard served. |
 | Scheduled CLI state and restart | At least two successful scheduled runs; a CLI read sees a prior run's random KV value; history survives restart; subsequent read-only jobs recover that value without writing it again. |
-| Pending retry and restart | One explicit API start fails with exit 23; a pending retry is visible; the daemon stops before retrying; restart alone produces exactly one successful retry and retains both outcomes. |
+| Pending retry and restart | A scheduled `@reboot` run fails with exit 23; a pending retry is visible; the daemon stops before retrying; restart alone produces exactly one successful retry at or after its saved deadline and retains both outcomes. |
 | Graceful drain | A real job blocks on a file controlled by the driver; shutdown acknowledges the drain; releasing the file lets the job finish; the daemon exits successfully and closes its listener. |
 
 The retry's 30-second delay leaves time for shutdown and restart. Other
