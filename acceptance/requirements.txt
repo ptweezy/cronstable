@@ -1,0 +1,3 @@
+# The driver never installs or imports cronstable.
+pytest>=8.2,<10
+psutil>=5.9
