@@ -48,6 +48,10 @@ alerting, durable state, orchestration, clustering, and a live dashboard.
 
 ### Failure handling
 
+* **Result verification**: a bounded `verify` command checks a job's output
+  before success is recorded or downstream tasks start. Check failures use
+  the job's reporting and retry policy (see
+  [result verification](https://github.com/ptweezy/cronstable/wiki/Result-Verification))
 * Flexible configuration: you decide how to determine if a cron job fails or not
 * Option to automatically retry failing cron jobs, with exponential backoff
 * Built-in sending of Sentry, Mail, and webhook (Slack-compatible)
@@ -73,6 +77,13 @@ alerting, durable state, orchestration, clustering, and a live dashboard.
 
 ### Durability and orchestration
 
+* **Shared resource pools**: jobs and DAG tasks share weighted capacity,
+  durable priority queues, and queue deadlines (see
+  [resource pools](https://github.com/ptweezy/cronstable/wiki/Resource-Pools))
+* **Selective workflow recovery**: preview and retry failed tasks, recover
+  from a chosen task, or replay failed dates while reusing retained successes
+  and artifacts (see
+  [workflow recovery](https://github.com/ptweezy/cronstable/wiki/Workflow-Recovery))
 * **Opt-in durable state**: point a single `state:` config block at a local
   directory (or an Amazon S3 Files / EFS mount to share it fleet-wide) and jobs
   gain durability: missed-run catch-up after downtime, and retries that

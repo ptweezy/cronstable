@@ -457,6 +457,8 @@ def outcome_key(outcome: Optional[str]) -> str:
 #: it and for the web's fg-faint fallback.  Coverage of dag.py's vocabulary
 #: is test-enforced (tests/test_tui.py).
 DAG_STATE_COLOR = {
+    "verifying": "run",
+    "queued": "pending",
     "pending": "pending",
     "running": "run",
     "up_for_retry": "pending",
@@ -3988,8 +3990,10 @@ class AppActions(App):
         except Exception as exc:  # noqa: BLE001 - toast + carry on
             self.toast("fail", "start %s: %s" % (name, exc))
             return
-        if status == 200:
-            self.toast("ok", "▶ started %s" % name)
+        if status in (200, 202):
+            self.toast(
+                "ok", ("queued %s" if status == 202 else "▶ started %s") % name
+            )
             self.refresh_now()
         elif status == 409:
             self.toast("warn", "%s is disabled" % name)

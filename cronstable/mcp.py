@@ -834,6 +834,71 @@ class MCPHandler:
             ),
             # ---- act (mutating job control; readOnly:false to expose) ----
             _tool(
+                "observe",
+                "cron_list_pools",
+                "List resource pools",
+                "Show pool capacity, queued work, and recent queue outcomes.",
+                obj({}),
+                self._t_list_pools,
+            ),
+            _tool(
+                "dags",
+                "cron_preview_recovery",
+                "Preview DAG recovery",
+                "Preview failed tasks or a selected task and its downstream "
+                "tasks. Supply run_key, or from and to for failed dates.",
+                obj(
+                    {
+                        "dag": _STR,
+                        "run_key": _STR,
+                        "from": _STR,
+                        "to": _STR,
+                        "mode": _STR,
+                        "tasks": {"type": "array", "items": _STR},
+                    },
+                    ["dag"],
+                ),
+                self._t_preview_recovery,
+            ),
+            _tool(
+                "dags",
+                "cron_recover_dag",
+                "Recover DAG work",
+                "Execute a reviewed recovery plan. Requires plan_token and "
+                "confirm=true. Creates a new run preserving successful work.",
+                obj(
+                    {
+                        "dag": _STR,
+                        "run_key": _STR,
+                        "from": _STR,
+                        "to": _STR,
+                        "mode": _STR,
+                        "tasks": {"type": "array", "items": _STR},
+                        "plan_token": _STR,
+                        "allow_config_change": _BOOL,
+                        "confirm": _BOOL,
+                    },
+                    ["dag", "plan_token"],
+                ),
+                self._t_recover_dag,
+                mutating=True,
+                idempotent=True,
+            ),
+            _tool(
+                "act",
+                "cron_cancel_queued",
+                "Cancel queued work",
+                "Cancel a waiting pool entry. Requires confirm=true.",
+                obj(
+                    {"pool": _STR, "id": _STR, "confirm": _BOOL},
+                    ["pool", "id"],
+                ),
+                self._t_cancel_queued,
+                mutating=True,
+                destructive=True,
+                idempotent=True,
+            ),
+            _tool(
                 "act",
                 "cron_run_job",
                 "Run job now",
@@ -1364,7 +1429,12 @@ class MCPHandler:
     async def _t_run_job(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         _require_confirm(args, "running")
-        await self._cron.start_job_by_name(name)
+        queued = await self._cron.start_job_by_name(name)
+        if queued is not None:
+            return _result(
+                {"queued": name, "queueId": queued},
+                "queued job {!r}".format(name),
+            )
         return _result({"started": name}, "started job {!r}".format(name))
 
     async def _t_cancel_job(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1400,6 +1470,78 @@ class MCPHandler:
         _require_confirm(args, "resuming")
         await self._cron.resume_job_by_name(name, by="mcp", channel="mcp")
         return _result({"resumed": name}, "resumed job {!r}".format(name))
+
+    async def _t_list_pools(self, args):
+        return _result(
+            {"pools": await self._cron._pools.snapshot()}, "resource pools"
+        )
+
+    async def _t_cancel_queued(self, args):
+        from cronstable.pools import PoolError
+
+        _require_confirm(args, "cancelling queued work")
+        try:
+            entry = await self._cron._pools.cancel(
+                _req_str(args, "pool"), _req_str(args, "id")
+            )
+        except PoolError as ex:
+            return _tool_error(str(ex))
+        return _result(
+            {"id": entry["id"], "state": entry["state"]},
+            "queued work cancelled",
+        )
+
+    async def _t_preview_recovery(self, args):
+        return await self._recovery_tool(args, execute=False)
+
+    async def _t_recover_dag(self, args):
+        _require_confirm(args, "recovering DAG work")
+        return await self._recovery_tool(args, execute=True)
+
+    async def _recovery_tool(self, args, *, execute):
+        from cronstable.recovery import RecoveryError
+
+        name = _req_str(args, "dag")
+        token = _req_str(args, "plan_token") if execute else None
+        tasks = args.get("tasks", [])
+        if (
+            not isinstance(tasks, list)
+            or len(tasks) > 2000
+            or any(not isinstance(t, str) for t in tasks)
+        ):
+            raise _ToolInputError(
+                "tasks must be a list of task instance names"
+            )
+        try:
+            if args.get("run_key"):
+                data = await self._cron._dag.recover(
+                    name,
+                    _req_str(args, "run_key"),
+                    mode=args.get("mode", "failed"),
+                    tasks=tasks,
+                    plan_token=token,
+                    allow_config_change=args.get("allow_config_change")
+                    is True,
+                )
+            else:
+                if tasks or args.get("mode", "failed") != "failed":
+                    raise _ToolInputError(
+                        "date ranges recover failed tasks; "
+                        "select run_key for mode 'from'"
+                    )
+                data = await self._cron._dag.recover_range(
+                    name,
+                    _req_str(args, "from"),
+                    _req_str(args, "to"),
+                    plan_token=token,
+                    allow_config_change=args.get("allow_config_change")
+                    is True,
+                )
+        except RecoveryError as ex:
+            return _tool_error(str(ex))
+        return _result(
+            data, "recovery started" if execute else "recovery preview"
+        )
 
     async def _t_trigger_dag(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")

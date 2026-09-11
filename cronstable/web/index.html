@@ -312,11 +312,11 @@
   }
 
   * { box-sizing: border-box; }
-  html { height: 100%; }
+  html { height: 100%; overflow-x: clip; }
   /* min-height (not height:100%) so the body box grows to contain all content.
      the sticky header's containing block is this box; a fixed 100% height caps
      it at one viewport, so the header un-sticks once you scroll past that. */
-  body { min-height: 100%; }
+  body { min-height: 100%; overflow-x: clip; }
   body {
     margin: 0;
     background: var(--bg);
@@ -522,8 +522,8 @@
   .st .label { font-weight: 600; }
   .st.ok .glyph, .st.ok .label { color: var(--ok); }
   .st.fail .glyph, .st.fail .label { color: var(--fail); }
-  .st.run .glyph, .st.run .label { color: var(--run); }
-  .st.pending .glyph, .st.pending .label { color: var(--pending); }
+  .st.verifying .glyph, .st.verifying .label, .st.run .glyph, .st.run .label { color: var(--run); }
+  .st.queued .glyph, .st.queued .label, .st.pending .glyph, .st.pending .label { color: var(--pending); }
   .st.disabled .glyph, .st.disabled .label { color: var(--disabled); }
   .st.cancelled .glyph, .st.cancelled .label { color: var(--cancelled); }
   .st.unknown .glyph, .st.unknown .label { color: var(--unknown); }
@@ -635,10 +635,11 @@
   .drawer {
     position: fixed; top: 0; right: 0; height: 100%; width: min(820px, 96vw);
     background: var(--panel); border-left: 1px solid var(--border2);
-    transform: translateX(100%); transition: transform .22s cubic-bezier(.22,.61,.36,1);
+    visibility: hidden;
+    transform: translateX(100%); transition: transform .22s cubic-bezier(.22,.61,.36,1), visibility 0s .22s;
     z-index: 50; display: flex; flex-direction: column;
   }
-  .drawer.open { transform: translateX(0); box-shadow: var(--shadow-lg); }  /* a parked drawer's shadow would bleed into the page edge */
+  .drawer.open { visibility: visible; transition-delay: 0s; transform: translateX(0); box-shadow: var(--shadow-lg); }
   .drawer-head { padding: 12px 16px; border-bottom: 1px solid var(--border); }
   .drawer-head .row1 { display: flex; align-items: center; gap: 9px; }
   .drawer-head h2 { margin: 0; font-size: 15px; font-weight: 700; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -681,7 +682,7 @@
   html[data-theme="carolina-light"] .term { background: #edf5fb; color: #123c5c; }
   .term.nowrap { white-space: pre; word-break: normal; }
   .term .ln { display: block; }
-  .term .ln.stderr { color: var(--fail); }
+  .term .ln.verify\.stderr, .term .ln.stderr { color: var(--fail); }
   .term .ln.sys { color: var(--fg-faint); font-style: italic; }
   .term .ln .gut { color: var(--fg-faint); user-select: none; display: inline-block; min-width: 3.5ch; margin-right: 10px; text-align: right; opacity: .6; }
   .term .ln .ts { color: var(--fg-faint); user-select: none; margin-right: 8px; opacity: .7; }
@@ -965,11 +966,11 @@
   .wb-tile.st-fail { border-color: color-mix(in srgb, var(--fail) 55%, var(--border)); border-width: 2px;
     background: color-mix(in srgb, var(--fail) 14%, var(--panel)); }
   .wb-tile.st-fail .wb-glyph { color: var(--fail); }
-  .wb-tile.st-run { background: color-mix(in srgb, var(--run) 8%, var(--panel)); }
-  .wb-tile.st-run .wb-glyph { color: var(--run); }
+  .wb-tile.st-verifying, .wb-tile.st-run { background: color-mix(in srgb, var(--run) 8%, var(--panel)); }
+  .wb-tile.st-verifying .wb-glyph, .wb-tile.st-run .wb-glyph { color: var(--run); }
   .wb-tile.st-ok .wb-glyph { color: var(--ok); }
-  .wb-tile.st-pending { background: color-mix(in srgb, var(--pending) 6%, var(--panel)); }
-  .wb-tile.st-pending .wb-glyph { color: var(--pending); }
+  .wb-tile.st-queued, .wb-tile.st-pending { background: color-mix(in srgb, var(--pending) 6%, var(--panel)); }
+  .wb-tile.st-queued .wb-glyph, .wb-tile.st-pending .wb-glyph { color: var(--pending); }
   .wb-tile.st-cancelled .wb-glyph { color: var(--cancelled); }
   .wb-tile.st-unknown { background: color-mix(in srgb, var(--unknown) 8%, var(--panel)); }
   .wb-tile.st-unknown .wb-glyph { color: var(--unknown); }
@@ -1358,6 +1359,12 @@
   .dst .g { width: 1.2ch; text-align: center; }
   .dst-pending        { color: var(--pending); }
   .dst-running        { color: var(--run); }
+  .dst-verifying      { color: var(--run); }
+  .dst-queued         { color: var(--pending); }
+  #poolBody details > summary { padding: 12px 16px; cursor: pointer; }
+  #poolBody details > p { margin: 0; padding: 0 16px 12px; }
+  .poolchip { margin-left: 8px; }
+  #dgRecovery, #dgRecoveryResults { max-height: 38vh; overflow: auto; }
   .dst-up_for_retry   { color: var(--pending); }
   .dst-success        { color: var(--ok); }
   .dst-failed         { color: var(--fail); }
@@ -1493,6 +1500,8 @@
       <button data-f="ok">ok</button>
       <button data-f="fail">fail</button>
       <button data-f="run">run</button>
+      <button data-f="queued">queued</button>
+      <button data-f="verifying">verifying</button>
       <button data-f="disabled">off</button>
     </div>
     <span class="grow"></span>
@@ -1619,6 +1628,11 @@
     </div>
   </div>
 
+  <div class="card" id="poolCard" style="display:none">
+    <div class="card-label"><span>Resource pools</span><span class="grow"></span><span class="faint" id="poolMeta"></span></div>
+    <div id="poolBody"></div>
+  </div>
+
   <div class="card" id="stateCard" style="display:none">
     <div class="card-label"><span>┌─ durable state</span><span class="grow"></span>
       <span class="src-chip" id="stateTopo"></span><span class="faint" id="stateMeta"></span></div>
@@ -1707,6 +1721,7 @@
       <h2 id="dgName">dag</h2>
       <button class="btn run" id="dgTrigger" title="Trigger a manual run"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg> Trigger</button>
       <button class="btn" id="dgBackfillBtn" title="Backfill a date range">▦ Backfill</button>
+      <button class="btn" id="dgRecoverBtn" disabled>Retry failed tasks</button>
       <button class="iconbtn" id="dgClose" title="Close (Esc)">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>
@@ -1717,7 +1732,10 @@
       <input type="text" id="dgBfFrom" placeholder="from ISO (2026-07-01T00:00:00)" style="width:220px" autocomplete="off" spellcheck="false">
       <input type="text" id="dgBfTo" placeholder="to ISO" style="width:220px" autocomplete="off" spellcheck="false">
       <button class="btn primary" id="dgBfGo">run backfill</button>
+      <label><input type="checkbox" id="dgBfFailed"> Failed dates only</label>
     </div>
+    <section id="dgRecoveryResults" style="display:none; margin-top:12px" aria-live="polite"></section>
+    <section id="dgRecovery" style="display:none; margin-top:12px" aria-live="polite"></section>
   </div>
   <div class="dtabs" id="dagTabs">
     <button data-dtab="runs" class="active">Runs</button>
@@ -5241,7 +5259,7 @@ var qrcode = function() {
   const PREF_PREFIX = "cronstable.";             // localStorage prefs
   const MAX_LOG_LINES = 5000;                 // bound the in-memory log view
   const RE_SCAN_CAP = 5000;                   // cap chars scanned per line (ReDoS guard)
-  const GLYPH = { ok: "●", fail: "✕", run: "▶", pending: "◔", disabled: "◌", cancelled: "⊘", unknown: "◍", paused: "⏸", skipped: "⊘" };
+  const GLYPH = { queued: "◷", verifying: "✓", ok: "●", fail: "✕", run: "▶", pending: "◔", disabled: "◌", cancelled: "⊘", unknown: "◍", paused: "⏸", skipped: "⊘" };
   // one place that maps a run outcome -> its CSS state class
   const outcomeCls = (o) => o === "failure" ? "fail" : o === "cancelled" ? "cancelled" : o === "unknown" ? "unknown" : o === "skipped" ? "skipped" : "ok";
 
@@ -5470,11 +5488,20 @@ var qrcode = function() {
     const elapsed = (performance.now() - state.fetchedAt) / 1000;
     return job.scheduled_in - elapsed;
   }
+  function queuedEntries(job) { return (job.pool || {}).queued || []; }
+  function capturesLogs(job) { return !!(job.captureStdout || job.captureStderr || (job.verification || {}).configured); }
+  function queueChip(job) {
+    if (!job.pool) return "";
+    const count = queuedEntries(job).length;
+    return '<button class="kbadge poolchip" data-open-pool="' + escAttr(job.pool.name) + '">' +
+      esc(job.pool.name) + (job.pool.queueUnavailable ? ' · queue unavailable' : count ? ' · ' + count + ' queued' : '') + '</button>';
+  }
   function health(job) {
     if (!job.enabled) return { key: "disabled", label: "Disabled" };
-    // a pause parks future slots only: a live run still shows Running
-    if (job.paused && !job.running) return { key: "paused", label: "Paused" };
-    if (job.running) return { key: "run", label: "Running" };
+    if (job.running) return (job.verification || {}).running
+      ? { key: "verifying", label: "Verifying" } : { key: "run", label: "Running" };
+    if (queuedEntries(job).length) return { key: "queued", label: "Queued" };
+    if (job.paused) return { key: "paused", label: "Paused" };
     if (job.last_run) {
       if (job.last_run.outcome === "failure") return { key: "fail", label: "Failed" };
       if (job.last_run.outcome === "cancelled") return { key: "cancelled", label: "Cancelled" };
@@ -5486,7 +5513,7 @@ var qrcode = function() {
     }
     return { key: "pending", label: "Pending" };
   }
-  const STATUS_ORDER = { run: 0, fail: 1, pending: 2, unknown: 3, cancelled: 4, ok: 5, paused: 6, disabled: 7 };
+  const STATUS_ORDER = { verifying: 0, queued: 1.5, run: 0, fail: 1, pending: 2, unknown: 3, cancelled: 4, ok: 5, paused: 6, disabled: 7 };
 
   // ===================================================================
   //  cron schedule intelligence  (client-side)
@@ -6475,6 +6502,7 @@ var qrcode = function() {
       // schedule + reference frame + command render as cells, and a config
       // reload can change any of them without touching a run-derived field.
       j.schedule, tzCell(j), j.command,
+      JSON.stringify(j.pool || null), (j.verification || {}).running,
       j.last_run && j.last_run.finished_at, j.last_run && j.last_run.outcome,
       j.last_run && j.last_run.exit_code, j.last_run && j.last_run.duration,
       (j.history || []).map((h) => h.outcome + ":" + h.duration).join(","),
@@ -6530,13 +6558,13 @@ var qrcode = function() {
     const runBtn = !ctl ? "" : job.running
       ? '<button class="btn cancel" data-cancel="' + escAttr(job.name) + '"><i class="ic stop"></i>Stop</button>'
       : '<button class="btn run" data-run="' + escAttr(job.name) + '"' + (job.enabled ? "" : ' disabled title="job is disabled"') +
-        '><i class="ic play"></i>Run</button>';
+        '><i class="ic play"></i>' + (queuedEntries(job).length ? "Queue another" : "Run") + '</button>';
     const pauseBtn = !ctl ? "" : job.paused
       ? '<button class="btn resume" data-resume="' + escAttr(job.name) + '"><i class="ic play"></i>Resume</button>'
       : '<button class="btn pause" data-pause="' + escAttr(job.name) + '"><i class="ic pause"></i>Pause</button>';
     return (
       '<tr data-job="' + escAttr(job.name) + '" class="' + rowCls.trim() + '">' +
-        '<td><span class="st ' + h.key + '"><span class="glyph">' + GLYPH[h.key] + '</span><span class="label">' + h.label + "</span></span>" + slowChip(job) + haChips(job) + "</td>" +
+        '<td><span class="st ' + h.key + '"><span class="glyph">' + GLYPH[h.key] + '</span><span class="label">' + h.label + "</span></span>" + slowChip(job) + haChips(job) + queueChip(job) + "</td>" +
         '<td><div class="jobname">' + esc(job.name) + "</div>" +
             '<div class="jobcmd" title="' + escAttr(job.command) + '">' + esc(job.command) + "</div></td>" +
         '<td class="col-owner">' + ownerCell(job) + "</td>" +
@@ -6999,7 +7027,7 @@ var qrcode = function() {
   // key makes the sort comparator return NaN, which leaves the whole ordering
   // unspecified (unknown once had exactly that bug). Mirrors STATUS_ORDER's
   // relative placement of unknown (after pending, before cancelled).
-  const WB_ORDER = { fail: 0, run: 1, pending: 2, unknown: 3, cancelled: 4, ok: 5, paused: 6, disabled: 7 };
+  const WB_ORDER = { verifying: 1, queued: 1.5, fail: 0, run: 1, pending: 2, unknown: 3, cancelled: 4, ok: 5, paused: 6, disabled: 7 };
   function utcClock() { const n = new Date(); return pad2(n.getUTCHours()) + ":" + pad2(n.getUTCMinutes()) + ":" + pad2(n.getUTCSeconds()) + " UTC"; }
   // The wallboard's staleness gate. TV mode hides the header (and with it the
   // #conn indicator), so the surface must judge freshness itself: stale when
@@ -7106,6 +7134,7 @@ var qrcode = function() {
     // lastRowSig contract, applied to the wallboard.
     const sig = JSON.stringify(jobs.map((j) => [
       j.name, health(j).key,
+      JSON.stringify(j.pool || null), (j.verification || {}).running,
       j.last_run && j.last_run.finished_at, j.last_run && j.last_run.outcome,
       j.last_run && j.last_run.exit_code,
       (j.history || []).length,
@@ -7168,20 +7197,22 @@ var qrcode = function() {
   }
   function renderWbFoot() {
     const j = state.jobs;
-    const c = { fail: 0, run: 0, pending: 0, unknown: 0, cancelled: 0, ok: 0, paused: 0, disabled: 0 };
+    const c = { queued: 0, verifying: 0, fail: 0, run: 0, pending: 0, unknown: 0, cancelled: 0, ok: 0, paused: 0, disabled: 0 };
     for (const x of j) c[health(x).key]++;
     // SLA overdue is orthogonal to the health buckets, so it is its own count
     const late = j.filter((x) => x.sla && x.sla.state === "late").length;
     // every health bucket is represented (zero-count rarities are elided), so
     // the tally adds up to the jobs total instead of silently dropping
     // pending/unknown/cancelled jobs
-    const sig = j.length + "|" + c.fail + "|" + c.run + "|" + c.ok + "|" + c.pending + "|" + c.unknown + "|" + c.cancelled + "|" + c.paused + "|" + c.disabled + "|" + late + "|" + (state.clusterLine || "");
+    const sig = JSON.stringify(c) + "|" + j.length + "|" + late + "|" + (state.clusterLine || "");
     if (sig === state.wbFootSig) return;   // keeps #wbExit alive (and focused) across polls
     state.wbFootSig = sig;
     $("wbFoot").innerHTML =
       '<span class="wb-stat"><b>' + j.length + "</b>jobs</span>" +
       '<span class="wb-stat fail"><b>' + c.fail + "</b>fail</span>" +
       '<span class="wb-stat run"><b>' + c.run + "</b>run</span>" +
+      (c.verifying ? '<span class="wb-stat run"><b>' + c.verifying + '</b>verifying</span>' : '') +
+      (c.queued ? '<span class="wb-stat pending"><b>' + c.queued + '</b>queued</span>' : '') +
       '<span class="wb-stat ok"><b>' + c.ok + "</b>ok</span>" +
       (c.pending ? '<span class="wb-stat pending"><b>' + c.pending + "</b>pending</span>" : "") +
       (c.unknown ? '<span class="wb-stat unknown"><b>' + c.unknown + "</b>unknown</span>" : "") +
@@ -7944,6 +7975,7 @@ var qrcode = function() {
       loadNode();
       loadDags();
       loadState();
+      loadPools();
       if (state.drawerJob) { renderDrawerMeta(); maybeReattachDrawerStream(); }
     } catch (e) {
       if (e.message !== "unauthorized") { setConnected(false); console.warn("loadJobs failed:", e); }
@@ -8036,10 +8068,11 @@ var qrcode = function() {
     try {
       const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/start", { method: "POST" });
       if (res.ok) {
-        toast("ok", "▶ started " + name);
-        if (state.drawerJob === name) setTimeout(() => startStream(name, true), 250);
+        toast("ok", (res.status === 202 ? "Queued " : "▶ started ") + name);
+        if (res.status === 202) loadPools();
+        if (res.status !== 202 && state.drawerJob === name) setTimeout(() => startStream(name, true), 250);
         setTimeout(loadJobs, 300);
-      } else if (res.status === 409) { toast("err", name + " is disabled"); }
+      } else if (res.status === 409) { const error = await res.json(); toast("err", error.error || "Job could not be queued"); }
       else { toast("err", "could not start (HTTP " + res.status + ")"); }
     } catch (e) { if (e.message !== "unauthorized") toast("err", "could not start " + name); }
   }
@@ -8171,6 +8204,7 @@ var qrcode = function() {
       parts.push('<span class="overdue">⚠ <b>OVERDUE</b>' +
         (checks ? ' · <span class="faint">' + esc(checks) + "</span>" : "") + "</span>");
     }
+    if (job.pool) parts.push(queueChip(job));
     $("dMeta").innerHTML = parts.join("");
     // Without `control` these three would only 403; the drawer opens on
     // every poll's re-render, so re-apply the scope here rather than
@@ -8179,6 +8213,8 @@ var qrcode = function() {
     for (const id of ["dRun", "dCancel", "dPause"])
       $(id).style.display = ctl ? "" : "none";
     $("dRun").disabled = !job.enabled || job.running;
+    $("dRun").textContent = queuedEntries(job).length ? "Queue another run" : "Run";
+    $("dCancel").title = "Cancel running instances";
     $("dCancel").disabled = !job.running;
     // the pause button doubles as resume; a manual Run stays allowed while paused
     $("dPause").className = "btn " + (job.paused ? "resume" : "pause");
@@ -8243,7 +8279,7 @@ var qrcode = function() {
         "<td>" + fmtDuration(r.duration) + "</td>" +
         (hasRes ? "<td>" + (r.resources ? fmtDuration(r.resources.cpu_total_seconds) : "—") + "</td>" +
                   "<td>" + (r.resources ? fmtBytes(r.resources.max_rss_bytes) : "—") + "</td>" : "") +
-        '<td class="reason">' + esc(r.fail_reason || "") + "</td>" +
+        '<td class="reason">' + esc(r.fail_reason || "") + verificationDetail(r.verification) + "</td>" +
       "</tr>";
     }
     const table = '<table class="runtable"><thead><tr><th>Outcome</th><th>Exit</th><th>Finished</th><th>Took</th>' +
@@ -8733,6 +8769,7 @@ var qrcode = function() {
     // absolute line number (monotonic, survives ring-buffer trimming)
     let inner = '<span class="gut">' + (item.n || 0) + "</span>";
     if (prefs.ts && item.ts) inner += '<span class="ts">' + fmtClock(item.ts) + "</span>";
+    if (!item.kind && (item.stream || "").startsWith("verify.")) inner += '<span class="faint">[verification] </span>';
     if (item.kind === "sys") inner += esc(item.text);
     else inner += lineContentHtml(item.text, item.kind ? null : q, ansiOn);
     return '<span class="ln ' + escAttr(item.kind || item.stream || "") + '"' +
@@ -8912,7 +8949,7 @@ var qrcode = function() {
     stopStream();
     if (clear) clearTerm();
     const job = state.byName[name];
-    if (job && !job.captureStdout && !job.captureStderr) {
+    if (job && !capturesLogs(job)) {
       appendLine("", "This job does not capture stdout or stderr — no logs to display. Enable captureStdout / captureStderr in its config.", "sys");
       return;
     }
@@ -8940,7 +8977,7 @@ var qrcode = function() {
     if (!state.drawerJob || state.tab !== "logs" || state.stream) return;
     const job = state.byName[state.drawerJob];
     if (!job || !job.running) return;
-    if (!job.captureStdout && !job.captureStderr) return;
+    if (!capturesLogs(job)) return;
     startStream(state.drawerJob, true);
   }
 
@@ -8991,6 +9028,7 @@ var qrcode = function() {
     if (prefs.ts && item.ts) inner += '<span class="ts">' + fmtClock(item.ts) + "</span>";
     inner += '<span class="tj" data-job="' + escAttr(item.job) + '" style="color:' + item.color +
       '" title="open ' + escAttr(item.job) + '">' + esc(item.job) + "</span>";
+    if (!item.kind && (item.stream || "").startsWith("verify.")) inner += '<span class="faint">[verification] </span>';
     if (item.kind === "sys") inner += esc(item.text);
     else inner += lineContentHtml(item.text, q, prefs.ansi);
     return '<span class="ln ' + escAttr(item.kind || item.stream || "") + '">' + inner + "</span>";
@@ -9081,7 +9119,7 @@ var qrcode = function() {
   function tailConnect(name) {
     const st = state.tail.streams[name], job = state.byName[name];
     if (!st || st.ctrl || !job) return;
-    if (!job.captureStdout && !job.captureStderr) return;   // nothing to attach to
+    if (!capturesLogs(job)) return;   // nothing to attach to
     const ctrl = new AbortController();
     st.ctrl = ctrl; st.err = false; st.retryAt = 0;
     st.sawRunning = !!job.running;   // were we ever attached to a LIVE run?
@@ -9136,7 +9174,7 @@ var qrcode = function() {
       awaitFin: false, sawRunning: false,
       sinceFin: job && job.last_run ? job.last_run.finished_at : null,
     };
-    if (job && !job.captureStdout && !job.captureStderr) {
+    if (job && !capturesLogs(job)) {
       appendTailLine(name, "", "captures no output — enable captureStdout / captureStderr to tail it", "sys");
       return;
     }
@@ -9154,7 +9192,7 @@ var qrcode = function() {
       // while a stream is live, just note whether its run was ever observed
       // running (the end hook uses it to reconcile the run's finished_at)
       if (st.ctrl) { if (job.running) st.sawRunning = true; continue; }
-      if (!job.captureStdout && !job.captureStderr) continue;
+      if (!capturesLogs(job)) continue;
       if (st.retryAt && now < st.retryAt) continue;
       const fin = job.last_run ? job.last_run.finished_at : null;
       if (st.err) { tailConnect(name); continue; }          // heal after a failure (throttled above)
@@ -9786,17 +9824,17 @@ var qrcode = function() {
 
   // the 8 DAG task states get their OWN glyphs (never overloads the job set)
   const DST_GLYPH = {
-    pending: "◌", running: "▶", up_for_retry: "↻", success: "●", failed: "✕",
+    verifying: "✓", queued: "◷", pending: "◌", running: "▶", up_for_retry: "↻", success: "●", failed: "✕",
     skipped: "⊘", upstream_failed: "⊗", expanded: "⋯", unknown: "◍", scheduled: "◔",
   };
   const DST_LABEL = {
-    pending: "pending", running: "running", up_for_retry: "retrying", success: "success",
+    verifying: "verifying", queued: "queued", pending: "pending", running: "running", up_for_retry: "retrying", success: "success",
     failed: "failed", skipped: "skipped", upstream_failed: "upstream failed",
     expanded: "expanded", unknown: "unknown",
   };
   function dstGlyph(s) { return DST_GLYPH[s] || "•"; }
   function dstVar(s) {
-    return ({ success: "ok", failed: "fail", running: "run", pending: "pending",
+    return ({ verifying: "run", queued: "pending", success: "ok", failed: "fail", running: "run", pending: "pending",
       up_for_retry: "pending", skipped: "disabled", upstream_failed: "fail",
       expanded: "fg-faint", unknown: "unknown" })[s] || "fg-faint";
   }
@@ -9956,6 +9994,7 @@ var qrcode = function() {
   // ---- DAG run-detail drawer ----
   function openDagDrawer(dag, runKey, tab) {
     if (!state.dags.byName[dag]) return;
+    clearRecoveryPreview();
     if (state.drawerJob) closeDrawer();
     const fresh = openOverlay("dagDrawer");
     state.dagDrawer.dag = dag;
@@ -9975,6 +10014,7 @@ var qrcode = function() {
     if (fresh) focusFirst($("dagDrawer"));
   }
   function closeDagDrawer() {
+    clearRecoveryPreview();
     stopDagTaskLog();
     if (state.dagRunPoll) { clearTimeout(state.dagRunPoll); state.dagRunPoll = null; }
     state.dagDrawer.dag = null; state.dagDrawer.runKey = null; state.dagDrawer.run = null;
@@ -9988,15 +10028,18 @@ var qrcode = function() {
     const d = state.dags.byName[state.dagDrawer.dag];
     if (!d) return;
     const run = state.dagDrawer.run;
+    $("dgRecoverBtn").disabled = !canControl() || !run || run.state !== "failed";
     const pill = $("dgState");
     if (run) {
       pill.style.display = "";
       pill.className = "rpill " + esc(run.state);
       pill.innerHTML = '<span class="g">' + dstGlyph(run.state) + "</span>" + esc(run.state);
     } else { pill.style.display = "none"; }
-    // manual-only dags cannot be backfilled (the schedule anchors the range)
-    $("dgBackfillBtn").disabled = !d.schedule;
-    $("dgBackfillBtn").title = d.schedule ? "Backfill a date range" : "manual-only dag: no schedule to backfill";
+    $("dgBackfillBtn").disabled = !canControl();
+    $("dgBackfillBtn").title = "Backfill or recover failed dates";
+    if (!d.schedule) $("dgBfFailed").checked = true;
+    $("dgBfFailed").disabled = !d.schedule;
+    $("dgBfGo").textContent = $("dgBfFailed").checked ? "Preview failed dates" : "run backfill";
     // each bit is its own <span>: .drawer-head .meta is a flex container and
     // separates flex items with its gap; bare text nodes would run together
     const bits = [];
@@ -10007,7 +10050,15 @@ var qrcode = function() {
       bits.push('<span class="kbadge">' + esc(run.kind || "?") + "</span>");
       if (run.createdAt) bits.push('<span>started <b data-ago-epoch="' + escAttr(run.createdAt) + '">' + agoEpoch(run.createdAt) + "</b></span>");
     }
+    if (run && run.recovery) {
+      const recovery = run.recovery;
+      bits.push('<a href="#" data-source-run="' + escAttr(recovery.sourceRunKey) + '">Source run</a>');
+      bits.push('<span>' + esc((recovery.tasks || []).length) + ' tasks rerun · ' + esc((recovery.preserved || []).length) + ' results reused</span>');
+      if (recovery.status === "preparing") bits.push('<span class="pending">Preparing reused results…</span>');
+      if (recovery.error) bits.push('<span role="alert" class="fail">' + esc(recovery.error) + '</span>');
+    }
     $("dgMeta").innerHTML = bits.join("");
+    renderRecoveryResults();
   }
   function switchDagTab(tab) {
     state.dagDrawer.tab = tab;
@@ -10037,20 +10088,25 @@ var qrcode = function() {
     const dag = state.dagDrawer.dag; if (!dag) return;
     const seq = ++dagRunsSeq;
     try {
-      const r = await apiFetch("/dags/" + encodeURIComponent(dag) + "/runs?limit=50");
+      const r = await apiFetch("/dags/" + encodeURIComponent(dag) + "/runs?limit=500");
       if (seq < dagRunsApplied || state.dagDrawer.dag !== dag) return;
-      if (!r.ok) { dagRunsApplied = seq; return; }
+      if (!r.ok) { dagRunsApplied = seq; state.dagDrawer.runsStale = true; renderRecoveryResults(); return; }
       const body = await r.json();
       if (seq < dagRunsApplied || state.dagDrawer.dag !== dag) return;
       dagRunsApplied = seq;
       state.dagDrawer.runs = body.runs || [];
+      state.dagDrawer.runsStale = false;
       if (!state.dagDrawer.runKey && state.dagDrawer.runs.length) {
         selectDagRun(state.dagDrawer.runs[0].runKey, false);
       } else if (state.dagDrawer.runKey) {
         loadDagRun();
       }
       renderDagRuns();
-    } catch (e) { if (e.message !== "unauthorized") console.warn("loadDagRuns failed:", e); }
+      renderRecoveryResults();
+    } catch (e) {
+      if (state.dagDrawer.dag === dag) { state.dagDrawer.runsStale = true; renderRecoveryResults(); }
+      if (e.message !== "unauthorized") console.warn("loadDagRuns failed:", e);
+    }
   }
   function renderDagRuns() {
     const holder = $("dgRuns"); if (!holder) return;
@@ -10072,6 +10128,7 @@ var qrcode = function() {
       }).join("") + "</tbody></table>";
   }
   function selectDagRun(runKey, doSwitch) {
+    clearRecoveryPreview();
     state.dagDrawer.runKey = runKey;
     state.dagDrawer.run = null; state.dagDrawer.xcom = null;
     setDagHash();
@@ -10136,7 +10193,8 @@ var qrcode = function() {
       if (anySkip) return "skipped";
       return "success";
     }
-    return (tasks[id] || {}).state || "pending";
+    const task = tasks[id] || {};
+    return task.state === "running" && (task.verification || {}).outcome === "running" ? "verifying" : task.queued && task.state === "pending" ? "queued" : task.state || "pending";
   }
 
   // ---- Tasks tab ----
@@ -10152,6 +10210,13 @@ var qrcode = function() {
   }
   function taskDetailCell(spec, e, taskkey, st) {
     const bits = [];
+    if (e.queued) bits.push('<span class="pending">Waiting for ' + esc(e.queued.pool) + ' capacity</span>');
+    if (e.reusedFrom) bits.push('<a href="#" data-source-run="' + escAttr(e.reusedFrom) + '">Reused result · source run</a>');
+    if (e.verification) bits.push(verificationDetail(e.verification));
+    const run = state.dagDrawer.run;
+    if (canControl() && run && (run.state === "success" || run.state === "failed")) {
+      bits.push('<button class="btn" data-recover-task="' + escAttr(taskkey) + '">Recover from here</button>');
+    }
     if (spec && spec.type === "approval") {
       if (e.approval) {
         const ap = e.approval;
@@ -10196,6 +10261,8 @@ var qrcode = function() {
   }
   function taskRowHtml(label, spec, e, taskkey, st, extra, opts) {
     opts = opts || {};
+    if (st === "running" && (e.verification || {}).outcome === "running") st = "verifying";
+    else if (st === "pending" && e.queued) st = "queued";
     const attempt = e.attempt != null && e.attempt > 0
       ? e.attempt + (spec && spec.retries ? "/" + (spec.retries + 1) : "")
       : (e.attempt === 0 ? "—" : "—");
@@ -10204,7 +10271,7 @@ var qrcode = function() {
       : "—";
     let dur = "—";
     if (e.startedAt && e.finishedAt) dur = fmtDuration(e.finishedAt - e.startedAt);
-    else if (e.startedAt && st === "running") dur = fmtDuration(Date.now() / 1000 - e.startedAt);
+    else if (e.startedAt && (st === "running" || st === "verifying")) dur = fmtDuration(Date.now() / 1000 - e.startedAt);
     const detail = opts.isGroup ? extra : taskDetailCell(spec, e, taskkey, st);
     const tcls = opts.inst ? "inst" : "";
     const typeBadge = (!opts.inst && spec && spec.type && spec.type !== "task")
@@ -10373,7 +10440,7 @@ var qrcode = function() {
     // renderDagLogs and cleared on a task switch, so counting the live nodes
     // beats carrying a counter that can drift out of step with them.
     if (t.childElementCount >= MAX_LOG_LINES) { const first = t.firstElementChild; if (first) first.remove(); }
-    t.insertAdjacentHTML("beforeend", '<span class="ln ' + escAttr(stream || "") + '">' + esc(text) + "</span>");
+    t.insertAdjacentHTML("beforeend", '<span class="ln ' + escAttr(stream || "") + '">' + ((stream || "").startsWith("verify.") ? '<span class="faint">[verification] </span>' : '') + esc(text) + "</span>");
     followBottom(t, true, false);
   }
   function startDagTaskLog(taskkey) {
@@ -10409,7 +10476,7 @@ var qrcode = function() {
     const tasks = run.tasks || {};
     const mapped = run.mapped || {};
     // instance keys only (skip the bare-id placeholder of a fan-out group)
-    const keys = Object.keys(tasks).filter((k) => !mapped[k]).sort();
+    const keys = Object.keys(tasks).filter((k) => !mapped[k] && !tasks[k].reusedFrom).sort();
     const opts = keys.map((k) => {
       const st = (tasks[k] || {}).state;
       return '<option value="' + escAttr(k) + '"' + (state.dagDrawer.logTask === k ? " selected" : "") + ">" + esc(k + " · " + st) + "</option>";
@@ -10418,8 +10485,9 @@ var qrcode = function() {
       '<div class="drawer-tools" style="padding:0 0 8px 0"><span class="faint">task</span> ' +
       '<select id="dgLogTask" class="mini"><option value="">— pick a task —</option>' + opts + "</select>" +
       '<span class="grow"></span><span class="faint" id="dgLogNote"></span></div>' +
+      (run.recovery ? '<p class="faint">For reused tasks, open the <a href="#" data-source-run="' + escAttr(run.recovery.sourceRunKey) + '">source run</a> to view logs.</p>' : '') +
       '<pre class="term" id="dgTerm" style="flex:1; min-height:120px; overflow:auto"></pre>';
-    if (state.dagDrawer.logTask && tasks[state.dagDrawer.logTask]) startDagTaskLog(state.dagDrawer.logTask);
+    if (keys.includes(state.dagDrawer.logTask)) startDagTaskLog(state.dagDrawer.logTask);
   }
 
   // ---- DAG control actions ----
@@ -10451,6 +10519,10 @@ var qrcode = function() {
     const dag = state.dagDrawer.dag;
     const from = $("dgBfFrom").value.trim(), to = $("dgBfTo").value.trim();
     if (!from || !to) { toast("err", "from and to ISO dates are required"); return; }
+    if ($("dgBfFailed").checked) {
+      await previewRecovery("/dags/" + encodeURIComponent(dag) + "/recover", { from, to });
+      return;
+    }
     try {
       const res = await apiFetch("/dags/" + encodeURIComponent(dag) + "/backfill",
         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ from: from, to: to }) });
@@ -10467,6 +10539,146 @@ var qrcode = function() {
         toast("err", "backfill: " + (msg || "HTTP " + res.status));
       }
     } catch (e) { if (e.message !== "unauthorized") toast("err", "backfill failed"); }
+  }
+
+  function verificationDetail(result) {
+    if (!result) return "";
+    return '<details style="max-width:440px"><summary>Verification: ' + esc(result.outcome) + '</summary>' +
+      '<p class="faint">' + esc(result.fail_reason || (result.outcome === "success" ? "Result checks passed" : "Checking results")) +
+      (result.exit_code == null ? "" : " · exit " + esc(result.exit_code)) + '</p>' +
+      '<pre style="white-space:pre-wrap;max-height:160px;overflow:auto">' + esc([result.stdout, result.stderr].filter(Boolean).join("\n")) + '</pre>' +
+      (result.output_truncated ? '<p class="faint">Diagnostic output truncated.</p>' : '') + '</details>';
+  }
+
+  async function loadPools() {
+    return singleFlight("pools", async () => {
+      try {
+        const res = await apiFetch("/pools");
+        if (!res.ok) throw new Error("Pool status unavailable");
+        const pools = await res.json();
+        state.pools = pools;
+        state.poolsUpdated = Date.now();
+        $("poolCard").style.display = pools.length ? "" : "none";
+        $("poolMeta").textContent = pools.reduce((n, p) => n + p.queued, 0) + " waiting";
+        $("poolMeta").classList.remove("overdue");
+        const signature = JSON.stringify([pools, canControl()]);
+        if (signature === state.poolSignature) return;
+        state.poolSignature = signature;
+        const opened = new Set(Array.from($("poolBody").querySelectorAll("details[open]")).map(el => el.dataset.pool));
+        $("poolBody").innerHTML = pools.map(pool => {
+          const running = pool.entries.filter(e => e.state === "running");
+          const waiting = pool.entries.filter(e => e.state === "queued").sort((a, b) => b.priority - a.priority || a.queuedAt - b.queuedAt || a.id.localeCompare(b.id));
+          const recent = pool.entries.filter(e => e.state !== "queued" && e.state !== "running").slice(-10);
+          const rows = [...running, ...waiting, ...recent];
+          return '<details data-pool="' + escAttr(pool.name) + '"' + (opened.has(pool.name) ? " open" : "") + '><summary>' +
+            esc(pool.name) + " · " + esc(pool.used) + "/" + esc(pool.slots) + " slots occupied · " + esc(pool.queued) + ' waiting</summary>' +
+            (pool.configuredSlots != null && pool.configuredSlots !== pool.slots ? '<p class="pending">Draining before changing capacity to ' + esc(pool.configuredSlots) + (pool.configuredSlots === 1 ? ' slot.</p>' : ' slots.</p>') + '' : '') +
+            '<div class="twrap"><table class="runtable"><thead><tr><th>Job or task</th><th>State</th><th>Slots</th><th>Priority</th><th>Wait / deadline</th><th></th></tr></thead><tbody>' +
+            rows.map(e => '<tr><td><button class="btn" ' + (e.task ? 'data-pool-dag="' + escAttr(e.dag) + '" data-pool-run="' + escAttr(e.runKey) + '"' : 'data-pool-job="' + escAttr(e.job) + '"') + '>' + esc(e.task ? e.dag + " / " + e.task : e.job) + '</button></td><td>' + esc(e.state) +
+              (e.state === "queued" ? ' #' + (waiting.indexOf(e) + 1) + '<div class="faint">' + esc(e.waitingReason || e.reason || "Waiting for capacity") + '</div>' : '') +
+              '</td><td>' + esc(e.slots) + '</td><td>' + esc(e.priority) + '</td><td>' +
+              (e.state === "queued" ? '<span data-ago-epoch="' + escAttr(e.queuedAt) + '">' + agoEpoch(e.queuedAt) + '</span><br>expires <span data-until-epoch="' + escAttr(e.expiresAt) + '">' + untilEpoch(e.expiresAt) + '</span>' : esc(e.reason || "")) +
+              '</td><td>' + (canControl() && e.state === "queued" ? '<button class="btn cancel" data-cancel-queue="' + escAttr(e.id) + '" data-pool-name="' + escAttr(pool.name) + '">Cancel queued run</button>' : "") + '</td></tr>').join("") +
+            '</tbody></table></div></details>';
+        }).join("");
+      } catch (e) {
+        if (e.message === "unauthorized") return;
+        $("poolCard").style.display = "";
+        $("poolMeta").textContent = state.poolsUpdated ? "Unavailable · showing data from " + fmtClock(state.poolsUpdated) : "Pool status unavailable";
+        $("poolMeta").classList.add("overdue");
+      }
+    });
+  }
+
+  const recoveryResults = {};
+  function renderRecoveryResults() {
+    const holder = $("dgRecoveryResults"), dag = state.dagDrawer.dag;
+    const batch = recoveryResults[dag];
+    holder.style.display = batch && !state.recoveryPreview ? "" : "none";
+    if (!batch) return;
+    const runs = new Map((state.dagDrawer.runs || []).map(r => [r.runKey, r]));
+    const finished = batch.runs.filter(key => ["success", "failed"].includes((runs.get(key) || {}).state)).length;
+    const signature = JSON.stringify([dag, batch.runs, state.dagDrawer.runsStale, batch.runs.map(key => runs.get(key))]);
+    if (signature === holder.dataset.signature) return;
+    const opened = !holder.firstElementChild || holder.firstElementChild.open;
+    holder.dataset.signature = signature;
+    holder.innerHTML = '<details' + (opened ? ' open' : '') + ' class="card" style="padding:16px"><summary>Recovery · ' + finished + '/' + batch.runs.length + ' finished</summary>' +
+      (state.dagDrawer.runsStale ? '<p role="status" class="pending">Run status unavailable. Showing the last received results.</p>' : '') +
+      batch.runs.map(key => '<p><a href="#" data-source-run="' + escAttr(key) + '">' + esc((runs.get(key) || {}).logicalDate || truncStr(key, 32)) + '</a> · ' + esc((runs.get(key) || {}).state || "awaiting status") + '</p>').join("") + '</details>';
+  }
+
+  let recoverySeq = 0;
+  function clearRecoveryPreview() {
+    recoverySeq++;
+    state.recoveryPreview = null;
+    $("dgRecovery").style.display = "none";
+    renderRecoveryResults();
+  }
+
+  async function previewRecovery(path, request) {
+    if (!canControl()) return;
+    clearRecoveryPreview();
+    const seq = recoverySeq;
+    const selectedDag = state.dagDrawer.dag;
+    const selectedRun = state.dagDrawer.runKey;
+    try {
+      const res = await apiFetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...request, dryRun: true }) });
+      const plan = await res.json();
+      if (!res.ok) throw new Error(plan.error || "Recovery preview failed");
+      if (seq !== recoverySeq || state.dagDrawer.dag !== selectedDag || state.dagDrawer.runKey !== selectedRun) return;
+      state.recoveryPreview = { path, request, plan, dag: selectedDag, run: selectedRun };
+      renderRecoveryResults();
+      const plans = plan.plans || [plan];
+      const changed = plans.some(p => p.configurationChanged);
+      const tasks = plans.reduce((n, p) => n + p.tasks.length, 0);
+      const preserved = plans.reduce((n, p) => n + p.preserved.length, 0);
+      $("dgRecovery").style.display = "";
+      $("dgRecovery").innerHTML = '<div class="card" style="padding:16px"><h3>Review recovery</h3><p>' + tasks + ' tasks will run; ' + preserved + ' task results will be reused across ' + plans.length + (plans.length === 1 ? ' run.</p>' : ' runs.</p>') +
+        plans.map(p => '<details><summary>' + esc(p.sourceRunKey) + '</summary><p>Run: ' + esc(p.tasks.join(", ")) + '</p><p>Reuse: ' + esc(p.preserved.join(", ") || "none") + '</p><p>Configuration: <code>' + esc(p.configurationRevision) + '</code></p><p>Artifacts: ' + esc(p.artifacts.map(a => a.name).join(", ") || "none") + '</p></details>').join("") +
+        (changed ? '<p><label><input type="checkbox" id="dgRecoveryConfig"> Use the current configuration, which differs from the source run.</label></p>' : '') +
+        '<p class="faint">Recovery preserves the source run. Selected commands run again and may repeat external side effects.</p>' +
+        '<button class="btn primary" id="dgRecoveryGo"' + (!tasks ? " disabled" : "") + '>Start recovery</button> <button class="btn" id="dgRecoveryDismiss">Dismiss</button></div>';
+      $("dgRecoveryGo").addEventListener("click", executeRecovery);
+      $("dgRecoveryDismiss").addEventListener("click", clearRecoveryPreview);
+    } catch (e) { if (e.message !== "unauthorized") toast("err", e.message); }
+  }
+
+  function previewTaskRecovery(task) {
+    const drawer = state.dagDrawer;
+    if (!drawer.dag || !drawer.runKey) return;
+    return previewRecovery("/dags/" + encodeURIComponent(drawer.dag) + "/runs/" + encodeURIComponent(drawer.runKey) + "/recover",
+      task ? { mode: "from", tasks: [task] } : { mode: "failed" });
+  }
+
+  async function executeRecovery() {
+    const selected = state.recoveryPreview;
+    if (!canControl() || !selected || selected.dag !== state.dagDrawer.dag || selected.run !== state.dagDrawer.runKey) return;
+    const acknowledge = $("dgRecoveryConfig");
+    if (acknowledge && !acknowledge.checked) { toast("err", "Review and acknowledge the configuration change first"); return; }
+    $("dgRecoveryGo").disabled = true;
+    try {
+      const res = await apiFetch(selected.path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...selected.request, dryRun: false, planToken: selected.plan.planToken, allowConfigChange: !!acknowledge }) });
+      const result = await res.json();
+      if (!res.ok) throw new Error(result.error || "Recovery failed");
+      if (state.recoveryPreview !== selected) return;
+      const keys = result.runs || (result.runKey ? [result.runKey] : []);
+      recoveryResults[selected.dag] = { runs: keys };
+      $("dgRecovery").style.display = "none";
+      state.recoveryPreview = null;
+      renderRecoveryResults();
+      toast("ok", "Recovery started · " + keys.length + (keys.length === 1 ? " run" : " runs"));
+      loadDagRuns(); loadDags();
+      if (result.runKey) selectDagRun(result.runKey, true);
+    } catch (e) {
+      if (e.message !== "unauthorized") toast("err", e.message);
+      if (state.recoveryPreview === selected && $("dgRecoveryGo")) {
+        $("dgRecoveryGo").disabled = false;
+        $("dgRecoveryGo").textContent = "Retry reviewed recovery";
+        let failure = $("dgRecoveryError");
+        if (!failure) { failure = el("p"); failure.id = "dgRecoveryError"; failure.setAttribute("role", "alert"); $("dgRecovery").appendChild(failure); }
+        failure.textContent = e.message + ". Retry uses the same reviewed request. If the preview is stale, dismiss it and preview again.";
+      }
+    }
   }
 
   // ===================================================================
@@ -10897,9 +11109,38 @@ var qrcode = function() {
     $("dgTrigger").addEventListener("click", () => { if (state.dagDrawer.dag) dagTrigger(state.dagDrawer.dag); });
     $("dgBackfillBtn").addEventListener("click", () => { const b = $("dgBackfill"); b.style.display = b.style.display === "none" ? "flex" : "none"; if (b.style.display === "flex") $("dgBfFrom").focus(); });
     $("dgBfGo").addEventListener("click", dagBackfill);
+    $("dgBfFailed").addEventListener("change", () => { $("dgBfGo").textContent = $("dgBfFailed").checked ? "Preview failed dates" : "run backfill"; });
+    $("dgRecoverBtn").addEventListener("click", () => previewTaskRecovery());
+    document.addEventListener("click", e => {
+      const pool = e.target.closest("[data-open-pool]");
+      if (pool) {
+        if (state.drawerJob) closeDrawer();
+        if (state.dagDrawer.dag) closeDagDrawer();
+        const detail = Array.from($("poolBody").querySelectorAll("details")).find(d => d.dataset.pool === pool.dataset.openPool);
+        if (detail) { detail.open = true; detail.scrollIntoView({ behavior: "smooth", block: "center" }); detail.querySelector("summary").focus(); }
+      }
+      const source = e.target.closest("[data-source-run]");
+      if (source) { e.preventDefault(); selectDagRun(source.dataset.sourceRun, true); }
+    });
+    $("poolBody").addEventListener("click", async e => {
+      const job = e.target.closest("[data-pool-job]");
+      if (job) { openDrawer(job.dataset.poolJob); return; }
+      const dag = e.target.closest("[data-pool-dag]");
+      if (dag) { openDagDrawer(dag.dataset.poolDag, dag.dataset.poolRun); return; }
+      const button = e.target.closest("[data-cancel-queue]");
+      if (!button || !canControl()) return;
+      button.disabled = true;
+      try {
+        const res = await apiFetch("/pools/" + encodeURIComponent(button.dataset.poolName) + "/queue/" + encodeURIComponent(button.dataset.cancelQueue) + "/cancel", { method: "POST" });
+        if (!res.ok) { const result = await res.json(); throw new Error(result.error || "Cancellation failed"); }
+        toast("ok", "Queued work cancelled"); loadPools(); loadJobs();
+      } catch (err) { toast("err", err.message); button.disabled = false; }
+    });
     $("dagTabs").addEventListener("click", (e) => { const b = e.target.closest("button[data-dtab]"); if (b) switchDagTab(b.getAttribute("data-dtab")); });
     $("dgRuns").addEventListener("click", (e) => { const tr = e.target.closest("tr[data-runkey]"); if (tr) selectDagRun(tr.getAttribute("data-runkey"), true); });
     $("dgTasks").addEventListener("click", (e) => {
+      const recover = e.target.closest("[data-recover-task]");
+      if (recover) { previewTaskRecovery(recover.dataset.recoverTask); return; }
       const ap = e.target.closest("[data-approve]");
       if (ap) { dagDecision(ap.getAttribute("data-approve"), "approve"); return; }
       const rj = e.target.closest("[data-reject]");

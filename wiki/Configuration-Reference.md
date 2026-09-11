@@ -56,6 +56,7 @@ web: { ... }        # optional: HTTP control API
 mcp: { ... }        # optional: Model Context Protocol server for AI agents
 cluster: { ... }    # optional: mTLS peer attestation / leader election
 state: { ... }      # optional: durable state store (history, catch-up, retries)
+pools: { ... }      # optional: shared capacity and durable admission queues
 logging: { ... }    # optional: Python logging dictConfig
 notify: { ... }     # optional: daemon/orchestration event notifications
 push: { ... }       # optional: E2E-encrypted push alerts (relay + device registry)
@@ -552,6 +553,25 @@ See [schedules and timezones](Schedules-and-Timezones).
 See [concurrency and timeouts](Concurrency-and-Timeouts).
 
 ### Failure detection
+
+`verify` adds a post-command result check to jobs and executable DAG tasks.
+Its required `command` is a string or sequence of strings; its optional
+`timeout` is a finite positive float, defaulting to `60`. The default
+`verify: null` disables the check. See [result verification](Result-Verification).
+
+### Resource pools
+
+The top-level `pools` map declares named pools. Each requires integer `slots`
+and accepts integer `maxQueued` (default `1000`); both range from 1 to 10000.
+Pools require `state`. Names must be unique across the assembled configuration.
+
+Jobs and executable DAG tasks accept `pool` (string, default null),
+`poolSlots` (integer, default `1`), `queuePriority` (integer, default `0`), and
+`queueTimeout` (finite positive float in seconds, default `3600`). Slots must
+be positive and fit the named pool. Nondefault queue options require a pool.
+Approval gates reject pools. See [resource pools](Resource-Pools).
+
+### Command failure rules
 
 `failsWhen` determines when a completed run is treated as a failure. In the
 strictyaml schema only `producesStdout` is a required key inside `failsWhen`.

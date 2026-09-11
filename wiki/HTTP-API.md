@@ -20,6 +20,23 @@ The interface is inherited from upstream yacron; `web.authToken` and
 
 ## Enabling the API
 
+Resource and recovery endpoints share this API's authentication:
+
+| Method and path | Scope | Operation |
+| --- | --- | --- |
+| `GET /pools` | `view` | Inspect pool capacity, waiting work, and recent terminal entries. |
+| `POST /pools/{name}/queue/{key}/cancel` | `control` | Cancel a waiting entry. |
+| `POST /dags/{name}/runs/{run_key}/recover` | `control` | Preview or execute selective recovery. |
+| `POST /dags/{name}/recover` | `control` | Preview or execute recovery for failed dates. |
+
+Recovery defaults to a preview. Execution requires `dryRun: false` and the
+preview's `planToken`. See [workflow recovery](Workflow-Recovery) for request
+fields and conflict handling. A pooled job's start endpoint returns `202`
+with its queue ID; see [resource pools](Resource-Pools). Completed run history
+includes [verification results](Result-Verification) when configured.
+
+### Listener configuration
+
 Add a `web` section with at least one `listen` URL:
 
 ```yaml

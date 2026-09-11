@@ -234,6 +234,7 @@ async def dag_cron(tmp_path):
     yield make
     for cron in reversed(crons):
         await _settle_dag_cron(cron)
+        await cron._pools.close()
         await cron._dag.shutdown()
         await cron._stop_job_api()
         if cron.state_backend is not None:

@@ -1322,6 +1322,7 @@ def _claim_task(
     # whose intents never reached it; see release_lost_claims.
     entry["proc"] = proc
     entry["pid"] = None
+    entry.pop("queued", None)
     entry["host"] = host
     entry["startedAt"] = entry.get("startedAt") or now
     entry["updatedAt"] = now
@@ -1954,6 +1955,8 @@ def mark_tasks_finished(marks: list[dict[str, Any]], now: float):
                     task,
                     mark.get("resources"),
                 )
+            if mark.get("verification") is not None:
+                entry["verification"] = mark["verification"]
             applied.append(taskkey)
         if not applied:
             return _DOC_KEEP, []
