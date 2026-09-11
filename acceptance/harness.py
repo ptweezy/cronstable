@@ -15,6 +15,29 @@ from pathlib import Path
 import psutil
 
 
+def _reserve_ports(count):
+    """``count`` distinct free loopback ports, named now and bound later.
+
+    A reservation cannot be held open, since the daemon does the binding
+    itself, so the only thief that matters is the daemon -- and an
+    unpinned job API robs the web API: with no ``state.jobApi.listen`` it
+    takes an OS-ASSIGNED port, which the kernel may draw from the pool
+    this harness just released. The daemon then logs "address already in
+    use", leaves the web API down for good (its bind retry can never win
+    a port its own job API holds), and every request 404s against the job
+    API instead. So ``configure`` pins BOTH listeners, and binding the
+    whole set before reading any port back is what keeps them distinct.
+    """
+    socks = [socket.socket() for _ in range(count)]
+    try:
+        for sock in socks:
+            sock.bind(("127.0.0.1", 0))
+        return [sock.getsockname()[1] for sock in socks]
+    finally:
+        for sock in socks:
+            sock.close()
+
+
 class Daemon:
     def __init__(self, binary, work, evidence):
         self.binary = binary
@@ -45,9 +68,8 @@ class Daemon:
         self.http = urllib.request.build_opener(
             urllib.request.ProxyHandler({})
         )
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            self.port = sock.getsockname()[1]
+        # Every port the daemon listens on is one this harness chose.
+        self.port, self.job_api_port = _reserve_ports(2)
         self.url = f"http://127.0.0.1:{self.port}"
 
     def configure(self, name, scenario, *, scheduled=False, retry=False):
@@ -67,6 +89,7 @@ class Daemon:
         body = (
             "state:\n  path: ./state\n  topology: single-node\n"
             "  jobApi:\n    enabled: true\n"
+            f"    listen: http://127.0.0.1:{self.job_api_port}\n"
             f"web:\n  listen:\n    - {self.url}\n"
             f"  authToken:\n    value: {self.token}\n"
             f"jobs:\n  - name: {name}\n"
