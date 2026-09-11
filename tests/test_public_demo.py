@@ -64,6 +64,8 @@ async def demo_http():
             return await cron._web_whoami(request)
         if request.path == "/dags":
             return web.json_response(state["rows"])
+        if request.path == "/pools":
+            return web.json_response([])
         if request.path == "/dags/pipeline/runs":
             return web.json_response({"runs": state["runs"]})
         if request.path == "/":
@@ -124,6 +126,15 @@ async def demo_http():
         async with TestClient(TestServer(gateway.application())) as client:
             yield client, gateway, now, state, seen, daemon
         state["stream_release"].set()
+
+
+async def test_dashboard_can_poll_resource_pools(demo_http):
+    client, gateway, now, state, seen, daemon = demo_http
+    response = await client.get("/pools")
+    assert response.status == 200
+    assert await response.json() == []
+    assert seen[-1][1] == "/pools"
+    assert seen[-1][2]["Authorization"] == "Bearer public"
 
 
 @pytest.mark.parametrize("token", [None, "public"])

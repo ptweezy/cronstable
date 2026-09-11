@@ -1123,7 +1123,7 @@ async def test_schedule_retry_job_abandoned_when_no_longer_owner():
         has_conflict=lambda: False,
         view_settled=lambda: True,  # a converged view, not the settle hold
     )
-    job = types.SimpleNamespace(name="j", clusterPolicy="Leader")
+    job = types.SimpleNamespace(name="j", clusterPolicy="Leader", pool=None)
     cron.cron_jobs["j"] = job
     state = JobRetryState(0.1, 2, 1)
     cron.retry_state["j"] = state  # a pending retry
@@ -1165,7 +1165,7 @@ async def test_schedule_retry_job_survives_transient_gate_blip(monkeypatch):
         "maybe_launch_job",
         lambda job: launched.append(job.name) or _noop(),
     )
-    job = types.SimpleNamespace(name="j", clusterPolicy="Leader")
+    job = types.SimpleNamespace(name="j", clusterPolicy="Leader", pool=None)
     cron.cron_jobs["j"] = job
     state = JobRetryState(0.01, 1, 0.01)
     cron.retry_state["j"] = state
@@ -1207,7 +1207,7 @@ async def test_schedule_retry_job_defers_during_unsettled_view(
         view_settled=lambda: settled,
     )
     # while unsettled, the gate denial must read as transient, never a move
-    job = types.SimpleNamespace(name="j", clusterPolicy="PreferLeader")
+    job = types.SimpleNamespace(name="j", clusterPolicy="PreferLeader", pool=None)
     assert cron._cluster_owner_moved(job) is False
     launched = []
     monkeypatch.setattr(
@@ -1264,7 +1264,7 @@ async def test_retry_abandonment_cancels_state_and_records(caplog):
         has_conflict=lambda: False,
         view_settled=lambda: True,
     )
-    job = types.SimpleNamespace(name="j", clusterPolicy="Leader")
+    job = types.SimpleNamespace(name="j", clusterPolicy="Leader", pool=None)
     cron.cron_jobs["j"] = job
     state = JobRetryState(0.1, 2, 1)
     cron.retry_state["j"] = state

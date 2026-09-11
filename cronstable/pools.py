@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import hashlib
+import json
 import logging
 import time
 import uuid
@@ -47,6 +48,13 @@ class Ticket:
     valid: bool = True
 
 
+@dataclass
+class RetrySettlement:
+    generation: str
+    reason: str
+    previous: Optional[str] = None
+
+
 def _maintain(body: dict[str, Any], now: float) -> None:
     entries = body["entries"]
     for entry in entries.values():
@@ -84,6 +92,7 @@ class PoolScheduler:
         self._task: Optional[asyncio.Task] = None
         self._heartbeat: Optional[asyncio.Task] = None
         self._wake = asyncio.Event()
+        self._retry_settlements: dict[tuple[str, str], RetrySettlement] = {}
 
     def service(self) -> None:
         if self._task is None or self._task.done():
@@ -128,9 +137,7 @@ class PoolScheduler:
             except asyncio.TimeoutError:
                 pass
 
-    async def _change(
-        self, pool, action, *, backend=None, strict=False, admission=False
-    ):
+    async def _change(self, pool, action, *, backend=None, strict=False):
         backend = backend or self.cron.state_backend
         if backend is None:
             raise PoolError("pool state is unavailable")
@@ -152,15 +159,10 @@ class PoolScheduler:
             )
             _maintain(body, now)
             if strict and conf is not None and body["slots"] != conf["slots"]:
-                if any(
+                if not any(
                     e["state"] not in TERMINAL
                     for e in body["entries"].values()
                 ):
-                    if admission:
-                        raise PoolError(
-                            "pool is draining before a capacity change"
-                        )
-                else:
                     body["slots"] = conf["slots"]
             result = action(body, now)
             return (DOC_KEEP if body == current else body), result
@@ -170,7 +172,9 @@ class PoolScheduler:
         )
         return result
 
-    async def enqueue(self, job, *, key=None, payload=None):
+    async def enqueue(
+        self, job, *, key=None, payload=None, retry_state=None, resume=False
+    ):
         key = key or uuid.uuid4().hex
         conf = self.cron.pool_config.get(job.pool)
         if conf is None:
@@ -178,14 +182,34 @@ class PoolScheduler:
 
         def add(body, now):
             old = body["entries"].get(key)
-            if old is not None:
+            if old is not None and not (
+                resume and old["state"] in ("cancelled", "expired")
+            ):
                 return old
+            if body["slots"] != conf["slots"]:
+                raise PoolError("pool is draining before a capacity change")
             if (
                 len(_waiting(body))
                 + sum(_unobserved_task(e) for e in body["entries"].values())
                 >= conf["maxQueued"]
             ):
                 raise PoolError("pool queue is full")
+            context = dict(payload or {})
+            if retry_state is not None:
+                scope = self._retry_scope(job.name, context.get("targetHost"))
+                guard = retry_state.pool_retry or {
+                    "pool": job.pool,
+                    "scope": scope,
+                    "generation": body.get("retryGenerations", {}).get(
+                        scope, ""
+                    ),
+                }
+                context["retryGuard"] = guard
+                context["retryCancelled"] = retry_state.cancelled
+                context["retry"] = {
+                    "count": retry_state.count,
+                    "delay": retry_state.delay,
+                }
             entry = {
                 "id": key,
                 "job": job.name,
@@ -196,7 +220,7 @@ class PoolScheduler:
                 "expiresAt": now + job.queueTimeout,
                 "digest": job_digest_cached(job),
                 "owner": None,
-                "payload": payload or {},
+                "payload": context,
             }
             if payload and payload.get("kind") == "task":
                 entry.update(
@@ -205,9 +229,158 @@ class PoolScheduler:
             body["entries"][key] = entry
             return entry
 
-        entry = await self._change(job.pool, add, strict=True, admission=True)
+        await self._flush_retry_settlements(job.pool)
+        entry = await self._change(job.pool, add, strict=True)
+        if retry_state is not None:
+            retry_state.pool_retry = entry["payload"].get("retryGuard")
         self.service()
         return entry
+
+    async def enqueue_job(
+        self, job, *, with_retries=True, manual=False, key=None, resume=False
+    ):
+        slot = self.cron._last_run_slot.get(job.name)
+        retry_state = (
+            self.cron.retry_state.get(job.name)
+            if with_retries and not manual
+            else None
+        )
+        if (
+            key is None
+            and retry_state is not None
+            and retry_state.count > 0
+            and retry_state.pool_retry
+        ):
+            # Rehydration or a timed-out admission must find the same attempt.
+            key = self._key(
+                ("retry", retry_state.pool_retry, retry_state.count)
+            )
+        return await self.enqueue(
+            job,
+            key=key,
+            payload={
+                "kind": "job",
+                "withRetries": with_retries,
+                "manual": manual,
+                "targetHost": self.cron._state_host
+                if manual or job.clusterPolicy == "EveryNode"
+                else None,
+                "scheduledAt": slot.isoformat()
+                if slot is not None and not manual
+                else None,
+            },
+            retry_state=retry_state,
+            resume=resume,
+        )
+
+    @staticmethod
+    def _key(parts):
+        return hashlib.sha256(
+            json.dumps(parts, sort_keys=True).encode()
+        ).hexdigest()
+
+    def catchup_key(self, job, watermark, index):
+        host = (
+            self.cron._state_host if job.clusterPolicy == "EveryNode" else None
+        )
+        return self._key(
+            (
+                "catchup",
+                job.name,
+                job_digest_cached(job),
+                host,
+                watermark,
+                index,
+            )
+        )
+
+    @staticmethod
+    def _retry_scope(name, host):
+        return json.dumps([name, host], separators=(",", ":"))
+
+    @staticmethod
+    def restore_retry(state, record):
+        guard = record.get("poolRetry")
+        if isinstance(guard, dict) and all(
+            isinstance(guard.get(key), str)
+            for key in ("pool", "scope", "generation")
+        ):
+            state.pool_retry = guard
+
+    @staticmethod
+    def _retry_current(body, payload):
+        if payload.get("retryCancelled"):
+            return False
+        guard = payload.get("retryGuard")
+        return (
+            guard is None
+            or body.get("retryGenerations", {}).get(guard["scope"], "")
+            == guard["generation"]
+        )
+
+    async def retry_current(self, guard):
+        if guard is None:
+            return True
+        await self._flush_retry_settlements(guard["pool"])
+        return await self._change(
+            guard["pool"],
+            lambda body, now: self._retry_current(body, {"retryGuard": guard}),
+        )
+
+    async def settle_retries(self, name, reason):
+        job = self.cron.cron_jobs.get(name)
+        # EveryNode ladders and explicit starts belong to their node.
+        scopes = {self._retry_scope(name, self.cron._state_host)}
+        if job is None or job.clusterPolicy != "EveryNode":
+            scopes.add(self._retry_scope(name, None))
+        for pool in self.cron.pool_config:
+            for scope in scopes:
+                self._retry_settlements.setdefault(
+                    (pool, scope), RetrySettlement(uuid.uuid4().hex, reason)
+                )
+            try:
+                await self._flush_retry_settlements(pool)
+            except (PoolError, OSError, asyncio.TimeoutError):
+                logger.warning("pool %s: retry settlement deferred", pool)
+        self.service()
+
+    async def _flush_retry_settlements(self, pool):
+        for (name, scope), settlement in list(self._retry_settlements.items()):
+            if name != pool:
+                continue
+
+            def settle(body, now, scope=scope, settlement=settlement):
+                generations = body.setdefault("retryGenerations", {})
+                current = generations.get(scope, "")
+                if settlement.previous is None:
+                    settlement.previous = current
+                if current != settlement.previous:
+                    # A timed-out mutation can land after its retry. Never
+                    # repeat cancellation or overwrite a newer generation.
+                    return
+                generations[scope] = settlement.generation
+                for entry in body["entries"].values():
+                    payload = entry["payload"]
+                    retry = payload.get("retry")
+                    if (
+                        retry is None
+                        or self._retry_scope(
+                            entry["job"], payload.get("targetHost")
+                        )
+                        != scope
+                    ):
+                        continue
+                    payload["retryCancelled"] = True
+                    if entry["state"] == "queued" and retry["count"] > 0:
+                        entry.update(
+                            state="cancelled",
+                            reason=settlement.reason,
+                            finishedAt=now,
+                        )
+
+            await self._change(pool, settle)
+            if self._retry_settlements.get((pool, scope)) == settlement:
+                del self._retry_settlements[(pool, scope)]
 
     async def acquire(self, pool: str, key: str) -> Optional[Ticket]:
         if (pool, key) in self.held:
@@ -218,6 +391,21 @@ class PoolScheduler:
         def claim(body, now):
             entry = body["entries"].get(key)
             if entry is None or entry["state"] != "queued":
+                return False
+            target = entry["payload"].get("targetHost")
+            if target is not None and target != self.cron._state_host:
+                return False
+            retry = entry["payload"].get("retry")
+            if (
+                retry
+                and retry["count"] > 0
+                and not self._retry_current(body, entry["payload"])
+            ):
+                entry.update(
+                    state="cancelled",
+                    reason="retry superseded",
+                    finishedAt=now,
+                )
                 return False
             used = sum(
                 e["slots"]
@@ -395,10 +583,18 @@ class PoolScheduler:
                 logger.exception("pool %s could not dispatch; retrying", pool)
 
     async def _tick_pool(self, pool):
+        await self._flush_retry_settlements(pool)
         body = await self._change(pool, lambda body, now: copy.deepcopy(body))
+        if await self._retire_tasks(pool, body):
+            body = await self._change(
+                pool, lambda body, now: copy.deepcopy(body)
+            )
         for entry in _waiting(body)[:32]:
             payload = entry["payload"]
             if payload.get("kind") != "job":
+                continue
+            target = payload.get("targetHost")
+            if target is not None and target != self.cron._state_host:
                 continue
             job = self.cron.cron_jobs.get(entry["job"])
             if (
@@ -441,6 +637,83 @@ class PoolScheduler:
                 await self.finish(ticket, "queued", "launch interrupted")
                 raise
 
+    async def _retire_tasks(self, pool, body):
+        """Retire orphaned claims, including failures nobody can observe.
+
+        Read each run once, with a bounded scan. Never infer absence from
+        an unavailable store. Terminal task states cannot become live again
+        under the same run ID and attempt.
+        """
+        from cronstable import dag
+
+        candidates = [
+            e for e in _waiting(body) if e["payload"].get("kind") == "task"
+        ][:32] + [e for e in body["entries"].values() if _unobserved_task(e)][
+            :32
+        ]
+        runs = {}
+        retired = set()
+        for entry in candidates:
+            payload = entry["payload"]
+            if payload.get("kind") != "task":
+                continue
+            ref = (payload["dag"], payload["runKey"])
+            if ref not in runs:
+                runs[ref] = await self.cron._dag._read(*ref)
+            run = runs[ref]
+            task = (run or {}).get("tasks", {}).get(payload["task"])
+            if (
+                run is None
+                or task is None
+                or dag.is_terminal_run(run)
+                or task["state"] in dag.TERMINAL_STATES
+                or (
+                    payload.get("runId") is not None
+                    and payload["runId"] != run["runId"]
+                )
+                or (
+                    payload.get("attempt") is not None
+                    and payload["attempt"] != task.get("attempt", 0)
+                )
+                or (
+                    payload.get("poke") is not None
+                    and payload["poke"] != task.get("pokeCount", 0)
+                )
+            ):
+                retired.add(entry["id"])
+        if not retired:
+            return False
+
+        def retire(body, now):
+            for key in retired:
+                entry = body["entries"].get(key)
+                if entry is None or entry["state"] == "running":
+                    continue
+                if entry["state"] == "queued":
+                    entry.update(
+                        state="cancelled",
+                        reason="task is no longer waiting",
+                        finishedAt=now,
+                    )
+                entry["observed"] = True
+            return True
+
+        return await self._change(pool, retire)
+
+    async def wait_finished(self, pool, key):
+        """Wait for this receipt, not for an instant of local idleness."""
+        while not self.cron._stop_event.is_set():
+            entry = await self._change(
+                pool, lambda body, now: body["entries"].get(key)
+            )
+            if entry is None or entry["state"] in TERMINAL:
+                return entry is not None and entry["state"] == "finished"
+            try:
+                await asyncio.wait_for(self.cron._stop_event.wait(), 0.25)
+            except asyncio.TimeoutError:
+                pass
+        return False
+
     async def admit_task(self, job, ref, run_id, intent):
         raw = repr(
             (ref, run_id, intent.taskkey, intent.attempt, intent.poke_number)
@@ -454,6 +727,9 @@ class PoolScheduler:
                 "dag": ref[0],
                 "runKey": ref[1],
                 "task": intent.taskkey,
+                "runId": run_id,
+                "attempt": intent.attempt,
+                "poke": intent.poke_number,
             },
         )
         if entry["state"] in TERMINAL:

@@ -549,6 +549,7 @@ jobs:
             tests/test_web_heat_e2e.py \
             tests/test_web_drawer_e2e.py \
             tests/test_web_recovery_e2e.py \
+            tests/test_web_work_e2e.py \
             tests/test_web_title_e2e.py \
             tests/test_web_logsearch_e2e.py \
             tests/test_web_fleet_e2e.py \

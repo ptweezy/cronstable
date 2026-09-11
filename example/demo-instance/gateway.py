@@ -47,6 +47,7 @@ READ_ROUTES = (
     "/jobs/{name}/trends",
     "/jobs/{name}/logs",
     "/dags",
+    "/pools",
     "/dags/{name}/runs",
     "/dags/{name}/runs/{run_key}",
     "/dags/{name}/runs/{run_key}/xcom",

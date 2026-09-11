@@ -2062,6 +2062,9 @@ class JobRetryState:
         # the hand-off instant; anchoring on the latter could re-run a run
         # completed between arming and hand-off (a double-fire).
         self.armed_at: datetime | None = None
+        # Durable pool generation: a settled ladder cannot be revived by
+        # an already queued attempt, including after a daemon restart.
+        self.pool_retry: Optional[dict[str, str]] = None
 
     def next_delay(self) -> float:
         delay = self.delay

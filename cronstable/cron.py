@@ -4443,17 +4443,14 @@ class Cron:
                 await self._reboot_boot_gate(job)
         if getattr(job, "pool", None) is not None:
             try:
-                entry = await self._pools.enqueue(
-                    job,
-                    payload={
-                        "kind": "job",
-                        "withRetries": True,
-                        "manual": True,
-                    },
-                )
+                entry = await self._pools.enqueue_job(job, manual=True)
                 return str(entry["id"])
             except PoolError as ex:
                 raise ApiActionError(str(ex), status=409) from ex
+            except (OSError, asyncio.TimeoutError) as ex:
+                raise ApiActionError(
+                    "pool state is unavailable", status=503
+                ) from ex
         else:
             await self.maybe_launch_job(job)
         return None
@@ -9476,7 +9473,7 @@ class Cron:
                 if job.concurrencyPolicy == "Forbid"
                 else CATCHUP_IDLE_WAIT_LIMIT
             )
-            for _ in range(count):
+            for index in range(count):
                 if not await self._wait_job_idle(job.name, max_wait=max_wait):
                     return  # shutdown while draining
                 # Revalidate EVERY iteration, not just after the jitter: a
@@ -9516,7 +9513,19 @@ class Cron:
                         job.name,
                     )
                     return
-                await self.maybe_launch_job(job, with_retries=False)
+                if job.pool is not None:
+                    entry = await self._pools.enqueue_job(
+                        job,
+                        with_retries=False,
+                        key=self._pools.catchup_key(job, watermark, index),
+                        resume=True,
+                    )
+                    if not await self._pools.wait_finished(
+                        job.pool, entry["id"]
+                    ):
+                        return  # keep the checkpoint open for unfinished work
+                else:
+                    await self.maybe_launch_job(job, with_retries=False)
             # drain the final launch so its run record lands before the
             # checkpoint closes (a crash in between merely replays: the
             # checkpoint is at-least-once by design).
@@ -10463,7 +10472,14 @@ class Cron:
             )
             self.retry_state[job.name] = retry_state
 
-        await self.maybe_launch_job(job)
+        try:
+            await self.maybe_launch_job(job)
+        except (PoolError, OSError, asyncio.TimeoutError) as ex:
+            if job.pool is None:
+                raise
+            logger.warning(
+                "Job %s could not enter pool %s: %s", job.name, job.pool, ex
+            )
 
     async def maybe_launch_job(
         self,
@@ -10479,21 +10495,7 @@ class Cron:
         work independent of the job's retry ladder.
         """
         if job.pool is not None and pool_ticket is None:
-            slot = self._last_run_slot.get(job.name)
-            retry = self.retry_state.get(job.name) if with_retries else None
-            await self._pools.enqueue(
-                job,
-                payload={
-                    "kind": "job",
-                    "withRetries": with_retries,
-                    "retry": {"count": retry.count, "delay": retry.delay}
-                    if retry is not None and not retry.cancelled
-                    else None,
-                    "scheduledAt": slot.isoformat()
-                    if slot is not None
-                    else None,
-                },
-            )
+            await self._pools.enqueue_job(job, with_retries=with_retries)
             return True
         async with self._launch_locks[job.name]:
             return await self._launch_job_locked(
@@ -10507,6 +10509,17 @@ class Cron:
         pool_ticket: Optional[Ticket] = None,
     ) -> bool:
         """The body of :meth:`maybe_launch_job`, under its per-job lock."""
+        retry_current = True
+        if pool_ticket is not None:
+            retry_current = await self._pools.retry_current(
+                pool_ticket.payload.get("retryGuard")
+            ) and not pool_ticket.payload.get("retryCancelled", False)
+            saved = pool_ticket.payload.get("retry")
+            if saved and saved["count"] > 0 and not retry_current:
+                await self._pools.finish(
+                    pool_ticket, "cancelled", "retry superseded"
+                )
+                return False
         # .get(), not a bare subscript: subscripting this defaultdict
         # would INSERT a phantom empty-list key, which makes running_jobs
         # truthy with nothing to reap and spins the reaper hot at
@@ -10546,17 +10559,22 @@ class Cron:
             if not await self._claim_cluster_slot(job):
                 return False
         logger.info("Starting job %s", job.name)
-        retry_state = self.retry_state.get(job.name) if with_retries else None
+        retry_state = (
+            self.retry_state.get(job.name)
+            if with_retries and pool_ticket is None
+            else None
+        )
         if pool_ticket is not None and with_retries:
             saved = pool_ticket.payload.get("retry")
             policy = job.onFailure["retry"]
-            if saved is not None:
+            if saved is not None and retry_current:
                 retry_state = JobRetryState(
                     saved["delay"],
                     policy["backoffMultiplier"],
                     policy["maximumDelay"],
                 )
                 retry_state.count = saved["count"]
+                retry_state.pool_retry = pool_ticket.payload.get("retryGuard")
                 self.retry_state[job.name] = retry_state
         run_token: Optional[str] = None
         try:
@@ -10618,6 +10636,12 @@ class Cron:
                 lambda: self._persist_inflight_open(job, running_job),
             )
         logger.info("Job %s spawned", job.name)
+        if (
+            pool_ticket is not None
+            and retry_state is not None
+            and retry_state.count > 0
+        ):
+            self.metrics.job_retry_launched(job.name)
         return True
 
     # --- cluster-wide concurrency slots (concurrencyScope: cluster) -------
@@ -12533,6 +12557,7 @@ class Cron:
         # delay == what the NEXT failure would sleep.
         for _ in range(attempt):
             state.next_delay()
+        self._pools.restore_retry(state, rec)
         now = get_now(datetime.timezone.utc)
         remaining = max(0.0, (not_before - now).total_seconds())
         self.retry_state[name] = state
@@ -12791,7 +12816,20 @@ class Cron:
         return latest[1] == "success"
 
     async def _handle_finished_job(self, job: RunningJob) -> None:
-        await self._pools.finish(getattr(job, "pool_ticket", None))
+        completed = False
+        try:
+            await self._record_finished_job(job)
+            completed = True
+        finally:
+            # Release capacity even if recording is interrupted. Only a
+            # completed receipt lets catch-up advance to its next run.
+            await self._pools.finish(
+                getattr(job, "pool_ticket", None),
+                "finished" if completed else "cancelled",
+                None if completed else "completion interrupted",
+            )
+
+    async def _record_finished_job(self, job: RunningJob) -> None:
         if getattr(job, "dag_ref", None) is not None:
             # a DAG task instance: route to the DAG scheduler and skip
             # the job record/retry/inflight/cluster-slot path; a task's
@@ -12988,6 +13026,15 @@ class Cron:
 
         # Handle retries...
         state = job.retry_state
+        if state is not None and state.pool_retry is not None:
+            try:
+                if not await self._pools.retry_current(state.pool_retry):
+                    state.cancelled = True
+            except (PoolError, OSError, asyncio.TimeoutError):
+                # Admission rechecks the guard and defers during outages.
+                logger.warning(
+                    "Job %s: deferring its retry guard check", job.config.name
+                )
         if state is None or state.cancelled:
             self.metrics.job_permanent_failure(job.config.name)
             await job.report_permanent_failure()
@@ -13148,7 +13195,10 @@ class Cron:
         # counted on the launch result (not where the retry is armed) so the
         # counter reports retries actually launched, net of cancellations,
         # abandonments, and a concurrencyPolicy=Forbid skip.
-        if await self.maybe_launch_job(job):
+        # Pool admission already happened in _retry_consume_ok. Its durable
+        # receipt replaces the consume-before-spawn record; the dispatcher
+        # counts the retry only when it actually starts a process.
+        if job.pool is None and await self.maybe_launch_job(job):
             self.metrics.job_retry_launched(job_name)
 
     def _persist_retry_pending(
@@ -13177,6 +13227,9 @@ class Cron:
             "host": self._state_host,
             "at": get_now(datetime.timezone.utc).isoformat(),
         }
+        state = self.retry_state.get(job.name)
+        if state is not None and state.pool_retry is not None:
+            record["poolRetry"] = state.pool_retry
         return self._queue_retry_write(job.name, record)
 
     def _persist_retry_settled(
@@ -13381,6 +13434,30 @@ class Cron:
         anyway (at-least-once) and fail-closed defers like a closed
         cluster gate. Stateless is always True with no I/O.
         """
+        job = self.cron_jobs.get(job_name)
+        if job is not None and job.pool is not None:
+            state = self.retry_state.get(job_name)
+            if state is None or state.cancelled:
+                return False
+            try:
+                if not await self._pools.retry_current(state.pool_retry):
+                    state.cancelled = True
+                    return False
+                await self._pools.enqueue_job(job)
+            except (PoolError, OSError, asyncio.TimeoutError) as ex:
+                if not quiet:
+                    logger.warning(
+                        "Job %s retry #%i waiting for pool admission: %s",
+                        job_name,
+                        retry_num,
+                        ex,
+                    )
+                return False
+            # Leave the pending ledger row in place: a restart finds this
+            # same receipt, and a later completion/attempt supersedes it.
+            # Settling before admission would lose a rejected retry; settling
+            # after admission could overwrite a fast peer's next attempt.
+            return True
         backend = self.state_backend
         fail_closed = (
             self._state_configured
@@ -13775,6 +13852,7 @@ class Cron:
         )
         for _ in range(attempt):
             state.next_delay()
+        self._pools.restore_retry(state, rec)
         now = get_now(datetime.timezone.utc)
         remaining = max(0.0, (not_before - now).total_seconds())
         self.retry_state[name] = state
@@ -13844,6 +13922,8 @@ class Cron:
             "at": get_now(datetime.timezone.utc).isoformat(),
             "claimedFrom": rec.get("host") or rec.get("fromHost"),
         }
+        if "poolRetry" in rec:
+            claim["poolRetry"] = rec["poolRetry"]
         write = self._queue_retry_write(name, claim)
         try:
             # the claim record must LAND before the lease is released, or
@@ -13979,6 +14059,11 @@ class Cron:
                 job_name,
                 {
                     "kind": "handoff",
+                    **(
+                        {"poolRetry": state.pool_retry}
+                        if state is not None and state.pool_retry is not None
+                        else {}
+                    ),
                     "attempt": retry_num,
                     "notBefore": now.isoformat(),
                     "jobDigest": job_digest_cached(job),
@@ -14060,19 +14145,23 @@ class Cron:
     async def cancel_job_retries(
         self, name: str, *, settle: Optional[str] = "superseded"
     ) -> None:
-        try:
-            state = self.retry_state.pop(name)
-        except KeyError:
-            return
-        state.cancelled = True
+        state = self.retry_state.pop(name, None)
+        if state is not None:
+            state.cancelled = True
         # Settle the durable ladder record so a pending retry is not
         # re-armed on the next boot. Skipped when settle is None (the
         # graceful-shutdown path: surviving the restart is the point) and
         # when count == 0 (nothing durable was written).
-        if settle is not None and state.count > 0:
+        if settle is not None and state is not None and state.count > 0:
             self._persist_retry_settled(name, settle, state.count)
-        if state.task is not None:
+        if state is not None and state.task is not None:
             if state.task.done():
                 self._reap_retry_task(name, state.task)
             else:
                 state.task.cancel()
+        job = self.cron_jobs.get(name)
+        if settle is not None and (
+            (job is not None and job.pool is not None)
+            or (state is not None and state.pool_retry is not None)
+        ):
+            await self._pools.settle_retries(name, settle)
