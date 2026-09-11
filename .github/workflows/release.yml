@@ -1794,7 +1794,7 @@ jobs:
       - name: Fetch the ARMv6 post-quantum wheel
         if: ${{ matrix.arch == 'armv6' }}
         continue-on-error: true
-        uses: actions/download-artifact@v7.0.0
+        uses: actions/download-artifact@v8.0.1
         with:
           name: pq-wheel-glibc-armv6
           path: pq-wheels
