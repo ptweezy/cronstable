@@ -1,0 +1,34 @@
+{
+  "jobs": [
+    "welcome",
+    "heartbeat",
+    "load-pulse",
+    "sensor-sweep",
+    "media-reindex",
+    "cam-timelapse",
+    "backup-verify",
+    "offsite-snapshot",
+    "feed-sync",
+    "config-drift-check",
+    "gateway-probe",
+    "meter-export",
+    "rotate-journal",
+    "photo-tagger",
+    "metrics-rollup",
+    "dns-flush",
+    "bill-reminder",
+    "pool-scrub",
+    "market-open-note",
+    "photo-frame-sync",
+    "disk-report",
+    "morning-briefing",
+    "thermostat-sync",
+    "ipv6-cutover",
+    "restore-drill"
+  ],
+  "dags": [
+    "nightly-archive",
+    "photo-pipeline",
+    "firmware-rollout"
+  ]
+}

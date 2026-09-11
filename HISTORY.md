@@ -1,5 +1,12 @@
 # History
 
+## 1.2.52
+
+- Make the hosted demo interactive through a separate gateway, with bounded
+  sample actions, lighter workloads and Docker/launchd setup. Demo policy
+  stays outside the standard daemon and dashboard.
+- Fix WinGet release dates and package metadata.
+
 ## 1.2.51
 
 - Release CI validates credentials, package recipes and dependency sources

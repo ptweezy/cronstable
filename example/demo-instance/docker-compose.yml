@@ -1,9 +1,9 @@
-# The public read-only demo instance (see cronstable.yaml and README.md).
+# The public interactive demo instance (see cronstable.yaml and README.md).
 #
 #   cp .env.example .env      # then paste the tunnel token into it
 #   docker compose -f example/demo-instance/docker-compose.yml up -d --build
 #
-# Two containers: the daemon, and a Cloudflare Tunnel that publishes it at
+# Three containers: the daemon, a demo-only gateway, and a tunnel serving
 # demo.cronstable.com.  The tunnel dials out to Cloudflare, so the host
 # needs no port forwarding, no static IP and no inbound firewall hole,
 # which is what makes running this on a machine at home reasonable.  TLS
@@ -13,6 +13,7 @@ services:
   cronstable-demo:
     build:
       context: ../..
+    image: cronstable-demo-local
     container_name: cronstable-demo
     # Point at the config file, not the image's default `-c /etc/cronstable.d`
     # directory. `include: legacy.crontab` resolves next to the config, so
@@ -24,8 +25,8 @@ services:
     environment:
       # The view-scoped demo credential. Public by design (it ships in the
       # companion app); override to rotate, then update the app config.
-      # Anonymous visitors already hold the same view scope, so this token
-      # is a convenience for clients that authenticate, not a gate.
+      # The gateway accepts this public token; it stays view-only on the
+      # daemon. Never promote it to operator scopes.
       CRONSTABLE_DEMO_VIEW_TOKEN: ${CRONSTABLE_DEMO_VIEW_TOKEN:-cronstable-public-demo-view}
       # The demo-operator job's control+approve credential. Deliberately has
       # no default: a literal here would be a published control token for
@@ -33,9 +34,8 @@ services:
       #   printf 'CRONSTABLE_DEMO_OPERATOR_TOKEN=%s\n' \
       #     "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" >> .env
       CRONSTABLE_DEMO_OPERATOR_TOKEN: ${CRONSTABLE_DEMO_OPERATOR_TOKEN:?generate one into example/demo-instance/.env (see the comment above)}
-    # Loopback only, and only so the operator can curl it on the box: the
-    # tunnel reaches the daemon over the compose network as
-    # http://cronstable-demo:8080, never through a published port.
+    # Internal daemon API. The tunnel must point at the gateway on 8081.
+    # Loopback publication is for private operator access and diagnostics.
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -67,12 +67,59 @@ services:
       retries: 3
       start_period: 30s
 
+  gateway:
+    image: cronstable-demo-local
+    pull_policy: never
+    container_name: cronstable-demo-gateway
+    # This script is mounted only into the demo deployment. It is absent
+    # from the standard image's installed Python package and entrypoint.
+    entrypoint: ["/opt/venv/bin/python", "/demo/gateway.py"]
+    command:
+      - --config
+      - /demo/cronstable.yaml
+      - --upstream
+      - http://cronstable-demo:8080
+      - --host
+      - 0.0.0.0
+      - --origin
+      - https://${CRONSTABLE_DEMO_HOSTNAME:-demo.cronstable.com}
+      - --origin
+      - http://127.0.0.1:8081
+      - --origin
+      - http://localhost:8081
+    environment:
+      CRONSTABLE_DEMO_VIEW_TOKEN: ${CRONSTABLE_DEMO_VIEW_TOKEN:-cronstable-public-demo-view}
+      CRONSTABLE_DEMO_OPERATOR_TOKEN: ${CRONSTABLE_DEMO_OPERATOR_TOKEN:?generate one into example/demo-instance/.env}
+    volumes:
+      - ./gateway.py:/demo/gateway.py:ro
+      - ./gateway.json:/demo/gateway.json:ro
+      - ./gateway-overlay.html:/demo/gateway-overlay.html:ro
+      - ./cronstable.yaml:/demo/cronstable.yaml:ro
+      - ./legacy.crontab:/demo/legacy.crontab:ro
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      cronstable-demo:
+        condition: service_healthy
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "/opt/venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/whoami', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
   tunnel:
     image: cloudflare/cloudflared:latest
     container_name: cronstable-demo-tunnel
     # A named tunnel run from a token; the public hostname -> service
     # mapping lives in the Cloudflare dashboard (see README.md), pointing
-    # at http://cronstable-demo:8080 on this compose network.
+    # at http://gateway:8081 on this compose network.
     command: tunnel --no-autoupdate run
     environment:
       # Required: the `:?` makes a missing token a startup error rather
@@ -81,8 +128,8 @@ services:
       # through your tunnel.
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in example/demo-instance/.env}
     depends_on:
-      cronstable-demo:
-        condition: service_started
+      gateway:
+        condition: service_healthy
     restart: unless-stopped
     cap_drop: [ALL]
     security_opt:

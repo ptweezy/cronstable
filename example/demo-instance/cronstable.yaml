@@ -1,4 +1,4 @@
-# The public read-only demo instance (demo.cronstable.com).
+# The public interactive demo instance (demo.cronstable.com).
 #
 # This board backs the dashboard anyone can open at demo.cronstable.com, the
 # companion app's "Try the demo" button, and App Store review. It is one
@@ -7,28 +7,15 @@
 # one capability, and its name, comment and log lines say which, so a
 # first-time visitor can answer "what can this thing do?" by scrolling.
 #
-# Access model, on purpose:
-#   - Anyone may read, with no credential at all: `web.anonymousScopes` below
-#     grants the `view` scope to unauthenticated requests, so the dashboard,
-#     the log tails and the calendar feeds open for a visitor who has never
-#     heard of a bearer token. Nothing mutating is reachable that way; every
-#     such call answers 403 by scope.
-#   - The view-scoped token below still exists for clients that authenticate
-#     (the companion app bakes it in). It grants exactly what anonymous
-#     visitors already have, so it is public by design.
-#   - The operator token belongs to the `demo-operator` job on this host.
-#     Visitors cannot mutate anything, so a scripted operator performs the
-#     mutating actions that make those states visible on the board: it decides
-#     the firmware-rollout approval gate, opens a scheduled maintenance-window
-#     pause, and clears meter-export's depends-on-past gate with a manual
-#     start. Its secret is generated per host, lives only in the daemon's
-#     environment, and is never printed and never leaves the machine.
-#   - No `push:` block: pairing a device against a public board makes no sense
-#     and would need control of a relay topic; the app's demo mode renders its
-#     own sample alerts locally. `GET /push/devices` is never anonymous.
-#   - No job talks to the outside world. The only "network" any job touches is
-#     the daemon's own loopback API (the job-facing state endpoint, the public
-#     /metrics scrape, and the operator's control calls).
+# Public access is explicitly bounded by the demo gateway. Visitors can run,
+# cancel, pause/resume the allowlisted samples and trigger/decide workflows.
+# Starts share a ten-second cooldown; pauses last one minute, public notes and
+# attribution are fixed, and only one active run per workflow may be started
+# by visitors. Administration, backfill and device pairing remain private.
+# The public view token stays compatible with existing companion-app builds.
+# The gateway and demo-operator use a PRIVATE control+approve token.
+# No push block: real APNs pairing/delivery still needs a separate test server.
+# All work is simulated locally; no backup, firmware or media service is touched.
 #
 # Every command here runs on both supported hosts: bash plus python3 only, no
 # curl and no coreutils-only binaries, because the container image is
@@ -49,6 +36,9 @@ defaults:
   shell: /bin/bash
   captureStdout: true
   captureStderr: true
+  concurrencyPolicy: Forbid
+  executionTimeout: 30
+  killTimeout: 2
 
 # Durable run history: job detail and run screens stay populated across daemon
 # restarts, jobs get the loopback state API (cursor/idempotent/lock/artifact/
@@ -64,9 +54,8 @@ web:
   # Plaintext on the local port; TLS is the tunnel's job.
   listen:
     - http://0.0.0.0:8080
-  # The whole point of a public demo: a visitor with no token reads the board.
-  # Only `view` may be granted this way, and the schema enforces it, so no
-  # anonymous path to a mutating endpoint can be configured by accident.
+  # The standard daemon grants anonymous read access. The gateway adds
+  # bounded visitor actions using a private credential on the internal API.
   anonymousScopes:
     - view
   # Prometheus exposition, tokenless by design: `curl demo.cronstable.com/metrics`
@@ -84,7 +73,7 @@ web:
       scopes:
         - view
       fromEnvVar: CRONSTABLE_DEMO_VIEW_TOKEN
-    # The scripted operator's credential (see the header note and the
+    # The gateway and scripted operator's credential (see the header and
     # demo-operator job). control+approve imply view. Generated per host by
     # launchd/install.sh; never checked in and never defaulted.
     #
@@ -115,7 +104,8 @@ jobs:
       echo "cronstable public demo up on $HOSTNAME at $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
       echo "every job on this board exists to show one capability; scroll and read"
       echo "you are reading this without a token: this instance grants anonymous view scope"
-      echo "visitors are read-only; the demo-operator job performs the approvals and pauses you will see"
+      echo "try Run now on the sample jobs or trigger firmware-rollout and decide its approval gate"
+      echo "work is simulated; starts have a shared 10s cooldown and visitor pauses last 60s"
     schedule: "@reboot"
 
   # [shows: durable KV counter] The steady green pulse, with a proof of
@@ -165,19 +155,16 @@ jobs:
       echo "sweep complete: 20/20 nominal"
     schedule: "*/3 * * * *"
 
-  # [shows: Forbid concurrency + per-run resource charts + duration variance]
-  # Runs 60-90 s with progress output and real CPU pulses the resource sampler
-  # draws; batch count varies, so the Trends duration chart is not a flat line.
-  # Forbid means a still-running instance makes the next tick skip rather than
-  # stack (contrast cam-timelapse's Replace).
+  # [shows: Forbid concurrency + progress logs + duration variance]
+  # Four to six one-second batches simulate index work without CPU stress.
   - name: media-reindex
     command: |
-      batches=$((RANDOM % 7 + 12))
+      batches=$((RANDOM % 3 + 4))
       echo "reindexing library in $batches batches..."
       for i in $(seq 1 $batches); do
-        python3 -c "import hashlib; h = hashlib.sha256(); block = b'x' * 1048576; [h.update(block) for _ in range(400)]; print('batch digest', h.hexdigest()[:12])"
+        echo "[demo] metadata read and index write simulated; no media files opened"
         echo "batch $i/$batches indexed ($((i * 512)) items)"
-        sleep 4
+        sleep 1
       done
       echo "reindex complete: $((batches * 512)) items"
     schedule: "*/15 * * * *"
@@ -186,25 +173,22 @@ jobs:
       interval: 0.5
       history: 240
 
-  # [shows: Replace concurrency -> Cancelled runs + a near-always-Running row]
-  # Stitches "camera stills" for 3.5-7 minutes on a 5-minute schedule: when a
-  # run overshoots its interval, Replace cancels it in favor of the new fire,
-  # and the ledger records Cancelled (not a failure). The short lock at the end
-  # shares the `photo-library` mutex with photo-tagger.
+  # [shows: Replace concurrency + cancellation + shared mutex]
+  # A 12–16 second simulated render can be replaced or cancelled by a visitor.
   - name: cam-timelapse
     schedule: "2-57/5 * * * *"
     concurrencyPolicy: Replace
     monitorResources: true
     command: |
-      segs=$((RANDOM % 15 + 14))
+      segs=$((RANDOM % 3 + 6))
       echo "stitching driveway-cam stills ($segs segments planned)"
       i=1
       while [ $i -le $segs ]; do
         echo "segment $i/$segs rendered at $(date -u +%T)"
-        sleep 15
+        sleep 2
         i=$((i + 1))
       done
-      cronstable lock run --global --wait --timeout 60 photo-library -- sh -c 'echo "publishing segments into the shared photo library (holds the photo-library mutex)"; sleep 5'
+      cronstable lock run --global --wait --timeout 5 photo-library -- sh -c 'echo "publishing segments into the shared photo library (holds the photo-library mutex)"; sleep 1'
       echo "timelapse updated: $segs segments"
 
   # =====================================================================
@@ -237,7 +221,7 @@ jobs:
   # random sleep keeps its Trends duration chart honest.
   - name: offsite-snapshot
     command: |
-      sleep $((RANDOM % 20 + 5))
+      sleep $((RANDOM % 3 + 2))
       echo "snapshot shipped at $(date -u +%T) ($((RANDOM % 400 + 200)) MiB)"
     schedule: "*/10 * * * *"
     sla:
@@ -363,11 +347,8 @@ jobs:
         exit "$rc"
       fi
 
-  # [shows: memory profile on the Resources chart + below-normal priority + the
-  # photo-library mutex] "Tags photos with a small on-device model": a stepped
-  # RAM ramp to ~170 MiB the resource sampler draws as a staircase, then a short
-  # write under the same lock cam-timelapse publishes with, so the two
-  # occasionally wait on each other, visibly and harmlessly.
+  # [shows: resource samples + below-normal priority + shared mutex]
+  # Four 256 KiB buffers model a pipeline in eight seconds; no AI inference.
   - name: photo-tagger
     schedule: "7-59/15 * * * *"
     priority: below-normal
@@ -375,17 +356,17 @@ jobs:
       interval: 0.5
       history: 240
     command: |
-      echo "tagging new photos with the on-device model"
+      echo "[demo] simulating photo tags with a 1 MiB sample buffer; no photos or model loaded"
       python3 - <<'PY'
       import time
       blobs = []
-      for step in range(6):
-          blobs.append(bytearray(28 * 1024 * 1024))
-          print(f"model pass {step + 1}/6: resident set ~{28 * (step + 1)} MiB", flush=True)
-          time.sleep(7)
+      for step in range(4):
+          blobs.append(bytearray(256 * 1024))
+          print(f"[demo] tagging pass {step + 1}/4: sample buffer {256 * (step + 1)} KiB; no AI model", flush=True)
+          time.sleep(2)
       print("tagged 214 photos; releasing model memory")
       PY
-      cronstable lock run --global --wait --timeout 90 photo-library -- sh -c 'echo "writing tags into the shared photo library (holds the photo-library mutex)"; sleep 4'
+      cronstable lock run --global --wait --timeout 5 photo-library -- sh -c 'echo "writing tags into the shared photo library (holds the photo-library mutex)"; sleep 1'
 
   # =====================================================================
   #  Schedule showpieces: the schedule tab, calendar, and lint findings
@@ -441,7 +422,8 @@ jobs:
     command: |
       echo "monthly scrub of the storage pool (idle priority)"
       for disk in ssd0 hdd1 hdd2; do
-        python3 -c "import hashlib; h = hashlib.sha256(); block = b'x' * 1048576; [h.update(block) for _ in range(800)]; print('surface digest', h.hexdigest()[:12])"
+        echo "[demo] checking a synthetic block list; no disk scan performed"
+        sleep 1
         echo "$disk: surface pass clean"
       done
       echo "scrub complete: 0 repaired, 0 unrecoverable"
@@ -506,7 +488,7 @@ jobs:
     utc: false
     command: |
       echo "refreshing the kitchen wallboard for the $(date +%H):00 block"
-      sleep $((RANDOM % 20 + 5))
+      sleep $((RANDOM % 3 + 2))
       echo "weather, family calendar, and bus-ETA tiles updated"
 
   # [shows: the duplicates panel's second group + the :00 herd] Shares
@@ -533,11 +515,15 @@ jobs:
   #  Manual, disabled, and the scripted operator
   # =====================================================================
 
-  # [shows: the Pending state] Effectively never scheduled; on installs with
-  # control scope this is what the "Run now" button is for. A read-only visitor
-  # gets a 403 by scope instead, which is its own demo.
+  # [shows: a visitor-started restore drill] Two seconds, fixed output,
+  # and no data access; Run now works for anyone through the gateway.
   - name: restore-drill
-    command: echo "restore drill launched at $(date -u +%T) UTC"
+    command: |
+      echo "[demo] restore drill: selected a synthetic backup snapshot"
+      sleep 1
+      echo "restored 12 sample records to a disposable scratch database (simulated)"
+      sleep 1
+      echo "12/12 checks passed; no real files or databases were changed"
     schedule: "0 3 1 1 *"
 
   # [shows: enabled:false] The disabled state.
@@ -546,22 +532,11 @@ jobs:
     command: echo "decommissioned 2025; kept for reference"
     schedule: "0 4 * * *"
 
-  # [shows: scoped tokens in action + secrets fromEnvVar; the narrator of the
-  # mutating features] Visitors are read-only, so this job performs the mutating
-  # actions that keep those states on the board, over loopback, with its own
-  # control+approve token (a run-scoped secret from the daemon's environment; on
-  # a host that never staged one it stands down politely). Each sweep:
-  #   - :22-:40  decide a waiting firmware-rollout gate as by:"demo-operator"
-  #              (rejected during hours 3, 9, 15, 21 UTC, approved otherwise, so
-  #              both decision paths appear daily without implying half of all
-  #              rollouts fail review)
-  #   - any run  if meter-export sits failed >12 min, a manual start clears its
-  #              depends-on-past gate
-  #   - :32 of hours 2, 8, 14, 20 UTC  pause feed-sync for 15 min with a note,
-  #              so the Paused badge and skipped ledger rows get stage time
-  # Its own log narrates every action it takes.
+  # Private housekeeping, excluded from the gateway. Once a minute it
+  # resolves gates older than five minutes, rescues a depends-on-past job,
+  # and occasionally demonstrates a scheduled maintenance window.
   - name: demo-operator
-    schedule: "2-57/5 * * * *"
+    schedule: "* * * * *"
     executionTimeout: 60
     secrets:
       - name: OPERATOR_TOKEN
@@ -597,7 +572,7 @@ jobs:
       now = datetime.now(timezone.utc)
       minute, hour = now.minute, now.hour
 
-      # 1) decide every waiting firmware-rollout approval gate.
+      # 1) decide abandoned firmware-rollout gates after five minutes.
       #
       # An approval task parks forever until someone decides it, and
       # retainRuns only prunes runs that reached success or failed, so a
@@ -605,21 +580,22 @@ jobs:
       # re-read on every /dags poll. This sweep is therefore the only thing
       # bounding them: it looks back far enough to drain a backlog left by
       # an operator that was down for a while, not just the current hour.
-      if 22 <= minute <= 40:
-          decision = "reject" if hour % 6 == 3 else "approve"
-          _, doc = call("GET", "/dags/firmware-rollout/runs?limit=100")
-          for run in doc.get("runs") or []:
-              if run.get("state") in ("success", "failed"):
-                  continue        # terminal: no gate left to decide
-              status, _ = call(
-                  "POST",
-                  "/dags/firmware-rollout/runs/{}/tasks/approve/decision".format(run["runKey"]),
-                  {"decision": decision, "by": BY},
-              )
-              if status == 200:
-                  print("{}d firmware-rollout run {} as {}".format(decision, run["runKey"], BY))
-              # 409 means that run is not sitting at its gate yet (the
-              # sensor is still poking); the next sweep catches it
+      decision = "reject" if hour % 6 == 3 else "approve"
+      _, doc = call("GET", "/dags/firmware-rollout/runs?limit=100")
+      for run in doc.get("runs") or []:
+          if run.get("state") in ("success", "failed"):
+              continue        # terminal: no gate left to decide
+          if now.timestamp() - float(run.get("createdAt") or now.timestamp()) < 300:
+              continue  # give visitors at least five minutes to decide
+          status, _ = call(
+              "POST",
+              "/dags/firmware-rollout/runs/{}/tasks/approve/decision".format(run["runKey"]),
+              {"decision": decision, "by": BY},
+          )
+          if status == 200:
+              print("{}d firmware-rollout run {} as {}".format(decision, run["runKey"], BY))
+          # 409 means that run is not sitting at its gate yet (the
+          # sensor is still poking); the next sweep catches it
 
       # 2) meter-export rescue: a manual start bypasses its depends-on-past gate
       _, doc = call("GET", "/jobs/meter-export/runs")
@@ -672,7 +648,7 @@ dags:
         command: |
           set -eu
           echo "archiving share $CRONSTABLE_DAG_MAP_ITEM (#$CRONSTABLE_DAG_MAP_INDEX)"
-          sleep $((RANDOM % 5 + 2))
+          sleep 1
           echo "share $CRONSTABLE_DAG_MAP_ITEM archived"
       - id: manifest
         dependsOn:
@@ -680,8 +656,10 @@ dags:
         command: |
           set -eu
           shares=$(cronstable xcom pull --task plan --key shares)
-          printf 'archived at %s\nshares: %s\n' "$(date -u +%FT%TZ)" "$shares" > /tmp/archive-manifest.txt
-          cronstable artifact put archive-manifest /tmp/archive-manifest.txt
+          manifest=$(mktemp "${TMPDIR:-/tmp}/cronstable-demo-manifest.XXXXXX")
+          trap 'rm -f "$manifest"' EXIT
+          printf 'archived at %s\nshares: %s\n' "$(date -u +%FT%TZ)" "$shares" > "$manifest"
+          cronstable artifact put archive-manifest "$manifest"
           echo "manifest for $shares published to the artifact store"
 
   # [shows: a frequent pipeline you can catch mid-flight + per-task retries +
@@ -712,7 +690,7 @@ dags:
           set -eu
           n=$((RANDOM % 14 + 4))
           echo "album $CRONSTABLE_DAG_MAP_ITEM: rendering $n thumbnails (worker #$CRONSTABLE_DAG_MAP_INDEX)"
-          sleep $((n / 2 + 4))
+          sleep 2
           echo "album $CRONSTABLE_DAG_MAP_ITEM done"
       - id: index
         dependsOn:
@@ -732,13 +710,9 @@ dags:
         triggerRule: all_done
         command: 'echo "scratch space cleared (all_done: runs after success and after the odd-hour index failure)"'
 
-  # [shows: sensor task + approval gate + onReject skip + all_done report + a
-  # durably recorded decision] The hourly rollout: stage the build, a sensor
-  # pokes every 30 s until the canary window opens (minute 14), then an approval
-  # gate waits for a human. The demo-operator decides it around :22 (rejects
-  # during hours 3/9/15/21 UTC, approves otherwise; the run document records
-  # by:"demo-operator" and the timestamp durably). Rejection skips `apply`
-  # rather than failing it, and `report` files either way.
+  # [shows: sensor + human approval + onReject skip + all_done report]
+  # A manual trigger reaches the gate in seconds. Visitors have at least five
+  # minutes to approve/reject before the private operator cleans up the run.
   - name: firmware-rollout
     schedule: "10 * * * *"
     onMissed: skip
@@ -754,11 +728,11 @@ dags:
         type: sensor
         dependsOn:
           - stage
-        pokeIntervalSeconds: 30
-        pokeTimeoutSeconds: 1200
-        pokeJitterSeconds: 5
+        pokeIntervalSeconds: 2
+        pokeTimeoutSeconds: 30
+        pokeJitterSeconds: 0
         command: |
-          [ "$(date -u +%-M)" -ge 14 ]
+          echo "[demo] canary health check passed; ready for your approval"
       - id: approve
         type: approval
         dependsOn:
@@ -773,7 +747,7 @@ dags:
           echo "rolling $v out to 6 plugs"
           for i in $(seq 1 6); do
             echo "plug $i/6 flashed"
-            sleep 3
+            sleep 1
           done
           echo "$v applied everywhere"
       - id: report

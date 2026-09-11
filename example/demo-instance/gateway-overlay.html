@@ -1,0 +1,24 @@
+<!-- Served only by the demo gateway; the packaged dashboard is unchanged. -->
+<style>
+#runFailingBtn, #vMitigate, #dgBackfillBtn { display: none !important; }
+#demoNotice { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+  z-index: 1000; max-width: calc(100vw - 24px); width: max-content;
+  padding: 8px 12px; border-radius: 8px; background: #182322; color: #e2f3ed;
+  border: 1px solid #45685b; font: 12px/1.5 system-ui; pointer-events: none; }
+</style>
+<div id="demoNotice" role="note">Interactive demo · shared starts every 10s · pauses last 1 minute</div>
+<script>
+(() => {
+  const label = document.getElementById("authLabel");
+  const button = document.getElementById("authBtn");
+  if (!label || !button) return;
+  const update = () => {
+    if (label.textContent !== "demo") label.textContent = "demo";
+    const title = "Interactive samples. Shared starts every 10 seconds; pauses last one minute.";
+    if (button.title !== title) button.title = title;
+  };
+  new MutationObserver(update).observe(label, {childList: true, subtree: true});
+  new MutationObserver(update).observe(button, {attributes: true, attributeFilter: ["title"]});
+  update();
+})();
+</script>
