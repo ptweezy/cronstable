@@ -84,6 +84,12 @@ where they start at once and always run to completion.
 
 ## Running the checks
 
+For tests of the actual packaged executable, see
+[binary acceptance](acceptance/README.md). That separate suite drives real
+scheduled jobs, state CLI calls, pending retries across restart, and graceful
+shutdown on native Linux, macOS, and Windows binary builds. It requires an
+explicit binary path and runs independently of the source coverage suite.
+
 `tox` drives everything CI runs:
 
 ```sh

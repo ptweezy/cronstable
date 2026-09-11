@@ -1460,10 +1460,16 @@ jobs:
                   exit 1
                 }
               fi
-              # The CLI-from-job smoke (cli_job_smoke.sh) runs on the native
-              # lanes only: it needs a daemon, loopback HTTP and curl, and
-              # most of these rows run under QEMU. The scrub it proves is
-              # shared Python code, identical on every lane.
+              # Exercise native musl and i686 glibc on their own libc. This
+              # needs no bash or curl in the container, only the driver deps.
+              if [ "${{ matrix.qemu }}" != "true" ]; then
+                python -m pip install -r acceptance/requirements.txt
+                python -m pytest -c acceptance/pytest.ini acceptance \
+                  --cronstable-bin dist/cronstable \
+                  --expected-version "$SETUPTOOLS_SCM_PRETEND_VERSION" \
+                  --acceptance-output acceptance-results \
+                  --junitxml acceptance-results/junit.xml
+              fi
               # Assert the glibc FLOOR on the rows that declare one, which no
               # functional test can see: the smoke ran on the same libc the
               # bundle was built against, so a dependency that starts
@@ -1513,6 +1519,14 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}"
+      - name: Upload binary acceptance evidence
+        if: ${{ always() && !matrix.qemu }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: acceptance-linux-${{ matrix.arch }}${{ matrix.suffix }}
+          path: acceptance-results/
+          if-no-files-found: warn
+          retention-days: 7
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
