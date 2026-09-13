@@ -2,9 +2,28 @@
 
 ## 1.2.53
 
-- Reduce resident memory by releasing superseded log buffers and completed
-  output batches, allocating log rings only when output arrives, and caching
-  the dashboard directly as bytes without a duplicate decoded copy.
+- Reduce resident memory by freeing superseded log-buffer storage and
+  completed passthrough and Windows Event Log payloads, allocating log rings
+  only when output arrives, and caching the dashboard directly as bytes
+  without a duplicate decoded copy. Add a regression benchmark for memory
+  retained by completed log streams.
+- Clarify labels, help and error messages across the web and terminal
+  dashboards, CLI, MCP tools and documentation. Use terms such as
+  "Workflows", "Schedule load", "Job actions" and "Live logs", and explain
+  schedule matches, daylight-saving changes and hashed run times more
+  precisely.
+- Generate all eight Dockerfiles from a shared template and distro settings,
+  and derive development and frozen-binary dependency files from
+  `pyproject.toml`. CI checks that generated files are current, and container
+  and binary builds share the optional-library verification code.
+- Define simple job-option defaults, YAML validation and fingerprint rules
+  together, preserving the job identities used by saved retries and reboot
+  markers.
+- Fix intermittent binary acceptance-test startup failures by assigning
+  distinct loopback ports to the web API and job API.
+- Cap the push extra's newer `cryptography` release line below version 51,
+  raise the binary acceptance tests' pytest minimum to 9.1.1, and update the
+  CI artifact-download action to 8.0.1.
 
 ## 1.2.52
 
