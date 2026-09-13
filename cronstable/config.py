@@ -598,7 +598,7 @@ JOB_SCALAR_FIELDS = {
     "clusterPolicy": JobScalarField(
         "Leader", Enum(["Leader", "PreferLeader", "EveryNode"]), "always"
     ),
-    # missed-run catch-up on restart (inert without a `state` backend):
+    # missed-run catch-up on restart/resume (inert without a state backend):
     # skip (default) | run-once (coalesce all missed slots into one fire) |
     # run-all (replay each missed occurrence). See cronstable.cron._catch_up.
     "onMissed": JobScalarField(
@@ -610,9 +610,9 @@ JOB_SCALAR_FIELDS = {
     "startingDeadlineSeconds": JobScalarField(
         None, EmptyNone() | Int(), "exclude"
     ),
-    # spread the boot-time catch-up launches of different jobs over [0, N)
+    # spread the catch-up launches of different jobs over [0, N)
     # seconds (deterministic per job name) so a fleet of jobs does not all fire
-    # at once on restart. 0 (default) fires them together.
+    # at once on restart or resume. 0 (default) fires them together.
     "catchupJitterSeconds": JobScalarField(0, Int(), "exclude"),
     # depends-on-past guard: skip a scheduled fire when the previous durable
     # run did not succeed (Airflow depends_on_past; inert without a `state`

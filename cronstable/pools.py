@@ -237,7 +237,14 @@ class PoolScheduler:
         return entry
 
     async def enqueue_job(
-        self, job, *, with_retries=True, manual=False, key=None, resume=False
+        self,
+        job,
+        *,
+        with_retries=True,
+        manual=False,
+        key=None,
+        resume=False,
+        catchup_after=None,
     ):
         slot = self.cron._last_run_slot.get(job.name)
         retry_state = (
@@ -262,6 +269,9 @@ class PoolScheduler:
                 "kind": "job",
                 "withRetries": with_retries,
                 "manual": manual,
+                "catchupAfter": catchup_after.isoformat()
+                if catchup_after is not None
+                else None,
                 "targetHost": self.cron._state_host
                 if manual or job.clusterPolicy == "EveryNode"
                 else None,

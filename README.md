@@ -765,7 +765,10 @@ Prometheus counters stop resetting to zero.
 
 `onMissed` adds catch-up on top: `run-once` coalesces any number of missed
 slots into one launch, `run-all` replays each one, bounded by
-`startingDeadlineSeconds`. The same store also hands your job *commands*
+`startingDeadlineSeconds`. Jobs recover after a restart and when the same
+daemon resumes after system sleep or a long stall. A normal start after
+resume satisfies `run-once`; failed catch-up attempts count as attempted
+and do not arm retries. The same store also hands your job *commands*
 durable primitives (key/value, cursors, fleet-wide locks, idempotency keys,
 artifacts, run-scoped secrets) over a loopback endpoint:
 `cronstable state|cursor|lock|idempotent|artifact|secret`. Deeper:

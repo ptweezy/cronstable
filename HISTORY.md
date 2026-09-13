@@ -2,6 +2,12 @@
 
 ## 1.2.53
 
+- Fix `onMissed` recovery after system sleep, long stalls, and forward
+  clock jumps in the same daemon process (#17). Stateful jobs recover
+  skipped slots through the existing bounded, checkpointed catch-up path,
+  preserving concurrency rules, pauses, jitter, and retry isolation.
+  A normal start after resume satisfies `run-once`, including a failed
+  attempt; `run-all` excludes the current scheduled slot from its backfill.
 - Reduce resident memory by freeing superseded log-buffer storage and
   completed passthrough and Windows Event Log payloads, allocating log rings
   only when output arrives, and caching the dashboard directly as bytes

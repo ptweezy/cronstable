@@ -191,7 +191,7 @@ WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
 # fire may drive the sleep below this, so near-zero hints cannot busy-spin.
 MIN_TICK_SLEEP = 0.02
 # Max lateness replayed after a slow pass or clock jump (Cron._advance);
-# past it only the newest occurrence fires, so a freeze cannot burst-launch.
+# past it only the current slot fires inline; onMissed recovery is detached.
 CATCHUP_LIMIT = datetime.timedelta(seconds=10)
 # Cap on onMissed: run-all replays per job when no startingDeadlineSeconds
 # bounds the window; run-once always launches exactly once.
@@ -791,6 +791,15 @@ WEB_SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeCatchup:
+    """A skipped scheduling window: exclusive bounds and detection time."""
+
+    after: datetime.datetime
+    before: datetime.datetime
+    observed: datetime.datetime
 
 
 @dataclass(slots=True)
@@ -2268,6 +2277,14 @@ class Cron:
         # in-flight catch-up evaluation; a background task, never inline
         # (a slow mount must degrade catch-up, not delay launches).
         self._catchup_eval_task: Optional[asyncio.Task] = None
+        # Resume windows are separate from the fixed startup reference.
+        # Keep disjoint gaps separate: merging across ordinary live fires
+        # would replay those fires under run-all. Bounded per job.
+        self._resume_catchup: dict[str, deque[ResumeCatchup]] = {}
+        self._resume_catchup_next_retry = 0.0
+        # Startup and resume share the checkpoint stream, so only one
+        # backfill per name may own it, including during jitter/draining.
+        self._catchup_running: dict[str, asyncio.Task] = {}
         # whether the loaded config HAS a state section, so catch-up can
         # tell "no durability configured" (latch and warn) from
         # "configured but not started yet" (retry).
@@ -8896,22 +8913,54 @@ class Cron:
         larger gap is a stall/suspend/clock jump and is handled WITHOUT
         walking the window (unbounded for a per-second job): fire the
         current slot only if now itself matches, then resync to the next
-        occurrence after now. This is cron's no-catch-up-after-an-outage
-        rule.
+        occurrence after now. Stateful onMissed recovery runs separately
+        against the skipped window, never on the scheduling path.
         """
         if now - fire_slot >= CATCHUP_LIMIT:
-            logger.warning(
-                "job %s: the scheduler fell behind by %.0fs (a slow pass, "
-                "stall, suspend, or clock change); resuming at the current "
-                "slot instead of replaying the interval",
-                job.name,
-                (now - fire_slot).total_seconds(),
-            )
             # Resume at the current slot, firing only if it matches, and
             # resync to the first occurrence after now (no enumeration).
             crontab = job.schedule
             assert isinstance(crontab, CronTab)
             now_slot = schedule_slot(job, now)
+            current_slot = now_slot.astimezone(datetime.timezone.utc)
+            pause = self._pause_active(job.name, now)
+            # An active pause excuses its portion of the gap immediately.
+            # Keep only pre-pause backlog, so a later manual resume cannot
+            # make those held slots owed by clearing the durable pause.
+            before = min(current_slot, pause.since) if pause else current_slot
+            recover = (
+                self._state_configured
+                and job.onMissed != "skip"
+                and job.enabled
+                and fire_slot < before
+            )
+            if recover:
+                windows = self._resume_catchup.setdefault(
+                    job.name, deque(maxlen=MAX_CATCHUP_OCCURRENCES)
+                )
+                if len(windows) == windows.maxlen:
+                    logger.warning(
+                        "catch-up: too many pending resume windows for %s; "
+                        "dropping the oldest window",
+                        job.name,
+                    )
+                windows.append(
+                    ResumeCatchup(
+                        fire_slot - datetime.timedelta(microseconds=1),
+                        before,
+                        now,
+                    )
+                )
+            logger.warning(
+                "job %s: the scheduler fell behind by %.0fs (a slow pass, "
+                "stall, suspend, or clock change); resuming at the current "
+                "slot%s",
+                job.name,
+                (now - fire_slot).total_seconds(),
+                "; queued onMissed recovery for skipped slots"
+                if recover
+                else " instead of replaying the interval",
+            )
             # Record the fired slot as aware UTC, matching the normal
             # branch. schedule_slot renders now into the job's OWN frame
             # (what crontab.test matches); astimezone(utc) maps it back.
@@ -9127,7 +9176,11 @@ class Cron:
         return await self._checkpoint_catchup(name, "close", pending)
 
     async def _missed_occurrences(
-        self, job: JobConfig, now: datetime.datetime
+        self,
+        job: JobConfig,
+        now: datetime.datetime,
+        *,
+        resume: Optional[ResumeCatchup] = None,
     ) -> tuple[int, Optional[str], bool]:
         """How many catch-up launches ``job`` is owed, and from where.
 
@@ -9135,8 +9188,8 @@ class Cron:
         watermark, hoisted back to an open checkpoint's older watermark,
         bounded by startingDeadlineSeconds and MAX_CATCHUP_OCCURRENCES.
         Occurrences inside a durable pause window are stepped over.
-        Returns (0, ...) when nothing was missed or the job never ran
-        under this store; (1, ...) for run-once; the bounded count for
+        Returns (0, ...) when nothing was missed or a startup job never
+        ran under this store; (1, ...) for run-once; the bounded count for
         run-all. Second element is the reference watermark for the
         cycle's checkpoint; third, whether an open checkpoint is pinned.
         Store errors propagate: callers treat them
@@ -9149,15 +9202,22 @@ class Cron:
         pending = await self._pending_catchup_watermark(job.name)
         pinned = pending is not None
         pending_dt = _parse_iso_utc(pending)
+        if resume is not None:
+            # The forward-only index proves these slots were skipped,
+            # even on a job's first run. Ordinary completions after resume
+            # must not erase them or add older, deliberately dropped slots.
+            after, watermark = resume.after, resume.after.isoformat()
         if pending_dt is not None and (after is None or pending_dt < after):
             after, watermark = pending_dt, pending
+        if self._resume_satisfied(job, resume.after if resume else None):
+            return 0, watermark, pinned
         if after is None:
             return 0, None, pinned
         # Slots inside a (possibly expired) pause window are never owed,
         # and ONLY those: the window is skipped while walking, never used
         # as a floor on `after` (see _pause_excusal_window).
         window = await self._pause_excusal_window(job.name)
-        if window is not None and after is not None:
+        if window is not None and after is not None and resume is None:
             # Belt and braces beside the open-checkpoint pin in
             # _evaluate_catch_up: an unpinned pause can have walked
             # durable_last_run_at past the pre-pause backlog via held-slot
@@ -9179,7 +9239,11 @@ class Cron:
                 after = cutoff  # only the recent window (bounds run-all)
         count = 0
         nxt = self._compute_next_fire(job, after)
-        while nxt is not None and nxt <= now:
+        while (
+            nxt is not None
+            and nxt <= now
+            and (resume is None or nxt < resume.before)
+        ):
             if window is not None and _in_pause_window(nxt, window):
                 # Jump the cursor to the window's end rather than stepping
                 # each excused slot. One microsecond back so a slot landing
@@ -9206,6 +9270,18 @@ class Cron:
                 break
             nxt = self._compute_next_fire(job, nxt)
         return count, watermark, pinned
+
+    def _resume_satisfied(
+        self, job: JobConfig, after: Optional[datetime.datetime]
+    ) -> bool:
+        """An attempt after the gap satisfies run-once, even on failure."""
+        started = self._sla_last_start.get(job.name)
+        return (
+            after is not None
+            and job.onMissed == "run-once"
+            and started is not None
+            and started > after
+        )
 
     async def _catch_up(self, now: datetime.datetime) -> None:
         """Replay (or coalesce) runs missed while down, on start-up.
@@ -9283,9 +9359,16 @@ class Cron:
             self._caught_up = True
             self._catchup_done.clear()
 
-    async def _evaluate_catch_up(self, now: datetime.datetime) -> bool:
+    async def _evaluate_catch_up(
+        self,
+        now: datetime.datetime,
+        *,
+        only: Optional[str] = None,
+        resume: Optional[ResumeCatchup] = None,
+    ) -> bool:
         """One catch-up evaluation pass; returns whether jobs stay pending."""
         unresolved = False
+        done = self._catchup_done if resume is None else set()
         # the stream listing serves only the retire branch below, and only
         # on the first pass that reaches it: list on demand, once per pass
         listing: list[Optional[set[str]]] = []
@@ -9295,8 +9378,14 @@ class Cron:
                 listing.append(await self._pinned_catchup_names())
             return listing[0]
 
-        for name, job in list(self.cron_jobs.items()):
-            if name in self._catchup_done:
+        names = list(self.cron_jobs) if only is None else [only]
+        for name in names:
+            job = self.cron_jobs.get(name)
+            if job is None or name in done:
+                continue
+            running = self._catchup_running.get(name)
+            if running is not None and not running.done():
+                unresolved = True
                 continue
             if (
                 job.onMissed == "skip"
@@ -9310,7 +9399,7 @@ class Cron:
                 if await self._retire_catchup_pin(
                     name, await pinned_names()
                 ) or not self._catchup_pin_deferred(name):
-                    self._catchup_done.add(name)
+                    done.add(name)
                     self._catchup_pin_failures.pop(name, None)
                 else:
                     unresolved = True
@@ -9331,6 +9420,8 @@ class Cron:
                             self.durable_last_completed_at(name),
                             timeout=STATE_OP_TIMEOUT,
                         )
+                        if resume is not None:
+                            real = resume.after.isoformat()
                         if real is not None:
                             await self._checkpoint_catchup(name, "open", real)
                 except asyncio.CancelledError:
@@ -9360,15 +9451,17 @@ class Cron:
                         "any backfill to its owner",
                         name,
                     )
-                    self._catchup_done.add(name)
+                    done.add(name)
                 else:
                     # transient denial (no owner elected yet, no quorum,
                     # conflict): nobody would backfill if we latched now.
                     unresolved = True
                 continue
             try:
-                count, watermark, pinned = await self._missed_occurrences(
-                    job, now
+                count, watermark, pinned = await (
+                    self._missed_occurrences(job, now)
+                    if resume is None
+                    else self._missed_occurrences(job, now, resume=resume)
                 )
             except asyncio.CancelledError:
                 raise
@@ -9384,7 +9477,7 @@ class Cron:
                 if await self._close_catchup_pin(
                     name, watermark, pinned
                 ) or not self._catchup_pin_deferred(name):
-                    self._catchup_done.add(name)
+                    done.add(name)
                     self._catchup_pin_failures.pop(name, None)
                 else:
                     unresolved = True
@@ -9394,13 +9487,22 @@ class Cron:
             # instead of losing the owed slots to the advancing ledger.
             await self._checkpoint_catchup(name, "open", watermark)
             offset = self._catchup_offset(name, job.catchupJitterSeconds)
-            task = asyncio.create_task(
+            backfill = (
                 self._run_catch_up(job, count, offset, now)
+                if resume is None
+                else self._run_catch_up(job, count, offset, now, resume=resume)
             )
+            task = asyncio.create_task(backfill)
+            self._catchup_running[name] = task
             self._catchup_tasks.add(task)
             task.add_done_callback(self._catchup_tasks.discard)
-            self._catchup_done.add(name)
+            task.add_done_callback(partial(self._catchup_finished, name))
+            done.add(name)
         return unresolved
+
+    def _catchup_finished(self, name: str, task: asyncio.Task) -> None:
+        if self._catchup_running.get(name) is task:
+            self._catchup_running.pop(name, None)
 
     async def _run_catch_up(
         self,
@@ -9408,6 +9510,8 @@ class Cron:
         count: int,
         offset: float,
         now: datetime.datetime,
+        *,
+        resume: Optional[ResumeCatchup] = None,
     ) -> None:
         """Launch a job's catch-up runs, after its jitter offset.
 
@@ -9456,8 +9560,10 @@ class Cron:
             # would stretch the window over slots the live scheduler
             # already fired during the jitter and replay them.
             try:
-                count, watermark, _pinned = await self._missed_occurrences(
-                    job, now
+                count, watermark, _pinned = await (
+                    self._missed_occurrences(job, now)
+                    if resume is None
+                    else self._missed_occurrences(job, now, resume=resume)
                 )
             except asyncio.CancelledError:
                 raise
@@ -9510,6 +9616,10 @@ class Cron:
                     )
                     return
                 job = live
+                if self._resume_satisfied(
+                    job, resume.after if resume else None
+                ):
+                    break  # an ordinary start satisfied the coalesced run
                 if not self._cluster_allows(job):
                     logger.info(
                         "catch-up: ownership of %s moved mid-backfill; "
@@ -9533,13 +9643,20 @@ class Cron:
                         with_retries=False,
                         key=self._pools.catchup_key(job, watermark, index),
                         resume=True,
+                        catchup_after=resume.after if resume else None,
                     )
                     if not await self._pools.wait_finished(
                         job.pool, entry["id"]
                     ):
                         return  # keep the checkpoint open for unfinished work
                 else:
-                    await self.maybe_launch_job(job, with_retries=False)
+                    await (
+                        self.maybe_launch_job(job, with_retries=False)
+                        if resume is None
+                        else self.maybe_launch_job(
+                            job, with_retries=False, catchup_after=resume.after
+                        )
+                    )
             # drain the final launch so its run record lands before the
             # checkpoint closes (a crash in between merely replays: the
             # checkpoint is at-least-once by design).
@@ -9574,6 +9691,51 @@ class Cron:
             return False
         return not self._stop_event.is_set()
 
+    async def _service_catch_up(self, now: datetime.datetime) -> None:
+        """Evaluate startup and queued resume windows off the live path."""
+        await self._catch_up(now)
+        if not self._resume_catchup:
+            return
+        if not self._state_configured:
+            self._resume_catchup.clear()
+            return
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._resume_catchup_next_retry:
+            return
+        if self.state_backend is not None:
+            for name, windows in list(self._resume_catchup.items()):
+                if name not in self.cron_jobs:
+                    self._resume_catchup.pop(name, None)
+                    continue
+                # An unresolved startup evaluation still owns this name.
+                if not self._caught_up and name not in self._catchup_done:
+                    continue
+                window = windows[0]
+                try:
+                    pending = await self._evaluate_catch_up(
+                        window.observed, only=name, resume=window
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - defer, never lose a gap
+                    logger.exception(
+                        "catch-up: unexpected error evaluating resume for %s; "
+                        "will retry",
+                        name,
+                    )
+                    continue
+                if not pending:
+                    # A slow evaluation may span another suspend. Remove
+                    # only the window evaluated, never a newly queued gap.
+                    if windows and windows[0] is window:
+                        windows.popleft()
+                    if not windows:
+                        self._resume_catchup.pop(name, None)
+        if self._resume_catchup:
+            self._resume_catchup_next_retry = (
+                loop.time() + CATCHUP_RECHECK_INTERVAL
+            )
+
     async def _service_slots(self, startup: bool) -> None:
         """Service the jobs due on this pass.
 
@@ -9589,10 +9751,10 @@ class Cron:
         # resolved but must retry when backend/cluster were not ready at
         # boot. Spawned, not awaited: a slow-but-alive mount must not
         # stall this pass. Tracked so shutdown cancels a straggler.
-        if not self._caught_up and (
+        if (not self._caught_up or self._resume_catchup) and (
             self._catchup_eval_task is None or self._catchup_eval_task.done()
         ):
-            task = asyncio.create_task(self._catch_up(now))
+            task = asyncio.create_task(self._service_catch_up(now))
             self._catchup_eval_task = task
             self._catchup_tasks.add(task)
             task.add_done_callback(self._catchup_tasks.discard)
@@ -10502,6 +10664,7 @@ class Cron:
         *,
         with_retries: bool = True,
         pool_ticket: Optional[Ticket] = None,
+        catchup_after: Optional[datetime.datetime] = None,
     ) -> bool:
         """Accept a job into its pool queue or launch it immediately.
 
@@ -10510,9 +10673,25 @@ class Cron:
         work independent of the job's retry ladder.
         """
         if job.pool is not None and pool_ticket is None:
-            await self._pools.enqueue_job(job, with_retries=with_retries)
+            await self._pools.enqueue_job(
+                job, with_retries=with_retries, catchup_after=catchup_after
+            )
             return True
         async with self._launch_locks[job.name]:
+            if pool_ticket is not None:
+                catchup_after = _parse_iso_utc(
+                    pool_ticket.payload.get("catchupAfter")
+                )
+            # Recheck under the launch lock: a normal spawn may have held
+            # it when the backfill last checked. Pool admission can wait
+            # much longer still, so carry the same guard in its receipt.
+            if self._resume_satisfied(job, catchup_after):
+                if pool_ticket is not None:
+                    await self._pools.finish(
+                        pool_ticket, "cancelled", "resume covered by a run"
+                    )
+                    return True  # receipt resolved; do not requeue it
+                return False
             return await self._launch_job_locked(
                 job, with_retries, pool_ticket
             )

@@ -135,7 +135,7 @@ history; its memory then resets on restart (see
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `onMissed` | `skip` | What to do about runs missed while the daemon was down: `skip` (classic cron), `run-once` (coalesce into one launch), `run-all` (replay each missed slot, bounded). See [missed-run catch-up](#missed-run-catch-up). |
+| `onMissed` | `skip` | What to do about runs missed during daemon downtime, system sleep, or a long stall: `skip` (classic cron), `run-once` (coalesce into one launch), `run-all` (replay each missed slot, bounded). See [missed-run catch-up](#missed-run-catch-up). |
 | `startingDeadlineSeconds` | *(none)* | Bound on the catch-up window: missed slots older than this are dropped (must be `> 0` when set). Also bounds how stale a [pending retry](#restart-surviving-retries) may be and still re-arm. |
 | `catchupJitterSeconds` | `0` | Deterministic per-job spread of boot backfills, so a fleet restart does not fire everything at once (must be `>= 0`). |
 | `onlyIfLastSucceeded` | `false` | Depends-on-past gate: skip scheduled fires while the job's most recent real outcome is a failure. See [depends-on-past](#depends-on-past-onlyiflastsucceeded). |
@@ -359,10 +359,11 @@ How the evaluation works:
   by occurrence, **in the job's own time zone frame, DST-safe**. A missed
   slot is what the live scheduler would have fired, not a naive interval
   division.
-* **A first-ever run is never "missed".** A job with no record under this
-  store has no reference point, so it schedules forward (the same rule
-  anacron and systemd timers apply). Catch-up starts mattering from the
-  second boot on.
+* **Startup needs a previous run or an open checkpoint.** A job with no
+  record under this store has no reference point at startup, so it schedules
+  forward. Within a running daemon, the next-fire index supplies that
+  reference: a known due slot skipped during sleep can be recovered even
+  before the job's first completed run.
 * **`startingDeadlineSeconds` bounds the window.** Slots older than the
   deadline are dropped, so a week-long outage cannot stampede a `run-all` job
   (the name and semantics deliberately mirror the Kubernetes CronJob field).
@@ -395,11 +396,29 @@ How the evaluation works:
   failing backfill cannot cancel a legitimate pending retry or burn the
   shared retry budget toward a premature `onPermanentFailure`.
 
-This catches up across **daemon downtime**, judged against the durable
-watermark. It is unrelated to the scheduler's small intra-process catch-up
-window for slow passes. A *running* daemon that crosses a forward clock jump
-still follows cron's no-catch-up-after-an-outage rule until the next restart
-evaluates the watermark.
+Jobs also recover after **same-process sleep, a long stall, or a forward
+clock jump**. When the next due slot is at least 10 seconds behind and an
+earlier scheduling slot was skipped, the scheduler queues a recovery window
+for that job. Evaluation runs in the background through the same durable
+checkpoint, deadline, jitter, pause, ownership, and concurrency checks as
+startup catch-up. Store or election trouble defers evaluation without
+extending the window across later live fires. Separate gaps remain separate
+windows; at most 100 pending windows per job are retained, with a warning
+if the oldest must be dropped.
+
+The current matching slot still fires normally. For `run-once`, any actual
+start after the skipped slot satisfies recovery, including a failed attempt;
+waiting or jittering recovery checks again before launching. For `run-all`,
+the backfill covers skipped slots before the current scheduling slot, so it
+does not replay that normal fire. Only one backfill per job can run at a
+time, including an unfinished startup backfill. A failed catch-up attempt
+does not arm a retry ladder or re-arm recovery on every scheduling pass;
+another detected gap can create a new recovery cycle.
+
+The default `onMissed: skip` and jobs without `state` keep the usual cron
+behavior after a long gap. Smaller delays still use the scheduler's bounded
+inline catch-up. These resume windows apply to jobs; scheduled DAG catch-up
+continues to use its own startup and logical-date handling.
 
 ## In-flight runs and crash reconciliation
 

@@ -138,6 +138,24 @@ async def test_catchup_shutdown_preserves_one_receipt(dag_cron, monkeypatch):
         await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_resume_run_once_coalesces_while_waiting_in_pool(
+    dag_cron, monkeypatch
+):
+    cron = await make(dag_cron, monkeypatch)
+    job = cron.cron_jobs["one"]
+    job.onMissed = "run-once"
+    after = datetime.datetime.now(datetime.timezone.utc)
+    await cron._pools.enqueue_job(job, with_retries=False, catchup_after=after)
+    await wait_queued(cron)
+    cron._sla_last_start[job.name] = after + datetime.timedelta(seconds=1)
+    await cron._pools.tick()
+    assert not cron.running_jobs
+    assert (await cron._pools.snapshot())[0]["queued"] == 0
+    # A satisfied receipt stays terminal on later admission passes.
+    await cron._pools.tick()
+    assert not cron.running_jobs
+
+
 @pytest.mark.parametrize("expire_entry", [False, True])
 async def test_timed_out_sensor_releases_queue_and_backlog(
     dag_cron, monkeypatch, expire_entry
