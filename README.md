@@ -26,9 +26,9 @@ cronstable keeps cron's model (a schedule file running your commands) and
 builds in the tooling that otherwise accumulates around it: retries,
 alerting, durable state, orchestration, clustering, and a live dashboard.
 
-It's built for small and old machines, with
+It's built for machines of all sizes, with efficiency in mind. The
 [benchmarks](https://github.com/ptweezy/cronstable/wiki/Performance-Benchmarks)
-that compare speed and memory use against the latest release on every commit
+compare speed and memory use against the latest release on every commit
 and catch regressions before release.
 
 ### Scheduling
