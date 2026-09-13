@@ -11,7 +11,6 @@
 [![Coverage](https://img.shields.io/codecov/c/github/ptweezy/cronstable?logo=codecov&logoColor=white&color=f01f7a)](https://codecov.io/gh/ptweezy/cronstable)
 [![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fcronstable-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/cronstable/pkgs/container/cronstable)
 [![Docker Hub](https://img.shields.io/badge/docker.io-ptweezy%2Fcronstable-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/ptweezy/cronstable)
-[![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 / kraahn-stuh-bl /
