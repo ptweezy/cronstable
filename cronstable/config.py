@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import (
     Any,
+    Literal,
     NamedTuple,
     NewType,
     Optional,
@@ -567,48 +568,101 @@ _REPORT_DEFAULTS = {
 }
 
 
-DEFAULT_CONFIG: dict[str, Any] = {
-    "shell": platform.DEFAULT_SHELL,
-    "concurrencyPolicy": "Allow",
+class JobScalarField(NamedTuple):
+    """A scalar option's default, YAML validator and v1 identity policy.
+
+    Complex values keep their explicit normalization and redaction paths.
+    New behavior-affecting options use ``nondefault`` so old job identities
+    (and the retries/reboot markers they protect) survive an upgrade.
+    """
+
+    default: Any
+    schema: Any
+    identity: Literal["always", "nondefault", "exclude"]
+
+
+JOB_SCALAR_FIELDS = {
+    "shell": JobScalarField(platform.DEFAULT_SHELL, Str(), "always"),
+    "concurrencyPolicy": JobScalarField(
+        "Allow", Enum(["Allow", "Forbid", "Replace"]), "always"
+    ),
     # how far concurrencyPolicy reaches: "node" (default) or "cluster"
     # (Forbid/Replace also exclude instances on other nodes via a TTL slot
     # lease on the shared `state` store). Requires a `state` section;
     # Allow+cluster is refused as inert. See cronstable.cron.maybe_launch_job.
-    "concurrencyScope": "node",
+    "concurrencyScope": JobScalarField(
+        "node", Enum(["node", "cluster"]), "nondefault"
+    ),
     # where this job runs under cluster leader election (inert unless
     # cluster.electLeader is set); see cronstable.cron._cluster_allows.
-    "clusterPolicy": "Leader",
+    "clusterPolicy": JobScalarField(
+        "Leader", Enum(["Leader", "PreferLeader", "EveryNode"]), "always"
+    ),
     # missed-run catch-up on restart (inert without a `state` backend):
     # skip (default) | run-once (coalesce all missed slots into one fire) |
     # run-all (replay each missed occurrence). See cronstable.cron._catch_up.
-    "onMissed": "skip",
+    "onMissed": JobScalarField(
+        "skip", Enum(["skip", "run-once", "run-all"]), "exclude"
+    ),
     # only occurrences missed within this many seconds are caught up; None (the
     # default) means no deadline. Bounds run-all to a recent window so a long
     # outage cannot stampede. Like Kubernetes CronJob startingDeadlineSeconds.
-    "startingDeadlineSeconds": None,
+    "startingDeadlineSeconds": JobScalarField(
+        None, EmptyNone() | Int(), "exclude"
+    ),
     # spread the boot-time catch-up launches of different jobs over [0, N)
     # seconds (deterministic per job name) so a fleet of jobs does not all fire
     # at once on restart. 0 (default) fires them together.
-    "catchupJitterSeconds": 0,
+    "catchupJitterSeconds": JobScalarField(0, Int(), "exclude"),
     # depends-on-past guard: skip a scheduled fire when the previous durable
     # run did not succeed (Airflow depends_on_past; inert without a `state`
     # backend). See cronstable.cron._depends_on_past_ok.
-    "onlyIfLastSucceeded": False,
+    "onlyIfLastSucceeded": JobScalarField(False, Bool(), "always"),
     # archive each finished run's captured output to the `state` store
     # (opt-in; encryption-at-rest is the mount's job).
-    "archiveOutput": False,
+    "archiveOutput": JobScalarField(False, Bool(), "exclude"),
     # scrub common secrets from archived output before it is written. On by
     # default; only applies when archiveOutput is set.
-    "redactArchivedSecrets": True,
+    "redactArchivedSecrets": JobScalarField(True, Bool(), "exclude"),
+    "captureStderr": JobScalarField(True, Bool(), "always"),
+    "captureStdout": JobScalarField(False, Bool(), "always"),
+    "saveLimit": JobScalarField(4096, Int(), "always"),
+    "maxLineLength": JobScalarField(16 * 1024 * 1024, Int(), "always"),
+    "utc": JobScalarField(True, Bool(), "exclude"),
+    "executionTimeout": JobScalarField(None, Float(), "always"),
+    "killTimeout": JobScalarField(30, Float(), "always"),
+    # scheduling priority of the job's process ("Priority" on a Task
+    # Scheduler task's Settings).  The default level is the one that is never
+    # applied, so the spawn is unchanged for every job that says nothing.
+    # How far a level reaches past the job's own process is per-platform; see
+    # cronstable.platform.new_process_group_kwargs.
+    # Built from platform.PRIORITY_LEVELS so the accepted values cannot drift
+    # from the per-OS tables that have to map them.  Enum is what refuses
+    # `priority: realtime` loudly, naming the values that are accepted,
+    # instead of silently downgrading it to something safe.
+    "priority": JobScalarField(
+        platform.DEFAULT_PRIORITY,
+        Enum(list(platform.PRIORITY_LEVELS)),
+        "nondefault",
+    ),
+    "streamPrefix": JobScalarField(
+        "[{job_name} {stream_name}] ", Str(), "always"
+    ),
+    "enabled": JobScalarField(True, Bool(), "always"),
+    # Pool options enter identity through canonical_job's composite pool
+    # object, only when a pool is configured.
+    "poolSlots": JobScalarField(1, Int(), "exclude"),
+    "queuePriority": JobScalarField(0, Int(), "exclude"),
+    "queueTimeout": JobScalarField(3600.0, Float(), "exclude"),
+}
+
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    **{name: spec.default for name, spec in JOB_SCALAR_FIELDS.items()},
     # sample each run's CPU time and peak resident memory (opt-in; see
     # cronstable.resources). Observability only: never changes a run's
     # success/failure verdict.
     "monitorResources": False,
-    "captureStderr": True,
-    "captureStdout": False,
-    "saveLimit": 4096,
-    "maxLineLength": 16 * 1024 * 1024,
-    "utc": True,
     "timezone": None,
     "failsWhen": {
         "producesStdout": False,
@@ -653,22 +707,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # action).  None, the default, inherits the daemon's own CWD, which is
     # what every job got before this key existed.
     "workingDirectory": None,
-    "executionTimeout": None,
-    "killTimeout": 30,
-    # scheduling priority of the job's process ("Priority" on a Task
-    # Scheduler task's Settings).  The default level is the one that is never
-    # applied, so the spawn is unchanged for every job that says nothing.
-    # How far a level reaches past the job's own process is per-platform; see
-    # cronstable.platform.new_process_group_kwargs.
-    "priority": platform.DEFAULT_PRIORITY,
     "statsd": None,
-    "streamPrefix": "[{job_name} {stream_name}] ",
-    "enabled": True,
     "verify": None,
     "pool": None,
-    "poolSlots": 1,
-    "queuePriority": 0,
-    "queueTimeout": 3600.0,
 }
 
 # An SLA breach has no run to report on, so the onLate defaults swap the
@@ -867,16 +908,7 @@ _schedule_schema = Str() | Map(
 )
 
 _job_defaults_common = {
-    Opt("shell"): Str(),
-    Opt("concurrencyPolicy"): Enum(["Allow", "Forbid", "Replace"]),
-    Opt("concurrencyScope"): Enum(["node", "cluster"]),
-    Opt("clusterPolicy"): Enum(["Leader", "PreferLeader", "EveryNode"]),
-    Opt("onMissed"): Enum(["skip", "run-once", "run-all"]),
-    Opt("startingDeadlineSeconds"): EmptyNone() | Int(),
-    Opt("catchupJitterSeconds"): Int(),
-    Opt("onlyIfLastSucceeded"): Bool(),
-    Opt("archiveOutput"): Bool(),
-    Opt("redactArchivedSecrets"): Bool(),
+    **{Opt(name): spec.schema for name, spec in JOB_SCALAR_FIELDS.items()},
     # bool enables sampling with the defaults; the map form additionally
     # tunes the sampling cadence and the per-run series retention (see
     # _normalize_monitor_resources).
@@ -888,11 +920,6 @@ _job_defaults_common = {
             Opt("history"): Int(),
         }
     ),
-    Opt("captureStderr"): Bool(),
-    Opt("captureStdout"): Bool(),
-    Opt("saveLimit"): Int(),
-    Opt("maxLineLength"): Int(),
-    Opt("utc"): Bool(),
     Opt("timezone"): Str(),
     Opt("failsWhen"): Map(
         {
@@ -949,13 +976,6 @@ _job_defaults_common = {
     # "inherit the daemon's CWD instead": a bare `workingDirectory:` writes
     # the inherited value back to None, like startingDeadlineSeconds above.
     Opt("workingDirectory"): EmptyNone() | Str(),
-    Opt("executionTimeout"): Float(),
-    Opt("killTimeout"): Float(),
-    # Built from platform.PRIORITY_LEVELS so the accepted values cannot drift
-    # from the per-OS tables that have to map them.  Enum is what refuses
-    # `priority: realtime` loudly, naming the values that are accepted,
-    # instead of silently downgrading it to something safe.
-    Opt("priority"): Enum(list(platform.PRIORITY_LEVELS)),
     Opt("statsd"): Map({"prefix": Str(), "host": Str(), "port": Int()}),
     # Int() is tried first so a numeric ``user: 1000`` parses as the integer
     # 1000 (a uid/gid), reaching the isinstance(..., int) branches in
@@ -965,14 +985,9 @@ _job_defaults_common = {
     # A non-numeric name (``user: www-data``) fails Int() and uses Str().
     Opt("user"): Int() | Str(),
     Opt("group"): Int() | Str(),
-    Opt("streamPrefix"): Str(),
-    Opt("enabled"): Bool(),
     Opt("verify"): EmptyNone()
     | Map({"command": Str() | Seq(Str()), Opt("timeout"): Float()}),
     Opt("pool"): EmptyNone() | Str(),
-    Opt("poolSlots"): Int(),
-    Opt("queuePriority"): Int(),
-    Opt("queueTimeout"): Float(),
 }
 
 _job_schema_dict = dict(_job_defaults_common)

@@ -44,6 +44,7 @@ which HA replicas are.
 import hashlib
 import json
 from collections.abc import Iterable
+from operator import attrgetter
 from typing import (
     Any,
     NamedTuple,
@@ -54,15 +55,29 @@ from cronstable.config import (
     DEFAULT_EVENTLOG_REPORT,
     DEFAULT_PUSH_REPORT,
     DEFAULT_REPORT_SHELL_TIMEOUT,
+    JOB_SCALAR_FIELDS,
     JobConfig,
     schedule_object_to_crontab,
 )
-from cronstable.platform import DEFAULT_PRIORITY
 
 # Canonicalization scheme version.  Prefixes the emitted ID and is folded into
 # the hash input, so a future change to what/how we canonicalize can bump this
 # and old/new IDs will compare unequal instead of silently colliding.
 SCHEME_VERSION = "v1"
+
+# Resolve the scalar projection once; hashing a large job set need not walk
+# validators or excluded fields for every job.
+_SCALAR_IDENTITY = tuple(
+    name
+    for name, spec in JOB_SCALAR_FIELDS.items()
+    if spec.identity == "always"
+)
+_scalar_identity_values = attrgetter(*_SCALAR_IDENTITY)
+_NONDEFAULT_IDENTITY = tuple(
+    (name, spec.default)
+    for name, spec in JOB_SCALAR_FIELDS.items()
+    if spec.identity == "nondefault"
+)
 
 # Placeholder substituted for any inline secret *value* so the fingerprint
 # never embeds secret material.  The surrounding structure (whether a secret
@@ -331,17 +346,6 @@ def canonical_job(
         "name": job.name,
         "command": _command_repr(job.command),
         "schedule": _schedule_repr(job),
-        "shell": job.shell,
-        "concurrencyPolicy": job.concurrencyPolicy,
-        # where the job runs under leader election: a behaviour-affecting,
-        # host-independent field, so replicas disagreeing on it should show as
-        # drift rather than silently coordinate differently.
-        "clusterPolicy": job.clusterPolicy,
-        "captureStderr": job.captureStderr,
-        "captureStdout": job.captureStdout,
-        "streamPrefix": job.streamPrefix,
-        "saveLimit": job.saveLimit,
-        "maxLineLength": job.maxLineLength,
         # The resolved scheduling frame fully captures firing behavior, so the
         # raw ``utc`` flag is NOT hashed separately: it would be redundant and
         # would split behaviorally-identical configs. job.timezone is "UTC"
@@ -349,14 +353,6 @@ def canonical_job(
         # raw utc flag is then inert), and None for local time (utc=false, no
         # timezone).
         "timezone": (str(timezone) if timezone is not None else None),
-        "enabled": job.enabled,
-        # gates every scheduled fire (like `enabled`), so replicas that
-        # disagree on it must show as drift.  The catch-up trio
-        # (onMissed/startingDeadlineSeconds/catchupJitterSeconds), the
-        # archival pair and the sla/onLate pair stay excluded: restart-time,
-        # observability-only or alerting-only behaviour that never changes
-        # what runs or when (see cronstable.config.JobConfig.__init__).
-        "onlyIfLastSucceeded": job.onlyIfLastSucceeded,
         "failsWhen": job.failsWhen,
         "onFailure": _redact_action(job.onFailure, memo),
         "onPermanentFailure": _redact_action(job.onPermanentFailure, memo),
@@ -372,30 +368,22 @@ def canonical_job(
         # rather than a generator: sorted() drains it either way, and the
         # generator only adds a frame to resume per name.
         "environment": sorted([e["key"] for e in job.environment]),
-        # `workingDirectory` is deliberately absent, for the reason directly
-        # above: it is a per-host path, and a fleet legitimately runs the
-        # same logical job from D:\jobs on a Windows replica and /srv/jobs
-        # on a Linux one.  Folding it into identity would read as permanent
-        # drift and split the job-set id the state and cluster backends
-        # namespace on.  Do not "fix" this by adding it.
-        "executionTimeout": job.executionTimeout,
-        "killTimeout": job.killTimeout,
+        # workingDirectory is host-local like environment values, so it
+        # stays outside identity even when different replicas set it.
         "statsd": job.statsd,
         # configured values, NOT the resolved uid/gid (which are host-specific)
         "user": job.user,
         "group": job.group,
     }
-    if job.concurrencyScope != "node":
-        # cluster-wide concurrency gates every fire fleet-wide (replicas
-        # disagreeing on it must show as drift), so it is identity -- but
-        # only when set, per the omit-when-default rule above.
-        out["concurrencyScope"] = job.concurrencyScope
-    if job.priority != DEFAULT_PRIORITY:
-        # A launch-shaping field, like executionTimeout and killTimeout, and
-        # host-independent: the LEVEL is identity, never the nice number or
-        # priority class it resolves to on one platform.  Only when set, per
-        # the same rule, so no existing digest moves.
-        out["priority"] = job.priority
+    # Scalar identity policies share the configuration's field definitions.
+    # Transformed and secret-bearing fields above stay explicit.
+    out.update(
+        zip(_SCALAR_IDENTITY, _scalar_identity_values(job), strict=True)
+    )
+    for name, default in _NONDEFAULT_IDENTITY:
+        value = getattr(job, name)
+        if value != default:
+            out[name] = value
     if job.verify is not None:
         out["verify"] = job.verify
     if job.pool is not None:

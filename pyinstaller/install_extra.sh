@@ -12,10 +12,9 @@
 #
 # Usage: install_extra.sh NAME SPEC hard|soft [FALLBACK]
 #   NAME      verify_extra.py probe name, also the pip name to uninstall
-#   SPEC      the full pip requirement, e.g. "uvloop>=X.Y". The version
-#             floors stay spelled at the release.yml call sites, where
-#             tests/test_extra_pins_parity.py checks them against
-#             pyproject's extras: bump them together, never here.
+#   SPEC      @ uses the floor generated from pyproject.toml; @,<49 adds a
+#             lane-specific cap. A full requirement also works (e.g. the
+#             zeroconf version resolved by the release source-offer job).
 #   hard      install and verify must both succeed, else exit nonzero. On
 #             the lanes that pick this, a wheel always exists, so absence
 #             means a broken build (a soft-fail would let a transient index
@@ -46,6 +45,14 @@ name="${1:?$usage}"
 spec="${2:?$usage}"
 policy="${3:?$usage}"
 note="${4:-not bundled}"
+
+case "$spec" in
+    @*)
+        cap=${spec#@}
+        spec=$(cat "$here/requirements/$name.txt") || exit 2
+        spec="$spec$cap"
+        ;;
+esac
 
 case "$policy" in
     hard|soft) ;;

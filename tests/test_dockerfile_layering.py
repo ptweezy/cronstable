@@ -1,28 +1,12 @@
-"""All eight Dockerfiles keep the dependency layers off the source tree.
+"""Generated Dockerfiles preserve dependency caching and artifact checks.
 
-The eight images (the root Dockerfile plus the seven distro variants under
-docker/) are hand-mirrored: the same builder stage rewritten per package
-manager.  They all once did ``WORKDIR /src`` then ``COPY . .`` and only
-afterwards installed the toolchain and every third-party dependency.  A COPY
-layer's cache key is the digest of the copied content, so any change anywhere
-in the build context invalidated that COPY and every RUN beneath it, and all
-36 emulated platform builds redid the whole dependency compile on a commit
-that touched only a test file or a screenshot.
-
-The split that fixed it is an ordering invariant, and an ordering invariant in
-eight parallel files is exactly the shape this repo has been bitten by before.
-So this pins the order rather than the wording: the dependency layers may only
-read ``pyproject.toml`` and the shared ``docker/extract_deps.py`` helper, and
-the per-commit inputs (the source tree and the ``VERSION`` arg) may only
-appear below them.  The shared ``docker/install_orjson.sh`` sits between the
-two: COPYd below the dependency layers (so editing it cannot invalidate their
-cache) and invoked above the per-commit section.
+The template supplies the shared recipe; these assertions check its build
+invariants across the actual image variants, including distro-specific inputs.
 """
 
 import importlib.util
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -147,17 +131,8 @@ def test_dependency_extraction_goes_through_the_shared_script(relpath):
 
 @pytest.mark.parametrize("relpath", DOCKERFILES)
 def test_orjson_install_goes_through_the_shared_script(relpath):
-    # Eight pasted ~25-line orjson blocks were the same drift class the
-    # extraction script killed, so the block lives once in
-    # docker/install_orjson.sh; per-distro variance stays in each file as the
-    # RUST_SETUP env string and any trailing package-manager cleanup. Two
-    # placement rules matter: the script COPY sits BELOW the dependency
-    # install (editing the script must never invalidate the expensive cached
-    # dependency layers) and the invocation sits ABOVE the source COPY
-    # (per-commit inputs stay at the bottom). The invocation must also spell
-    # the "orjson>=X.Y" floor itself, because test_extra_pins_parity.py scans
-    # the Dockerfiles, not the script, for hand-spelled pins to check against
-    # pyproject.
+    # Installer/probe changes keep the expensive dependency layers cached.
+    # Version floors come from the generator, not a handwritten call site.
     lines = _lines(relpath)
     deps_invoke = _index(
         lines,
@@ -173,10 +148,8 @@ def test_orjson_install_goes_through_the_shared_script(relpath):
     )
     orjson_invoke = _index(
         lines,
-        lambda ln: (
-            ORJSON_INVOKE in ln and re.search(r'"orjson>=[0-9][^"]*"', ln)
-        ),
-        "pin-carrying invocation of the shared orjson install script",
+        lambda ln: ln.lstrip().startswith(ORJSON_INVOKE + " "),
+        "invocation of the shared orjson install script",
         relpath,
     )
     source_copy = _index(
@@ -189,6 +162,10 @@ def test_orjson_install_goes_through_the_shared_script(relpath):
         "{}: expected the dependency install, then the orjson script COPY, "
         "then its invocation, all above the source COPY".format(relpath)
     )
+    probe_copy = lines.index(
+        "COPY pyinstaller/verify_extra.py /tmp/deps/verify_extra.py"
+    )
+    assert deps_invoke < probe_copy < orjson_invoke
     assert not any("orjson_ok()" in ln for ln in lines), (
         "{}: the inline orjson block is back; edit docker/install_orjson.sh "
         "instead".format(relpath)
@@ -417,7 +394,7 @@ def test_cryptography_line_keeps_its_floor_and_loses_its_marker():
     # Where the script says yes, the marker comes off (it is narrower than
     # the decision just made and would veto the armv7l/ppc64le images), and
     # the floor survives untouched: pyproject stays the one place it is
-    # spelled, which is what tests/test_extra_pins_parity.py depends on.
+    # spelled, including any upper bound.
     module = _extract_deps_module()
     line = "cryptography>=48; sys_platform == 'linux'"
     assert module.resolve_cryptography(line, ("x86_64", 8, "glibc")) == (

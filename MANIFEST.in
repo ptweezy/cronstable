@@ -16,6 +16,10 @@ include TRADEMARKS.md
 recursive-include tests *
 recursive-include acceptance *.py *.ini *.txt *.md *.sh *.cmd
 recursive-include example *
+include scripts/generate_build_files.py
+include docker/images.toml
+recursive-include docker/templates *
+recursive-include pyinstaller/requirements *.txt
 recursive-exclude * __pycache__
 recursive-exclude * *.py[co]
 recursive-exclude env *
