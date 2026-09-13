@@ -20,7 +20,7 @@ and currently covers about 37 metrics across these groups:
 | `startup` | wall clock of `cronstable --version`, importing the scheduling engine, importing the full daemon graph, `--validate-config` over a 100-job file |
 | `cronexpr` | parsing plain and extended expressions (ranges, steps, `L`, `W`, `#`, `H`, seconds), `next()` search, enumerating occurrences, instant matching |
 | `config` | YAML parsing of a 300-job config, per-job `JobConfig` construction, classic crontab parsing |
-| `schedule` | building the fire schedule for 100,000 jobs from cold, reseeding it pre-parsed, schedule pressure over 24 hours, duplicate detection, slot suggestion |
+| `schedule` | building the fire schedule for 100,000 jobs from cold, reseeding it pre-parsed, schedule load over 24 hours, duplicate detection, slot suggestion |
 | `dag` | building and validating 10k-task graphs, the plan-and-claim transform over a 2k-task run |
 | `state` | appending durable records, cold and memoized `derive_max`, listing records, job KV round trips |
 | `json`, `fingerprint`, `redact`, `ical` | serialization round trips, job-set fingerprinting at 10k jobs, log redaction with and without secrets, iCal rendering |

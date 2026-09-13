@@ -100,9 +100,9 @@ def _add_keys_args(parser: argparse.ArgumentParser) -> None:
 # same rows, so a verb added here is routed to jobcli by __main__
 # automatically; there is no second list to keep in step.
 _STATE_JOB_ACTION_TABLE = (
-    ("get", "print a durable KV value", _add_get_args),
-    ("set", "set a durable KV value", _add_set_args),
-    ("delete", "delete a durable KV value", _add_delete_args),
+    ("get", "print a saved value by key", _add_get_args),
+    ("set", "save a value by key", _add_set_args),
+    ("delete", "delete a saved value by key", _add_delete_args),
     ("keys", "list the keys in a scope", _add_keys_args),
 )
 
@@ -126,7 +126,7 @@ def add_job_commands(sub: Any) -> None:
     """Add the top-level `cursor|lock|artifact|idempotent|secret` commands."""
     # cursor
     cursor = sub.add_parser(
-        "cursor", help="read or advance a monotonic ETL cursor/watermark"
+        "cursor", help="read or advance a saved processing position (cursor)"
     )
     cursor_actions = cursor.add_subparsers(
         dest="cursor_command", metavar="ACTION"
@@ -135,7 +135,7 @@ def add_job_commands(sub: Any) -> None:
     cget.add_argument("name")
     _add_scope_flags(cget)
     cadv = cursor_actions.add_parser(
-        "advance", help="advance a cursor (monotonic unless --force)"
+        "advance", help="move a cursor forward (use --force to move backwards)"
     )
     cadv.add_argument("name")
     cadv.add_argument("value")
@@ -148,7 +148,8 @@ def add_job_commands(sub: Any) -> None:
 
     # lock
     lock = sub.add_parser(
-        "lock", help="a fleet-wide distributed mutex or semaphore"
+        "lock",
+        help="coordinate concurrent work across nodes with a shared lock",
     )
     lock_actions = lock.add_subparsers(dest="lock_command", metavar="ACTION")
     for verb, help_text in (
@@ -161,7 +162,7 @@ def add_job_commands(sub: Any) -> None:
             "--permits",
             type=int,
             default=1,
-            help="semaphore capacity (default 1 = a mutex)",
+            help="maximum simultaneous lock holders (default: 1)",
         )
         p.add_argument(
             "--wait",
@@ -205,7 +206,7 @@ def add_job_commands(sub: Any) -> None:
 
     # artifact
     artifact = sub.add_parser(
-        "artifact", help="publish or fetch a named artifact blob"
+        "artifact", help="save or retrieve a named artifact"
     )
     art_actions = artifact.add_subparsers(
         dest="artifact_command", metavar="ACTION"
@@ -228,7 +229,8 @@ def add_job_commands(sub: Any) -> None:
     # idempotent
     idem = sub.add_parser(
         "idempotent",
-        help="claim a key once fleet-wide (exit 0 fresh, 5 duplicate, "
+        help="claim a key once across nodes (exit 0 for a new claim, 5 if "
+        "claimed, "
         "1 error)",
     )
     idem.add_argument("key")
@@ -249,7 +251,7 @@ def add_job_commands(sub: Any) -> None:
     # xcom: cross-task data hand-off within a dag_run
     xcom = sub.add_parser(
         "xcom",
-        help="publish or read a DAG task output (XCom) within a dag_run",
+        help="share task output (XCom) within a workflow run",
     )
     xcom_actions = xcom.add_subparsers(dest="xcom_command", metavar="ACTION")
     xpush = xcom_actions.add_parser(
@@ -276,14 +278,16 @@ def add_job_commands(sub: Any) -> None:
 
     # secret
     secret = sub.add_parser(
-        "secret", help="read a run-scoped secret staged for this run"
+        "secret", help="read a secret available to the current run"
     )
     secret_actions = secret.add_subparsers(
         dest="secret_command", metavar="ACTION"
     )
     sget = secret_actions.add_parser("get", help="print a secret's value")
     sget.add_argument("name")
-    secret_actions.add_parser("list", help="list staged secret names")
+    secret_actions.add_parser(
+        "list", help="list secrets available to the current run"
+    )
 
 
 def _add_web_client_flags(
@@ -366,7 +370,7 @@ def add_mcp_command(sub: Any) -> None:
     )
     _add_web_client_flags(
         parser,
-        url_help="daemon web base URL serving /mcp (default: %(default)s)",
+        url_help="cronstable server URL serving /mcp (default: %(default)s)",
     )
     parser.add_argument(
         "--protocol-version",
@@ -611,21 +615,17 @@ def add_tui_command(sub: Any) -> None:
     """Attach the ``tui`` subcommand to the root parser's subparsers."""
     parser = sub.add_parser(
         "tui",
-        help=(
-            "open the terminal dashboard (the web dashboard's TUI "
-            "sibling) against a running daemon's web listener"
-        ),
+        help=("open the terminal dashboard for a running cronstable server"),
         description=(
-            "A keyboard-driven terminal rendition of the cronstable web "
-            "dashboard, speaking the same HTTP control API. The web "
-            "page's shortcuts apply: j/k move, Enter opens a job, r "
+            "Manage cronstable from your terminal. Use the same shortcuts "
+            "as the web dashboard: j/k move, Enter opens a job, r "
             "runs it, x cancels, / filters, Ctrl-K opens the command "
             "palette, ? lists every key."
         ),
     )
     _add_web_client_flags(
         parser,
-        url_help="daemon web listener (default: %(default)s)",
+        url_help="cronstable server URL (default: %(default)s)",
         token_env_default=WEB_ENV_TOKEN,
     )
     parser.add_argument(
@@ -637,23 +637,23 @@ def add_tui_command(sub: Any) -> None:
     parser.add_argument(
         "--tv",
         action="store_true",
-        help="start straight on the wallboard (the page's #tv)",
+        help="open in wallboard mode",
     )
     parser.add_argument(
         "--job",
         default=None,
         metavar="NAME",
-        help="open a job's drawer at startup (the page's #job/NAME)",
+        help="open a job's details at startup",
     )
     parser.add_argument(
         "--boot",
         action="store_true",
-        help="force the boot self-test even if one ran recently",
+        help="show startup checks even if they ran recently",
     )
     parser.add_argument(
         "--no-boot",
         action="store_true",
-        help="skip the boot self-test",
+        help="skip startup checks",
     )
     parser.add_argument(
         "--ascii",

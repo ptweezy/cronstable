@@ -1,13 +1,15 @@
 # Suggest a slot
 
-Where should the next job go? The answer comes from the fleet's real fires: cronstable walks every enabled schedule over the next 24 hours (the same enumeration behind [schedule pressure](Schedule-Pressure)) and recommends the least-loaded slot.
+Find a quieter time for a new job. Cronstable compares upcoming runs over
+the next 24 hours and suggests a time with the fewest scheduled runs,
+using the same forecast as [schedule load](Schedule-Pressure).
 
 ```
 GET /schedule/suggest?period=hourly
 GET /schedule/suggest?period=daily&tz=Europe/London
 ```
 
-`period=hourly` picks a minute of the hour (a `<m> * * * *` schedule); `period=daily` picks a minute and hour (`<m> <h> * * *`). `tz` frames the daily pick (default UTC).
+`period=hourly` picks a minute of the hour (a `<m> * * * *` schedule); `period=daily` picks a minute and hour (`<m> <h> * * *`). `tz` sets the timezone for the daily suggestion (default UTC).
 
 ```json
 {
@@ -25,7 +27,7 @@ GET /schedule/suggest?period=daily&tz=Europe/London
 }
 ```
 
-The choice is deterministic, so the same fleet always gets the same answer: fewest fires first. Ties break toward the slot circularly farthest from the busiest one, then toward the earliest slot. That tie-break is why an idle fleet gets `:30`, not `:00`: the outside world crowds the top of the hour even when your fleet does not.
+The choice is deterministic, so the same fleet always gets the same answer: fewest scheduled runs first. Ties break toward the slot circularly farthest from the busiest one, then toward the earliest slot. That tie-break is why an idle fleet gets `:30`, not `:00`: the outside world crowds the top of the hour even when your fleet does not.
 
 `busiest` is included for contrast. `alternatives` are the two runners-up. `hash_hint` names the [`H` spelling](Hashed-Schedules) that would keep future jobs spreading themselves without anyone consulting this endpoint again.
 
@@ -33,7 +35,7 @@ The same analyzer backs the `cron_suggest_slot` [Model Context Protocol (MCP) to
 
 ## In the dashboards
 
-The [web dashboard](Web-Dashboard)'s schedule-pressure card has **suggest an hourly slot** and **suggest a daily slot** buttons. The suggested expression is a chip you click to copy. The [terminal dashboard](Terminal-Dashboard)'s pressure overlay shows both suggestions inline, computed locally from the same shared analyzer.
+The [web dashboard](Web-Dashboard)'s schedule load card has **suggest an hourly slot** and **suggest a daily slot** buttons. The suggested expression is a chip you click to copy. The [terminal dashboard](Terminal-Dashboard)'s schedule load overlay shows both suggestions inline, computed locally from the same shared analyzer.
 
 ## Suggest versus H
 

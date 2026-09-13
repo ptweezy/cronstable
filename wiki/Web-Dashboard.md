@@ -404,15 +404,17 @@ quorum` means *the lease store is unreachable from this node*, not "no
 majority". For the full `GET /cluster` field semantics, see
 [clustering and leader election](Clustering-and-Leader-Election#observing-the-cluster).
 
-## Merged multi-tail
+<a id="merged-multi-tail"></a>
 
-[![The multi-tail console: four jobs' live logs merged into one pane with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png)
+## Live logs
 
-The **`≋ tail`** toolbar button opens the **multi-tail console**: several jobs'
+[![The live logs panel: four jobs' live logs merged into one pane with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png)
+
+The **`≋ live logs`** toolbar button opens the **live logs panel**: several jobs'
 log streams merged into one live pane, each line prefixed with its job name in
 a stable identity color, like tailing a set of pods. It is built for correlated
-incidents. The incident verdict bar and the mitigate console each carry a
-`≋ tail` button that opens it pre-loaded with the failing set, and the command
+incidents. The incident verdict bar and the job actions panel each carry a
+`≋ live logs` button that opens it pre-loaded with the failing set, and the command
 palette offers a per-job **Tail: …** action plus **failing** / **running**
 presets.
 
@@ -435,20 +437,21 @@ presets.
   appears only for the streams a job captures
   ([`captureStdout` / `captureStderr`](Output-Capturing)).
 
-## Incident tools: verdict bar, timeline, and mitigate console
+<a id="incident-tools-verdict-bar-timeline-and-mitigate-console"></a>
+
+## Incident tools: verdict bar, timeline, and job actions panel
 
 None of these need a cluster; they all work on a single node.
 
 When something is failing, a **verdict bar** appears at the top of the page and
 distills the situation into one line. A single failure reads
 `JOB FAILING — <name> · exit <code> · <reason>`. When several jobs are failing,
-a correlation pass groups them by exit code and failure reason and headlines
-either `FLEET EVENT — N jobs failing, K share exit=… — likely one cause` or
-"likely independent", so the first thing you read is whether this is one
-incident or many. A cluster quorum, leadership, or conflict problem escalates
+the dashboard groups matching exit codes and failure reasons. It reports
+`MULTIPLE FAILURES — N jobs failing` and highlights jobs that may share a
+cause, or says that no matching failure details were found. A cluster quorum, leadership, or conflict problem escalates
 the bar to the red **CLUSTER ALERT** severity described earlier under
-[cluster panel](#cluster-panel). The bar carries `▤ timeline`, `▸ mitigate`, and
-`≋ tail` buttons scoped to the incident set.
+[cluster panel](#cluster-panel). The bar carries `▤ timeline`, `▸ review actions`, and
+`≋ live logs` buttons scoped to the incident set.
 
 [![The incident timeline overlay: every job's most recent finished run, newest first, with failure reasons, exit codes, and durations](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)
 
@@ -458,13 +461,13 @@ its relative time, outcome glyph, failure reason, exit code, and duration. A
 **failing only** filter narrows it, and the correlated blast-radius set from
 the verdict bar is highlighted, so you can read "what happened, in what order".
 
-The **mitigate console** (*Mitigate failing jobs* in the palette, or the
-verdict bar's `▸ mitigate` button) acts on the failing set in bulk. Guarded
-**start all** / **cancel all** actions fire the per-job
+The **job actions panel** (*Review actions for failing jobs* in the palette, or the
+verdict bar's `▸ review actions` button) acts on the failing set in bulk. Guarded
+**start all now** / **cancel all** actions send the per-job
 [start/cancel endpoints](HTTP-API#post-jobsnamestart) staggered a few hundred
 milliseconds apart (gentle on the daemon), with a live per-job ✓/✕ result log
-and a final tally; you can stop the sequence while it runs. The console can also
-open a [multi-tail](#merged-multi-tail) of the set, and copy a ready-made
+and a final tally; you can stop the sequence while it runs. The panel can also
+open [live logs](#merged-multi-tail) for the selected jobs, and copy a ready-made
 **Markdown incident summary** (timestamp, host, version, cluster state, and a
 per-job table) for your incident channel or ticket.
 
@@ -510,18 +513,20 @@ It also respects `prefers-reduced-motion`. The
 `example/zen-demo/docker-compose.yml` demo boots a single calm node to
 demonstrate it.
 
-## Next-fire radar
+<a id="next-fire-radar"></a>
 
-The **`⌁ radar`** toolbar button (or *Toggle next-fire radar* in the palette)
-opens a **next fires** panel answering "what runs next", fleet-wide: a feed of
-the next eight upcoming fires, each with a live countdown (hover one for the
+## Upcoming runs
+
+The **`⌁ upcoming`** toolbar button (or *Toggle upcoming runs* in the palette)
+opens an **upcoming runs** panel answering "what runs next", fleet-wide: a feed of
+the next eight scheduled runs, each with a live countdown (hover one for the
 wall-clock time and the schedule's plain-English reading), above a
 **ten-minute track** on which every fire due inside the window drifts toward
 *now* as a mark. Clicking an entry or a mark opens that job's drawer, and the
 panel header counts everything upcoming. The browser computes fire times with
 the same cron engine as the
 [Schedule tab](#schedule-in-plain-english-in-the-right-timezone) and the
-[cron sandbox](#cron-sandbox). Disabled jobs, and schedules the engine cannot
+[schedule preview](#cron-sandbox). Disabled jobs, and schedules the engine cannot
 preview (such as `@reboot`), are omitted.
 
 ## Week calendar
@@ -553,13 +558,14 @@ one batched [`GET /activity`](HTTP-API#get-activity) fetch, falling back to
 per-job [run history](HTTP-API#get-jobsnameruns) fetches against an older
 daemon, so the card's horizon is bounded by the daemon's in-memory history.
 
-## Schedule pressure
+<a id="schedule-pressure"></a>
 
-The **`▥ pressure`** header button (or *Toggle schedule pressure* in the
-palette) adds the forward-looking counterpart of the activity heatmap: instead
-of what DID run, it shows every fire the fleet WILL attempt over the next 24
+## Schedule load
+
+The **`▥ schedule load`** header button (or *Toggle schedule load* in the
+palette) shows upcoming scheduled runs over the next 24
 hours, fetched from [`/schedule/pressure`](HTTP-API#get-schedulepressure)
-where the daemon enumerates each schedule with its own engine. The card draws
+using the server’s scheduling engine. The card shows
 the hour-by-minute collision grid (hot cells highlighted), the minute-of-hour
 histogram, the fleet's
 [duplicate-schedule groups](Duplicate-Schedule-Detection) as clickable job
@@ -569,32 +575,35 @@ copy-to-clipboard chip alongside the `H * * * *` hint.
 A selector switches the display zone between UTC and the browser's local zone,
 and the data refreshes about once a minute. With the panel enabled, the
 [wallboard](#wallboard--tv-mode) shows a compact pressure strip above the tile
-grid, so the room sees the `:00` stampede before it happens. See
-[schedule pressure](Schedule-Pressure).
+grid, so the room sees when many jobs are scheduled at once. See
+[schedule load](Schedule-Pressure).
 
-## Cron sandbox
+<a id="cron-sandbox"></a>
 
-*Cron sandbox* in the palette opens a scratchpad for schedule expressions: type
+## Schedule preview
+
+*Schedule preview* in the palette opens a scratchpad for schedule expressions: type
 any 5-, 6-, or 7-field cron expression (including [second-level](Schedules-and-Timezones#second-level-schedules)
-schedules) or `@macro`, pick a time zone frame, and it validates the expression,
+schedules) or `@macro`, pick a timezone, and it validates the expression,
 describes it in plain English, breaks out the fields, and previews the
-**next 12 fire times** with wall-clock and relative labels (impossible
+**next 12 scheduled runs** with wall-clock and relative labels (impossible
 schedules and `@reboot` are called out). It cross-references your live jobs to
 show which ones use the same schedule, and keeps a browser-local list of recent
 expressions. The same engine powers the dashboard's schedule advisories
-(overlap, thundering-herd, and DST warnings).
+(overlapping runs, jobs scheduled together, and daylight saving time changes).
 
-## Run ledger
+<a id="run-ledger"></a>
 
-The daemon keeps at most the last 50 runs per job in memory. The opt-in **run
-ledger** (a Settings toggle, or *Toggle run ledger* in the palette) extends
-that horizon in your browser: while a tab is open it records each newly
-finished run into IndexedDB, computes robust per-job duration baselines
+## Browser run history
+
+The daemon keeps at most the last 50 runs per job in memory. The opt-in **browser run
+history** (a Settings toggle, or *Toggle browser run history* in the palette) extends
+that horizon in your browser: while a tab is open it saves each job’s latest
+completed run at every refresh, computes robust per-job duration baselines
 (median plus deviation over successful runs), and flags runs that are
 unusually slow with a `◱ slow` chip on the job row. Settings shows the storage
-used, with one-click **export** (a JSON dump) and **purge**. The ledger lives
-only in that browser: it grows only while a tab is open, and it never sends
-anything back to the daemon.
+used, with **export** (JSON) and **clear history** buttons. This history stays in the browser and only grows while a tab is open.
+Runs that finish between refreshes may be missed.
 
 ## Command palette
 
@@ -650,7 +659,7 @@ The settings panel (and the command palette) expose:
 - **Alarm escalation**: the wallboard reddens and the alarm quickens the longer a failure goes unacknowledged. The cue interval ramps from every 6 seconds down to roughly every 1.6 by the ten-minute mark, and `a` silences it until the next failure.
 - A **refresh interval** of 1s / 2s / 3s / 5s / 10s, or paused.
 - The **zen screensaver** toggle and its idle delay, for the [wallboard](#wallboard--tv-mode).
-- The opt-in **[run ledger](#run-ledger)**, with its storage stats, export, and purge buttons.
+- The opt-in **[browser run history](#run-ledger)**, with its storage stats, export, and purge buttons.
 
 All preferences are remembered in the browser's `localStorage`, so the dashboard
 comes back the way you left it.
@@ -783,7 +792,7 @@ The dashboard is a thin client over the [HTTP control API](HTTP-API):
 - opening a job's **History** tab fetches `GET /jobs/{name}/runs` (full retained history plus aggregate stats); the [activity heatmap](#activity-heatmap) fills from one batched [`GET /activity`](HTTP-API#get-activity) fetch and keeps the capped per-job loop as a fallback against an older daemon;
 - opening a job's **Resources** tab fetches `GET /jobs/{name}/resources` lazily, never on the poll loop, and refetches it at the live view's selectable pace while the tab stays open;
 - opening the **Logs** tab opens the `GET /jobs/{name}/logs` SSE stream;
-- the [multi-tail console](#merged-multi-tail) opens up to four of those SSE streams at once (one per tailed job) and re-attaches them as runs come and go;
+- the [live logs panel](#merged-multi-tail) opens up to four of those SSE streams at once (one per tailed job) and re-attaches them as runs come and go;
 - the [DAG drawer](#dag-orchestration) fetches `GET /dags/{name}/runs`, the selected run's document and XCom list, and a running task's log SSE stream; its buttons call `POST /dags/{name}/trigger`, `POST /dags/{name}/backfill`, and the approval decision endpoint;
 - the **Run** / **Stop** buttons call `POST /jobs/{name}/start` and `POST /jobs/{name}/cancel`;
 - the version in the header comes from `GET /version`, and the [job-set id](Job-Set-ID) chip beside it from `GET /job-set-id` (each fetched once at load).

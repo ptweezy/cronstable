@@ -69,7 +69,7 @@ def test_findings_are_json_shaped():
 def test_never_fires_impossible_date():
     finding = _by_code("0 0 30 2 *", "never-fires")
     assert finding.level == "warning"
-    assert "never fire" in finding.message
+    assert "no future runs" in finding.message
 
 
 def test_never_fires_past_year_names_the_year():
@@ -280,7 +280,7 @@ def test_lint_hashed_slot_note_and_uneven_h_step():
     assert "hashed-slot" in codes
     note = next(f for f in findings if f.code == "hashed-slot")
     assert note.level == "note"
-    assert "renaming the job re-hashes" in note.message
+    assert "renaming the job may change its run times" in note.message
     # H/7 spans the whole minute field like */7, so the uneven-step
     # warning applies to it too
     uneven = lint_schedule("H/7 * * * *", hash_key="spread")

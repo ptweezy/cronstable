@@ -3149,7 +3149,7 @@ async def test_catchup_spawn_due_jobs_latches_dead_schedule(monkeypatch, caplog)
         await cron._spawn_due_jobs(now)
     assert "dead" in cron._dead_schedules
     assert "dead" not in cron._next_fire
-    assert any("NEVER fire again" in r.getMessage() for r in caplog.records)
+    assert any("no remaining runs" in r.getMessage() for r in caplog.records)
 
 
 async def test_catchup_launch_plan_skips_shallow_jobs_in_later_rounds(monkeypatch):

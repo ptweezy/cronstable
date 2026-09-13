@@ -3777,11 +3777,14 @@ def _validate_web_config(webconf: WebConfig) -> None:
     _validate_web_tls(webconf)
     if webconf.get("anonymousScopes") and not _web_has_any_token(webconf):
         raise ConfigError(
-            "web.anonymousScopes is set but no web.authToken or "
-            "web.authTokens entry is configured; with no tokens the web "
-            "API installs no auth middleware and every request already "
-            "holds every scope, so an anonymous grant would only mislead. "
-            "Configure at least one token, or remove anonymousScopes."
+            (
+                "web.anonymousScopes requires at least one token in "
+                "web.authToken "
+                "or web.authTokens. Without tokens, the API allows full"
+                " access. "
+                "Configure a token to restrict anonymous access, or remove "
+                "anonymousScopes."
+            )
         )
     for entry in webconf.get("authTokens") or ():
         if entry.get("label") == "anonymous":
@@ -4117,9 +4120,12 @@ def _validate_eventlog_config(config: "CronstableConfig") -> None:
 
     if users and not platform.IS_WINDOWS:
         logger.warning(
-            "report.eventlog is enabled (%s) but there is no Windows Event "
-            "Log on this platform, so those reports are dropped; the rest "
-            "of each report block still fires normally",
+            (
+                "report.eventlog is enabled (%s), but Windows Event Log is "
+                "unavailable on this platform. Event Log reports will "
+                "be skipped; "
+                "other configured reporters still run normally"
+            ),
             ", ".join(sorted(users)),
         )
 
@@ -4846,16 +4852,22 @@ def _validate_dags(config: CronstableConfig) -> None:
             template_owner[template] = (d.name, task.id)
     if config.state_config is None:
         raise ConfigError(
-            "dags require a `state` section (each dag_run and its per-task "
-            "state live on the durable store); none is configured, "
-            "offending dag(s): {}".format(", ".join(sorted(names)))
+            (
+                "workflows require a `state` section to save runs and task "
+                "progress. Add state store settings for these entries "
+                "in `dags`: "
+                "{}"
+            ).format(", ".join(sorted(names)))
         )
     job_api = config.state_config.get("jobApi") or {}
     if not job_api.get("enabled", True):
         raise ConfigError(
-            "dags need the state loopback endpoint for XCom and task state, "
-            "but state.jobApi.enabled is false; offending dag(s): "
-            "{}".format(", ".join(sorted(names)))
+            (
+                "workflows need the job API for task outputs (XCom) and"
+                " progress. "
+                "Set state.jobApi.enabled to true for these entries in "
+                "`dags`: {}"
+            ).format(", ".join(sorted(names)))
         )
 
 

@@ -23,7 +23,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     state = sub.add_parser(
         "state",
-        help="administer the durable state store (backup/restore/migrate/"
+        help="manage saved state (backup/restore/migrate/"
         "gc/check/migrate-schema)",
     )
     actions = state.add_subparsers(dest="state_command", metavar="ACTION")
@@ -38,7 +38,8 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
             "--config",
             default=argparse.SUPPRESS,
             metavar="FILE-OR-DIR",
-            help="configuration with the `state:` section to administer",
+            help="configuration containing the state store settings "
+            "(`state:`)",
         )
         return sub_parser
 
@@ -56,7 +57,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
         "--force",
         default=False,
         action="store_true",
-        help="merge into a non-empty store (NOT safe while a daemon uses it)",
+        help="merge into a non-empty store (stop cronstable first)",
     )
     migrate = _with_config(
         actions.add_parser(
@@ -80,7 +81,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     )
     gc = _with_config(
         actions.add_parser(
-            "gc", help="garbage-collect state of unreferenced jobs"
+            "gc", help="remove saved state for jobs no longer referenced"
         )
     )
     gc.add_argument("--dry-run", default=False, action="store_true")
@@ -92,7 +93,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     migrate_schema = _with_config(
         actions.add_parser(
             "migrate-schema",
-            help="rewrite records of older known record schemes",
+            help="upgrade records from older supported formats",
         )
     )
     migrate_schema.add_argument(
@@ -156,7 +157,7 @@ _INIT_STARTER = """\
 # cronstable starter configuration (written by `cronstable init`).
 # Every *.yaml and *.yml file in this directory is loaded; classic crontab
 # files (*.crontab, *.cron, or a file named `crontab`) are accepted here
-# too. Names beginning with _ or . are skipped, which is how you park one.
+# too. To exclude a file, start its name with _ or .
 # Reference: https://github.com/ptweezy/cronstable/wiki/Configuration-Reference
 #
 # Windows note: quote paths with single quotes ('C:\\scripts\\nightly.bat').

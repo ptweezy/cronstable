@@ -4818,7 +4818,7 @@ async def test_reconcile_on_boot_no_backend_and_nonstr_runkey(
 async def test_approve_unknown_dag(tmp_path, dag_cron):
     cron = await dag_cron(_LINEAR)
     res = await cron._dag.approve("ghost", "rk", "gate", approved=True, by="x")
-    assert res == {"ok": False, "reason": "no such dag"}
+    assert res == {"ok": False, "reason": "workflow not found"}
 
 
 async def test_backfill_unscheduled_or_unknown_dag(tmp_path, dag_cron):
@@ -4826,7 +4826,7 @@ async def test_backfill_unscheduled_or_unknown_dag(tmp_path, dag_cron):
     res = await cron._dag.backfill(
         "lin", "2026-01-01T00:00:00+00:00", "2026-01-01T01:00:00+00:00"
     )
-    assert res == {"ok": False, "reason": "no such scheduled dag"}
+    assert res == {"ok": False, "reason": "scheduled workflow not found"}
     res2 = await cron._dag.backfill(
         "ghost", "2026-01-01T00:00:00+00:00", "2026-01-01T01:00:00+00:00"
     )

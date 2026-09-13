@@ -45,6 +45,6 @@ The original `H` spelling is what you configured, so it is what the surfaces dis
 - The [web dashboard](Web-Dashboard)'s job drawer shows "`H * * * *` (H resolves to `9 * * * *`)". Its previews and collision analysis compute from the resolved form.
 - The job-set [fingerprint](Job-Set-ID) hashes the schedule as written, so an `H` schedule fingerprints as `H`. Identical configs still agree across replicas because the resolution is deterministic.
 
-## Pairs with schedule pressure
+## Pairs with schedule load
 
-[Schedule pressure](Schedule-Pressure) reports the problem (`37 jobs fire at :00`). `H` is the remedy you can apply per job without anyone coordinating slot assignments by hand. When you want a concrete, explicit minute instead, [suggest a slot](Suggest-a-Slot) is the middle path.
+[Schedule load](Schedule-Pressure) reports the problem (`37 jobs fire at :00`). `H` is the remedy you can apply per job without anyone coordinating slot assignments by hand. When you want a concrete, explicit minute instead, [suggest a slot](Suggest-a-Slot) is the middle path.

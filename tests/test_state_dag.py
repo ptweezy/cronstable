@@ -1080,14 +1080,14 @@ def test_dag_manual_only_no_schedule():
             "dags:\n  - name: d\n    tasks:\n"
             "      - id: t\n        command: 'echo'\n",
             "",
-            "dags require a `state` section",
+            "workflows require a `state` section",
             id="requires-state",
         ),
         pytest.param(
             "dags:\n  - name: d\n    tasks:\n"
             "      - id: t\n        command: 'echo'\n",
             "state:\n  path: /x\n  jobApi:\n    enabled: false\n",
-            "loopback endpoint",
+            "workflows need the job API",
             id="requires-jobapi-enabled",
         ),
         pytest.param(

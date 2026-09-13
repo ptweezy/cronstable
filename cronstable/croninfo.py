@@ -626,9 +626,9 @@ def lint_schedule(
             Finding(
                 "hashed-slot",
                 LEVEL_NOTE,
-                "'H' resolves to '{}' for this job: the slot is a stable "
-                "hash of the job name, so it survives restarts and "
-                "reloads, but renaming the job re-hashes it".format(
+                "'H' resolves to '{}' based on this job's name. The "
+                "schedule stays the same after restarts and reloads; "
+                "renaming the job may change its run times".format(
                     tab.resolved_source
                 ),
             )
@@ -661,12 +661,13 @@ def _never_fires_message(tab: CronTab) -> str:
         )
         if rewound is not None:
             return (
-                "no future occurrence: the year column ends at {}, so this "
-                "schedule will never fire again".format(max(years))
+                "no future runs: the last year in this schedule is {}".format(
+                    max(years)
+                )
             )
     return (
-        "no future occurrence: the day, month and weekday fields never all "
-        "line up on a real date, so this schedule will never fire"
+        "no future runs: no calendar date matches the selected day, "
+        "month and weekday"
     )
 
 
@@ -690,11 +691,10 @@ def _lint_day_fields(tab: CronTab) -> list[Finding]:
             Finding(
                 "day-fields-both-restricted",
                 LEVEL_WARNING,
-                "day-of-month and day-of-week are both restricted, and a "
-                "day must satisfy BOTH here ('0 0 13 * 5' is Friday the "
-                "13th); classic Vixie cron fires when either field "
-                "matches, so a schedule imported from a system crontab "
-                "fires less often than it did there",
+                "dates must match both day-of-month and day-of-week "
+                "('0 0 13 * 5' means Friday the 13th). Classic Vixie cron "
+                "accepts either field, so an imported schedule may run "
+                "less often in cronstable",
             )
         ]
     return []
@@ -756,9 +756,10 @@ def _lint_steps(expression: str) -> list[Finding]:
                     Finding(
                         "uneven-step",
                         LEVEL_WARNING,
-                        "'{}' in the {} field: {} does not divide the "
-                        "field's span of {}, so one interval at the wrap "
-                        "is only {} {}".format(
+                        "'{}' in the {} field produces uneven intervals: "
+                        "a step of {} does not divide evenly into {}. "
+                        "When the field starts over, the gap is only {}"
+                        " {}".format(
                             item,
                             label,
                             step,
@@ -836,9 +837,8 @@ def _lint_month_lengths(tab: CronTab) -> list[Finding]:
                 Finding(
                     "leap-day-only",
                     LEVEL_NOTE,
-                    "in February only the leap 29th makes the selected "
-                    "days land, so February runs occur only in leap "
-                    "years",
+                    "this schedule runs in February only during leap "
+                    "years, when February has 29 days",
                 )
             )
     return findings
@@ -1070,10 +1070,9 @@ def _dst_finding(
                     return Finding(
                         "dst-skipped-time",
                         LEVEL_NOTE,
-                        "on {} the wall time {:02d}:{:02d} does not exist "
-                        "in {} (clocks jump forward); that run fires at "
-                        "the shifted wall time instead of being "
-                        "skipped".format(
+                        "on {}, clocks move forward past {:02d}:{:02d} "
+                        "in {}. Cronstable moves this run forward by "
+                        "the clock change instead of skipping it".format(
                             day.isoformat(), hour, minute, zone_name
                         ),
                     )
@@ -1081,9 +1080,9 @@ def _dst_finding(
                     return Finding(
                         "dst-repeated-time",
                         LEVEL_NOTE,
-                        "on {} the wall time {:02d}:{:02d} occurs twice in "
-                        "{} (clocks fall back); the run fires on the "
-                        "first occurrence only".format(
+                        "on {}, {:02d}:{:02d} occurs twice in {} when "
+                        "clocks move back. Cronstable runs the job only "
+                        "at the first occurrence".format(
                             day.isoformat(), hour, minute, zone_name
                         ),
                     )
@@ -1305,11 +1304,11 @@ def why_no_run(
             Finding(
                 "day-fields-and-rule",
                 LEVEL_NOTE,
-                "day-of-month and day-of-week are both restricted and a "
-                "day must satisfy BOTH here: {} matched but {} did not, "
-                "so classic Vixie cron (which fires when either field "
-                "matches) WOULD have run this schedule at this "
-                "instant".format(ok_field, bad_field),
+                "dates must match both day-of-month and day-of-week: "
+                "{} matched but {} did not. Classic Vixie cron accepts "
+                "either field and would schedule a run at this time".format(
+                    ok_field, bad_field
+                ),
             )
         )
     if (
@@ -1329,9 +1328,9 @@ def why_no_run(
                 Finding(
                     "dst-skipped-time",
                     LEVEL_NOTE,
-                    "the wall time {} did not exist on {} in {} (clocks "
-                    "jump forward); the scheduler fired once at the "
-                    "shifted wall time {} instead".format(
+                    "the local time {} does not exist on {} in {} because "
+                    "clocks move forward. Cronstable schedules this run "
+                    "at {} instead".format(
                         civil.time().isoformat(),
                         civil.date().isoformat(),
                         timezone,
@@ -1344,9 +1343,9 @@ def why_no_run(
                 Finding(
                     "dst-repeated-time",
                     LEVEL_NOTE,
-                    "the wall time {} occurred twice on {} in {} (clocks "
-                    "fall back); the schedule fired on the first "
-                    "occurrence only".format(
+                    "the local time {} occurs twice on {} in {} because "
+                    "clocks move back. Cronstable schedules a run at "
+                    "the first occurrence only".format(
                         civil.time().isoformat(),
                         civil.date().isoformat(),
                         timezone,
