@@ -26,6 +26,11 @@ cronstable keeps cron's model (a schedule file running your commands) and
 builds in the tooling that otherwise accumulates around it: retries,
 alerting, durable state, orchestration, clustering, and a live dashboard.
 
+It's built for small and old machines, with
+[benchmarks](https://github.com/ptweezy/cronstable/wiki/Performance-Benchmarks)
+that compare speed and memory use against the latest release on every commit
+and catch regressions before release.
+
 ### Scheduling
 
 * "Crontab" is in YAML format, and cronstable reads classic crontab files
@@ -1887,20 +1892,6 @@ jobs:
     shell: /bin/bash
     schedule: "* * * * *"
 ```
-
-## Performance
-
-cronstable is built to run on small and old machines, and CI holds it to
-that: every commit runs an exhaustive benchmark suite (startup time, schedule
-computation for 100,000 jobs, config parsing, DAG planning, durable-state
-I/O, memory footprint, about 37 metrics in all) paired against the latest
-release on the same runner. A release that regresses a metric past its
-declared limit does not ship, and every release page carries a chart and a
-full table of the change against the previous release.
-
-Run the suite yourself with `python benchmarks/bench.py --quick`. For how the
-comparison and the gate work, see
-[performance benchmarks](https://github.com/ptweezy/cronstable/wiki/Performance-Benchmarks).
 
 ## Documentation map
 
