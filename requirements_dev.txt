@@ -14,7 +14,7 @@
 # kernel passes this marker, finds no i686 wheel, and fails the sdist build
 # for want of Rust. Use `linux32 pip install -r requirements_dev.txt` there:
 # uname reports 32-bit, dropping cryptography so both test arms self-skip.
-cryptography>=48; (sys_platform == "linux" and (platform_machine == "x86_64" or platform_machine == "aarch64")) or (sys_platform == "darwin" and platform_machine == "arm64") or (sys_platform == "win32" and platform_machine == "AMD64")
+cryptography>=48,<51; (sys_platform == "linux" and (platform_machine == "x86_64" or platform_machine == "aarch64")) or (sys_platform == "darwin" and platform_machine == "arm64") or (sys_platform == "win32" and platform_machine == "AMD64")
 cryptography>=48,<49; (sys_platform == "darwin" and platform_machine == "x86_64") or (sys_platform == "win32" and platform_machine == "x86")
 # orjson is the optional `speedups` extra, but the tests that cover the
 # accelerated durable-state/gossip JSON paths are worthless if no CI cell ever
