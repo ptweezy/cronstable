@@ -293,6 +293,31 @@ def _extract_deps_module():
     return module
 
 
+@pytest.fixture
+def linux_cryptography_requirement():
+    """The complete Linux push constraint, without its platform marker."""
+    tomllib = pytest.importorskip("tomllib")
+    from packaging.requirements import Requirement
+
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fobj:
+        project = tomllib.load(fobj)["project"]
+    target = {
+        "sys_platform": "linux",
+        "platform_system": "Linux",
+        "os_name": "posix",
+        "platform_machine": "x86_64",
+    }
+    expected = []
+    for line in project["optional-dependencies"]["push"]:
+        req = Requirement(line)
+        if req.name == "cryptography" and (
+            req.marker is None or req.marker.evaluate(target)
+        ):
+            expected.append(line.split(";", 1)[0].strip())
+    assert len(expected) == 1
+    return expected[0]
+
+
 def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
     # The push+discovery extras pair lives in exactly one place, so pin
     # what the script writes against a straight read of pyproject.toml, and
@@ -358,7 +383,7 @@ def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
     ],
 )
 def test_extract_deps_writes_the_file_the_target_can_install(
-    tmp_path, monkeypatch, target, keeps
+    tmp_path, monkeypatch, target, keeps, linux_cryptography_requirement
 ):
     # The end of the same story, on the written file rather than the
     # decision: an image whose target has no wheel must get a
@@ -381,7 +406,7 @@ def test_extract_deps_writes_the_file_the_target_can_install(
         for line in written
         if module.requirement_name(line) == "cryptography"
     ]
-    assert crypto == (["cryptography>=48"] if keeps else [])
+    assert crypto == ([linux_cryptography_requirement] if keeps else [])
     # PyNaCl rides through untouched either way: it has wheels or a plain C
     # source build everywhere, so push keeps sealing x25519 on the rows that
     # lose the post-quantum suite.
@@ -405,7 +430,7 @@ def test_cryptography_line_keeps_its_floor_and_loses_its_marker():
 
 
 def test_a_wheelhouse_wheel_keeps_cryptography_where_pypi_has_none(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, linux_cryptography_requirement
 ):
     # The pq-wheels job hands the image builds a cryptography wheel for the
     # platforms PyPI publishes none for. With one in the wheelhouse the
@@ -440,7 +465,7 @@ def test_a_wheelhouse_wheel_keeps_cryptography_where_pypi_has_none(
     )
     module.main(str(tmp_path / "pyproject.toml"), str(wheelhouse))
     written = (tmp_path / "requirements.txt").read_text(encoding="utf-8")
-    assert "cryptography>=48" in written.splitlines()
+    assert linux_cryptography_requirement in written.splitlines()
 
 
 def test_a_wheelhouse_wheel_must_load_on_the_image_interpreter(tmp_path):

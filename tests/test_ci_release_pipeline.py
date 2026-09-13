@@ -384,7 +384,12 @@ def test_source_constraints_come_from_pyproject(name, extra):
     inputs = load("release_inputs")
     # Compare the complete canonical constraint, including any upper bound.
     # Resolve the Linux build target even when these tests run on another OS.
-    target = {"sys_platform": "linux", "platform_machine": "x86_64"}
+    target = {
+        "sys_platform": "linux",
+        "platform_system": "Linux",
+        "os_name": "posix",
+        "platform_machine": "x86_64",
+    }
     requirements = map(
         Requirement, project["project"]["optional-dependencies"][extra]
     )
