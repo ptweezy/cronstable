@@ -98,7 +98,7 @@ bugs. The explainer flags both in `notes`:
   at daemon startup and never fire on a timetable.
 - **DAG schedules** resolve under their synthetic `dag:<name>` job name,
   exactly as they appear in the
-  [schedule pressure](Schedule-Pressure) fleet views.
+  [schedule load](Schedule-Pressure) fleet views.
 
 ## For AI agents
 

@@ -2681,19 +2681,17 @@ class RunningJob:
             )
         fails_when = self.config.failsWhen
         if fails_when["always"]:
-            return "failsWhen=always"
+            return "configured to mark every run as failed (failsWhen.always)"
         if fails_when["nonzeroReturn"] and self.retcode != 0:
-            return "failsWhen=nonzeroReturn and retcode={}".format(
-                self.retcode
-            )
+            return "command exited with code {}".format(self.retcode)
         if fails_when["producesStdout"] and (
             self.stdout or self.stdout_discarded
         ):
-            return "failsWhen=producesStdout and stdout is not empty"
+            return "command wrote to stdout (configured to count as a failure)"
         if fails_when["producesStderr"] and (
             self.stderr or self.stderr_discarded
         ):
-            return "failsWhen=producesStderr and stderr is not empty"
+            return "command wrote to stderr (configured to count as a failure)"
         return None
 
     async def cancel(self) -> None:

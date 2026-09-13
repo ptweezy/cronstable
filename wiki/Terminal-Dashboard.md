@@ -72,7 +72,7 @@ The web page's shortcut table applies verbatim to both frontends. Press
 
 Terminal-only extras are grouped separately in the `?` overlay. `q`
 quits, `s`/`S` cycle the sort key/direction, `f` cycles the status
-filter, `m` opens the multi-tail console, `←`/`→` (or `Tab`) switch
+filter, `m` opens the live logs panel, `←`/`→` (or `Tab`) switch
 drawer tabs, and `PgUp`/`PgDn` scroll.
 
 Inside the **Logs** tab, `f`/`t`/`w` toggle follow/timestamps/wrap;
@@ -102,26 +102,26 @@ Everything an operator drives from the web page:
 - The **fuzzy command palette**, with the same global, per-job, and
   per-DAG (directed acyclic graph) actions.
 - The **verdict bar** and **incident timeline**, with the same
-  failure-correlation logic ("×4 share exit=69 — likely one cause").
-  The **mitigate console** has staggered bulk start/cancel, **abort**,
+  failure-correlation logic ("×4 share exit code 69 — may share a cause").
+  The **job actions panel** has staggered bulk start/cancel, **stop sending**,
   and a Markdown **incident writeup**, copied to the clipboard and saved
   to `~/cronstable-incident-<YYYYmmdd-HHMMSS>.md`. If the file write
   fails, the clipboard copy still stands.
-- The **multi-tail console**: up to four jobs' live logs merged with
+- The **live logs panel**: up to four jobs' live logs merged with
   identity-colored prefixes.
-- The **DAG drawer**: runs, an ASCII task graph, per-task states and
+- The **workflow drawer**: runs, an ASCII task graph, per-task states and
   attempts, **approval gates** (`a` approve / `R` reject), XCom
   (cross-communication) values, task logs, trigger and backfill.
 - The **cluster panel**, **fleet matrix** (jobs × nodes, failing-only
   filter), **node resources**, **activity heatmap** punchcard, and
-  **next-fire radar**.
-- The **schedule pressure** overlay (`Ctrl-K` → "Toggle schedule
-  pressure"): the next 24 hours of fires as an hour-by-minute collision
+  **upcoming runs**.
+- The **schedule load** overlay (`Ctrl-K` → "Toggle schedule
+  load"): the next 24 hours of scheduled runs as an hour-by-minute collision
   grid with a minute histogram, the fleet's
   [duplicate-schedule groups](Duplicate-Schedule-Detection), and the
   [least-loaded-slot suggestions](Suggest-a-Slot), computed locally from
   the `/jobs` snapshot with the daemon's own shared analyzers (see
-  [schedule pressure](Schedule-Pressure)), so it works against older
+  [schedule load](Schedule-Pressure)), so it works against older
   daemons too.
 - The **week calendar** overlay (`Ctrl-K` → "Toggle week calendar"): the
   web dashboard's seven-day view, terminal-shaped: a day-by-hour shaded
@@ -133,7 +133,7 @@ Everything an operator drives from the web page:
   [calendar export](Calendar-Export)).
 - The **state inspector** for the durable store (inventory, document
   namespaces, record streams).
-- The **cron sandbox** (`Ctrl-K` → "Cron sandbox"), evaluating
+- The **schedule preview** (`Ctrl-K` → "Schedule preview"), evaluating
   expressions live against the daemon's own engine, with the
   [schedule linter's](Schedule-Linting) advisory findings inline. A
   job's schedule drawer shows the same findings in the job's own time

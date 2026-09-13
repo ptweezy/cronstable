@@ -1177,6 +1177,10 @@
   .verdict .vsub { color: var(--fg-dim); font-size: 11.5px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }
   .verdict .vact { display: flex; gap: 6px; flex: none; }
   .verdict.sev-crit .vhead { color: var(--fail); }
+  @media (max-width: 820px) {
+    .verdict { display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: start; }
+    .verdict .vact { grid-column: 2; flex-wrap: wrap; }
+  }
 
   /* ---------- incident timeline overlay ---------- */
   .tlpanel {
@@ -1505,15 +1509,15 @@
       <button data-f="disabled">off</button>
     </div>
     <span class="grow"></span>
-    <button class="ghostbtn" id="radarBtn" title="Next-fire radar">⌁ radar</button>
-    <button class="ghostbtn" id="heatBtn" title="Activity heatmap">▦ heat</button>
-    <button class="ghostbtn" id="pressBtn" title="Schedule pressure: upcoming fire collisions">▥ pressure</button>
-    <button class="ghostbtn" id="weekBtn" title="Week calendar: the next 7 days of fires, browser time">◫ week</button>
-    <button class="ghostbtn" id="tailBtn" title="Merged multi-tail console">≋ tail</button>
+    <button class="ghostbtn" id="radarBtn" title="Upcoming runs and a 10-minute timeline">⌁ upcoming</button>
+    <button class="ghostbtn" id="heatBtn" title="Recent run activity">▦ activity</button>
+    <button class="ghostbtn" id="pressBtn" title="Schedule load: see when jobs are scheduled together">▥ schedule load</button>
+    <button class="ghostbtn" id="weekBtn" title="Scheduled runs for the next 7 days, in your browser’s timezone">◫ week</button>
+    <button class="ghostbtn" id="tailBtn" title="Watch logs from multiple jobs">≋ live logs</button>
     <button class="ghostbtn" id="tvBtn" title="Wallboard / TV mode (w)">▣ tv</button>
     <button class="ghostbtn" id="runFailingBtn" title="Run every failing job now">▶ run failing</button>
-    <button class="ghostbtn" id="dagsBtn" title="DAG orchestration" style="display:none">⧉ dags</button>
-    <button class="ghostbtn" id="stateBtn" title="Durable state store" style="display:none">⛁ state</button>
+    <button class="ghostbtn" id="dagsBtn" title="Workflows and task dependencies" style="display:none">⧉ workflows</button>
+    <button class="ghostbtn" id="stateBtn" title="Saved state: runs, retries, locks, and job data" style="display:none">⛁ state</button>
     <select class="mini" id="sortSel" title="Sort">
       <option value="name">sort: name</option>
       <option value="status">sort: status</option>
@@ -1529,13 +1533,13 @@
     <div class="vbody"><div class="vhead" id="vHead"></div><div class="vsub" id="vSub"></div></div>
     <div class="vact">
       <button class="btn" id="vTimeline" title="Incident timeline (i)">▤ timeline</button>
-      <button class="btn" id="vTail" title="Tail the failing jobs' output live">≋ tail</button>
-      <button class="btn primary" id="vMitigate" title="Bulk run/cancel the failing set">▸ mitigate</button>
+      <button class="btn" id="vTail" title="Watch live logs from failing jobs">≋ live logs</button>
+      <button class="btn primary" id="vMitigate" title="Review failing jobs and run or cancel them together">▸ review actions</button>
     </div>
   </div>
 
   <div class="card radar" id="radarPanel" style="display:none">
-    <div class="card-label"><span>┌─ next fires</span><span class="grow"></span><span class="faint" id="radarMeta"></span></div>
+    <div class="card-label"><span>┌─ upcoming runs</span><span class="grow"></span><span class="faint" id="radarMeta"></span></div>
     <div class="radar-body">
       <ul class="radar-feed" id="radarFeed"></ul>
       <div class="radar-track" id="radarTrack"></div>
@@ -1544,7 +1548,7 @@
 
   <div class="card weekcal" id="weekCard" style="display:none">
     <div class="card-label"><span>┌─ week calendar</span><span class="grow"></span>
-      <a class="icslink" id="icsLink" href="/calendar.ics" title="Subscribe to these fires as an iCal feed (.ics)">⤓ .ics feed</a>
+      <a class="icslink" id="icsLink" href="/calendar.ics" title="Subscribe to scheduled runs in your calendar (.ics)">⤓ calendar feed</a>
       <span class="faint" id="weekMeta"></span>
     </div>
     <div class="weekcal-body" id="weekBody"></div>
@@ -1563,7 +1567,7 @@
   </div>
 
   <div class="card press" id="pressureCard" style="display:none">
-    <div class="card-label"><span>┌─ schedule pressure</span><span class="grow"></span>
+    <div class="card-label"><span>┌─ schedule load</span><span class="grow"></span>
       <select class="mini" id="pressTz" title="display timezone">
         <option value="utc">UTC</option>
         <option value="browser">local</option>
@@ -1614,12 +1618,12 @@
   </div>
 
   <div class="card" id="dagCard" style="display:none">
-    <div class="card-label"><span>┌─ dags</span><span class="grow"></span><span class="faint" id="dagMeta"></span></div>
+    <div class="card-label"><span>┌─ workflows</span><span class="grow"></span><span class="faint" id="dagMeta"></span></div>
     <div class="twrap">
     <table class="runtable" id="dagsTable">
       <thead>
         <tr>
-          <th>Status</th><th>DAG</th><th>Schedule</th><th>Tasks</th>
+          <th>Status</th><th>Workflow</th><th>Schedule</th><th>Tasks</th>
           <th>Latest run</th><th>Runs</th><th style="text-align:right">Actions</th>
         </tr>
       </thead>
@@ -1634,7 +1638,7 @@
   </div>
 
   <div class="card" id="stateCard" style="display:none">
-    <div class="card-label"><span>┌─ durable state</span><span class="grow"></span>
+    <div class="card-label"><span>┌─ saved state</span><span class="grow"></span>
       <span class="src-chip" id="stateTopo"></span><span class="faint" id="stateMeta"></span></div>
     <div class="sthead" id="stateHealth"></div>
     <div class="sttabs" id="stateTabs"></div>
@@ -1718,8 +1722,8 @@
   <div class="drawer-head">
     <div class="row1">
       <span class="rpill" id="dgState" style="display:none"></span>
-      <h2 id="dgName">dag</h2>
-      <button class="btn run" id="dgTrigger" title="Trigger a manual run"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg> Trigger</button>
+      <h2 id="dgName">workflow</h2>
+      <button class="btn run" id="dgTrigger" title="Run this workflow now"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg> Trigger</button>
       <button class="btn" id="dgBackfillBtn" title="Backfill a date range">▦ Backfill</button>
       <button class="btn" id="dgRecoverBtn" disabled>Retry failed tasks</button>
       <button class="iconbtn" id="dgClose" title="Close (Esc)">
@@ -1758,9 +1762,9 @@
      open over the console (⌘K palette, the 401 token modal, settings) must
      paint above it, not under it with focus. -->
 <div class="overlay" id="tailWrap">
-  <div class="tailpanel" role="dialog" aria-label="Multi-tail console">
+  <div class="tailpanel" role="dialog" aria-label="Live logs">
     <div class="tailhead">
-      <h3>multi-tail</h3>
+      <h3>live logs</h3>
       <span class="faint" id="tailMeta"></span>
       <span class="grow"></span>
       <button class="ghostbtn mini" id="tailAddFailing" title="Tail every failing job">+ failing</button>
@@ -1796,7 +1800,7 @@
     <h3>settings</h3>
     <div class="body">
       <div class="setrow">
-        <span class="lab">Theme<small>dark or paper (light)</small></span>
+        <span class="lab">Theme<small>choose a dark or light theme</small></span>
         <select class="mini" id="setTheme">
           <optgroup label="dark">
             <option value="standard">standard</option>
@@ -1805,7 +1809,7 @@
             <option value="green">green</option>
             <option value="modern">modern</option>
           </optgroup>
-          <optgroup label="paper">
+          <optgroup label="light">
             <option value="standard-light">standard</option>
             <option value="carolina-light">carolina</option>
             <option value="amber-light">amber</option>
@@ -1815,7 +1819,7 @@
         </select>
       </div>
       <div class="setrow">
-        <span class="lab">Color vision<small>remap status colors for red-green or blue-yellow color blindness (status glyphs always differ too)</small></span>
+        <span class="lab">Color vision<small>adjust status colors for color blindness; symbols also identify each status</small></span>
         <select class="mini" id="setCvd">
           <option value="none">default</option>
           <option value="deutan">red-green friendly</option>
@@ -1824,7 +1828,7 @@
       </div>
       <div class="setrow"><span class="lab">Compact density<small>tighter rows</small></span><label class="switch"><input type="checkbox" id="setDensity"><span class="sl"></span></label></div>
       <div class="setrow">
-        <span class="lab">Interface font<small>terminal monospace, or a proportional sans for easier reading (logs &amp; cron strings stay monospace)</small></span>
+        <span class="lab">Interface font<small>choose a fixed-width or proportional font; logs and cron expressions stay fixed-width</small></span>
         <select class="mini" id="setFont">
           <option value="mono">monospace</option>
           <option value="sans">sans-serif</option>
@@ -1837,10 +1841,10 @@
           <option value="125">125%</option><option value="140">140%</option>
         </select>
       </div>
-      <div class="setrow"><span class="lab">Reduce motion<small>suppress spinners &amp; pulsing dots (your OS setting is always honored too)</small></span><label class="switch"><input type="checkbox" id="setMotion"><span class="sl"></span></label></div>
-      <div class="setrow"><span class="lab">Boot self-test<small>BIOS-style POST screen on load (replays after 12h)</small></span><label class="switch"><input type="checkbox" id="setBoot"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Reduce motion<small>reduce animation; also follows your device’s motion setting</small></span><label class="switch"><input type="checkbox" id="setMotion"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Startup check<small>show connection and status checks on startup, at most once every 12 hours</small></span><label class="switch"><input type="checkbox" id="setBoot"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Desktop notifications<small>alert when a job fails</small></span><label class="switch"><input type="checkbox" id="setNotify"><span class="sl"></span></label></div>
-      <div class="setrow"><span class="lab">Audible cues<small>tick on ok, buzz on failure, alarm until ack (a)</small></span><label class="switch"><input type="checkbox" id="setSound"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Audible cues<small>play sounds for success and failure; press a to silence the alarm</small></span><label class="switch"><input type="checkbox" id="setSound"><span class="sl"></span></label></div>
       <div class="setrow">
         <span class="lab">Cue volume</span>
         <select class="mini" id="setVol">
@@ -1856,16 +1860,16 @@
           <option value="10000">10s</option><option value="0">paused</option>
         </select>
       </div>
-      <div class="setrow"><span class="lab">Run ledger<small>accumulate long-term run history in this browser (IndexedDB)</small></span><label class="switch"><input type="checkbox" id="setLedger"><span class="sl"></span></label></div>
-      <div class="setrow" id="ledgerStatRow" style="display:none"><span class="lab">Ledger storage<small>only grows while a tab is open; latest run per poll</small></span><span class="stor"><small id="ledgerStat">—</small><button class="ghostbtn mini" id="ledgerExport">export</button><button class="ghostbtn mini" id="ledgerPurge">purge</button></span></div>
-      <div class="setrow"><span class="lab">Zen screensaver<small>drift an idle, healthy wallboard into a live all-clear field</small></span><label class="switch"><input type="checkbox" id="setZen"><span class="sl"></span></label></div>
-      <div class="setrow"><span class="lab">Zen idle<small>how long a calm wallboard waits before zen engages</small></span>
+      <div class="setrow"><span class="lab">Browser run history<small>save observed runs in this browser for longer-term trends</small></span><label class="switch"><input type="checkbox" id="setLedger"><span class="sl"></span></label></div>
+      <div class="setrow" id="ledgerStatRow" style="display:none"><span class="lab">History storage<small>records each job’s latest run at every refresh while the tab is open; some runs may be missed</small></span><span class="stor"><small id="ledgerStat">—</small><button class="ghostbtn mini" id="ledgerExport">export</button><button class="ghostbtn mini" id="ledgerPurge">clear history</button></span></div>
+      <div class="setrow"><span class="lab">Zen screensaver<small>show an animated screensaver when the wallboard is idle and jobs are healthy</small></span><label class="switch"><input type="checkbox" id="setZen"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Zen idle<small>how long to wait before showing the screensaver</small></span>
         <select class="mini" id="setZenIdle">
           <option value="5000">5s</option><option value="10000">10s</option>
           <option value="30000">30s</option><option value="60000">1m</option><option value="120000">2m</option>
         </select>
       </div>
-      <div class="setrow"><span class="lab">Alarm escalation<small>wallboard reddens &amp; the alarm quickens the longer a failure goes unacked (a)</small></span><label class="switch"><input type="checkbox" id="setEscalate"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Alarm escalation<small>make alerts more prominent until you silence the alarm (a)</small></span><label class="switch"><input type="checkbox" id="setEscalate"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Keyboard shortcuts</span><button class="ghostbtn" id="openHelp">view (?)</button></div>
       <div class="setrow"><span class="lab">Pair a device<small>QR to pair your phone</small></span><button class="ghostbtn" id="openPair">pair</button></div>
     </div>
@@ -1891,11 +1895,11 @@
 <div class="overlay" id="pairWrap">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pairTitle" aria-describedby="pairMsg">
     <h3 id="pairTitle">Pair a device</h3>
-    <p id="pairMsg">Scan with your phone's camera to open the companion app and pair it with this dashboard, or scan from inside the app. The QR is a link on the push relay's host carrying this page's address and your bearer token in its fragment, so pair over HTTPS or a trusted network. After pairing, compare the key fingerprint the app shows with the one <code>GET /push/devices</code> reports; a mismatch means the stored key is not your phone's.</p>
+    <p id="pairMsg">Scan with your phone’s camera or the companion app to pair this server. The code includes the dashboard address and your access token, so use HTTPS or a trusted network. After pairing, compare the app’s key fingerprint with the one returned by <code>GET /push/devices</code>. They must match; a mismatch means the server has a different key from your phone.</p>
     <div class="pair-qr" id="pairQr"></div>
-    <div class="pair-hint" id="pairHint" style="display:none"><span>No token is stored in this tab; the payload pairs unauthenticated.</span><button class="ghostbtn mini" id="pairToken">set token</button></div>
+    <div class="pair-hint" id="pairHint" style="display:none"><span>No token is saved in this tab. Pairing will use an unauthenticated connection.</span><button class="ghostbtn mini" id="pairToken">set token</button></div>
     <div class="pair-payload" id="pairPayload"></div>
-    <div class="pair-warn" id="pairWarn" style="display:none">This token holds every scope. Consider a scoped web.authTokens entry for phones.</div>
+    <div class="pair-warn" id="pairWarn" style="display:none">This token grants full access. To limit phone access, configure a token with fewer permissions in web.authTokens.</div>
     <div class="modal-actions">
       <button class="btn" id="pairCopy" style="margin-right:auto">Copy</button>
       <button class="btn primary" id="pairClose">Close</button>
@@ -1928,22 +1932,22 @@
       <button class="iconbtn" id="tlClose" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
     <div class="tlbody" id="tlBody"></div>
-    <div class="tlnote">Newest finish per job, from the live poll (each job's most recent run). History is in-memory; this is the current fleet frame, not a full audit log.</div>
+    <div class="tlnote">Shows each job’s latest completed run from the current refresh. This timeline does not include the full run history.</div>
   </div>
 </div>
 
 <!-- mitigate console -->
 <div class="overlay" id="mitigateWrap">
-  <div class="mitpanel" role="dialog" aria-modal="true" aria-label="Mitigate">
-    <div class="mithead"><h3 id="mitTitle">Mitigate</h3><p id="mitDesc"></p></div>
+  <div class="mitpanel" role="dialog" aria-modal="true" aria-label="Job actions">
+    <div class="mithead"><h3 id="mitTitle">Job actions</h3><p id="mitDesc"></p></div>
     <div class="mitlist" id="mitList"></div>
     <pre class="mitlog" id="mitLog" style="display:none"></pre>
     <div class="mitact">
       <button class="btn cancel" id="mitCancelAll">■ cancel all</button>
       <button class="btn run" id="mitStartAll">▶ start all now</button>
-      <button class="btn" id="mitTail" title="Watch these jobs' output in the multi-tail console">≋ tail output</button>
+      <button class="btn" id="mitTail" title="Watch live logs from these jobs">≋ live logs</button>
       <button class="btn" id="mitCopy">❏ copy summary</button>
-      <button class="btn" id="mitAbort" style="display:none;margin-left:auto">✕ abort</button>
+      <button class="btn" id="mitAbort" style="display:none;margin-left:auto">✕ stop sending</button>
       <button class="btn" id="mitClose" style="margin-left:auto">close</button>
     </div>
   </div>
@@ -1951,11 +1955,11 @@
 
 <!-- cron sandbox -->
 <div class="overlay" id="sandboxWrap">
-  <div class="sbxpanel" role="dialog" aria-label="Cron sandbox">
+  <div class="sbxpanel" role="dialog" aria-label="Schedule preview">
     <div class="sbxhead">
-      <h3>cron sandbox</h3>
+      <h3>schedule preview</h3>
       <label class="sbxin"><span class="prompt">◴</span><input id="sbxInput" type="text" placeholder="* * * * *  or  @daily" autocomplete="off" spellcheck="false"></label>
-      <select class="mini" id="sbxFrame" title="timezone frame"></select>
+      <select class="mini" id="sbxFrame" title="Preview timezone"></select>
       <button class="iconbtn" id="sbxClose" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
     <div class="sbxbody" id="sbxBody"></div>
@@ -6317,7 +6321,7 @@ var qrcode = function() {
     const p = job.clusterPolicy;
     if (!p) return '<span class="faint">—</span>';
     const hint = p === "EveryNode" ? "runs on every node"
-      : p === "PreferLeader" ? "runs on the leader, but keeps firing without quorum"
+      : p === "PreferLeader" ? "runs on the leader, but continues scheduling runs without quorum"
       : "runs only on the leader (or the job's owner under spread)";
     return '<span class="chip" title="' + escAttr(hint) + '">' + esc(p) + "</span>";
   }
@@ -6831,7 +6835,7 @@ var qrcode = function() {
               '<span class="cd">' + fmtCountdown((x.t - now) / 1000) + "</span>" +
               '<span class="nm">' + esc(x.name) + "</span></li>";
           }).join("")
-        : '<li class="empty">no jobs scheduled to fire soon</li>';
+        : '<li class="empty">no upcoming runs to show</li>';
       // timeline over the next 10 minutes (HTML — crisp text at any width)
       let marks = "";
       for (let m = 0; m <= 10; m += 2) {
@@ -7000,8 +7004,8 @@ var qrcode = function() {
       }
       $("weekBody").innerHTML = items.length || frequent.length
         ? '<div class="wk-grid">' + gutter + cols.join("") + "</div>" + strip
-        : '<div class="wk-empty">no scheduled fires in the next 7 days</div>';
-      $("weekMeta").textContent = items.length + " fire" + (items.length === 1 ? "" : "s") +
+        : '<div class="wk-empty">no runs scheduled in the next 7 days</div>';
+      $("weekMeta").textContent = items.length + " scheduled run" + (items.length === 1 ? "" : "s") +
         (frequent.length ? " + " + frequent.length + " frequent job" + (frequent.length === 1 ? "" : "s") : "") +
         " / 7 days · browser time";
       updateIcsLink();
@@ -7496,7 +7500,7 @@ var qrcode = function() {
       const v = byMinuteFires[m] || 0;
       const jn = byMinuteJobs ? (byMinuteJobs[m] || 0) : null;
       const h = v ? Math.max(6, Math.round(100 * v / hmax)) : 2;
-      const tip = ":" + pad2(m) + " · " + v + " fire" + (v === 1 ? "" : "s") +
+      const tip = ":" + pad2(m) + " · " + v + " scheduled run" + (v === 1 ? "" : "s") +
         (jn == null ? "" : " · " + jn + " job" + (jn === 1 ? "" : "s"));
       bars += '<i class="' + (v ? (v >= hmax * 0.7 ? "hot" : "") : "zero") +
         '" style="height:' + h + '%" title="' + escAttr(tip) + '"></i>';
@@ -7509,7 +7513,7 @@ var qrcode = function() {
     const d = state.press.data;
     const body = $("pressBody");
     if (!d) {
-      body.innerHTML = '<div class="tlempty">Loading the fleet fire forecast…</div>';
+      body.innerHTML = '<div class="tlempty">Loading upcoming scheduled runs…</div>';
       return;
     }
     const grid = d.grid || [];
@@ -7519,9 +7523,9 @@ var qrcode = function() {
     const bm = d.busiest_minute || {};
     const excl = d.excluded || {};
     let html = '<div class="press-summary">' +
-      "<span><b>" + esc(d.total_fires) + "</b> fires in the next " + esc(d.hours) + "h from <b>" + esc(d.jobs) + "</b> schedules</span>" +
+      "<span><b>" + esc(d.total_fires) + "</b> scheduled runs in the next " + esc(d.hours) + "h from <b>" + esc(d.jobs) + "</b> schedules</span>" +
       "<span>busiest minute <b>:" + pad2(bm.minute || 0) + "</b> (" + esc(bm.jobs || 0) + " jobs)</span>" +
-      "<span><b>" + esc((d.empty_minutes || []).length) + "</b> of 60 minutes empty</span>" +
+      "<span><b>" + esc((d.empty_minutes || []).length) + "</b> of 60 minute positions have no scheduled runs</span>" +
       ((excl.disabled || excl.reboot)
         ? '<span class="faint">not counting ' +
           [excl.disabled ? excl.disabled + " disabled" : "", excl.reboot ? excl.reboot + " @reboot" : ""].filter(Boolean).join(", ") + "</span>"
@@ -7539,12 +7543,12 @@ var qrcode = function() {
         if (!c) { html += '<span class="press-cell"></span>'; continue; }
         const op = (0.3 + 0.7 * (c / max)).toFixed(2);
         html += '<span class="press-cell ' + (c >= hot ? "hot" : "p") + '" style="opacity:' + op +
-          '" title="' + escAttr(pad2(h) + ":" + pad2(m) + " · " + c + " fire" + (c === 1 ? "" : "s")) + '"></span>';
+          '" title="' + escAttr(pad2(h) + ":" + pad2(m) + " · " + c + " scheduled run" + (c === 1 ? "" : "s")) + '"></span>';
       }
       html += "</div>";
     }
     html += "</div>";
-    html += '<div class="card-label" style="padding-left:0;border:0">fires by minute of hour · whole window</div>';
+    html += '<div class="card-label" style="padding-left:0;border:0">scheduled runs by minute of the hour · entire forecast</div>';
     html += pressBars(d.by_minute_fires || [], d.by_minute_jobs || [], true);
     // duplicate schedules (semantic grouping, from the daemon's own engine)
     const dups = state.press.dups;
@@ -7562,7 +7566,7 @@ var qrcode = function() {
       if (groups.length > 6) html += '<div class="faint">… ' + (groups.length - 6) + " more group(s)</div>";
       html += "</div>";
     } else if (dups) {
-      html += '<div class="press-sect faint">no duplicate schedules: every enabled job fires on its own set of instants</div>';
+      html += '<div class="press-sect faint">no enabled jobs have identical schedules; individual run times may still overlap</div>';
     }
     html += '<div class="press-suggest">' +
       '<button class="ghostbtn mini" data-suggest="hourly">◴ suggest an hourly slot</button>' +
@@ -7581,9 +7585,9 @@ var qrcode = function() {
       s = await r.json();
     } catch (_) { return; }
     state.press.suggestHtml =
-      "least loaded " + esc(s.period) + ': <span class="chip" data-expr="' + escAttr(s.expression) + '" title="click to copy">' + esc(s.expression) + "</span> " +
-      '<span class="faint">(' + esc(s.fires_in_window) + " fires there now; or let each job spread itself: " +
-      '</span><span class="chip" data-expr="' + escAttr(s.hash_hint) + '" title="H hashes the job name to a stable slot · click to copy">' + esc(s.hash_hint) + '</span><span class="faint">)</span>';
+      "suggested " + esc(s.period) + ': <span class="chip" data-expr="' + escAttr(s.expression) + '" title="click to copy">' + esc(s.expression) + "</span> " +
+      '<span class="faint">(' + esc(s.fires_in_window) + " scheduled runs already use this time in the next 24 hours; to spread jobs automatically, use " +
+      '</span><span class="chip" data-expr="' + escAttr(s.hash_hint) + '" title="H chooses a consistent time based on the job name · click to copy">' + esc(s.hash_hint) + '</span><span class="faint">)</span>';
     const out = $("pressSuggestOut");
     if (out) out.innerHTML = state.press.suggestHtml;
   }
@@ -7606,7 +7610,7 @@ var qrcode = function() {
     const sig = bmf.join(",") + "|" + (bm.minute || 0);
     if (sig !== state.wbPressSig) {
       state.wbPressSig = sig;
-      el.innerHTML = '<span class="lbl">24h pressure</span>' +
+      el.innerHTML = '<span class="lbl">24h schedule load</span>' +
         pressBars(bmf, d.by_minute_jobs || [], false) +
         '<span class="lbl">busiest :' + pad2(bm.minute || 0) + " · " + esc(bm.jobs || 0) + " jobs</span>";
     }
@@ -7903,7 +7907,7 @@ var qrcode = function() {
       html += "</tr>";
     }
     html += "</tbody></table></div>";
-    if (!rows.length) html += '<div class="fleet-note">' + (state.fleet.failOnly && names.size ? "nothing failing — clear the filter to see the fleet" : "no jobs advertised yet (peer summaries arrive with the next gossip round)") + "</div>";
+    if (!rows.length) html += '<div class="fleet-note">' + (state.fleet.failOnly && names.size ? "no failing jobs — clear the filter to see all jobs" : "waiting for job updates from other nodes") + "</div>";
     // The rebuild replaces the scroll container, which would snap a matrix
     // the user has scrolled (tall job list / many nodes) back to the top on
     // every poll. Carry the offsets (and the filter checkbox's keyboard
@@ -8253,7 +8257,7 @@ var qrcode = function() {
       stat("ok / fail", (s.success || 0) + " / " + (s.failure || 0)) +
       // crash-reconciled runs: only surfaced when any occurred, so a healthy
       // job's stat strip stays uncluttered.
-      (s.unknown ? '<div class="stat"><div class="k">interrupted</div><div class="v" style="color:var(--unknown)" title="crash-reconciled: the daemon crashed or lost the state store mid-run">' + esc(s.unknown) + "</div></div>" : "") +
+      (s.unknown ? '<div class="stat"><div class="k">interrupted</div><div class="v" style="color:var(--unknown)" title="run interrupted: the server stopped or lost access to saved state before completion">' + esc(s.unknown) + "</div></div>" : "") +
       stat("avg", fmtDuration(s.avg_duration)) +
       stat("min", fmtDuration(s.min_duration)) +
       stat("max", fmtDuration(s.max_duration)) +
@@ -8293,7 +8297,7 @@ var qrcode = function() {
       if (lg.length) {
         const ok = lg.filter((r) => r.o === "success").length, fa = lg.filter((r) => r.o === "failure").length;
         const st = state.ledger.stats[name] || {};
-        ledgerNote = '<div class="tlnote" style="border:1px solid var(--border);border-radius:var(--radius);margin-bottom:12px">◱ ledger (this browser): <b>' +
+        ledgerNote = '<div class="tlnote" style="border:1px solid var(--border);border-radius:var(--radius);margin-bottom:12px">◱ browser run history: <b>' +
           lg.length + "</b> runs · " + ok + " ok / " + fa + " fail · oldest " + esc(fmtAgo(lg[0].iso)) +
           (st.median != null ? " · median " + esc(fmtDuration(st.median)) : "") +
           (st.slow ? ' · <span style="color:var(--pending)">latest run slow</span>' : "") +
@@ -8589,7 +8593,7 @@ var qrcode = function() {
     // a field schedule that yields no upcoming runs is an impossible date
     // (e.g. "31 of February") — say so instead of a confident-but-wrong prose.
     const impossible = parsed.type === "fields" && !runs.length;
-    const desc = impossible ? "This schedule can never occur (impossible date)." : describeCron(schedOf(job));
+    const desc = impossible ? "No future run times were found for this schedule." : describeCron(schedOf(job));
     const t = token();
     const icsHref = "/jobs/" + encodeURIComponent(name) + "/calendar.ics" +
       (t ? "?token=" + encodeURIComponent(t) : "");
@@ -8598,7 +8602,7 @@ var qrcode = function() {
       '<div class="sched-sub">schedule <span class="chip">' + esc(job.schedule) + "</span>" +
       (job.schedule_resolved ? ' <span class="faint">(H resolves to</span> <span class="chip">' + esc(job.schedule_resolved) + '</span><span class="faint">)</span>' : "") +
       ' · times shown in <b>' + esc(frame === "LOCAL" ? "local" : frame) + "</b>" +
-      ' · <a class="icslink" href="' + escAttr(icsHref) + '" title="Subscribe to this job\'s fires as an iCal feed">⤓ .ics</a></div>';
+      ' · <a class="icslink" href="' + escAttr(icsHref) + '" title="Subscribe to this job\'s scheduled runs in your calendar">⤓ .ics</a></div>';
 
     // foot-gun advisories: self-overlap, thundering-herd collisions, DST
     const warns = scheduleWarnings(job);
@@ -9287,7 +9291,7 @@ var qrcode = function() {
       { ic: "↻", lbl: "Refresh now", hint: "g", run: loadJobs },
       ...(ctl ? [{ ic: "▶", lbl: "Run all failing jobs", run: runAllFailing }] : []),
       { ic: "◐", lbl: "Cycle theme", hint: "t", run: cycleTheme },
-      { ic: "◑", lbl: "Toggle light / dark", sub: "dark ↔ paper", hint: "T", run: toggleLightDark },
+      { ic: "◑", lbl: "Toggle light / dark", sub: "dark ↔ light", hint: "T", run: toggleLightDark },
       { ic: "⊟", lbl: "Toggle compact density", run: () => setDensity(!prefs.density) },
       { ic: "A", lbl: "Toggle readable font", sub: "proportional sans-serif UI", run: () => setFont(fontPref() === "sans" ? "mono" : "sans") },
       { ic: "⤢", lbl: "Cycle UI scale", sub: "100 → 110 → 125 → 140%", run: cycleScale },
@@ -9296,20 +9300,20 @@ var qrcode = function() {
       { ic: "⊞", lbl: "Choose table columns", run: () => toggleColsMenu(true) },
       { ic: "✦", lbl: "Toggle desktop notifications", run: () => setNotify(!prefs.notify) },
       { ic: "♪", lbl: "Toggle audible cues", run: () => setSound(!prefs.sound) },
-      { ic: "⌁", lbl: "Toggle next-fire radar", run: () => setRadar(!prefs.radar) },
+      { ic: "⌁", lbl: "Toggle upcoming runs", run: () => setRadar(!prefs.radar) },
       { ic: "◫", lbl: "Toggle week calendar", run: () => setWeek(!prefs.week) },
       { ic: "▦", lbl: "Toggle activity heatmap", run: () => setHeat(!prefs.heat) },
-      { ic: "▥", lbl: "Toggle schedule pressure", sub: "upcoming fire collisions + duplicates", run: () => setPressure(!prefs.press) },
+      { ic: "▥", lbl: "Toggle schedule load", sub: "scheduled runs at the same time and identical schedules", run: () => setPressure(!prefs.press) },
       { ic: "⊞", lbl: "Toggle fleet view", sub: "every node's runs", run: () => setFleet(!prefs.fleet) },
-      { ic: "≋", lbl: "Multi-tail console", run: () => openTail([]) },
-      { ic: "≋", lbl: "Multi-tail: failing jobs", run: () => tailPreset("fail") },
-      { ic: "≋", lbl: "Multi-tail: running jobs", run: () => tailPreset("run") },
+      { ic: "≋", lbl: "Live logs", run: () => openTail([]) },
+      { ic: "≋", lbl: "Live logs: failing jobs", run: () => tailPreset("fail") },
+      { ic: "≋", lbl: "Live logs: running jobs", run: () => tailPreset("run") },
       { ic: "▣", lbl: "Wallboard / TV mode", hint: "w", run: () => setWallboard(!state.wallboard) },
       { ic: "▤", lbl: "Incident timeline", hint: "i", run: openTimeline },
-      ...(ctl ? [{ ic: "▸", lbl: "Mitigate failing jobs", run: () => openMitigate(state.jobs.filter((j) => health(j).key === "fail").map((j) => j.name), "failing jobs") }] : []),
-      { ic: "◴", lbl: "Cron sandbox", run: () => openSandbox() },
-      { ic: "◱", lbl: "Toggle run ledger", run: () => setLedger(!prefs.ledger) },
-      { ic: "▮", lbl: "Toggle boot self-test", run: () => setBoot(!prefs.boot) },
+      ...(ctl ? [{ ic: "▸", lbl: "Review actions for failing jobs", run: () => openMitigate(state.jobs.filter((j) => health(j).key === "fail").map((j) => j.name), "failing jobs") }] : []),
+      { ic: "◴", lbl: "Schedule preview", run: () => openSandbox() },
+      { ic: "◱", lbl: "Toggle browser run history", run: () => setLedger(!prefs.ledger) },
+      { ic: "▮", lbl: "Toggle startup checks", run: () => setBoot(!prefs.boot) },
       // the header chips also copy these on click, but the chips are
       // mouse-only spans -- the palette keeps both reachable by keyboard
       { ic: "❏", lbl: "Copy version", run: () => { const v = $("ver").textContent; if (v) copyText(v, "version"); } },
@@ -9318,7 +9322,7 @@ var qrcode = function() {
       { ic: "?", lbl: "Keyboard shortcuts", hint: "?", run: openHelp },
       { ic: "⚿", lbl: "Set access token", run: () => openModal() },
       { ic: "▦", lbl: "Pair a device (QR)", run: () => openPair() },
-      { ic: "⧉", lbl: "Toggle DAGs card", run: () => $("dagsBtn").click() },
+      { ic: "⧉", lbl: "Toggle workflows", run: () => $("dagsBtn").click() },
       { ic: "⛁", lbl: "Toggle state inspector", run: () => $("stateBtn").click() },
       { ic: "⌕", lbl: "Focus filter", hint: "/", run: () => { closePalette(); $("search").focus(); } },
     ];
@@ -9334,7 +9338,7 @@ var qrcode = function() {
       else if (ctl) out.push({ ic: "⏸", lbl: "Pause: " + j.name, run: () => pauseJob(j.name) });
       out.push({ ic: "❏", lbl: "Copy command: " + j.name, run: () => copyText(j.command, "command") });
       out.push({ ic: "◴", lbl: "Schedule: " + j.name, run: () => openDrawer(j.name, "schedule") });
-      out.push({ ic: "≋", lbl: "Tail: " + j.name, sub: "multi-tail", run: () => openTail([j.name]) });
+      out.push({ ic: "≋", lbl: "Tail: " + j.name, sub: "live logs", run: () => openTail([j.name]) });
     }
     return out;
   }
@@ -9342,8 +9346,8 @@ var qrcode = function() {
     const out = [];
     const ctl = canControl();   // same scope rule as the DAG card's Run button
     for (const d of state.dags.list) {
-      out.push({ ic: d.latestRun ? dstGlyph(d.latestRun.state) : "⧉", lbl: "DAG: " + d.name, sub: "open", run: () => openDagDrawer(d.name) });
-      if (ctl) out.push({ ic: "▶", lbl: "Trigger DAG: " + d.name, run: () => dagTrigger(d.name) });
+      out.push({ ic: d.latestRun ? dstGlyph(d.latestRun.state) : "⧉", lbl: "Workflow: " + d.name, sub: "open", run: () => openDagDrawer(d.name) });
+      if (ctl) out.push({ ic: "▶", lbl: "Run workflow: " + d.name, run: () => dagTrigger(d.name) });
     }
     return out;
   }
@@ -9564,8 +9568,8 @@ var qrcode = function() {
     $("pairPayload").textContent = payload;
     $("pairHint").style.display = token() ? "none" : "";
     $("pairHint").querySelector("span").textContent = publicView()
-      ? "No token is stored; this instance serves anonymous read-only viewing, and pairing needs an operator token."
-      : "No token is stored in this tab; the payload pairs unauthenticated.";
+      ? "Pairing requires an access token. This tab is using the public view; enter a token to pair a device."
+      : "No token is saved in this tab. Pairing will use an unauthenticated connection.";
     $("pairWarn").style.display = "none";
     focusFirst($("pairWrap"));
     const seq = ++pairSeq;
@@ -9828,8 +9832,8 @@ var qrcode = function() {
     skipped: "⊘", upstream_failed: "⊗", expanded: "⋯", unknown: "◍", scheduled: "◔",
   };
   const DST_LABEL = {
-    verifying: "verifying", queued: "queued", pending: "pending", running: "running", up_for_retry: "retrying", success: "success",
-    failed: "failed", skipped: "skipped", upstream_failed: "upstream failed",
+    verifying: "verifying", queued: "queued", pending: "pending", running: "running", up_for_retry: "waiting for retry", success: "success",
+    failed: "failed", skipped: "skipped", upstream_failed: "dependency failed",
     expanded: "expanded", unknown: "unknown",
   };
   function dstGlyph(s) { return DST_GLYPH[s] || "•"; }
@@ -9859,7 +9863,7 @@ var qrcode = function() {
       const secs = (new Date(r.nextRetryAt).getTime() - Date.now()) / 1000;
       nxt = ' · <span data-until-iso="' + escAttr(r.nextRetryAt) + '">' + fmtIn(secs) + "</span>";
     }
-    return '<span class="ha-chip retry" title="durable retry ladder is armed">↻ ' + esc(cnt) + nxt + "</span>";
+    return '<span class="ha-chip retry" title="retry in progress; progress is saved across restarts">↻ ' + esc(cnt) + nxt + "</span>";
   }
   function slotChip(job) {
     if (job.concurrencyScope !== "cluster" || !job.slot) return "";
@@ -9872,7 +9876,7 @@ var qrcode = function() {
   }
   function rebootChip(job) {
     return job.rebootPending
-      ? '<span class="ha-chip reboot" title="@reboot one-shot: still pending its boot run (awaiting a cluster owner)">⏻ boot pending</span>'
+      ? '<span class="ha-chip reboot" title="@reboot job is waiting for a cluster node to run it">⏻ boot pending</span>'
       : "";
   }
   function reconChip(job) {
@@ -9937,7 +9941,7 @@ var qrcode = function() {
     const card = $("dagCard");
     if (!has || !prefs.dags) { card.style.display = "none"; return; }
     card.style.display = "";
-    $("dagMeta").textContent = dags.length + (dags.length === 1 ? " dag" : " dags");
+    $("dagMeta").textContent = dags.length + (dags.length === 1 ? " workflow" : " workflows");
     const sig = JSON.stringify(dags.map((d) => [
       d.name, d.enabled, d.schedule, (d.tasks || []).length, d.totalRuns,
       d.latestRun && d.latestRun.state, d.latestRun && d.latestRun.updatedAt,
@@ -9948,7 +9952,7 @@ var qrcode = function() {
     $("dagRows").innerHTML = dags.map((d) => {
       const lr = d.latestRun;
       const status = lr
-        ? '<span class="rpill ' + esc(lr.state) + '"><span class="g">' + dstGlyph(lr.state) + "</span>" + esc(lr.state) + "</span>"
+        ? '<span class="rpill ' + esc(lr.state) + '"><span class="g">' + dstGlyph(lr.state) + "</span>" + esc(DST_LABEL[lr.state] || lr.state) + "</span>"
         : '<span class="faint">no runs</span>';
       const tasks = d.tasks || [];
       const kinds = tasks.reduce((a, t) => { a[t.type] = (a[t.type] || 0) + 1; return a; }, {});
@@ -9974,7 +9978,7 @@ var qrcode = function() {
         // triggering needs `control`; a read-only visitor gets Open alone,
         // matching the DAG drawer's gated Trigger button
         (canControl()
-          ? '<button class="btn run" data-dagtrigger="' + escAttr(d.name) + '" title="Trigger a manual run"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>Run</button>'
+          ? '<button class="btn run" data-dagtrigger="' + escAttr(d.name) + '" title="Run this workflow now"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>Run</button>'
           : "") +
         '<button class="btn" data-dagopen="' + escAttr(d.name) + '">Open</button>' +
         "</div></td></tr>";
@@ -9986,7 +9990,7 @@ var qrcode = function() {
     if (!total) return "";
     const order = ["success", "running", "failed", "skipped", "up_for_retry", "pending", "upstream_failed", "unknown"];
     let bar = '<span class="tsbar" style="width:90px" title="' +
-      escAttr(order.filter((k) => counts[k]).map((k) => counts[k] + " " + k).join(" · ")) + '">';
+      escAttr(order.filter((k) => counts[k]).map((k) => counts[k] + " " + (DST_LABEL[k] || k)).join(" · ")) + '">';
     order.forEach((k) => { if (counts[k]) bar += '<i class="' + k + '" style="width:' + (100 * counts[k] / total).toFixed(1) + '%"></i>'; });
     return bar + "</span>";
   }
@@ -10033,7 +10037,7 @@ var qrcode = function() {
     if (run) {
       pill.style.display = "";
       pill.className = "rpill " + esc(run.state);
-      pill.innerHTML = '<span class="g">' + dstGlyph(run.state) + "</span>" + esc(run.state);
+      pill.innerHTML = '<span class="g">' + dstGlyph(run.state) + "</span>" + esc(DST_LABEL[run.state] || run.state);
     } else { pill.style.display = "none"; }
     $("dgBackfillBtn").disabled = !canControl();
     $("dgBackfillBtn").title = "Backfill or recover failed dates";
@@ -10119,7 +10123,7 @@ var qrcode = function() {
         const sel = state.dagDrawer.runKey === r.runKey ? " active" : "";
         const total = Object.values(r.taskStates || {}).reduce((a, b) => a + b, 0);
         return '<tr class="dagrun' + sel + '" data-runkey="' + escAttr(r.runKey) + '" style="cursor:pointer">' +
-          '<td><span class="rpill ' + esc(r.state) + '"><span class="g">' + dstGlyph(r.state) + "</span>" + esc(r.state) + "</span></td>" +
+          '<td><span class="rpill ' + esc(r.state) + '"><span class="g">' + dstGlyph(r.state) + "</span>" + esc(DST_LABEL[r.state] || r.state) + "</span></td>" +
           '<td><span class="kbadge">' + esc(r.kind || "?") + "</span></td>" +
           "<td>" + dagHistBar(r.taskStates, total) + ' <span class="faint">' + esc(total) + "</span></td>" +
           '<td class="muted">' + esc(r.logicalDate ? r.logicalDate.replace("T", " ").replace(/\+.*/, "") : "—") + "</td>" +
@@ -10226,7 +10230,7 @@ var qrcode = function() {
         // decision buttons need the approve scope; without it the gate
         // still shows, as a fact rather than an affordance
         bits.push(canApprove()
-          ? '<span class="approw"><span class="pending">⏸ awaiting</span>' +
+          ? '<span class="approw"><span class="pending">⏸ awaiting approval</span>' +
             '<button class="btn run" data-approve="' + escAttr(taskkey) + '">✓ Approve</button>' +
             '<button class="btn cancel" data-reject="' + escAttr(taskkey) + '">✕ Reject</button></span>'
           : '<span class="approw"><span class="pending">⏸ awaiting approval</span></span>');
@@ -10499,7 +10503,7 @@ var qrcode = function() {
         "/tasks/" + encodeURIComponent(taskkey) + "/decision",
         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: decision, by: "dashboard" }) });
       if (res.ok) { toast("ok", (decision === "approve" ? "✓ approved " : "✕ rejected ") + taskkey); loadDagRun(); loadDags(); }
-      else if (res.status === 409) { toast("err", "already decided / not awaiting"); loadDagRun(); }
+      else if (res.status === 409) { toast("err", "This task is no longer waiting for approval. Refreshing its status."); loadDagRun(); }
       else toast("err", "decision failed (HTTP " + res.status + ")");
     } catch (e) { if (e.message !== "unauthorized") toast("err", "decision failed"); }
   }
@@ -10760,7 +10764,7 @@ var qrcode = function() {
         '<td>' + (r.nextRetryAt ? '<span class="pending" data-until-iso="' + escAttr(r.nextRetryAt) + '">' + fmtIn((new Date(r.nextRetryAt).getTime() - Date.now()) / 1000) + "</span>" : "—") + "</td>" +
         '<td class="muted">' + (r.delaySeconds != null ? fmtDuration(r.delaySeconds) : "—") + "</td></tr>").join("");
       body.innerHTML = '<table class="runtable"><thead><tr><th>Job</th><th>Attempt</th><th>Next retry</th><th>Backoff</th></tr></thead><tbody>' +
-        (rows || '<tr><td colspan="4" class="faint">no armed retries on this node</td></tr>') + "</tbody></table>";
+        (rows || '<tr><td colspan="4" class="faint">no pending retries on this node</td></tr>') + "</tbody></table>";
     } else if (tab === "slots") {
       const rows = (data.node.slots || []).map((s) =>
         "<tr><td><b>" + esc(s.slot) + "</b></td><td class='muted'>" + esc(s.holder || "—") + "</td><td>" + esc(s.refs) + "</td>" +
@@ -11691,7 +11695,7 @@ var qrcode = function() {
     const f = ledgerFlag(job.name);
     if (!f || job.running) return "";
     const r = f.ratio ? "×" + f.ratio.toFixed(1) : "";
-    return '<span class="slow-chip" title="latest successful run ran unusually slow vs its ledger baseline">◱ slow ' + esc(r) + "</span>";
+    return '<span class="slow-chip" title="latest successful run was slower than usual for this job’s saved browser history">◱ slow ' + esc(r) + "</span>";
   }
   function refreshLedgerStat() {
     const row = $("ledgerStatRow"), out = $("ledgerStat");
@@ -11792,11 +11796,11 @@ var qrcode = function() {
       return { sev: sev, glyph: glyph, head: head, sub: sub, ago: lr.finished_at };
     } else {
       sev = "crit";
-      head = "FLEET EVENT — " + failing.length + " jobs failing";
+      head = "MULTIPLE FAILURES — " + failing.length + " jobs failing";
       sub = corr
-        ? "×" + corr.n + " share exit=" + (corr.exit == null ? "?" : corr.exit) + (corr.reason ? " (" + corr.reason + ")" : "") +
-          (corr.span <= CORR_WINDOW ? " within " + Math.max(1, Math.round(corr.span / 1000)) + "s" : "") + " — likely one cause"
-        : "no shared failure signature — likely independent";
+        ? "×" + corr.n + " share exit code " + (corr.exit == null ? "?" : corr.exit) + (corr.reason ? " (" + corr.reason + ")" : "") +
+          (corr.span <= CORR_WINDOW ? " within " + Math.max(1, Math.round(corr.span / 1000)) + "s" : "") + " — may share a cause"
+        : "no matching failure details found";
     }
     return { sev: sev, glyph: glyph, head: head, sub: sub };
   }
@@ -11874,12 +11878,12 @@ var qrcode = function() {
   const MIT_STAGGER = 300;   // ms between actions (gentle on the daemon)
   function openMitigate(names, label) {
     names = (names || []).filter((n) => state.byName[n]);
-    if (!names.length) { toast("info", "nothing to mitigate — no target jobs"); return; }
+    if (!names.length) { toast("info", "no jobs to review"); return; }
     openOverlay("mitigateWrap");
     state.mitigate.open = true; state.mitigate.set = names; state.mitigate.abort = false;
-    $("mitTitle").textContent = "Mitigate — " + (label || (names.length + " jobs"));
+    $("mitTitle").textContent = "Job actions — " + (label || (names.length + " jobs"));
     $("mitDesc").textContent = "Acts on these " + names.length + " job" + (names.length > 1 ? "s" : "") +
-      ". Bulk actions are staggered and abortable; each uses the same token as a single action.";
+      ". Requests are sent one at a time. Stop sending to leave the remaining jobs unchanged.";
     $("mitLog").style.display = "none"; $("mitLog").textContent = "";
     $("mitAbort").style.display = "none";
     renderMitList();
@@ -12024,20 +12028,20 @@ var qrcode = function() {
     const expr = $("sbxInput").value.trim();
     const frame = $("sbxFrame").value || "UTC";
     const body = $("sbxBody");
-    if (!expr) { body.innerHTML = '<div class="tlempty">Type a cron expression or a @macro.</div>' + sbxRecentHtml(); return; }
+    if (!expr) { body.innerHTML = '<div class="tlempty">Enter a cron expression or a shortcut such as @daily.</div>' + sbxRecentHtml(); return; }
     const parsed = parseCron(expr);
     let html = "";
     if (parsed.type === "reboot") {
       html += '<p class="sbx-desc">Runs once, when cronstable starts (@reboot).</p>';
     } else if (parsed.type !== "fields") {
       if (sbxLooksHashed(expr))
-        html += '<p class="sbx-desc">An <b>H</b> slot is a stable hash of the job name, so it resolves per job, not in this sandbox. Open a job\'s <b>schedule</b> tab to see the values its H resolved to.</p>';
+        html += '<p class="sbx-desc"><b>H</b> chooses a consistent time based on the job name. Open a job\'s <b>schedule</b> tab to preview its times.</p>';
       else
-        html += '<p class="sbx-desc sbx-bad">Not a valid cron expression (5, 6, or 7 fields) or known @macro.</p>';
+        html += '<p class="sbx-desc sbx-bad">Enter a valid cron expression with 5, 6, or 7 fields, or a shortcut such as @daily.</p>';
     } else {
       const runs = nextRuns(parsed, 12, frame, Date.now());
       const impossible = !runs.length;
-      html += '<p class="sbx-desc' + (impossible ? " sbx-bad" : "") + '">' + esc(impossible ? "This schedule can never occur (impossible date)." : describeCron(expr)) + "</p>";
+      html += '<p class="sbx-desc' + (impossible ? " sbx-bad" : "") + '">' + esc(impossible ? "No future run times were found for this schedule." : describeCron(expr)) + "</p>";
       const low = expr.toLowerCase();
       const f = (MACROS[low] || expr).split(/\s+/);
       // Label each present column by the engine's end-column rule: 5 fields
@@ -12052,7 +12056,7 @@ var qrcode = function() {
       for (const [k, v] of cols) html += '<div class="sbx-fld"><div class="fk">' + k + '</div><div class="fv">' + esc(v || "*") + "</div></div>";
       html += "</div>";
       if (runs.length) {
-        html += '<div class="card-label" style="padding-left:0;border:0">next ' + runs.length + " fires · " + esc(frame === "LOCAL" ? "local" : frame) + '</div><ul class="nextruns">';
+        html += '<div class="card-label" style="padding-left:0;border:0">next ' + runs.length + " scheduled runs · " + esc(frame === "LOCAL" ? "local" : frame) + '</div><ul class="nextruns">';
         for (const r of runs)
           html += "<li><span class='when'>" + esc(fmtWall(r.c, parsed.hasSeconds)) + "</span><span class='rel'>" + esc(fmtIn((r.t - Date.now()) / 1000)) + "</span></li>";
         html += "</ul>";
@@ -12130,20 +12134,20 @@ var qrcode = function() {
     const out = [];
     const gap = minFireGap(parsed, frame), est = jobDurEstimate(job);
     if (gap != null && est != null && est >= gap)
-      out.push({ sev: "crit", t: "<b>Runs may overlap.</b> Fires as often as every " + esc(fmtDuration(gap)) +
+      out.push({ sev: "crit", t: "<b>Runs may overlap.</b> Scheduled as often as every " + esc(fmtDuration(gap)) +
         ", but a run has taken up to " + esc(fmtDuration(est)) + ". Check this job's <b>concurrencyPolicy</b>." });
     else if (gap != null && est != null && est >= gap * 0.7)
-      out.push({ sev: "warn", t: "<b>Runs pack tightly.</b> Fires every " + esc(fmtDuration(gap)) +
-        " and has taken up to " + esc(fmtDuration(est)) + " — little headroom before overlap." });
+      out.push({ sev: "warn", t: "<b>Little time between runs.</b> Scheduled as often as every " + esc(fmtDuration(gap)) +
+        " and has taken up to " + esc(fmtDuration(est)) + ", leaving little time before the next run." });
     const col = nextCollisions(job, parsed, frame);
     if (col && col.others.length)
-      out.push({ sev: "warn", t: "<b>Thundering herd.</b> Next fire at <b>" + pad2(col.at.h) + ":" + pad2(col.at.mi) +
+      out.push({ sev: "warn", t: "<b>Jobs scheduled together.</b> The next run at <b>" + pad2(col.at.h) + ":" + pad2(col.at.mi) +
         "</b> coincides with " + col.others.length + " other job" + (col.others.length > 1 ? "s" : "") + " (" +
         esc(col.others.slice(0, 4).join(", ")) + (col.others.length > 4 ? ", …" : "") + ")." });
     const dst = dstAdvisory(parsed, frame);
     if (dst)
-      out.push({ sev: "warn", t: "<b>DST transition ahead.</b> " + esc(frame) + " shifts clocks " + dst.dir +
-        " on <b>" + esc(dst.date) + "</b>; a fixed local time near the change may be skipped or run twice. Verify around that date." });
+      out.push({ sev: "warn", t: "<b>Daylight saving time change ahead.</b> " + esc(frame) + " shifts clocks " + dst.dir +
+        " on <b>" + esc(dst.date) + "</b>; check scheduled run times around that date." });
     return out;
   }
 
@@ -12256,7 +12260,7 @@ var qrcode = function() {
     }
     const enabled = state.jobs.filter((j) => j.enabled).length;
     const soon = state.radar.items.filter((x) => x.t >= now)[0];
-    $("zenSub").textContent = enabled + " jobs armed · " + utcClock() +
+    $("zenSub").textContent = enabled + " enabled jobs · " + utcClock() +
       (soon ? " · next " + soon.name + " " + fmtCountdown((soon.t - now) / 1000) : "");
   }
   // decide whether an idle, healthy wallboard should drift to zen
@@ -12387,10 +12391,10 @@ var qrcode = function() {
       await pause(220); if (skipped) return;
 
       // 1) connectivity + firmware version (/version doubles as the reachability probe)
-      const l1 = line("CONNECTING TO DAEMON");
+      const l1 = line("CONNECTING TO SERVER");
       const v = await probe("/version"); if (skipped) return;
       if (v.status === "UNAUTHORIZED") { await halt(l1, "UNAUTHORIZED", "enter an access token to continue"); return; }
-      if (!v.ok) { await halt(l1, v.status === "OFFLINE" ? "FAIL — daemon unreachable" : v.status, "continuing in degraded mode"); return; }
+      if (!v.ok) { await halt(l1, v.status === "OFFLINE" ? "FAIL — server unreachable" : v.status, "continuing without a server connection"); return; }
       res(l1, '<span class="ok">OK</span>');
       const version = (await v.r.text()).trim();
       await pause(130); if (skipped) return;

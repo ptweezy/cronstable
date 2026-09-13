@@ -815,7 +815,7 @@ async def test_validate_schedule_never_fires_is_loud():
         h, "cron_validate_schedule", {"expression": "0 0 30 2 *"}
     )
     assert result["structuredContent"]["never_fires"] is True
-    assert "never fires" in result["content"][0]["text"]
+    assert "no future runs" in result["content"][0]["text"]
 
 
 async def test_explain_schedule_counts_and_frames_fires():
@@ -942,7 +942,7 @@ async def test_why_no_run_dst_gap_reaches_the_summary():
     data = result["structuredContent"]
     assert data["matches"] is True
     assert [n["code"] for n in data["notes"]] == ["dst-skipped-time"]
-    assert "did not exist" in result["content"][0]["text"]
+    assert "does not exist" in result["content"][0]["text"]
 
 
 async def test_why_no_run_unknown_job_and_bad_timestamp():
@@ -953,7 +953,7 @@ async def test_why_no_run_unknown_job_and_bad_timestamp():
     assert result["isError"] is True
     # the lookup resolves DAG schedules too, so the reason names both and
     # points at both listers (tests/test_mcp_tools.py holds the full pin)
-    assert "no job or DAG schedule named" in result["content"][0]["text"]
+    assert "no job or workflow schedule named" in result["content"][0]["text"]
     result = await _call(
         h, "cron_why_no_run", {"name": "weekday-report", "at": "yesterday"}
     )

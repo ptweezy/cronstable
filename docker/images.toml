@@ -1,0 +1,175 @@
+# Distro inputs for scripts/generate_build_files.py; see docker/templates/Dockerfile.
+# Image paths and platforms live in .github/docker-matrix.json.
+# Optional fields default to empty; runtime defaults to builder, libc to gnu,
+# python to python3, and entrypoint to ["cronstable"].
+
+[debian]
+builder = "python:3.14-slim"
+toolchain = '''
+    retry apt-get -o Acquire::Retries=5 update; \
+    retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev git; \
+    rm -rf /var/lib/apt/lists/*
+'''
+python = "python"
+rust_setup = '''
+    RUST_SETUP="apt-get -o Acquire::Retries=5 update \
+        && apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates \
+        && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" \
+'''
+rust_cleanup = '''
+; \
+    rm -rf /var/lib/apt/lists/*
+'''
+description = "A modern, rootless-container-friendly cron replacement."
+extra_labels = '''
+      org.opencontainers.image.url="https://github.com/ptweezy/cronstable" \
+      org.opencontainers.image.documentation="https://github.com/ptweezy/cronstable/wiki" \
+      org.opencontainers.image.authors="Parker Loflin <parker@cronstable.dev>" \
+      org.opencontainers.image.vendor="Parker Loflin" \
+'''
+
+# musl wheels and the musl runtime must stay paired.
+[alpine]
+build_args = "ARG PYTHON_VERSION=3.14"
+builder = "python:${PYTHON_VERSION}-alpine"
+toolchain = "    retry apk add --no-cache build-base libffi-dev git"
+python = "python"
+libc = "musl"
+rust_setup = '''
+    RUST_SETUP="apk add --no-cache curl \
+        && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" \
+'''
+description = "A modern, rootless-container-friendly cron replacement (Alpine)."
+
+# Amazon Linux's default Python is too old; use 3.11 in both stages.
+[amazonlinux]
+build_args = "ARG AL_VERSION=2023"
+builder = "amazonlinux:${AL_VERSION}"
+toolchain = '''
+    retry dnf --setopt=retries=10 install -y python3.11 python3.11-pip python3.11-devel gcc git; \
+    dnf clean all
+'''
+python = "python3.11"
+runtime_install = '''
+RUN set -eux; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry dnf --setopt=retries=10 install -y python3.11; \
+    dnf clean all
+'''
+description = "A modern, rootless-container-friendly cron replacement (Amazon Linux 2023)."
+
+# Debian 13 provides the same Python 3.13 layout as the distroless runtime.
+# An absolute entrypoint and exec-form smoke check work without a shell.
+[distroless]
+builder = "debian:13-slim"
+builder_env = "ENV DEBIAN_FRONTEND=noninteractive"
+toolchain = '''
+    retry apt-get -o Acquire::Retries=5 update; \
+    retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends python3 python3-venv python3-dev python3-pip build-essential libffi-dev zlib1g-dev git; \
+    rm -rf /var/lib/apt/lists/*
+'''
+python = "python3.13"
+runtime = "gcr.io/distroless/python3-debian13"
+entrypoint = "[\"/opt/venv/bin/cronstable\"]"
+description = "A modern, rootless-container-friendly cron replacement (distroless)."
+
+# System libsodium avoids PyNaCl's bundled autotools tests under QEMU.
+# The runtime must carry libsodium to match the builder link.
+[fedora]
+build_args = "ARG FEDORA_VERSION=44"
+builder = "fedora:${FEDORA_VERSION}"
+toolchain = '''
+    retry dnf --setopt=retries=10 install -y python3 python3-pip python3-devel gcc make libffi-devel libsodium-devel git; \
+    dnf clean all
+'''
+sodium = "    export SODIUM_INSTALL=system; \\"
+runtime_install = '''
+RUN set -eux; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry dnf --setopt=retries=10 install -y python3 libsodium; \
+    dnf clean all
+'''
+rust_setup = "    RUST_SETUP=\"dnf --setopt=retries=10 install -y rust cargo\" \\"
+rust_cleanup = '''
+; \
+    dnf clean all
+'''
+description = "A modern, rootless-container-friendly cron replacement (Fedora)."
+
+# python313 includes ensurepip; no separate pip package is needed.
+# System libsodium avoids emulated bundled-library builds; ship libsodium26.
+[opensuse]
+build_args = "ARG LEAP_VERSION=16.0"
+builder = "opensuse/leap:${LEAP_VERSION}"
+toolchain = '''
+    retry zypper --non-interactive refresh; \
+    retry zypper --non-interactive install python313 python313-devel gcc make libffi-devel libsodium-devel git; \
+    zypper clean --all
+'''
+python = "python3.13"
+sodium = "    export SODIUM_INSTALL=system; \\"
+runtime_install = '''
+RUN set -eux; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry zypper --non-interactive refresh; \
+    retry zypper --non-interactive install python313 libsodium26; \
+    zypper clean --all
+'''
+rust_setup = '''
+    RUST_SETUP="zypper --non-interactive refresh \
+        && zypper --non-interactive install rust cargo" \
+'''
+rust_cleanup = '''
+; \
+    zypper clean --all
+'''
+description = "A modern, rootless-container-friendly cron replacement (openSUSE Leap)."
+
+# UBI builder and ubi-minimal runtime share their Python 3.12 layout.
+[rhel]
+build_args = "ARG UBI_VERSION=10"
+builder = "registry.access.redhat.com/ubi${UBI_VERSION}/ubi"
+toolchain = '''
+    retry dnf --setopt=retries=10 install -y python3 python3-pip python3-devel gcc make libffi-devel git; \
+    dnf clean all
+'''
+runtime = "registry.access.redhat.com/ubi${UBI_VERSION}/ubi-minimal"
+runtime_install = '''
+RUN set -eux; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry microdnf install -y python3; \
+    microdnf clean all
+'''
+rust_setup = "    RUST_SETUP=\"dnf --setopt=retries=10 install -y rust cargo\" \\"
+rust_cleanup = '''
+; \
+    dnf clean all
+'''
+description = "A modern, rootless-container-friendly cron replacement (RHEL/UBI 10)."
+
+[ubuntu]
+build_args = "ARG UBUNTU_VERSION=26.04"
+builder = "ubuntu:${UBUNTU_VERSION}"
+builder_env = "ENV DEBIAN_FRONTEND=noninteractive"
+toolchain = '''
+    retry apt-get -o Acquire::Retries=5 update; \
+    retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends python3 python3-venv python3-dev python3-pip build-essential libffi-dev zlib1g-dev git; \
+    rm -rf /var/lib/apt/lists/*
+'''
+runtime_install = '''
+RUN set -eux; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry apt-get -o Acquire::Retries=5 update; \
+    retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends python3 ca-certificates; \
+    rm -rf /var/lib/apt/lists/*
+'''
+rust_setup = '''
+    RUST_SETUP="apt-get -o Acquire::Retries=5 update \
+        && apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates \
+        && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" \
+'''
+rust_cleanup = '''
+; \
+    rm -rf /var/lib/apt/lists/*
+'''
+description = "A modern, rootless-container-friendly cron replacement (Ubuntu)."

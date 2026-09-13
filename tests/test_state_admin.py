@@ -385,7 +385,7 @@ def test_cli_backup_restore_roundtrip(
     assert (
         cli_runner(["state", "restore", "-c", config2, archive]) == 1
     )
-    assert "refusing" in capsys.readouterr().err
+    assert "is not empty" in capsys.readouterr().err
     # ... and proceeds with it
     assert (
         cli_runner(

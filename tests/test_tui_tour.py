@@ -590,7 +590,7 @@ async def test_tour_state_heat_radar_node(tmp_path):
         # ---- radar ----
         app._toggle("radar")
         screen = await snap_text(h)
-        assert "next-fire radar" in screen
+        assert "upcoming runs" in screen
         assert "upcoming" in screen
         h.keys.send("esc")
 
@@ -624,14 +624,14 @@ async def test_tour_mitigate_console(tmp_path, monkeypatch):
         app = await h.start(tmp_path)
         await _wait_for(lambda: len(app.jobs) == 4)
         await _wait_for(lambda: app.verdict is not None)
-        assert "share exit=69" in app.verdict["sub"]
+        assert "share exit code 69" in app.verdict["sub"]
         h.keys.send("i")
         await _wait_for(lambda: app.is_open("timeline"))
         h.keys.send("m")  # hand the blast radius to mitigate
         await _wait_for(lambda: app.is_open("mitigate"))
         assert sorted(app.mitigate_names) == ["bad-a", "bad-b"]
         screen = await snap_text(h)
-        assert "mitigate console" in screen
+        assert "job actions" in screen
         h.keys.send("s")  # staggered bulk start
         await _wait_for(
             lambda: (
@@ -690,13 +690,13 @@ async def test_tour_multitail(tmp_path):
         app.add_tail("e")  # fifth: over TAIL_MAX, refused with a toast
         assert len(app.tails) == 4
         await _wait_for(
-            lambda: any("multi-tail is full" in t[1] for t in app.toasts)
+            lambda: any("live logs is full" in t[1] for t in app.toasts)
         )
         await _wait_for(lambda: all(t.lines for t in app.tails), 10)
         app.timestamps = True
         h.keys.send("t", "w", "pgup", "pgdn", "end", "j", "k")
         screen = await snap_text(h)
-        assert "multi-tail (4/4)" in screen
+        assert "live logs (4/4)" in screen
         assert "hello from a" in screen
         assert "end of run output" in screen
         h.keys.send("x")  # remove the picked stream
@@ -878,7 +878,7 @@ async def test_tour_sandbox_and_token_palette_paths(tmp_path):
         # sandbox via the palette
         h.keys.send("ctrl+k")
         await _wait_for(lambda: app.is_open("palette"))
-        for ch in "sandbox":
+        for ch in "schedule preview":
             h.keys.send(ch)
         h.keys.send("enter")
         await _wait_for(lambda: app.is_open("sandbox"))
@@ -886,12 +886,12 @@ async def test_tour_sandbox_and_token_palette_paths(tmp_path):
             h.keys.send(ch)
         screen = await snap_text(h)
         assert "Every 5 minutes" in screen
-        assert "next fires (UTC):" in screen
+        assert "upcoming runs (UTC):" in screen
         h.keys.send("ctrl+u")
         for ch in "not a cron":
             h.keys.send(ch)
         screen = await snap_text(h)
-        assert "rejects this expression" in screen
+        assert "Enter a valid cron expression" in screen
         h.keys.send("esc")
         await _wait_for(lambda: not app.is_open("sandbox"))
         # token modal via the palette, cancelled with esc

@@ -644,17 +644,17 @@ def verdict_info(
             },
             incident,
         )
-    head = "FLEET EVENT — %d jobs failing" % len(failing)
+    head = "MULTIPLE FAILURES — %d jobs failing" % len(failing)
     if corr:
         exit_code = "?" if corr["exit"] is None else corr["exit"]
-        sub = "×%d share exit=%s" % (corr["n"], exit_code)
+        sub = "×%d share exit code %s" % (corr["n"], exit_code)
         if corr["reason"]:
             sub += " (%s)" % corr["reason"]
         if corr["span"] <= CORR_WINDOW_MS:
             sub += " within %ds" % max(1, round(corr["span"] / 1000))
-        sub += " — likely one cause"
+        sub += " — may share a cause"
     else:
-        sub = "no shared failure signature — likely independent"
+        sub = "no matching failure details found"
     return ({"sev": "crit", "glyph": "▲", "head": head, "sub": sub}, incident)
 
 
@@ -3737,7 +3737,7 @@ class App:
             self.press_dups = duplicate_schedules(entries)
             self.press_computed = time.monotonic()
         except Exception:  # noqa: BLE001 - an analyzer bug must not kill
-            logger.exception("schedule pressure recompute failed")
+            logger.exception("schedule load recompute failed")
         self.mark()
 
     async def _recompute_week_bg(self) -> None:
@@ -4183,7 +4183,7 @@ class AppActions(App):
 
     def add_tail(self, name: str) -> None:
         if len(self.tails) >= TAIL_MAX:
-            self.toast("warn", "multi-tail is full (%d)" % TAIL_MAX)
+            self.toast("warn", "live logs is full (%d jobs)" % TAIL_MAX)
             return
         if any(t.label == name for t in self.tails):
             return
@@ -4435,35 +4435,35 @@ class AppPalette(AppActions):
             ("◓", "Cycle color vision mode", self.cycle_cvd),
             ("⊟", "Toggle compact density", self._toggle_compact),
             ("♪", "Toggle audible cues", self._toggle_sound),
-            ("⌁", "Toggle next-fire radar", lambda: self._toggle("radar")),
+            ("⌁", "Toggle upcoming runs", lambda: self._toggle("radar")),
             ("▦", "Toggle activity heatmap", lambda: self._toggle("heat")),
-            ("▥", "Toggle schedule pressure", lambda: self._toggle("press")),
+            ("▥", "Toggle schedule load", lambda: self._toggle("press")),
             ("◫", "Toggle week calendar", lambda: self._toggle("week")),
             ("⊞", "Toggle fleet view", lambda: self._toggle("fleet")),
             ("◉", "Toggle cluster panel", lambda: self._toggle("cluster")),
             ("▤", "Toggle node resources", lambda: self._toggle("node")),
-            ("≋", "Multi-tail console", lambda: self.open_tail([])),
+            ("≋", "Live logs", lambda: self.open_tail([])),
             (
                 "≋",
-                "Multi-tail: failing jobs",
+                "Live logs: failing jobs",
                 lambda: self.tail_preset("fail"),
             ),
-            ("≋", "Multi-tail: running jobs", lambda: self.tail_preset("run")),
+            ("≋", "Live logs: running jobs", lambda: self.tail_preset("run")),
             (
                 "▣",
                 "Wallboard / TV mode",
                 lambda: self.set_wallboard(not self.wallboard),
             ),
             ("▤", "Incident timeline", lambda: self.open("timeline")),
-            ("▸", "Mitigate failing jobs", self._mitigate_failing),
-            ("◴", "Cron sandbox", lambda: self.open("sandbox")),
-            ("▮", "Toggle boot self-test", self._toggle_boot),
+            ("▸", "Review actions for failing jobs", self._mitigate_failing),
+            ("◴", "Schedule preview", lambda: self.open("sandbox")),
+            ("▮", "Toggle startup checks", self._toggle_boot),
             ("❏", "Copy version", lambda: self._copy_chip(self.version)),
             ("❏", "Copy job set id", lambda: self._copy_chip(self.job_set_id)),
             ("⚙", "Open settings", lambda: self.open("settings")),
             ("?", "Keyboard shortcuts", lambda: self.open("help")),
             ("⚿", "Set access token", self._open_token),
-            ("⧉", "Toggle DAGs panel", self._toggle_dags),
+            ("⧉", "Toggle workflows", self._toggle_dags),
             ("⛁", "Toggle state inspector", lambda: self._toggle("state")),
             ("⌕", "Focus filter", self._focus_filter),
         ]
@@ -4471,12 +4471,16 @@ class AppPalette(AppActions):
         for dag in self.dags:
             name = str(dag.get("name", ""))
             out.append(
-                ("⧉", "DAG: %s" % name, functools.partial(self.open_dag, name))
+                (
+                    "⧉",
+                    "Workflow: %s" % name,
+                    functools.partial(self.open_dag, name),
+                )
             )
             out.append(
                 (
                     "▶",
-                    "Trigger DAG: %s" % name,
+                    "Run workflow: %s" % name,
                     functools.partial(self._act_trigger_dag, name),
                 )
             )
@@ -4655,7 +4659,7 @@ class AppPalette(AppActions):
         self.save_prefs()
         self.toast(
             "info",
-            "▮ boot self-test: %s" % ("on" if self.prefs["boot"] else "off"),
+            "▮ startup checks: %s" % ("on" if self.prefs["boot"] else "off"),
         )
 
     def _mitigate_failing(self) -> None:
@@ -5727,7 +5731,7 @@ class AppRender(AppKeys):
                 "no jobs match the filter"
                 if self.jobs
                 else (
-                    "waiting for the daemon…"
+                    "waiting for the server…"
                     if not self.connected
                     else "no jobs configured"
                 )
@@ -6136,7 +6140,7 @@ HELP_EXTRA_ROWS = [
     ("q", "Quit"),
     ("s / S", "Cycle sort key / direction"),
     ("f", "Cycle status filter"),
-    ("m", "Multi-tail console"),
+    ("m", "Live logs"),
     ("←/→ or Tab", "Switch drawer tab"),
     ("PgUp / PgDn", "Scroll"),
     ("in logs: f/t/w", "Follow · timestamps · wrap"),
@@ -6167,7 +6171,7 @@ class AppOverlays(AppRender):
     # ---- help --------------------------------------------------------
     def render_help(self, paint: Painter, cols: int, lines: int) -> list[str]:
         width = min(64, cols - 4)
-        body = [paint.style("the web dashboard's keys", "dim")]
+        body = [paint.style("dashboard shortcuts", "dim")]
         for keycap, action in HELP_ROWS:
             body.append(
                 paint.style(pad_to(keycap, 16), "accent", bold=True)
@@ -6272,7 +6276,7 @@ class AppOverlays(AppRender):
             ("Audible cues (bell)", onoff("sound"), flip("sound")),
             ("Zen screensaver", onoff("zen"), flip("zen")),
             ("Zen idle", "%ds" % int(prefs["zen_idle_s"]), zen_idle_cycle),
-            ("Boot self-test", onoff("boot"), flip("boot")),
+            ("Startup checks", onoff("boot"), flip("boot")),
             ("ASCII glyphs", onoff("ascii"), flip("ascii")),
             ("Living logo", onoff("motion"), flip("motion")),
         ]
@@ -6318,7 +6322,9 @@ class AppOverlays(AppRender):
         width = min(56, cols - 4)
         masked = "•" * len(self.inputs["token"])
         body = [
-            paint.style("the daemon wants a bearer token", "fg"),
+            paint.style(
+                "Enter an access token to connect to this server.", "fg"
+            ),
             paint.style(
                 "(web.authToken; stored only for this session)", "dim"
             ),
@@ -6413,7 +6419,7 @@ class AppOverlays(AppRender):
             title,
             body,
             width,
-            "j/k move · enter open · f fail-only · m mitigate · esc close",
+            "j/k move · enter open · f fail-only · m actions · esc close",
         )
 
     # ---- mitigate console -------------------------------------------
@@ -6423,7 +6429,7 @@ class AppOverlays(AppRender):
         width = min(76, cols - 4)
         body = [
             paint.style(
-                " %d job%s in the set — %s"
+                " %d job%s selected — %s"
                 % (
                     len(self.mitigate_names),
                     "s" if len(self.mitigate_names) != 1 else "",
@@ -6449,13 +6455,13 @@ class AppOverlays(AppRender):
             )
             body.append(paint.style(" " + line, color))
         if self.mitigate_running:
-            body.append(paint.style(" … running (a to abort)", "warn"))
+            body.append(paint.style(" … sending requests (a to stop)", "warn"))
         return panel_frame(
             paint,
-            "mitigate console",
+            "job actions",
             body,
             width,
-            "s start all · x cancel all · a abort · y writeup · esc close",
+            "s run all · x cancel all · a stop · y copy summary · esc close",
         )
 
     # ---- cron sandbox ------------------------------------------------
@@ -6497,7 +6503,7 @@ class AppOverlays(AppRender):
                 fires = next_fires(expr.strip(), 6)
                 if fires:
                     body.append(paint.style("", "fg"))
-                    body.append(paint.style(" next fires (UTC):", "dim"))
+                    body.append(paint.style(" upcoming runs (UTC):", "dim"))
                     for when in fires:
                         body.append(
                             paint.style(
@@ -6509,18 +6515,22 @@ class AppOverlays(AppRender):
                 body.append(paint.style("", "fg"))
                 body.append(
                     paint.style(
-                        " an H slot is a stable hash of the job name,", "dim"
+                        " H chooses a consistent time based on the job name.",
+                        "dim",
                     )
                 )
                 body.append(
                     paint.style(
-                        " so it resolves per job, not in this sandbox", "dim"
+                        " Open a job’s schedule tab to preview its times.",
+                        "dim",
                     )
                 )
             elif not parses:
                 body.append(
                     paint.style(
-                        "  the daemon's engine rejects this expression", "dim"
+                        "  Enter a valid cron expression or a shortcut "
+                        "like @daily.",
+                        "dim",
                     )
                 )
             if parses:
@@ -6540,7 +6550,7 @@ class AppOverlays(AppRender):
                     "dim",
                 )
             )
-        return panel_frame(paint, "cron sandbox", body, width, "esc close")
+        return panel_frame(paint, "schedule preview", body, width, "esc close")
 
     # ---- DAGs index --------------------------------------------------
     def render_dags(self, paint: Painter, cols: int, lines: int) -> list[str]:
@@ -6583,13 +6593,13 @@ class AppOverlays(AppRender):
                 )
             )
         if not self.dags:
-            body.append(paint.style("  no DAGs configured", "dim"))
+            body.append(paint.style("  no workflows configured", "dim"))
         return panel_frame(
             paint,
-            "orchestration DAGs",
+            "workflows",
             body,
             width,
-            "enter open · t trigger · r reload · esc close",
+            "enter open · t run now · r reload · esc close",
         )
 
     # ---- durable-state inspector ------------------------------------
@@ -6614,7 +6624,8 @@ class AppOverlays(AppRender):
         if not data.get("enabled"):
             body.append(
                 paint.style(
-                    " durable state is not configured (no state: block)", "dim"
+                    " Saved state is not configured (missing state: section).",
+                    "dim",
                 )
             )
             return panel_frame(
@@ -6869,7 +6880,8 @@ class AppOverlays(AppRender):
         if not data.get("enabled"):
             body.append(
                 paint.style(
-                    " fleet view needs a cluster with a node-to-node channel",
+                    " Configure cluster peer communication to see runs "
+                    "from other nodes.",
                     "dim",
                 )
             )
@@ -7063,8 +7075,8 @@ class AppOverlays(AppRender):
         if not data:
             return panel_frame(
                 paint,
-                "schedule pressure",
-                [paint.style("  computing the fire forecast…", "dim")],
+                "schedule load",
+                [paint.style("  loading upcoming scheduled runs…", "dim")],
                 width,
                 "r refresh · esc close",
             )
@@ -7096,7 +7108,7 @@ class AppOverlays(AppRender):
         body = body[self.panel_scroll : self.panel_scroll + visible]
         return panel_frame(
             paint,
-            "schedule pressure",
+            "schedule load",
             body,
             width,
             "j/k scroll · r refresh · esc close",
@@ -7115,12 +7127,19 @@ class AppOverlays(AppRender):
         busiest = data["busiest_minute"]
         body.append(
             paint.style(
-                " next %dh: %d fires from %d schedules · busiest :%02d "
-                "(%d jobs) · %d/60 minutes empty"
+                " next %dh: %d scheduled runs from %d schedules"
                 % (
                     data["hours"],
                     data["total_fires"],
                     data["jobs"],
+                ),
+                "dim",
+            )
+        )
+        body.append(
+            paint.style(
+                " busiest :%02d (%d jobs) · unused minutes of the hour: %d/60"
+                % (
                     busiest["minute"],
                     busiest["jobs"],
                     len(data["empty_minutes"]),
@@ -7160,14 +7179,14 @@ class AppOverlays(AppRender):
                 + paint.style(sug["daily"]["expression"], "accent", bold=True)
                 + paint.style(" (daily) · or ", "dim")
                 + paint.style("H * * * *", "accent", bold=True)
-                + paint.style(" per-job hashed slots", "dim")
+                + paint.style(" to spread jobs by name", "dim")
             )
         if dups:
             body.append(paint.style("", "fg"))
             body.append(
                 paint.style(
-                    " duplicate schedules (%d group%s, firing on identical "
-                    "instants)" % (len(dups), "" if len(dups) == 1 else "s"),
+                    " duplicate schedules (%d group%s, same run "
+                    "times)" % (len(dups), "" if len(dups) == 1 else "s"),
                     "dim",
                 )
             )
@@ -7187,7 +7206,8 @@ class AppOverlays(AppRender):
         body.append(paint.style("", "fg"))
         body.append(
             paint.style(
-                " hour × minute fire grid (%s)" % data["timezone"], "dim"
+                " scheduled runs by hour and minute (%s)" % data["timezone"],
+                "dim",
             )
         )
         grid = data["grid"]
@@ -7268,7 +7288,7 @@ class AppOverlays(AppRender):
         start = data["start"]
         body.append(
             paint.style(
-                " next 7 days: %d fires from %d schedules"
+                " next 7 days: %d scheduled runs from %d schedules"
                 % (len(items), data["schedules"])
                 + (
                     " · %d frequent jobs summarized below" % len(frequent)
@@ -7306,7 +7326,7 @@ class AppOverlays(AppRender):
             body.append("".join(spans))
         if items:
             body.append("")
-            body.append(paint.style(" upcoming fires (UTC)", "dim"))
+            body.append(paint.style(" upcoming runs (UTC)", "dim"))
             for when, name in items:
                 past = when < now
                 body.append(
@@ -7322,7 +7342,7 @@ class AppOverlays(AppRender):
         elif not frequent:
             body.append("")
             body.append(
-                paint.style("  no scheduled fires in the next 7 days", "dim")
+                paint.style("  no runs scheduled in the next 7 days", "dim")
             )
         if frequent:
             body.append("")
@@ -7360,7 +7380,7 @@ class AppOverlays(AppRender):
                 + paint.style(truncate(name, width - 16), "fg")
             )
         if not items:
-            body.append(paint.style("  no jobs scheduled to fire soon", "dim"))
+            body.append(paint.style("  no upcoming runs to show", "dim"))
         # a 10-minute track with a mark per fire, like the web timeline
         track = [" "] * (width - 8)
         for nxt, _name in items:
@@ -7369,7 +7389,7 @@ class AppOverlays(AppRender):
                 track[pos] = "◆"
         body.append(paint.style("", "fg"))
         body.append(paint.style(" now" + "".join(track)[3:], "dim"))
-        return panel_frame(paint, "next-fire radar", body, width, "esc close")
+        return panel_frame(paint, "upcoming runs", body, width, "esc close")
 
     # ---- node resources ---------------------------------------------
     def render_node(self, paint: Painter, cols: int, lines: int) -> list[str]:
@@ -7789,7 +7809,7 @@ class AppDrawers(AppOverlays):
             run_rows[self.panel_scroll : self.panel_scroll + available]
         )
         if not run_rows:
-            rows.append(paint.style("  no runs retained yet", "dim"))
+            rows.append(paint.style("  no run history yet", "dim"))
         return rows
 
     def _history_rows(
@@ -7991,7 +8011,7 @@ class AppDrawers(AppOverlays):
         if resolved and resolved != schedule:
             rows.append(" " + paint.style("resolves to %s" % resolved, "dim"))
         rows.append(paint.style("", "fg"))
-        rows.append(paint.style(" reference frame: %s" % frame, "dim"))
+        rows.append(paint.style(" timezone: %s" % frame, "dim"))
         if fires:
             rows.append(paint.style("", "fg"))
             rows.append(paint.style(" next runs:", "dim"))
@@ -8001,7 +8021,9 @@ class AppDrawers(AppOverlays):
                     + paint.style(when.strftime("%Y-%m-%d %H:%M:%S %Z"), "fg")
                 )
         elif schedule.strip().lower() == "@reboot":
-            rows.append(paint.style(" runs once, at daemon start", "dim"))
+            rows.append(
+                paint.style(" runs once, when cronstable starts", "dim")
+            )
         # the daemon computed the findings at config load in the job's own
         # frame; render those when the payload ships them (an empty list
         # means "linted clean"), and lint locally with the same rules only
@@ -8029,7 +8051,7 @@ class AppDrawers(AppOverlays):
             rows.append(
                 " "
                 + paint.style(
-                    "daemon says: next fire %s" % fmt_in(sched_in), "ok"
+                    "server reports: next run %s" % fmt_in(sched_in), "ok"
                 )
             )
         return rows
@@ -8091,7 +8113,7 @@ class AppDrawers(AppOverlays):
         rows = [
             " "
             + paint.style("⧉ %s" % (self.dag_name or "?"), "accent", bold=True)
-            + paint.style("  t trigger · b backfill · esc close", "dim"),
+            + paint.style("  t run now · b backfill · esc close", "dim"),
             self._tabs_row(paint, self.DAG_TABS, self.dag_tab),
             paint.hline(width - 2),
         ]
@@ -8355,7 +8377,7 @@ class AppDrawers(AppOverlays):
         if not self.dag_run_key:
             return [paint.style("  open a run first (runs tab, enter)", "dim")]
         if data is None:
-            return [paint.style("  loading xcom…", "dim")]
+            return [paint.style("  loading task outputs…", "dim")]
         entries = data.get("xcom") if isinstance(data, dict) else None
         if entries is None and isinstance(data, dict):
             entries = {
@@ -8376,7 +8398,7 @@ class AppDrawers(AppOverlays):
                     )
                 )
         else:
-            rows.append(paint.style("  no xcom values", "dim"))
+            rows.append(paint.style("  no task outputs", "dim"))
         return rows
 
     def _dag_logs_tab(
@@ -8489,7 +8511,7 @@ class AppDrawers(AppOverlays):
             body.append(paint.style("  waiting for output…", "dim"))
         return panel_frame(
             paint,
-            "multi-tail (%d/%d)" % (len(self.tails), TAIL_MAX),
+            "live logs (%d/%d)" % (len(self.tails), TAIL_MAX),
             body,
             width,
             "a add · x remove · j/k pick · t timestamps · w wrap · "
@@ -8597,7 +8619,7 @@ class TuiApp(AppDrawers):
             if await type_line(
                 " schedules ... %s"
                 % (
-                    "next fire %s" % fmt_in(soonest)
+                    "next run %s" % fmt_in(soonest)
                     if soonest is not None
                     else "nothing scheduled"
                 ),
@@ -8631,7 +8653,7 @@ class TuiApp(AppDrawers):
                 else " %d JOB%s FAILING — the board wants you"
                 % (failing, "S" if failing != 1 else "")
                 if ok
-                else " DEGRADED — daemon unreachable"
+                else " DISCONNECTED — server unreachable"
             )
             if await type_line(
                 verdictline, "ok" if ok and not failing else "warn"

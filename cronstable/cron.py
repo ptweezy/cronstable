@@ -3363,7 +3363,7 @@ class Cron:
                 elif jobstat["status"] == "disabled":
                     status = "disabled"
                 elif jobstat.get("never_fires"):
-                    status = "never fires (schedule has no future occurrence)"
+                    status = "no future runs (check the schedule)"
                 else:
                     status = "scheduled ({})".format(
                         (
@@ -3555,7 +3555,11 @@ class Cron:
         if service is None:
             raise _api_error(
                 web.HTTPNotFound,
-                "no `push:` section is configured on this daemon",
+                (
+                    "push notifications are not configured on this "
+                    "server (missing "
+                    "`push:` section)"
+                ),
             )
         return service
 
@@ -3981,9 +3985,11 @@ class Cron:
                         {
                             "code": "reboot",
                             "level": "note",
-                            "message": "@reboot runs once when the daemon "
-                            "starts; it never fires on a timetable, so no "
-                            "timestamp can match",
+                            "message": (
+                                "@reboot runs when cronstable starts, "
+                                "rather than at a scheduled "
+                                "time. No timestamp can match this schedule"
+                            ),
                         }
                     ],
                     "previous_fire": None,
@@ -4068,7 +4074,7 @@ class Cron:
             # handler-built payloads, not aiohttp error responses.
             raise _api_error(
                 web.HTTPNotFound,
-                "no job or DAG schedule named {!r}".format(name),
+                ("no job or workflow schedule named {!r}").format(name),
             )
         return _json_response(payload, headers=headers)
 
@@ -4357,7 +4363,7 @@ class Cron:
         if entries is None:
             raise _api_error(
                 web.HTTPNotFound,
-                "no job or DAG schedule named {!r}".format(name),
+                ("no job or workflow schedule named {!r}").format(name),
             )
         text = await asyncio.get_running_loop().run_in_executor(
             None,
@@ -5807,13 +5813,10 @@ class Cron:
         live in a durable store, so say that instead.
         """
         if self.state_backend is None:
-            return (
-                "no `state:` store is configured; DAG run documents only "
-                "exist in a durable store"
-            )
+            return "workflow run history requires a configured `state:` store"
         if run_key is not None and name in self.cron_dags:
-            return "dag {!r} has no run {!r}".format(name, run_key)
-        return "dag {!r} not found".format(name)
+            return ("workflow {!r} has no run {!r}").format(name, run_key)
+        return ("workflow {!r} not found").format(name)
 
     async def _web_dag_runs(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
@@ -6025,7 +6028,7 @@ class Cron:
         run_key = await self._dag.trigger_run(name)
         if run_key is None:
             raise _api_error(
-                web.HTTPNotFound, "dag {!r} not found".format(name)
+                web.HTTPNotFound, ("workflow {!r} not found").format(name)
             )
         return _json_response(
             {"dag": name, "name": name, "runKey": run_key},
@@ -6796,7 +6799,7 @@ class Cron:
         if name not in self.cron_dags:
             # before prepare(), as in _web_job_logs above.
             raise _api_error(
-                web.HTTPNotFound, "dag {!r} not found".format(name)
+                web.HTTPNotFound, ("workflow {!r} not found").format(name)
             )
 
         resp = web.StreamResponse(headers=self._sse_headers())
@@ -8433,15 +8436,18 @@ class Cron:
                 if canonical in _WEB_ANONYMOUS_EXCLUDED:
                     raise _api_error(
                         web.HTTPForbidden,
-                        "the device registry is not served anonymously; "
-                        "present a bearer token with the {!r} "
-                        "scope".format(required),
+                        (
+                            "device access requires a bearer token with"
+                            " the {!r} permission"
+                        ).format(required),
                     )
                 raise _api_error(
                     web.HTTPForbidden,
-                    "anonymous access to this daemon grants only the "
-                    "{} scope; this endpoint requires {!r}; present a "
-                    "bearer token".format(
+                    (
+                        "anonymous access grants only {} permission; "
+                        "this action requires "
+                        "{!r}. Provide a bearer token with that permission"
+                    ).format(
                         " and ".join(
                             repr(s) for s in sorted(anonymous_scopes)
                         ),
@@ -8505,8 +8511,11 @@ class Cron:
                 if required not in matched.scopes:
                     raise _api_error(
                         web.HTTPForbidden,
-                        "token {!r} lacks the {!r} scope required for "
-                        "this endpoint".format(matched.label, required),
+                        (
+                            "token {!r} does not grant the {!r} "
+                            "permission required for this "
+                            "action"
+                        ).format(matched.label, required),
                     )
             request[WEB_TOKEN_REQUEST_KEY] = matched
             return await handler(request)
@@ -8740,9 +8749,11 @@ class Cron:
                     # index and vanish without a trace
                     dead.add(name)
                     logger.warning(
-                        "job %r: schedule %r has no future occurrence and "
-                        "will NEVER fire; fix the schedule or disable the "
-                        "job (its status reports never_fires)",
+                        (
+                            "job %r: schedule %r has no future runs; "
+                            "update the schedule or "
+                            "disable the job (status: never_fires)"
+                        ),
                         name,
                         schedule_str(job),
                     )
@@ -9743,10 +9754,11 @@ class Cron:
                 if name not in self._dead_schedules:
                     self._dead_schedules.add(name)
                     logger.warning(
-                        "job %r: schedule %r has no further occurrence "
-                        "and will NEVER fire again; fix the schedule or "
-                        "disable the job (its status reports "
-                        "never_fires)",
+                        (
+                            "job %r: schedule %r has no remaining runs;"
+                            " update the schedule or"
+                            " disable the job (status: never_fires)"
+                        ),
                         name,
                         schedule_str(job),
                     )
@@ -11594,10 +11606,10 @@ class Cron:
         if not isinstance(started_iso, str):
             started_iso = get_now(datetime.timezone.utc).isoformat()
         fail_reason = (
-            "run interrupted: no completion was recorded for the run "
-            "started at {} on {} (daemon crash, or the node lost access "
-            "to the state store mid-run)".format(started_iso, rec.get("host"))
-        )
+            "run interrupted: no completion was recorded for the run started "
+            "at {} on {}. The server may have stopped or lost access to saved "
+            "state before completion"
+        ).format(started_iso, rec.get("host"))
         data: dict[str, Any] = {
             "outcome": "unknown",
             "exit_code": None,

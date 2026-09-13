@@ -488,7 +488,7 @@ async def test_anonymous_view_excludes_the_device_registry():
         await _run(
             _anon_mw(), _ScopedReq("/push/devices", canonical="/push/devices")
         )
-    assert "device registry" in str(exc.value.text)
+    assert "device access requires a bearer token" in str(exc.value.text)
 
 
 async def test_anonymous_view_does_not_rescue_a_wrong_token():

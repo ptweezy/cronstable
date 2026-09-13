@@ -273,9 +273,9 @@ def test_verdict_correlates_a_shared_signature():
     verdict, incident = verdict_info(jobs, None)
     assert verdict is not None
     assert verdict["sev"] == "crit"
-    assert "FLEET EVENT — 3 jobs failing" in verdict["head"]
-    assert "×2 share exit=69" in verdict["sub"]
-    assert "likely one cause" in verdict["sub"]
+    assert "MULTIPLE FAILURES — 3 jobs failing" in verdict["head"]
+    assert "×2 share exit code 69" in verdict["sub"]
+    assert "may share a cause" in verdict["sub"]
     # the blast radius is the correlated pair, not all three
     assert sorted(incident) == ["a", "b"]
 
@@ -287,7 +287,7 @@ def test_verdict_uncorrelated_failures():
     ]
     verdict, incident = verdict_info(jobs, None)
     assert verdict is not None
-    assert "no shared failure signature" in verdict["sub"]
+    assert "no matching failure details found" in verdict["sub"]
     assert sorted(incident) == ["a", "b"]
 
 
@@ -1622,7 +1622,7 @@ async def test_schedule_pressure_overlay(tmp_path):
         await _wait_for(lambda: app.pressure is not None)
         await h.settle()
         screen = h.term.screen()
-        assert "schedule pressure" in screen
+        assert "schedule load" in screen
         assert "duplicate schedules" in screen
         assert "0 * * * *" in screen          # the herd's group
         assert "suggest" in screen
@@ -1654,7 +1654,7 @@ async def test_week_calendar_overlay(tmp_path):
         await h.settle()
         screen = h.term.screen()
         assert "week calendar (UTC)" in screen
-        assert "upcoming fires" in screen
+        assert "upcoming runs" in screen
         assert "daily-report" in screen
         # the minutely job is hum, not agenda: named once, in the strip
         assert "background hum" in screen
@@ -3150,7 +3150,9 @@ def test_render_state_and_fleet_edges(tmp_path):
     app.state_tab = "documents"
     assert "nothing here yet" in _txt(app.render_state(paint, 110, 30))
     app.fleet = {"enabled": False}
-    assert "needs a cluster" in _txt(app.render_fleet(paint, 110, 30))
+    assert "Configure cluster peer communication" in _txt(
+        app.render_fleet(paint, 110, 30)
+    )
     # a fleet whose only jobs are filtered out shows the empty note
     app.fleet = {
         "enabled": True,
@@ -3426,7 +3428,7 @@ def test_render_heat_survives_an_outcome_key_the_ladder_lacks(
 def test_render_press_full_grid(tmp_path):
     app = _bare_app(tmp_path)
     paint = _paint(app)
-    assert "computing the fire forecast" in _txt(
+    assert "loading upcoming scheduled runs" in _txt(
         app.render_press(paint, 110, 30)
     )
     fires = [0] * 60
@@ -3516,7 +3518,7 @@ def test_render_week_variants(tmp_path):
         "schedules": 0,
         "grid": [[0] * 24 for _ in range(7)],
     }
-    assert "no scheduled fires" in _txt(app.render_week(paint, 110, 30))
+    assert "no runs scheduled" in _txt(app.render_week(paint, 110, 30))
     now = datetime.datetime.now(datetime.timezone.utc)
     app.week = {
         "items": [
@@ -3529,7 +3531,7 @@ def test_render_week_variants(tmp_path):
         "grid": [[1] * 24 for _ in range(7)],
     }
     body = _txt(app.render_week(paint, 110, 40))
-    assert "upcoming fires" in body and "background hum" in body
+    assert "upcoming runs" in body and "background hum" in body
     assert "future-job" in body
 
 
@@ -3541,7 +3543,7 @@ def test_render_radar_variants(tmp_path):
         _job("disabled", enabled=False),
         _job("running", running=True, scheduled_in=None),
     ]
-    assert "no jobs scheduled" in _txt(app.render_radar(paint, 110, 30))
+    assert "no upcoming runs to show" in _txt(app.render_radar(paint, 110, 30))
     app.jobs = [
         _job("soon", scheduled_in=120.0),
         _job("null", scheduled_in=None),
@@ -3575,7 +3577,7 @@ def test_render_dags_index_variants(tmp_path):
     app = _bare_app(tmp_path)
     paint = _paint(app)
     app.dags = []
-    assert "no DAGs configured" in _txt(app.render_dags(paint, 110, 30))
+    assert "no workflows configured" in _txt(app.render_dags(paint, 110, 30))
     app.dags = [
         {
             "name": "pipeline",
@@ -3597,7 +3599,7 @@ def test_render_mitigate_overflow_and_running(tmp_path):
     app.mitigate_running = True
     body = _txt(app.render_mitigate(paint, 110, 30))
     assert "+2 more" in body
-    assert "running (a to abort)" in body
+    assert "sending requests (a to stop)" in body
 
 
 def test_render_sandbox_hashed_and_empty(tmp_path):
@@ -3606,11 +3608,11 @@ def test_render_sandbox_hashed_and_empty(tmp_path):
     app.inputs["sandbox"] = ""
     assert "type a cron expression" in _txt(app.render_sandbox(paint, 110, 30))
     app.inputs["sandbox"] = "H * * * *"
-    assert "stable hash" in _txt(app.render_sandbox(paint, 110, 30))
+    assert "based on the job name" in _txt(app.render_sandbox(paint, 110, 30))
     # a never-fires expression parses but lints with a finding
     app.inputs["sandbox"] = "0 0 30 2 *"
     body = _txt(app.render_sandbox(paint, 110, 40))
-    assert "cron sandbox" in body
+    assert "schedule preview" in body
 
 
 def test_render_timeline_blast_and_empty(tmp_path):
@@ -3662,7 +3664,7 @@ def test_drawer_history_variants(tmp_path):
     assert "loading run history" in _txt(app._drawer_history(paint, 80, 20))
     # empty run list
     app.drawer_runs = {"stats": {"total": 0}, "runs": []}
-    assert "no runs retained yet" in _txt(app._drawer_history(paint, 80, 20))
+    assert "no run history yet" in _txt(app._drawer_history(paint, 80, 20))
     # full stats block with cpu line + a failure run with resources
     app.drawer_runs = {
         "stats": {
@@ -3727,12 +3729,12 @@ def test_drawer_resources_variants(tmp_path):
 def test_drawer_schedule_variants(tmp_path):
     app = _bare_app(tmp_path)
     paint = _paint(app)
-    # an @reboot job has no upcoming fires but its own note
+    # an @reboot job has no upcoming runs but its own note
     reboot = _job("boot", schedule="@reboot", scheduled_in=None)
     app.jobs = [reboot]
     app.by_name = {"boot": reboot}
     app.drawer_job = "boot"
-    assert "runs once, at daemon start" in _txt(
+    assert "runs once, when cronstable starts" in _txt(
         app._drawer_schedule(paint, 60, 24)
     )
     # a resolved H schedule with a timezone and shipped findings
@@ -3751,7 +3753,7 @@ def test_drawer_schedule_variants(tmp_path):
     assert "resolves to 18 * * * *" in body
     assert "next runs:" in body
     assert "uneven cadence" in body
-    assert "daemon says: next fire" in body
+    assert "server reports: next run" in body
 
 
 def test_render_drawer_panel_dispatches_tabs(tmp_path):
@@ -3825,11 +3827,11 @@ def test_dag_panel_tabs_render(tmp_path):
     assert "open a run first" in _txt(app.render_dag_panel(paint, 70, 24))
     app.dag_run_key = "manual-1"
     app.dag_xcom = None
-    assert "loading xcom" in _txt(app.render_dag_panel(paint, 70, 24))
+    assert "loading task outputs" in _txt(app.render_dag_panel(paint, 70, 24))
     app.dag_xcom = {"xcom": {"rows": 42}}
     assert "rows" in _txt(app.render_dag_panel(paint, 70, 24))
     app.dag_xcom = {"xcom": {}}
-    assert "no xcom values" in _txt(app.render_dag_panel(paint, 70, 24))
+    assert "no task outputs" in _txt(app.render_dag_panel(paint, 70, 24))
 
     # logs tab: no tail selected
     app.dag_tab = "logs"
@@ -4299,8 +4301,8 @@ async def test_palette_commands_toggles_and_acts(tmp_path):
     app.by_name = {j["name"]: j for j in app.jobs}
     app.dags = [{"name": "pipe"}]
     labels = [c[1] for c in app.palette_commands()]
-    assert any("DAG: pipe" in ln for ln in labels)
-    assert any("Trigger DAG: pipe" in ln for ln in labels)
+    assert any("Workflow: pipe" in ln for ln in labels)
+    assert any("Run workflow: pipe" in ln for ln in labels)
     assert any("Resume: pausable" in ln for ln in labels)
     assert any("Pause: normal" in ln for ln in labels)
     assert any("Cancel: run1" in ln for ln in labels)
@@ -4698,7 +4700,7 @@ def test_render_sandbox_reboot_and_reject(tmp_path):
     assert "cronstable starts" in _txt(app.render_sandbox(paint, 110, 30))
     app.inputs["sandbox"] = "not a cron"
     rejected = _txt(app.render_sandbox(paint, 110, 30))
-    assert "rejects this expression" in rejected
+    assert "Enter a valid cron expression" in rejected
 
 
 def test_render_state_view_sparse(tmp_path):
@@ -4721,7 +4723,9 @@ def test_drawer_schedule_bad_timezone(tmp_path):
     app.by_name = {"tz": job}
     app.drawer_job = "tz"
     body = _txt(app._drawer_schedule(paint, 70, 24))
-    assert "reference frame" in body
+    assert "timezone" in body
+
+
 # ===================================================================
 #  Per-frame memos: the wrap tally, the schedule facts, the palette,
 #  the drawer bodies, the timeline entries and the fleet matrix
@@ -5056,7 +5060,7 @@ def test_drawer_schedule_local_frame_uses_the_host_zone(tmp_path, monkeypatch):
     app.by_name = {"loc": job}
     app.drawer_job = "loc"
     body = _txt(app._drawer_schedule(paint, 70, 24))
-    assert "reference frame: local" in body
+    assert "timezone: local" in body
     assert "next runs:" in body
     facts = app._sched_facts
     assert facts[2] == "local" and facts[4] is LOCAL_ZONE

@@ -1,12 +1,14 @@
 # Duplicate schedule detection
 
-Fourteen jobs sharing `0 0 * * *` is a fact worth surfacing before midnight proves it. Using the engine's own semantic equality, cronstable groups the fleet's schedules and reports every group of two or more jobs that fire on the identical set of instants.
+Find jobs with identical schedules so you can spread their runs out.
+Cronstable groups jobs by their parsed schedule and timezone, rather
+than the spelling of the cron expression. For example, `*/5 * * * *`
+matches `0-59/5 * * * *`, and `@hourly` matches `0 * * * *`.
 
-Semantic, not textual: `*/5 * * * *`, `0-59/5 * * * *`, and `@hourly` versus `0 * * * *` group together because the parsed field sets are equal. The scheduler itself uses that same equality to keep an unchanged job's next-fire instant across reloads.
-
-An [`H` schedule](Hashed-Schedules) joins a group only if its resolved slot coincides with the others, which is exactly when it collides. The grouping also includes each job's resolved time zone, so two `0 0 * * *` jobs in different zones, which never fire together, are not called duplicates.
-
-Disabled and `@reboot` jobs are excluded for the same reason they are excluded from [schedule pressure](Schedule-Pressure): they cannot collide with anything.
+An [`H` schedule](Hashed-Schedules) joins a group when its resolved
+schedule matches. Disabled jobs and `@reboot` jobs are excluded.
+Jobs without identical schedules can still have individual run times
+in common; use [schedule load](Schedule-Pressure) to see those overlaps.
 
 ## The endpoint
 
@@ -33,7 +35,7 @@ Groups are sorted largest first. `expression` is the most common source spelling
 
 ## In the dashboards
 
-The [web dashboard](Web-Dashboard)'s schedule-pressure card lists the groups as clickable job chips. A chip opens that job's schedule tab. The [terminal dashboard](Terminal-Dashboard)'s pressure overlay shows the top groups inline.
+The [web dashboard](Web-Dashboard)'s schedule load card lists the groups as clickable job chips. A chip opens that job's schedule tab. The [terminal dashboard](Terminal-Dashboard)'s schedule load overlay shows the top groups inline.
 
 ## What to do with a group
 

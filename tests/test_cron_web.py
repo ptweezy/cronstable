@@ -765,7 +765,7 @@ async def test_web_list_jobs_includes_last_run():
         exit_code=2,
         started_at=DT(1999, 12, 31, 12, 0, 0, tzinfo=UTC),
         finished_at=DT(1999, 12, 31, 12, 0, 5, tzinfo=UTC),
-        fail_reason="failsWhen=nonzeroReturn and retcode=2",
+        fail_reason="command exited with code 2",
         output=JobOutputStream(),
     )
     resp = await cron._web_list_jobs(Req())
@@ -774,7 +774,7 @@ async def test_web_list_jobs_includes_last_run():
     assert last["outcome"] == "failure"
     assert last["exit_code"] == 2
     assert last["duration"] == 5.0
-    assert last["fail_reason"].startswith("failsWhen")
+    assert last["fail_reason"] == "command exited with code 2"
 
 
 def _mk_run(outcome, exit_code=0, dur=1.0):
@@ -1417,12 +1417,12 @@ async def test_handler_errors_carry_the_json_envelope():
         (
             cron._web_schedule_why,
             Req(query={"job": "nope", "at": "2026-01-01T00:00:00Z"}),
-            "no job or DAG schedule named 'nope'",
+            "no job or workflow schedule named 'nope'",
         ),
         (
             cron._web_job_calendar,
             Req(match={"name": "nope"}),
-            "no job or DAG schedule named 'nope'",
+            "no job or workflow schedule named 'nope'",
         ),
     ):
         with pytest.raises(web.HTTPNotFound) as raised:
@@ -2096,13 +2096,13 @@ async def test_chunked_oversized_mcp_body_413s_with_the_envelope(
 _CONVERTED_404_ROUTES = [
     (
         "/schedule/why?job=nope&at=2026-01-01T00:00:00Z",
-        "no job or DAG schedule named 'nope'",
+        "no job or workflow schedule named 'nope'",
     ),
-    ("/jobs/nope/calendar.ics", "no job or DAG schedule named 'nope'"),
+    ("/jobs/nope/calendar.ics", "no job or workflow schedule named 'nope'"),
     ("/jobs/nope", "job 'nope' not found"),
     ("/jobs/nope/trends", "job 'nope' not found"),
     ("/jobs/nope/logs", "job 'nope' not found"),
-    ("/dags/nope/runs/rk/tasks/tk/logs", "dag 'nope' not found"),
+    ("/dags/nope/runs/rk/tasks/tk/logs", "workflow 'nope' not found"),
 ]
 
 
@@ -2141,10 +2141,7 @@ async def test_dag_run_404_splits_unknown_dag_from_no_state_store():
 
     cron = _cron(_DAG_LOGS_YAML)  # dags: lin, and no `state:` section
     assert cron.state_backend is None
-    no_store = (
-        "no `state:` store is configured; DAG run documents only exist "
-        "in a durable store"
-    )
+    no_store = "workflow run history requires a configured `state:` store"
     for handler, request in (
         (cron._web_dag_runs, Req(match={"name": "lin"})),
         (cron._web_dag_run, Req(match={"name": "lin", "run_key": "rk"})),
@@ -2156,12 +2153,14 @@ async def test_dag_run_404_splits_unknown_dag_from_no_state_store():
 
     # with a store configured the two DAG-side causes read as they did
     cron.state_backend = object()
-    assert cron._dag_run_lookup_reason("ghost") == "dag 'ghost' not found"
+    assert cron._dag_run_lookup_reason("ghost") == "workflow 'ghost' not found"
     assert (
-        cron._dag_run_lookup_reason("ghost", "rk") == "dag 'ghost' not found"
+        cron._dag_run_lookup_reason("ghost", "rk")
+        == "workflow 'ghost' not found"
     )
     assert (
-        cron._dag_run_lookup_reason("lin", "rk") == "dag 'lin' has no run 'rk'"
+        cron._dag_run_lookup_reason("lin", "rk")
+        == "workflow 'lin' has no run 'rk'"
     )
 
 
@@ -2845,7 +2844,7 @@ async def test_webloop_web_dag_task_logs_unknown_dag():
         resp = await client.get("/dags/nope/runs/rk/tasks/a/logs")
         assert resp.status == 404
         assert resp.content_type == "application/json"
-        assert (await resp.json())["error"] == "dag 'nope' not found"
+        assert (await resp.json())["error"] == "workflow 'nope' not found"
 
 
 @pytest.mark.asyncio

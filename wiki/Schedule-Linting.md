@@ -31,7 +31,7 @@ The DST rules run in the job's frame: its explicit `timezone:`, or the host's lo
   ```
 
 - **The HTTP API.** `GET /jobs` carries each job's findings verbatim (`schedule_findings`, a list of `{code, level, message}`) plus a computed `never_fires` boolean. `GET /status` marks dead schedules with `never_fires: true` (and says `never fires` in the plain-text form). `GET /schedule/preview` lints arbitrary expressions before they become jobs. See [HTTP API](HTTP-API).
-- **The terminal dashboard.** The cron sandbox (`x`) lints as you type, and a job's schedule drawer shows findings in the job's own time zone, so DST notes carry real dates. See the [terminal dashboard](Terminal-Dashboard).
+- **The terminal dashboard.** The schedule preview (`x`) lints as you type, and a job's schedule drawer shows findings in the job's own time zone, so DST notes carry real dates. See the [terminal dashboard](Terminal-Dashboard).
 
 ## Dead schedules are loud, not fatal
 

@@ -388,15 +388,23 @@ def job_name(uri: Optional[str], fallback: str) -> str:
 #: most common trigger on a real Windows 11 box (97 of 195 tasks measured),
 #: so it is named for what it is rather than left to a generic message.
 _UNCONVERTIBLE_TRIGGERS = {
-    "LogonTrigger": "fires when a user logs on, which is not a schedule",
-    "IdleTrigger": "fires when the machine goes idle, which is not a schedule",
-    "EventTrigger": "fires on a Windows event-log event, which is not a "
-    "schedule",
-    "SessionStateChangeTrigger": "fires on a session connect, disconnect "
-    "or lock, which is not a schedule",
-    "RegistrationTrigger": "fires once when the task is registered",
-    "WnfStateChangeTrigger": "fires on an internal Windows notification "
-    "with no public schema",
+    "LogonTrigger": ("runs when a user logs on, which is not a schedule"),
+    "IdleTrigger": (
+        "runs when the machine goes idle, which is not a schedule"
+    ),
+    "EventTrigger": (
+        "runs in response to a Windows event-log event, which is not a "
+        "schedule"
+    ),
+    "SessionStateChangeTrigger": (
+        "runs in response to a session connect, disconnect or lock, which "
+        "is not a schedule"
+    ),
+    "RegistrationTrigger": ("runs once when the task is registered"),
+    "WnfStateChangeTrigger": (
+        "runs in response to an internal Windows notification with no "
+        "public schema"
+    ),
 }
 
 _WEEKDAYS = (
@@ -602,11 +610,13 @@ def _lower_schedule_by_day(
         Note(
             task,
             "CalendarTrigger/ScheduleByDay",
-            "it runs every {} days, which cron cannot express: a "
-            "day-of-month step restarts each month, so it would fire on "
-            "the 1st, then every {} days, then the 1st again".format(
-                interval, interval
-            ),
+            (
+                "it runs every {} days, which cron cannot express: a "
+                "day-of-month "
+                "step restarts each month, so it would run on the 1st, "
+                "then every "
+                "{} days, then the 1st again"
+            ).format(interval, interval),
             "run it daily and gate it on a durable `cronstable cursor`",
             True,
         )
@@ -793,8 +803,11 @@ def _lower_boot_trigger(
             Note(
                 task,
                 "BootTrigger/Delay",
-                "cronstable runs an @reboot job when the daemon starts, "
-                "with no delay after boot",
+                (
+                    "cronstable runs an @reboot job when cronstable "
+                    "starts, with no "
+                    "delay after boot"
+                ),
                 "",
                 False,
             )
@@ -805,8 +818,11 @@ def _lower_boot_trigger(
             Note(
                 task,
                 "BootTrigger/Repetition",
-                "the repetition was not merged into @reboot, which fires "
-                "once per boot",
+                (
+                    "the repetition was not merged into @reboot, which "
+                    "runs once per "
+                    "boot"
+                ),
                 "add a second job on a repeating schedule if the repeat "
                 "matters",
                 False,
@@ -850,7 +866,10 @@ def _trigger_notes(trigger: ET.Element, task: str) -> list[Note]:
             Note(
                 task,
                 "RandomDelay",
-                "cronstable does not delay a fire by a random amount",
+                (
+                    "cronstable does not delay a scheduled run by a "
+                    "random amount"
+                ),
                 "a hashed schedule (H) spreads jobs deterministically, "
                 "which is a different thing but usually the intent",
                 False,
@@ -1066,9 +1085,12 @@ def lower_settings(
             Note(
                 task,
                 "MultipleInstancesPolicy",
-                "Queue has no cronstable equivalent: an overlapping fire "
-                "is either skipped or replaces the running one, never "
-                "queued behind it",
+                (
+                    "Queue has no cronstable equivalent: an overlapping"
+                    " run is either "
+                    "skipped or replaces the running one, never queued "
+                    "behind it"
+                ),
                 "choose concurrencyPolicy Forbid to skip it or Replace to "
                 "cancel the running one",
                 False,
@@ -1128,8 +1150,11 @@ def lower_settings(
             Note(
                 task,
                 "RestartOnFailure",
-                "cronstable retries a failed run through its own retry "
-                "ladder rather than by restarting the task",
+                (
+                    "cronstable retries a failed run using its retry "
+                    "settings rather "
+                    "than by restarting the task"
+                ),
                 "set onFailure.retry.maximumRetries and initialDelay",
                 False,
             )
@@ -1227,7 +1252,10 @@ def convert_task(
                 "Triggers",
                 "the task has no trigger, so it is registered but launched "
                 "on demand or by another task",
-                "give it a schedule, or drive it from a cronstable DAG",
+                (
+                    "give it a schedule, or run it as part of a "
+                    "cronstable workflow"
+                ),
                 True,
             )
         )
@@ -1256,8 +1284,11 @@ def convert_task(
                 "the task runs {} actions in sequence inside one instance, "
                 "while separate cronstable jobs on one schedule run at "
                 "once".format(len(execs)),
-                "chain them as a DAG, or leave one job per action only if "
-                "their order does not matter",
+                (
+                    "chain them as a workflow, or leave one job per "
+                    "action only if "
+                    "their order does not matter"
+                ),
                 True,
             )
         )

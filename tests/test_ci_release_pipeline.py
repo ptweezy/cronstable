@@ -373,17 +373,34 @@ def test_input_resolution_ignores_yanked_prerelease_and_incompatible_sources():
     )
 
 
-def test_source_constraints_come_from_pyproject():
+@pytest.mark.parametrize(
+    "name,extra", [("zeroconf", "discovery"), ("cryptography", "push")]
+)
+def test_source_constraints_come_from_pyproject(name, extra):
     import tomllib
     from packaging.requirements import Requirement
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     inputs = load("release_inputs")
-    discovery = project["project"]["optional-dependencies"]["discovery"]
-    assert inputs.requirement_for("zeroconf", project) == str(
-        Requirement(discovery[0]).specifier
+    # Compare the complete canonical constraint, including any upper bound.
+    # Resolve the Linux build target even when these tests run on another OS.
+    target = {
+        "sys_platform": "linux",
+        "platform_system": "Linux",
+        "os_name": "posix",
+        "platform_machine": "x86_64",
+    }
+    requirements = map(
+        Requirement, project["project"]["optional-dependencies"][extra]
     )
-    assert inputs.requirement_for("cryptography", project) == ">=48"
+    expected = [
+        str(req.specifier)
+        for req in requirements
+        if req.name == name
+        and (req.marker is None or req.marker.evaluate(target))
+    ]
+    assert len(expected) == 1
+    assert inputs.requirement_for(name, project) == expected[0]
 
 
 def test_prepared_release_rejects_changed_bytes(tmp_path):

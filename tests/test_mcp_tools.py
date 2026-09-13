@@ -890,7 +890,7 @@ def test_preview_summary_shapes():
     assert "@reboot" in mcp_mod._preview_summary(
         {"valid": True, "reboot": True}
     )
-    assert "never fires" in mcp_mod._preview_summary(
+    assert "no future runs" in mcp_mod._preview_summary(
         {"valid": True, "description": "d", "never_fires": True, "lint": []}
     )
     text = mcp_mod._preview_summary(
@@ -903,7 +903,7 @@ def test_preview_summary_shapes():
         }
     )
     assert "1 lint warning(s), 1 note(s)" in text
-    assert "first fire 2026-07-18T00:00:00+00:00" in text
+    assert "first scheduled run 2026-07-18T00:00:00+00:00" in text
     # clean lint and no computed fires: the description stands alone
     bare = mcp_mod._preview_summary(
         {
@@ -934,7 +934,7 @@ def test_why_summary_shapes():
         }
     )
     assert yes.startswith("YES")
-    assert "BUT shifted" in yes
+    assert "; shifted" in yes
     assert "disabled" in yes
     yes_enabled = mcp_mod._why_summary(
         {
@@ -1013,8 +1013,8 @@ async def test_why_no_run_miss_names_both_lookups():
     assert result["isError"] is True
     text = result["content"][0]["text"]
     assert text == (
-        "no job or DAG schedule named 'ghost'. Use cron_list_jobs or "
-        "cron_list_dags to enumerate."
+        "no job or workflow schedule named 'ghost'. Use cron_list_jobs or "
+        "cron_list_dags to find available schedules."
     )
     # the half that makes the old wording false: a dag: name answers
     result = await _call(

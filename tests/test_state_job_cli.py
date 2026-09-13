@@ -416,7 +416,7 @@ def test_no_env_errors(monkeypatch, cli_runner, capsys):
     monkeypatch.delenv("CRONSTABLE_STATE_URL", raising=False)
     monkeypatch.delenv("CRONSTABLE_STATE_TOKEN", raising=False)
     assert cli_runner(["state", "get", "k"]) == 1
-    assert "not running inside a cronstable job" in capsys.readouterr().err
+    assert "job state connection is unavailable" in capsys.readouterr().err
 
 
 def test_typed_value_parsing():

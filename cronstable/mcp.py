@@ -294,14 +294,15 @@ class MCPHandler:
         }
         instructions = self._instructions or (
             "cronstable's MCP server. Read-only 'observe' tools describe "
-            "jobs, DAGs, the cluster/fleet, metrics and durable state. "
+            "jobs, workflows, cluster health, metrics and saved state. "
             "Mutating tools (run/cancel/pause/resume a job, "
-            "trigger/backfill/approve a DAG) require confirm=true and "
+            "run/backfill/approve a workflow) require confirm=true and "
             "appear only when the operator disabled readOnly. Start with "
             "cron_get_status or cron_list_jobs. When authoring a schedule, "
             "verify it with cron_validate_schedule / cron_explain_schedule "
-            "(the daemon's own engine) before proposing it; cron_why_no_run "
-            "explains why a job's schedule did or did not fire at a given "
+            "(the server's scheduling engine) before proposing it; "
+            "cron_why_no_run "
+            "explains why a job's schedule did or did not match a given "
             "timestamp."
         )
         result["instructions"] = instructions
@@ -595,7 +596,8 @@ class MCPHandler:
                 "observe",
                 "cron_list_runs",
                 "Run history",
-                "Retained run history + success/duration stats for one job "
+                "Saved run history, success rate and duration "
+                "statistics for one job "
                 "(most recent `limit` runs).",
                 obj({"name": _STR, "limit": _INT}, ["name"]),
                 self._t_list_runs,
@@ -605,7 +607,7 @@ class MCPHandler:
                 "cron_get_job_trends",
                 "SLA trends",
                 "Per-window (1h/24h/7d/30d/all) success-rate and duration "
-                "aggregates over the durable run ledger for one job.",
+                "statistics from the saved run history for one job.",
                 obj({"name": _STR}, ["name"]),
                 self._t_get_job_trends,
             ),
@@ -631,8 +633,8 @@ class MCPHandler:
                 "observe",
                 "cron_get_fleet",
                 "Fleet view",
-                "The cluster-wide jobs x nodes run matrix (single pane of "
-                "glass). enabled:false without a cluster.",
+                "Run status for each job on each node. Returns enabled:false "
+                "when cluster peer communication is unavailable.",
                 obj({}),
                 self._t_get_fleet,
             ),
@@ -641,7 +643,7 @@ class MCPHandler:
                 "cron_get_node",
                 "Node resources",
                 "This node's live whole-host CPU/memory (optionally with the "
-                "retained history ring).",
+                "recent history).",
                 obj({"history": _BOOL}),
                 self._t_get_node,
             ),
@@ -658,7 +660,7 @@ class MCPHandler:
                 "observe",
                 "cron_get_version",
                 "Version",
-                "Daemon version, job-set id and job count.",
+                "Server version, job-set id and job count.",
                 obj({}),
                 self._t_get_version,
             ),
@@ -675,11 +677,11 @@ class MCPHandler:
             _tool(
                 "observe",
                 "cron_schedule_pressure",
-                "Schedule pressure",
-                "The fleet's collision heatmap: every enabled schedule's "
-                "fires over the next `hours` (default 24, max 168), bucketed "
-                "by hour and minute in `tz` (default UTC). Answers 'how many "
-                "jobs fire at :00?' and 'which minutes are empty?'.",
+                "Schedule load",
+                "Upcoming runs for enabled schedules over the next `hours` "
+                "(default 24, max 168), grouped by hour and minute in `tz` "
+                "(default UTC). Shows when jobs are scheduled together "
+                "and which minute positions have no scheduled runs.",
                 obj({"hours": _INT, "tz": _STR}),
                 self._t_schedule_pressure,
             ),
@@ -687,20 +689,20 @@ class MCPHandler:
                 "observe",
                 "cron_schedule_duplicates",
                 "Duplicate schedules",
-                "Groups of jobs whose schedules fire on the identical "
-                "instants (semantic equality: */5 == 0-59/5, same timezone). "
-                "Use to spot copy-pasted schedules worth spreading out.",
+                "Jobs with identical run times (for example, */5 and 0-59/5 "
+                "in the same timezone). Use to find schedules that could "
+                "be spread out.",
                 obj({}),
                 self._t_schedule_duplicates,
             ),
             _tool(
                 "observe",
                 "cron_suggest_slot",
-                "Suggest a slot",
-                "The least-loaded slot for a new job, from the fleet's real "
-                "fires over the next 24h: `period` 'hourly' picks a minute, "
+                "Suggest a quieter run time",
+                "Suggest a time with fewer scheduled runs in the next 24h. "
+                "For `period`, 'hourly' picks a minute, "
                 "'daily' a minute and hour; returns the cron expression, two "
-                "runners-up, and the busiest slot for contrast.",
+                "alternatives, and the busiest time.",
                 obj(
                     {
                         "period": _enum(["hourly", "daily"]),
@@ -713,12 +715,12 @@ class MCPHandler:
                 "observe",
                 "cron_validate_schedule",
                 "Validate a schedule",
-                "Parse and lint a cron expression BEFORE it becomes a job: "
+                "Check a cron expression before saving it as a job: "
                 "valid true/false with the engine's exact error (including "
                 "wrong-field hints for Quartz-style forms), the "
                 "plain-English description, the normalized form, advisory "
-                "lint findings and the first upcoming fire, all from the "
-                "daemon's own scheduling engine. The dialect includes L "
+                "warnings and the first scheduled run, all from the "
+                "server's scheduling engine. The dialect includes L "
                 "(last day), L-n (n days before it), nW / LW (nearest / "
                 "last weekday) and Ln / d#n (last / nth weekday: L5 = last "
                 "Friday, 5#3 = third Friday). `tz` (IANA zone the job will "
@@ -735,11 +737,11 @@ class MCPHandler:
                 "cron_explain_schedule",
                 "Explain a schedule",
                 "Decode a cron expression into a plain-English description, "
-                "its next `count` fires (default 5, max 60) as ISO instants "
+                "its next `count` run times (default 5, max 60) as ISO "
+                "timestamps "
                 "in `tz` (default UTC; pass the job's zone), and advisory "
-                "lint findings, so a schedule can be authored, verified "
-                "against the daemon's own engine, and round-tripped to the "
-                "user for confirmation. `seed` (a job name) resolves "
+                "warnings from the server's scheduling engine. "
+                "`seed` (a job name) resolves "
                 "Jenkins-style H slots.",
                 obj(
                     {
@@ -758,10 +760,10 @@ class MCPHandler:
                 "Why no run?",
                 "Explain field-by-field why a job's schedule did or did not "
                 "select a timestamp ('day-of-week Tuesday is not in Monday "
-                "and Friday'), with the nearest real fire on each side and "
+                "and Friday'), with the previous and next scheduled runs and "
                 "notes on this dialect's day-field AND rule and DST "
-                "effects. `at` is ISO 8601; a naive timestamp reads as wall "
-                "time in the job's own timezone. If the schedule DOES "
+                "effects. `at` is ISO 8601; timestamps without an offset use "
+                "the job's timezone. If the schedule does "
                 "match, the answer points at execution history "
                 "(cron_list_runs) instead.",
                 obj({"name": _STR, "at": _STR}, ["name", "at"]),
@@ -771,8 +773,8 @@ class MCPHandler:
             _tool(
                 "dags",
                 "cron_list_dags",
-                "List DAGs",
-                "Configured orchestration DAGs with their tasks and "
+                "List workflows",
+                "Configured workflows (DAGs) with their tasks and "
                 "dependencies.",
                 obj({}),
                 self._t_list_dags,
@@ -780,32 +782,32 @@ class MCPHandler:
             _tool(
                 "dags",
                 "cron_list_dag_runs",
-                "List DAG runs",
-                "Recent runs of one DAG with per-state task counts.",
+                "List workflow runs",
+                "Recent workflow runs with task counts for each status.",
                 obj({"dag": _STR, "limit": _INT}, ["dag"]),
                 self._t_list_dag_runs,
             ),
             _tool(
                 "dags",
                 "cron_get_dag_run",
-                "Get DAG run",
-                "One DAG run's full document: task states, timing, decisions.",
+                "Get workflow run",
+                "Workflow run details: task status, timing and decisions.",
                 obj({"dag": _STR, "run_key": _STR}, ["dag", "run_key"]),
                 self._t_get_dag_run,
             ),
             _tool(
                 "dags",
                 "cron_get_dag_xcom",
-                "DAG XCom",
-                "The XCom values a DAG run's tasks published.",
+                "Workflow task outputs (XCom)",
+                "Output values (XCom) shared by tasks in a workflow run.",
                 obj({"dag": _STR, "run_key": _STR}, ["dag", "run_key"]),
                 self._t_get_dag_xcom,
             ),
             _tool(
                 "dags",
                 "cron_tail_dag_task_logs",
-                "Tail DAG task logs",
-                "Last retained log lines of a currently-running DAG task "
+                "Read workflow task logs",
+                "Latest saved log lines for a running workflow task "
                 "instance, with a `cursor` to poll for more.",
                 obj(
                     {
@@ -824,7 +826,7 @@ class MCPHandler:
                 "state",
                 "cron_inspect_state",
                 "Inspect state store",
-                "Metadata-only view of the durable state store: overview "
+                "Inspect saved state without revealing values: overview "
                 "(default), one namespace's documents (`ns` "
                 "kv/|cursor/|idem/) or a stream's newest records (`stream`). "
                 "KV values and "
@@ -844,7 +846,7 @@ class MCPHandler:
             _tool(
                 "dags",
                 "cron_preview_recovery",
-                "Preview DAG recovery",
+                "Preview workflow recovery",
                 "Preview failed tasks or a selected task and its downstream "
                 "tasks. Supply run_key, or from and to for failed dates.",
                 obj(
@@ -863,7 +865,7 @@ class MCPHandler:
             _tool(
                 "dags",
                 "cron_recover_dag",
-                "Recover DAG work",
+                "Recover workflow tasks",
                 "Execute a reviewed recovery plan. Requires plan_token and "
                 "confirm=true. Creates a new run preserving successful work.",
                 obj(
@@ -924,7 +926,7 @@ class MCPHandler:
                 "act",
                 "cron_pause_job",
                 "Pause job",
-                "Skip a job's scheduled fires until the window expires "
+                "Pause scheduled runs until the pause expires "
                 "(durationSeconds, default 3600) or the job is resumed; "
                 "manual runs stay allowed. Requires confirm=true.",
                 obj(
@@ -944,7 +946,7 @@ class MCPHandler:
                 "act",
                 "cron_resume_job",
                 "Resume job",
-                "Lift a job's pause so scheduled fires resume; a no-op when "
+                "Resume scheduled runs; has no effect when "
                 "the job is not paused. Requires confirm=true.",
                 obj({"name": _STR, "confirm": _BOOL}, ["name"]),
                 self._t_resume_job,
@@ -955,9 +957,8 @@ class MCPHandler:
             _tool(
                 "dags",
                 "cron_trigger_dag",
-                "Trigger DAG",
-                "Create and start a manual DAG run now. "
-                "Requires confirm=true.",
+                "Run workflow now",
+                "Start a workflow run now. Requires confirm=true.",
                 obj({"dag": _STR, "confirm": _BOOL}, ["dag"]),
                 self._t_trigger_dag,
                 mutating=True,
@@ -965,8 +966,8 @@ class MCPHandler:
             _tool(
                 "dags",
                 "cron_backfill_dag",
-                "Backfill DAG",
-                "Replay a scheduled DAG across an ISO date range. dry_run "
+                "Run workflow for past dates",
+                "Run a scheduled workflow for an ISO date range. dry_run "
                 "(default true) previews; a real backfill needs dry_run=false "
                 "AND confirm=true.",
                 obj(
@@ -987,7 +988,7 @@ class MCPHandler:
                 "dags",
                 "cron_decide_gate",
                 "Decide approval gate",
-                "Approve or reject a DAG approval gate. "
+                "Approve or reject a workflow approval step. "
                 "Requires confirm=true; with scoped web tokens, the "
                 "presented token must hold the approve scope.",
                 obj(
@@ -1079,9 +1080,8 @@ class MCPHandler:
         payload = self._cron.job_detail_payload(name)
         if payload is None:
             return _tool_error(
-                "job not found: {!r}. Use cron_list_jobs to enumerate.".format(
-                    name
-                )
+                "job not found: {!r}. Use cron_list_jobs to find "
+                "available jobs.".format(name)
             )
         return _result(payload, "job {!r}".format(name))
 
@@ -1196,8 +1196,9 @@ class MCPHandler:
         busiest = payload["busiest_minute"]
         return _result(
             payload,
-            "{} fire(s) from {} job(s) in the next {}h; busiest minute :{:02d}"
-            " ({} job(s)), {} minute(s) empty".format(
+            "{} scheduled runs from {} jobs in the next {}h; "
+            "busiest minute :{:02d} ({} jobs); "
+            "{} of 60 minute positions have no scheduled runs".format(
                 payload["total_fires"],
                 payload["jobs"],
                 payload["hours"],
@@ -1243,7 +1244,8 @@ class MCPHandler:
             return _tool_error(str(err))
         return _result(
             payload,
-            "least-loaded {} slot: '{}' ({} fire(s) already there "
+            "suggested {} schedule: '{}' ({} runs already scheduled at "
+            "this time "
             "in 24h)".format(
                 payload["period"],
                 payload["expression"],
@@ -1309,8 +1311,9 @@ class MCPHandler:
             # job was the only thing searched, nor point at a tool that
             # cannot list one. The HTTP twin says the same sentence.
             return _tool_error(
-                "no job or DAG schedule named {!r}. Use cron_list_jobs or "
-                "cron_list_dags to enumerate.".format(name)
+                "no job or workflow schedule named {!r}. Use "
+                "cron_list_jobs or "
+                "cron_list_dags to find available schedules.".format(name)
             )
         return _result(payload, _why_summary(payload))
 
@@ -1344,7 +1347,7 @@ class MCPHandler:
 
     async def _t_list_dags(self, args: dict[str, Any]) -> dict[str, Any]:
         dags = await self._cron.dags_payload()
-        return _result({"dags": dags}, "{} DAG(s)".format(len(dags)))
+        return _result({"dags": dags}, "{} workflow(s)".format(len(dags)))
 
     async def _t_list_dag_runs(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")
@@ -1495,7 +1498,7 @@ class MCPHandler:
         return await self._recovery_tool(args, execute=False)
 
     async def _t_recover_dag(self, args):
-        _require_confirm(args, "recovering DAG work")
+        _require_confirm(args, "recovering workflow tasks")
         return await self._recovery_tool(args, execute=True)
 
     async def _recovery_tool(self, args, *, execute):
@@ -1735,7 +1738,7 @@ class MCPHandler:
                 "cronstable://version",
                 "version",
                 "Version",
-                "Daemon version, job-set id and job count.",
+                "Server version, job-set id and job count.",
                 "observe",
                 version_data,
             ),
@@ -1776,8 +1779,8 @@ class MCPHandler:
                 "cronstable://dags/{name}",
                 r"^cronstable://dags/([^/]+)$",
                 "dag",
-                "DAG detail",
-                "One DAG's tasks and dependencies.",
+                "Workflow details",
+                "A workflow's tasks and dependencies.",
                 "dags",
                 dag_detail,
             ),
@@ -1785,8 +1788,8 @@ class MCPHandler:
                 "cronstable://dags/{name}/runs/{run_key}",
                 r"^cronstable://dags/([^/]+)/runs/([^/]+)$",
                 "dag-run",
-                "DAG run",
-                "One DAG run's full document.",
+                "workflow run",
+                "One workflow run's full document.",
                 "dags",
                 cron._dag.get_run,
             ),
@@ -1870,7 +1873,7 @@ class MCPHandler:
 
         def dag_fail(a: dict[str, Any]) -> str:
             return (
-                "Diagnose the failed DAG run '{1}' of dag '{0}'. Use "
+                "Diagnose the failed workflow run '{1}' of dag '{0}'. Use "
                 "cron_get_dag_run(dag='{0}', run_key='{1}') to find the "
                 "failed task(s), cron_tail_dag_task_logs(...) for their "
                 "output, and cron_get_dag_xcom(dag='{0}', run_key='{1}') for "
@@ -1882,7 +1885,8 @@ class MCPHandler:
             return (
                 "Assess the blast radius of an incident involving '{0}'. Use "
                 "cron_get_status and cron_get_fleet to find other affected "
-                "jobs, cron_list_dags to see which DAGs depend on it, and "
+                "jobs, cron_list_dags to see which workflows depend on "
+                "it, and "
                 "cron_inspect_state to check for shared locks/cursors it "
                 "holds. Summarize what else is at risk if it stays broken."
             ).format(a.get("target", "<target>"))
@@ -1901,8 +1905,9 @@ class MCPHandler:
             return (
                 "Plan a backfill of dag '{0}' from {1} to {2}. First run "
                 "cron_backfill_dag(dag='{0}', from='{1}', to='{2}') with its "
-                "default dry_run to preview the range, confirm the DAG exists "
-                "and the window is sane, then explain what a real backfill "
+                "default dry_run to preview the range, confirm the "
+                "workflow exists "
+                "and review the date range, then explain what a real backfill "
                 "would do. Only propose the real run (dry_run=false, "
                 "confirm=true) after the operator agrees."
             ).format(
@@ -1915,7 +1920,7 @@ class MCPHandler:
             {
                 "name": "triage_job_failure",
                 "title": "Triage a job failure",
-                "description": "Root-cause a failing job from its runs, "
+                "description": "Find why a job failed using its runs, "
                 "trends, logs and host health.",
                 "arguments": [arg("job", "the failing job's name")],
                 "toolset": "observe",
@@ -1923,29 +1928,28 @@ class MCPHandler:
             },
             {
                 "name": "blast_radius",
-                "title": "Assess blast radius",
-                "description": "Scope what else is at risk from a broken job "
-                "or DAG.",
-                "arguments": [arg("target", "a job or dag name")],
+                "title": "Assess affected jobs and workflows",
+                "description": "Identify jobs and workflows affected by a "
+                "failing job or workflow.",
+                "arguments": [arg("target", "a job or workflow name")],
                 "toolset": "observe",
                 "render": blast,
             },
             {
                 "name": "fleet_health_summary",
                 "title": "Fleet health summary",
-                "description": "A wallboard-style digest of cluster + fleet + "
-                "job health.",
+                "description": "A summary of cluster, node and job health.",
                 "arguments": [],
                 "toolset": "observe",
                 "render": fleet,
             },
             {
                 "name": "why_did_dag_run_fail",
-                "title": "Diagnose a failed DAG run",
-                "description": "Walk a failed DAG run's tasks, logs and XCom "
-                "to find the cause.",
+                "title": "Diagnose a failed workflow run",
+                "description": "Review tasks, logs and outputs from a failed "
+                "workflow run to find the cause.",
                 "arguments": [
-                    arg("dag", "the DAG name"),
+                    arg("dag", "the workflow name"),
                     arg("run_key", "the failed run key"),
                 ],
                 "toolset": "dags",
@@ -1953,11 +1957,11 @@ class MCPHandler:
             },
             {
                 "name": "backfill_plan",
-                "title": "Plan a DAG backfill",
-                "description": "Preview and reason about a DAG backfill "
+                "title": "Plan runs for past dates",
+                "description": "Preview workflow runs for a date range "
                 "before proposing a real run.",
                 "arguments": [
-                    arg("dag", "the DAG name"),
+                    arg("dag", "the workflow name"),
                     arg("from", "ISO start date"),
                     arg("to", "ISO end date"),
                 ],
@@ -2067,14 +2071,11 @@ def _preview_summary(payload: dict[str, Any]) -> str:
         return "INVALID: {}".format(payload.get("error"))
     if payload.get("reboot"):
         return (
-            "valid: @reboot runs once when the daemon starts, never on a "
-            "timetable"
+            "valid: @reboot runs when cronstable starts, without a timetable"
         )
     parts = ["valid: {}".format(payload["description"])]
     if payload.get("never_fires"):
-        parts.append(
-            "WARNING: no future occurrence, this schedule never fires"
-        )
+        parts.append("WARNING: this schedule has no future runs")
     else:
         warnings = sum(
             1 for f in payload["lint"] if f.get("level") == "warning"
@@ -2086,7 +2087,7 @@ def _preview_summary(payload: dict[str, Any]) -> str:
             )
         fires = payload.get("fires") or []
         if fires:
-            parts.append("first fire {}".format(fires[0]))
+            parts.append("first scheduled run {}".format(fires[0]))
     return "; ".join(parts)
 
 
@@ -2095,8 +2096,8 @@ def _why_summary(payload: dict[str, Any]) -> str:
     name = payload["job"]
     if payload.get("reboot"):
         return (
-            "job {!r} is @reboot: it runs once when the daemon starts and "
-            "never fires on a timetable".format(name)
+            "job {!r} is @reboot: it runs when cronstable starts and "
+            "has no scheduled run time".format(name)
         )
     if payload["matches"]:
         text = "YES: the schedule of job {!r} selects {}".format(
@@ -2106,12 +2107,12 @@ def _why_summary(payload: dict[str, Any]) -> str:
         # so it belongs in the one-line verdict, not only in the notes.
         for note in payload["notes"]:
             if note["code"].startswith("dst-"):
-                text += "; BUT " + note["message"]
+                text += "; " + note["message"]
         if not payload["enabled"]:
             return text + ", but the job is disabled, so it did not launch"
         return text + (
-            "; if no run is on record (cron_list_runs), look at execution, "
-            "not the schedule: daemon downtime, concurrencyPolicy, or "
+            "; if no run is recorded (cron_list_runs), check for "
+            "server downtime, concurrencyPolicy limits, or "
             "cluster leadership"
         )
     matched = [c["field"] for c in payload["checks"] if c["matched"]]

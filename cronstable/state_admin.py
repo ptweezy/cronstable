@@ -206,9 +206,13 @@ def cmd_restore(config_arg: str, archive: str, force: bool) -> int:
     )
     if populated and not force:
         print(
-            "state: refusing to restore into the non-empty store at {} "
-            "(pass --force to merge into it; NOT safe while a daemon "
-            "uses it)".format(base),
+            (
+                "state: the destination store at {} is not empty. To "
+                "merge this "
+                "backup, stop every cronstable process using this "
+                "store, then pass"
+                " --force"
+            ).format(base),
             file=sys.stderr,
         )
         return 1
@@ -333,9 +337,12 @@ def cmd_migrate(
     )
     if populated and not force:
         print(
-            "state: refusing to migrate into the non-empty store at {} "
-            "(pass --force to overwrite; NOT safe while a daemon uses "
-            "it)".format(dest_base),
+            (
+                "state: the destination store at {} is not empty. To "
+                "overwrite it,"
+                " stop every cronstable process using this store, then pass "
+                "--force"
+            ).format(dest_base),
             file=sys.stderr,
         )
         return 1

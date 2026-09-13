@@ -4096,7 +4096,10 @@ def _set_fails_when(
 def test_fail_reason_always():
     job = _fresh_job()
     _set_fails_when(job, always=True)
-    assert job.fail_reason == "failsWhen=always"
+    assert (
+        job.fail_reason
+        == "configured to mark every run as failed (failsWhen.always)"
+    )
     assert job.failed is True
 
 
@@ -4104,7 +4107,7 @@ def test_fail_reason_nonzero_return():
     job = _fresh_job()
     _set_fails_when(job, nonzero=True)
     job.retcode = 5
-    assert job.fail_reason == ("failsWhen=nonzeroReturn and retcode=5")
+    assert job.fail_reason == ("command exited with code 5")
 
 
 def test_fail_reason_produces_stdout():
@@ -4113,7 +4116,7 @@ def test_fail_reason_produces_stdout():
     job.retcode = 0
     job.stdout = "some output\n"
     assert job.fail_reason == (
-        "failsWhen=producesStdout and stdout is not empty"
+        "command wrote to stdout (configured to count as a failure)"
     )
 
 
@@ -4126,7 +4129,7 @@ def test_fail_reason_produces_stdout_via_discarded_count():
     job.stdout = None
     job.stdout_discarded = 3
     assert job.fail_reason == (
-        "failsWhen=producesStdout and stdout is not empty"
+        "command wrote to stdout (configured to count as a failure)"
     )
 
 
@@ -4136,7 +4139,7 @@ def test_fail_reason_produces_stderr():
     job.retcode = 0
     job.stderr = "an error\n"
     assert job.fail_reason == (
-        "failsWhen=producesStderr and stderr is not empty"
+        "command wrote to stderr (configured to count as a failure)"
     )
 
 

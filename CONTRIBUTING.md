@@ -71,6 +71,33 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 > write `# pragma: no cover (windows)`, not a bare `# pragma: no cover`. See
 > [the pragma vocabulary](#coverage-pragmas).
 
+## Generated build files
+
+Edit `pyproject.toml` for development dependencies and optional-extra version
+floors. `requirements_dev.txt` and `pyinstaller/requirements/*.txt` are
+generated from it. The binary lanes still choose which extras to install,
+their failure policy, and any platform-specific cap.
+
+The eight Dockerfiles share `docker/templates/Dockerfile`; distro-specific
+base images, packages, and runtime settings live in `docker/images.toml`.
+The supported image paths and platforms remain in `.github/docker-matrix.json`.
+After changing these inputs, regenerate with Python 3.11 or newer:
+
+```sh
+python scripts/generate_build_files.py
+python scripts/generate_build_files.py --check
+```
+
+Commit the generated files with their inputs. CI checks freshness before its
+static checks. Builds consume the checked-in files directly, including on
+Python 3.10; they do not run the generator.
+
+Simple job options declare their default, YAML validator, and fingerprint
+policy together in `cronstable.config.JOB_SCALAR_FIELDS`. Normalization and
+secret-bearing values keep explicit code paths. An added identity field must
+preserve the existing v1 digests when its value is the default; the fingerprint
+tests protect persisted retries and reboot markers from accidental changes.
+
 ## Branching
 
 The project develops on a single branch, `main`. Open your pull request

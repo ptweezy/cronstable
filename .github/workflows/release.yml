@@ -428,6 +428,8 @@ jobs:
         with:
           python-version: '3.14'
       # tox-uv pulls in uv and makes tox provision envs + install deps with it.
+      - name: Check generated build files
+        run: python scripts/generate_build_files.py --check
       - run: pip install tox tox-uv
       - run: tox -p auto -e lint,mypy,bandit,openapi
 
@@ -956,7 +958,7 @@ jobs:
               # The shared script has verify_extra.py prove the result runs a
               # loop (a source build can miscompile under QEMU) and uninstalls
               # it otherwise, so the binary cleanly falls back to asyncio.
-              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+              sh pyinstaller/install_extra.sh uvloop "@" soft "using asyncio"
               # Bundle orjson (the `speedups` extra): a wheel on amd64/arm64,
               # else a Rust source build behind RUST_SETUP. armv7 passes no
               # RUST_SETUP by choice (see the matrix comment), so that row falls
@@ -971,7 +973,7 @@ jobs:
               # always exists, soft where it source-builds: a build that fails
               # the sealed-box round trip is uninstalled, so push fails closed
               # rather than shipping a miscompiled libsodium.
-              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" ${{ matrix.nacl }} "push extra not bundled"
+              sh pyinstaller/install_extra.sh pynacl "@" ${{ matrix.nacl }} "push extra not bundled"
               # Bundle cryptography (the post-quantum half of the `push` extra) so the frozen daemon
               # seals post-quantum X-Wing push. NO APOSTROPHES BELOW: this
               # whole script is the argument of a single-quoted sh -euc, so
@@ -1015,7 +1017,7 @@ jobs:
                   export PATH CARGO_HOME RUSTUP_HOME OPENSSL_DIR OPENSSL_STATIC
                 fi
                 if [ "$pq_ready" = 1 ]; then
-                  sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
+                  sh pyinstaller/install_extra.sh cryptography "@" \
                     ${{ matrix.pq }} "post-quantum push not bundled"
                 else
                   echo "cryptography: source-build toolchain setup failed; post-quantum push not bundled"
@@ -1369,7 +1371,7 @@ jobs:
               # can miscompile under QEMU) and uninstalls it otherwise, so a
               # broken uvloop is never frozen in; the binary then cleanly
               # falls back to asyncio.
-              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+              sh pyinstaller/install_extra.sh uvloop "@" soft "using asyncio"
               # Bundle orjson (the `speedups` extra): a wheel on amd64/arm64,
               # else a Rust source build. RUST_SETUP (per-libc, from the
               # matrix) installs a CURRENT Rust via rustup (distro rustc is
@@ -1389,7 +1391,7 @@ jobs:
               # uninstalled, so the binary never ships a miscompiled
               # libsodium (push fails closed).
               ${{ matrix.nacl_tools }}
-              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh pynacl "@" soft "push extra not bundled"
               # Bundle cryptography (the post-quantum half of the `push` extra) so the frozen daemon
               # seals post-quantum X-Wing push. The wheel rows take it hard;
               # the pq_src rows first install the distro Rust and OpenSSL
@@ -1428,7 +1430,7 @@ jobs:
                   export PATH CARGO_HOME RUSTUP_HOME OPENSSL_DIR OPENSSL_STATIC
                 fi
                 if [ "$pq_ready" = 1 ]; then
-                  sh pyinstaller/install_extra.sh cryptography "cryptography>=48" \
+                  sh pyinstaller/install_extra.sh cryptography "@" \
                     ${{ matrix.pq }} "post-quantum push not bundled"
                 else
                   echo "cryptography: source-build toolchain setup failed; post-quantum push not bundled"
@@ -1654,9 +1656,9 @@ jobs:
               # rustc past the orjson MSRV, so RUST_SETUP stays unset and the
               # script falls back to the stdlib json encoder (cronstable/_json),
               # which is byte-compatible.
-              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+              sh pyinstaller/install_extra.sh uvloop "@" soft "using asyncio"
               sh pyinstaller/install_orjson.sh
-              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh pynacl "@" soft "push extra not bundled"
               sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
               /v/bin/pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version          # smoke test: fails the job if the bundle is broken
@@ -1853,9 +1855,9 @@ jobs:
               # rustup publishes no host toolchain for either ABI, so
               # RUST_SETUP stays unset and the binary uses the stdlib json
               # encoder (cronstable/_json), which is byte-compatible.
-              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+              sh pyinstaller/install_extra.sh uvloop "@" soft "using asyncio"
               sh pyinstaller/install_orjson.sh
-              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh pynacl "@" soft "push extra not bundled"
               # Bundle cryptography (the post-quantum half of the push extra)
               # on the armv6 row, from the wheel pq-wheel-armv6 built and the
               # preceding step fetched: PIP_ONLY_BINARY keeps pip off the sdist,
@@ -1865,7 +1867,7 @@ jobs:
               # toolchain for its ABI at all and stays on x25519.
               if [ "${{ matrix.arch }}" = armv6 ] && ls /src/pq-wheels/cryptography-*.whl >/dev/null 2>&1; then
                 PIP_FIND_LINKS=/src/pq-wheels PIP_ONLY_BINARY=cryptography \
-                  sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
+                  sh pyinstaller/install_extra.sh cryptography "@" soft "post-quantum push not bundled"
               else
                 echo "cryptography: no wheel for this row; post-quantum push not bundled"
               fi
@@ -2076,9 +2078,9 @@ jobs:
               # from rustup, which publishes loongarch64 host toolchains for
               # both libcs; orjson soft-fails to the stdlib json encoder
               # (cronstable/_json) if that build does not come off.
-              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+              sh pyinstaller/install_extra.sh uvloop "@" soft "using asyncio"
               RUST_SETUP="${{ matrix.rust_setup }}" sh pyinstaller/install_orjson.sh
-              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh pynacl "@" soft "push extra not bundled"
               # Bundle cryptography (the post-quantum half of the `push` extra): no loong64 wheel
               # exists, so it builds from its sdist against the distro
               # OpenSSL 3.5 (pq_tools) with the rustup Rust the orjson step
@@ -2092,7 +2094,7 @@ jobs:
               # that cannot.
               if { ${{ matrix.pq_tools }}; } && { [ -x /opt/cargo/bin/cargo ] || sh -c "${{ matrix.rust_setup }}"; }; then
                 PATH=/opt/cargo/bin:$PATH CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup \
-                  sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
+                  sh pyinstaller/install_extra.sh cryptography "@" soft "post-quantum push not bundled"
               else
                 echo "cryptography: source-build toolchain setup failed; post-quantum push not bundled"
               fi
@@ -2268,7 +2270,7 @@ jobs:
           # confirm it imports and runs a loop, else uninstalls it so the binary
           # falls back to asyncio.
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+            sh pyinstaller/install_extra.sh uvloop "@" soft "using asyncio"
           # Bundle orjson (the `speedups` extra); macOS ships wheels (no Rust).
           # The shared script round-trip-verifies it and drops a broken build, so
           # the binary falls back to stdlib json (cronstable/_json).
@@ -2279,7 +2281,7 @@ jobs:
           # are HARD failures on this lane (a soft-fail would silently
           # ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
+            sh pyinstaller/install_extra.sh pynacl "@" hard
           # Bundle cryptography (the post-quantum half of the `push` extra) so the frozen daemon
           # seals post-quantum X-Wing push. Every row declares `pq`: the
           # arm64 rows take the newest release, and the Intel rows cap at
@@ -2288,7 +2290,7 @@ jobs:
           # probe before freezing.
           if [ -n "${{ matrix.pq }}" ]; then
             PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-              sh pyinstaller/install_extra.sh cryptography "cryptography>=48${{ matrix.pqcap }}" \
+              sh pyinstaller/install_extra.sh cryptography "@${{ matrix.pqcap }}" \
                 ${{ matrix.pq }} "post-quantum push not bundled"
           fi
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
@@ -2561,7 +2563,7 @@ jobs:
             # shared script has verify_extra.py prove the result runs a loop
             # and uninstalls it otherwise, so a miscompiled uvloop is never
             # frozen in and the binary cleanly falls back to asyncio.
-            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+            sh pyinstaller/install_extra.sh uvloop "@" soft "using asyncio"
             # Bundle orjson (the `speedups` extra) where this lane attempts
             # it; see the matrix comment for why the emulated row does not.
             # Rust comes from pkg (1.96+, past orjson's MSRV), so the
@@ -2580,7 +2582,7 @@ jobs:
             # that fails the sealed-box round trip is uninstalled, so push
             # fails closed rather than shipping a miscompiled libsodium.
             SODIUM_INSTALL=system \
-              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh pynacl "@" soft "push extra not bundled"
             # Bundle cryptography (the post-quantum half of the `push` extra) from its sdist on
             # the row that attempts it (see the matrix): the port OpenSSL
             # 3.5 under /usr/local is the library, linked statically so the
@@ -2589,7 +2591,7 @@ jobs:
             # drops a build that cannot.
             if [ "${{ matrix.pq }}" = "1" ]; then
               OPENSSL_DIR=/usr/local OPENSSL_STATIC=1 \
-                sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
+                sh pyinstaller/install_extra.sh cryptography "@" soft "post-quantum push not bundled"
             else
               echo "cryptography: skipped on this lane; post-quantum push not bundled"
             fi
@@ -2745,7 +2747,7 @@ jobs:
             # Bundle uvloop (the `speedups` extra): the pkg_add above already
             # satisfies the floor, so this resolves without a source build.
             # The shared script still round-trips it before freezing.
-            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+            sh pyinstaller/install_extra.sh uvloop "@" soft "using asyncio"
             # orjson is skipped on this lane: OpenBSD ships rust 1.94.1, below
             # orjson's MSRV, so a source build cannot succeed and the packaged
             # py3-orjson is below the floor pyproject spells. The binary uses
@@ -2761,7 +2763,7 @@ jobs:
             LDFLAGS="-L/usr/local/lib"
             export CFLAGS LDFLAGS
             SODIUM_INSTALL=system \
-              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh pynacl "@" soft "push extra not bundled"
             # Bundle cryptography (the post-quantum half of the `push` extra) from its sdist: no
             # OpenBSD wheel exists. The base LibreSSL is no use to it (its
             # ML-KEM compiles only against OpenSSL 3.5 or newer), so the
@@ -2773,7 +2775,7 @@ jobs:
             # that cannot.
             OPENSSL_INCLUDE_DIR=/usr/local/include/eopenssl35 \
               OPENSSL_LIB_DIR=/usr/local/lib/eopenssl35 OPENSSL_STATIC=1 \
-              sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
+              sh pyinstaller/install_extra.sh cryptography "@" soft "post-quantum push not bundled"
             # Bundle zeroconf (the `discovery` extra): pure Python with
             # optional speedups, so a HARD install here too. LGPL-2.1; the
             # in-binary notice, Release source archive and public build recipe
@@ -2899,14 +2901,14 @@ jobs:
             # uvloop and orjson both come from pkgsrc above, at versions past
             # the floors these scripts spell, so neither needs a source build;
             # the scripts still round-trip both before freezing.
-            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+            sh pyinstaller/install_extra.sh uvloop "@" soft "using asyncio"
             sh pyinstaller/install_orjson.sh
             # Bundle pynacl (the `push` extra) against the pkgsrc libsodium
             # rather than PyNaCl's bundled autotools build. Soft: a build that
             # fails the sealed-box round trip is uninstalled, so push fails
             # closed rather than shipping a miscompiled libsodium.
             SODIUM_INSTALL=system \
-              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh pynacl "@" soft "push extra not bundled"
             # Bundle cryptography (the post-quantum half of the `push` extra) from its sdist: no
             # NetBSD wheel exists. pkgsrc's openssl (3.6, past the 3.5 that
             # ML-KEM needs) and rust (past the 1.83 MSRV), both installed
@@ -2915,7 +2917,7 @@ jobs:
             # verify_extra.py seals a real X-Wing probe and drops a build
             # that cannot.
             OPENSSL_DIR=/usr/pkg OPENSSL_STATIC=1 \
-              sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
+              sh pyinstaller/install_extra.sh cryptography "@" soft "post-quantum push not bundled"
             # Bundle zeroconf (the `discovery` extra): pure Python with
             # optional speedups, so a HARD install. LGPL-2.1; see LICENSING.md.
             sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
@@ -3038,17 +3040,17 @@ jobs:
             # 3.5, which the interpreter already links, so the bundle carries
             # one OpenSSL. Both are soft: verify_extra.py proves a sealed-box
             # round trip and a real X-Wing seal, and drops a build that fails.
-            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+            sh pyinstaller/install_extra.sh uvloop "@" soft "using asyncio"
             sh pyinstaller/install_orjson.sh
             PKG_CONFIG_PATH=/opt/ooce/lib/amd64/pkgconfig \
               CFLAGS="-I/opt/ooce/include" \
               LDFLAGS="-L/opt/ooce/lib/amd64 -R/opt/ooce/lib/amd64" \
               SODIUM_INSTALL=system \
-              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" soft "push extra not bundled"
+              sh pyinstaller/install_extra.sh pynacl "@" soft "push extra not bundled"
             if [ -x /opt/ooce/bin/cargo ]; then
               PATH="/opt/ooce/bin:$PATH" \
                 OPENSSL_LIB_DIR=/usr/lib/amd64 OPENSSL_INCLUDE_DIR=/usr/include \
-                sh pyinstaller/install_extra.sh cryptography "cryptography>=48" soft "post-quantum push not bundled"
+                sh pyinstaller/install_extra.sh cryptography "@" soft "post-quantum push not bundled"
             else
               echo "cryptography: no rust on this host; post-quantum push not bundled"
             fi
@@ -3214,7 +3216,7 @@ jobs:
           # and verify are HARD failures on this lane (a soft-fail would
           # silently ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.6.2" hard
+            sh pyinstaller/install_extra.sh pynacl "@" hard
           # Bundle cryptography (the post-quantum half of the `push` extra) so the frozen daemon
           # seals post-quantum X-Wing push. amd64 and i686 take a wheel
           # (i686 capped by `pqcap` at the last release with a win32 wheel);
@@ -3252,7 +3254,7 @@ jobs:
             fi
             if [ "$pq_ready" = 1 ]; then
               PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-                sh pyinstaller/install_extra.sh cryptography "cryptography>=48${{ matrix.pqcap }}" \
+                sh pyinstaller/install_extra.sh cryptography "@${{ matrix.pqcap }}" \
                   ${{ matrix.pq }} "post-quantum push not bundled"
             else
               echo "cryptography: source-build toolchain setup failed; post-quantum push not bundled"

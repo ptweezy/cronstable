@@ -1854,7 +1854,7 @@ class DagScheduler:
             "dag_failure",
             success=False,
             name=dag_name,
-            subject="DAG {!r} run {} failed".format(dag_name, run_key),
+            subject=("Workflow {!r} run {} failed").format(dag_name, run_key),
             message="{} task(s) failed: {}".format(len(failed), detail),
             dag=dag_name,
             run_key=run_key,
@@ -1885,9 +1885,9 @@ class DagScheduler:
                 "approval_waiting",
                 success=False,
                 name=dagcfg.name,
-                subject="DAG {!r} run {} awaiting approval: {}".format(
-                    dagcfg.name, ref[1], taskkey
-                ),
+                subject=(
+                    "Workflow {!r} run {} is waiting for approval: {}"
+                ).format(dagcfg.name, ref[1], taskkey),
                 message=(
                     "Task {} is an approval gate awaiting a decision; "
                     "approve or reject it to let the run continue.".format(
@@ -2579,7 +2579,7 @@ class DagScheduler:
         """Record an approval-gate decision, then advance the run."""
         dagcfg = self._dags().get(dag_name)
         if dagcfg is None:
-            return {"ok": False, "reason": "no such dag"}
+            return {"ok": False, "reason": ("workflow not found")}
         task_id = taskkey.split("#", 1)[0]
         task = dagcfg.spec.by_id.get(task_id)
         on_reject = task.on_reject if task is not None else dag.FAILED
@@ -2604,7 +2604,7 @@ class DagScheduler:
         source = await self._read(name, run_key)
         backend = self._backend()
         if config is None or source is None or backend is None:
-            raise recovery.RecoveryError("DAG run not found")
+            raise recovery.RecoveryError(("workflow run not found"))
         records = await asyncio.wait_for(
             backend.list_records(
                 jobstate.ARTIFACT_STREAM_PREFIX
@@ -2742,7 +2742,9 @@ class DagScheduler:
         backend = self._backend()
         start, end = _parse_iso(start_iso), _parse_iso(end_iso)
         if backend is None or name not in self._dags():
-            raise recovery.RecoveryError("DAG or state is unavailable")
+            raise recovery.RecoveryError(
+                ("workflow or state store is unavailable")
+            )
         if start is None or end is None or end < start:
             raise recovery.RecoveryError("invalid recovery date range")
         ns = "recoverybatch/" + name
@@ -2966,14 +2968,14 @@ class DagScheduler:
         """
         dagcfg = self._dags().get(dag_name)
         if dagcfg is None or dagcfg.schedule_job is None:
-            return {"ok": False, "reason": "no such scheduled dag"}
+            return {"ok": False, "reason": ("scheduled workflow not found")}
         sched = dagcfg.schedule_job
         if not isinstance(sched.schedule, CronTab):
             # e.g. the literal "@reboot": no computable instants to replay --
             # a clean refusal (-> 400), not a 500 out of _compute_next_fire.
             return {
                 "ok": False,
-                "reason": "the dag's schedule has no computable instants",
+                "reason": ("the workflow has no future scheduled run times"),
             }
         start = _parse_iso(start_iso)
         end = _parse_iso(end_iso)

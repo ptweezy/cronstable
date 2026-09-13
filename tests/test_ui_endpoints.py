@@ -496,7 +496,7 @@ async def test_web_status_text_says_never_fires():
     resp = await cron._web_get_status(Req())
     lines = resp.text.splitlines()
     parked = next(line for line in lines if line.startswith("parked:"))
-    assert "never fires" in parked
+    assert "no future runs" in parked
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +650,9 @@ def test_dead_schedule_never_enters_the_fire_index_but_warns(caplog):
     warned = [
         rec
         for rec in caplog.records
-        if "NEVER fire" in rec.getMessage() and "'parked'" in rec.getMessage()
+        if rec.name == "cronstable"
+        and "no future runs" in rec.getMessage()
+        and "'parked'" in rec.getMessage()
     ]
     assert len(warned) == 1
 

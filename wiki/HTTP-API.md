@@ -287,7 +287,7 @@ The payload carries the 24x60 `grid`, the 60-bin
 `by_minute_fires`/`by_minute_jobs` histograms, `by_hour`, the
 `busiest_minute` headline, `empty_minutes`, `top_cells` (each naming up to
 ten jobs), and an `excluded` count of disabled and `@reboot` jobs. For the
-full field reference, see [schedule pressure](Schedule-Pressure).
+full field reference, see [schedule load](Schedule-Pressure).
 
 ### `GET /schedule/duplicates`
 

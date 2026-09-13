@@ -53,7 +53,7 @@ Every schedule surface understands them from the engine's parsed ground truth, n
 - The plain-English describers, server and dashboard alike: `0 0 L-3 * *` reads "At 00:00, on 3 days before the last day of the month".
 - [Schedule linting](Schedule-Linting): the preceding month-reachability checks, plus the day-field AND warning when combined with a weekday restriction.
 - The no-run explainer (`GET /schedule/why`, Model Context Protocol `cron_why_no_run`) decomposes them per instant: "day-of-month wanted the weekday nearest day 15 (15W)".
-- [Schedule pressure](Schedule-Pressure), [duplicate detection](Duplicate-Schedule-Detection) (semantic equality treats `fri#3` and `5#3` as equal), and the fire previews.
+- [Schedule load](Schedule-Pressure), [duplicate detection](Duplicate-Schedule-Detection) (semantic equality treats `fri#3` and `5#3` as equal), and the fire previews.
 - The [calendar export and week calendar](Calendar-Export), where month-shaped jobs land on the days the engine fires.
 
 See also: [Schedules and Timezones](Schedules-and-Timezones) for the whole dialect, [Hashed Schedules](Hashed-Schedules) for the `H` forms.

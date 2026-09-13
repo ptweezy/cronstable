@@ -2,21 +2,23 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/cronstable.svg?logo=pypi&logoColor=white&color=0073b7)](https://pypi.org/project/cronstable/)
 [![GitHub release](https://img.shields.io/github/v/release/ptweezy/cronstable?logo=github&color=8a2be2)](https://github.com/ptweezy/cronstable/releases/latest)
-[![Release downloads](https://img.shields.io/github/downloads/ptweezy/cronstable/total?logo=github&label=binary%20downloads&color=fb8c00)](https://github.com/ptweezy/cronstable/releases)
-[![Python versions](https://img.shields.io/pypi/pyversions/cronstable.svg?logo=python&logoColor=ffd343&color=306998)](https://pypi.org/project/cronstable/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 [![PyPI status](https://img.shields.io/pypi/status/cronstable.svg?color=2ea44f)](https://pypi.org/project/cronstable/)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-00bcd4)](https://github.com/ptweezy/cronstable/releases/latest)
-[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20amd64v3%20%7C%20arm64%20%7C%20armv7%20%7C%20armv6%20%7C%20i686%20%7C%20ppc64le%20%7C%20s390x%20%7C%20riscv64%20%7C%20loong64%20%7C%20mips64le%20%7C%20armel-c2185b)](https://github.com/ptweezy/cronstable/releases/latest)
 [![CI](https://github.com/ptweezy/cronstable/actions/workflows/release.yml/badge.svg)](https://github.com/ptweezy/cronstable/actions/workflows/release.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/ptweezy/cronstable?logo=codecov&logoColor=white&color=f01f7a)](https://codecov.io/gh/ptweezy/cronstable)
+
+[![Release downloads](https://img.shields.io/github/downloads/ptweezy/cronstable/total?logo=github&label=binary%20downloads&color=fb8c00)](https://github.com/ptweezy/cronstable/releases)
 [![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fcronstable-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/cronstable/pkgs/container/cronstable)
 [![Docker Hub](https://img.shields.io/badge/docker.io-ptweezy%2Fcronstable-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/ptweezy/cronstable)
-[![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+[![Python versions](https://img.shields.io/pypi/pyversions/cronstable.svg?logo=python&logoColor=ffd343&color=306998)](https://pypi.org/project/cronstable/)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-00bcd4)](https://github.com/ptweezy/cronstable/releases/latest)
+[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20amd64v3%20%7C%20arm64%20%7C%20armv7%20%7C%20armv6%20%7C%20i686%20%7C%20ppc64le%20%7C%20s390x%20%7C%20riscv64%20%7C%20loong64%20%7C%20mips64le%20%7C%20armel-c2185b)](https://github.com/ptweezy/cronstable/releases/latest)
 
 / kraahn-stuh-bl /
 
-A stability-focused, container-friendly, optionally-distributed, fault-tolerant, leader-electing, resumable, configurable, precompiled, multi-architecture, portable, batteries-included, security-hardened, production-ready cron replacement.
+A cron replacement with retries, alerts, saved run history, workflows, and web and terminal dashboards. Run it on one machine or across a cluster.
 
 ## Why cronstable?
 
@@ -484,7 +486,7 @@ recent runs**. Jobs with [resource monitoring](#resource-monitoring) add live
 **CPU and memory** chips while they run, and a cluster adds each job's
 **owner node**. Everything is sortable, filterable, and searchable, and when
 something is failing a **verdict bar** correlates the failures into one
-headline ("4 share exit=69, likely one cause"). Click any job (or press
+headline ("4 share exit code 69, may share a cause"). Click any job (or press
 `Enter`) to open its detail drawer:
 
 | Live log tail | Run history | Schedule, explained |
@@ -511,7 +513,7 @@ decide **approval gates** with a click, from any node in the fleet.
 | The task graph | A human approval gate |
 | :---: | :---: |
 | [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png) | [![The DAG drawer's task list with an approval gate awaiting a decision, Approve and Reject buttons armed](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-approval.png) |
-| A `data-quality-gate` diamond: fan-out checks that reconverge on a `certify` task, colored by state as the run advances. | A release train **parked on a human**: the build succeeded, the approval gate is `awaiting`, and the sensor and publish tasks queue behind your decision. |
+| A `data-quality-gate` diamond: fan-out checks that reconverge on a `certify` task, colored by state as the run advances. | A release workflow **waiting for approval**: the build succeeded, the approval gate is `awaiting`, and the sensor and publish tasks queue behind your decision. |
 
 ### The whole fleet on one page
 
@@ -531,14 +533,14 @@ so any node can serve the whole fleet from one page.
 
 Three panels are built for incident response. The verdict bar's incident
 timeline lays out every job's most recent finish, newest first, with the
-correlated blast-radius set highlighted. The mitigate console starts or
-cancels the failing set in bulk and copies a Markdown incident summary for
-your ticket. The multi-tail console merges up to four jobs' live logs into one
+jobs with similar failures highlighted. The job actions panel starts or
+cancels failing jobs together and copies a Markdown incident summary for
+your ticket. The live logs panel merges up to four jobs' live logs into one
 pane, like tailing a set of pods.
 
 | Incident timeline | Merged multi-tail |
 | :---: | :---: |
-| [![The incident timeline overlay: every job's most recent run, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity colors and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png) |
+| [![The incident timeline overlay: every job's most recent run, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png) | [![The live logs panel merging four jobs' live logs with identity colors and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png) |
 | "What happened, in what order": relative times, outcome glyphs, failure reasons, exit codes, durations, and a **failing only** filter. | Four streams, one pane: identity-colored prefixes, `end of run output` markers, auto re-attach on each job's next run. |
 
 ### Wallboards, heatmaps, and the state store
@@ -658,7 +660,7 @@ The same incident tools are here, from the timeline to the multi-tail:
 
 | Incident timeline | Merged multi-tail |
 | :---: | :---: |
-| [![The incident timeline: every job's most recent finish, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png) |
+| [![The incident timeline: every job's most recent finish, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png) | [![The live logs panel merging four jobs' live logs with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png) |
 
 So are the wallboard, the heatmap, and the state inspector:
 
@@ -954,7 +956,7 @@ Six features answer questions about schedules, each with its own wiki page:
   so a fleet of hourly jobs spreads across the hour instead of stampeding
   at `:00`
   ([Hashed Schedules](https://github.com/ptweezy/cronstable/wiki/Hashed-Schedules)).
-* Schedule pressure: `GET /schedule/pressure` buckets the next 24 hours of
+* Schedule load: `GET /schedule/pressure` buckets the next 24 hours of
   fires into a collision heatmap, drawn in both dashboards
   ([Schedule Pressure](https://github.com/ptweezy/cronstable/wiki/Schedule-Pressure)).
 * Duplicate detection: `GET /schedule/duplicates` groups jobs whose

@@ -33,13 +33,13 @@ PIPUNINST="${PIPUNINST:-$PIP uninstall -y}"
 RUST_SETUP="${RUST_SETUP:-}"
 here=$(dirname "$0")
 
-# tests/test_extra_pins_parity.py checks the floor spelled below against
-# pyproject's speedups floor: bump them together.
-if $PIP install "orjson>=3.11.6"; then
+# Generated from pyproject.toml alongside the Dockerfiles and dev requirements.
+spec=$(cat "$here/requirements/orjson.txt") || exit 2
+if $PIP install "$spec"; then
     :  # a prebuilt wheel (or a toolchain already present) installed it
 elif [ -n "$RUST_SETUP" ] && sh -c "$RUST_SETUP" \
     && env PATH="/opt/cargo/bin:$PATH" CARGO_HOME=/opt/cargo \
-        RUSTUP_HOME=/opt/rustup $PIP install "orjson>=3.11.6"; then
+        RUSTUP_HOME=/opt/rustup $PIP install "$spec"; then
     :  # no wheel for this arch; a current Rust (rustup) source-built it
 else
     echo "orjson: no wheel and no working source build here; using stdlib json"

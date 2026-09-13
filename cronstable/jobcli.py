@@ -91,10 +91,9 @@ def _endpoint() -> tuple[str, str]:
     token = os.environ.get(ENV_TOKEN)
     if not url or not token:
         raise _CliError(
-            "not running inside a cronstable job: {} is not set (these "
-            "commands reach the daemon's loopback state endpoint, which is "
-            "injected into a job's environment; is a `state` section with "
-            "jobApi enabled configured?)".format(ENV_URL)
+            "job state connection is unavailable: {} is not set. Run this "
+            "command inside a cronstable job and configure a `state` "
+            "section with state.jobApi.enabled set to true.".format(ENV_URL)
         )
     return url, token
 
@@ -498,9 +497,11 @@ def _xcom_scope() -> str:
     scope = os.environ.get(ENV_DAG_XCOM_SCOPE)
     if not scope:
         raise _CliError(
-            "not running inside a cronstable DAG task: {} is not set (xcom "
-            "publishes/reads task outputs within a dag_run; it only works "
-            "for a task the DAG scheduler launched)".format(ENV_DAG_XCOM_SCOPE)
+            "workflow task context is unavailable: {} is not set. "
+            "Run xcom inside a task started by a cronstable workflow "
+            "to share outputs with other tasks in that run.".format(
+                ENV_DAG_XCOM_SCOPE
+            )
         )
     return scope
 

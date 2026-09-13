@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cronstable"
-description = "A modern, distributed, fault-tolerant, highly available, leader-electing, container-friendly, highly configurable, precompiled, multi-architecture, portable, security-hardened, production-ready cron replacement."
+description = "A cron replacement with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -176,24 +176,22 @@ push = [
 # installed is a ConfigError, never a silent no-advert.
 discovery = ["zeroconf>=0.149.16"]
 dev = [
-    # the cluster mTLS tests mint throwaway certs with it, and the X-Wing
-    # sealing tests need its HPKE module (>=48). Same two lines as the
-    # push extra (the second is the capped Intel macOS and 32-bit
-    # Windows line); see requirements_dev.txt for what the tests do where
-    # they resolve to nothing.
+    # Canonical dev list: scripts/generate_build_files.py emits
+    # requirements_dev.txt for tox and pip. Edit dependencies here.
+    # The mTLS and X-Wing tests need cryptography; use the push extra's
+    # wheel markers and skip those tests where no wheel is available.
+    # On a 32-bit Linux userland with a 64-bit kernel, install under
+    # linux32 so the marker sees the userland architecture (see push).
     "cryptography>=48,<51; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     "cryptography>=48,<49; (sys_platform == 'darwin' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'x86')",
-    # The optional-extra deps the tests must really exercise (orjson, pynacl,
-    # zeroconf); requirements_dev.txt documents why each is here.  Without
-    # them a `pip install -e .[dev]` + `pytest` checkout runs the suite in
-    # the importorskip blind spot that file warns about: the accelerated
-    # JSON, push-sealing, and mDNS test arms all self-skip.  This list and
-    # requirements_dev.txt are pinned equal by tests/test_dev_deps_parity.py.
+    # Exercise the real accelerated JSON, push-sealing and mDNS paths.
+    # orjson is wheel-only in dev: omit platforms/interpreters that would
+    # need a Rust source build. PyNaCl and zeroconf cover every CI runner.
     "orjson>=3.11.6; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
     "pynacl>=1.6.2",
     "zeroconf>=0.149.16",
-    # drives a real Chromium for the client/daemon cron-engine differential;
-    # requirements_dev.txt explains the marker and the separate browser step.
+    # Browser-backed tests require a separate `playwright install chromium`
+    # step after pip installs the library. No wheel/sdist exists on win-arm64.
     "playwright; platform_machine != 'ARM64' or sys_platform != 'win32'",
     # security linter; bandit[toml] reads [tool.bandit] from pyproject.toml.
     "bandit[toml]",
