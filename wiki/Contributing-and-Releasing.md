@@ -220,11 +220,10 @@ metadata. You can find these files and the scan and extraction logs in the
 
 After publication, the `winget` job downloads the release MSIs and `SHA256SUMS`
 and verifies that both match the scanned hashes. It submits the validated
-manifests with `wingetcreate submit`. After submission succeeds, cleanup closes
-the submitting account's unapproved PRs for lower versions. Release downloads,
-GitHub submission, and Microsoft's upstream validation depend on published
-assets and run at this stage. Missing signing credentials fail preflight;
-the `winget` job also requires signed MSIs as a final check.
+manifests with `wingetcreate submit`. Release downloads, GitHub submission,
+and Microsoft's upstream validation depend on published assets and run at
+this stage. Missing signing credentials fail preflight; the `winget` job also
+requires signed MSIs as a final check.
 
 Defender can flag a signed MSI or its payload. If validation fails, follow the
 [Microsoft validation guide](https://github.com/microsoft/winget-pkgs/blob/master/doc/ValidationFailureGuide.md).
