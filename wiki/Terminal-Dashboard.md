@@ -10,10 +10,10 @@ terminal user interface (TUI).
 
 [![The cronstable TUI against a live 9-node fleet: 70 jobs with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, the cluster owner column, and the verdict bar](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)
 
-*(This screenshot, like the larger gallery in the README's Terminal
-dashboard section, is the real TUI driven against the running
+This screenshot and the [gallery below](#screenshot-gallery) show the TUI
+connected to the running
 [grand tour](https://github.com/ptweezy/cronstable/tree/main/example/grand-tour)
-fleet, the same one the web dashboard's screenshots use.)*
+fleet, which also appears in the web dashboard screenshots.
 
 ```shell
 cronstable tui                              # local daemon on :8080
@@ -245,6 +245,48 @@ multi-tail pane is attached (replay-then-follow, with the page's same
 reconnect throttle).
 
 Run `cronstable tui` against any daemon you can `curl`.
+
+## Screenshot gallery
+
+| Live log tail | Run history | Schedule, explained |
+| :---: | :---: | :---: |
+| [![The Logs tab: a live SSE tail with per-line timestamps, in-log search with match highlighting, and end-of-run markers between runs](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-logs.png) | [![The History tab: success rate, duration stats, and per-run rows with duration bars and CPU seconds](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-history.png) | [![The Schedule tab: the cron expression in plain English with the exact next fire instants from the daemon's own engine](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-schedule.png) |
+
+| Fuzzy command palette | Keyboard-first, with the web page's keys |
+| :---: | :---: |
+| [![The command palette fuzzy-matching "run": global actions plus per-job commands](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-palette.png) | [![The shortcut overlay: the web dashboard's shortcut table verbatim, with terminal extras grouped below](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-shortcuts.png) |
+
+| The task graph, mid-flight | A human approval gate |
+| :---: | :---: |
+| [![The DAG drawer's graph tab: the data-quality-gate diamond as topological layers, states coloring as the run advances](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-graph.png) | [![The DAG drawer's tasks tab: release-train parked on its approval gate, with a approve / R reject armed](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-approval.png) |
+
+| Cluster panel | Fleet view |
+| :---: | :---: |
+| [![The cluster panel: nine gossiping peers, all agreed, with per-node load and status](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-cluster.png) | [![The fleet view: a 70-job by 9-node matrix of live cells: ok, failing, and running with ages](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-fleet.png) |
+
+| Incident timeline | Merged multi-tail |
+| :---: | :---: |
+| [![The incident timeline: every job's most recent finish, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png) | [![The live logs panel merging four jobs' live logs with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png) |
+
+| Wallboard / TV mode | Activity heatmap | Durable-state inspector |
+| :---: | :---: | :---: |
+| [![The wallboard: worst-first tiles with failure ages and exit codes, run sparklines, and the tally foot](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-wallboard.png) | [![The activity heatmap: one row per job, one cell per hour, worst outcome colored and shaded by volume](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-heatmap.png) | [![The state inspector: store inventory, record streams, and document namespaces from the durable state store](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-state.png) |
+
+| Carolina | Amber |
+| :---: | :---: |
+| [![The TUI in the carolina theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-carolina.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-carolina.png) | [![The TUI in the amber theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png) |
+
+| Green | Flat modern |
+| :---: | :---: |
+| [![The TUI in the green theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png) | [![The TUI in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-modern.png) |
+
+| Standard, on paper (light) |
+| :---: |
+| [![The TUI in the standard light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-standard-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-standard-light.png) |
+
+| Startup self-test | Settings |
+| :---: | :---: |
+| [![The TUI boot self-test: link latency, firmware, job set, schedules, and cluster probed live, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-boot.png) | [![The TUI settings panel: theme, color vision, refresh interval, log toggles, zen, and the boot self-test](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-settings.png) |
 
 ## See also
 

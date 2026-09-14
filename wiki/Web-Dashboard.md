@@ -210,6 +210,10 @@ The Schedule tab turns the cron expression into a plain-English reading:
 
 ## DAG orchestration
 
+| The task graph | A human approval gate |
+| :---: | :---: |
+| [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png) | [![The DAG drawer's task list with an approval gate awaiting a decision, Approve and Reject buttons armed](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-approval.png) |
+
 When a [`dags:`](Orchestration-and-DAGs) section is configured, a **`⧉ dags`**
 toolbar button appears; it stays hidden otherwise, like the cluster panel. The
 button toggles the **DAG card** (also *Toggle DAGs card* in the command
@@ -251,6 +255,8 @@ keys, retries, approval gates, and the `dags:` configuration) live on
 [HTTP control API](HTTP-API#dag-endpoints).
 
 ## Durable state inspector
+
+[![The durable-state inspector: record counts per kind, op latencies, and per-primitive tabs](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-state.png)
 
 When a [durable state](Durable-State) backend is enabled, a **`⛁ state`**
 toolbar button appears and toggles the **durable state** card (also *Toggle
@@ -643,6 +649,12 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 
 ## Settings, themes, and notifications
 
+[![The same cronstable board cycling through all ten themes (standard, carolina, amber, green and modern, each in a dark and a light paper variant) and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)
+
+Ten themes and two interface fonts. [GIF version](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.gif).
+
+[![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)
+
 [![The settings panel: theme, compact density, desktop notifications, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)
 
 The settings panel (and the command palette) expose:
@@ -707,6 +719,8 @@ the wordmark knocks it clean over so you can watch a full recovery (on a touch
 screen, a tap nudges it). Under reduced motion the mark parks in a still pose
 that stays honest about daemon state, upright when live and hanging when not.
 Without JavaScript, the letter is printed.
+
+I like to call him double-P, Peter Parker, or PP.
 
 ## Tab title and favicon
 

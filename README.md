@@ -33,153 +33,82 @@ and catch regressions before release.
 
 ### Scheduling
 
-* "Crontab" is in YAML format, and cronstable reads classic crontab files
-  as-is too (see [classic crontab files](#classic-crontab-files))
-* **Business-day schedules**: `LW` is the month's last weekday, `L-3` is three
-  days before month-end, `15W` is the weekday nearest the 15th, and `5#3` is
-  the third Friday. These express payroll and billing cadences, and Quartz day
-  expressions largely paste straight in (see
+* **YAML and classic crontab files**: define jobs in YAML or load an existing
+  crontab (see [classic crontab files](#classic-crontab-files))
+* **Business-day schedules**: run on the last weekday of the month, the
+  weekday nearest a date, or the nth occurrence of a weekday (see
   [business-day schedules](https://github.com/ptweezy/cronstable/wiki/Business-Day-Schedules))
-* Built-in **schedule linting**: cronstable reports dead schedules that can
-  never fire again instead of dropping them silently, and flags error-prone
-  patterns (AND day semantics, uneven `*/n` steps, day-31-in-April, schedules
-  that DST skips or repeats) at config load, in the dashboards, and over the
-  API (see [schedule introspection](#schedule-introspection))
+* **Schedule linting**: flag impossible schedules, uneven intervals, and
+  daylight-saving surprises (see [schedule introspection](#schedule-introspection))
 * Arbitrary time zone support
-* **iCal calendar export**: subscribe any calendar app to `GET /calendar.ics`,
-  or to one job's `/jobs/{name}/calendar.ics`, and the fleet's upcoming fires
-  appear on the on-call engineer's calendar. The scheduler's own engine
-  enumerates them, and the dashboard draws the same data as a seven-day week
-  calendar (see
+* **iCal calendar export**: subscribe to upcoming runs in your calendar app
+  or view them in the dashboard's week calendar (see
   [calendar export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export))
 
 ### Failure handling
 
-* **Result verification**: a bounded `verify` command checks a job's output
-  before success is recorded or downstream tasks start. Check failures use
-  the job's reporting and retry policy (see
+* **Result verification**: check a job's output before recording success or
+  starting downstream tasks (see
   [result verification](https://github.com/ptweezy/cronstable/wiki/Result-Verification))
-* Flexible configuration: you decide how to determine if a cron job fails or not
-* Option to automatically retry failing cron jobs, with exponential backoff
-* Built-in sending of Sentry, Mail, and webhook (Slack-compatible)
-  notifications when cron jobs fail
-* **End-to-end encrypted push notifications**: a dedicated reporter seals each
-  alert to a paired device's own key (an X25519 sealed box, or post-quantum
-  X-Wing HPKE), so the relay that forwards it to the platform push service
-  never sees job names, hostnames, or log lines. Pairing is a dashboard QR
-  scan or one API call, and an opt-in Bonjour/mDNS advert lets a companion
-  app find the daemon on the LAN (see
-  [push notifications](#push-notifications), plus the
-  [Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
-  and [LAN Discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)
-  wiki pages)
-* **Per-job SLA monitoring**: an `sla:` block declares thresholds for late and
-  missing runs: too long without a success, a due slot that never started, a
-  run exceeding its runtime bound. A breach fires a dedicated
-  `onLate` reporting hook once (mail, Sentry, shell, webhook), gauges and
-  counters land in the metrics, and the dashboards badge the job **OVERDUE**
-  (see [late-run detection](#late-run-detection-sla-monitoring) and the
-  [Late-Run Detection](https://github.com/ptweezy/cronstable/wiki/Late-Run-Detection)
-  wiki page)
+* Configurable failure conditions
+* Automatic retries with exponential backoff
+* Failure notifications through Sentry, email, and Slack-compatible webhooks
+* **End-to-end encrypted push notifications**: send alerts that only paired
+  devices can decrypt (see [push notifications](#push-notifications))
+* **Per-job SLA monitoring**: detect missing or late runs and excessive
+  runtimes, with alerts and dashboard status (see
+  [late-run detection](#late-run-detection-sla-monitoring))
 
 ### Durability and orchestration
 
-* **Shared resource pools**: jobs and DAG tasks share weighted capacity,
-  durable priority queues, and queue deadlines (see
+* **Shared resource pools**: limit capacity across jobs and DAG tasks, with
+  priority queues and deadlines (see
   [resource pools](https://github.com/ptweezy/cronstable/wiki/Resource-Pools))
-* **Selective workflow recovery**: preview and retry failed tasks, recover
-  from a chosen task, or replay failed dates while reusing retained successes
-  and artifacts (see
+* **Selective workflow recovery**: retry failed tasks or replay failed dates
+  while reusing successful results (see
   [workflow recovery](https://github.com/ptweezy/cronstable/wiki/Workflow-Recovery))
-* **Opt-in durable state**: point a single `state:` config block at a local
-  directory (or an Amazon S3 Files / EFS mount to share it fleet-wide) and jobs
-  gain durability: missed-run catch-up after downtime, and retries that
-  survive a daemon restart. The daemon hands the same store to
-  the jobs themselves over a loopback endpoint, so a job command can use
-  durable key/value, an ETL cursor/watermark, a fleet-wide mutex or semaphore,
-  idempotency keys, a shared artifact store, and run-scoped secrets with
-  `cronstable state|cursor|lock|artifact|idempotent|secret` (see
-  [durable state](https://github.com/ptweezy/cronstable/wiki/Durable-State)).
-  Without it, cronstable stays stateless
-* **Opt-in orchestration DAGs**: a `dags:` block turns the scheduler into a
-  small, durable workflow engine: tasks with `dependsOn` edges, cross-task
-  data hand-off (XCom), dynamic fan-out/mapping, sensors, human approval gates,
-  whole-DAG backfill, and crash-resume of a partial graph. It all runs on the
-  same state store, coordinated across a fleet under a single lease so a task
-  never double-launches (see
+* **Opt-in durable state**: preserve history and retries across restarts,
+  catch up missed runs, and share state between jobs (see
+  [durable state](https://github.com/ptweezy/cronstable/wiki/Durable-State))
+* **Orchestration DAGs**: build durable workflows with task dependencies,
+  data sharing, dynamic fan-out, sensors, and approval gates (see
   [orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs))
 
 ### Observability and control
 
-* Optional **[live control panel](#web-dashboard)**: watch every job's status,
-  tail its logs live, run or cancel jobs on demand, review run history and
-  success rates, drive DAG runs and approvals, and follow the whole cluster,
-  from one self-contained page with ten themes and a shortcut for everything,
-  plus a **[terminal twin](#terminal-dashboard)** (`cronstable tui`) with the
-  same keys
-* Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
-  read per-job run history on demand
-* **Runtime pause/resume**: pause any job's scheduled fires for a bounded
-  window (an hour by default, thirty days at most) over the API, the
-  dashboards, or MCP, without touching the config. cronstable records each
-  skipped slot, pending retries defer, catch-up does not replay the window, and
-  with a `state:` store the pause survives restarts and every node honors it
-  (see [pausing jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs))
-* **Built-in TLS on the listeners**: `web.listen` accepts `https://` addresses
-  served from a `web.tls` block, mixed freely with plaintext and unix-socket
-  entries on one runner. An optional `clientCa` makes the listener require a
-  client certificate signed by your own CA (mutual TLS), so it authenticates
-  its callers rather than only encrypting them.
-
-  A web certificate replaced in place takes effect without a daemon restart.
-  The job-facing state API gains the same block as `state.jobApi.tls`, and
-  `cronstable tui` / `cronstable mcp` gain `--cacert`, `--client-cert`,
-  `--client-key` and `--insecure` (see
-  [serving the API over TLS](#serving-the-api-over-tls) and
-  [listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS))
-* Optional **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)** for
-  AI agents. An agent can observe cronstable and author or debug schedules
-  with the daemon's own engine: validate or explain an expression, or explain
-  field by field why a job did not run at a timestamp. It can also control the
-  daemon when you opt in.
-
-  The server is read-only by default and exposes tools, resources, and triage
-  prompts covering jobs, DAGs, the cluster/fleet, metrics, and durable state.
-  cronstable serves it at `POST /mcp` on the web listeners and through a
-  `cronstable mcp` stdio bridge, and it is written in pure Python with no new
-  dependencies
-* Built-in **Prometheus metrics** at `/metrics` (plus per-job statsd push
-  metrics), covering run outcomes, durations, retries, schedules, and cluster
-  health (see [metrics](#metrics))
-* Opt-in **per-job resource monitoring**: one `monitorResources: true` samples
-  each run's CPU time and peak memory across its whole process tree, live and
-  per run, in the dashboard, the metrics, and the failure reports (see
-  [resource monitoring](#resource-monitoring))
+* **[Web](#web-dashboard) and [terminal](#terminal-dashboard) dashboards**:
+  follow live logs, review history, control jobs and workflows, and monitor
+  the cluster
+* Optional **HTTP REST API** for job status, history, and control
+* **Runtime pause/resume**: pause scheduled runs for maintenance without
+  editing configuration (see
+  [pausing jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs))
+* **Built-in TLS**: serve the API over HTTPS, optionally require client
+  certificates, and reload web certificates without restarting (see
+  [serving the API over TLS](#serving-the-api-over-tls))
+* **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)**: let AI agents
+  inspect jobs and debug schedules. Read-only by default, with optional control
+* **Prometheus and statsd metrics**: track outcomes, durations, retries, and
+  cluster health (see [metrics](#metrics))
+* **Per-job resource monitoring**: track CPU time and peak memory across each
+  job's process tree (see [resource monitoring](#resource-monitoring))
 
 ### Fleets
 
-* A **job-set id**: an order-independent fingerprint of every job's effective
-  configuration, so replicas deployed from the same config can confirm they
-  hold an identical set of jobs (see [job-set id](#job-set-id))
-* **Opt-in clustering and leader election**: instances confirm over mutual TLS
-  that a configured set of peers is running the same job set, and elect a
-  leader so several replicas can run from one config without double-running
-  jobs (see
-  [clustering and leader election](#clustering-and-leader-election))
+* **Job-set id**: compare configuration fingerprints to detect drift between
+  replicas (see [job-set id](#job-set-id))
+* **Opt-in clustering and leader election**: coordinate job execution across
+  replicas (see [clustering and leader election](#clustering-and-leader-election)
+  for backend options and guarantees)
 
 ### Deployment
 
-* **Built for locked-down containers.** Runs in the foreground, logs
-  everything to stdout/stderr, 12-factor style, and works unmodified under
-  restricted Kubernetes PodSecurity: as a non-root user, on a read-only root
-  filesystem with an `fsGroup`-mounted config, under a `RuntimeDefault`
-  seccomp profile, and with every Linux capability dropped, so it needs no
-  writable paths or elevated privileges (see
+* **Built for restricted containers**: run as a non-root user with a read-only
+  root filesystem and restricted Kubernetes security settings (see
   [production container deployment](#production-container-deployment))
-* **Prebuilt for practically everything.** Multi-architecture images on GHCR
-  and Docker Hub, plus self-contained binaries for Linux (glibc and musl),
-  macOS (signed and notarized), FreeBSD, and Windows, so Python on the host
-  is optional (see [installation](#installation))
+* **Prebuilt releases**: multi-architecture container images and self-contained
+  binaries for Linux, macOS, BSD, illumos, and Windows (see
+  [installation](#installation))
 
 [![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](#web-dashboard)
 
@@ -219,13 +148,13 @@ Open <http://127.0.0.1:8080/> and watch `hello` fire once a minute, with its
 output tailing live in the [dashboard](#web-dashboard). From there, each of
 these is a few lines of config away:
 
-* **Never miss a silent failure**: retries with backoff and a Slack/mail/Sentry
+* **Get failure alerts**: retries with backoff and a Slack/mail/Sentry
   report when a job ultimately fails ([tutorial](#tutorial-1-alert-when-a-job-fails-then-retry-it)).
 * **Survive restarts**: a one-line `state:` block makes history, retries and
   missed-run catch-up durable ([tutorial](#tutorial-2-survive-restarts-catch-up-what-was-missed)).
 * **Chain jobs into a pipeline**: a durable DAG with data hand-off and an
   approval gate ([tutorial](#tutorial-3-your-first-dag-a-durable-pipeline)).
-* **Run replicas safely**: leader election so two copies never double-fire
+* **Coordinate replicas**: use leader election to coordinate job execution
   ([tutorial](#tutorial-4-two-replicas-zero-double-runs)).
 * **See it all at once**: `docker compose -f example/grand-tour/docker-compose.yml up
   --build` boots a nine-node cluster running every feature together
@@ -477,230 +406,64 @@ writable-path exceptions in detail, and health checks.
 
 ## Web dashboard
 
-cronstable ships with a **built-in web dashboard**: one self-contained page (no
-build step, no external assets, no database) served straight from the daemon.
-Point a browser at the HTTP listener and you have a keyboard-driven control
-room for every job, and, when you use them, for the cluster, the DAGs, and the
-durable state store too.
+The built-in web dashboard is a self-contained page served by the daemon,
+with no build step or external assets. Enable the
+[HTTP interface](#remote-webhttp-interface), then open its address in a browser.
 
 [![cronstable web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)
 
-The overview shows every job with its **live status**, a **countdown to its
-next run**, the last run's duration and exit-code badge, and a **sparkline of
-recent runs**. Jobs with [resource monitoring](#resource-monitoring) add live
-**CPU and memory** chips while they run, and a cluster adds each job's
-**owner node**. Everything is sortable, filterable, and searchable, and when
-something is failing a **verdict bar** correlates the failures into one
-headline ("4 share exit code 69, may share a cause"). Click any job (or press
-`Enter`) to open its detail drawer:
+The overview shows job status, upcoming runs, recent outcomes, and resource
+usage when monitoring is enabled. Open a job to follow its logs, review run
+history, or inspect its schedule. You can also:
 
-| Live log tail | Run history | Schedule, explained |
+* Trigger workflows, follow task graphs, and approve or reject approval gates.
+* Inspect cluster health and compare each job's runs across nodes.
+* Investigate failures with an incident timeline and merged live logs.
+* Use the wallboard, activity heatmap, and durable state inspector.
+
+| Live logs | Workflow task graph | Fleet view |
 | :---: | :---: | :---: |
-| [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png) | [![Run history with success rate, duration chart, and per-run CPU and peak-memory columns](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-history.png) | [![A plain-English schedule with time-zone-aware next-run times](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-schedule.png) |
-| Follow a running job's output **live** over Server-Sent Events, with ANSI color, in-log **grep** (plain text or regex), per-line timestamps, line-wrap, and one-click download. | **Success rate** plus average / min / max duration over the retained history, with a color-coded per-run chart; with [resource monitoring](#resource-monitoring) on, **CPU time and peak memory** per run and in the stats. | A **plain-English** reading of the cron expression and a **time-zone-aware preview of the next run times**, computed live in the browser. |
+| [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png) | [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png) |
 
-Every action has a key. A fuzzy command palette (`Ctrl-K` / `⌘K`) runs any
-action or jumps to any job, `?` lists every shortcut, `/` filters, `j`/`k`
-move the cursor, `r` runs the selected job and `x` cancels it. A click runs a
-single job on demand, or every failing job at once.
+Press `Ctrl-K` / `⌘K` for the command palette, `?` for shortcuts, or `Enter`
+to open the selected job. Ten themes, adjustable fonts and UI scale,
+color-vision-safe palettes, and reduced-motion support help with readability.
+Status is shown through text and symbols as well as color.
 
-| Fuzzy command palette | Keyboard-first, with a shortcut for everything |
-| :---: | :---: |
-| [![A fuzzy command palette listing run and log actions for each job](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-palette.png) | [![The keyboard shortcut reference overlay](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-shortcuts.png) |
+Run history and live logs stay in memory unless you enable the
+[durable state store](https://github.com/ptweezy/cronstable/wiki/Durable-State).
+The page is served with a strict Content-Security-Policy. See the
+[web dashboard guide](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard)
+for the full panel tour, screenshots, shortcuts, and settings.
 
-### Orchestration, live
+**Try it:** start a demo node with:
 
-[DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs) get
-their own card and drawer: trigger or backfill a run, watch the **task graph**
-advance node by node, inspect per-task attempts, XCom values and logs, and
-decide **approval gates** with a click, from any node in the fleet.
+```shell
+docker compose -f example/zen-demo/docker-compose.yml up
+```
 
-| The task graph | A human approval gate |
-| :---: | :---: |
-| [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png) | [![The DAG drawer's task list with an approval gate awaiting a decision, Approve and Reject buttons armed](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-approval.png) |
-| A `data-quality-gate` diamond: fan-out checks that reconverge on a `certify` task, colored by state as the run advances. | A release workflow **waiting for approval**: the build succeeded, the approval gate is `awaiting`, and the sensor and publish tasks queue behind your decision. |
-
-### The whole fleet on one page
-
-With [clustering](#clustering-and-leader-election) on, a **cluster panel**
-shows the quorum math, this node's role, per-peer attestation status, and,
-with `cluster.observability`, every node's **whole-host CPU and memory**. The
-**fleet view** goes further: a jobs × nodes matrix of the entire fleet's runs,
-assembled from data that piggybacks on the gossip the nodes already exchange,
-so any node can serve the whole fleet from one page.
-
-| Cluster panel | Fleet view |
-| :---: | :---: |
-| [![The cluster panel: nine peers, all agreed, quorum met, with per-node load and per-node job ownership](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-cluster.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png) |
-| Nine nodes, `8/8 agreed`, quorum met, per-node **load meters** and per-node **owns** counts under `distribution: spread`. | Every node's state for every job, one glance: ok / failing / running cells with ages, per-column node health, and a **failing only** filter. |
-
-### When things break
-
-Three panels are built for incident response. The verdict bar's incident
-timeline lays out every job's most recent finish, newest first, with the
-jobs with similar failures highlighted. The job actions panel starts or
-cancels failing jobs together and copies a Markdown incident summary for
-your ticket. The live logs panel merges up to four jobs' live logs into one
-pane, like tailing a set of pods.
-
-| Incident timeline | Merged multi-tail |
-| :---: | :---: |
-| [![The incident timeline overlay: every job's most recent run, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png) | [![The live logs panel merging four jobs' live logs with identity colors and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-multitail.png) |
-| "What happened, in what order": relative times, outcome glyphs, failure reasons, exit codes, durations, and a **failing only** filter. | Four streams, one pane: identity-colored prefixes, `end of run output` markers, auto re-attach on each job's next run. |
-
-### Wallboards, heatmaps, and the state store
-
-Press `w` for a full-screen **wallboard** built for a TV: worst-first tiles,
-an incident stamp when something is failing, a `NO SIGNAL` banner when the
-data goes stale (never a stale all-green), and a zen **screensaver** that
-takes over when every job is ok. The **activity heatmap** turns run history
-into a punchcard (worst outcome per bucket, shaded by volume), and the
-opt-in **state inspector** shows the [durable state store](https://github.com/ptweezy/cronstable/wiki/Durable-State)'s
-health: record counts by kind, op latencies and errors, locks, cursors,
-counters, artifacts, and quarantine.
-
-| Wallboard / TV mode | Activity heatmap | Durable-state inspector |
-| :---: | :---: | :---: |
-| [![The wallboard: worst-first job tiles with an INCIDENT stamp and next-fire countdowns](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-wallboard.png) | [![The activity heatmap punchcard: one row per job, cells colored by worst outcome and shaded by run volume](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-heatmap.png) | [![The durable-state inspector: record counts per kind, op latencies, and per-primitive tabs](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-state.png) |
-
-### Themes, readability, and accessibility
-
-**Ten themes**: **standard** (the default, a flat neutral charcoal),
-**carolina** (Carolina blue), **amber**, **green**, and flat **modern**, each in
-a dark and a light (paper) variant. Cycle hues with `t`, flip
-light/dark with `T`:
-
-[![The same cronstable board cycling through all ten themes (standard, carolina, amber, green and modern, each in a dark and a light paper variant) and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp)
-
-*(One board, ten themes, two interface fonts, animated: [WebP](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.webp), [GIF](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.gif). The five stills that follow are pulled from it.)*
-
-| Carolina | Amber |
-| :---: | :---: |
-| [![The dashboard in the carolina theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-carolina.png) | [![The dashboard in the amber theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-amber.png) |
-
-| Green | Flat modern |
-| :---: | :---: |
-| [![The dashboard in the green theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-green.png) | [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-modern.png) |
-
-| Standard, on paper (light) |
-| :---: |
-| [![The dashboard in the standard light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-standard-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-standard-light.png) |
-
-Beyond the themes: an optional proportional-sans interface font (shown per
-theme in the preceding animation), UI scaling, deuteranopia- and
-tritanopia-safe palettes, reduced-motion support, and notification toggles,
-all remembered per browser, with status always carried by glyphs and text, not
-color or animation alone. There is also an optional (on by default, once per
-12 hours) BIOS-style boot self-test that checks the daemon, job set, cluster,
-and schedules for real while it types:
-
-| Settings | Startup self-test |
-| :---: | :---: |
-| [![The settings panel: theme picker with standard selected, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png) |
-
-The `l` in the header's "cronstable" is a live cart-and-double-pendulum
-simulation. I like to call him double-P, Peter Parker, or PP.
-
-Run history and live logs are kept **in memory only** (unless you opt into the
-durable state store), and the page is served with a strict
-Content-Security-Policy. A one-line `web:` block turns it on: the
-[**web dashboard tour**](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard)
-in the wiki is the full walkthrough, and
-[remote web/HTTP interface](#remote-webhttp-interface) later shows how to
-enable it.
-
-**Try it:** `docker compose -f example/zen-demo/docker-compose.yml up` boots
-a single node with a demo job set.
-`docker compose -f example/cluster/docker-compose.yml up` boots a 3-node
-cluster (`cronstable-a`/`cronstable-b`/`cronstable-c`), so you can open each
-node's dashboard and watch the cluster panel and leader election live.
-
-For **every feature at once**, run
-`docker compose -f example/grand-tour/docker-compose.yml up --build` (the
-[grand tour](example/grand-tour); see its
-[README](example/grand-tour/README.md)): a 9-node mutual-TLS cluster sharing
-one durable state store and running the classic job set, durable-state jobs,
-orchestration DAGs and second-level probes together, with all five
-cross-platform failure reporters wired to live sinks. More one-command demos
-are in the [example gallery](#example-gallery).
+The [example gallery](#example-gallery) includes a three-node cluster and the
+nine-node [grand tour](example/grand-tour), with workflows, shared state, and
+failure reporters.
 
 ## Terminal dashboard
 
-The dashboard has a **TUI sibling**: `cronstable tui` opens the board in
-your terminal, over SSH, in a tmux pane, or on a box where a browser is
-not an option. It is a client of the same HTTP control API (nothing extra
-to enable on the daemon), and the shortcut table is the same one as the
-web page's: `j`/`k` move, `Enter` opens a job's drawer, `r` runs, `x`
-cancels, `/` filters, `Ctrl-K` opens the fuzzy command palette, and `?`
-lists everything.
+`cronstable tui` brings the dashboard to your terminal, including SSH and tmux
+sessions. It uses the same HTTP API and keyboard shortcuts as the web dashboard,
+with job logs, history, workflows, cluster views, and incident tools.
 
 [![The cronstable TUI: a live 70-job board with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, cluster owner column, and the fleet verdict bar](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)
 
-Press `Enter` on any job for its drawer, the same three tabs as the
-web page, plus resources for monitored jobs:
+```shell
+cronstable tui                            # local daemon on port 8080
+cronstable tui --url http://prod-node:8080  # remote daemon
+cronstable tui --tv                       # open the wallboard
+```
 
-| Live log tail | Run history | Schedule, explained |
-| :---: | :---: | :---: |
-| [![The Logs tab: a live SSE tail with per-line timestamps, in-log search with match highlighting, and end-of-run markers between runs](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-logs.png) | [![The History tab: success rate, duration stats, and per-run rows with duration bars and CPU seconds](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-history.png) | [![The Schedule tab: the cron expression in plain English with the exact next fire instants from the daemon's own engine](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-schedule.png) |
-
-| Fuzzy command palette | Keyboard-first, with the web page's keys |
-| :---: | :---: |
-| [![The command palette fuzzy-matching "run": global actions plus per-job commands](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-palette.png) | [![The shortcut overlay: the web dashboard's shortcut table verbatim, with terminal extras grouped below](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-shortcuts.png) |
-
-DAGs get the same drawer as the browser, and approval gates are decided
-with a keypress:
-
-| The task graph, mid-flight | A human approval gate |
-| :---: | :---: |
-| [![The DAG drawer's graph tab: the data-quality-gate diamond as topological layers, states coloring as the run advances](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-graph.png) | [![The DAG drawer's tasks tab: release-train parked on its approval gate, with a approve / R reject armed](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-dag-approval.png) |
-
-With clustering on, the cluster panel and the full fleet matrix render
-in the terminal too:
-
-| Cluster panel | Fleet view |
-| :---: | :---: |
-| [![The cluster panel: nine gossiping peers, all agreed, with per-node load and status](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-cluster.png) | [![The fleet view: a 70-job by 9-node matrix of live cells: ok, failing, and running with ages](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-fleet.png) |
-
-The same incident tools are here, from the timeline to the multi-tail:
-
-| Incident timeline | Merged multi-tail |
-| :---: | :---: |
-| [![The incident timeline: every job's most recent finish, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-incident-timeline.png) | [![The live logs panel merging four jobs' live logs with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-multitail.png) |
-
-So are the wallboard, the heatmap, and the state inspector:
-
-| Wallboard / TV mode | Activity heatmap | Durable-state inspector |
-| :---: | :---: | :---: |
-| [![The wallboard: worst-first tiles with failure ages and exit codes, run sparklines, and the tally foot](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-wallboard.png) | [![The activity heatmap: one row per job, one cell per hour, worst outcome colored and shaded by volume](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-heatmap.png) | [![The state inspector: store inventory, record streams, and document namespaces from the durable state store](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-state.png) |
-
-The same ten themes as the browser (`t` cycles the hue, `T` flips
-dark ↔ paper), with the same color-vision-safe remaps and an
-`--ascii` glyph mode:
-
-| Carolina | Amber |
-| :---: | :---: |
-| [![The TUI in the carolina theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-carolina.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-carolina.png) | [![The TUI in the amber theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-amber.png) |
-
-| Green | Flat modern |
-| :---: | :---: |
-| [![The TUI in the green theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-green.png) | [![The TUI in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-modern.png) |
-
-| Standard, on paper (light) |
-| :---: |
-| [![The TUI in the standard light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-standard-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-theme-standard-light.png) |
-
-The TUI runs the same BIOS-style boot self-test, next to the settings
-sheet:
-
-| Startup self-test | Settings |
-| :---: | :---: |
-| [![The TUI boot self-test: link latency, firmware, job set, schedules, and cluster probed live, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-boot.png) | [![The TUI settings panel: theme, color vision, refresh interval, log toggles, zen, and the boot self-test](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-settings.png) |
-
-Run `cronstable tui` against the local daemon, or point it elsewhere with
-`--url` and `--token-env`. The `--tv` flag starts on the wallboard, and
-`--job` deep-links a drawer. The
-[**Terminal Dashboard**](https://github.com/ptweezy/cronstable/wiki/Terminal-Dashboard)
-wiki page is the full reference (options, every key, the panel tour).
+Use `--token-env` for authentication, `--job` to open a specific job, or
+`--ascii` when your terminal lacks the status glyphs. The
+[terminal dashboard guide](https://github.com/ptweezy/cronstable/wiki/Terminal-Dashboard)
+covers all options, shortcuts, panels, themes, and screenshots.
 
 ## Tutorials
 
@@ -1061,8 +824,7 @@ jobs:
         value: /bin:/usr/bin
 ```
 
-You can also provide an environment file to define environments for the
-command:
+Load environment variables for the command from a file:
 
 ```yaml
 jobs:
@@ -1457,10 +1219,8 @@ in the wiki.
 
 ### Concurrency
 
-Sometimes it may happen that a cron job takes so long to run that when its
-next scheduled slot comes due, a previous instance may still be running. The
-`concurrencyPolicy` option controls how cronstable handles this situation, and
-takes one of the following values:
+If a job is still running when its next scheduled run is due,
+`concurrencyPolicy` determines what happens:
 
 Allow
 : allows concurrently running jobs (default)
@@ -1473,11 +1233,9 @@ Replace
 
 ### Execution timeout
 
-If you have a cron job that may sometimes stop responding, you can
-instruct cronstable to terminate the process after N seconds if it is still
-running by then, with the `executionTimeout` option. For example, the
-following cron job takes 2 seconds to complete, and cronstable terminates it
-after 1 second:
+Set `executionTimeout` to terminate a job after a specified number of seconds.
+This job would take two seconds to complete, but cronstable terminates it
+after one:
 
 ```yaml
 - name: test-03
@@ -1491,20 +1249,12 @@ after 1 second:
   executionTimeout: 1  # in seconds
 ```
 
-When terminating a job, it is always a good idea to give that job process some
-time to terminate properly. For example, it may have opened a file, and even
-if you tell it to shut down, the process may need a few seconds to flush
-buffers and avoid losing data.
+`killTimeout` sets how long cronstable waits for a job to exit gracefully
+before forcing termination. On Unix, it sends `SIGTERM`, waits up to
+`killTimeout` seconds (30 by default), then sends `SIGKILL` if the process
+is still running.
 
-On the other hand, programs are sometimes buggy and get stuck, refusing to
-terminate nicely no matter what. For this reason, cronstable always checks
-whether a process exited some time after being asked to do so. If it has
-not, cronstable tries to kill the process forcefully. The `killTimeout`
-option indicates how many seconds to wait for the process to terminate
-gracefully before killing it more forcefully. On Unix systems, cronstable
-first sends a `SIGTERM`, but if the process does not exit after `killTimeout`
-seconds (30 by default), it sends `SIGKILL`. For example, this cron job
-ignores `SIGTERM`, so cronstable sends it a `SIGKILL` after half a second:
+This job ignores `SIGTERM`, so cronstable sends `SIGKILL` half a second later:
 
 ```yaml
 - name: test-03
@@ -1587,18 +1337,16 @@ POSIX cronstable renices the job's process group right after the spawn
 (`idle` is nice 19, `high` is nice -10). Descendants inherit a lowered level
 on both platforms.
 
-A raised one reaches only the job's own process on Windows, which starts an
-unflagged child of an above-normal or high parent at `NORMAL`. POSIX renices
-the whole group, so it has no such split. `normal` is the default, and the one
-level cronstable never applies. Raising a priority needs privilege on POSIX,
-and a kernel that refuses leaves the run going at the priority it inherited
-rather than failing it. See
+On Windows, child processes do not automatically inherit above-normal or
+high priority; they start at `NORMAL` unless explicitly configured. On POSIX,
+cronstable adjusts the whole process group. The default, `normal`, leaves
+the inherited priority unchanged. Raising priority requires privilege on POSIX;
+if denied, the job continues at its inherited priority. See
 [commands and environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment#priority).
 
 ### Remote web/HTTP interface
 
-To control cronstable remotely, you can optionally enable an HTTP REST
-interface, with the following configuration (example):
+Enable the HTTP API to control cronstable remotely:
 
 ```yaml
 web:
@@ -1660,10 +1408,11 @@ web:
     clientCa: /etc/cronstable/callers-ca.pem      # optional: require client certs
 ```
 
-`clientCa` turns the listener into mutual TLS, web certificates rotate in
-place without a daemon restart, and the clients (`cronstable tui`,
-`cronstable mcp`) take matching `--cacert` / `--client-cert` /
-`--client-key` / `--insecure` flags. The rest is covered in depth in the
+Set `clientCa` to require mutual TLS, which authenticates clients as well as
+encrypting connections. Web certificates rotate in place without a daemon
+restart. The clients (`cronstable tui`, `cronstable mcp`) take matching
+`--cacert` / `--client-cert` / `--client-key` / `--insecure` flags.
+The rest is covered in depth in the
 [listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS)
 guide in the wiki: issuing the certificates, the mTLS trust model and how it
 interacts with `web.authToken`, the rotation mechanics and what they do not
@@ -1778,21 +1527,16 @@ trust model, per-peer status table, quorum math, sizing guidance,
 `distribution: spread` load-balancing, and the fenced lease backends are all
 covered in depth in the
 [clustering and leader election](https://github.com/ptweezy/cronstable/wiki/Clustering-and-Leader-Election)
-guide in the wiki. To watch it live, see [try it](#web-dashboard) in the web
-dashboard section.
+guide in the wiki. Try a cluster from the [example gallery](#example-gallery)
+to watch leader election in the dashboard.
 
 ### Includes
 
-You may have a use case where it's convenient to have multiple config files,
-and choose at runtime which one to use. In that case, it might be useful if
-you can put common definitions (such as defaults for reporting and shell)
-in a separate file, that is included by the other files.
+Use `include` to share defaults and other configuration across files. It
+accepts a list of filenames, which cronstable parses and merges into the
+current configuration.
 
-To support this use case, you can ask one config file to include another one,
-with the `include` directive. It takes a list of file names, and cronstable
-parses those files as configuration and merges them in with this file.
-
-Example, your main config file could be:
+For example, the main configuration:
 
 ```yaml
 include:
@@ -1804,7 +1548,7 @@ jobs:
     ...
 ```
 
-And your included `_inc.yaml` file could contain some useful defaults:
+And the shared defaults in `_inc.yaml`:
 
 ```yaml
 defaults:
