@@ -2,13 +2,10 @@
 
 **Status:** Implemented · **Author:** Principal Engineering · **Date:** 2026-07-08 · **Target spec:** MCP `2025-11-25`
 
-This page was the design document for cronstable's MCP server. The design
-shipped as `cronstable/mcp.py` (protocol core and tool registry) and
-`cronstable/mcpcli.py` (the `cronstable mcp` stdio bridge). The
-implementation has since diverged from the text in the points listed later.
-Where they differ, the implementation prevails, so the design body is no
-longer on this page. The full text as written on 2026-07-08 is in this
-page's history.
+This page summarizes the MCP server's original design and how the
+implementation differs. The server is in `cronstable/mcp.py`; its stdio
+bridge is in `cronstable/mcpcli.py`. The full design dated 2026-07-08 is
+available in this page's history.
 
 The authoritative sources are:
 
@@ -26,11 +23,10 @@ The authoritative sources are:
 The document's headline decisions, all of which shipped (details that moved
 are in the divergence list):
 
-- Hand-roll a small pure-Python MCP layer over the existing aiohttp
-  apiserver rather than vendor the official `mcp` SDK. Its transitive tree
-  breaks cronstable's zero-new-dependency, multi-arch packaging story. That
-  tree is Rust-compiled `pydantic-core`, `cryptography`, and `rpds-py`, plus
-  `starlette`/`uvicorn`/`anyio`/`httpx`.
+- Implement a small pure-Python MCP layer on the existing aiohttp server
+  to avoid adding the official `mcp` SDK's dependencies to multi-architecture
+  builds: `pydantic-core`, `cryptography`, `rpds-py`, `starlette`, `uvicorn`,
+  `anyio`, and `httpx`.
 - Two transports, one core: a stateless Streamable HTTP `POST /mcp` route
   embedded in the existing web server (same listeners, auth, and reload
   lifecycle), plus the `cronstable mcp` stdio bridge, a urllib frame-proxy
@@ -42,8 +38,7 @@ are in the divergence list):
 - Authentication reuses what cronstable already has: `web.authToken` bearer
   tokens, filesystem-gated Unix sockets, and mutual TLS (mTLS). It fails
   closed on tokenless routable listeners. No OAuth for the self-hosted case.
-- Build to spec revision `2025-11-25` and stay stateless (no sessions) so
-  later spec revisions land small.
+- Target spec revision `2025-11-25` with a stateless, session-free server.
 
 ## Shipped divergences
 

@@ -1,12 +1,12 @@
 # Resource monitoring
 
-cronstable can record what each job run *uses*. Opt-in per-job resource accounting (`monitorResources`) samples the run's **whole process tree** (children and shell-outs included) with [psutil](https://github.com/giampaolo/psutil) while it runs. Resource accounting records the run's **total CPU time** (user + system), its **sampled peak resident memory**, and, optionally, a downsampled CPU%/RSS chart series.
+Enable `monitorResources` to record a job's **total CPU time** (user + system), **sampled peak resident memory**, and optional CPU%/RSS chart series. cronstable samples the **whole process tree**, including child processes, with [psutil](https://github.com/giampaolo/psutil).
 
 The run record carries the numbers to every surface that already reports a run: the [web dashboard](Web-Dashboard), the [terminal dashboard](Terminal-Dashboard), the [HTTP API](HTTP-API), [Prometheus](Metrics-with-Prometheus), [statsd](Metrics-with-Statsd), failure [reports](Reporting), and the durable [run ledger](Durable-State).
 
 It is observability only. Monitoring never changes a run's success/failure verdict, never delays or crashes a job, and is off by default. A per-run sampling task is spawned only when it is on.
 
-psutil is a core dependency and ships wheels for the mainstream targets. If it is somehow unavailable, monitoring degrades to "no data" rather than failing anything.
+psutil is a core dependency. If it is unavailable, monitoring reports no data and the job continues.
 
 ## Enabling it
 
@@ -24,7 +24,7 @@ The bool form samples with the defaults: a 1s cadence and a 240-point chart seri
 
 ### Options
 
-The schema is `Bool() | Map({Opt("enabled"): Bool(), Opt("interval"): Float(), Opt("history"): Int()})`, a bool shorthand or a map with every key optional:
+Use a boolean or a map of optional settings:
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -47,7 +47,7 @@ The monitor attaches to the launched child's pid immediately after launch, takes
 - **The whole tree is accounted.** Each sample reads the child and all of its descendants. CPU time is tracked per tree member. A member that exits has its last reading banked before it is forgotten, so sequential children (`sh -c 'a; b'`) accumulate instead of plateauing. The only CPU that escapes accounting entirely is a child that spawns *and* exits within a single sampling gap.
 - **Peak RSS is a sampled high-water mark.** The recorded maximum is the highest resident-set sum observed across samples, so a spike narrower than the sampling gap can be missed. A shorter `interval` narrows that window.
 - **Best-effort, never fatal.** Every psutil interaction is guarded. A process that exits mid-sample, a platform that denies the read, or psutil raising anything at all yields whatever was captured so far. A run where nothing could be sampled carries no resource stats (`resources` is `null` in the API). It is never an error.
-- **Sampled, so approximate for short runs.** A run that finishes between two samples is measured approximately. The long, heavy runs whose resource use matters are sampled many times and measured well.
+- **Short runs have fewer samples.** Measurements are less precise when a run finishes between samples.
 
 A finished monitored run records a summary object: `cpu_user_seconds`, `cpu_system_seconds`, `cpu_total_seconds`, `max_rss_bytes`, and `samples` (how many times the tree was successfully read). While the run is still going, the live readings are `cpu_seconds` (cumulative), `cpu_percent` (usage since the previous sample; can exceed 100 across multiple cores), and `rss_bytes` (the tree's current resident memory).
 

@@ -1,10 +1,10 @@
 # Metrics with statsd
 
-cronstable can emit per-job lifecycle metrics to a [statsd](https://github.com/statsd/statsd) server over UDP. This page documents the `statsd` config block, the exact wire format cronstable emits, and the delivery guarantees (best-effort, fire-and-forget, idempotent stop). statsd is the push-side metrics option. For pull-side scraping, cronstable also serves a built-in [Prometheus endpoint](Metrics-with-Prometheus) on the web API, and you can enable both at once.
+cronstable sends per-job lifecycle metrics to a [statsd](https://github.com/statsd/statsd) server over UDP. This page covers configuration, wire format, and delivery behavior. You can enable statsd alongside the built-in [Prometheus endpoint](Metrics-with-Prometheus).
 
 ## Enabling statsd for a job
 
-Configure statsd per job, or in a [`defaults` block](Includes-and-Defaults), with a `statsd` mapping. The block is optional. If you omit it, no metrics are sent (`DEFAULT_CONFIG["statsd"]` is `None`). When the block is present, the schema requires all three keys.
+Add a `statsd` block to a job or a [`defaults` block](Includes-and-Defaults). Jobs without it send no statsd metrics.
 
 ```yaml
 jobs:
@@ -19,15 +19,13 @@ jobs:
 
 ### Options
 
-The schema for the block is `Map({"prefix": Str(), "host": Str(), "port": Int()})`. None of the keys is wrapped in `Opt(...)`, so all three are required whenever `statsd` is set.
+All three options are required when `statsd` is configured:
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `host` | string | (required when `statsd` set) | Hostname or IP of the statsd server. Resolved per send. An unresolvable host produces a warning, not a crash (see [best-effort delivery](#best-effort-delivery)). |
 | `port` | int | (required when `statsd` set) | UDP port of the statsd server (commonly `8125`). |
 | `prefix` | string | (required when `statsd` set) | Metric name prefix, prepended verbatim to each metric name. No separator is added, so the prefix should not have a trailing dot (cronstable inserts the `.` between the prefix and the metric suffix, for example `<prefix>.start`). |
-
-The whole `statsd` block defaults to absent (`None`). There is no partial default. If you set it, you must provide `host`, `port`, and `prefix`.
 
 ## Wire format
 
@@ -43,7 +41,7 @@ After the subprocess launches, cronstable records `time.perf_counter()` as the s
 
 `|g` is the statsd gauge type. The value is always `1`.
 
-The start metric is sent by `_on_start`, which runs only after the subprocess was successfully created. If the command fails to launch at all (for example, the executable does not exist), `_on_start` is never reached and no start metric is emitted. That run still produces no stop metric either (see the next section).
+A command that fails to launch, such as a missing executable, emits neither start nor stop metrics.
 
 ### On stop
 
@@ -95,7 +93,7 @@ async def _on_stop(self) -> None:
     ...
 ```
 
-This matters for `concurrencyPolicy: Replace`, where the scheduler may cancel a running job (`cancel()`) while its `wait()` task is also completing. Both call `_on_stop`, but only the first one emits metrics. This guarantee is intentional and tested. Duplicate stop metrics under cancellation were fixed in a prior release. See [concurrency and timeouts](Concurrency-and-Timeouts) for the concurrency policies, and [failure detection and retries](Failure-Detection-and-Retries) for how `success` is computed.
+With `concurrencyPolicy: Replace`, cancellation and completion may both call `_on_stop`; only the first call emits metrics. See [concurrency and timeouts](Concurrency-and-Timeouts) for the policies and [failure detection and retries](Failure-Detection-and-Retries) for how `success` is computed.
 
 > The `start_time` guard means a forced cancellation also yields a correct duration. The duration is measured from the recorded `perf_counter` start to the moment `job_stopped` runs, regardless of how the process ended (normal exit, `executionTimeout`, or `Replace` cancellation).
 

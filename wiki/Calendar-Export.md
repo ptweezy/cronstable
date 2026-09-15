@@ -1,11 +1,11 @@
 # Calendar export (iCal) and the week calendar
 
-For every schedule it runs, cronstable owns the fire-instant enumeration, so it can hand that enumeration to anything that reads a calendar. Two surfaces do:
+cronstable shows upcoming scheduled runs in two calendar views:
 
-- **`GET /calendar.ics`** and **`GET /jobs/{name}/calendar.ics`**: standard iCalendar (RFC 5545) feeds of upcoming fires, fleet-wide or per job. Subscribe a calendar app and the overnight maintenance jobs appear on your week, updating as the feed refreshes.
+- **`GET /calendar.ics`** and **`GET /jobs/{name}/calendar.ics`**: standard iCalendar (RFC 5545) feeds, fleet-wide or per job. Subscribe in a calendar app to see scheduled jobs alongside your other events.
 - The dashboard's **week calendar** (the `◫ week` toolbar button): the same data drawn as a seven-day grid inside the [web dashboard](Web-Dashboard).
 
-Both enumerate through the scheduler's own engine in each job's resolved time zone, so what the calendar shows is exactly what the daemon will do, daylight saving time shifts included.
+Both use the scheduler's engine and each job's resolved time zone, including daylight saving time shifts.
 
 ## The feed endpoints
 
@@ -14,7 +14,7 @@ Both enumerate through the scheduler's own engine in each job's resolved time zo
 | `GET /calendar.ics` | every enabled, cron-scheduled job (directed acyclic graph, or DAG, schedules appear as their `dag:<name>` job) |
 | `GET /jobs/{name}/calendar.ics` | one job (or one DAG schedule); `404` for an unknown name |
 
-Query parameters, both clamped rather than erroring:
+Query parameters (values outside the range are clamped):
 
 | Parameter | Default | Range | Meaning |
 |-----------|---------|-------|---------|
@@ -31,38 +31,38 @@ Disabled jobs and `@reboot` jobs never become events (neither has upcoming sched
 
 ## What an event carries
 
-- **`DTSTART` in UTC** (`...Z` form). The fire instants are real instants. The calendar client localizes them, and no `VTIMEZONE` blocks need shipping.
+- **`DTSTART` in UTC** (`...Z` form). The calendar client converts event times to its display time zone; no `VTIMEZONE` blocks are needed.
 - **A stable `UID`** (hashed job name plus the fire instant), so a subscribed client updates events in place across refreshes instead of duplicating them.
-- **A duration from run history**: the job's typical runtime rounded up to a whole minute, never under 5 minutes, because a zero-length event renders as an invisible sliver in week views, and never over 24 hours. The description states the real average.
+- **A duration from run history**: the job's typical runtime rounded up to a whole minute, with a minimum of 5 minutes for visibility and a maximum of 24 hours. The description states the actual average.
 - **`TRANSP:TRANSPARENT`**: a maintenance window on your calendar does not mark you busy.
 - **`SUMMARY`** is the job name. **`DESCRIPTION`** is the schedule expression, its plain-English description, the job's time zone, and the typical runtime when known.
 - **Refresh hints** (`REFRESH-INTERVAL` / `X-PUBLISHED-TTL`, one hour) for subscription clients that honor them.
 
-Deliberately absent: command lines, environment, and output. Calendar feeds end up on phones and third-party calendar services, far outside the daemon's [redaction](Output-Capturing) reach, so the feed carries scheduling facts only.
+Feeds contain scheduling information only. They exclude command lines, environment variables, and output because subscribers may store the data on phones or third-party calendar services.
 
 ## Authentication for calendar clients
 
-With [`web.authToken`](HTTP-API) unset, the feeds are as open as the rest of the read API. With a token set, calendar apps are a special case: they cannot attach an `Authorization` header. For exactly the `.ics` paths, the token may go in a `token` query parameter instead, the same secret-address model calendar services use:
+With [`web.authToken`](HTTP-API) unset, the feeds are as open as the rest of the read API. For calendar clients that cannot send an `Authorization` header, the `.ics` endpoints also accept a `token` query parameter:
 
 ```console
 curl "http://localhost:8080/calendar.ics?token=s3cret"
 ```
 
-Subscribe with that full URL. Every other API path still requires the bearer header, keeping the token out of URLs, logs, and referrers there. A wrong or missing query token is a `401` like any other auth failure. Treat the subscribe URL as the secret it contains: anyone holding it can read the fleet's schedule until the token rotates.
+Subscribe with the full URL. Other API paths require the bearer header. Invalid or missing credentials return `401`. Keep the subscription URL private: anyone holding it can read the fleet's schedule until the token rotates.
 
 ## Subscribing
 
-Any calendar app that adds a calendar "from URL" works: paste the feed URL (with `?token=` when auth is on). Google Calendar, Apple Calendar, Outlook, and Thunderbird all poll subscribed feeds on their own cadence (typically hours; the feed's refresh hints suggest one hour). The feed regenerates on every request, so a fetched copy is always current as of the fetch.
+In a calendar app that supports subscriptions "from URL", paste the feed URL (with `?token=` when auth is on). Google Calendar, Apple Calendar, Outlook, and Thunderbird poll on their own schedules, typically every few hours. The feed suggests a one-hour refresh interval and regenerates on every request.
 
 ## The week calendar in the dashboard
 
-The `◫ week` toolbar button opens a seven-day grid of the same enumeration, starting today:
+The `◫ week` toolbar button opens a seven-day grid of scheduled runs, starting today:
 
-- Fires are computed in each job's own frame and **placed by your browser's local time** (the grid needs one display frame, and you think in yours). The dashed line is now.
-- Each chip is one fire, hue-keyed to its job. Chips sharing a quarter-hour split the column instead of stacking. Today's already-fired chips render dimmed. Clicking a chip opens the job's drawer on its **Schedule** tab.
-- **High-frequency jobs stay out of the grid.** A job firing more than about eight times a day summarizes into the **background hum** strip below the grid, where its cadence reads better than hundreds of sliver chips would. The strip chips open the same drawer.
-- The card header links the fleet `.ics` feed, and each job's drawer **Schedule** tab links its per-job feed, both token-aware.
+- Runs follow each job's time zone and **appear in your browser's local time**. The dashed line marks the current time.
+- Each chip represents a scheduled run, colored by job. Chips sharing a quarter-hour split the column. Past times today appear dimmed. Clicking a chip opens the job's **Schedule** tab.
+- **High-frequency jobs** (more than about eight runs a day) appear in the **background hum** summary strip below the grid. Clicking a strip chip opens the same job drawer.
+- The card header links to the fleet `.ics` feed; each job's **Schedule** tab links to its feed. Both links include the token when authentication is enabled.
 
 The view is a persisted preference like the other dashboard panels, and appears in the command palette as "Toggle week calendar". The [terminal dashboard](Terminal-Dashboard) carries the same panel under the same palette command: a day-by-hour fire grid, the agenda, and the hum strip, rendered in UTC.
 
-See also: [Web Dashboard](Web-Dashboard), [HTTP Control API](HTTP-API), [Business-Day Schedules](Business-Day-Schedules) for the month-shaped day forms that make these calendars worth watching, and [Schedule Pressure](Schedule-Pressure) for the collision view of the same enumeration.
+See also: [Web Dashboard](Web-Dashboard), [HTTP Control API](HTTP-API), [Business-Day Schedules](Business-Day-Schedules), and [Schedule Pressure](Schedule-Pressure).

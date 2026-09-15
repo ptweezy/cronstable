@@ -1,12 +1,12 @@
 # Schedule linting
 
-Every cron schedule cronstable loads is linted. The linter only looks at schedules the engine already *accepts* (rejecting bad syntax is the parser's job) and flags legal expressions that probably do not mean what the author intended, or that behave in a way worth knowing about. A dead schedule (one that can never fire again) is the loudest case. It used to go unreported; now it is reported everywhere.
+cronstable lints every cron schedule at load time. After the parser accepts an expression, the linter flags likely mistakes and behavior to check, including schedules that can never run again.
 
-The rules live in `cronstable/croninfo.py` (`lint_schedule`), the same module that computes plain-English descriptions and fire previews, so every surface (config load, the HTTP API, and the [terminal dashboard](Terminal-Dashboard)) reports identical findings.
+Config loading, the HTTP API, and the [terminal dashboard](Terminal-Dashboard) share the rules in `cronstable/croninfo.py` (`lint_schedule`).
 
 ## Findings
 
-Each finding has a stable `code`, a `level`, and a one-line `message`. A `warning` means a probable mistake. A `note` means deliberate schedules do this too, but know what it does.
+Each finding has a stable `code`, a `level`, and a one-line `message`. A `warning` marks a probable mistake; a `note` explains behavior that may be intentional.
 
 | Code | Level | What it means |
 |------|-------|---------------|
@@ -33,15 +33,17 @@ The DST rules run in the job's frame: its explicit `timezone:`, or the host's lo
 - **The HTTP API.** `GET /jobs` carries each job's findings verbatim (`schedule_findings`, a list of `{code, level, message}`) plus a computed `never_fires` boolean. `GET /status` marks dead schedules with `never_fires: true` (and says `never fires` in the plain-text form). `GET /schedule/preview` lints arbitrary expressions before they become jobs. See [HTTP API](HTTP-API).
 - **The terminal dashboard.** The schedule preview (`x`) lints as you type, and a job's schedule drawer shows findings in the job's own time zone, so DST notes carry real dates. See the [terminal dashboard](Terminal-Dashboard).
 
-## Dead schedules are loud, not fatal
+<a id="dead-schedules-are-loud-not-fatal"></a>
 
-A `never-fires` schedule stays a warning rather than a config error, deliberately. A fixed past year (`schedule: "0 0 1 1 * 2020"`) is also the working idiom for parking a job without deleting its config. Failing the whole config load over it would turn an upgrade into an outage. What changed is the silence. Besides the load-time warning, the scheduler logs once per (re)load when it drops a dead schedule from its fire index:
+## Schedules that never run
+
+A `never-fires` finding does not reject the configuration: existing configs may use a past year (`schedule: "0 0 1 1 * 2020"`) to disable a job. Besides the load-time warning, the scheduler logs once per load or reload when it removes such a schedule from its fire index:
 
 ```
 WARNING:cronstable:job 'parked': schedule '0 0 1 1 * 2020' has no future occurrence and will NEVER fire; fix the schedule or disable the job (its status reports never_fires)
 ```
 
-and every status surface reports `never_fires` until the schedule changes. If a job should not run, prefer `enabled: false`, which says what it means.
+Status responses report `never_fires` until the schedule changes. To disable a job explicitly, use `enabled: false`.
 
 ## Linting expressions before they become jobs
 

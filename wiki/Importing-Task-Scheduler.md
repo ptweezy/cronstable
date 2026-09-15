@@ -1,14 +1,11 @@
 # Importing from Task Scheduler
 
 `cronstable import-taskscheduler` converts Windows Task Scheduler XML
-exports into cronstable jobs, so you do not have to retype an existing
-estate.
+exports to YAML jobs. Review and edit the generated YAML before loading it;
+cronstable does not read Task Scheduler XML at runtime.
 
-It is a one-shot converter, not a loader. It writes YAML you read, edit, and
-commit. At run time, cronstable never reads Task Scheduler XML. The main
-reason is that exporting a task does not unregister it, so an export
-describes tasks Task Scheduler is still running. If you load the output
-without reviewing it first, both schedulers run the same work.
+Exporting a task leaves it registered in Task Scheduler. Disable or remove
+the original task when migrating it to avoid running it in both schedulers.
 
 ## Exporting
 

@@ -1,11 +1,9 @@
 # Web dashboard
 
-cronstable includes a **built-in web dashboard**: a single, self-contained HTML page
-(one inline `<script>`, inline styles, no external assets, no build step, and no
-database) served by the optional [HTTP control API](HTTP-API). It is a live,
-keyboard-driven control surface for the daemon: watch every job's status, tail
-its output as it runs, review run history, and preview upcoming schedules, all
-from a browser.
+The **web dashboard** lets you monitor jobs, tail live output, review run
+history, and preview schedules from a browser. It supports keyboard shortcuts
+and is served by the optional [HTTP control API](HTTP-API), with no external
+assets or build step.
 
 [![The cronstable web dashboard, a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)
 
@@ -75,11 +73,9 @@ Each row shows:
 | **Trend** | A **sparkline** of recent runs: one bar per run, height by duration, colored by outcome (pause-skipped slots paint neutral, not green). |
 | **Actions** | One-click **Run** (or **Stop**, for a running job), **Pause** (or **Resume**, for a paused job), and **Logs**. |
 
-The **⊞ cols** button in the table header opens a column picker, so you can
-trim the table down or add columns that are off by default (the choice is
-remembered per browser). The page widens to give opted-in columns real room,
-and the table scrolls horizontally if the window still can't fit everything.
-The optional columns:
+Use **⊞ cols** in the table header to show or hide columns. The choice is saved
+per browser. The table widens as needed and scrolls horizontally if it exceeds
+the window. Optional columns:
 
 | Column | What it shows |
 | --- | --- |
@@ -249,10 +245,9 @@ runs are **deep-linkable** like jobs: the URL tracks `#dag/<name>` (and
 `#dag/<name>/<run_key>` with a run selected), so you can bookmark a run or paste
 it into an incident channel.
 
-This section covers the dashboard surface only. DAG semantics (task types, run
-keys, retries, approval gates, and the `dags:` configuration) live on
-[orchestration and DAGs](Orchestration-and-DAGs), and the endpoints on the
-[HTTP control API](HTTP-API#dag-endpoints).
+See [orchestration and DAGs](Orchestration-and-DAGs) for task types, retries,
+approval gates, and configuration, or the [HTTP control API](HTTP-API#dag-endpoints)
+for endpoint details.
 
 ## Durable state inspector
 
@@ -277,10 +272,9 @@ splits into sub-tabs built from what the store holds:
   [state inspector endpoints](HTTP-API#state-inspector-endpoints)
   (`GET /state/documents` / `GET /state/records`).
 
-The whole surface is **metadata-only**: record payloads, KV values, and archived
-output are never fetched (values render as a type and size). Apart from the
-single startup probe that decides whether to offer the button, the card polls
-only while it is open, because the inventory walk is not free.
+The inspector shows **metadata only**, including value types and sizes. It
+does not fetch record payloads, KV values, or archived output. After the
+startup probe, it polls only while open.
 
 ## Cluster panel
 
@@ -352,12 +346,11 @@ peer set only, so it is hidden entirely for the lease backends.
 
 [![The fleet view: a jobs-by-nodes matrix, each cell a node's last outcome for the job, with per-node health and load in the column headers](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png)
 
-The dashboard normally shows one node's truth: `/jobs` reports the runs *this*
-node made, so under
+The dashboard normally shows runs from the node you are viewing. Under
 [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
-a job that last ran on a peer shows nothing here. The **`⊞ fleet`** button in
-the cluster panel header opens the **fleet view**, a jobs × nodes matrix that
-closes that gap: one row per job, one column per node. The rows are the union of
+a job's runs on a peer do not appear in that history. Use **`⊞ fleet`** in
+the cluster panel header to open a matrix with one row per job and one column
+per node. The rows include
 every node's advertised jobs, so a mid-deploy peer's new job shows up too. Each
 cell carries that node's state for the job: **▶ running**, the last outcome with
 its age (`● ok 3m`, `✕ failure 12s`), `◌ off` for disabled-there, `◔` for never
@@ -370,13 +363,11 @@ matrix to the rows that are red anywhere in the fleet. Under spread, the cell
 belonging to each job's current owner carries an accent marker, so "who *should*
 run this next" and "who ran it last" sit side by side.
 
-The data arrives by piggyback, not fan-out. Every node attaches a compact
-per-job summary (running / enabled / next fire / last run) to the mutual-TLS
-[`/peer` response](Clustering-and-Leader-Election#cluster-peer-attestation) it
-already serves, so each node absorbs the whole fleet's state through the peer
-polls it already makes. The dashboard reads the merged result from
-[`GET /fleet`](HTTP-API#get-fleet) on its usual poll: no extra traffic towards
-the peers, and any node can serve the whole-fleet view.
+Nodes exchange per-job summaries (running, enabled, next fire, and last run)
+through their existing mutual-TLS
+[`/peer` responses](Clustering-and-Leader-Election#cluster-peer-attestation).
+The dashboard polls [`GET /fleet`](HTTP-API#get-fleet) for the merged result,
+which any node can serve.
 
 The cost of that design is freshness. A peer column is up to one gossip
 `interval` stale (30 s by default), so every column header shows its node's
@@ -462,10 +453,10 @@ the bar to the red **CLUSTER ALERT** severity described earlier under
 [![The incident timeline overlay: every job's most recent finished run, newest first, with failure reasons, exit codes, and durations](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-incident-timeline.png)
 
 The **incident timeline** (press `i`, or *Incident timeline* in the command
-palette) lists every job's most recent finished run, newest first, each with
-its relative time, outcome glyph, failure reason, exit code, and duration. A
-**failing only** filter narrows it, and the correlated blast-radius set from
-the verdict bar is highlighted, so you can read "what happened, in what order".
+palette) lists each job's most recent finished run, newest first, with its
+relative time, outcome, failure reason, exit code, and duration. Use
+**failing only** to filter the list. Jobs grouped by the verdict bar are
+highlighted.
 
 The **job actions panel** (*Review actions for failing jobs* in the palette, or the
 verdict bar's `▸ review actions` button) acts on the failing set in bulk. Guarded
@@ -503,11 +494,8 @@ even that overflows, the healthiest tail is cut behind an explicit footer chip
 (`+22 offscreen · none failing`), computed from what was cut, so the board never
 silently clips a failure behind a scrollbar nobody can reach.
 
-Because the normal header (and its connection indicator) is hidden, the
-wallboard judges its own freshness: if no successful poll lands for ~15 seconds
-(or three refresh intervals), the grid dims behind a loud `▚ NO SIGNAL` /
-`▚ STALE DATA` banner, so a wedged screen reads as broken rather than as a
-frozen healthy frame.
+If no poll succeeds for about 15 seconds (or three refresh intervals), the
+wallboard dims and shows `▚ NO SIGNAL` / `▚ STALE DATA`.
 
 When everything is healthy and the wallboard has been idle for a while (30
 seconds by default; configurable in Settings), the **zen screensaver** drifts
@@ -538,25 +526,23 @@ preview (such as `@reboot`), are omitted.
 ## Week calendar
 
 The **`◫ week`** toolbar button (or *Toggle week calendar* in the palette)
-opens a seven-day grid of upcoming fires, starting today: one hue-keyed chip
-per fire, placed at its **browser-local** wall time (the client engine computes
-fires in each job's own frame, then plots them in yours), with a dashed now-line
-in today's column. Chips sharing a quarter-hour split the column side by side,
-past fires today render dimmed, and clicking a chip opens the job's drawer on
-its [Schedule tab](#schedule-in-plain-english-in-the-right-timezone).
+opens a seven-day grid starting today. Each chip represents a scheduled run,
+colored by job and displayed in **your browser's local time**. A dashed line
+marks the current time. Chips sharing a quarter-hour split the column;
+past times today appear dimmed. Clicking a chip opens the job's
+[Schedule tab](#schedule-in-plain-english-in-the-right-timezone).
 
-Jobs that fire more than about eight times a day summarize into a **background
-hum** strip below the grid instead of flooding it with sliver chips. The card
-header links the fleet's **iCal feed** (`⤓ .ics feed`), and each drawer's
-Schedule tab links the per-job feed, so the same data lands in a real calendar
-app. See [calendar export](Calendar-Export).
+Jobs scheduled more than about eight times a day appear in a **background
+hum** summary below the grid. Subscribe in a calendar app using the fleet's
+**iCal feed** (`⤓ .ics feed`) in the card header or the per-job feed in its
+Schedule tab. See [calendar export](Calendar-Export).
 
 ## Activity heatmap
 
 [![The activity heatmap punchcard: one row per job, cells colored by worst outcome in the bucket and shaded by run volume](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-heatmap.png)
 
 The **`▦ heat`** header button (or *Toggle activity heatmap* in the palette)
-adds a punchcard card: one row per job, 24 time buckets across a **6h / 24h /
+adds a grid: one row per job, 24 time buckets across a **6h / 24h /
 7d** window, each cell colored by the worst outcome in that bucket and shaded
 by run volume. Hover a cell for the bucket's tally (such as `3 ok / 1 fail`);
 click a cell or a job name to open that job. The dashboard fills the card with
@@ -811,20 +797,17 @@ The dashboard is a thin client over the [HTTP control API](HTTP-API):
 - the **Run** / **Stop** buttons call `POST /jobs/{name}/start` and `POST /jobs/{name}/cancel`;
 - the version in the header comes from `GET /version`, and the [job-set id](Job-Set-ID) chip beside it from `GET /job-set-id` (each fetched once at load).
 
-By default, run history and captured output live **in memory** in the running
-daemon (the most recent 50 runs per job), nothing is written to disk, and
-everything resets on restart, so the dashboard adds nothing to cronstable's
-read-only-root-filesystem deployment story. With a
-[durable state store](Durable-State) configured, run history survives
-restarts (rehydrated from the durable run ledger), and
+By default, the daemon keeps run history (the most recent 50 runs per job)
+and captured output **in memory**, resetting both on restart. A
+[durable state store](Durable-State) preserves run history, and
 [`archiveOutput`](Durable-State#output-archival-and-secret-redaction) can
-persist captured output into the store. The Logs tab, though, only ever replays
-output buffered by the current process.
+also save output. The Logs tab replays only output buffered by the current
+process.
 
 ## See also
 
-- [Terminal Dashboard](Terminal-Dashboard): `cronstable tui`, this dashboard's TUI sibling, with the same board and the same shortcuts, rendered in a terminal over the same API.
-- [MCP](MCP): the third frontend (the same daemon, for AI agents).
+- [Terminal Dashboard](Terminal-Dashboard): monitor and control jobs with `cronstable tui`.
+- [MCP](MCP): access for AI agents.
 - [HTTP Control API](HTTP-API): the REST endpoints, configuration schema, authentication, and Unix-socket options the dashboard is built on.
 - [Pausing Jobs](Pausing-Jobs): the runtime pause behind the `⏸` chip and the `p` key.
 - [Late-Run Detection](Late-Run-Detection): the `sla:` monitor behind the OVERDUE badge.

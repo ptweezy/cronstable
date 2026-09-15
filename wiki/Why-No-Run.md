@@ -1,11 +1,8 @@
 # Why didn't it run?
 
-"The report job didn't run this morning" is the classic scheduling
-mystery, and the answer is usually buried in one cron field. The answer
-comes from ground truth. `GET /schedule/why` (and the
-`cron_why_no_run` [MCP tool](MCP)) takes **one job and one timestamp**
-and decomposes the scheduler's own match test **field by field**, so the
-verdict can never disagree with what the daemon computed.
+Use `GET /schedule/why` or the `cron_why_no_run` [MCP tool](MCP) to check
+why a job was not scheduled at a given time. Supply **one job and one
+timestamp** to see the scheduler's match test **field by field**.
 
 ```shell
 $ http get "http://127.0.0.1:8080/schedule/why?job=weekday-report&at=2026-07-14T09:00"
@@ -35,11 +32,9 @@ $ http get "http://127.0.0.1:8080/schedule/why?job=weekday-report&at=2026-07-14T
 }
 ```
 
-Every other field matched; Tuesday is not in {Monday, Friday}. The
-`previous_fire` / `next_fire` pair brackets the probe with the nearest
-**real** fire instants (from the same occurrence walk the scheduler
-runs, in the job's zone), so the same response also answers when the
-job fired around then.
+Every other field matched; Tuesday is not in {Monday, Friday}.
+`previous_fire` and `next_fire` give the nearest scheduled times before
+and after the timestamp, computed in the job's time zone.
 
 ## Reading the answer
 
@@ -63,7 +58,9 @@ job fired around then.
   replaced by its hashed values. `allowed` names the concrete slot, so
   "minute 0 is not in 16" tells you where the hash landed.
 
-## When the answer is genuinely surprising
+<a id="when-the-answer-is-genuinely-surprising"></a>
+
+## Day-field and daylight saving rules
 
 Two scheduling semantics produce misses (or odd runs) that look like
 bugs. The explainer flags both in `notes`:
@@ -79,8 +76,8 @@ bugs. The explainer flags both in `notes`:
   about.
 - **`dst-skipped-time` / `dst-repeated-time`.** For a matching wall time
   that a DST transition in the job's zone skips, the note names the
-  shifted wall time the run actually fired at. For a repeated wall time,
-  it says the run fired on the first occurrence only. See
+  shifted wall time used by the schedule. For a repeated wall time,
+  it says only the first occurrence is scheduled. See
   [schedules and time zones](Schedules-and-Timezones) for the underlying
   time model.
 

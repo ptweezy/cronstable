@@ -1,6 +1,6 @@
 # Business-day schedules (L-n, nW, LW, d#n)
 
-Payroll, billing, and close-of-books jobs run on month-shaped days: "the last weekday", "three days before month-end", and "the third Friday". Plain cron cannot say any of those, so cronstable's dialect includes four additive day forms that can:
+Payroll, billing, and month-end jobs often need schedules such as "the last weekday", "three days before month-end", or "the third Friday". cronstable supports four forms for these schedules:
 
 ```yaml
 jobs:
@@ -27,7 +27,7 @@ jobs:
 | `LW` | day-of-month | the month's last weekday |
 | `<d>#<n>` | day-of-week | the month's `n`-th such weekday, `n` in 1 to 5; `d` is any single weekday value (numeric `0`-`7` with 7 meaning Sunday, or a name like `fri`) |
 
-Every form is an ordinary list item, so they combine freely with plain values and each other: `1,15W,L` in day-of-month, `mon#1,L5` in day-of-week. `L5`, the month's last Friday, predates these forms, and `5#3` is its missing sibling.
+These forms can be combined with plain values and each other: `1,15W,L` in day-of-month, or `mon#1,L5` in day-of-week. `L5` means the month's last Friday; `5#3` means its third Friday.
 
 ## Exact edge rules
 
@@ -35,8 +35,8 @@ The rules match Quartz, the scheduler these spellings come from:
 
 - **`<n>W` shifts to the nearest weekday.** A Saturday target resolves to the Friday before; a Sunday target to the Monday after. At the month's edges the shift flips inward so the fire never leaves the month. `1W` on a Saturday 1st fires Monday the 3rd, and `31W` on a Sunday 31st fires Friday the 29th.
 - **A target the month never reaches does not fire that month.** `31W` in April behaves like a plain `31`: no April fire. The [schedule linter](Schedule-Linting) warns (`skipped-months`) when every selected month is too short.
-- **`L-<n>` can also outrun a month.** `L-30` reaches day 1 only in 31-day months. `L-28` lands in February only when the leap 29th exists, which the linter notes as `leap-day-only`.
-- **`<d>#<n>` skips months without an `n`-th such weekday.** `5#5` fires only in months with five Fridays. Ordinals run 1 to 5. No month holds six of one weekday.
+- **`L-<n>` skips months that are too short.** `L-30` reaches day 1 only in 31-day months. `L-28` runs in February only in leap years, which the linter notes as `leap-day-only`.
+- **`<d>#<n>` skips months without that occurrence.** `5#5` fires only in months with five Fridays. Valid ordinals are 1 to 5.
 - **The day-field AND rule applies unchanged.** When day-of-month and day-of-week are both restricted, a day must satisfy both. `0 0 15W * fri` therefore fires only when the weekday nearest the 15th is a Friday. See [schedules and time zones](Schedules-and-Timezones).
 
 ## Quartz compatibility notes
@@ -48,12 +48,12 @@ With these forms, most Quartz day expressions paste in unchanged, `?` included (
 
 ## Where the forms show up
 
-Every schedule surface understands them from the engine's parsed ground truth, not from re-parsing text:
+These forms are supported throughout cronstable:
 
 - The plain-English describers, server and dashboard alike: `0 0 L-3 * *` reads "At 00:00, on 3 days before the last day of the month".
 - [Schedule linting](Schedule-Linting): the preceding month-reachability checks, plus the day-field AND warning when combined with a weekday restriction.
 - The no-run explainer (`GET /schedule/why`, Model Context Protocol `cron_why_no_run`) decomposes them per instant: "day-of-month wanted the weekday nearest day 15 (15W)".
 - [Schedule load](Schedule-Pressure), [duplicate detection](Duplicate-Schedule-Detection) (semantic equality treats `fri#3` and `5#3` as equal), and the fire previews.
-- The [calendar export and week calendar](Calendar-Export), where month-shaped jobs land on the days the engine fires.
+- The [calendar export and week calendar](Calendar-Export).
 
 See also: [Schedules and Timezones](Schedules-and-Timezones) for the whole dialect, [Hashed Schedules](Hashed-Schedules) for the `H` forms.

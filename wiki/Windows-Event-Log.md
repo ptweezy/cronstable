@@ -1,11 +1,8 @@
 # Windows Event Log
 
-The `eventlog` reporter writes each job outcome to the Windows Event Log,
-where Windows monitoring already looks: Event Viewer, a Windows Event
-Forwarding subscription, SCOM, and every SIEM connector that ingests
-Windows events. It is the sixth reporter, beside `sentry`, `mail`, `shell`,
-`webhook`, and `push` in the same `report` block, so it fires from the same
-hooks and on the same outcomes as the rest.
+The `eventlog` reporter writes job outcomes to the Windows Event Log for
+Event Viewer, Windows Event Forwarding, SCOM, and SIEM tools. Configure it
+in a `report` block alongside `sentry`, `mail`, `shell`, `webhook`, or `push`.
 
 See [reporting](Reporting) for the hooks and the block's shared shape, and
 [running on Windows](Running-on-Windows) for the rest of the platform's

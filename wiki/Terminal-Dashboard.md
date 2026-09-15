@@ -1,12 +1,9 @@
 # Terminal dashboard
 
-`cronstable tui` is the [web dashboard](Web-Dashboard)'s terminal
-sibling: the same board, keyboard-first, rendered in your terminal: an
-SSH session, a tmux pane, a serial console, or a machine where running
-a browser is impractical. It is a client of the same
-[HTTP control API](HTTP-API) the web page uses, so there is nothing
-extra to enable on the daemon: if the dashboard works, so does the
-terminal user interface (TUI).
+`cronstable tui` lets you monitor and control jobs from a terminal,
+including over SSH or in tmux. The terminal user interface (TUI) uses
+the same [HTTP control API](HTTP-API) as the
+[web dashboard](Web-Dashboard), with no additional daemon configuration.
 
 [![The cronstable TUI against a live 9-node fleet: 70 jobs with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, the cluster owner column, and the verdict bar](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)
 
@@ -22,13 +19,11 @@ cronstable tui --tv                         # straight to the wallboard
 cronstable tui --job nightly-backup         # deep-link a job's drawer
 ```
 
-It is hand-rolled on the standard library plus the core `aiohttp`
-dependency, following the same zero-new-dependency rule as the
-[Model Context Protocol (MCP) server](MCP). It works on Linux, macOS,
-and Windows, and ships in the same package and binaries as the daemon.
+The TUI works on Linux, macOS, and Windows. It ships with the daemon
+and requires no additional dependencies.
 
-It does need a real terminal. If stdin or stdout is not a tty (a pipe, a
-redirect, a CI runner), it refuses to start, printing `cronstable tui
+The TUI requires an interactive terminal. If stdin or stdout is not a tty
+(for example, when piped or redirected), it prints `cronstable tui
 needs an interactive terminal (stdin/stdout are not a tty)` to stderr
 and exiting with code 2. On Windows it turns on the console's ANSI/VT
 processing itself, so a stock Command Prompt or PowerShell window works.
@@ -81,9 +76,11 @@ log to your home directory as
 `cronstable-<job>-<YYYYmmdd-HHMMSS>.log` (a toast confirms the exact
 path).
 
-## What made the trip
+<a id="what-made-the-trip"></a>
 
-Everything an operator drives from the web page:
+## Features
+
+The TUI includes:
 
 - The **jobs board**: status glyphs, next-fire countdowns, last-run
   ages, duration sparklines, live CPU/memory chips for monitored jobs,
@@ -94,7 +91,7 @@ Everything an operator drives from the web page:
   [late on a service level agreement (SLA) check](Late-Run-Detection)
   carries an **OVERDUE** suffix in its status cell and wallboard tile.
 - The **job drawer**: the live **Server-Sent-Events (SSE) log tail**
-  (ANSI colors re-inked per theme, search, follow, wrap, timestamps,
+  (ANSI colors adapted to the theme, search, follow, wrap, timestamps,
   save-to-file), **run history** with success rate and per-run bars,
   **resources** for monitored jobs, and the **schedule tab**, whose
   plain-English text and next-fire preview come from the daemon's own
@@ -120,17 +117,14 @@ Everything an operator drives from the web page:
   grid with a minute histogram, the fleet's
   [duplicate-schedule groups](Duplicate-Schedule-Detection), and the
   [least-loaded-slot suggestions](Suggest-a-Slot), computed locally from
-  the `/jobs` snapshot with the daemon's own shared analyzers (see
+  the `/jobs` snapshot with the daemon's shared analyzers (see
   [schedule load](Schedule-Pressure)), so it works against older
   daemons too.
-- The **week calendar** overlay (`Ctrl-K` → "Toggle week calendar"): the
-  web dashboard's seven-day view, terminal-shaped: a day-by-hour shaded
-  fire grid, a chronological agenda of the calendar-worthy fires (all
-  labels UTC, the TUI's frame everywhere), and the same background-hum
-  rule, so a minutely job summarizes to one name-and-count line instead
-  of flooding the agenda. It is computed locally like pressure, and is
-  the same data the daemon serves as an iCal feed (see
-  [calendar export](Calendar-Export)).
+- The **week calendar** overlay (`Ctrl-K` → "Toggle week calendar"): a
+  seven-day schedule with a day-by-hour grid and chronological agenda
+  in UTC. Frequent jobs appear in a **background hum** summary, with
+  one line per job. Like schedule load, the calendar is computed locally
+  (see [calendar export](Calendar-Export)).
 - The **state inspector** for the durable store (inventory, document
   namespaces, record streams).
 - The **schedule preview** (`Ctrl-K` → "Schedule preview"), evaluating
@@ -141,13 +135,12 @@ Everything an operator drives from the web page:
 - The **wallboard** (`w`) with worst-first tiles, the tally foot, a
   `NO SIGNAL` banner when data goes stale, and the zen screensaver on an
   idle board (nothing failing or running, data fresh).
-- The **BIOS-style boot self-test**, probing the daemon for real, once
+- The **BIOS-style boot self-test**, checking the daemon once
   per 12 hours. Skip it with any key, `--no-boot`, or a settings toggle.
 
-Everything painted into the terminal is sanitized first. Raw log lines
-get log-viewer carriage-return semantics: only the last non-empty `\r`
-segment of a line is kept, so progress bars and cmd.exe's CRLF output
-collapse cleanly. Tabs expand, and other control characters are dropped.
+Text is sanitized before display. For log lines, only the last non-empty
+`\r` segment is kept, so progress bars and cmd.exe's CRLF output display
+correctly. Tabs expand, and other control characters are dropped.
 
 Every escape sequence except SGR styling is scrubbed from job output and
 from API-derived strings such as job and node names, which under
@@ -166,9 +159,9 @@ neutral), **carolina**, **amber**, **green**, and flat **modern**.
 Each has a dark and a light (paper) variant. `t` cycles hues and `T`
 flips the variant, exactly as in the browser.
 
-The **color-vision** remaps (red-green and blue-yellow) re-ink the
-status colors with the same shape-differs-too guarantee, and `--ascii`
-swaps the status glyphs for plain ASCII.
+The **color-vision** settings offer red-green and blue-yellow palettes.
+Statuses also use distinct shapes, and `--ascii` replaces the glyphs
+with plain ASCII.
 
 Preferences (theme, refresh, toggles) persist in a small JSON file, the
 TUI's analogue of the page's `localStorage`:
@@ -180,12 +173,12 @@ TUI's analogue of the page's `localStorage`:
 Open the settings panel from the command palette (`Ctrl-K` → "Open
 settings"); it has no dedicated key. `j`/`k` (or the arrow keys) select
 a row. `Enter`, `Space`, `←` or `→` cycle or toggle the selected value.
-Every change saves immediately to the prefs file, whose path the panel's
+Every change saves immediately to the preferences file, whose path the panel's
 footer shows.
 
 The panel has twelve rows. **Theme**, **Light / dark**, **Color
 vision**, and **ASCII glyphs** are the
-[themes and accessibility](#themes-and-accessibility) knobs described
+[themes and accessibility](#themes-and-accessibility) settings described
 earlier. **Refresh interval** is the `--poll` cadence, 1s–10s or paused.
 **Wrap log lines** and **Log timestamps** are the **Logs** tab's `w`/`t`
 toggles. **Audible cues (bell)** is off by default. The panel also has
@@ -214,10 +207,9 @@ only path to your local clipboard. It needs an emulator that supports
 OSC 52; most modern ones do, and tmux passes it through only when its
 `set-clipboard` option allows.
 
-A failed copy is silent: the TUI cannot see whether the OSC 52 escape
-landed, so it reports success either way. If pastes come up empty in a
-remote session, check the emulator's OSC 52 support. The incident
-writeup is the one copy that also lands in a file.
+The TUI reports success without being able to verify OSC 52 delivery.
+If the clipboard is empty in a remote session, check the emulator's
+OSC 52 support. Incident writeups are also saved to a file.
 
 ## Authentication
 
@@ -243,8 +235,6 @@ as the fallback against a daemon without that batch.
 `GET /jobs/{name}/logs` is an SSE stream while a **Logs** tab or
 multi-tail pane is attached (replay-then-follow, with the page's same
 reconnect throttle).
-
-Run `cronstable tui` against any daemon you can `curl`.
 
 ## Screenshot gallery
 
@@ -290,13 +280,11 @@ Run `cronstable tui` against any daemon you can `curl`.
 
 ## See also
 
-- [Web Dashboard](Web-Dashboard): the browser original, every surface
-  the TUI mirrors, annotated with screenshots.
+- [Web Dashboard](Web-Dashboard): browser features and screenshots.
 - [HTTP Control API](HTTP-API): the endpoints and authentication both
   frontends are built on.
 - [Pausing Jobs](Pausing-Jobs): the runtime pause behind the `⏸` glyph
   and the `p` key.
 - [Late-Run Detection](Late-Run-Detection): the `sla:` monitor behind
   the **OVERDUE** suffix.
-- [MCP](MCP): the third frontend, the same daemon, for artificial
-  intelligence agents.
+- [MCP](MCP): access for AI agents.

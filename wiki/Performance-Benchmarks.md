@@ -1,14 +1,9 @@
 # Performance benchmarks
 
-The CI pipeline benchmarks every commit and gates every release on the
-result.
-
-Because cronstable is meant to run comfortably on old and small machines, the
-pipeline measures the paths that determine that (process startup, schedule
-math at 100k-job scale, config parsing, DAG planning, durable-state I/O,
-JSON, redaction, calendar rendering, and memory footprint). For the same
-reason, it refuses to publish a release that regressed past a metric's
-declared limit.
+CI benchmarks every commit and blocks releases that exceed regression
+limits. The suite measures startup, scheduling at 100,000-job scale,
+config parsing, DAG planning, durable-state I/O, JSON, redaction, calendar
+rendering, and memory use to track performance on older and smaller machines.
 
 ## What is measured
 

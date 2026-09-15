@@ -1,15 +1,11 @@
 # Clustering and leader election
 
-By default cronstable holds its schedule in-process and keeps no shared state, so
-two instances started from the same configuration each run **every** job
-independently. That is the safe single-instance model, but it means you cannot
-scale to two replicas for availability without double-running every job.
+Without clustering, instances using the same configuration each run **every**
+job independently. Adding a replica therefore duplicates scheduled work.
 
-The optional **`cluster`** section closes that gap. It lets a static set of
-instances attest, over mutual TLS, that they are running the *same* job set.
-When you opt in, it turns that attestation into a **quorum-gated leader
-election**, so that several replicas deployed from one config run with only the
-elected leader firing scheduled jobs. It builds directly on the
+The optional **`cluster`** section lets instances verify over mutual TLS that
+they share a job set. Enabling **leader election** uses that agreement and
+quorum to select which replica runs scheduled jobs. It builds on the
 [job-set id](#the-job-set-id-foundation) and is implemented in
 `cronstable/cluster.py` (the `ClusterManager`, `ClusterView`, and the pure
 `elect_leader`/`quorum_size` functions).

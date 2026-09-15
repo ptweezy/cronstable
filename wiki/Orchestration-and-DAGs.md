@@ -1,12 +1,9 @@
 # Orchestration and DAGs
 
-cronstable schedules independent jobs. A **DAG** (directed acyclic graph) in
-the optional `dags:` section adds the other axis: a durable,
-dependency-ordered **workflow** of tasks, run on a schedule, that survives
-restarts and coordinates across a fleet exactly the way the rest of
-[durable state](Durable-State) does. It is a small orchestration engine built
-entirely on the pieces that already exist. There is **no new coordination
-service, no new backend, no client library**:
+Use the optional `dags:` section to define **workflows** whose tasks run in
+dependency order. Each workflow is a **DAG** (directed acyclic graph) backed
+by [durable state](Durable-State), allowing it to resume after restarts and
+coordinate across a fleet. DAGs use the existing job runner and state store:
 
 - a **dag_run** (one execution of a DAG) is a single mutable *document* in the
   [state store](Durable-State), holding every task's state;

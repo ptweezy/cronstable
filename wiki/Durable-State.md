@@ -1,14 +1,12 @@
 # Durable state
 
-By default cronstable is **stateless**: run history, retry ladders, the next-fire
-index and the Prometheus counters live in memory and reset with the process,
-and that zero-disk story is a feature. The optional **`state`** section adds
-the other half: a durable, restart-surviving store for the things that are
-worth keeping (a run ledger, pending retries, `@reboot` boot markers, metric
-counters), plus the scheduling features that only make sense after a store
-exists (missed-run catch-up, a depends-on-past gate, output archival, SLA
-trends). It is implemented in `cronstable/state.py` (the
-`FilesystemStateBackend`) and wired into the scheduler in `cronstable/cron.py`.
+By default cronstable keeps run history, retries, the next-fire index, and
+Prometheus counters in memory. The optional **`state`** section preserves
+run history, pending retries, `@reboot` markers, and metric counters across
+restarts. It also enables missed-run catch-up, depends-on-past checks,
+output archival, and SLA trends. The backend is implemented in
+`cronstable/state.py` (`FilesystemStateBackend`) and integrated with the
+scheduler in `cronstable/cron.py`.
 
 > **Everything on this page is opt-in.** Without a `state` section the backend
 > is never constructed, no file is ever written, and the in-memory behavior

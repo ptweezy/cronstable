@@ -1,8 +1,8 @@
 # Pausing jobs
 
-cronstable can pause a job at runtime without a configuration change: it skips the scheduled fires until the pause expires or someone resumes it. A pause is a bounded window, never a permanent state. Every pause carries an `until` deadline (one hour by default, thirty days at most), so a job silenced during an incident always comes back on its own. For an indefinite stop, set `enabled: false` in the config instead.
+Pause a job at runtime to skip scheduled runs until the pause expires or you resume it. Pauses last one hour by default and at most thirty days. To stop a job indefinitely, set `enabled: false` in its configuration.
 
-One code path in `cronstable/cron.py` holds the mechanics: `Cron.pause_job_by_name` and `Cron.resume_job_by_name`. Every surface shares it: the [HTTP API](HTTP-API#post-jobsnamepause) (`POST /jobs/{name}/pause` and `/resume`), the [web dashboard](Web-Dashboard) and [terminal dashboard](Terminal-Dashboard) (the `p` key and the drawer button), and the `cron_pause_job` and `cron_resume_job` [Model Context Protocol (MCP) tools](MCP).
+Pause and resume are available through the [HTTP API](HTTP-API#post-jobsnamepause), the [web dashboard](Web-Dashboard) and [terminal dashboard](Terminal-Dashboard) (`p` or the drawer button), and the `cron_pause_job` and `cron_resume_job` [MCP tools](MCP).
 
 ## Pausing and resuming
 
@@ -30,10 +30,10 @@ $ http post http://127.0.0.1:8080/jobs/nightly-etl/pause durationSeconds:=7200 n
 }
 ```
 
-Pausing an already-paused job overwrites the window (idempotent, and how you extend a pause). For an unknown job, the daemon returns `404`. These are `400` errors:
+To extend or change a pause, pause the job again. An unknown job returns `404`. Invalid inputs return `400`:
 
-- both keys at once
-- a past or over-cap `until`
+- both `durationSeconds` and `until`
+- an `until` value in the past or more than thirty days away
 - an out-of-range duration
 - a wrong type
 - an oversized `note`/`by`
@@ -43,17 +43,17 @@ Pausing an already-paused job overwrites the window (idempotent, and how you ext
 ## What a pause does
 
 - **Scheduled fires are skipped, visibly.** Each due slot gets a synthetic row in the run ledger with outcome `skipped` and `skip_reason: "paused"` (no `started_at`, no `exit_code`), so the history records a due fire that was deliberately not run, instead of a silent gap. The dashboards show these rows neutrally, and they stamp no success or failure state.
-- **Pending retries defer.** An armed [retry ladder](Failure-Detection-and-Retries) is neither consumed nor cancelled: the attempt waits and fires after the resume. A pause defers the attempt without changing the ladder.
-- **Catch-up owes nothing for the window.** [Missed-run catch-up](Durable-State) never backfills slots inside a pause window, including those the daemon slept through while it was down; the durable pause record accounts for them. Catch-up covers slots after the expiry. A job that is paused when the boot evaluation reaches it waits for the pause to lift, with its pre-pause watermark pinned in an open checkpoint; the evaluation then replays the backlog from before the pause, or closes the checkpoint when nothing is owed. A job set aside for good while its checkpoint is open (disabled, or switched to `onMissed: skip`) closes it as well, so a later change of heart starts from the run ledger rather than from the pin.
-- **Manual start still works.** `POST /jobs/{name}/start` launches a paused job, unlike a disabled one, which is refused with `409`. A start request names the job, so it takes precedence over the standing instruction to skip the schedule. Cancel is likewise unaffected.
+- **Pending retries defer.** A pending [retry](Failure-Detection-and-Retries) waits until the job resumes, preserving its attempt number and retry budget.
+- **Catch-up skips the pause window.** [Missed-run catch-up](Durable-State) excludes slots within recorded pause windows, including daemon downtime, and covers slots after expiry. If the job is paused during boot evaluation, catch-up waits with its pre-pause watermark saved in an open checkpoint. After resume, it replays the backlog from before the pause or closes the checkpoint if nothing is owed. Disabling the job or setting `onMissed: skip` also closes the checkpoint; later catch-up starts from the run ledger.
+- **Manual start still works.** `POST /jobs/{name}/start` can launch a paused job; a disabled job returns `409`. Cancellation also remains available.
 - **Running instances are unaffected.** Pausing stops future fires. It never touches a run already in progress.
 - **The pause sticks to the name.** Config reloads and edits to the job leave an active pause in place. Only removing the job from the config drops it.
 
-While paused, the job's [service level agreement (SLA) checks](Late-Run-Detection) are suppressed. A deliberately held job must not page as overdue, and pause-skipped slots are never counted as late.
+While paused, the job's [service level agreement (SLA) checks](Late-Run-Detection) are suppressed. Slots skipped during a pause do not count as late.
 
 ## Expiry
 
-Expiry needs no timer and no write. A pause window whose `until` has passed reads as absent at every consumer at once, and the daemon sweeps the stale entry and logs the auto-resume on its housekeeping pass (once per wall-clock minute). A daemon restart across the deadline leaves nothing to clean up.
+A pause stops applying when its `until` deadline passes. The daemon removes the expired entry and logs the automatic resume during housekeeping, once per wall-clock minute. A restart after the deadline ignores the expired pause.
 
 ## Durability and clusters
 

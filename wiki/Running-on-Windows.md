@@ -1,14 +1,9 @@
 # Running on Windows
 
-cronstable runs natively on Windows, alongside Linux and macOS. This page is the
-canonical reference for the behaviors that differ on Windows: how to install
-it, where it looks for configuration, how a string `command` is fed to a
-shell, and how job output is decoded. It covers how to stop the daemon,
-how to run it unattended (at boot, surviving logoff), how a job is terminated,
-the POSIX-only features that are reported (never silently dropped) on Windows,
-and what file-lock coordination over a shared mount can and cannot verify.
-Everything not listed here behaves exactly as it does on POSIX, so the rest of
-this wiki applies unchanged.
+cronstable runs natively on Windows. This page covers installation,
+configuration paths, shells, output decoding, unattended operation, shutdown,
+and shared-store coordination. It also lists unsupported POSIX features.
+The rest of the wiki applies unless a Windows-specific difference is noted here.
 
 A single module (`cronstable/platform.py`) holds all the OS-specific
 behavior. The scheduler, job runner, config loader, and entry point read the

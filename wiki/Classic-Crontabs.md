@@ -1,22 +1,17 @@
 # Classic crontabs
 
-cronstable's configuration format is YAML, but it also reads classic
-(Vixie-style) crontabs, the `m h dom mon dow command` format described by
-`man 5 crontab`. You can point `-c` at an existing crontab, drop one into a
-config directory next to your YAML files, or pull one in with `include:`, and
-every entry runs as a first-class cronstable job.
+cronstable reads classic (Vixie-style) crontabs in the
+`m h dom mon dow command` format described by `man 5 crontab`. Pass a
+crontab to `-c`, place it beside YAML files in a config directory, or load
+it with `include:`.
 
-The contract is deliberately one-directional: **the crontab syntax is
-supported, but the configuration around it is not emulated.** Each entry is
-lowered into an ordinary job definition, then built exactly like a YAML job.
-It therefore carries cronstable's standard defaults (among them UTC
-schedules, stderr and exit-status failure detection,
-`concurrencyPolicy: Allow`, and no retries), not a re-creation of cron's
-environment, mailer, or quirks.
+**Entries use cronstable's defaults**: UTC schedules, stderr and exit-status
+failure detection, `concurrencyPolicy: Allow`, and no retries. Cron's
+environment and mail behavior are not emulated.
 
-The later [deviations](#deviations-from-cron) section lists every place that
-matters and what to do about each. All behavior on this page is implemented
-in `cronstable/crontabs.py` and `cronstable/config.py`.
+See [deviations from cron](#deviations-from-cron) before migrating an
+existing crontab. The loader is implemented in `cronstable/crontabs.py`
+and `cronstable/config.py`.
 
 ## How a crontab is recognised
 
@@ -137,14 +132,10 @@ that cronstable runs it, and what the same line did under classic cron:
 | retries (`onFailure.retry`) | none | none |
 | user (`user`) | the user cronstable runs as | the crontab's owner |
 
-There is no way to override these from inside a crontab; the format has no
-vocabulary for it. That is by design. A crontab gets you *running* with
-sensible, predictable standards. When an entry needs reporting, retries,
-timeouts, or any other per-job option, move that entry to YAML, where every
-option in the [configuration reference](Configuration-Reference) is
-available. A `defaults:` section in a sibling or including YAML file does
-**not** apply to crontab entries, for the same reason per-file defaults never
-cross files (see
+For reporting, retries, timeouts, or other per-job options, move the entry
+to YAML and use the [configuration reference](Configuration-Reference).
+A `defaults:` section in a sibling or including YAML file does **not**
+apply to crontab entries; defaults are scoped to their file (see
 [includes, defaults, and multi-file config](Includes-and-Defaults)).
 
 ### Job names
@@ -159,26 +150,20 @@ history ends and the new name starts fresh.
 
 ## Deviations from cron
 
-Each of these is a deliberate choice in favor of cronstable's standard
-behavior, made loudly rather than silently:
+Check these differences when migrating:
 
-- **Schedules default to UTC, not local time.** This is cronstable's standard
-  and by far the least surprising choice in containers. Put `CRON_TZ=<zone>`
+- **Schedules default to UTC, not local time.** Put `CRON_TZ=<zone>`
   above the entries that need a specific zone.
 - **`MAILTO` does not send mail.** It is exported to the job's environment
-  but not interpreted. A crontab has nowhere to declare an SMTP server, and
-  cronstable's failure handling is richer than mail-on-output. To get failure
-  mail, configure [reporting](Reporting) in YAML. Failures are always visible
-  in logs, the dashboard, and the HTTP API regardless: cronstable reads each
-  entry's stderr for exactly that purpose, whereas stdout is left unread and
-  flows straight to cronstable's own stdout (see the preceding table).
+  but not interpreted. Configure [reporting](Reporting) in YAML to receive
+  email. Failures remain visible in logs, the dashboard, and the HTTP API.
+  stderr is captured; stdout passes through to cronstable's stdout
+  (see the preceding table).
 - **An unescaped `%` is a load-time error, not stdin.** In cron, `%` ends
   the command, and everything after it is fed to the command as standard
-  input. The daemon does not feed stdin to jobs, and the silent alternatives
-  are both worse: running the command without input it expects, or leaving
-  the input text on the command line for the shell to run. The escaped
-  form `\%` (the common case, such as `date +\%F`) works exactly as in cron.
-  For genuine stdin data, use a YAML job with a heredoc or file redirect.
+  input. cronstable does not support that syntax. The escaped form `\%`
+  (such as `date +\%F`) works as in cron. To supply stdin, use a YAML job
+  with a heredoc or file redirect.
 - **The system-crontab user column is not parsed.** `/etc/crontab` and
   `/etc/cron.d` files carry a sixth field naming the user to run as. A
   parser cannot reliably tell that column from the first word of a command,

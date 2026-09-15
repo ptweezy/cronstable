@@ -1,8 +1,8 @@
 # cronstable™ wiki
 
-cronstable is a cron replacement built on asyncio that runs natively on Linux, macOS, and Windows. Its "crontab" is written in YAML ([classic Vixie crontabs](Classic-Crontabs) are accepted as-is too), so jobs, schedules, and behavior are all declared in configuration. The daemon reports job failures by email, Sentry, webhook, push notification, or shell command. It retries failing jobs with exponential backoff, emits job metrics to statsd, and serves them to Prometheus from a built-in endpoint. It can expose an optional HTTP control API and a built-in [web dashboard](Web-Dashboard) to watch, run, cancel, and tail jobs live.
+cronstable is an asyncio-based cron replacement for Linux, macOS, and Windows. Define jobs in YAML or load [classic Vixie crontabs](Classic-Crontabs). It supports failure notifications, retries with exponential backoff, statsd and Prometheus metrics, and an optional HTTP control API with a [web dashboard](Web-Dashboard) to monitor and control jobs.
 
-An opt-in [durable state store](Durable-State) adds restart-surviving run history, missed-run catch-up, and state primitives for jobs. An optional [DAG engine](Orchestration-and-DAGs) runs dependency-ordered workflows on top of it. An optional [MCP server](MCP) lets AI agents observe the daemon and, when you opt in, act on jobs and DAGs.
+An optional [durable state store](Durable-State) preserves run history across restarts and enables missed-run catch-up, job state, and [DAG workflows](Orchestration-and-DAGs). The [MCP server](MCP) lets AI agents inspect the daemon and, with control enabled, act on jobs and DAGs.
 
 When one instance is not enough, opt-in [clustering and leader election](Clustering-and-Leader-Election) lets several replicas run one config without double-running jobs, coordinated by mTLS gossip or fenced through a Kubernetes or etcd lease.
 
@@ -12,7 +12,7 @@ cronstable is a fork of [gjcarneiro/yacron](https://github.com/gjcarneiro/yacron
 
 ## Contents
 
-Every page's sidebar is the canonical index. This list uses its grouping:
+Use the sidebar for the full index, or browse these sections:
 
 - **Getting Started**: [Installation](Installation) · [Command-Line Reference](CLI-Reference) · [Running on Windows](Running-on-Windows) · [Production and Container Deployment](Production-Deployment)
 - **Configuration**: [Configuration Reference](Configuration-Reference) · [Classic Crontabs](Classic-Crontabs) · [Schedules and Timezones](Schedules-and-Timezones) · [Business-Day Schedules](Business-Day-Schedules) · [Schedule Linting](Schedule-Linting) · [Hashed Schedules (H)](Hashed-Schedules) · [Commands and Environment](Commands-and-Environment) · [Environment-Variable Interpolation](Environment-Variable-Interpolation) · [Output Capturing](Output-Capturing) · [Includes, Defaults, and Multi-File Config](Includes-and-Defaults) · [Logging Configuration](Logging-Configuration)

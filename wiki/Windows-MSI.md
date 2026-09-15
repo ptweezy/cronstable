@@ -27,12 +27,10 @@ availability and steps to switch from a portable install.
 
 * The program in `C:\Program Files\cronstable` (`cronstable.exe` beside its
   `_internal` directory).
-* The `cronstable` Windows service, registered with exactly the settings
-  `cronstable service install` writes: the same command line, LocalSystem,
-  automatic start, the same description, and the same recovery actions
-  (restart after 60 seconds, twice, then give up, resetting the count
-  daily), applied to orderly failure exits as well as crashes. A test in
-  the repository holds the two spellings equal.
+* The `cronstable` Windows service, using the same settings as
+  `cronstable service install`: LocalSystem, automatic start, and recovery
+  after failure exits or crashes. Recovery restarts the service after
+  60 seconds, up to twice, with the count reset daily.
 * The install directory on the system `PATH`, so `cronstable` works in any
   new shell. Shells that were already open do not see the change until
   they are restarted.
@@ -57,14 +55,10 @@ The full paths matter: the shell that ran `msiexec` predates the `PATH`
 change the installer made, so a bare `cronstable` only works in shells
 opened later.
 
-The service is registered for automatic start, but the MSI does not start
-it on a first install, because there is no configuration yet and a service
-with nothing to read would stop with an error and burn its recovery
-restarts. `cronstable init` writes a commented starter configuration and
-tightens the directory's permissions where the platform default leaves
-them loose. After that, `cronstable service start` or the next boot brings
-it up. Until then, `cronstable service status` reports the service as
-stopped, which is the expected state.
+By default, a first install leaves the service stopped so you can create
+its configuration. Run `cronstable init` to write a commented starter config
+and restrict directory permissions where needed. Then run
+`cronstable service start`, or let the service start at the next boot.
 
 ## Properties
 
@@ -95,13 +89,10 @@ log names the exact action that failed.
 
 ## Upgrades
 
-Installing a newer MSI over an older one upgrades in place: the old
-version is removed first, and a running service is stopped for the
-switch. Install-time properties are remembered (see the preceding
-section), so the upgraded service keeps its configuration directory. When
-that directory exists, the service is started again at the end of the
-upgrade. That is the working deployment's normal case. A machine that
-never got configuration stays stopped.
+Installing a newer MSI upgrades in place, stopping the service and
+removing the old version first. The upgrade preserves install properties,
+including the configuration directory. It restarts the service if that
+directory exists; otherwise, the service remains stopped.
 
 Windows Installer waits for the service's stop, and the stop drains
 running jobs first. An upgrade during a very long job can therefore time

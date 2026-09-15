@@ -1,10 +1,8 @@
 # Push notifications
 
-cronstable can deliver job and daemon alerts as end-to-end encrypted push
-notifications to paired devices, through a hosted relay, using a fifth
-reporter named `push` beside the mail, Sentry, shell, and webhook reporters
-(see [reporting](Reporting)). The point is a page on a phone with none of
-the usual trust cost: no third-party service ever reads the alert.
+The `push` [reporter](Reporting) sends end-to-end encrypted job and daemon
+alerts to paired devices through a hosted relay. Only the paired devices
+can decrypt alert contents.
 
 The encryption model: the daemon seals each alert to every paired device's
 public key under the device's sealing suite (a libsodium sealed box for

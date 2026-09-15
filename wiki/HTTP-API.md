@@ -680,14 +680,11 @@ $ http get http://127.0.0.1:8080/jobs
 
 ### `GET /jobs/{name}`
 
-One job's detail, in the **identical** shape as a single entry of
-[`GET /jobs`](#get-jobs) (every field documented in that table, plus the same
-conditional `running_resources` / `retry` / `sla` / `schedule_resolved`
-extras). It lets a client (a detail screen, a widget) refresh a single job
-without pulling and filtering the whole fleet. Returns `404 Not Found` for an
-unknown job, like the other `/jobs/{name}/...` routes. The same detail dict has
-long been available to AI agents as the `cron_get_job` [MCP tool](MCP). This
-puts it on the REST surface too.
+Returns one job in the same format as a [`GET /jobs`](#get-jobs) entry,
+including conditional `running_resources`, `retry`, `sla`, and
+`schedule_resolved` fields. Use it to refresh a single job without fetching
+the whole fleet. An unknown name returns `404 Not Found`. The
+`cron_get_job` [MCP tool](MCP) returns the same data.
 
 ### `GET /jobs/{name}/runs`
 

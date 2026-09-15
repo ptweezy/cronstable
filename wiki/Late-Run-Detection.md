@@ -1,10 +1,10 @@
 # Late-run detection (SLA monitoring)
 
-Cron's failure model only sees runs that happened. The runs that hurt most are the ones that did not. Per-job service level agreement (SLA) monitoring watches for exactly that: a job that has gone too long without a success, a due slot that never started, or a run that is still going long past what it should take. Each job declares its thresholds in an `sla:` block. When a threshold is breached, a dedicated `onLate` reporting hook fires once, through the same six reporters as [failure reporting](Reporting). On a breach, the Windows Event Log reporter writes event 1003 at Warning level.
+Service level agreement (SLA) monitoring detects jobs that have gone too long without success, missed their scheduled start, or exceeded an expected runtime. Set per-job thresholds in an `sla:` block. Each breach triggers `onLate` once, using the same six reporters as [failure reporting](Reporting). The Windows Event Log reporter writes event 1003 at Warning level.
 
-The monitor lives in `cronstable/cron.py` (`Cron._sla_periodic`), evaluating every configured check once per wall-clock minute, entirely in memory. It needs no [state store](Durable-State), though one improves the staleness check across restarts. Breaches show on every dashboard surface: the [HTTP API](HTTP-API#get-jobs) (`sla` on `GET /jobs`), the [web dashboard](Web-Dashboard) and [terminal dashboard](Terminal-Dashboard) (an **OVERDUE** badge), [Prometheus](Metrics-with-Prometheus#per-job), and the [Model Context Protocol (MCP)](MCP) observe tools.
+The monitor evaluates checks once per wall-clock minute. It needs no [state store](Durable-State), though a store preserves the last successful run across restarts. Breaches appear in the [HTTP API](HTTP-API#get-jobs) (`sla` on `GET /jobs`), the [web dashboard](Web-Dashboard) and [terminal dashboard](Terminal-Dashboard) (**OVERDUE**), [Prometheus](Metrics-with-Prometheus#per-job), and [MCP](MCP) observe tools.
 
-One naming caution: `GET /jobs/{name}/trends` reports historical "SLA aggregates" (success rates and durations over the durable ledger). That surface describes runs that finished. This page's `sla:` block watches for runs that have not happened. They share the acronym and nothing else.
+The historical "SLA aggregates" in `GET /jobs/{name}/trends` summarize completed runs. The `sla:` checks described here monitor current thresholds.
 
 ## Configuring it
 
@@ -33,13 +33,13 @@ jobs:
 | `sla.maxRuntimeSeconds` | int or null | `null` (off) | Breach while any running instance has been running longer than this. Observes only; this check never stops the run (to enforce a limit, use [`executionTimeout`](Concurrency-and-Timeouts)). Must be `> 0` when set. |
 | `onLate.report` | report block | reporter defaults | The [reporters](Reporting) fired once per breach: `mail`, `sentry`, `shell`, `webhook`. The schema matches `onFailure.report`, with overdue-specific default templates. |
 
-The three thresholds are independent. Set any subset. Configuring an `onLate` reporter (a mail recipient, a sentry DSN, a shell command, a webhook URL) with all three thresholds unset is a load-time `ConfigError` (`onLate requires sla`): a reporter that can never fire is a misconfiguration, not a default. Both keys merge normally under a [`defaults:` block](Includes-and-Defaults). Like the catch-up options, they are excluded from the [job-set id](Job-Set-ID) fingerprint: alerting thresholds are not part of a job's identity.
+The three thresholds are independent; set any subset. Configuring an `onLate` reporter with no thresholds raises a load-time `ConfigError` (`onLate requires sla`). Both keys merge under a [`defaults:` block](Includes-and-Defaults) and are excluded from the [job-set id](Job-Set-ID) fingerprint.
 
 ## The three checks
 
 Check names are the config keys minus their `Seconds` suffix: `maxTimeSinceSuccess`, `lateAfter`, `maxRuntime`. The same vocabulary appears everywhere a check is named: the metric `check` label, the payload's `check` field, and the `{{sla_check}}` template variable.
 
-1. **`maxTimeSinceSuccess`**: breached when `now - last successful finish` exceeds the threshold. With no success on record (a stateless daemon after a restart, or a job that has never succeeded), the reference is the daemon's start time, so a fresh boot ages into the breach instead of paging instantly. With a [durable run ledger](Durable-State), the real last success is rehydrated at boot, and paging soon after a restart for a genuinely stale job is correct.
+1. **`maxTimeSinceSuccess`**: breached when `now - last successful finish` exceeds the threshold. With no recorded success, the check measures from daemon startup. A [durable run ledger](Durable-State) restores the last success at boot, so an already-overdue job may trigger a report soon after restart.
 2. **`lateAfter`**: a scheduled slot falls due, and no run of the job has started since it. Breached when `now - due` exceeds the threshold. Any start (scheduled, catch-up, retry, or manual) clears it. Slots skipped because the job was [paused](Pausing-Jobs) do not count as late, and a restart baselines on the next due slot.
 3. **`maxRuntime`**: breached while any running instance has been running longer than the threshold, measured from the run's launch instant. Clears when the run ends. It never stops anything.
 
@@ -79,7 +79,7 @@ Templates receive the full standard [template variable set](Reporting#templating
 
 ## The monitor cannot report its own death
 
-`onLate` runs inside the cronstable daemon. A stopped daemon, an unresponsive host, or a partitioned node takes the monitor down with the jobs it watches, and no in-process check can page about that. Pair the `sla:` block with the external staleness alert documented on [metrics with Prometheus](Metrics-with-Prometheus#example-alerts). A Prometheus server alerting on `time() - cronstable_job_last_success_timestamp_seconds` (and on the scrape itself going stale through `up == 0`) watches from outside the process, so the two layers cover each other. Use `onLate` for per-job thresholds with rich, job-aware notifications, and keep the Prometheus rule as the backstop that still fires when the daemon itself is gone.
+`onLate` runs inside the daemon, so it cannot report when the daemon or host stops. Pair it with the external alerts in [metrics with Prometheus](Metrics-with-Prometheus#example-alerts): `time() - cronstable_job_last_success_timestamp_seconds` detects stale successes, and `up == 0` detects failed scrapes. These checks can alert when the daemon cannot send notifications.
 
 ## See also
 

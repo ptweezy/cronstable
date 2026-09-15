@@ -1,14 +1,8 @@
 # Installation
 
-This page covers every way to install cronstable: the published container image,
-`pip`, `pipx`, Homebrew, winget, Scoop, `.deb`, `.rpm`, `.apk` and FreeBSD
-packages, Nix, `ubi` and `mise`, and the self-contained PyInstaller binaries. It
-documents the Python and platform requirements, the runtime dependencies, the
-exact binary release assets, and the writable-and-executable temp-directory
-requirement that applies to the standalone binary only.
-
-Besides Linux and macOS, cronstable runs natively on Windows. For the
-Windows-specific details, see [running on Windows](Running-on-Windows).
+Install cronstable with a package manager, a standalone binary, or the
+published container image. This page covers requirements and setup for each
+method. For Windows-specific behavior, see [running on Windows](Running-on-Windows).
 
 ## Requirements
 

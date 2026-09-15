@@ -27,9 +27,9 @@ GET /schedule/suggest?period=daily&tz=Europe/London
 }
 ```
 
-The choice is deterministic, so the same fleet always gets the same answer: fewest scheduled runs first. Ties break toward the slot circularly farthest from the busiest one, then toward the earliest slot. That tie-break is why an idle fleet gets `:30`, not `:00`: the outside world crowds the top of the hour even when your fleet does not.
+The choice is deterministic for a given forecast: fewest scheduled runs first, then the slot farthest around the clock from the busiest one, then the earliest slot. For an idle fleet, this rule selects `:30`.
 
-`busiest` is included for contrast. `alternatives` are the two runners-up. `hash_hint` names the [`H` spelling](Hashed-Schedules) that would keep future jobs spreading themselves without anyone consulting this endpoint again.
+`busiest` identifies the most crowded slot, `alternatives` gives two runners-up, and `hash_hint` suggests an [`H` expression](Hashed-Schedules) for automatic distribution.
 
 The same analyzer backs the `cron_suggest_slot` [Model Context Protocol (MCP) tool](MCP), so an agent asked to "add a cleanup job" can pick a schedule that does not add to a crowded slot.
 
@@ -39,6 +39,4 @@ The [web dashboard](Web-Dashboard)'s schedule load card has **suggest an hourly 
 
 ## Suggest versus H
 
-Both solve the same collision problem from different ends. A suggested slot is explicit: the schedule reads as a concrete minute. The cost is a point-in-time answer that no one re-balances later. An [`H` hashed slot](Hashed-Schedules) is self-maintaining: every job spreads itself. The cost is the minute living in the hash rather than the configuration file.
-
-New fleets tend to standardize on `H`. Established fleets use suggest to place jobs that must keep an explicit, reviewable schedule.
+A suggested slot gives you an explicit minute based on the current forecast; it does not rebalance later. An [`H` schedule](Hashed-Schedules) derives a stable slot from each job's name. Use a suggestion when the time must be explicit in the configuration, or `H` to assign slots automatically.
