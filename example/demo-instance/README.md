@@ -150,6 +150,21 @@ The installer verifies public reads and sample starts, refusal of private
 housekeeping through the gateway, and refusal of anonymous direct daemon
 mutations. Re-run it after editing this directory's deployment files.
 
+Re-running restarts all three agents, and the installer waits for the
+previous daemon and gateway to actually be gone before starting the next
+ones. `launchctl bootout` signals the process launchd started, which for a
+frozen daemon is a PyInstaller bootloader whose child holds the socket; that
+child drains running jobs on SIGTERM, outlives launchd's 20-second grace,
+and has stayed bound to `127.0.0.1:8080` on nearly every restart of the
+hosted demo. A replacement then fails to bind and is relaunched every
+`ThrottleInterval` while the orphan keeps answering, and because the gateway
+relays to whatever is on 8080, every probe still passes. So after each
+bootout the installer waits for every process of the old instance to exit
+and its port to free, sends SIGTERM and then SIGKILL only to processes that
+are provably that instance, refuses if anything else holds the port, and
+after the restart proves that the process on each port descends from the
+job launchd just started and that the daemon reports the deployed build.
+
 For unattended operation, arrange for the Mac to stay awake and the user
 session to return after reboot: LaunchAgents start at login. The Docker path
 also requires its container runtime to start. Native jobs have no container

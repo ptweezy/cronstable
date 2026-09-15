@@ -3,7 +3,9 @@
 # Install the demo daemon, demo-only gateway and tunnel as launchd agents,
 # for a macOS host with no container runtime. The container path
 # (../docker-compose.yml) is the default; see ../README.md for when to prefer
-# which. Safe to re-run: it re-derives the config and reloads all three agents.
+# which. Safe to re-run: it re-derives the config, reloads all three agents,
+# and waits for the previous daemon and gateway to let go of their ports
+# before the next ones start (the comment above the bootout says why).
 #
 #   brew install cronstable cloudflared
 #   cloudflared tunnel login
@@ -99,22 +101,32 @@ CF_DIR="$HOME/.cloudflared"
 # here would make re-running the script mint duplicate tunnels. Capture the
 # listing first: under `set -e` a failing pipeline would kill the script
 # before the `die` below, with cloudflared's own error discarded.
-TUNNEL_LIST="$(cloudflared tunnel list --output json 2>&1)" \
-  || die "cloudflared tunnel list failed (run 'cloudflared tunnel login' first?): $TUNNEL_LIST"
+#
+# stderr goes to a file, not into the listing: since 2026.8.2 a cloudflared
+# that is not the newest release appends a JSON "outdated version" warning
+# to stderr on every successful command. Merged into stdout it lands after
+# the listing, the parse fails, and that used to be reported as a missing
+# tunnel for a tunnel that was up. A listing that does not parse is its
+# own error now.
+TUNNEL_ERR="$(mktemp -t cronstable-tunnel-list)"
+trap 'rm -f "$TUNNEL_ERR"' EXIT
+TUNNEL_LIST="$(cloudflared tunnel list --output json 2>"$TUNNEL_ERR")" \
+  || die "cloudflared tunnel list failed (run 'cloudflared tunnel login' first?): $(cat "$TUNNEL_ERR")"
 TUNNEL_ID="$(printf '%s' "$TUNNEL_LIST" | python3 -c "
 import json, sys
 name = sys.argv[1]
 try:
     tunnels = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
+except Exception as exc:
+    print(f'install.sh: cloudflared tunnel list did not return JSON: {exc}', file=sys.stderr)
+    sys.exit(1)
 for t in tunnels:
     # A live tunnel carries Go's zero timestamp here, not an empty string.
     stamp = t.get('deleted_at') or ''
     deleted = bool(stamp) and not stamp.startswith('0001-01-01')
     if t.get('name') == name and not deleted:
         print(t['id']); break
-" "$TUNNEL_NAME")"
+" "$TUNNEL_NAME")" || die "could not read 'cloudflared tunnel list --output json' (its error is above)"
 [ -n "$TUNNEL_ID" ] || die "no tunnel named '$TUNNEL_NAME' (run: cloudflared tunnel create $TUNNEL_NAME)"
 
 CREDS="$CF_DIR/$TUNNEL_ID.json"
@@ -341,6 +353,35 @@ EOF
 # launchd reads it as this user, so 0600 is enough.
 chmod 600 "$AGENT_DIR/com.cronstable.demo.plist" "$AGENT_DIR/com.cronstable.demo-gateway.plist"
 
+# Stopping the daemon takes more than the bootout below. launchd signals the
+# process it started, and for a PyInstaller build that is a bootloader whose
+# child holds the listening socket. The child drains running jobs on
+# SIGTERM, launchd allows the parent 20s before SIGKILL, and on the demo host
+# the child has outlived both as an orphan still bound to 127.0.0.1:8080 on
+# nearly every restart: the replacement logged "address already in use" and
+# exited, KeepAlive relaunched it every ThrottleInterval, and the orphan kept
+# answering. The gateway proxies to whatever is on 8080, so every probe at
+# the end still passed and the board ran the old build indefinitely. Even
+# without an orphan there is a window: `launchctl print` stops resolving the
+# label seconds before the process is actually gone. So after a label
+# disappears, wait for every process of the previous instance to exit and
+# for its port to free, then escalate, but only against processes that are
+# provably that instance. The gateway gets the same treatment on 8081.
+#
+# Every incarnation of the daemon shares the argv tail "-c <deployed
+# config>", whichever binary started it (an earlier CRONSTABLE_BIN, the
+# bootloader, its child, an instance someone started by hand), and every
+# gateway runs the deployed gateway.py, so those are the matches. The
+# validation runs above put more arguments after those, and jobs invoke
+# subcommands, never "-c". Only dots are escaped; a Homebrew prefix carries
+# no other metacharacter.
+re_escape() { printf '%s' "$1" | sed 's/[.]/\\./g'; }
+ETC_RE="$(re_escape "$ETC_DIR")"
+DAEMON_ARGV_RE="cronstable[^ ]* -c $ETC_RE/cronstable\.yaml\$"
+GATEWAY_ARGV_RE="$ETC_RE/gateway\.py --config "
+procs_matching() { pgrep -f "$1" 2>/dev/null || true; }
+port_holders()   { lsof -nP -iTCP@127.0.0.1:"$1" -sTCP:LISTEN -t 2>/dev/null || true; }
+
 for label in com.cronstable.demo com.cronstable.demo-gateway com.cronstable.tunnel; do
     plutil -lint "$AGENT_DIR/$label.plist" >/dev/null || die "$label.plist failed lint"
     # plutil tolerates malformed XML that a strict parser rejects, and these
@@ -353,10 +394,47 @@ for label in com.cronstable.demo com.cronstable.demo-gateway com.cronstable.tunn
     # after the bootout, leaving the service down and the demo dark. Wait for
     # the label to disappear, then retry the bootstrap rather than trusting it.
     launchctl bootout "gui/$UID/$label" 2>/dev/null || true
-    for _ in $(seq 1 50); do
+    for _ in $(seq 1 150); do
         launchctl print "gui/$UID/$label" >/dev/null 2>&1 || break
         sleep 0.2
     done
+
+    # Which loopback port this label must own, and the argv shape of its
+    # process, for the wait below. The tunnel owns no local port.
+    case "$label" in
+        com.cronstable.demo)         port=8080; argv_re="$DAEMON_ARGV_RE" ;;
+        com.cronstable.demo-gateway) port=8081; argv_re="$GATEWAY_ARGV_RE" ;;
+        *)                           port="";   argv_re="" ;;
+    esac
+    if [ -n "$port" ]; then
+        # The label is gone; the previous process may not be. Give its drain
+        # a bounded grace on top of what launchd allowed, then escalate.
+        for _ in $(seq 1 150); do
+            [ -n "$(procs_matching "$argv_re")$(port_holders "$port")" ] || break
+            sleep 0.2
+        done
+        stale="$(procs_matching "$argv_re" | xargs)"
+        if [ -n "$stale" ]; then
+            printf 'install.sh: previous %s still running after bootout (pid %s), terminating it\n' "$label" "$stale"
+            # unquoted on purpose: one pid per word
+            kill -TERM $stale 2>/dev/null || true
+            for _ in $(seq 1 25); do
+                [ -n "$(procs_matching "$argv_re")" ] || break
+                sleep 0.2
+            done
+            stale="$(procs_matching "$argv_re" | xargs)"
+            if [ -n "$stale" ]; then
+                printf 'install.sh: pid %s survived SIGTERM, killing it\n' "$stale"
+                kill -KILL $stale 2>/dev/null || true
+                sleep 1
+            fi
+        fi
+        # Whatever holds the port now is not a process this script knows,
+        # so it is not this script's to kill: refuse rather than bootstrap
+        # one that will lose the bind.
+        holder="$(port_holders "$port" | head -1)"
+        [ -z "$holder" ] || die "127.0.0.1:$port is held by pid $holder ($(ps -o args= -p "$holder" 2>/dev/null || echo unknown)); free it and re-run"
+    fi
 
     booted=""
     for _ in 1 2 3 4 5; do
@@ -402,8 +480,37 @@ direct="$(curl -sS -o /dev/null -w '%{http_code}' -m 5 \
     -X POST http://127.0.0.1:8080/jobs/restore-drill/start 2>/dev/null || true)"
 [ "$direct" = "403" ] || die "direct daemon mutation answered $direct, expected 403"
 
+# Those answers are exactly what the orphan trap produced (a stale process
+# answering for a replacement that could not bind, and the gateway relays
+# whatever is on 8080), so prove that the process on each port descends
+# from the job launchd just started. For a PyInstaller build the listener
+# is the bootloader's child, hence the walk up the parent chain rather than
+# a direct comparison; it ends at launchd (pid 1) when the listener is
+# someone else's.
+listener_is_job() {
+    local port="$1" label="$2" job_pid listener ancestor
+    job_pid="$(launchctl print "gui/$UID/$label" 2>/dev/null \
+        | awk '$1 == "pid" && $2 == "=" { print $3; exit }' || true)"
+    listener="$(port_holders "$port" | head -1)"
+    ancestor="$listener"
+    while [ -n "$ancestor" ] && [ "$ancestor" != "$job_pid" ]; do
+        case "$ancestor" in 0|1) ancestor=""; break ;; esac
+        ancestor="$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d ' ' || true)"
+    done
+    [ -n "$job_pid" ] && [ "$ancestor" = "$job_pid" ] \
+        || die "127.0.0.1:$port is served by pid ${listener:-none}, which is not the $label job launchd started (pid ${job_pid:-none}); a previous instance is still alive"
+}
+listener_is_job 8080 com.cronstable.demo
+listener_is_job 8081 com.cronstable.demo-gateway
+
+# ...and that the daemon is the build this script deployed, not one left over.
+want="$("$CRONSTABLE" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+have="$(curl -fsS -m 5 http://127.0.0.1:8080/version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+[ -n "$have" ] && [ "$have" = "$want" ] \
+    || die "the daemon on 127.0.0.1:8080 reports version '${have:-none}' but $CRONSTABLE is '${want:-unknown}'"
+
 printf '\ninstalled:\n'
-printf '  daemon   %s\n' "$CRONSTABLE"
+printf '  daemon   %s (%s)\n' "$CRONSTABLE" "$have"
 printf '  config   %s\n' "$ETC_DIR/cronstable.yaml"
 printf '  crontab  %s\n' "$ETC_DIR/legacy.crontab"
 printf '  state    %s\n' "$STATE_DIR"
