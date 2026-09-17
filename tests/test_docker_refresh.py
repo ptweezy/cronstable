@@ -1,0 +1,270 @@
+"""Check release selection, refresh coverage, and publication safeguards."""
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from strictyaml.ruamel import YAML
+
+ROOT = Path(__file__).resolve().parents[1]
+REVISION = "a" * 40
+RELEASE = {"id": 42, "tag_name": "v1.2.3", "draft": False, "prerelease": False}
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(
+        name, ROOT / ".github/scripts" / (name + ".py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def workflow(name):
+    return YAML(typ="safe").load(
+        (ROOT / ".github/workflows" / (name + ".yml")).read_text()
+    )
+
+
+def ancestors(jobs, name):
+    needs = jobs[name].get("needs", [])
+    if isinstance(needs, str):
+        needs = [needs]
+    return set(needs).union(*(ancestors(jobs, n) for n in needs))
+
+
+@pytest.mark.parametrize("tag", ["1.2.3", "v1.2.3"])
+def test_refresh_pins_released_source_and_distinguishes_reruns(tag):
+    refresh = load("docker_refresh")
+    release = dict(RELEASE, tag_name=tag)
+    first = refresh.plan(release, REVISION, "100", "1", "20260917")
+    retry = refresh.plan(release, REVISION, "100", "2", "20260917")
+    assert first == {
+        "version": "1.2.3",
+        "tag": tag,
+        "release-id": "42",
+        "revision": REVISION,
+        "build": "1.2.3-rebuild-20260917-100-1",
+    }
+    assert retry["build"] != first["build"]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"draft": True},
+        {"prerelease": True},
+        {"tag_name": "v1.2.3-rc1"},
+        {"tag_name": "main"},
+        {"tag_name": "1.02.3"},
+        {"tag_name": "1.2.3\nrevision=main"},
+    ],
+)
+def test_unreleased_or_invalid_tags_cannot_enter_refresh(changes):
+    with pytest.raises(ValueError):
+        load("docker_refresh").plan(
+            dict(RELEASE, **changes), REVISION, "100", "1", "20260917"
+        )
+
+
+@pytest.mark.parametrize(
+    "revision,run_id", [("main", "100"), (REVISION, "100\ntag=latest")]
+)
+def test_refresh_rejects_unpinned_source_and_invalid_build_ids(
+    revision, run_id
+):
+    with pytest.raises(ValueError):
+        load("docker_refresh").plan(RELEASE, revision, run_id, "1", "20260917")
+
+
+@pytest.mark.parametrize(
+    "changes,revision",
+    [
+        ({"id": 43, "tag_name": "v1.2.4"}, REVISION),
+        ({"id": 43}, REVISION),
+        ({"tag_name": "v1.2.4"}, REVISION),
+        ({}, "b" * 40),
+    ],
+)
+def test_superseded_releases_and_moved_tags_cannot_publish(changes, revision):
+    refresh = load("docker_refresh")
+    expected = refresh.plan(RELEASE, REVISION, "100", "1", "20260917")
+    assert refresh.is_current(RELEASE, REVISION, expected)
+    assert not refresh.is_current(dict(RELEASE, **changes), revision, expected)
+
+
+@pytest.mark.parametrize("current", [True, False])
+def test_publication_check_emits_a_machine_readable_decision(
+    tmp_path, monkeypatch, current
+):
+    refresh = load("docker_refresh")
+    output = tmp_path / "outputs"
+    for key, value in {
+        "GITHUB_OUTPUT": str(output),
+        "RELEASE_ID": "42",
+        "RELEASE_TAG": "v1.2.3",
+        "REVISION": REVISION,
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(sys, "argv", ["docker_refresh.py", "check"])
+    responses = {
+        "releases/latest": RELEASE,
+        "commits/v1.2.3": {"sha": REVISION if current else "b" * 40},
+    }
+    monkeypatch.setattr(refresh, "api", responses.__getitem__)
+    refresh.main()
+    assert output.read_text() == f"current={str(current).lower()}\n"
+
+
+def test_every_image_gets_unique_build_and_existing_release_aliases():
+    refresh = load("docker_refresh")
+    matrix = load("docker_matrix")
+    rows = matrix.expand(
+        json.loads((ROOT / ".github/docker-matrix.json").read_text())
+    )
+    all_tags = []
+    build = "1.2.3-rebuild-20260917-100-1"
+    for row in rows:
+        tags = refresh.tags("1.2.3", build, row["distro"], row["suffix"])
+        assert build + row["suffix"] in tags
+        assert "1.2.3" + row["suffix"] in tags
+        assert "latest" + row["suffix"] in tags
+        if row["distro"] == "debian-amd64v3":
+            assert "latest-debian-amd64v3" in tags
+        all_tags.extend(tags)
+    assert len(all_tags) == len(set(all_tags))
+    assert "latest-debian" in all_tags
+
+
+def test_matrix_uses_released_recipes_and_covers_required_wheels(tmp_path):
+    source = tmp_path / "matrix.json"
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "distro": "alpine",
+                    "dockerfile": "docker/Dockerfile.alpine",
+                    "suffix": "-alpine",
+                    "platforms": "linux/amd64,linux/s390x",
+                }
+            ]
+        )
+    )
+    output = tmp_path / "outputs"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github/scripts/docker_matrix.py"),
+            str(source),
+        ],
+        env=dict(os.environ, GITHUB_OUTPUT=str(output)),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert {r["distro"] for r in json.loads(result.stdout)} == {
+        "alpine",
+        "alpine-amd64v3",
+    }
+    values = {
+        k: json.loads(v)
+        for k, v in (
+            line.split("=", 1) for line in output.read_text().splitlines()
+        )
+    }
+    assert len(values["docker-musl"]) == 1
+    assert values["docker-glibc"] == []
+    matrix = load("docker_matrix")
+    rows = matrix.platforms(
+        json.loads((ROOT / ".github/docker-matrix.json").read_text())
+    )
+    wheel_names = {
+        f"pq-wheel-{r['libc']}-{r['arch']}"
+        for group in ("glibc", "musl")
+        for r in values["pq-" + group]
+    }
+    assert {r["wheel"] for r in rows if r["wheel"]} <= wheel_names
+
+
+def test_daily_refresh_gates_all_images_before_any_publication():
+    refresh = workflow("rehydrate-docker")
+    assert refresh["on"]["schedule"] == [{"cron": "23 6 * * *"}]
+    assert "workflow_dispatch" in refresh["on"]
+    assert refresh["concurrency"]["cancel-in-progress"] is False
+    jobs = refresh["jobs"]
+    assert {
+        "prepare",
+        "test",
+        "pq-wheels",
+        "pq-wheels-musl",
+        "docker",
+        "docker-glibc",
+        "docker-musl",
+        "assemble",
+    } <= ancestors(jobs, "publish")
+    for name in (
+        "docker",
+        "docker-glibc",
+        "docker-musl",
+        "pq-wheels",
+        "pq-wheels-musl",
+    ):
+        assert jobs[name]["with"]["refresh"] is True
+        assert (
+            jobs[name]["with"]["ref"]
+            == "${{ needs.prepare.outputs.revision }}"
+        )
+    publish = jobs["publish"]
+    assert (
+        publish["concurrency"]
+        == workflow("release")["jobs"]["docker-push"]["concurrency"]
+    )
+    step = next(
+        s
+        for s in publish["steps"]
+        if s.get("name") == "Publish the validated images"
+    )
+    assert step["if"] == "steps.current.outputs.current == 'true'"
+    assert "skopeo copy --all --preserve-digests" in step["run"]
+    assert "docker/build-push-action" not in str(publish)
+
+
+def test_refresh_bypasses_all_image_and_compiler_caches_and_checks_bytes():
+    jobs = workflow("build-docker")["jobs"]
+    steps = jobs["build"]["steps"]
+    build = next(
+        s
+        for s in steps
+        if s.get("uses", "").startswith("docker/build-push-action")
+    )
+    for option in ("pull", "no-cache"):
+        assert build["with"][option] == "${{ inputs.refresh }}"
+    assert "inputs.ref || github.sha" in build["with"]["labels"]
+    assert "!inputs.refresh" in build["with"]["cache-to"]
+    scan = next(
+        s for s in steps if s.get("name") == "Scan the refreshed image"
+    )
+    assert scan["with"]["input"] == "${{ runner.temp }}/image.tar"
+    assert scan["with"]["exit-code"] == "1"
+    assert scan["with"]["ignore-unfixed"] is True
+    assert scan["env"]["TRIVY_PLATFORM"] == "${{ matrix.platforms }}"
+    assert not scan.get("continue-on-error")
+    names = [s.get("name") for s in steps]
+    assert names.index("Test the refreshed runtime") < names.index(
+        "Scan the refreshed image"
+    )
+    assert "COPY --from=dependency-sources" in str(steps)
+    smoke = next(
+        s for s in steps if s.get("name") == "Test the refreshed runtime"
+    )
+    for option in ("--override-os", "--override-arch", "--override-variant"):
+        assert option in smoke["run"]
+    wheel = workflow("build-pq-wheels")["jobs"]["wheel"]
+    assert wheel["continue-on-error"] == "${{ !inputs.refresh }}"
+    for step in wheel["steps"]:
+        if step.get("uses", "").startswith("actions/cache/"):
+            assert "!inputs.refresh" in step["if"]

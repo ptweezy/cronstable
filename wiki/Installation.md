@@ -145,6 +145,35 @@ architectures its base image publishes:
 All variants share the same non-root, read-only-friendly hardening as the
 default image.
 
+### Daily image refreshes
+
+The [Rehydrate Docker images workflow](https://github.com/ptweezy/cronstable/actions/workflows/rehydrate-docker.yml)
+runs daily at 06:23 UTC and supports manual runs from `main`. GitHub Actions
+can delay scheduled runs. Each run rebuilds the latest stable release's full
+image matrix, including the `amd64v3` variants, from its recorded commit.
+It pulls fresh base images and rebuilds every Docker layer and optional
+cryptography wheel. Dependency versions follow the release's constraints.
+Updating exact pins, including the custom Python runtime, requires a new release.
+
+Publication requires passing tests on Python 3.11 through 3.14 and runtime checks
+on every image platform. The workflow verifies each image manifest. Trivy blocks
+publication for high or critical vulnerabilities with an available fix.
+Scan reports remain in the workflow artifacts for 30 days. A newer release
+or a moved release tag cancels publication of the older rebuild.
+
+Successful refreshes update `latest` and the current release's version tags,
+including their distro and CPU suffixes, on GHCR and the configured Docker Hub
+repository. A version tag pins the application version; its dependencies can
+change. Each run also publishes a tag such as
+`1.2.3-rebuild-20260917-123456-1-alpine`, whose date, run ID, and attempt identify
+the build. Pin that tag or an image digest to retain specific image bytes.
+Historical release tags remain at their existing builds.
+
+Refreshed images contain their matching zeroconf source archive and notices at
+`/usr/share/doc/cronstable/third-party/`. Pull the updated image and recreate
+your containers to apply a refresh. For a Compose deployment that uses published
+images, run `docker compose pull` followed by `docker compose up -d`.
+
 ## Install using pip
 
 Python >= 3.10 is required. Install cronstable in a virtual environment:

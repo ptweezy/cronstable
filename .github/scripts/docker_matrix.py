@@ -4,6 +4,7 @@ Both gate and publish consume this output. v3 deliberately has its own tag:
 OCI's amd64 platform alone does not ensure the pulling CPU supports v3.
 """
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -62,7 +63,12 @@ def platforms(distros):
 
 
 if __name__ == "__main__":
-    source = Path(__file__).resolve().parents[1] / "docker-matrix.json"
+    config = Path(__file__).resolve().parents[1]
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "source", nargs="?", type=Path, default=config / "docker-matrix.json"
+    )
+    source = parser.parse_args().source
     distros = json.loads(source.read_text(encoding="utf-8"))
     print(json.dumps(expand(distros)))
     if os.environ.get("GITHUB_OUTPUT"):
@@ -72,3 +78,6 @@ if __name__ == "__main__":
                     r for r in platforms(distros) if r["wheel_group"] == group
                 ]
                 output.write(f"docker-{group}={json.dumps(rows)}\n")
+            wheels = json.loads((config / "pq-wheel-matrix.json").read_text())
+            for group, rows in wheels.items():
+                output.write(f"pq-{group}={json.dumps(rows)}\n")

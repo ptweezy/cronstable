@@ -7,6 +7,8 @@ on:
       release: {type: boolean, required: true}
       cryptography: {type: string, required: true}
       crypto-sha: {type: string, required: true}
+      ref: {type: string, default: ''}
+      refresh: {type: boolean, default: false}
 permissions:
   contents: read
 env:
@@ -19,17 +21,20 @@ jobs:
       matrix:
         include: ${{ fromJSON(inputs.matrix) }}
     runs-on: ubuntu-latest
-    continue-on-error: true
+    continue-on-error: ${{ !inputs.refresh }}
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - name: Download resolved cryptography source
         uses: actions/download-artifact@v8.0.1
         with:
           name: release-inputs
           path: release-inputs
       - name: Restore the OpenSSL build (manylinux rows)
-        if: ${{ matrix.manylinux }}
+        if: ${{ matrix.manylinux && !inputs.refresh }}
         id: openssl-cache
         uses: actions/cache/restore@v6.1.0
         with:
@@ -46,6 +51,7 @@ jobs:
           echo "digest=$(docker image inspect --format '{{.Id}}' '${{ matrix.image }}')" >> "$GITHUB_OUTPUT"
         id: image
       - name: Restore compiler work
+        if: ${{ !inputs.refresh }}
         uses: actions/cache/restore@v6.1.0
         with:
           path: .pq-cache
@@ -172,10 +178,10 @@ jobs:
         with:
           path: .pq-cache
           key: pq-work-${{ matrix.libc }}-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ inputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/build-pq-wheels.yml') }}
-        if: github.ref == 'refs/heads/main' && steps.cache-size.outputs.fits == 'true'
+        if: ${{ !inputs.refresh && github.ref == 'refs/heads/main' && steps.cache-size.outputs.fits == 'true' }}
         continue-on-error: true
       - name: Save the OpenSSL build (manylinux rows, trunk only)
-        if: ${{ matrix.manylinux && steps.openssl-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
+        if: ${{ !inputs.refresh && matrix.manylinux && steps.openssl-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v6.1.0
         with:
           path: .openssl-${{ matrix.arch }}

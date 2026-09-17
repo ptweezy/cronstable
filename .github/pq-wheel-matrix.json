@@ -1,0 +1,14 @@
+{
+  "glibc": [
+    {"libc": "glibc", "arch": "i686", "platform": "linux/386", "image": "python:3.11-slim-trixie"},
+    {"libc": "glibc", "arch": "riscv64", "platform": "linux/riscv64", "image": "python:3.11-slim-trixie", "qemu": true},
+    {"libc": "glibc", "arch": "s390x", "platform": "linux/s390x", "image": "quay.io/pypa/manylinux_2_28_s390x:2026.08.15-1", "qemu": true, "manylinux": "1"}
+  ],
+  "musl": [
+    {"libc": "musl", "arch": "i686", "platform": "linux/386", "image": "python:3.11-alpine3.23"},
+    {"libc": "musl", "arch": "armv7", "platform": "linux/arm/v7", "image": "python:3.11-alpine3.23", "qemu": true},
+    {"libc": "musl", "arch": "ppc64le", "platform": "linux/ppc64le", "image": "python:3.11-alpine3.23", "qemu": true},
+    {"libc": "musl", "arch": "s390x", "platform": "linux/s390x", "image": "python:3.11-alpine3.23", "qemu": true},
+    {"libc": "musl", "arch": "riscv64", "platform": "linux/riscv64", "image": "python:3.11-alpine3.23", "qemu": true}
+  ]
+}

@@ -15,6 +15,12 @@ on:
       zeroconf:
         type: string
         required: true
+      ref:
+        type: string
+        default: ''
+      refresh:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,13 +36,30 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - name: Fetch this platform's optional wheel
         if: matrix.wheel != ''
-        continue-on-error: true
+        continue-on-error: ${{ !inputs.refresh }}
         uses: actions/download-artifact@v8.0.1
         with:
           name: ${{ matrix.wheel }}
           path: docker/wheelhouse/${{ matrix.wheel_group }}
+      - name: Download dependency sources for the refreshed image
+        if: inputs.refresh
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs
+      - name: Include the matching dependency source offer
+        if: inputs.refresh
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+        run: |
+          set -euo pipefail
+          cat "$DOCKERFILE" > "$RUNNER_TEMP/Dockerfile.refresh"
+          printf '\nCOPY --from=dependency-sources / /usr/share/doc/cronstable/third-party/\n' >> "$RUNNER_TEMP/Dockerfile.refresh"
       - uses: docker/setup-qemu-action@v4.3.0
         if: matrix.qemu
       - uses: docker/setup-buildx-action@v4.3.0
@@ -44,24 +67,95 @@ jobs:
         uses: docker/build-push-action@v7.3.0
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
+          file: ${{ inputs.refresh && format('{0}/Dockerfile.refresh', runner.temp) || matrix.dockerfile }}
           platforms: ${{ matrix.platforms }}
           push: false
+          pull: ${{ inputs.refresh }}
+          no-cache: ${{ inputs.refresh }}
+          build-contexts: ${{ inputs.refresh && format('dependency-sources={0}/release-inputs/third-party', runner.temp) || '' }}
           outputs: type=oci,dest=${{ runner.temp }}/image.tar
           labels: |
             org.opencontainers.image.version=${{ inputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ inputs.ref || github.sha }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
           build-args: |
             VERSION=${{ inputs.version }}
             PYTHON_VARIANT=${{ matrix.python_variant }}
             ZEROCONF_VERSION=${{ inputs.zeroconf }}
-            DEPS_REFRESH=${{ inputs.release && github.run_id || '' }}
+            DEPS_REFRESH=${{ (inputs.release || inputs.refresh) && github.run_id || '' }}
           provenance: false
           # Cache loss affects build speed only. Publishing consumes the OCI
           # artifact, never this mutable, quota-limited cache.
           cache-from: type=gha,scope=${{ matrix.distro }}-${{ matrix.platform_id }}
-          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope={0}-{1},ignore-error=true', matrix.distro, matrix.platform_id) || '' }}
+          cache-to: ${{ !inputs.refresh && github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope={0}-{1},ignore-error=true', matrix.distro, matrix.platform_id) || '' }}
+      - name: Test the refreshed runtime
+        if: inputs.refresh
+        env:
+          PLATFORM: ${{ matrix.platforms }}
+          VERSION: ${{ inputs.version }}
+          ZEROCONF_VERSION: ${{ inputs.zeroconf }}
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y skopeo
+          IFS=/ read -r image_os image_arch image_variant <<< "$PLATFORM"
+          platform_args=(--override-os "$image_os" --override-arch "$image_arch")
+          if [ -n "$image_variant" ]; then
+            platform_args+=(--override-variant "$image_variant")
+          fi
+          skopeo "${platform_args[@]}" copy "oci-archive:$RUNNER_TEMP/image.tar" docker-daemon:cronstable-refresh:test
+          docker run --rm --platform "$PLATFORM" --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            cronstable-refresh:test --version
+          docker run --rm -i --platform "$PLATFORM" --network none --read-only \
+            --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
+            --entrypoint /opt/venv/bin/python cronstable-refresh:test - "$VERSION" "$ZEROCONF_VERSION" <<'PY'
+          import importlib.metadata
+          import pathlib
+          import ssl
+          import subprocess
+          import sys
+          import tempfile
+          import aiohttp
+          import zeroconf.asyncio
+          from nacl.public import PrivateKey, SealedBox
+          assert importlib.metadata.version('cronstable') == sys.argv[1]
+          assert importlib.metadata.version('zeroconf') == sys.argv[2]
+          assert list(pathlib.Path('/usr/share/doc/cronstable/third-party').glob('zeroconf-*.tar.gz'))
+          ssl.create_default_context()
+          key = PrivateKey.generate()
+          assert SealedBox(key).decrypt(SealedBox(key.public_key).encrypt(b'refresh')) == b'refresh'
+          with tempfile.TemporaryDirectory() as directory:
+              config = pathlib.Path(directory) / 'cronstable.yaml'
+              config.write_text('jobs:\n  - name: smoke\n    command: /opt/venv/bin/python --version\n    schedule: "* * * * *"\n')
+              subprocess.run([sys.executable, '-m', 'cronstable', '--validate-config', '-c', str(config)], check=True)
+          PY
+          docker run --rm -i --platform "$PLATFORM" --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --entrypoint /opt/venv/bin/python cronstable-refresh:test - < .github/scripts/check_licenses.py
+      - name: Scan the refreshed image
+        if: inputs.refresh
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: ${{ matrix.platforms }}
+        with:
+          input: ${{ runner.temp }}/image.tar
+          scanners: vuln
+          format: json
+          output: ${{ runner.temp }}/vulnerabilities.json
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          list-all-pkgs: true
+          exit-code: '1'
+          timeout: 15m
+      - name: Upload vulnerability report
+        if: ${{ always() && inputs.refresh }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: vulnerabilities-${{ matrix.distro }}-${{ matrix.platform_id }}
+          path: ${{ runner.temp }}/vulnerabilities.json
+          if-no-files-found: warn
+          retention-days: 30
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: image-${{ matrix.distro }}-${{ matrix.platform_id }}

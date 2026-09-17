@@ -164,6 +164,8 @@ jobs:
       docker-none: ${{ steps.distros.outputs.docker-none }}
       docker-glibc: ${{ steps.distros.outputs.docker-glibc }}
       docker-musl: ${{ steps.distros.outputs.docker-musl }}
+      pq-glibc: ${{ steps.distros.outputs.pq-glibc }}
+      pq-musl: ${{ steps.distros.outputs.pq-musl }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -3532,7 +3534,7 @@ jobs:
     needs: [version, preflight]
     uses: ./.github/workflows/build-pq-wheels.yml
     with:
-      matrix: '[{"libc": "glibc", "arch": "i686", "platform": "linux/386", "image": "python:3.11-slim-trixie"}, {"libc": "glibc", "arch": "riscv64", "platform": "linux/riscv64", "image": "python:3.11-slim-trixie", "qemu": true}, {"libc": "glibc", "arch": "s390x", "platform": "linux/s390x", "image": "quay.io/pypa/manylinux_2_28_s390x:2026.08.15-1", "qemu": true, "manylinux": "1"}]'
+      matrix: ${{ needs.version.outputs.pq-glibc }}
       version: ${{ needs.version.outputs.new }}
       release: ${{ needs.version.outputs.release == 'true' }}
       cryptography: ${{ needs.preflight.outputs.cryptography }}
@@ -3542,7 +3544,7 @@ jobs:
     needs: [version, preflight]
     uses: ./.github/workflows/build-pq-wheels.yml
     with:
-      matrix: '[{"libc": "musl", "arch": "i686", "platform": "linux/386", "image": "python:3.11-alpine3.23"}, {"libc": "musl", "arch": "armv7", "platform": "linux/arm/v7", "image": "python:3.11-alpine3.23", "qemu": true}, {"libc": "musl", "arch": "ppc64le", "platform": "linux/ppc64le", "image": "python:3.11-alpine3.23", "qemu": true}, {"libc": "musl", "arch": "s390x", "platform": "linux/s390x", "image": "python:3.11-alpine3.23", "qemu": true}, {"libc": "musl", "arch": "riscv64", "platform": "linux/riscv64", "image": "python:3.11-alpine3.23", "qemu": true}]'
+      matrix: ${{ needs.version.outputs.pq-musl }}
       version: ${{ needs.version.outputs.new }}
       release: ${{ needs.version.outputs.release == 'true' }}
       cryptography: ${{ needs.preflight.outputs.cryptography }}
@@ -4809,6 +4811,9 @@ jobs:
   # the DOCKERHUB_* secrets are set); the Debian image owns the bare
   # `latest`/`<version>` tags, the variants get `-<distro>` suffixes.
   docker-push:
+    concurrency:
+      group: docker-publish-${{ github.repository }}-${{ matrix.distro }}
+      cancel-in-progress: false
     needs:
       - version
       - release
