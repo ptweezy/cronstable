@@ -248,14 +248,16 @@ def test_refresh_bypasses_all_image_and_compiler_caches_and_checks_bytes():
     scan = next(
         s for s in steps if s.get("name") == "Scan the refreshed image"
     )
-    assert scan["with"]["input"] == "${{ runner.temp }}/image.tar"
+    assert scan["with"]["input"] == "${{ runner.temp }}/scan-image"
     assert scan["with"]["exit-code"] == "1"
     assert scan["with"]["ignore-unfixed"] is True
     assert scan["env"]["TRIVY_PLATFORM"] == "${{ matrix.platforms }}"
     assert not scan.get("continue-on-error")
     names = [s.get("name") for s in steps]
-    assert names.index("Test the refreshed runtime") < names.index(
-        "Scan the refreshed image"
+    assert (
+        names.index("Test the refreshed runtime")
+        < names.index("Prepare the OCI image for scanning")
+        < names.index("Scan the refreshed image")
     )
     assert "COPY --from=dependency-sources" in str(steps)
     smoke = next(

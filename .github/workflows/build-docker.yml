@@ -133,13 +133,19 @@ jobs:
           docker run --rm -i --platform "$PLATFORM" --network none --read-only \
             --cap-drop ALL --security-opt no-new-privileges \
             --entrypoint /opt/venv/bin/python cronstable-refresh:test - < .github/scripts/check_licenses.py
+      - name: Prepare the OCI image for scanning
+        if: inputs.refresh
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/scan-image"
+          tar -xf "$RUNNER_TEMP/image.tar" -C "$RUNNER_TEMP/scan-image"
       - name: Scan the refreshed image
         if: inputs.refresh
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
           TRIVY_PLATFORM: ${{ matrix.platforms }}
         with:
-          input: ${{ runner.temp }}/image.tar
+          input: ${{ runner.temp }}/scan-image
           scanners: vuln
           format: json
           output: ${{ runner.temp }}/vulnerabilities.json
