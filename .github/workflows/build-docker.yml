@@ -52,14 +52,15 @@ jobs:
         with:
           name: release-inputs
           path: ${{ runner.temp }}/release-inputs
-      - name: Include the matching dependency source offer
+      - name: Prepare the runtime refresh and dependency source offer
         if: inputs.refresh
         env:
           DOCKERFILE: ${{ matrix.dockerfile }}
+          DISTRO: ${{ matrix.distro }}
         run: |
           set -euo pipefail
-          cat "$DOCKERFILE" > "$RUNNER_TEMP/Dockerfile.refresh"
-          printf '\nCOPY --from=dependency-sources / /usr/share/doc/cronstable/third-party/\n' >> "$RUNNER_TEMP/Dockerfile.refresh"
+          python3 "$RUNNER_TEMP/release-inputs/refresh-tools/refresh_runtime.py" recipe \
+            --dockerfile "$DOCKERFILE" --distro "$DISTRO" --output "$RUNNER_TEMP/Dockerfile.refresh"
       - uses: docker/setup-qemu-action@v4.4.0
         if: matrix.qemu
       - uses: docker/setup-buildx-action@v4.4.0
@@ -72,7 +73,9 @@ jobs:
           push: false
           pull: ${{ inputs.refresh }}
           no-cache: ${{ inputs.refresh }}
-          build-contexts: ${{ inputs.refresh && format('dependency-sources={0}/release-inputs/third-party', runner.temp) || '' }}
+          build-contexts: |
+            ${{ inputs.refresh && format('dependency-sources={0}/release-inputs/third-party', runner.temp) || '' }}
+            ${{ inputs.refresh && format('refresh-tools={0}/release-inputs/refresh-tools', runner.temp) || '' }}
           outputs: type=oci,dest=${{ runner.temp }}/image.tar
           labels: |
             org.opencontainers.image.version=${{ inputs.version }}
@@ -92,6 +95,7 @@ jobs:
         if: inputs.refresh
         env:
           PLATFORM: ${{ matrix.platforms }}
+          DISTRO: ${{ matrix.distro }}
           VERSION: ${{ inputs.version }}
           ZEROCONF_VERSION: ${{ inputs.zeroconf }}
         run: |
@@ -133,6 +137,10 @@ jobs:
           docker run --rm -i --platform "$PLATFORM" --network none --read-only \
             --cap-drop ALL --security-opt no-new-privileges \
             --entrypoint /opt/venv/bin/python cronstable-refresh:test - < .github/scripts/check_licenses.py
+          docker run --rm -i --platform "$PLATFORM" --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --entrypoint /opt/venv/bin/python cronstable-refresh:test - check --distro "$DISTRO" \
+            < "$RUNNER_TEMP/release-inputs/refresh-tools/refresh_runtime.py"
       - name: Prepare the OCI image for scanning
         if: inputs.refresh
         run: |
@@ -154,6 +162,14 @@ jobs:
           list-all-pkgs: true
           exit-code: '1'
           timeout: 15m
+      - name: Show vulnerability findings
+        if: ${{ always() && inputs.refresh }}
+        run: |
+          if [ -f "$RUNNER_TEMP/vulnerabilities.json" ]; then
+            jq -r '.Results[]? | .Target as $target | .Vulnerabilities[]? |
+              [$target, .PkgName, .InstalledVersion, .FixedVersion, .Severity, .VulnerabilityID] | @tsv' \
+              "$RUNNER_TEMP/vulnerabilities.json"
+          fi
       - name: Upload vulnerability report
         if: ${{ always() && inputs.refresh }}
         uses: actions/upload-artifact@v7.0.1

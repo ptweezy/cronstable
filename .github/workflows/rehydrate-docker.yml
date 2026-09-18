@@ -66,6 +66,8 @@ jobs:
           python -m pip install packaging
           python ../.github/scripts/release_inputs.py
           cp release-inputs/resolved.json release-inputs/third-party/resolved.json
+          mkdir -p release-inputs/refresh-tools
+          cp ../.github/scripts/refresh_runtime.py release-inputs/refresh-tools/
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: release-inputs

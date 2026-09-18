@@ -259,14 +259,83 @@ def test_refresh_bypasses_all_image_and_compiler_caches_and_checks_bytes():
         < names.index("Prepare the OCI image for scanning")
         < names.index("Scan the refreshed image")
     )
-    assert "COPY --from=dependency-sources" in str(steps)
+    contexts = build["with"]["build-contexts"]
+    assert "dependency-sources=" in contexts
+    assert "refresh-tools=" in contexts
     smoke = next(
         s for s in steps if s.get("name") == "Test the refreshed runtime"
     )
     for option in ("--override-os", "--override-arch", "--override-variant"):
         assert option in smoke["run"]
+    assert 'check --distro "$DISTRO"' in smoke["run"]
     wheel = workflow("build-pq-wheels")["jobs"]["wheel"]
     assert wheel["continue-on-error"] == "${{ !inputs.refresh }}"
     for step in wheel["steps"]:
         if step.get("uses", "").startswith("actions/cache/"):
             assert "!inputs.refresh" in step["if"]
+
+
+def test_runtime_refresh_uses_tools_from_the_workflow_checkout():
+    prepare = workflow("rehydrate-docker")["jobs"]["prepare"]["steps"]
+    inputs = next(s for s in prepare if s.get("id") == "inputs")
+    assert inputs["working-directory"] == "source"
+    assert (
+        "cp ../.github/scripts/refresh_runtime.py "
+        "release-inputs/refresh-tools/" in inputs["run"]
+    )
+    steps = workflow("build-docker")["jobs"]["build"]["steps"]
+    render = next(s for s in steps if " recipe " in s.get("run", ""))
+    assert render["if"] == "inputs.refresh"
+    assert (
+        "$RUNNER_TEMP/release-inputs/refresh-tools/refresh_runtime.py"
+        in (render["run"])
+    )
+    assert render["env"]["DOCKERFILE"] == "${{ matrix.dockerfile }}"
+    assert render["env"]["DISTRO"] == "${{ matrix.distro }}"
+
+
+@pytest.mark.parametrize(
+    "row",
+    load("docker_matrix").expand(
+        json.loads((ROOT / ".github/docker-matrix.json").read_text())
+    ),
+    ids=lambda row: row["distro"],
+)
+def test_runtime_refresh_preserves_the_released_recipe_and_user(row):
+    source = (ROOT / row["dockerfile"]).read_text()
+    rendered = load("refresh_runtime").recipe(source, row["distro"])
+    assert rendered.startswith(source.rstrip() + "\n")
+    added = rendered[len(source.rstrip()) :]
+    lines = added.strip().splitlines()
+    assert lines[0] == "USER 0:0"
+    assert lines[2] == "USER 65534:65534"
+    command = json.loads(lines[1][lines[1].index("[") :])
+    assert command == [
+        "/opt/venv/bin/python",
+        "/tmp/refresh-tools/refresh_runtime.py",
+        "refresh",
+        "--distro",
+        row["distro"].removesuffix("-amd64v3"),
+    ]
+    assert "COPY --from=dependency-sources" in lines[3]
+    assert "ENTRYPOINT" not in added
+    assert "CMD" not in added
+
+
+def test_runtime_refresh_preserves_a_custom_runtime_user():
+    source = "FROM builder\nUSER build\nFROM runtime\nUSER app:group\n"
+    assert "\nUSER app:group\nCOPY" in load("refresh_runtime").recipe(
+        source, "debian"
+    )
+
+
+@pytest.mark.parametrize(
+    "source,distro",
+    [
+        ("FROM builder\nUSER build\nFROM runtime\n", "debian"),
+        ("FROM runtime\nUSER app\n", "unknown"),
+    ],
+)
+def test_runtime_refresh_rejects_unsupported_recipes(source, distro):
+    with pytest.raises(ValueError):
+        load("refresh_runtime").recipe(source, distro)
