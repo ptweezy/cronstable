@@ -60,11 +60,11 @@ jobs:
           set -euo pipefail
           cat "$DOCKERFILE" > "$RUNNER_TEMP/Dockerfile.refresh"
           printf '\nCOPY --from=dependency-sources / /usr/share/doc/cronstable/third-party/\n' >> "$RUNNER_TEMP/Dockerfile.refresh"
-      - uses: docker/setup-qemu-action@v4.3.0
+      - uses: docker/setup-qemu-action@v4.4.0
         if: matrix.qemu
-      - uses: docker/setup-buildx-action@v4.3.0
+      - uses: docker/setup-buildx-action@v4.4.0
       - name: Build the platform once
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: ${{ inputs.refresh && format('{0}/Dockerfile.refresh', runner.temp) || matrix.dockerfile }}
