@@ -21,6 +21,7 @@ cronstable mcp [--url URL] [--token TOKEN | --token-env VAR] [--check]
 cronstable tui [--url URL] [--token TOKEN | --token-env VAR] [options]
 cronstable service install|remove|start|stop|reload|status|run [options]
 cronstable import-taskscheduler PATH... [-o FILE] [--timezone NAME]
+cronstable reach show|rotate [-c FILE-OR-DIR]
 ```
 
 Without a subcommand, `cronstable` is the scheduler daemon described later.
@@ -36,6 +37,10 @@ The `mcp` and `tui` subcommands are clients of a running daemon's web listener:
 the MCP stdio bridge and the terminal dashboard. See the
 [`mcp` subcommand](#the-mcp-subcommand) and the
 [`tui` subcommand](#the-tui-subcommand).
+
+The `reach` subcommand manages the node's remote-access identity offline,
+from the configuration file. See the
+[`reach` subcommand](#the-reach-subcommand).
 
 `cronstable` runs as a single foreground process. It does not daemonize, does not
 fork, and does not write a PID file. Diagnostics go to stdout/stderr through
@@ -518,6 +523,28 @@ cronstable tui [--url URL] [--token TOKEN | --token-env VAR] [--theme NAME]
 daemon's web listener (`--url`, default `http://127.0.0.1:8080`). It requires
 an interactive terminal. The [terminal dashboard](Terminal-Dashboard) page
 documents every option, key, and panel.
+
+## The `reach` subcommand
+
+```
+cronstable reach show [-c FILE-OR-DIR]
+cronstable reach rotate [-c FILE-OR-DIR]
+```
+
+`cronstable reach` manages the node's [remote access](Remote-Access)
+identity, the file `web.reach.keyFile` names. Both actions load the
+configuration exactly as the daemon does, so they need a `web.reach` block
+and exit `1` with an error on stderr without one.
+
+`show` prints the tunnel id, the fingerprint, the relay origin, the key file
+path, and the creation time. When the file is absent it generates the
+identity first, exactly as the daemon does on its first start, so you can
+read the fingerprint before the daemon runs.
+
+`rotate` writes a new identity over the current one and prints the new
+fingerprint. The tunnel id, the channel key, and the admission salt all
+change, so every paired phone must scan the dashboard's pairing QR again. A
+running daemon picks the new file up on its next housekeeping pass.
 
 ## The `import-taskscheduler` subcommand
 

@@ -826,6 +826,7 @@
   }
   .pair-hint { margin: 0 0 10px; color: var(--fg-dim); font-size: 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .pair-warn { margin-top: 10px; color: var(--pending); font-size: 12px; }
+  .pair-reach { margin-top: 8px; color: var(--fg-dim); font-size: 12px; }
 
   /* ---------- toasts ---------- */
   .toasts { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 7px; z-index: 80; align-items: center; }
@@ -1899,6 +1900,7 @@
     <div class="pair-qr" id="pairQr"></div>
     <div class="pair-hint" id="pairHint" style="display:none"><span>No token is saved in this tab. Pairing will use an unauthenticated connection.</span><button class="ghostbtn mini" id="pairToken">set token</button></div>
     <div class="pair-payload" id="pairPayload"></div>
+    <div class="pair-reach" id="pairReach" style="display:none"></div>
     <div class="pair-warn" id="pairWarn" style="display:none">This token grants full access. To limit phone access, configure a token with fewer permissions in web.authTokens.</div>
     <div class="modal-actions">
       <button class="btn" id="pairCopy" style="margin-right:auto">Copy</button>
@@ -9560,12 +9562,45 @@ var qrcode = function() {
     const b64 = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     return (base || pairLinkBase()) + "#" + b64;
   }
+  // The `tunnel` object rides the payload only while the daemon's relay
+  // socket is up (docs/reach-protocol.md, "Pairing payload"), so a QR
+  // never advertises a dead route. It comes from /whoami's `reach`
+  // object: the cached probe first, then the fresh answer openPair
+  // fetches, which re-renders the QR and the copyable string on change.
+  function reachTunnel(a) {
+    const r = a && a.reach;
+    if (!r || r.state !== "connected") return null;
+    for (const k of ["relay", "id", "key", "salt", "node"])
+      if (typeof r[k] !== "string" || !r[k]) return null;
+    return { relay: r.relay, id: r.id, key: r.key, salt: r.salt, node: r.node };
+  }
+  function pairPayload(a) {
+    const p = { v: 1, name: state.clusterNode || location.host, url: location.origin, token: token() };
+    const tunnel = reachTunnel(a);
+    if (tunnel) p.tunnel = tunnel;
+    return JSON.stringify(p);
+  }
+  // The line under the payload: the remote-access key fingerprint and
+  // relay host to compare against the app's remote-access screen, or a
+  // note that the relay socket is down. Hidden while Reach is off.
+  function renderPairReach(a) {
+    const box = $("pairReach"), r = a && a.reach;
+    if (!r || !r.state || r.state === "off") { box.style.display = "none"; box.textContent = ""; return; }
+    box.style.display = "";
+    if (r.state !== "connected") { box.textContent = "Remote access is configured but not connected"; return; }
+    let host = r.relay || "";
+    try { host = new URL(r.relay).host; } catch (_) {}
+    box.textContent = r.fingerprint
+      ? "Remote access key " + r.fingerprint + " through " + host
+      : "Remote access is connected through " + host;
+  }
   function openPair() {
     if (!openOverlay("pairWrap")) return;
-    const payload = JSON.stringify({ v: 1, name: state.clusterNode || location.host, url: location.origin, token: token() });
+    let payload = pairPayload(state.auth);
     let renderedBase = pairLinkBase();
     renderPairQr(pairLink(payload, renderedBase));
     $("pairPayload").textContent = payload;
+    renderPairReach(state.auth);
     $("pairHint").style.display = token() ? "none" : "";
     $("pairHint").querySelector("span").textContent = publicView()
       ? "Pairing requires an access token. This tab is using the public view; enter a token to pair a device."
@@ -9575,10 +9610,19 @@ var qrcode = function() {
     const seq = ++pairSeq;
     apiFetch("/whoami").then((r) => (r.ok ? r.json() : null)).then((w) => {
       if (!w || seq !== pairSeq) return;
+      let changed = false;
       if (typeof w.pairLinkBase === "string" && w.pairLinkBase && w.pairLinkBase !== renderedBase) {
         renderedBase = w.pairLinkBase;
-        renderPairQr(pairLink(payload, renderedBase));
+        changed = true;
       }
+      const fresh = pairPayload(w);
+      if (fresh !== payload) {
+        payload = fresh;
+        $("pairPayload").textContent = payload;
+        changed = true;
+      }
+      if (changed) renderPairQr(pairLink(payload, renderedBase));
+      renderPairReach(w);
       if (w.authenticated === true && w.allScopes === true) $("pairWarn").style.display = "";
     }).catch(() => {});
   }

@@ -123,6 +123,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     _cliargs.add_tui_command(sub)
     _cliargs.add_service_command(sub)
     _cliargs.add_import_taskscheduler_command(sub)
+    _cliargs.add_reach_command(sub)
     _add_init_command(sub)
 
 
@@ -559,6 +560,14 @@ def main_loop(loop=None):
 
     if command == "init":
         sys.exit(_run_init(args))
+
+    if command == "reach":
+        # the remote-access identity commands: an offline read or rewrite
+        # of the key file through the daemon's own config parse, imported
+        # at dispatch like every other subcommand branch.
+        from cronstable import reach
+
+        sys.exit(reach.dispatch(args))
 
     if command == "import-taskscheduler":
         # Dispatch-time import, like every other subcommand branch: the XML

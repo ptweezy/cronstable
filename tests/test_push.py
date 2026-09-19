@@ -2949,6 +2949,9 @@ async def test_whoami_with_and_without_token():
         "allScopes": False,
         "pairLinkBase": "https://relay.cronstable.com/pair",
         "sealableSuites": _sealable_now(),
+        # no web.reach section: remote access is off (tests/test_reach.py
+        # covers the connected shapes)
+        "reach": {"state": "off"},
     }
     body = json.loads((await cron._web_whoami(_Req())).body)
     assert body["authenticated"] is False
@@ -2975,6 +2978,7 @@ async def test_whoami_reports_an_anonymous_grant():
         "allScopes": False,
         "pairLinkBase": "https://relay.cronstable.com/pair",
         "sealableSuites": _sealable_now(),
+        "reach": {"state": "off"},
     }
 
 

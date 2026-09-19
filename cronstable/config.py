@@ -1193,6 +1193,18 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("name"): Str(),
                     }
                 ),
+                # relay-brokered remote access (cronstable.reach): the
+                # relay origin (default: the origin of push.relay.url), the
+                # node's identity file, and the WebSocket ping cadence.
+                # Needs a bearer token and PyNaCl; see
+                # _validate_reach_config.
+                Opt("reach"): Map(
+                    {
+                        Opt("relay"): Str(),
+                        "keyFile": Str(),
+                        Opt("heartbeat"): Float(),
+                    }
+                ),
             }
         ),
         # Optional MCP server: expose jobs/DAGs/cluster/state as MCP tools on
@@ -4210,6 +4222,178 @@ def _validate_push_config(config: "CronstableConfig") -> None:
             )
 
 
+REACH_HEARTBEAT_DEFAULT = 30.0
+REACH_HEARTBEAT_MIN = 5.0
+REACH_HEARTBEAT_MAX = 300.0
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _reach_relay_origin(url: str, what: str) -> str:
+    """The origin a Reach relay URL names, or a ConfigError.
+
+    ``https`` only, except ``http`` to a loopback host so a relay under
+    ``wrangler dev`` can be dialed; nothing past the host but a bare
+    ``/``.  Userinfo stays: it becomes Basic authentication on the
+    upgrade request and is redacted from every log line and error.
+    """
+    text = url.strip()
+    parsed = _safe_urlparse(text, what)
+    host = (parsed.hostname or "").lower()
+    shown = _redact_userinfo(text)
+    if not host:
+        raise ConfigError("{} must name a host, got {!r}".format(what, shown))
+    if parsed.scheme != "https" and not (
+        parsed.scheme == "http" and _is_loopback_host(host)
+    ):
+        raise ConfigError(
+            "{} must be an https URL (http is accepted for a loopback "
+            "host only), got {!r}".format(what, shown)
+        )
+    if (
+        parsed.path not in ("", "/")
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ConfigError(
+            "{} is a relay origin: scheme and host only, with no path, "
+            "query, or fragment; got {!r}".format(what, shown)
+        )
+    try:
+        _ = parsed.port
+    except ValueError:
+        raise ConfigError(
+            "{} has an invalid port, got {!r}".format(what, shown)
+        ) from None
+    return "{}://{}".format(parsed.scheme, parsed.netloc)
+
+
+def _reach_relay_from_push(url: str) -> str:
+    """The relay origin ``web.reach`` derives from ``push.relay.url``."""
+    parsed = _safe_urlparse(url.strip(), "push.relay.url")
+    return _reach_relay_origin(
+        "{}://{}".format(parsed.scheme, parsed.netloc),
+        "push.relay.url (the origin web.reach dials while web.reach.relay "
+        "is absent)",
+    )
+
+
+def _validate_reach_config(config: "CronstableConfig") -> None:
+    """Fail-closed checks for ``web.reach`` on the assembled config.
+
+    Runs at the top-level parse (from :func:`_validate_cross_sections`),
+    beside the push validator, because the sections involved (``web``,
+    ``push``, ``cluster``) may live in different config-directory files.
+    Everything here refuses to start rather than degrade: a remote-access
+    channel that silently self-disables is a phone that cannot reach the
+    daemon when it matters.
+    """
+    web = config.web_config
+    reach = web.get("reach") if web is not None else None
+    if web is None or reach is None:
+        return
+    if not _web_has_any_token(web):
+        mtls = bool((web.get("tls") or {}).get("clientCa"))
+        raise ConfigError(
+            "web.reach requires at least one bearer token (web.authToken "
+            "or a web.authTokens entry): the relay admits a phone by a "
+            "credential derived from its bearer token, and every relayed "
+            "request is authenticated by that token inside the tunnel.{} "
+            "push.allowUnauthenticated does not apply to remote "
+            "access.".format(
+                " web.tls.clientCa authenticates direct callers by "
+                "certificate, which a relayed request cannot present."
+                if mtls
+                else ""
+            )
+        )
+    # Imported here, not at module top: cronstable.push pulls in aiohttp,
+    # which a bare config parse should not pay for.
+    from cronstable.push import HAVE_PYNACL
+
+    if not HAVE_PYNACL:
+        raise ConfigError(
+            "web.reach is configured but PyNaCl is not installed; install "
+            'the push extra (pip install "cronstable[push]") or remove the '
+            "section. Remote access fails closed rather than silently "
+            "self-disabling."
+        )
+    if config.cluster_config is not None:
+        raise ConfigError(
+            "web.reach cannot be configured beside a `cluster:` section: "
+            "Reach serves one node's identity and pairing payload, and a "
+            "cluster is a fleet. Reach each node of a cluster through its "
+            "own address instead; see the Remote-Access wiki page "
+            "(https://github.com/ptweezy/cronstable/wiki/Remote-Access)."
+        )
+    relay = reach.get("relay")
+    if relay is None or not str(relay).strip():
+        push_conf = config.push_config
+        if push_conf is None:
+            raise ConfigError(
+                "web.reach.relay is absent and there is no push.relay.url "
+                "to derive the relay origin from; set one of the two"
+            )
+        _reach_relay_from_push(push_conf["relay"]["url"])
+    else:
+        _reach_relay_origin(str(relay), "web.reach.relay")
+    heartbeat = reach.get("heartbeat")
+    if heartbeat is not None:
+        value = float(heartbeat)
+        if not math.isfinite(value) or not (
+            REACH_HEARTBEAT_MIN <= value <= REACH_HEARTBEAT_MAX
+        ):
+            raise ConfigError(
+                "web.reach.heartbeat must be between {:g} and {:g} "
+                "seconds".format(REACH_HEARTBEAT_MIN, REACH_HEARTBEAT_MAX)
+            )
+    if not str(reach.get("keyFile") or "").strip():
+        raise ConfigError(
+            "web.reach.keyFile must name the file that holds the node's "
+            "remote-access identity"
+        )
+
+
+def resolve_reach_config(
+    config: "CronstableConfig",
+) -> Optional[dict[str, Any]]:
+    """The ``web.reach`` settings the daemon runs on, or ``None``.
+
+    ``{"relay", "keyFile", "heartbeat"}``: the relay origin (derived from
+    ``push.relay.url`` while ``web.reach.relay`` is absent, userinfo
+    kept for the dial), the identity path, and the heartbeat with its
+    default applied.  Assumes :func:`_validate_reach_config` passed.
+    """
+    web = config.web_config
+    reach = web.get("reach") if web is not None else None
+    if reach is None:
+        return None
+    relay = reach.get("relay")
+    if relay is None or not str(relay).strip():
+        push_conf = config.push_config
+        if push_conf is None:
+            return None
+        origin = _reach_relay_from_push(push_conf["relay"]["url"])
+    else:
+        origin = _reach_relay_origin(str(relay), "web.reach.relay")
+    heartbeat = reach.get("heartbeat")
+    return {
+        "relay": origin,
+        "keyFile": str(reach.get("keyFile") or "").strip(),
+        "heartbeat": (
+            REACH_HEARTBEAT_DEFAULT if heartbeat is None else float(heartbeat)
+        ),
+    }
+
+
 def _merge_pools(base, extra):
     pools = dict(base)
     for name, raw in extra.items():
@@ -4814,6 +4998,7 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
     _validate_dags(config)
     _validate_mcp_config(config)
     _validate_push_config(config)
+    _validate_reach_config(config)
     _validate_eventlog_config(config)
 
 

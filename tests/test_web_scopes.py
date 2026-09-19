@@ -776,6 +776,8 @@ async def test_anonymous_view_end_to_end(caplog):
                     # what this box can seal to; tests/test_push.py pins
                     # the list's content against the library probe
                     "sealableSuites": cronstable.push.sealable_suites(),
+                    # no web.reach section: remote access is off
+                    "reach": {"state": "off"},
                 }
             # ...but cannot act, on any of the three mutating gates
             async with session.post(base + "/jobs/test/start") as resp:

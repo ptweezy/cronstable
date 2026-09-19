@@ -1704,7 +1704,52 @@ components:
             a daemon that omits it seals `x25519` only, so generated
             clients decode it as optional and read absence as
             `["x25519"]`.
+        reach:
+          $ref: '#/components/schemas/ReachStatus'
       required: [authenticated, scopes, allScopes, pairLinkBase]
+
+    ReachStatus:
+      type: object
+      description: >-
+        The daemon's relay-brokered remote access (`web.reach`, see
+        `docs/reach-protocol.md`). `state` is `off` when no `web.reach`
+        section is configured, `connecting` while the daemon has no live
+        socket to its relay, and `connected` once it does. The pairing
+        fields (`relay`, `id`, `key`, `salt`, `node`, `fingerprint`) are
+        present for a caller that authenticated with a bearer token; a
+        caller served through `web.anonymousScopes` sees `state` only.
+        A daemon that omits the whole object has no Reach at all.
+      properties:
+        state:
+          type: string
+          description: >-
+            Known values: off, connecting, connected. Open like every
+            other enum here: a newer daemon may add a state, and a client
+            treats an unknown one as "not connected".
+          anyOf:
+            - type: string
+              enum: [off, connecting, connected]
+            - type: string
+        relay:
+          type: string
+          description: The relay origin the daemon dials (https, no path).
+        id:
+          type: string
+          description: The tunnel id (the daemon's Ed25519 public key, base64url).
+        key:
+          type: string
+          description: The daemon's static X25519 channel key, base64.
+        salt:
+          type: string
+          description: The 16-byte admission salt, base64.
+        node:
+          type: string
+          description: The daemon's node name, for alert routing.
+        fingerprint:
+          type: string
+          description: >-
+            The identity fingerprint the dashboard shows, `xxxx-xxxx-xxxx`.
+      required: [state]
 
     PushDevice:
       type: object

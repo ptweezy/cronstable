@@ -51,6 +51,7 @@ if TYPE_CHECKING:  # the loopback job-state API is imported lazily at runtime
     from aiohttp import web
 
     from cronstable.jobapi import JobStateAPI
+    from cronstable.reach import ReachService
 
 import cronstable.version
 from cronstable import _json, discovery, platform, push, statsd, tlsutil
@@ -70,6 +71,7 @@ from cronstable.config import (
     parse_config_string,
     parse_config_with_sources,
     resolve_bonjour_config,
+    resolve_reach_config,
     validate_pools,
 )
 from cronstable.cronexpr import CronTab
@@ -2143,6 +2145,17 @@ class Cron:
         # (push.set_service) for the stateless reporter singletons.
         self._push_service: Optional[push.PushService] = None
         self._applied_push_config: Optional[dict[str, Any]] = None
+        # the `web.reach` remote-access service and its source config,
+        # managed by start_stop_reach; it rides the web runner, so it is
+        # rebuilt with the web app and stopped before the runner is.
+        self._reach: Optional[ReachService] = None
+        self._applied_reach_config: Optional[dict[str, Any]] = None
+        # fingerprint of the identity file the RUNNING service loaded, so
+        # `cronstable reach rotate` takes effect on the next pass.
+        self._reach_identity_signature: Optional[tuple[int, int]] = None
+        # the bearer table the RUNNING web app authenticates with; the
+        # reach admit set is derived from exactly this, never re-resolved
+        self._web_token_table: Optional[list[_WebToken]] = None
         # the opt-in Bonjour/mDNS advert; follows the web app's lifecycle.
         self._bonjour = discovery.BonjourAdvertiser()
         # cluster-wide concurrency slots: lease per running slot-gated job,
@@ -2465,6 +2478,11 @@ class Cron:
                         await self.start_stop_web_app(
                             config.web_config, config.mcp_config
                         )
+                        # after the web app, never raising: the service
+                        # binds its loopback site onto self.web_runner.
+                        await self.start_stop_reach(
+                            resolve_reach_config(config)
+                        )
                     except ConfigError as err:
                         logger.error(
                             "Error in the web configuration, so not starting "
@@ -2586,6 +2604,8 @@ class Cron:
         await self._node_sampler.stop_history()
         # the mDNS advert must go before the listener it points at.
         await self._bonjour.stop()
+        # and the relay socket before the loopback site it proxies into
+        await self._stop_reach()
         if self.web_runner is not None:
             logger.info("Stopping http server")
             await self.web_runner.cleanup()
@@ -3546,6 +3566,7 @@ class Cron:
             }
         payload["pairLinkBase"] = self._web_pair_link_base()
         payload["sealableSuites"] = await push.sealable_suites_async()
+        payload["reach"] = self._reach_whoami(matched is not None)
         return _json_response(payload, headers=self._web_headers())
 
     def _web_pair_link_base(self) -> str:
@@ -3756,6 +3777,132 @@ class Cron:
         self._applied_push_config = copy.deepcopy(push_config)
         push.set_service(service)
         logger.info("push: service running (registry %s)", store.describe())
+
+    async def start_stop_reach(
+        self, reach_config: Optional[dict[str, Any]]
+    ) -> None:
+        """Converge the Reach service onto ``reach_config``, never raising.
+
+        Runs every housekeeping pass right after start_stop_web_app: the
+        service binds a private loopback site onto ``self.web_runner``,
+        so it follows the web app's lifecycle (rebuilt with it, stopped
+        before it). ``reach_config`` is :func:`resolve_reach_config`'s
+        shape. Never-raising for the start_stop_push reason: nothing
+        about remote access is worth the rest of the pass.
+        """
+        try:
+            await self._converge_reach(reach_config)
+        except Exception:
+            logger.exception(
+                "reach: could not converge the remote-access service; "
+                "leaving it as it was and continuing the housekeeping pass"
+            )
+
+    async def _converge_reach(
+        self, reach_config: Optional[dict[str, Any]]
+    ) -> None:
+        """The convergence itself; see :meth:`start_stop_reach`."""
+        runner = self.web_runner
+        service = self._reach
+        if reach_config is None or runner is None:
+            if service is not None:
+                logger.info(
+                    "reach: %s; stopping the remote-access service",
+                    "section removed"
+                    if reach_config is None
+                    else "web app is down",
+                )
+                await self._stop_reach()
+            return
+        if service is not None:
+            if reach_config != self._applied_reach_config:
+                reason: Optional[str] = "configuration changed"
+            elif service.runner is not runner:
+                reason = "web app rebuilt"
+            elif self._reach_identity_changed():
+                reason = "identity file changed"
+            else:
+                reason = None
+            if reason is not None:
+                logger.info(
+                    "reach: %s; restarting the remote-access service", reason
+                )
+                await self._stop_reach()
+                service = None
+        if service is None:
+            # Imported here, not at module top: the reach module is a
+            # daemon-start cost only for the deployments that use it.
+            from cronstable import reach as reach_mod
+
+            service = reach_mod.ReachService(
+                identity_path=reach_config["keyFile"],
+                relay=reach_config["relay"],
+                heartbeat=reach_config["heartbeat"],
+                node=self._node_name(),
+                agent="cronstable/{} reach".format(
+                    cronstable.version.__version__
+                ),
+                bearers=self._reach_bearers,
+                runner=runner,
+            )
+            await service.start()
+            self._reach = service
+            # a deep copy, for the convergence-guard reason written at
+            # _converge_push: the guard compares by equality.
+            self._applied_reach_config = copy.deepcopy(reach_config)
+            self._reach_identity_signature = tlsutil.file_signature(
+                reach_config["keyFile"]
+            )
+            assert service.identity is not None
+            logger.info(
+                "reach: remote access through %s as %s (identity %s)",
+                service.relay_host,
+                service.identity.fingerprint,
+                reach_config["keyFile"],
+            )
+        # tokens rotate only through a web-app rebuild, which restarts
+        # the service; this is the cheap belt that keeps the relay's
+        # admit set equal to the running token table regardless.
+        await service.refresh_admit()
+
+    async def _stop_reach(self) -> None:
+        """Stop the Reach service if one runs; a no-op otherwise."""
+        service = self._reach
+        self._reach = None
+        self._applied_reach_config = None
+        self._reach_identity_signature = None
+        if service is not None:
+            await service.stop()
+
+    def _reach_identity_changed(self) -> bool:
+        """Whether the identity file differs from the one the running
+        service loaded (`cronstable reach rotate` writes a new one)."""
+        applied = self._applied_reach_config
+        if applied is None or self._reach_identity_signature is None:
+            return False
+        return (
+            tlsutil.file_signature(applied["keyFile"])
+            != self._reach_identity_signature
+        )
+
+    def _reach_bearers(self) -> list[str]:
+        """The bearer secrets the running web app accepts, for the relay's
+        admit set."""
+        return [
+            token.token_bytes.decode("utf-8")
+            for token in (self._web_token_table or [])
+        ]
+
+    def _reach_whoami(self, matched: bool) -> dict[str, Any]:
+        """The ``/whoami`` ``reach`` object: the full pairing fields for a
+        matched bearer token, the state alone for every other caller,
+        and ``off`` while no service exists."""
+        service = self._reach
+        if service is None:
+            return {"state": "off"}
+        if matched:
+            return service.status()
+        return {"state": service.state}
 
     @staticmethod
     def _zone_from_name(tz_name: Optional[str]) -> datetime.tzinfo:
@@ -6932,11 +7079,15 @@ class Cron:
             reason = self._web_restart_reason(web_config, mcp_config)
             if reason is not None:
                 logger.info("web: %s, stopping http server", reason)
+                # the reach service's loopback site rides this runner;
+                # start_stop_reach rebuilds it onto the next one
+                await self._stop_reach()
                 await self.web_runner.cleanup()
                 self.web_runner = None
                 self._web_tcp_bound = []
                 self._web_tls_signature = None
                 self._web_token_files_signature = None
+                self._web_token_table = None
 
         # Build the listener's TLS context ONCE per (re)start, before anything
         # is bound, so a context failure never leaves a half-built runner.
@@ -7127,11 +7278,13 @@ class Cron:
                 self.web_runner = None
                 self._mcp = None
                 self._web_tcp_bound = []
+                self._web_token_table = None
             else:
                 self.web_config = web_config
                 self.mcp_config = mcp_config
                 self._web_tls_signature = tls_signature
                 self._web_token_files_signature = token_files_signature
+                self._web_token_table = token_table
 
         # Node history sampling follows the web API's lifecycle: the ring
         # only feeds the dashboard's node chart, so it runs whenever the web

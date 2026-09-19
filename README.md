@@ -55,6 +55,9 @@ and catch regressions before release.
 * Failure notifications through Sentry, email, and Slack-compatible webhooks
 * **End-to-end encrypted push notifications**: send alerts that only paired
   devices can decrypt (see [push notifications](#push-notifications))
+* **Remote access through the relay**: the app reaches the daemon from
+  anywhere over a sealed, relay-brokered channel, with no inbound port (see
+  [remote access](#remote-access))
 * **Per-job SLA monitoring**: detect missing or late runs and excessive
   runtimes, with alerts and dashboard status (see
   [late-run detection](#late-run-detection-sla-monitoring))
@@ -1011,6 +1014,35 @@ See
 [push notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
 in the wiki for the report options, pairing and revocation, storage, size
 limits, and the relay trust model.
+
+### Remote access
+
+Reach carries the app's requests back to the daemon through the same relay,
+so the app works from anywhere with no inbound port on the daemon's host.
+The daemon dials out and holds one WebSocket; the app posts sealed requests
+to the relay. Every request and response is sealed end to end, so the relay
+sees ciphertext and routing metadata only. Every relayed request goes through
+the daemon's own web app, with its bearer tokens and scopes intact.
+Add the block beside a bearer token; the `push` extra provides the
+cryptography:
+
+```yaml
+web:
+  listen:
+    - http://127.0.0.1:8080
+  authToken:
+    fromFile: /etc/cronstable/token
+  reach:
+    keyFile: /var/lib/cronstable/reach.json
+```
+
+The dashboard's **Pair a device** QR carries the tunnel while the daemon's
+relay socket is up and shows the remote-access key fingerprint to compare
+with the app. `cronstable reach show` prints the identity and
+`cronstable reach rotate` replaces it. See
+[remote access](https://github.com/ptweezy/cronstable/wiki/Remote-Access)
+in the wiki for the trust model, limits, rotation, troubleshooting, and the
+alternatives (Tailscale, cloudflared, and SSH).
 
 ### Windows Event Log
 

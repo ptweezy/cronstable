@@ -464,6 +464,7 @@ renders the notification on the device.
 ## Related pages
 
 - [Reporting](Reporting): the mail, Sentry, shell, and webhook reporters and the shared report schema
+- [Remote Access](Remote-Access): the other direction, the relay-brokered channel that carries the app's requests back to the daemon
 - [HTTP Control API](HTTP-API): the `/push/devices` endpoints and `GET /whoami`
 - [Durable State](Durable-State): the store the device registry rides when configured
 - [LAN Discovery](LAN-Discovery): how a companion app finds the daemon on the local network

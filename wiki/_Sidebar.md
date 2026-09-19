@@ -36,6 +36,7 @@
 - **Integrations**
   - [Reporting (Mail, Sentry, Shell, Webhook)](Reporting)
   - [Push Notifications](Push-Notifications)
+  - [Remote Access (Reach)](Remote-Access)
   - [Windows Event Log](Windows-Event-Log)
   - [Metrics with Prometheus](Metrics-with-Prometheus)
   - [Metrics with statsd](Metrics-with-Statsd)

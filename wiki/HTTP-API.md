@@ -986,7 +986,8 @@ empty `stream` parameter is a `400`; a stateless install is a `404`
 ### `GET /whoami`
 
 Describes the bearer token that authenticated this request, as
-`{authenticated, label, scopes, allScopes, pairLinkBase, sealableSuites}`:
+`{authenticated, label, scopes, allScopes, pairLinkBase, sealableSuites,
+reach}`:
 its `label`, the scopes it grants (with the implied `view` expanded),
 whether it is an all-scopes token, the base URL of the pairing QR's deep
 link (the origin of `push.relay.url` plus `/pair`, the hosted landing while
@@ -1009,6 +1010,16 @@ third shape: `authenticated` is `false`, `label` is `"anonymous"` (a
 reserved label config load refuses for real tokens), `scopes` lists the
 granted set, and `allScopes` is `false`. Branch on `allScopes`, because the
 open daemon described earlier shares `authenticated: false`.
+
+Every shape carries `reach`, the daemon's [remote access](Remote-Access)
+state. Without a `web.reach` section it is `{"state": "off"}`. With one,
+`state` is `connecting` while the daemon has no live relay socket and
+`connected` once it does. A caller that authenticated with a bearer token
+also gets the pairing fields: `relay` (the relay origin), `id` (the tunnel
+id), `key` (the daemon's channel key, base64), `salt` (the admission salt,
+base64), `node` (the node name), and `fingerprint` (`xxxx-xxxx-xxxx`, the
+value the dashboard's pairing panel shows). The anonymous grant and the
+open daemon see `state` only.
 
 ### `GET /push/devices`
 

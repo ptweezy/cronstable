@@ -21,6 +21,15 @@ All fields described here are versioned under `"v": 1`. Both the relay
 envelope and the sealed plaintext carry their own `v`, so either side of the
 protocol can evolve independently.
 
+The relay also brokers Reach, the private control channel a daemon opens
+to it so the app can send requests back through the relay. Reach has its
+own routes (`/v1/tunnel/` and `/v1/reach/`), its own credential, and its
+own sealed framing, all specified in
+[`reach-protocol.md`](reach-protocol.md). The push envelope this document
+describes is unchanged by it. The one shared surface is the pairing
+payload, which gains an additive `tunnel` object while the daemon's relay
+socket is connected.
+
 ## Pairing links
 
 Separate from the alert path, the dashboard's "Pair a device" QR encodes a

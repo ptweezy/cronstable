@@ -611,6 +611,42 @@ def add_service_command(sub: Any) -> None:
     _add_service_log_flags(run)
 
 
+def add_reach_command(sub: Any) -> None:
+    """Register ``cronstable reach <action>`` on the root subparsers.
+
+    The remote-access identity commands (``show``, ``rotate``); each
+    action takes its own -c/--config like the ``state`` actions, with
+    the same SUPPRESS default (see _add_service_config_flag).  A
+    stdlib-only registration: cronstable.reach is imported by the
+    dispatch branch alone.
+    """
+    parser = sub.add_parser(
+        "reach",
+        help="manage the remote-access identity (show/rotate)",
+    )
+    actions = parser.add_subparsers(dest="reach_command", metavar="ACTION")
+    for name, help_text in (
+        (
+            "show",
+            "print the tunnel id, fingerprint, relay, and key file "
+            "(generating the identity when the file is absent)",
+        ),
+        (
+            "rotate",
+            "write a new identity; every paired phone must then scan "
+            "the pairing QR again",
+        ),
+    ):
+        action = actions.add_parser(name, help=help_text)
+        action.add_argument(
+            "-c",
+            "--config",
+            default=argparse.SUPPRESS,
+            metavar="FILE-OR-DIR",
+            help="configuration containing the `web.reach` section",
+        )
+
+
 def add_tui_command(sub: Any) -> None:
     """Attach the ``tui`` subcommand to the root parser's subparsers."""
     parser = sub.add_parser(

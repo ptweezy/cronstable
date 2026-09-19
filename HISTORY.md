@@ -1,5 +1,14 @@
 # History
 
+## Unreleased
+
+- Add Reach, relay-brokered remote access for the app. A `web.reach` block
+  (`keyFile`, with optional `relay` and `heartbeat`) dials the push relay
+  and serves sealed requests through the daemon's own web app,
+  `cronstable reach show|rotate` manages the node identity, `GET /whoami`
+  reports a `reach` object, and the dashboard's pairing payload carries a
+  `tunnel` object while the relay socket is connected.
+
 ## 1.2.53
 
 - Fix `onMissed` recovery after system sleep, long stalls, and forward
