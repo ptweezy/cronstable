@@ -11,8 +11,11 @@ the ``test_state_dag_run.py`` harness (real task subprocesses via
 
 import datetime
 import json
+import os
 import sys
 import types
+
+import pytest
 
 from cronstable import mcp as mcp_mod
 from cronstable.config import _build_mcp_config, parse_config_string
@@ -26,6 +29,7 @@ from cronstable.cron import (
 )
 from cronstable.job import JobOutputStream
 from cronstable.mcp import MCPHandler
+from cronstable.platform import IS_WINDOWS
 from cronstable.resources import ResourceUsage
 from tests.test_state_dag_run import (
     _drive,
@@ -1418,6 +1422,291 @@ async def test_decide_gate_enforces_the_approve_scope():
     assert "scope" not in result["content"][0]["text"]
 
 
+def _install_handler(tmp_path, monkeypatch, *, rc=0, output="== installed =="):
+    """A handler whose config dir is real and whose installer is a spy.
+
+    The installer itself is a host script with root, a 70-second sleep and
+    a journalctl read; what belongs under test here is the wrapper around
+    it -- the confirm gate, the path rules, the staged copy, and whether
+    its output survives the trip back. ``calls`` records one argv per run.
+    """
+    h = _handler()
+    confdir = tmp_path / "cronstable.d"
+    confdir.mkdir()
+    (confdir / "jobs-existing.yaml").write_text("jobs: []\n")
+    h._cron.config_arg = str(confdir)
+    calls = []
+
+    async def spy(argv):
+        # snapshot the staged file WHILE it exists: the wrapper deletes its
+        # temp dir on the way out, and the real installer moves the file.
+        staged = argv[1]
+        calls.append(
+            {
+                "argv": list(argv),
+                "staged_exists": os.path.isfile(staged),
+                "staged_text": _read_if_file(staged),
+            }
+        )
+        return rc, output
+
+    monkeypatch.setattr(mcp_mod, "_run_installer", spy)
+    monkeypatch.setattr(
+        mcp_mod, "INSTALL_CONFIG_SCRIPT", str(tmp_path / "installer.sh")
+    )
+    (tmp_path / "installer.sh").write_text("#!/bin/sh\n")
+    return h, confdir, calls
+
+
+async def test_install_config_confirm_gate(tmp_path, monkeypatch):
+    h, confdir, calls = _install_handler(tmp_path, monkeypatch)
+    src = tmp_path / "jobs-new.yaml"
+    src.write_text("jobs: []\n")
+    result = await _call(
+        h,
+        "cron_install_config",
+        {"source": str(src), "target": "jobs-new.yaml", "reason": "why"},
+    )
+    assert result["isError"] is True
+    assert "confirm=true" in result["content"][0]["text"]
+    assert calls == []  # the installer never ran
+
+def _read_if_file(path):
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+async def test_install_config_stages_a_copy_and_keeps_the_source(
+    tmp_path, monkeypatch
+):
+    """The installer MOVES its input, so the caller's file must not be it."""
+    h, confdir, calls = _install_handler(tmp_path, monkeypatch)
+    src = tmp_path / "estate" / "jobs-fstrim.yaml"
+    src.parent.mkdir()
+    src.write_text("jobs:\n  - name: fstrim-all\n    command: true\n")
+    result = await _call(
+        h,
+        "cron_install_config",
+        {
+            "source": str(src),
+            "target": "jobs-fstrim.yaml",
+            "reason": "move fstrim off its systemd timer",
+            "new": True,
+            "confirm": True,
+        },
+    )
+    assert "isError" not in result, result
+    assert len(calls) == 1
+    staged, target = calls[0]["argv"][1], calls[0]["argv"][2]
+    assert staged != str(src)  # a throwaway, not the caller's file
+    assert calls[0]["staged_exists"] is True
+    assert calls[0]["staged_text"] == src.read_text()
+    assert target == str(confdir / "jobs-fstrim.yaml")
+    assert src.exists()  # the real file survives the install
+    assert not os.path.exists(staged)  # and the copy is cleaned up
+    assert result["structuredContent"]["installed"] == target
+
+
+async def test_install_config_flags_are_explicit(tmp_path, monkeypatch):
+    h, confdir, calls = _install_handler(tmp_path, monkeypatch)
+    src = tmp_path / "jobs-a.yaml"
+    src.write_text("jobs: []\n")
+    base = {
+        "source": str(src),
+        "target": "jobs-a.yaml",
+        "reason": "r",
+        "confirm": True,
+    }
+    await _call(h, "cron_install_config", base)
+    assert "--new" not in calls[-1]["argv"]
+    assert "--allow-removals" not in calls[-1]["argv"]
+    await _call(
+        h,
+        "cron_install_config",
+        {**base, "new": True, "allow_removals": True},
+    )
+    assert "--new" in calls[-1]["argv"]
+    assert "--allow-removals" in calls[-1]["argv"]
+    # reason reaches the installer verbatim -- it becomes the bak record
+    assert calls[-1]["argv"][3] == "r"
+
+
+async def test_install_config_surfaces_the_installer_refusal_verbatim(
+    tmp_path, monkeypatch
+):
+    """A refusal names the job at risk; summarising it loses the point."""
+    refusal = (
+        "REFUSED - staged config DROPS jobs that are currently live:\n"
+        "    traefik-router-guard\n"
+        "  If the removal is intentional, re-run with --allow-removals."
+    )
+    h, confdir, calls = _install_handler(
+        tmp_path, monkeypatch, rc=1, output=refusal
+    )
+    src = tmp_path / "jobs-agents.yaml"
+    src.write_text("jobs: []\n")
+    result = await _call(
+        h,
+        "cron_install_config",
+        {
+            "source": str(src),
+            "target": "jobs-agents.yaml",
+            "reason": "r",
+            "confirm": True,
+        },
+    )
+    assert result["isError"] is True
+    assert refusal in result["content"][0]["text"]
+    assert "traefik-router-guard" in result["content"][0]["text"]
+
+
+async def test_install_config_refuses_targets_outside_the_config_dir(
+    tmp_path, monkeypatch
+):
+    h, confdir, calls = _install_handler(tmp_path, monkeypatch)
+    src = tmp_path / "jobs-a.yaml"
+    src.write_text("jobs: []\n")
+    for bad in (
+        "../escape.yaml",
+        "nested/jobs.yaml",
+        "/etc/cron.d/jobs.yaml",
+        str(tmp_path / "elsewhere.yaml"),
+    ):
+        result = await _call(
+            h,
+            "cron_install_config",
+            {
+                "source": str(src),
+                "target": bad,
+                "reason": "r",
+                "confirm": True,
+            },
+        )
+        assert result["isError"] is True, bad
+        assert "config directory" in result["content"][0]["text"], bad
+    # and a non-yaml name inside it, which cronstable would never merge
+    result = await _call(
+        h,
+        "cron_install_config",
+        {
+            "source": str(src),
+            "target": "jobs.yml",
+            "reason": "r",
+            "confirm": True,
+        },
+    )
+    assert result["isError"] is True
+    assert "*.yaml" in result["content"][0]["text"]
+    assert calls == []  # nothing reached the installer
+
+
+async def test_install_config_needs_a_real_source_and_config_dir(
+    tmp_path, monkeypatch
+):
+    h, confdir, calls = _install_handler(tmp_path, monkeypatch)
+    result = await _call(
+        h,
+        "cron_install_config",
+        {
+            "source": str(tmp_path / "nope.yaml"),
+            "target": "jobs-a.yaml",
+            "reason": "r",
+            "confirm": True,
+        },
+    )
+    assert result["isError"] is True
+    assert "no such source file" in result["content"][0]["text"]
+    # a daemon started with a single config FILE has nowhere to install to
+    src = tmp_path / "jobs-a.yaml"
+    src.write_text("jobs: []\n")
+    h._cron.config_arg = str(src)
+    result = await _call(
+        h,
+        "cron_install_config",
+        {
+            "source": str(src),
+            "target": "jobs-a.yaml",
+            "reason": "r",
+            "confirm": True,
+        },
+    )
+    assert result["isError"] is True
+    assert "not a config directory" in result["content"][0]["text"]
+    assert calls == []
+
+
+async def test_install_config_reports_a_missing_installer(
+    tmp_path, monkeypatch
+):
+    """No fallback: the script is the only implementation, by design."""
+    h, confdir, calls = _install_handler(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        mcp_mod, "INSTALL_CONFIG_SCRIPT", str(tmp_path / "gone.sh")
+    )
+    src = tmp_path / "jobs-a.yaml"
+    src.write_text("jobs: []\n")
+    result = await _call(
+        h,
+        "cron_install_config",
+        {
+            "source": str(src),
+            "target": "jobs-a.yaml",
+            "reason": "r",
+            "confirm": True,
+        },
+    )
+    assert result["isError"] is True
+    assert "installer is missing" in result["content"][0]["text"]
+    assert calls == []
+
+
+async def test_install_config_timeout_says_the_file_may_be_installed(
+    tmp_path, monkeypatch
+):
+    """The installer writes BEFORE it waits, so a kill is ambiguous."""
+    h, confdir, calls = _install_handler(tmp_path, monkeypatch)
+
+    async def hung(argv):
+        return None, "== validating =="
+
+    monkeypatch.setattr(mcp_mod, "_run_installer", hung)
+    src = tmp_path / "jobs-a.yaml"
+    src.write_text("jobs: []\n")
+    result = await _call(
+        h,
+        "cron_install_config",
+        {
+            "source": str(src),
+            "target": "jobs-a.yaml",
+            "reason": "r",
+            "confirm": True,
+        },
+    )
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "may already be in place" in text
+    assert "cron_get_job" in text
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="the installer is a POSIX shell script")
+async def test_run_installer_really_spawns_and_merges_streams(tmp_path):
+    """The one test that exercises the subprocess, not a stand-in."""
+    script = tmp_path / "fake-installer.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        'echo "== validating =="\n'
+        'echo "REFUSED - nope" >&2\n'
+        "exit 3\n"
+    )
+    script.chmod(0o755)
+    rc, out = await mcp_mod._run_installer([str(script)])
+    assert rc == 3
+    # stderr folded into stdout, in the order an operator would see it
+    assert out.splitlines() == ["== validating ==", "REFUSED - nope"]
+
+
 #: The REST route (or routes) each MCP tool is the twin of: same action,
 #: same in-process payload builder, so the same token scope should reach
 #: both. Hand-maintained because the two authorization tables cannot be
@@ -1468,6 +1757,13 @@ _TOOL_REST_TWINS = {
     "cron_cancel_job": (("POST", "/jobs/{name}/cancel"),),
     "cron_pause_job": (("POST", "/jobs/{name}/pause"),),
     "cron_resume_job": (("POST", "/jobs/{name}/resume"),),
+    # No REST twin: installing a job DEFINITION has no route, it shells out
+    # to the host installer. So this is the one mutating tool the guard
+    # below cannot cross-check, and any `control`-scoped token can call it.
+    # Recorded rather than papered over: if the estate ever wants config
+    # writes held back from a control token, that needs a scope of their
+    # own on both surfaces, not an entry invented here.
+    "cron_install_config": None,
     "cron_trigger_dag": (("POST", "/dags/{name}/trigger"),),
     "cron_backfill_dag": (("POST", "/dags/{name}/backfill"),),
     "cron_decide_gate": (

@@ -77,7 +77,7 @@ default) strips every mutating tool regardless of toolset.
 | `observe` (read) | `cron_get_status`, `cron_list_jobs`, `cron_get_job`, `cron_list_runs`, `cron_get_job_trends`, `cron_get_job_resources`, `cron_get_cluster`, `cron_get_fleet`, `cron_get_node`, `cron_query_metrics`, `cron_get_version`, `cron_tail_job_logs`, `cron_schedule_pressure`, `cron_schedule_duplicates`, `cron_suggest_slot`, `cron_validate_schedule`, `cron_explain_schedule`, `cron_why_no_run` |
 | `dags` (read) | `cron_list_dags`, `cron_list_dag_runs`, `cron_get_dag_run`, `cron_get_dag_xcom`, `cron_tail_dag_task_logs` |
 | `state` (read) | `cron_inspect_state` (store overview / a namespace's documents / a stream's records; KV values and secrets redacted) |
-| `act` (**mutating**) | `cron_run_job`, `cron_cancel_job`, `cron_pause_job`, `cron_resume_job` |
+| `act` (**mutating**) | `cron_run_job`, `cron_cancel_job`, `cron_pause_job`, `cron_resume_job`, `cron_install_config` |
 | `dags` (**mutating**) | `cron_trigger_dag`, `cron_backfill_dag`, `cron_decide_gate` |
 
 Mutating tools require an explicit `confirm: true` argument, carry honest
@@ -93,6 +93,22 @@ as `mcp`, so a pause taken by an agent reads as such in the audit fields. The
 observe tools report the resulting `paused` and `sla` state on every job
 payload. Semantics: [pausing jobs](Pausing-Jobs) and
 [late-run detection](Late-Run-Detection).
+
+`cron_install_config` is the one tool that writes a job *definition* rather
+than acting on a job that already exists. It takes `source` (the real file you
+keep, in a repo or anywhere else), `target` (a file name inside the daemon's
+config directory), and a mandatory `reason`, plus explicit `new` and
+`allow_removals` flags. It does not validate anything itself: it stages a
+throwaway copy of `source` and runs the host installer script, which checks the
+staged file against cronstable's own schema alongside every sibling config,
+refuses a lost update or a duplicate job name, backs up the previous version,
+installs, and then confirms the daemon reloaded. Those refusals come back
+verbatim. Two consequences worth knowing before you call it: the daemon must be
+running as root (it is shelling out to a script that writes to the config
+directory), and a successful call takes roughly 75-90 seconds, because the
+installer waits out the daemon's reload timer rather than assuming acceptance —
+a rejected config is silent, and the daemon keeps serving the last good one
+from memory.
 
 The three schedule-authoring tools make an agent a competent schedule
 **author**, not only a reader, with the daemon's own engine as the authority:

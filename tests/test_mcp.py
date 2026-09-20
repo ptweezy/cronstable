@@ -225,6 +225,7 @@ async def test_default_lists_observe_readonly_only():
     assert "cron_run_job" not in names
     assert "cron_pause_job" not in names
     assert "cron_resume_job" not in names
+    assert "cron_install_config" not in names
     assert "cron_inspect_state" not in names
 
 
@@ -235,6 +236,7 @@ async def test_mutating_tools_absent_under_readonly():
     assert "cron_cancel_job" not in names
     assert "cron_pause_job" not in names
     assert "cron_resume_job" not in names
+    assert "cron_install_config" not in names
     assert "cron_trigger_dag" not in names
     # read DAG tools still present (reads aren't gated by readOnly)
     assert "cron_list_dags" in names
@@ -250,6 +252,7 @@ async def test_mutating_tools_present_when_writes_enabled():
         "cron_cancel_job",
         "cron_pause_job",
         "cron_resume_job",
+        "cron_install_config",
         "cron_trigger_dag",
         "cron_backfill_dag",
         "cron_decide_gate",
@@ -289,6 +292,9 @@ async def test_mutating_tool_annotations_are_declared_correctly():
         "cron_cancel_job": (False, True, True),
         "cron_pause_job": (False, False, True),
         "cron_resume_job": (False, False, True),
+        # installing overwrites a job file (destructive) and is not a
+        # no-op on repeat: a second call re-installs and takes another bak
+        "cron_install_config": (False, True, False),
         "cron_trigger_dag": (False, False, False),
         # a backfill and a gate decision both overwrite run state
         "cron_backfill_dag": (False, True, False),

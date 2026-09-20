@@ -4,7 +4,8 @@ MCP (https://modelcontextprotocol.io) lets an AI agent -- Claude Desktop /
 Code, Cursor, VS Code Copilot, and other MCP clients -- drive cronstable the
 way an operator drives the dashboard: list and inspect jobs, DAGs, the
 cluster/fleet and the durable state store (observe), and, when the operator
-opts in, run/cancel a job or trigger/backfill/approve a DAG (act).
+opts in, run/cancel a job, install a job config file, or
+trigger/backfill/approve a DAG (act).
 
 The protocol is JSON-RPC 2.0 over the "Streamable HTTP" transport
 (https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) --
@@ -28,9 +29,13 @@ only (no resources/prompts yet), pinned to protocol revision
 2026 revision a near-no-op.
 """
 
+import asyncio
 import json as _stdlib_json
 import logging
+import os
 import re
+import shutil
+import tempfile
 from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
 from typing import (
@@ -90,6 +95,34 @@ _MethodHandler = Callable[
 _TOOL_SCOPE_OVERRIDES = {
     "cron_decide_gate": "approve",
 }
+
+#: The ONE implementation of "install a cronstable job file safely": it
+#: validates the staged file against cronstable's own schema (in place of
+#: the target, alongside every sibling, because a schema error can be
+#: cross-file), refuses a lost update or a duplicate job name, takes a
+#: `bak` with the caller's reason, installs, and then confirms the daemon
+#: actually reloaded it.
+#:
+#: cron_install_config SHELLS OUT to this and reimplements none of it. That
+#: is the point: `yaml.safe_load` passing is not schema validation -- it
+#: happily accepts a config cronstable rejects (documented 2026-08-11, and
+#: again 2026-08-22 with an `env:` key absent from the schema) -- and on a
+#: rejection the daemon keeps serving the LAST GOOD config from memory, so
+#: a broken edit looks completely fine until a restart leaves it with no
+#: config at all. A second validator here would be a second thing to get
+#: wrong, silently, estate-wide.
+#:
+#: Overridable so the tests can drive a stub instead of the real installer.
+INSTALL_CONFIG_SCRIPT = os.environ.get(
+    "CRONSTABLE_INSTALL_CONFIG_SCRIPT",
+    "/opt/scripts/cronstable-install-config.sh",
+)
+
+#: Ceiling for one installer run. The script deliberately sleeps ~70s after
+#: installing, waiting out the daemon's own reload timer before it will
+#: claim the config was accepted, so a SUCCESSFUL run takes ~75-90s. This
+#: bound exists to catch a wedged run, not to cut the wait short.
+INSTALL_CONFIG_TIMEOUT = 180.0
 
 #: Scopes granted to the caller of the current request, set by handle_http
 #: from the token the web auth middleware matched; None when auth is off
@@ -296,12 +329,13 @@ class MCPHandler:
             "cronstable's MCP server. Read-only 'observe' tools describe "
             "jobs, workflows, cluster health, metrics and saved state. "
             "Mutating tools (run/cancel/pause/resume a job, "
-            "run/backfill/approve a workflow) require confirm=true and "
+            "run/backfill/approve a workflow, install a job config file) "
+            "require confirm=true and "
             "appear only when the operator disabled readOnly. Start with "
             "cron_get_status or cron_list_jobs. When authoring a schedule, "
             "verify it with cron_validate_schedule / cron_explain_schedule "
-            "(the server's scheduling engine) before proposing it; "
-            "cron_why_no_run "
+            "(the server's scheduling engine) before proposing it, then write "
+            "the job file with cron_install_config; cron_why_no_run "
             "explains why a job's schedule did or did not match a given "
             "timestamp."
         )
@@ -956,6 +990,44 @@ class MCPHandler:
                 mutating=True,
                 idempotent=True,
             ),
+            _tool(
+                "act",
+                "cron_install_config",
+                "Install job config file",
+                "Install a job-definition file into this daemon's config "
+                "directory by running the estate installer "
+                "(/opt/scripts/cronstable-install-config.sh), which "
+                "validates against cronstable's OWN schema -- a YAML parse "
+                "is not a schema check -- backs the old version up with "
+                "`bak`, installs, and confirms the daemon reloaded it. "
+                "`source` is the REAL file you keep (e.g. one in an estate "
+                "repo): the tool copies it to a throwaway staging path "
+                "first, because the installer MOVES what it is given. "
+                "`target` is the file NAME inside the config directory; "
+                "anything resolving outside it is refused. `reason` is "
+                "mandatory and becomes part of the bak record. Pass "
+                "new=true for a file that does not exist yet and "
+                "allow_removals=true to drop a currently-live job -- both "
+                "explicit, never inferred. The installer's refusals are "
+                "returned verbatim. SLOW BY DESIGN: ~75-90s, most of it the "
+                "installer waiting out the daemon's reload timer so a "
+                "silent rejection cannot pass as success. Requires "
+                "confirm=true, and the daemon must run as root.",
+                obj(
+                    {
+                        "source": _STR,
+                        "target": _STR,
+                        "reason": _STR,
+                        "new": _BOOL,
+                        "allow_removals": _BOOL,
+                        "confirm": _BOOL,
+                    },
+                    ["source", "target", "reason"],
+                ),
+                self._t_install_config,
+                mutating=True,
+                destructive=True,
+            ),
             # ---- dag control (mutating; toolset dags + readOnly:false) ----
             _tool(
                 "dags",
@@ -1547,6 +1619,92 @@ class MCPHandler:
             return _tool_error(str(ex))
         return _result(
             data, "recovery started" if execute else "recovery preview"
+        )
+
+    async def _t_install_config(
+        self, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        source = _req_str(args, "source")
+        target = _req_str(args, "target")
+        reason = _req_str(args, "reason")
+        _require_confirm(args, "installing a config file")
+        new = args.get("new") is True
+        allow_removals = args.get("allow_removals") is True
+
+        confdir = self._cron.config_arg
+        if not confdir or not os.path.isdir(confdir):
+            raise _ToolInputError(
+                "this daemon was started with {!r}, which is not a config "
+                "directory, so there is no job-file directory to install "
+                "into".format(confdir)
+            )
+        target_path = _resolve_config_target(confdir, target)
+        if not os.path.isfile(source):
+            raise _ToolInputError(
+                "no such source file: {!r}".format(source)
+            )
+        if not os.path.isfile(INSTALL_CONFIG_SCRIPT):
+            return _tool_error(
+                "the installer is missing: {}. This tool is a wrapper "
+                "around it and deliberately has no fallback of its "
+                "own.".format(INSTALL_CONFIG_SCRIPT)
+            )
+
+        argv = [INSTALL_CONFIG_SCRIPT, "", target_path, reason]
+        if new:
+            argv.append("--new")
+        if allow_removals:
+            argv.append("--allow-removals")
+
+        # The installer MOVES its staged input, so it gets a throwaway copy
+        # and the caller keeps the real file. The copy is named for the
+        # target (the installer's messages quote it) but lives in a private
+        # temp dir, NEVER in the config directory -- cronstable merges every
+        # *.yaml it finds there, so staging in place would briefly publish a
+        # duplicate of every job in the file.
+        tmpdir = tempfile.mkdtemp(prefix="cronstable-install-config-")
+        try:
+            staged = os.path.join(tmpdir, os.path.basename(target_path))
+            shutil.copyfile(source, staged)
+            argv[1] = staged
+            rc, output = await _run_installer(argv)
+        except OSError as ex:
+            return _tool_error(
+                "could not stage {!r} for install: {}".format(source, ex)
+            )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        if rc is None:
+            return _tool_error(
+                "the installer did not finish within {:.0f}s and was "
+                "killed. It installs BEFORE it waits for the reload, so "
+                "the file may already be in place: check with "
+                "cron_get_job / cron_list_jobs before retrying.\n\n"
+                "{}".format(INSTALL_CONFIG_TIMEOUT, output)
+            )
+        if rc != 0:
+            # Verbatim: the installer's refusals name the exact job that
+            # would be lost or collide, and how to re-stage. Summarising
+            # them would throw away the only part worth reading.
+            return _tool_error(
+                "cronstable-install-config.sh exited {}. Its refusals "
+                "happen before anything is written; the one failure that "
+                "does not is a daemon rejection AFTER install, which the "
+                "output names explicitly.\n\n{}".format(rc, output)
+            )
+        return _result(
+            {
+                "installed": target_path,
+                "source": source,
+                "reason": reason,
+                "new": new,
+                "allowRemovals": allow_removals,
+                "output": output,
+            },
+            "installed {} and the daemon reloaded clean\n\n{}".format(
+                target_path, output
+            ),
         )
 
     async def _t_trigger_dag(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -2152,6 +2310,60 @@ def _opt_int(value: Any) -> Optional[int]:
     # other unusable value instead of surfacing a -32603 internal error.
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _resolve_config_target(confdir: str, target: str) -> str:
+    """Absolute path ``target`` names inside ``confdir``, or refuse.
+
+    ``target`` is normally a bare file name; an absolute path is accepted
+    only when it already points directly into the config directory. The
+    installer has its own ``*.yaml`` check, but a traversal must never
+    reach a shell argument in the first place, so the rule is enforced on
+    both sides of the call.
+    """
+    if not target.strip() or target != target.strip():
+        raise _ToolInputError("target must not be blank or padded")
+    if "\x00" in target:
+        raise _ToolInputError("target must not contain a NUL byte")
+    resolved = os.path.normpath(
+        target if os.path.isabs(target) else os.path.join(confdir, target)
+    )
+    if os.path.realpath(os.path.dirname(resolved)) != os.path.realpath(
+        confdir
+    ):
+        raise _ToolInputError(
+            "target must name a file directly inside the config directory "
+            "{!r}; {!r} resolves outside it".format(confdir, target)
+        )
+    if not resolved.endswith(".yaml"):
+        raise _ToolInputError(
+            "cronstable merges only *.yaml: {!r}".format(target)
+        )
+    return resolved
+
+
+async def _run_installer(argv: list[str]) -> tuple[Optional[int], str]:
+    """Run the installer, returning ``(returncode, combined output)``.
+
+    stderr is folded into stdout so the script's REFUSED banners stay in
+    reading order with the progress lines around them, exactly as an
+    operator would see them on a terminal. A returncode of ``None`` means
+    the run exceeded :data:`INSTALL_CONFIG_TIMEOUT` and was killed.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(
+            proc.communicate(), timeout=INSTALL_CONFIG_TIMEOUT
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        proc.kill()
+        out, _ = await proc.communicate()
+        return None, out.decode("utf-8", "replace").strip()
+    return proc.returncode, out.decode("utf-8", "replace").strip()
 
 
 def _require_confirm(args: dict[str, Any], gerund: str) -> None:
