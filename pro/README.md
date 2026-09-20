@@ -29,16 +29,17 @@ pro/
 
 ## Develop and test
 
-Pro is not part of the MIT core's tox suite; run it with its own tooling from the
-repository root:
+To install the core and Pro packages and run Pro tests, run these commands
+from the repository root:
 
 ```sh
-pip install -e . -e "./pro[dev]"   # the core, then Pro + its dev deps
-pytest pro/tests
+python -m pip install -e . -e "./pro[dev]"
+python -m pytest pro/tests
 ```
 
-CI builds the core and Pro together and runs these tests (the `pro` job), so the
-boundary (Pro importing the core) cannot silently break.
+Pytest discovers Pro's configuration in `pro/pyproject.toml`. The `pro` CI
+job runs these tests separately from the core's tox suite to check that Pro
+imports the core and rejects unverified entitlements.
 
 ## Conventions
 

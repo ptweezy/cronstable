@@ -14,6 +14,7 @@ include SECURITY.md
 include TRADEMARKS.md
 
 recursive-include tests *
+recursive-include .github/tests *.py *.ini
 recursive-include acceptance *.py *.ini *.txt *.md *.sh *.cmd
 recursive-include example *
 include scripts/generate_build_files.py

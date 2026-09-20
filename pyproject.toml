@@ -45,7 +45,7 @@ dependencies = [
     "strictyaml>=1.7.3,<2",
     "aiohttp>=3.14.3,<4",
     "sentry-sdk>=2.8,<3",
-    "aiosmtplib>=5.1.1,<6",
+    "aiosmtplib>=5.1.2,<6",
     "jinja2>=3.1.6,<4",
     # zoneinfo's tz database, so timezones resolve on minimal/slim images
     # that don't ship the system tzdata.
@@ -328,7 +328,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests", ".github/tests"]
 # A wedged await (the intermittent 3.12 test_dag_tools_full_flow hang) must
 # dump every thread's stack and fail the run, not burn the 30 min CI job
 # timeout and report "cancelled". Armed per test; no test comes near 300s.
