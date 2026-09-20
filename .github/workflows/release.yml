@@ -153,7 +153,7 @@ jobs:
   # it emits the natural setuptools_scm dev version (e.g. 1.2.9.devN+g<sha>),
   # exactly as the old build.yml did for its per-commit builds.
   version:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       release: ${{ steps.d.outputs.release }}
       bump: ${{ steps.d.outputs.bump }}
@@ -331,7 +331,7 @@ jobs:
     needs:
       - version
       - tox-static
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -408,7 +408,7 @@ jobs:
           retention-days: 7
 
   tox-static:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -447,7 +447,7 @@ jobs:
   # report, and shipped with its compliance kit (in-binary notice, Release
   # source archive, public build recipe). See LICENSING.md.
   licenses:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -478,17 +478,17 @@ jobs:
         # Test macOS with the POSIX profile. Its process, signal, fsync,
         # and pipe behavior differs from Linux, and releases include macOS
         # binaries.
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-26.04, windows-latest, macos-latest]
         python: ['3.10', '3.11', '3.12', '3.13', '3.14']
         experimental: [false]
         include:
           # Test Linux ARM64 with the oldest and newest supported Python
           # versions. Releases include ARM64 binaries, images, and packages;
           # dependencies such as cryptography and orjson use different wheels.
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-26.04-arm
             python: '3.10'
             experimental: false
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-26.04-arm
             python: '3.14'
             experimental: false
           # Windows on ARM64: a gating row on the latest stable Python so the
@@ -533,13 +533,13 @@ jobs:
       # green, with nothing comparing the second engine again. The enforcement
       # step below turns that silence into a red cell.
       - name: Install Chromium for the web engine differential
-        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
+        if: matrix.os == 'ubuntu-26.04' && matrix.python == '3.14'
         run: |
           set -euo pipefail
           pip install "$(grep -E '^playwright' requirements_dev.txt)"
           python -m playwright install --with-deps chromium
       # Both arms on every runner: the one that does not match the OS skips
-      # (a pass, no venv), so ubuntu-latest, windows-latest and
+      # (a pass, no venv), so ubuntu-26.04, windows-latest and
       # windows-11-arm all take the same line and each measures the coverage
       # profile for the OS it is on. See tox.ini's `platform` key.
       - if: matrix.python != '3.14t'
@@ -582,7 +582,7 @@ jobs:
       # literal "1 passed", which a second test in the file would flip to a
       # false red.
       - name: Enforce the web engine differential ran (no silent skip)
-        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
+        if: matrix.os == 'ubuntu-26.04' && matrix.python == '3.14'
         run: |
           set -euo pipefail
           .tox/py-posix/bin/python -m pytest \
@@ -648,7 +648,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-26.04]
         # Test Python 3.15 and the free-threaded 3.14 build. The latter
         # exercises daemon threads without serialization by the global
         # interpreter lock (GIL).
@@ -670,7 +670,7 @@ jobs:
   # Other jobs resolve newer dependencies, so this job checks the declared
   # minimums on the oldest supported Python version.
   tox-mindeps:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -690,7 +690,7 @@ jobs:
   # both Kubernetes transports. CRONSTABLE_LIVE_REQUIRED fails the job if a
   # test skips because a server is not configured.
   backends-live:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       ETCD_IMAGE: gcr.io/etcd-development/etcd:v3.5.21
@@ -788,7 +788,7 @@ jobs:
     needs:
       - version
       - preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
       # setuptools_scm never walks history here, and its git file-finder (which
@@ -854,7 +854,7 @@ jobs:
   # outside this repository, so a red here is information about nixpkgs, not a
   # reason to hold a release that ships no Nix artifact.
   nix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     continue-on-error: true
     timeout-minutes: 60
     steps:
@@ -906,7 +906,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             platform: linux/amd64
             image: quay.io/pypa/manylinux2014_x86_64:2026.08.15-1
             pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.14.7+20260814-x86_64-unknown-linux-gnu-install_only.tar.gz'
@@ -924,7 +924,7 @@ jobs:
             rust: '1'
             native: '1'
           - arch: amd64v3
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             platform: linux/amd64
             image: quay.io/pypa/manylinux2014_x86_64:2026.08.15-1
             pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.14.7+20260814-x86_64_v3-unknown-linux-gnu-install_only.tar.gz'
@@ -936,7 +936,7 @@ jobs:
             rust: '1'
             native: '1'
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             platform: linux/arm64
             image: quay.io/pypa/manylinux2014_aarch64:2026.08.15-1
             pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.14.7+20260814-aarch64-unknown-linux-gnu-install_only.tar.gz'
@@ -948,7 +948,7 @@ jobs:
             rust: '1'
             native: '1'
           - arch: ppc64le
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             platform: linux/ppc64le
             qemu: true
             # manylinux_2_28 rather than manylinux2014: cryptography publishes
@@ -966,7 +966,7 @@ jobs:
             rust: '1'
             native: '0'
           - arch: s390x
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             platform: linux/s390x
             qemu: true
             image: quay.io/pypa/manylinux2014_s390x:2026.08.15-1
@@ -987,7 +987,7 @@ jobs:
             rust: '1'
             native: '0'
           - arch: armv7
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             platform: linux/arm/v7
             qemu: true
             # No manylinux2014 armv7l image exists; this one is Ubuntu 20.04,
@@ -1373,10 +1373,10 @@ jobs:
             pq_tools: 'retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends rustc cargo libssl-dev pkg-config'
           # per-arch: docker platform, runner, and whether QEMU is needed
           # (amd64/arm64/i686 execute natively on the runners)
-          - {arch: amd64, platform: linux/amd64, runner: ubuntu-24.04}
-          - {arch: amd64v3, platform: linux/amd64, runner: ubuntu-24.04}
-          - {arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm}
-          - {arch: i686, platform: linux/386, runner: ubuntu-24.04}
+          - {arch: amd64, platform: linux/amd64, runner: ubuntu-26.04}
+          - {arch: amd64v3, platform: linux/amd64, runner: ubuntu-26.04}
+          - {arch: arm64, platform: linux/arm64, runner: ubuntu-26.04-arm}
+          - {arch: i686, platform: linux/386, runner: ubuntu-26.04}
           # Post-quantum sealing on every row. `pq: hard` where cryptography
           # publishes a musllinux_1_2 wheel (x86_64 and aarch64): the wheel
           # is always there, so absence is a broken build. `pq: soft` with
@@ -1415,11 +1415,11 @@ jobs:
           # tags, so those wheels stop being candidates and the C extensions
           # compile in-container against Alpine's ARMv6 gcc instead. armgate
           # then holds the result to it.
-          - {arch: armv7, platform: linux/arm/v7, runner: ubuntu-24.04, qemu: true, armgate: '--arm-float hard --max-arm-arch v7 --max-arm-fp 4'}
-          - {arch: armv6, platform: linux/arm/v6, runner: ubuntu-24.04, qemu: true, armgate: '--arm-float hard --max-arm-arch v6 --max-arm-fp 2', hostplat: linux-armv6l}
-          - {arch: ppc64le, platform: linux/ppc64le, runner: ubuntu-24.04, qemu: true}
-          - {arch: s390x, platform: linux/s390x, runner: ubuntu-24.04, qemu: true}
-          - {arch: riscv64, platform: linux/riscv64, runner: ubuntu-24.04, qemu: true}
+          - {arch: armv7, platform: linux/arm/v7, runner: ubuntu-26.04, qemu: true, armgate: '--arm-float hard --max-arm-arch v7 --max-arm-fp 4'}
+          - {arch: armv6, platform: linux/arm/v6, runner: ubuntu-26.04, qemu: true, armgate: '--arm-float hard --max-arm-arch v6 --max-arm-fp 2', hostplat: linux-armv6l}
+          - {arch: ppc64le, platform: linux/ppc64le, runner: ubuntu-26.04, qemu: true}
+          - {arch: s390x, platform: linux/s390x, runner: ubuntu-26.04, qemu: true}
+          - {arch: riscv64, platform: linux/riscv64, runner: ubuntu-26.04, qemu: true}
           # per-libc-and-arch, so these land on the two glibc rows only and
           # leave the musl rows of the same arches alone. `floor` is the glibc
           # version elf_floor.py holds the frozen bundle to; the musl rows set
@@ -1749,7 +1749,7 @@ jobs:
             # because e_machine alone is not an architecture: EM_MIPS covers
             # 32-bit and big-endian MIPS too.
             archspec: elf:2:1:8
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # Emulated MIPS compiles the whole dependency stack plus a bootloader.
     # Generous on purpose; a row still going at this point is wedged, not slow.
     timeout-minutes: 300
@@ -1954,7 +1954,7 @@ jobs:
             armgate: '--arm-float hard --max-arm-arch v6 --max-arm-fp 2'
             floor: '2.36'
             sources: ''
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # Emulating an ARM1176 while compiling the whole dependency stack plus a
     # bootloader is slow even by this workflow's standards. Generous on purpose;
     # a row still going at this point is wedged, not slow.
@@ -2136,7 +2136,7 @@ jobs:
             # row.
             armgate: '--arm-float soft --max-arm-arch v5 --max-arm-fp 0 --arm-arch-except libatomic.so.1'
             floor: '2.36'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # Emulating an ARM926 while compiling the whole dependency stack plus a
     # bootloader is slow even by this workflow's standards. Generous on purpose;
     # a row still going at this point is wedged, not slow.
@@ -2192,7 +2192,7 @@ jobs:
             # Alpine 3.24's OpenSSL 3.5 headers, for the same source build.
             pq_tools: 'retry 5 apk add --no-cache openssl-dev pkgconf'
             floor: ''
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # Emulated LoongArch compiles the whole dependency stack plus a bootloader.
     # Generous on purpose; a row still going at this point is wedged, not slow.
     timeout-minutes: 300
@@ -2663,7 +2663,7 @@ jobs:
             orjson: '0'
             pq: '1'
             cflags: -I/usr/local/include -include sys/cdefs.h
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
@@ -2866,7 +2866,7 @@ jobs:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         arch: [amd64, amd64v3]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 240
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
@@ -3017,7 +3017,7 @@ jobs:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         arch: [amd64, amd64v3]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 240
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
@@ -3150,7 +3150,7 @@ jobs:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
         arch: [amd64, amd64v3]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The Rust compile of cryptography is the largest cost here; the VM is
     # host-native (KVM), so it is minutes rather than the hour QEMU takes.
     timeout-minutes: 180
@@ -3739,7 +3739,7 @@ jobs:
     needs:
       - version
       - preflight
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     continue-on-error: true
     timeout-minutes: 360
     steps:
@@ -3860,7 +3860,7 @@ jobs:
   compiler-cache-budget:
     needs: [pq-wheels, pq-wheels-musl, pq-wheel-armv6, binaries-mips, binaries-loong64]
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'ptweezy/cronstable' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     continue-on-error: true
     permissions:
@@ -3905,7 +3905,7 @@ jobs:
 
   docker-assemble:
     needs: [version, docker, docker-glibc, docker-musl]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
@@ -3950,7 +3950,7 @@ jobs:
     needs:
       - version
       - preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # perf=ignore: a perf job that fails for ANY reason (a gated regression
     # is already a warning under that mode, so this covers a crashed bench,
     # a timeout, a pairing refusal) reads as success to the `release` job's
@@ -4157,7 +4157,7 @@ jobs:
   # and never blocks a publish.
   dco:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7.0.1
@@ -4192,7 +4192,7 @@ jobs:
   # push and PR but is NOT in the release gate below; the MIT core ships
   # independently of the proprietary package's health.
   pro:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -4538,7 +4538,7 @@ jobs:
 
   packages:
     needs: [version, binaries, binaries-container, binaries-loong64]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -4587,7 +4587,7 @@ jobs:
       - packages
       - binaries-armel
     if: needs.version.outputs.release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -4816,7 +4816,7 @@ jobs:
       - release-prepare
       - docker-assemble
     if: needs.version.outputs.release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write   # push the tag and create the GitHub Release
       id-token: write   # PyPI Trusted Publishing (OIDC)
@@ -5005,7 +5005,7 @@ jobs:
       - version
       - release
     if: needs.version.outputs.release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write   # push to GHCR
@@ -5094,7 +5094,7 @@ jobs:
   homebrew:
     needs: [version, release]
     if: needs.version.outputs.release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7.0.1    # for the formula template + render script
 
@@ -5252,7 +5252,7 @@ jobs:
     # Every other job in this pipeline is fork-clean, so without this the wiki
     # job would be a permanent red X on every fork's main push.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'ptweezy/cronstable'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       # The one grant that allows pushing the wiki. GitHub's docs never mention
       # wikis under `contents`, but staff confirm it and both maintained wiki

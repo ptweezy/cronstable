@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   deep:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7.0.1
@@ -47,7 +47,7 @@ jobs:
       - run: tox -e deep
 
   devmode:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     env:
       PYTHONDEVMODE: '1'
@@ -71,7 +71,7 @@ jobs:
           - ical
           - _json
           - fingerprint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v7.0.1

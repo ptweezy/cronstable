@@ -81,6 +81,9 @@
   exports. Add experimental free-threaded Python 3.14 coverage with a
   generated dependency list that omits orjson and tests the standard-library
   JSON fallback. Guard against optional test dependencies silently missing.
+- Move Linux GitHub Actions workers to explicit Ubuntu 26.04 x64 and ARM64
+  runner labels across tests, builds, nightly checks, container refreshes,
+  and release jobs, including the generated Docker platform matrix.
 - Add nightly extended property tests, repeated randomized suite runs,
   Python development-mode checks, and mutation tests. Treat warnings as
   errors, report timed-out tests before the process timeout, and clean up

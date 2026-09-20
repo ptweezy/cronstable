@@ -15,7 +15,7 @@ concurrency:
 jobs:
   prepare:
     if: github.repository == 'ptweezy/cronstable' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     outputs:
       version: ${{ steps.release.outputs.version }}
@@ -77,7 +77,7 @@ jobs:
 
   test:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -163,7 +163,7 @@ jobs:
 
   assemble:
     needs: [prepare, test, docker, docker-glibc, docker-musl]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -207,7 +207,7 @@ jobs:
 
   publish:
     needs: [prepare, assemble]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: read

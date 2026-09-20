@@ -276,7 +276,7 @@ def test_each_docker_platform_has_one_build_and_only_its_required_wheel():
             assert row["wheel"] == "" and row["wheel_group"] == "none"
             assert not row["qemu"]
         if row["platforms"] == "linux/arm64":
-            assert row["runner"] == "ubuntu-24.04-arm"
+            assert row["runner"] == "ubuntu-26.04-arm"
         if row["wheel"]:
             assert row["wheel"].startswith(
                 "pq-wheel-" + row["wheel_group"] + "-"
