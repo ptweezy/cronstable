@@ -207,7 +207,7 @@ bursts rather than one burst of subprocesses.
 
 A `type: sensor` task polls an external condition on a bounded, jittered,
 durable schedule instead of running once. Its command's exit code is the
-verdict: **0 = condition met** (the task succeeds); non-zero = not yet, poke
+verdict: **0 = condition met** (the task succeeds); nonzero = not yet, poke
 again after `pokeIntervalSeconds` (± `pokeJitterSeconds`) until
 `pokeTimeoutSeconds` elapses, after which the sensor fails.
 

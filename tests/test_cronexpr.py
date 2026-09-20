@@ -141,10 +141,11 @@ def test_now_omitted_uses_wall_clock():
 
 
 def test_live_differential_against_old_library():
-    """Cross-check every golden vector against the real old library.
+    """Compare every golden test case with the original cron library.
 
-    Runs only where the legacy package is installed (a dev machine after
-    ``pip install "crontab>=1,<2"``); CI relies on the committed vectors.
+    The legacy package is a development dependency in pyproject.toml.
+    tests/test_dev_deps_parity.py fails if it is missing, so a skipped
+    comparison cannot produce a successful CI result.
     """
     old = pytest.importorskip("crontab")
     for expr in _EXPRS:

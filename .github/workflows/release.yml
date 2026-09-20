@@ -475,10 +475,22 @@ jobs:
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
-        os: [ubuntu-latest, windows-latest]  # macOS is POSIX like Linux; add macos-latest to cover it too
+        # Test macOS with the POSIX profile. Its process, signal, fsync,
+        # and pipe behavior differs from Linux, and releases include macOS
+        # binaries.
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python: ['3.10', '3.11', '3.12', '3.13', '3.14']
         experimental: [false]
         include:
+          # Test Linux ARM64 with the oldest and newest supported Python
+          # versions. Releases include ARM64 binaries, images, and packages;
+          # dependencies such as cryptography and orjson use different wheels.
+          - os: ubuntu-24.04-arm
+            python: '3.10'
+            experimental: false
+          - os: ubuntu-24.04-arm
+            python: '3.14'
+            experimental: false
           # Windows on ARM64: a gating row on the latest stable Python so the
           # runtime is exercised on win-arm64 (the released .exe targets it too).
           - os: windows-11-arm
@@ -533,6 +545,27 @@ jobs:
       - run: |-
           tox -e py-windows,py-posix
 
+      # Test conversion of the runner's Task Scheduler library. This test
+      # requires an explicit environment variable because it reads host
+      # tasks. Run it on one hosted Windows runner and fail if it skips.
+      - name: Convert the runner's real Task Scheduler library
+        if: matrix.os == 'windows-latest' && matrix.python == '3.14'
+        shell: bash
+        env:
+          CRONSTABLE_TASKXML_LIVE: '1'
+        run: |
+          set -euo pipefail
+          .tox/py-windows/Scripts/python -m pytest tests/test_taskxml.py \
+            -k test_a_real_export_converts_and_loads -v -rs \
+            --junitxml=taskxml-live.xml
+          .tox/py-windows/Scripts/python - <<'EOF'
+          import xml.etree.ElementTree as ET
+          root = ET.parse("taskxml-live.xml").getroot()
+          suite = next(root.iter("testsuite"))
+          assert int(suite.get("tests", 0)) == 1, "the live test was not collected"
+          assert int(suite.get("skipped", 0)) == 0, "the live test skipped"
+          EOF
+
       # The differential self-skips wherever Chromium is missing (every other
       # cell, by design), so THIS cell must prove it actually ran: re-drive it
       # through the tox env's own interpreter (and therefore the env's own
@@ -557,6 +590,16 @@ jobs:
             tests/test_web_title_e2e.py \
             tests/test_web_logsearch_e2e.py \
             tests/test_web_fleet_e2e.py \
+            tests/test_web_xss_e2e.py \
+            tests/test_web_auth_e2e.py \
+            tests/test_web_connectivity_e2e.py \
+            tests/test_web_table_e2e.py \
+            tests/test_web_actions_e2e.py \
+            tests/test_web_logs_e2e.py \
+            tests/test_web_keyboard_e2e.py \
+            tests/test_web_dag_e2e.py \
+            tests/test_web_prefs_e2e.py \
+            tests/test_web_surfaces_e2e.py \
             -v -rs --junitxml=parity-enforce.xml
           .tox/py-posix/bin/python - <<'EOF'
           import xml.etree.ElementTree as ET
@@ -564,6 +607,15 @@ jobs:
           for suite in ET.parse("parity-enforce.xml").getroot().iter("testsuite"):
               for key in totals:
                   totals[key] += int(suite.get(key, 0))
+          # JUnit XML includes expected failures in the skipped count.
+          # Exclude pytest.xfail results because those tests ran and failed
+          # as expected.
+          root = ET.parse("parity-enforce.xml").getroot()
+          totals["skipped"] -= sum(
+              1
+              for mark in root.iter("skipped")
+              if mark.get("type") == "pytest.xfail"
+          )
           print("parity differential:", totals)
           assert totals["tests"] >= 1, "no parity test was collected"
           assert totals["failures"] == 0 and totals["errors"] == 0
@@ -593,7 +645,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python: ['3.15']
+        # Test Python 3.15 and the free-threaded 3.14 build. The latter
+        # exercises daemon threads without serialization by the global
+        # interpreter lock (GIL).
+        python: ['3.15', '3.14t']
         experimental: [true]
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
@@ -602,6 +657,122 @@ jobs:
     # runner VM, which has cost us whole runs at 20.
     timeout-minutes: 30
     steps: *tox-steps
+    needs:
+      - version
+      - preflight
+
+  # Run the suite with the minimum dependency versions in pyproject.toml.
+  # The mindeps environment installs the generated requirements_min.txt.
+  # Other jobs resolve newer dependencies, so this job checks the declared
+  # minimums on the oldest supported Python version.
+  tox-mindeps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.10'
+      - run: pip install tox tox-uv
+      - run: tox -e mindeps
+    needs:
+      - version
+      - preflight
+
+  # Test the etcd and Kubernetes backends against real servers.
+  # tests/test_backend_live.py runs election scenarios and checks that the
+  # fake servers match real HTTP behavior. Provision a plaintext etcd server,
+  # a second etcd server with TLS and authentication, and a kind cluster for
+  # both Kubernetes transports. CRONSTABLE_LIVE_REQUIRED fails the job if a
+  # test skips because a server is not configured.
+  backends-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ETCD_IMAGE: gcr.io/etcd-development/etcd:v3.5.21
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install the package, development dependencies, and Kubernetes client
+        run: pip install -e '.[kubernetes]' -r requirements_dev.txt
+      - name: Start etcd without TLS or authentication
+        run: |
+          set -euo pipefail
+          docker run -d --name etcd-plain -p 2379:2379 "$ETCD_IMAGE" \
+            /usr/local/bin/etcd \
+            --listen-client-urls http://0.0.0.0:2379 \
+            --advertise-client-urls http://127.0.0.1:2379
+      - name: Start etcd with TLS and authentication
+        run: |
+          set -euo pipefail
+          tls="$RUNNER_TEMP/etcd-tls"
+          mkdir -p "$tls"
+          python - "$tls" <<'EOF'
+          import pathlib
+          import sys
+
+          from tests._helpers import _write_tls
+
+          paths = _write_tls(pathlib.Path(sys.argv[1]), cn="etcd")
+          for path in paths.values():
+              pathlib.Path(path).chmod(0o644)
+          EOF
+          docker run -d --name etcd-auth -p 2389:2379 -v "$tls:/tls:ro" \
+            "$ETCD_IMAGE" /usr/local/bin/etcd \
+            --listen-client-urls https://0.0.0.0:2379 \
+            --advertise-client-urls https://localhost:2389 \
+            --cert-file /tls/etcd-leaf.pem --key-file /tls/etcd-leaf.key
+          ctl() {
+            docker exec etcd-auth /usr/local/bin/etcdctl \
+              --endpoints https://localhost:2379 --cacert /tls/etcd-ca.pem "$@"
+          }
+          for attempt in $(seq 1 30); do
+            if ctl endpoint health; then break; fi
+            sleep 1
+          done
+          ctl user add root:live-lane-password
+          ctl user grant-role root root
+          ctl auth enable
+      - name: Wait for the plaintext etcd server
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:2379/health; then exit 0; fi
+            sleep 1
+          done
+          docker logs etcd-plain
+          exit 1
+      - name: Start a kind cluster
+        uses: helm/kind-action@v1.12.0
+      - name: Run the live backend tests
+        env:
+          CRONSTABLE_LIVE_REQUIRED: '1'
+          CRONSTABLE_LIVE_ETCD: http://127.0.0.1:2379
+          CRONSTABLE_LIVE_ETCD_AUTH: https://localhost:2389
+          CRONSTABLE_LIVE_ETCD_AUTH_PASSWORD: live-lane-password
+          CRONSTABLE_LIVE_ETCD_AUTH_CA: ${{ runner.temp }}/etcd-tls/etcd-ca.pem
+          CRONSTABLE_LIVE_K8S: '1'
+        run: |
+          set -euo pipefail
+          python -m pytest tests/test_backend_live.py -v -rs -p no:randomly \
+            --junitxml=backends-live.xml
+          python - <<'EOF'
+          import xml.etree.ElementTree as ET
+          totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          for suite in ET.parse("backends-live.xml").getroot().iter("testsuite"):
+              for key in totals:
+                  totals[key] += int(suite.get(key, 0))
+          print("live backends:", totals)
+          assert totals["tests"] >= 1, "no live test was collected"
+          assert totals["skipped"] == 0, "a live test skipped"
+          EOF
+      - name: Server logs
+        if: failure()
+        run: |
+          docker logs etcd-plain || true
+          docker logs etcd-auth || true
     needs:
       - version
       - preflight
@@ -4624,6 +4795,8 @@ jobs:
     needs:
       - version
       - tox
+      - tox-mindeps
+      - backends-live
       - tox-static
       - licenses
       - release-prepare

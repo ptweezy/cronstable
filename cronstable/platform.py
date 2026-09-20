@@ -862,17 +862,20 @@ def os_boot_time() -> Optional[float]:
 
 # --- Process liveness -------------------------------------------------------
 def pid_alive(pid: int) -> Optional[bool]:
-    """Whether a process with ``pid`` currently exists, or ``None``.
+    """Return whether ``pid`` is running, or ``None`` if its status is unknown.
 
-    Used by in-flight run reconciliation (:mod:`cronstable.cron`) as a
-    same-host safety check before declaring a previous daemon's run dead: a
-    daemon crash does NOT kill the job processes it spawned, so an ``open``
-    in-flight record whose recorded pid is still running must be left alone.
-    PID reuse can make this report ``True`` for an unrelated process; that
-    errs toward *not* reconciling, the safe direction.  ``None`` means the
-    platform could not answer (treated by callers the same as dead, since
-    the per-process token in the record already proved a different daemon
-    wrote it).
+    In-flight run reconciliation (:mod:`cronstable.cron`) uses this check
+    on the same host before marking a previous daemon's run as interrupted.
+    A daemon crash does not terminate its jobs, so leave an ``open`` record
+    unchanged while its process is running.
+
+    PID reuse can return ``True`` for an unrelated process. In that case,
+    reconciliation leaves the record open. Return ``False`` for a zombie
+    process, which has exited but has not been reaped.
+
+    Return ``None`` if the platform cannot determine the status. Callers
+    treat this as an exited process because the record's process token has
+    already established that a different daemon wrote it.
     """
     if pid <= 0:
         return None
@@ -909,7 +912,27 @@ def pid_alive(pid: int) -> Optional[bool]:
             return True
         except OSError:
             return None
-        return True
+        return not _is_zombie(pid)
+
+
+def _is_zombie(pid: int) -> bool:
+    """Return whether ``pid`` has exited but has not been reaped.
+
+    Signal 0 succeeds for a zombie process. An existence check alone would
+    therefore leave its in-flight record open. This can persist indefinitely
+    in a container whose PID 1 never reaps adopted children, preventing an
+    ``@reboot`` job from running again. The Windows implementation of
+    :func:`pid_alive` checks the exit code for the same reason.
+
+    If the status cannot be read, return ``False`` so reconciliation leaves
+    the record open.
+    """
+    try:
+        import psutil
+
+        return bool(psutil.Process(pid).status() == psutil.STATUS_ZOMBIE)
+    except Exception:  # noqa: BLE001 - any failure -> cannot tell
+        return False
 
 
 def process_start_time(pid: int) -> Optional[float]:
@@ -946,7 +969,7 @@ def exclusive_file_lock(
     * on a **local** filesystem the lock excludes other processes on the same
       host, exactly right for single-node durability;
     * on a **shared** NFSv4 mount (an Amazon S3 Files / EFS mount) the same
-      lock is honoured *across hosts*, so it excludes the fleet, exactly
+      lock is honored *across hosts*, so it excludes the fleet, exactly
       right for HA.
 
     On POSIX this is ``fcntl.flock`` (whole-file, advisory: it does not block
@@ -1248,7 +1271,7 @@ def _sddl_write_grantee(sddl: str) -> Optional[str]:
     already produces, and reading it needs no struct layouts, no SID
     comparisons and no ``MapGenericMask``.
 
-    Deny ACEs are honoured, coarsely: a principal denied any of the same
+    Deny ACEs are honored, coarsely: a principal denied any of the same
     rights is skipped entirely rather than intersected properly.  That errs
     toward silence, which is the right direction for a warning that fires
     at every start.

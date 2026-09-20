@@ -54,7 +54,7 @@ web:
 > entire HTTP control API otherwise behave identically on Windows. See
 > [running on Windows](Running-on-Windows).
 
-The server is created only when `web.listen` is non-empty. There must be exactly one
+The server is created only when `web.listen` is nonempty. There must be exactly one
 `web` block across the whole configuration: a duplicate `web` block in an included file
 or a second file in a config directory raises a `ConfigError`. See
 [includes, defaults, and multi-file config](Includes-and-Defaults).
@@ -1118,9 +1118,9 @@ $ curl -X POST -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/shutdown
 
 ### `GET /job-set-id`
 
-Returns this instance's job-set id: the order-independent fingerprint of every
+Returns this instance's job-set ID: the order-independent fingerprint of every
 job's effective configuration that replicas compare to confirm they hold the
-same set of jobs (see [job-set id](Job-Set-ID)).
+same set of jobs (see [job-set ID](Job-Set-ID)).
 The response is `text/plain` by default. When `Accept` lists
 `application/json` among its media ranges, it is a JSON object that also
 carries the job count (wildcards keep the text default, as on
@@ -1557,7 +1557,7 @@ reload from the scheduler loop:
   running one, the running server is stopped (`web_runner.cleanup()`) before any new
   one is started. A change to any `web` field (including `headers`, `authToken`, or
   `socketMode`) thus triggers a restart of the server on reload.
-- The server is (re)started only when `web` is present, `listen` is non-empty, and no
+- The server is (re)started only when `web` is present, `listen` is nonempty, and no
   server is currently running.
 - A reload also restarts the server when the `web.tls` files changed on disk
   under unchanged config (an in-place certificate rotation), because the
@@ -1696,7 +1696,7 @@ All routes are under `/v1/` and registered in `JobStateAPI._routes`:
 
 `cursor/advance` is monotonic by default: the stored value only ever moves to
 `max(current, value)`, so a replayed or out-of-order batch cannot walk a
-watermark backwards, and two nodes racing to advance the same cursor converge on
+watermark backward, and two nodes racing to advance the same cursor converge on
 the larger value. `advanced` is `false` when the given value was not greater than
 the current one (a no-op that is not even a write), and `force: true` sets the
 value unconditionally (a deliberate rewind).

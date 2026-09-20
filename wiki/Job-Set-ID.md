@@ -1,9 +1,9 @@
 # Job-set ID
 
-The **job-set id** is a deterministic, order-independent fingerprint of the set
+The **job-set ID** is a deterministic, order-independent fingerprint of the set
 of jobs a cronstable instance is running: two instances produce the *same* id if
 and only if they hold the same set of jobs. It exists so several replicas
-deployed from one configuration can confirm they run the same thing, or detect
+deployed from one configuration can confirm they run the same jobs, or detect
 that one has drifted from the others. It is the agreement key for
 [cluster peer attestation](Clustering-and-Leader-Election). It is useful
 without clustering too: print it in a deploy script, compare it across a fleet

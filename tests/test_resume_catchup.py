@@ -9,6 +9,7 @@ from cronstable.cron import Cron
 from cronstable.job import JobRetryState
 from tests._cron_helpers import _set_now
 from tests._helpers import (
+    start_state,
     _drain_state_writes,
     _reap_running,
     _state_cfg,
@@ -45,8 +46,9 @@ async def _daemon(
     )
     cron = Cron(None, config_yaml=yaml)
     if state:
-        await cron.start_stop_state(
-            _state_cfg("state:\n  path: " + str(tmp_path))
+        await start_state(
+        cron,
+        _state_cfg("state:\n  path: " + str(tmp_path))
         )
         if seed:
             await cron.state_backend.append_record(
@@ -114,7 +116,8 @@ async def test_resume_attempt_is_final_across_passes_and_restart(
         await _resume(cron, clock)
     assert calls == [(RESUME, False)]
     restarted = Cron(None, config_yaml=yaml)
-    await restarted.start_stop_state(
+    await start_state(
+        restarted,
         _state_cfg("state:\n  path: " + str(tmp_path))
     )
     restarted_calls = []
@@ -300,7 +303,8 @@ async def test_interrupted_resume_checkpoint_recovers_on_restart(
     assert calls == []
     assert await cron._pending_catchup_watermark("j") is not None
     restarted = Cron(None, config_yaml=yaml)
-    await restarted.start_stop_state(
+    await start_state(
+        restarted,
         _state_cfg("state:\n  path: " + str(tmp_path))
     )
     # Keep the shared fake launcher for counting, but use the new daemon's

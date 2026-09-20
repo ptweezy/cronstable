@@ -1,47 +1,29 @@
 r"""Convert Windows Task Scheduler XML exports into cronstable jobs.
 
-A Windows estate's schedules already exist, as Task Scheduler tasks, and
-Task Scheduler exports its whole task set as a documented, stable XML schema
-(``schtasks /query /XML``, ``Export-ScheduledTask``, namespace
-``http://schemas.microsoft.com/windows/2004/02/mit/task``).  Without this,
-migrating a few hundred tasks means retyping a few hundred tasks.
+Task Scheduler exports tasks using ``schtasks /query /XML`` or
+``Export-ScheduledTask`` with the XML namespace
+``http://schemas.microsoft.com/windows/2004/02/mit/task``.
 
-This module is a ONE-SHOT CONVERTER, not a config-directory loader, and that
-is the one place it departs from what the roadmap entry asked for.  Four
-reasons, in the order that decides it:
+This module converts an export to YAML for review. It does not load XML
+files as configuration. Exporting a task leaves it registered in Task
+Scheduler, so loading its export automatically could cause duplicate
+runs. XML files can also contain unrelated data or unsupported tasks,
+such as tasks that use COM handlers or have no trigger.
 
-* exporting a task does not unregister it, so an export describes tasks Task
-  Scheduler is still firing.  A loader would silently double-run an estate
-  on first start.  ``crontabs.py`` has no equivalent hazard, because a
-  crontab file is handed over deliberately and cron may not even be running;
-* ``.xml`` is a name half the tooling on a Windows box writes, while
-  ``.crontab`` and ``.cron`` are names nothing else uses.  Teaching the
-  config directory to read ``.xml`` would also let one stray file decide
-  which directory becomes the Windows default config location;
-* measured on a real Windows 11 estate, most of a whole-machine export is
-  not convertible at all (111 of 195 tasks act through a COM handler and 57
-  have no trigger).  A loader would have to either fail the whole directory
-  or drop those silently, and dropping silently is what the roadmap entry
-  explicitly forbids;
-* a converter can be reviewed.  Its output is YAML an operator reads, edits
-  and commits, which is where the judgement calls below belong.
+The converter translates schedules and reports other Task Scheduler
+behavior that it cannot preserve. Each unsupported feature includes a
+reason and, when available, a suggested action. Review the YAML before
+loading it and disable the original tasks when you migrate them.
 
-So the contract is one-directional and narrow: the SCHEDULE is converted,
-and the surrounding Task Scheduler semantics are reported rather than
-emulated.  Everything that could not be carried across is listed, with a
-reason and, where one exists, a remedy.
+The parser handles two common export problems:
 
-Two things about exports trip people up before any of this matters, so they
-are handled here rather than left to the operator:
-
-* ``schtasks /query /XML`` without ``ONE`` emits one XML declaration per
-  task INSIDE a single ``<Tasks>`` root, which is not well-formed;
-  :func:`strip_xml_declarations` removes them.
-* the declaration lies about the encoding whenever the export passed
-  through a redirect.  ``Export-ScheduledTask`` returns a string stamped
-  ``encoding="UTF-16"`` that PowerShell then writes as UTF-8, and expat
-  honours that declaration only for byte input.  :func:`decode_task_xml`
-  therefore decides the encoding from the bytes and hands the parser text.
+* Without ``ONE``, ``schtasks /query /XML`` places an XML declaration for
+  each task inside one ``<Tasks>`` root. :func:`strip_xml_declarations`
+  removes those declarations to make the document valid XML.
+* Redirected output can have an encoding that differs from its declaration.
+  For example, PowerShell can write UTF-8 while preserving an
+  ``encoding="UTF-16"`` declaration. :func:`decode_task_xml` determines the
+  encoding from the bytes and passes decoded text to the XML parser.
 """
 
 from __future__ import annotations
@@ -147,7 +129,7 @@ def read_source(path: str) -> tuple[bytes, str]:
 def decode_task_xml(data: bytes, source: str) -> str:
     """Decode an export to text, deciding the encoding from the BYTES.
 
-    Never hand these bytes to the parser directly.  expat honours an XML
+    Never hand these bytes to the parser directly.  expat honors an XML
     declaration only for byte input, and the declaration is routinely wrong:
     ``Export-ScheduledTask`` returns a string stamped ``UTF-16`` which
     PowerShell then writes as UTF-8, so parsing those bytes fails with

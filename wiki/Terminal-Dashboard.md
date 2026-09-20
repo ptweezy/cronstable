@@ -138,7 +138,7 @@ The TUI includes:
 - The **BIOS-style boot self-test**, checking the daemon once
   per 12 hours. Skip it with any key, `--no-boot`, or a settings toggle.
 
-Text is sanitized before display. For log lines, only the last non-empty
+Text is sanitized before display. For log lines, only the last nonempty
 `\r` segment is kept, so progress bars and cmd.exe's CRLF output display
 correctly. Tabs expand, and other control characters are dropped.
 

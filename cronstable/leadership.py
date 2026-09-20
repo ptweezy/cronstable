@@ -95,7 +95,7 @@ class LeadershipBackend(abc.ABC):
 
     Subclasses set the three attributes (``config``, ``node_name``,
     ``distribution``) and implement the core abstract methods; the rest
-    default to single-holder lease behaviour, which gossip overrides.
+    default to single-holder lease behavior, which gossip overrides.
     """
 
     #: the resolved cluster config block this backend was built from
@@ -293,7 +293,7 @@ class LeadershipBackend(abc.ABC):
         would make a quorate *follower* run every ``PreferLeader`` job,
         silently, on every replica.  The fence itself is per-process unique
         (a lease id / ``#<token>`` suffix), so :meth:`is_leader`
-        self-recognises regardless of any display-name collision.
+        self-recognizes regardless of any display-name collision.
         """
         if not self.is_quorate():
             return True

@@ -31,7 +31,11 @@ from cronstable.fingerprint import job_digest
 from cronstable.job import JobRetryState
 from tests._commands import cmd_print, cmd_sleep, yaml_command
 from tests._configs import _PLAIN_JOB, _RETRY_JOB
-from tests._helpers import _newest, _wait_until
+from tests._helpers import (
+    _newest,
+    _wait_until,
+    start_state,
+)
 from tests.test_state import (
     _count_launcher,
     _drain_state_writes,
@@ -160,7 +164,7 @@ def _stub_manager(**over):
 async def _stateful_cron(tmp_path, yaml, extra_state=""):
     cron = Cron(None, config_yaml=yaml)
     cfg = _state_cfg("state:\n  path: {}\n{}".format(tmp_path, extra_state))
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     assert cron.state_backend is not None
     return cron
 
@@ -384,7 +388,7 @@ async def test_same_store_state_reload_keeps_the_slot_fence(
         "state:\n  path: {}\n{}  maxRunsPerJob: 200\n".format(tmp_path, ttl)
     )
     assert edited != first_backend.config
-    await cron.start_stop_state(edited)
+    await start_state(cron, edited)
     backend = cron.state_backend
     assert backend is not None and backend is not first_backend
     assert cron._slot_leases["j"].fence == lease.fence
@@ -412,7 +416,7 @@ async def test_same_store_state_reload_keeps_the_slot_fence(
     moved = _state_cfg(
         "state:\n  path: {}\n{}".format(tmp_path / "moved", ttl)
     )
-    await cron.start_stop_state(moved)
+    await start_state(cron, moved)
     assert "j" not in cron._slot_leases and "j" not in cron._slot_renewers
     await asyncio.sleep(0)
     assert renewer.cancelled()

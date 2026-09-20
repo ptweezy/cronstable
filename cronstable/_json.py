@@ -1,25 +1,21 @@
-"""Optional orjson acceleration for the hot JSON serialization paths.
+"""JSON serialization with optional orjson acceleration.
 
-orjson (a compiled Rust/pyo3 extension) serializes and parses JSON several
-times faster than the stdlib and hands back ``bytes`` directly, saving the
-separate ``.encode("utf-8")`` every persistence site does by hand. It is an
-OPTIONAL speedup, wired exactly like the uvloop event-loop swap: it ships no
-wheels for some of the leaner architectures cronstable targets (riscv64, armv6,
-musl ppc64le/s390x), so it stays out of the core dependency set (install the
-``speedups`` extra to pull it in) and this module transparently falls back to
-the stdlib ``json`` when it is absent -- identical behaviour, just slower.
+orjson parses and serializes JSON and returns UTF-8 bytes directly, avoiding
+a separate encoding step. It is part of the ``speedups`` extra because
+wheels are unavailable for some supported architectures. If orjson is not
+installed, this module uses the standard library's ``json`` module. Both
+paths enforce the same value constraints.
 
-CONTRACT -- read before pointing anything new at these helpers:
+Use these helpers for data read back through :func:`loads`, such as durable
+records, leases, documents, and peer messages. orjson writes non-ASCII
+characters as UTF-8 instead of ASCII escapes, so its serialized bytes can
+differ from ``json.dumps(...).encode("utf-8")``.
 
-Use them only where the serialized bytes are round-tripped back through
-:func:`loads` (durable state records, leases, documents; parsing peer gossip
-bodies). orjson always emits UTF-8 and does NOT ``ensure_ascii``, so for
-non-ASCII input its bytes are NOT identical to
-``json.dumps(...).encode("utf-8")``. Anywhere the exact bytes matter -- a value
-fed into a hash / content-address, or compared across nodes or versions (the
-job-set fingerprint in :mod:`cronstable.fingerprint`, the cluster peer ETag in
-:mod:`cronstable.cluster`) -- keep the stdlib ``json`` directly, so the output
-stays stable and backend-independent whether or not a given host has orjson.
+When exact bytes determine a hash, content address, or cross-node
+comparison, use the standard library's ``json`` module directly. This
+includes job-set fingerprints in :mod:`cronstable.fingerprint` and peer
+ETags in :mod:`cronstable.cluster`. Their output must not depend on whether
+orjson is installed.
 """
 
 import json as _stdlib

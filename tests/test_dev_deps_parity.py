@@ -30,3 +30,51 @@ def test_playwright_is_installed_where_a_wheel_exists():
         "cron-engine differential silently skips. Check the playwright line "
         "in pyproject.toml (then regenerate build files)."
     )
+
+
+#: Required development dependencies and the checks that need them.
+#: Missing packages can silently skip tests or disable pytest checks.
+#: Each package supports every platform where the suite runs.
+_ALWAYS_INSTALLED = {
+    "hypothesis": "the property-based tests (tests/test_properties_*.py)",
+    "crontab": "the legacy-library differential in tests/test_cronexpr.py",
+    "nacl": "the push sealing tests (requires_pynacl)",
+    "zeroconf": "the mDNS discovery tests",
+    "pytest_randomly": "the random test order that exposes order dependence",
+    "pytest_timeout": "the per-test timeout",
+}
+
+
+@pytest.mark.parametrize("module", sorted(_ALWAYS_INSTALLED))
+def test_skip_guarded_dev_dependencies_are_installed(module):
+    assert importlib.util.find_spec(module) is not None, (
+        "{} is missing from this environment, which silently disables {}. "
+        "Check its line in pyproject.toml's dev extra (then regenerate "
+        "build files).".format(module, _ALWAYS_INSTALLED[module])
+    )
+
+
+def _has_cryptography_wheel():
+    # mirrors the marker on the cryptography lines of the dev extra
+    machine = platform.machine()
+    if sys.platform == "linux":
+        return machine in ("x86_64", "aarch64")
+    if sys.platform == "darwin":
+        return machine in ("arm64", "x86_64")
+    if sys.platform == "win32":
+        return machine in ("AMD64", "x86")
+    return False
+
+
+def test_cryptography_is_installed_where_a_wheel_exists():
+    # The mTLS, certificate-rotation and X-Wing tests skip without
+    # cryptography (about 70 call sites). The dev extra installs it behind
+    # a platform marker. If it stops matching, these tests could all skip
+    # without failing CI.
+    if not _has_cryptography_wheel():
+        pytest.skip("no cryptography wheel for this platform")
+    assert importlib.util.find_spec("cryptography") is not None, (
+        "cryptography is missing from this environment, so the TLS and "
+        "X-Wing tests silently skip. Check the cryptography lines in "
+        "pyproject.toml's dev extra (then regenerate build files)."
+    )

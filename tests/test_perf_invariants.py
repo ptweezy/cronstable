@@ -26,7 +26,12 @@ from cronstable import jobstate
 from cronstable.cron import Cron
 from cronstable.jobstate import JobStateError
 from tests._commands import cmd_print, yaml_command
-from tests._helpers import _backend, _drain_state_writes, _state_cfg
+from tests._helpers import (
+    _backend,
+    _drain_state_writes,
+    _state_cfg,
+    start_state,
+)
 
 
 def test_idle_mirror_releases_completed_output(monkeypatch):
@@ -275,7 +280,7 @@ async def test_one_run_writes_open_record_close_and_nothing_else(tmp_path):
     cfg = _state_cfg(
         "state:\n  path: %s\n  jobApi:\n    enabled: false\n" % tmp_path
     )
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     assert cron.state_backend is not None
     try:
         backend = cron.state_backend

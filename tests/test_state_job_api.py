@@ -15,6 +15,7 @@ never waited on for a renewal).
 """
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -39,7 +40,12 @@ from cronstable.jobapi import (
 )
 from cronstable.jobstate import JobStateError
 from cronstable.state import Lease
-from tests._helpers import _instant_sleep, _state_cfg, bare_http_raises
+from tests._helpers import (
+    _instant_sleep,
+    _state_cfg,
+    bare_http_raises,
+    start_state,
+)
 
 _ONE_JOB = (
     "state:\n  path: {path}\n"
@@ -420,7 +426,7 @@ async def test_artifact_put_2mib_with_no_limit(job_api):
     # (the job_api fixture sets both size limits to 0)
     payload = b"x" * (2 * 1024 * 1024)
     r = await job_api.session.post(
-        job_api.url("/v1/artifact/put?name=big"), data=payload
+        job_api.url("/v1/artifact/put?name=big"), data=io.BytesIO(payload)
     )
     assert r.status == 200
     assert (await r.json())["size"] == len(payload)
@@ -436,12 +442,15 @@ async def test_artifact_and_kv_2mib_within_raised_limits(job_api_factory):
     )
     r = await job_api.session.post(
         job_api.url("/v1/artifact/put?name=big"),
-        data=b"x" * (2 * 1024 * 1024),
+        data=io.BytesIO(b"x" * (2 * 1024 * 1024)),
     )
     assert r.status == 200
+    # Stream the large body; aiohttp's json parameter sends raw bytes.
+    body = json.dumps({"key": "k", "value": "v" * (2 * 1024 * 1024)})
     r = await job_api.session.post(
         job_api.url("/v1/kv/set"),
-        json={"key": "k", "value": "v" * (2 * 1024 * 1024)},
+        data=io.BytesIO(body.encode()),
+        headers={"Content-Type": "application/json"},
     )
     assert r.status == 200
 
@@ -780,7 +789,7 @@ def test_run_environment_keys():
 
 async def test_cron_starts_job_api_and_injects_env(tmp_path):
     cron = Cron(None, config_yaml=_ONE_JOB.format(path=tmp_path))
-    await cron.start_stop_state(_state_cfg(_ONE_JOB.format(path=tmp_path)))
+    await start_state(cron, _state_cfg(_ONE_JOB.format(path=tmp_path)))
     try:
         assert cron._job_api is not None
         job = parse_config_string(_ONE_JOB.format(path=tmp_path), "").jobs[0]
@@ -804,7 +813,8 @@ async def test_cron_starts_job_api_and_injects_env(tmp_path):
 
 async def test_cron_jobapi_disabled(tmp_path):
     cron = Cron(None, config_yaml=_ONE_JOB.format(path=tmp_path))
-    await cron.start_stop_state(
+    await start_state(
+        cron,
         _state_cfg(
             "state:\n  path: {}\n  jobApi:\n    enabled: false\n".format(
                 tmp_path
@@ -828,7 +838,7 @@ async def test_end_to_end_real_subprocess(tmp_path):
     # the write lands in the backend. This is the one seam the other tests
     # split across the server, the CLI parser, and env injection.
     cron = Cron(None, config_yaml=_ONE_JOB.format(path=tmp_path))
-    await cron.start_stop_state(_state_cfg(_ONE_JOB.format(path=tmp_path)))
+    await start_state(cron, _state_cfg(_ONE_JOB.format(path=tmp_path)))
     try:
         job = parse_config_string(_ONE_JOB.format(path=tmp_path), "").jobs[0]
         token, env = await cron._prepare_job_api_run(job, None)
@@ -869,7 +879,7 @@ async def test_cli_subprocess_ignores_proxy_env(tmp_path):
     # daemon instead of shipping the bearer run token to an external proxy.
     # Nothing listens on the proxy address, so a proxied request would fail.
     cron = Cron(None, config_yaml=_ONE_JOB.format(path=tmp_path))
-    await cron.start_stop_state(_state_cfg(_ONE_JOB.format(path=tmp_path)))
+    await start_state(cron, _state_cfg(_ONE_JOB.format(path=tmp_path)))
     try:
         job = parse_config_string(_ONE_JOB.format(path=tmp_path), "").jobs[0]
         token, env = await cron._prepare_job_api_run(job, None)
@@ -921,7 +931,7 @@ async def test_job_command_invoking_cli_writes_state(tmp_path):
     # against the real frozen binary in .github/scripts/cli_job_smoke.sh.
     config = _ONE_JOB.format(path=tmp_path)
     cron = Cron(None, config_yaml=config)
-    await cron.start_stop_state(_state_cfg(config))
+    await start_state(cron, _state_cfg(config))
     try:
         command = '"{}" -m cronstable state set beats ok'.format(
             sys.executable
@@ -964,7 +974,7 @@ async def test_cron_stages_secrets(tmp_path):
         "    secrets:\n      - name: TOKEN\n        value: s3cr3t\n"
     ).format(path=tmp_path)
     cron = Cron(None, config_yaml=yaml)
-    await cron.start_stop_state(_state_cfg(yaml))
+    await start_state(cron, _state_cfg(yaml))
     try:
         job = parse_config_string(yaml, "").jobs[0]
         token, env = await cron._prepare_job_api_run(job, None)

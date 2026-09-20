@@ -4,7 +4,7 @@ This page covers the cronstable developer workflow (environment, tests, linters,
 
 ## Development environment
 
-The project targets **Python 3.10+**; 3.10, 3.11, 3.12, 3.13 and 3.14 are the tested interpreters (`pyproject.toml` `requires-python = ">=3.10"`, classifiers for 3.10 through 3.14).
+The project targets **Python 3.10+**; 3.10, 3.11, 3.12, 3.13, and 3.14 are the tested interpreters (`pyproject.toml` `requires-python = ">=3.10"`, classifiers for 3.10 through 3.14).
 
 You can run cronstable **natively on Windows, Linux, and macOS** (WSL is not required). `cronstable/platform.py` isolates all OS-specific behavior and guards `grp`/`pwd` instead of importing them unconditionally at load time on Windows, so the package and its full test suite run natively on every supported OS, and `pip install cronstable` works on Windows. For the platform-specific details, see [running on Windows](Running-on-Windows).
 
@@ -21,7 +21,7 @@ uv venv                                         # create .venv (uv picks a suita
 uv pip install -e ".[dev]"                      # editable install with the dev extra
 ```
 
-The classic virtualenv+pip path still works unchanged:
+To use Python's built-in `venv` module and pip, run:
 
 ```sh
 python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
@@ -50,7 +50,7 @@ tox -e py-posix    # POSIX hosts: the POSIX coverage profile explicitly
 
 Each interpreter row exists twice, once per OS coverage profile (see [per-OS coverage profiles](#per-os-coverage-profiles) later), and `tox.ini`'s `platform` key makes the arm that does not match the running OS skip. A skip counts as a pass as long as the invocation also names an arm that does match. An invocation whose only env skips exits 1.
 
-So a bare `tox` measures the profile for the machine you are on, and CI names both arms on every runner with `tox -e py-windows,py-posix`. Naming the single wrong arm for your box fails. On Windows, `tox -e py-posix` prints `py-posix: skipped because platform win32 does not match (?!win32).*` followed by `evaluation failed :(`.
+So a bare `tox` measures the profile for the machine you are on, and CI names both arms on every runner with `tox -e py-windows,py-posix`. Selecting only the environment for a different OS fails. On Windows, `tox -e py-posix` prints `py-posix: skipped because platform win32 does not match (?!win32).*` followed by `evaluation failed :(`.
 
 An unfactored env such as `tox -e py` or `tox -e py312` still runs the whole suite, at the POSIX profile. On Windows, use a bare `tox` or `tox -e py-windows` instead. The POSIX profile hides the Windows branches you are editing, and counts the POSIX ones you cannot run as missed against the same `--cov-fail-under`.
 
@@ -61,10 +61,12 @@ An unfactored env such as `tox -e py` or `tox -e py312` still runs the whole sui
 | `mypy` | yes | `mypy -p cronstable` |
 | `bandit` | no (`skip_install = true`) | `bandit -c pyproject.toml -r cronstable --severity-level=medium` |
 | `openapi` | no (`skip_install = true`) | `python .github/scripts/check_openapi.py` |
+| `mindeps` (opt-in) | yes (`-rrequirements_dev.txt -rrequirements_min.txt`) | `pytest` with the minimum dependency versions declared in `pyproject.toml`, pinned in the generated `requirements_min.txt` |
+| `deep` (opt-in) | yes | Hypothesis property tests with the `thorough` profile, followed by three full-suite runs with randomized test order |
 
 The interpreter rows carry two environment variables the others do not. `CRONSTABLE_COVERAGE_SKIP` picks the coverage profile, and `CRONSTABLE_COV_FLOOR` is the `--cov-fail-under` number, one per arm so the two cells can be ratcheted independently. The command line itself is deliberately not factor-conditional. A factored `commands` resolves to nothing in an unfactored env, so `tox -e py312` would build a venv, run no tests, and report success.
 
-`tox.ini` declares `requires = tox-uv`, so `tox` provisions its environments and installs dependencies with uv automatically (much faster; behavior-identical). If you ever need the legacy virtualenv+pip path, force it with `tox --runner virtualenv`.
+`tox.ini` declares `requires = tox-uv`, so `tox` provisions its environments and installs dependencies with uv automatically. To use virtualenv and pip instead, run `tox --runner virtualenv`.
 
 The `lint` and `bandit` envs deliberately skip installing the package. ruff and bandit analyze the source tree directly, so they avoid imposing the project's `requires-python` on those interpreters. The `mypy` env does install it, so the runtime dependencies resolve for real. The imports that legitimately cannot resolve (optional extras, untyped libraries) are enumerated per-module in `pyproject.toml`'s `[[tool.mypy.overrides]]` tables rather than blanket-ignored.
 
@@ -74,7 +76,9 @@ The `lint` and `bandit` envs deliberately skip installing the package. ruff and 
 
 - **ruff**: `target-version = "py310"`, `line-length = 79`. Lint rule sets selected: `B`, `B9` (bugbear), `C` (mccabe complexity), `E` (pycodestyle errors), `F` (pyflakes), `W` (pycodestyle warnings), `I` (import sorting). `pyupgrade` (`UP`) is present but commented out. `max-complexity = 20`.
 - **mypy**: `no_implicit_optional = true`, `warn_no_return = true`, `warn_return_any = true`, `strict_optional = true`.
-- **pytest**: `asyncio_mode = "auto"`, `testpaths = ["tests"]`.
+- **pytest**: `asyncio_mode = "auto"` and `testpaths = ["tests"]`. `filterwarnings = ["error", ...]` treats warnings as errors; each exception includes a reason. `timeout = 270` limits each test to 270 seconds and reports thread stacks on timeout. The run continues if the timeout mechanism supports recovery. `pytest-randomly` shuffles tests and prints the seed in the header. Use `-p randomly --randomly-seed=N` to reproduce the order or `-p no:randomly` to disable shuffling.
+- **Hypothesis**: `tests/conftest.py` registers the `ci` profile (150 examples) and the `thorough` profile (5,000 examples). Select a profile with `CRONSTABLE_HYPOTHESIS_PROFILE`.
+- **mutmut**: `[tool.mutmut]` selects modules and tests for the scheduled `nightly` workflow. Each job introduces small changes to one module and checks whether the tests detect them.
 - **bandit**: `exclude_dirs = ["tests"]` and `skips = ["B104"]` (B104's only matches are non-bind wildcard-listen host constants in `config.py`). CI runs it at medium severity with `tox -e bandit`.
 - **coverage**: `source = ["cronstable"]`, `branch = true`, `omit = ["cronstable/version.py"]`, `show_missing = true`, plus the `exclude_lines` block described next.
 
@@ -90,7 +94,7 @@ The `lint` and `bandit` envs deliberately skip installing the package. ruff and 
 
 There is more than one because a single vocabulary scored the wrong file on the Windows rows. Every Windows branch carried a bare pragma, so the code that really ran on those cells was invisible to `--cov-fail-under`, while the POSIX code that can never run there stayed in the denominator and counted as missed. Retagging `cronstable/platform.py` moves it from 149 measured statements at 69% to 250 at 87% on a Windows run, and changes nothing on Linux.
 
-Use the bare form only for code that no CI row can reach: defensive branches, unreachable raises, the etcd/kubernetes network glue, and `tui.py`'s macOS branch (the matrix has no macOS row, so a third token would have no profile to be measured in).
+Use the bare form only for code that no CI test can exercise, such as unreachable defensive branches. The POSIX profile also runs on macOS; don't exclude code solely because it is specific to macOS.
 
 A branch guarded by `IS_WINDOWS` or `sys.platform == "win32"` takes a token where its clause genuinely cannot run on the other OS, because it reaches for something that exists only there: `msvcrt`, `fcntl`, `grp`/`pwd`, `os.nice`, `os.killpg`, `ctypes.windll`. Where it does, the other side of the branch takes the other token.
 
@@ -104,9 +108,9 @@ One consequence to expect rather than diagnose: the merged Codecov number and th
 
 ### CI for every commit
 
-There is **one** workflow, `.github/workflows/release.yml` (named `CI`), and it runs on every `push` (any branch) and every `pull_request`. On an ordinary commit it builds and tests the whole product in parallel and stops there. Only a release (described later) proceeds to publish.
+The `.github/workflows/release.yml` workflow (named `CI`) runs on every `push` (any branch) and every `pull_request`. The separate `nightly` workflow runs scheduled checks. For ordinary commits, `CI` builds and tests the product in parallel. Only a release (described later) proceeds to publish.
 
-The test half is a `tox-static` job (`tox -e lint,mypy,bandit,openapi`) on `ubuntu-latest`, plus a `tox` matrix running `tox -e py-windows,py-posix` (`fail-fast: false`) across `os` `[ubuntu-latest, windows-latest]` × Python `3.10`–`3.14`. The matrix adds exactly two more rows: an experimental `ubuntu-latest`/`3.15` row (`continue-on-error`, never gates) and a `windows-11-arm`/`3.14` row for **Windows ARM64**. Both arms are named on every runner because the one that does not match the OS skips.
+The `tox-static` job runs `tox -e lint,mypy,bandit,openapi` on Ubuntu. The `tox` matrix runs Python 3.10–3.14 on Linux, Windows, and macOS. It also tests Linux ARM64 with Python 3.10 and 3.14, and Windows ARM64 with Python 3.14. Each runner selects both OS profiles with `tox -e py-windows,py-posix`; the profile that doesn't match the OS skips. Experimental Linux jobs test Python 3.15 and the free-threaded Python 3.14 build without blocking releases. Separate `tox-mindeps` and `backends-live` jobs check minimum dependency versions and real backend servers.
 
 Alongside the tests, the same run builds every release artifact at the computed version (all the PyInstaller binaries, the wheel + sdist) and does a **build-only pass over every Docker image** (the `docker` job, all 8 distros at their full published arch sets, no push), so a broken `Dockerfile` fails CI before a release. On an ordinary commit the version is the natural `setuptools_scm` dev version. No **software** is published, pushed, tagged, or signed. The lone exception is documentation: the `wiki` job publishes `wiki/` to the GitHub wiki whenever it changes on `main` (see [editing the wiki](#editing-the-wiki)). See [production and container deployment](Production-Deployment).
 
@@ -322,7 +326,7 @@ The image build passes the computed version with `--build-arg VERSION=X.Y.Z`. A 
 
 `pyinstaller/cronstable.spec` produces the self-contained binaries. The spec analyzes the entry script `pyinstaller/cronstable` (which calls `cronstable.__main__:main`) and by default emits a single-file console executable named `cronstable` with `upx=False`, `debug=False`, `console=True`, stripped on POSIX only (`STRIP = sys.platform != "win32"`; the GNU `strip` that ships with git bash corrupts the bundled PE DLLs). Setting `CRONSTABLE_BUNDLE=onedir` switches the same Analysis to `EXE(exclude_binaries=True)` plus `COLLECT`, emitting the one-directory `dist/cronstable/` layout the Windows zip and MSI assets carry. The default stays one-file because every other build lane consumes the single-file path. PyInstaller is **pinned to `6.22.1`** consistently across the release jobs and the local Dockerfile.
 
-Installing the package under `SETUPTOOLS_SCM_PRETEND_VERSION` before running PyInstaller bakes the version in, so the bundled `cronstable/version.py` carries the release version (verified by the `--version` smoke test). PyInstaller is not a cross-compiler, so each architecture/libc is built on a matching native runner or container.
+Installing the package under `SETUPTOOLS_SCM_PRETEND_VERSION` before running PyInstaller records the version, so the bundled `cronstable/version.py` carries the release version (verified by the `--version` smoke test). PyInstaller is not a cross-compiler, so each architecture/libc is built on a matching native runner or container.
 
 ### Building a binary locally
 

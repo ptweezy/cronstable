@@ -1,42 +1,28 @@
-"""A terminal (TUI) rendition of the cronstable web dashboard.
+"""Terminal dashboard for a running cronstable daemon.
 
-``cronstable tui`` opens a keyboard-driven control room in the terminal,
-talking to a running daemon over the same HTTP control API the web
-dashboard uses (``GET /jobs``, the SSE log streams, ``POST .../start``,
-and friends; see the HTTP-API wiki page).  It works against a local or
-remote daemon and needs nothing on the daemon side beyond the existing
-``web:`` listener.
+``cronstable tui`` uses the same HTTP control API as the web dashboard,
+including ``GET /jobs``, server-sent log events, and job control endpoints.
+It connects to a local or remote daemon with a configured ``web`` listener.
+See ``wiki/HTTP-API.md`` for the API reference.
 
-Design notes, in the spirit of the rest of the codebase:
+The terminal layer uses the standard library for raw mode, ANSI output,
+keyboard input, and themes. The HTTP client uses the existing ``aiohttp``
+dependency, imported only when needed to keep CLI startup fast.
 
-* No new dependencies.  The terminal layer (raw mode, ANSI painting,
-  key decoding, themes) is hand-rolled on the stdlib, exactly as the MCP
-  server hand-rolls JSON-RPC; the HTTP/SSE client rides the core
-  ``aiohttp`` dependency the daemon already carries.  ``aiohttp`` is
-  imported lazily so registering the subcommand keeps ``cronstable
-  --help`` (and the other thin CLIs) fast.
-* Keyboard parity with the web dashboard.  The web page's shortcut
-  map is mirrored key for key (``j``/``k``, ``Enter``, ``r``/``x``,
-  ``g``/``t``/``T``/``i``/``w``/``a``, ``/``, ``?``, ``Ctrl-K``
-  palette, ``Esc`` close-priority), including its guard semantics: list
-  keys are suppressed while an overlay is open or a text field is
-  focused, and modifier chords fall through.  Terminal-only additions
-  (drawer tab switching, ``q`` to quit, sort/filter cycling) are grouped
-  separately in the ``?`` overlay so the shared muscle memory stays
-  honest.
-* Same client semantics as the page.  The status classifier, sort
-  order, failure-verdict correlation, palette fuzzy scoring, and the
-  plain-English schedule text are line-for-line ports of the web UI's
-  client-side logic, so both frontends always agree on what they say.
-* Windows and POSIX alike.  Key input uses ``termios`` +
-  ``loop.add_reader`` on POSIX and an ``msvcrt`` reader thread on
-  Windows (the Proactor loop cannot watch stdin); ANSI output is enabled
-  on Windows via ``SetConsoleMode``.  All of it follows the
-  ``sys.platform`` guard idiom from :mod:`cronstable.platform`.
+Keyboard shortcuts match the web dashboard. Overlays and text fields
+suppress list shortcuts, and modified key combinations pass through.
+Terminal-specific shortcuts, such as ``q`` to quit and keys for switching
+drawer tabs, appear separately in the keyboard help.
 
-The module is deliberately one file, like the web dashboard it mirrors
-(one self-contained ``index.html``): sections below are ordered
-utilities -> terminal engine -> API client -> views -> app -> CLI.
+Status classification, sorting, failure correlation, command matching,
+and schedule descriptions follow the web dashboard's behavior.
+
+On POSIX, keyboard input uses ``termios`` and ``loop.add_reader``. On
+Windows, it uses an ``msvcrt`` reader thread because the Proactor event
+loop cannot watch stdin. ``SetConsoleMode`` enables ANSI output on Windows.
+
+The module contains utilities, the terminal engine, the API client, views,
+the application, and CLI handling, in that order.
 """
 
 import asyncio
@@ -383,7 +369,7 @@ OUTCOME_KEY = {
     "unknown": "unknown",
     "skipped": "skipped",
 }
-#: Theme colour for each key ``outcome_key`` can return. "skipped" takes
+#: Theme color for each key ``outcome_key`` can return. "skipped" takes
 #: the neutral "off" ink the web gives it, never "ok".
 OUTCOME_COLOR = {
     "ok": "ok",
@@ -393,7 +379,7 @@ OUTCOME_COLOR = {
     "skipped": "off",
 }
 
-#: Theme colour for each key :func:`health` can return, shared by the jobs
+#: Theme color for each key :func:`health` can return, shared by the jobs
 #: table, the wallboard tiles and the job drawer header.  The
 #: :data:`OUTCOME_KEY` lesson again: three hand-rolled copies of this dict
 #: used to live inline in those panels, one drifted arm away from a job
@@ -448,7 +434,7 @@ def outcome_key(outcome: Optional[str]) -> str:
     return OUTCOME_KEY.get(outcome or "", "ok")
 
 
-#: Theme colour for each DAG run/task state, the port of the web page's
+#: Theme color for each DAG run/task state, the port of the web page's
 #: ``dstVar``.  An explicit map over dag.py's state vocabulary (plus the
 #: run-level "scheduled"), replacing a spelling-guess ladder that handled
 #: six strings the engine never emits while ``upstream_failed`` (a failure
@@ -478,7 +464,7 @@ DAG_STATE_COLOR = {
 
 
 def outcome_color(outcome: Optional[str]) -> str:
-    """Theme colour key for a run outcome, via :func:`outcome_key`."""
+    """Theme color key for a run outcome, via :func:`outcome_key`."""
     return OUTCOME_COLOR[outcome_key(outcome)]
 
 
@@ -915,9 +901,9 @@ _P = {
     },
 }
 
-#: Colour-vision remaps (web "color vision" setting): status colours are
+#: Color-vision remaps (web "color vision" setting): status colors are
 #: re-inked so ok/fail/pending stay apart for red-green (deutan) and
-#: blue-yellow (tritan) colour blindness; glyph shapes differ regardless.
+#: blue-yellow (tritan) color blindness; glyph shapes differ regardless.
 _CVD = {
     "none": {},
     "deutan": {"ok": "#4aa8ff", "fail": "#ffb000", "pending": "#c8c8c8"},
@@ -927,7 +913,7 @@ CVD_MODES = ["none", "deutan", "tritan"]
 
 
 class Theme:
-    """One resolved theme: named colours -> ready-made SGR fragments."""
+    """One resolved theme: named colors -> ready-made SGR fragments."""
 
     def __init__(self, hue: str, light: bool, cvd: str = "none") -> None:
         self.hue = hue if hue in THEME_HUES else DEFAULT_THEME_HUE
@@ -1021,7 +1007,7 @@ _ANSI_RE = re.compile(
 )
 
 #: The 8-bit C1 controls: one-byte aliases of the ESC-introduced
-#: sequences (\u009b is CSI, \u009d is OSC), honoured by terminals that
+#: sequences (\u009b is CSI, \u009d is OSC), honored by terminals that
 #: interpret C1 in UTF-8 mode, so they die wherever their ESC forms do.
 _C1_RE = re.compile(r"[\u0080-\u009f]")
 
@@ -1041,7 +1027,7 @@ def scrub_non_sgr(text: str) -> str:
     under clustering from *other machines* over gossip) are painted to
     the live terminal, so anything that could move the cursor, retitle
     the window, or write the clipboard (OSC 52) must never survive into
-    a frame; the painter's own SGR colours do.  The C1 range needs no
+    a frame; the painter's own SGR colors do.  The C1 range needs no
     ESC introducer, so it is dropped outright.
     """
     if text.isprintable():
@@ -1295,9 +1281,9 @@ def _rewrite_sgr_token(token: str, theme: Theme) -> str:
 
 
 def rewrite_sgr(line: str, theme: Theme) -> str:
-    """Translate a log line's SGR colours into theme colours.
+    """Translate a log line's SGR colors into theme colors.
 
-    Bold/dim/reset survive; the 16-colour and 256/truecolour foregrounds
+    Bold/dim/reset survive; the 16-color and 256/truecolour foregrounds
     are mapped onto the theme's log palette (background requests are
     dropped: the TUI owns the background).  All non-SGR escapes are
     stripped. Each theme caches nonempty SGR rewrites within its entry
@@ -1313,7 +1299,7 @@ def rewrite_sgr(line: str, theme: Theme) -> str:
 def sparkline(history: list[dict[str, Any]], width: int = 10) -> str:
     """Recent-run sparkline: bar height = relative duration, one bar per
     run, oldest first (the terminal cousin of the web SVG sparkline).
-    Returns a plain string; the caller colours per-bar via
+    Returns a plain string; the caller colors per-bar via
     :func:`spark_cells`.
     """
     return "".join(ch for ch, _ in spark_cells(history, width))
@@ -1332,7 +1318,7 @@ WEEK_FREQ_MAX = 56
 def spark_cells(
     history: list[dict[str, Any]], width: int = 10
 ) -> list[tuple[str, str]]:
-    """``(bar-char, health-colour-key)`` cells for the recent-run tail."""
+    """``(bar-char, health-color-key)`` cells for the recent-run tail."""
     tail = history[-width:] if history else []
     durations = [
         float(r["duration"]) for r in tail if r.get("duration") is not None
@@ -1354,7 +1340,7 @@ def spark_cells(
 
 
 def colour_runs(cells: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    """Merge neighbouring cells that share a colour key into ``(text,
+    """Merge neighbouring cells that share a color key into ``(text,
     key)`` runs.
 
     A ten-bar spark whose history is all green is one span, not ten: the
@@ -1386,7 +1372,7 @@ def colour_runs(cells: list[tuple[str, str]]) -> list[tuple[str, str]]:
 PREF_DEFAULTS: dict[str, Any] = {
     "theme": DEFAULT_THEME_HUE,  # hue
     "light": False,  # dark vs paper (light)
-    "cvd": "none",  # colour-vision remap
+    "cvd": "none",  # color-vision remap
     "poll_ms": DEFAULT_POLL_MS,
     "wrap": False,  # log line wrap
     "timestamps": False,  # per-line log timestamps
@@ -3895,7 +3881,7 @@ class App:
 
     @staticmethod
     def _dag_state_color(state: str) -> str:
-        """Theme colour key for a DAG run/task state string.
+        """Theme color key for a DAG run/task state string.
 
         Reads the explicit :data:`DAG_STATE_COLOR` port of the web page's
         ``dstVar``; anything outside the known vocabulary paints "dim",
@@ -4459,7 +4445,7 @@ class AppPalette(AppActions):
             ("◴", "Schedule preview", lambda: self.open("sandbox")),
             ("▮", "Toggle startup checks", self._toggle_boot),
             ("❏", "Copy version", lambda: self._copy_chip(self.version)),
-            ("❏", "Copy job set id", lambda: self._copy_chip(self.job_set_id)),
+            ("❏", "Copy job-set ID", lambda: self._copy_chip(self.job_set_id)),
             ("⚙", "Open settings", lambda: self.open("settings")),
             ("?", "Keyboard shortcuts", lambda: self.open("help")),
             ("⚿", "Set access token", self._open_token),
@@ -6546,7 +6532,8 @@ class AppOverlays(AppRender):
         else:
             body.append(
                 paint.style(
-                    " type a cron expression — e.g. */5 9-17 * * mon-fri",
+                    " enter a cron expression, for example: "
+                    "*/5 9-17 * * mon-fri",
                     "dim",
                 )
             )
@@ -6809,7 +6796,7 @@ class AppOverlays(AppRender):
                 ("expiry", "expires"),
                 ("fence", "fence"),
                 ("electionName", "election"),
-                ("identity", "our identity"),
+                ("identity", "node identity"),
                 ("path", "store path"),
             ]
             for key, label in labels:
@@ -8011,7 +7998,7 @@ class AppDrawers(AppOverlays):
         if resolved and resolved != schedule:
             rows.append(" " + paint.style("resolves to %s" % resolved, "dim"))
         rows.append(paint.style("", "fg"))
-        rows.append(paint.style(" timezone: %s" % frame, "dim"))
+        rows.append(paint.style(" time zone: %s" % frame, "dim"))
         if fires:
             rows.append(paint.style("", "fg"))
             rows.append(paint.style(" next runs:", "dim"))
@@ -8325,7 +8312,9 @@ class AppDrawers(AppOverlays):
         rows: list[str] = []
         if not self.dag_run_key:
             rows.append(
-                paint.style("  open a run first (runs tab, enter)", "dim")
+                paint.style(
+                    "  select a run in the Runs tab and press Enter", "dim"
+                )
             )
             return rows
         rows.append(paint.style(" run %s" % self.dag_run_key, "dim"))
@@ -8375,7 +8364,11 @@ class AppDrawers(AppOverlays):
     ) -> list[str]:
         data = self.dag_xcom
         if not self.dag_run_key:
-            return [paint.style("  open a run first (runs tab, enter)", "dim")]
+            return [
+                paint.style(
+                    "  select a run in the Runs tab and press Enter", "dim"
+                )
+            ]
         if data is None:
             return [paint.style("  loading task outputs…", "dim")]
         entries = data.get("xcom") if isinstance(data, dict) else None
@@ -8408,7 +8401,9 @@ class AppDrawers(AppOverlays):
         if tail is None:
             return [
                 paint.style(
-                    "  pick a task (tasks tab, enter) to read its log", "dim"
+                    "  to read logs, select a task in the Tasks tab "
+                    "and press Enter",
+                    "dim",
                 )
             ]
         rows = [paint.style(" task: %s" % tail.label, "dim")]
@@ -8650,7 +8645,7 @@ class TuiApp(AppDrawers):
             verdictline = (
                 " ALL CHECKS PASSED"
                 if ok and not failing
-                else " %d JOB%s FAILING — the board wants you"
+                else " %d JOB%s FAILING — review failing jobs"
                 % (failing, "S" if failing != 1 else "")
                 if ok
                 else " DISCONNECTED — server unreachable"
@@ -8741,8 +8736,8 @@ def _resolve_tls(args: Any) -> Optional["ssl.SSLContext"]:
         # connection, including whatever is impersonating the daemon.
         # stderr keeps it out of anything piping the TUI's stdout.
         print(
-            "warning: --insecure disables certificate verification; the "
-            "bearer token is still sent, so it reaches whoever answers",
+            "warning: --insecure disables TLS certificate verification; "
+            "this can expose the bearer token to an untrusted server",
             file=sys.stderr,
         )
     try:

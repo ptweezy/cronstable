@@ -8,7 +8,10 @@ from tests._configs import job_yaml
 from tests._cron_helpers import (
     fixed_current_time,  # noqa: F401
 )
-from tests._helpers import _state_cfg
+from tests._helpers import (
+    _state_cfg,
+    start_state,
+)
 
 # ---------------------------------------------------------------------------
 # Cluster concurrency slot leasing.
@@ -940,11 +943,12 @@ async def test_slotlease_respelled_same_store_keeps_slots(
         "state:\n  path: {}\n  deploymentId: default\n".format(tmp_path),
         "state:\n  path: {}\n  maxRunsPerJob: 200\n".format(respelled),
     ):
-        await cron.start_stop_state(_state_cfg(section))
+        await start_state(cron, _state_cfg(section))
         assert cron.state_backend is not None
         assert "s" in cron._slot_leases and not renewer.done()
     assert "stays in the previous state store" not in caplog.text
-    await cron.start_stop_state(
+    await start_state(
+        cron,
         _state_cfg("state:\n  path: {}\n".format(tmp_path / "moved"))
     )
     assert cron._slot_leases == {} and cron._slot_renewers == {}
@@ -976,7 +980,8 @@ async def test_slotlease_store_change_while_down_drops_slots(
         raise OSError("mount gone")
 
     monkeypatch.setattr(cronstable.cron, "make_state_backend", _down)
-    await cron.start_stop_state(
+    await start_state(
+        cron,
         _state_cfg(
             "state:\n  path: {}\n  maxRunsPerJob: 200\n".format(tmp_path)
         )
@@ -990,7 +995,7 @@ async def test_slotlease_store_change_while_down_drops_slots(
         if removed
         else _state_cfg("state:\n  path: {}\n".format(tmp_path / "moved"))
     )
-    await cron.start_stop_state(target)
+    await start_state(cron, target)
     assert (cron.state_backend is None) is removed
     assert cron._slot_leases == {} and cron._slot_renewers == {}
     await asyncio.sleep(0)

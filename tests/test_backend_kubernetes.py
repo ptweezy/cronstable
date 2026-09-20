@@ -1,11 +1,12 @@
-"""Unit tests for the Kubernetes Lease backend.
+"""Test Kubernetes Lease leadership without an API server.
 
-No apiserver: the pure decision helpers and the locally-computed leader/quorum
-state run directly, and the lifecycle around them (start, the renew loop, the
-round, the teardown that hands the Lease back) runs over an in-memory
-``_K8sTransport``.  The two real transports perform the calls and load
-credentials: they are ``# pragma: no cover``, exercised by the Docker
-integration tests.
+Test decision helpers and locally computed leadership and quorum state
+directly. Lifecycle tests use an in-memory ``_K8sTransport`` for startup,
+renewal, election rounds, and lease release.
+``tests/test_backend_kubernetes_transport.py`` tests the HTTP transport
+against a fake API server over a socket.
+``tests/test_backend_kubernetes_library.py`` tests the library transport
+with a fake ``kubernetes`` package.
 """
 
 import asyncio
@@ -860,8 +861,8 @@ def test_http_load_kubeconfig_yaml_errors_become_configerror(tmp_path):
 # A minimal in-memory "apiserver" Lease object with the optimistic-concurrency
 # semantics the fence relies on: create fails (409) if the object exists, and
 # replace fails (409) on a stale resourceVersion. This exercises the actual
-# write()->fence path the production transports drive, which is otherwise only
-# covered by (absent) Docker integration tests.
+# write()->fence path the production transports drive. The same fence runs
+# through HTTP in tests/test_backend_kubernetes_transport.py.
 
 
 class _StoreNotFound(Exception):

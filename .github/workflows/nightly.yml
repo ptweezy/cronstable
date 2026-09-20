@@ -1,0 +1,109 @@
+# Run extended checks on main without blocking commits. release.yml
+# contains the required checks.
+#
+# - deep: Run Hypothesis with the thorough profile, which generates about
+#   30 times as many examples as required CI runs. Then run the full suite
+#   three times with randomized test order; see the deep environment in tox.ini.
+# - devmode: Run the suite with PYTHONDEVMODE=1 to enable asyncio diagnostics
+#   and allocation tracebacks for ResourceWarning messages.
+# - mutation: Introduce small code changes with mutmut, one module per job,
+#   and check whether the tests detect them. Upload undetected mutations
+#   and include counts in each job summary.
+#
+# Each job installs the latest compatible dependencies. Scheduled runs can
+# therefore detect breaking dependency changes before the next push.
+
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  deep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
+      - run: pip install tox tox-uv
+      # Install Chromium so the browser suites run instead of skipping.
+      # Use the same installation as release.yml.
+      - name: Install Chromium
+        run: |
+          set -euo pipefail
+          pip install "$(grep -E '^playwright' requirements_dev.txt)"
+          python -m playwright install --with-deps chromium
+      - run: tox -e deep
+
+  devmode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PYTHONDEVMODE: '1'
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
+      - run: pip install -e . -r requirements_dev.txt
+      # Allow twice the usual timeout for Python development mode.
+      - run: python -m pytest -q --timeout=540 -o faulthandler_timeout=600
+
+  mutation:
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - cronexpr
+          - crontabs
+          - redact
+          - ical
+          - _json
+          - fingerprint
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
+      - run: pip install -e . -r requirements_dev.txt mutmut
+      # [tool.mutmut] in pyproject.toml selects the sources and tests.
+      # Limit this job to mutations in one module.
+      - name: Mutate cronstable.${{ matrix.module }}
+        run: |
+          set -euo pipefail
+          python -m mutmut run --max-children 4 \
+            "cronstable.${{ matrix.module }}*" > mutmut-run.log 2>&1 || true
+          tail -c 2000 mutmut-run.log | tr '\r' '\n' | tail -n 5
+          python -m mutmut results > "mutation-${{ matrix.module }}.txt"
+          python -m mutmut export-cicd-stats
+      - name: Summarize
+        run: |
+          python - "${{ matrix.module }}" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import json
+          import sys
+
+          stats = json.load(open("mutants/mutmut-cicd-stats.json"))
+          print("### cronstable.{}".format(sys.argv[1]))
+          print("| killed | survived | timeout | no tests | total |")
+          print("|---|---|---|---|---|")
+          print("| {killed} | {survived} | {timeout} | {no_tests} | {total} |".format(**stats))
+          EOF
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: mutation-${{ matrix.module }}
+          path: mutation-${{ matrix.module }}.txt
+          if-no-files-found: error
+          retention-days: 30

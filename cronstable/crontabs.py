@@ -1,13 +1,10 @@
 r"""Classic (Vixie-style) crontab support.
 
-cronstable's native configuration is YAML, but plenty of perfectly good
-schedules already exist as plain crontabs.  This module accepts that
-format: it recognises crontab files (:func:`is_crontab_path`,
-:func:`looks_like_crontab`) and lowers each entry into the same plain job
-dictionaries the YAML front end produces (:func:`parse_crontab`), so
-everything downstream -- defaults merging, validation, scheduling,
-concurrency, reporting, the web API and clustering -- treats a legacy
-crontab job exactly like a YAML one.
+This module recognizes crontab files through :func:`is_crontab_path` and
+:func:`looks_like_crontab`. :func:`parse_crontab` converts each entry to
+the same job dictionaries as the YAML loader. Default merging, validation,
+scheduling, concurrency, reporting, the web API, and clustering then
+process crontab and YAML jobs in the same way.
 
 The accepted syntax follows ``man 5 crontab`` (user crontabs):
 
@@ -21,12 +18,11 @@ The accepted syntax follows ``man 5 crontab`` (user crontabs):
   ``@weekly`` / ``@daily`` / ``@midnight`` / ``@hourly`` nicknames;
 * ``\%`` in the command as an escaped literal percent sign.
 
-Everything *around* the schedule deliberately gets cronstable's standard
-defaults rather than an emulation of cron's environment: schedules run in
-UTC unless ``CRON_TZ`` says otherwise, failure is detected from stderr
-output and exit status instead of mailed via ``MAILTO``, and the
-``%``-as-stdin feature is refused rather than half-imitated.  See the
-"Classic crontabs" documentation for the full list of deviations.
+Imported jobs use cronstable's defaults. Schedules run in UTC unless
+``CRON_TZ`` specifies another zone, and stderr output and exit status
+determine failure. The loader does not support ``MAILTO`` notifications
+or the use of ``%`` to provide stdin. See ``wiki/Classic-Crontabs.md``
+for the full list of differences.
 """
 
 import logging
@@ -93,7 +89,7 @@ _ENV_LINE = re.compile(
 # escape the scheduler; the others are exactly the ``str.splitlines()``
 # family that renders as ONE line in an editor, ``cat``, ``git diff`` and a
 # code review -- silently truncating a command or smuggling a job into a
-# comment if honoured as separators, and confusing the shell if passed
+# comment if honored as separators, and confusing the shell if passed
 # through.  Refusing with a file:line error follows the module's documented
 # bias: refuse rather than half-imitate.
 # Built from explicit code points rather than literal ``x-y`` ranges: a

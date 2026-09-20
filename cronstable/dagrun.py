@@ -514,7 +514,7 @@ class DagScheduler:
                 del self._locks[ref]
         candidates = [self._next_sched_check]
         # A hint whose advance is in flight is stale by construction (the pass
-        # rewrites it on the way out), so it is polled rather than honoured as
+        # rewrites it on the way out), so it is polled rather than honored as
         # due -- see ADVANCE_POLL_FLOOR.
         poll_floor = now + ADVANCE_POLL_FLOOR
         for ref, hint in self._wake.items():
@@ -657,7 +657,7 @@ class DagScheduler:
             # replay loop below would fire a backdated run per missed
             # occurrence (per-pass capped, but every pass immediately due
             # again until the whole gap is drained) regardless of onMissed.
-            # Only the one-time boot seed honoured that policy; a mid-life
+            # Only the one-time boot seed honored that policy; a mid-life
             # gap must too, or a laptop resume unleashes the exact stampede
             # DAG_MAX_CATCHUP's cap claims to prevent.
             await self._fire_past_gap(dagcfg, stale, now_dt)
@@ -3095,7 +3095,7 @@ class DagScheduler:
         """One list_documents sweep: rebuild the cache from every body. Used
         for the cold cache / large-delta case and when the backend cannot list
         keys only. Returns None on a hiccup, matching the old degrade
-        behaviour."""
+        behavior."""
         gen = self._summaries_gen
         try:
             docs = await asyncio.wait_for(

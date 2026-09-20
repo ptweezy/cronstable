@@ -21,6 +21,7 @@ from tests._cron_helpers import (
     fixed_current_time,  # noqa: F401
 )
 from tests._helpers import (
+    start_state,
     _drain_state_writes,
     _state_cfg,
     _wait_until,
@@ -2450,7 +2451,8 @@ async def test_webloop_run_shutdown_teardown(tmp_path, monkeypatch, run_cron):
     # sleep, then inject the teardown-path fixtures.
     await asyncio.sleep(0.2)
 
-    await cron.start_stop_state(
+    await start_state(
+        cron,
         _state_cfg("state:\n  path: {}\n".format(tmp_path))
     )
     assert cron.state_backend is not None

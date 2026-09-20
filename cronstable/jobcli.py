@@ -1,23 +1,20 @@
-"""The job-facing state CLI: `cronstable state|cursor|lock|artifact|...`.
+"""Job state commands: ``cronstable state|cursor|lock|artifact|...``.
 
-These are the commands a job command line reaches for -- durable KV, an ETL
-cursor, a distributed lock, the artifact store, idempotency keys, run-scoped
-secrets.  Each is a thin client of the loopback endpoint the daemon injected
-into the job's environment (:mod:`cronstable.jobapi`): it reads the injected
-``CRONSTABLE_STATE_URL`` / ``CRONSTABLE_STATE_TOKEN`` and speaks HTTP over
-stdlib ``urllib`` (no aiohttp, no event loop, so the command starts instantly).
+Jobs use these commands to access durable key-value storage, processing
+cursors, distributed locks, artifacts, idempotency keys, and run-scoped
+secrets. Each command reads ``CRONSTABLE_STATE_URL`` and
+``CRONSTABLE_STATE_TOKEN`` from the job's environment and calls the
+loopback API (:mod:`cronstable.jobapi`) through the standard library's
+``urllib`` module. The client needs neither aiohttp nor an event loop.
 
-They coexist with the ``cronstable state`` *admin* commands (backup / restore /
-gc / check ...): the admin actions operate on the store file tree offline via
-``-c``, while these job-facing actions (get / set / delete / keys, and the
-other verbs) act through the running daemon.  ``cronstable.__main__`` routes by
-action name, so ``cronstable state check`` and ``cronstable state get KEY``
-reach the right handler.
+These commands use a running daemon. The ``cronstable state`` admin
+commands, such as ``backup``, ``restore``, ``gc``, and ``check``, operate
+directly on the store configured with ``-c``.
+``cronstable.__main__`` selects the handler by action name.
 
-The default *scope* every KV / cursor / artifact / lock call lands in is the
-calling job's own name (the daemon fills it from the run's identity), so one
-job cannot read another's keys by accident; ``--global`` (or ``--scope NAME``)
-opts into a shared namespace for deliberate cross-job coordination.
+The default scope for key-value, cursor, artifact, and lock operations is
+the calling job's name. To coordinate across jobs, use ``--global`` or
+``--scope NAME`` to select a shared namespace.
 """
 
 import argparse
@@ -200,7 +197,9 @@ def _http(
         with _opener().open(req, timeout=timeout) as resp:  # noqa: S310
             return resp.status, dict(resp.headers), resp.read()
     except urllib.error.HTTPError as ex:
-        return ex.code, dict(ex.headers or {}), ex.read()
+        # HTTPError holds the response. Close it to release the connection.
+        with ex:
+            return ex.code, dict(ex.headers or {}), ex.read()
     except urllib.error.URLError as ex:
         # A handshake failure arrives here WRAPPED: urllib turns the OSError
         # the TLS layer raised into a URLError, so this cannot be a separate

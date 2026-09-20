@@ -1,38 +1,33 @@
-"""Human-facing schedule intelligence, shared by every surface.
+"""Schedule descriptions and analysis shared by the CLI, API, and dashboards.
 
-Plain-English descriptions (:func:`describe_cron`), fire previews
-(:func:`next_fires`) and the advisory schedule linter
-(:func:`lint_schedule`) in one importable module, so the TUI, the daemon's
-``GET /schedule/preview`` endpoint and any future MCP tool all agree with
-the engine that actually schedules (:mod:`cronstable.cronexpr`) instead of
-re-implementing the arithmetic.  The TUI re-exports the names it always
-had, so ``cronstable.tui.describe_cron`` keeps working.
+:func:`describe_cron` describes schedules in plain English,
+:func:`next_fires` previews run times, and :func:`lint_schedule` reports
+potential problems. They use :mod:`cronstable.cronexpr`, the scheduler's
+expression engine, so each interface produces consistent results. The TUI
+re-exports its existing public names, including
+``cronstable.tui.describe_cron``.
 
-The describers are deliberately tolerant: text the engine rejects degrades
-to a "Custom schedule" phrase rather than raising, because the TUI renders
-them while the user is still typing.  The linter is the opposite: it
-assumes the expression already parses and reports advisory
-:class:`Finding` rows for legal schedules that probably do not mean what
-they say (level ``"warning"``) or behave in a way worth knowing about
-(level ``"note"``).  Config loading logs the findings per job and the
-status payloads carry them to the dashboards.
+Descriptions fall back to "Custom schedule" for invalid expressions so the
+TUI can display them while you type. The linter requires a valid expression
+and returns :class:`Finding` objects: ``warning`` for a probable mistake,
+or ``note`` for behavior to consider. Configuration loading logs findings
+for each job, and status responses include them for the dashboards.
 
-:func:`why_no_run` is the linter's sibling for one instant instead of
-the whole schedule: it decomposes the engine's own :meth:`CronTab.test`
-into a per-field verdict ("minute matched; day-of-week Tuesday is not in
-Monday and Friday"), so "why didn't it run at 09:00?" gets answered from
-ground truth.  The daemon serves it per job as ``GET /schedule/why`` and
-the MCP server as the ``cron_why_no_run`` tool.
+:func:`why_no_run` checks one timestamp against each schedule field using
+:meth:`CronTab.test`. For example, it can explain why a schedule didn't
+match at 09:00. The daemon exposes it as ``GET /schedule/why`` and the MCP
+server exposes it as ``cron_why_no_run``.
 
-The fleet-level analyzers live here too, one :class:`ScheduleEntry` row
-per scheduled job: :func:`schedule_pressure` (every fire over the next
-24 hours, bucketed into an hour by minute collision grid),
-:func:`duplicate_schedules` (groups of jobs whose schedules fire on the
-identical instants, via the engine's semantic equality) and
-:func:`suggest_slot` (the least-loaded minute or hour:minute for a new
-job).  The daemon serves them as ``GET /schedule/pressure``,
-``/schedule/duplicates`` and ``/schedule/suggest``; the TUI computes the
-same payloads locally from its ``/jobs`` snapshot.
+Fleet analysis uses one :class:`ScheduleEntry` per scheduled job:
+
+* :func:`schedule_pressure` groups upcoming runs by hour and minute.
+* :func:`duplicate_schedules` groups schedules that match the same times.
+* :func:`suggest_slot` finds a minute or hour and minute with the fewest
+  scheduled runs for a new job.
+
+The daemon serves these results at ``GET /schedule/pressure``,
+``/schedule/duplicates``, and ``/schedule/suggest``. The TUI computes the
+same results locally from its ``/jobs`` snapshot.
 """
 
 import datetime
@@ -534,7 +529,7 @@ class Finding(NamedTuple):
 
     #: stable machine identifier, kebab-case (dashboards key styling on it)
     code: str
-    #: ``"warning"`` (probable mistake) or ``"note"`` (behaviour worth
+    #: ``"warning"`` (probable mistake) or ``"note"`` (behavior worth
     #: knowing about)
     level: str
     #: one line of plain text, self-contained enough for a log line
@@ -672,7 +667,7 @@ def _never_fires_message(tab: CronTab) -> str:
 
 
 def _lint_day_fields(tab: CronTab) -> list[Finding]:
-    """Both day fields restricted: the AND-semantics footgun.
+    """Warn when both day fields are restricted under AND matching.
 
     This dialect requires a day to satisfy BOTH fields (deliberately, see
     cronexpr), while classic Vixie cron fires when EITHER matches, so a
@@ -1483,7 +1478,7 @@ def _fire_cells(
     civil (hour, minute) label, the per-cell job names (capped at
     ``_NAME_CAP``), and the set of jobs firing at each minute-of-hour.
     Enumerates real instants through the engine's own
-    :meth:`CronTab.occurrences`, so DST behaviour matches the scheduler:
+    :meth:`CronTab.occurrences`, so DST behavior matches the scheduler:
     on a fall-back day both real fires of a repeated wall time land in
     (and truthfully double-count at) the same cell.
 

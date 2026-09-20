@@ -130,7 +130,7 @@ is inserted between the top and bottom halves:
 ```
 
 where `N` is the number of discarded lines. The marker is only present when
-discards occurred and when the bottom buffer is non-empty.
+discards occurred and when the bottom buffer is nonempty.
 
 ### saveLimit = 0
 
@@ -158,7 +158,7 @@ re-emitted, and is **not** counted as a discarded line.
 
 The `producesStdout` and `producesStderr` checks in `failsWhen` (see
 [failure detection and retries](Failure-Detection-and-Retries)) consider a
-stream non-empty if it has **either** retained output **or** a non-zero discard
+stream nonempty if it has **either** retained output **or** a nonzero discard
 count.
 
 Consequently, output that was produced but discarded (including all output when

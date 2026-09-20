@@ -30,7 +30,10 @@ from cronstable.cron import (
 from cronstable.job import JobOutputStream, JobRetryState
 from cronstable.resources import ResourceUsage
 from cronstable.state import Lease
-from tests._helpers import _state_cfg
+from tests._helpers import (
+    _state_cfg,
+    start_state,
+)
 from tests.conftest import Req, _cron
 
 _UTC = datetime.timezone.utc
@@ -197,7 +200,7 @@ async def _make_cron(tmp_path, dags_yaml):
     ) + dags_yaml
     cron = Cron(None, config_yaml=cfg)
     cron.web_config = {}
-    await cron.start_stop_state(_state_cfg(cfg))
+    await start_state(cron, _state_cfg(cfg))
     return cron
 
 

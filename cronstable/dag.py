@@ -1420,7 +1420,7 @@ def _maybe_terminalise(spec, body, now, result) -> None:
 
 # Per-entry verdicts of the pre-scan.  ACT: this pass could change the entry,
 # or the scan cannot prove it will not (any doubt lands here; the only cost
-# is running the full pass, which is exactly the pre-scan-less behaviour).
+# is running the full pass, which is exactly the pre-scan-less behavior).
 # BLOCKED: the entry is provably inert this pass AND its non-terminal state
 # is consulted by _maybe_terminalise, so the run provably cannot terminalise
 # either.  INERT: the entry is inert but does not hold the run open (a
@@ -1464,7 +1464,7 @@ def _is_quiescent(
     * any running entry is claimed under a FOREIGN proc token (the
       reconcile half may recover it; an entry holding OUR token is left
       alone by reconcile and claim alike);
-    * any entry is in a state this scan does not recognise, belongs to a
+    * any entry is in a state this scan does not recognize, belongs to a
       task no longer in the spec, or cannot be positively matched to a slot
       :func:`_maybe_terminalise` consults;
     * no consulted non-terminal entry exists at all (the run could
@@ -1529,7 +1529,7 @@ def _entry_quiescence(
     if state == EXPANDED:
         if task.expand is None and not (mapped_all and task_id in mapped_all):
             # marked expanded with no recorded fan-out to stand in for it:
-            # a shape this scan does not recognise; the full pass owns it.
+            # a shape this scan does not recognize; the full pass owns it.
             return _Q_ACT
         # the recorded instances carry the real state (even if the spec
         # stopped mapping the task since: dispatch and terminalisation key
@@ -1560,7 +1560,7 @@ def _entry_quiescence(
         if task.type != SENSOR or entry.get("pid") is not None:
             # a proc-less RUNNING entry is only ever a sensor idling
             # between pokes (see reconcile_crashed); anything else here is
-            # a shape this scan does not recognise.
+            # a shape this scan does not recognize.
             return _Q_ACT
         next_poke = entry.get("nextPokeAt")
         if next_poke is None:
@@ -1586,7 +1586,7 @@ def _entry_quiescence(
         if _deps_verdict(spec, body, task) == "wait":
             return _q_blocked(mapped_all, task, taskkey, entry)
     # PENDING and claimable/propagatable, or a state this build does not
-    # recognise.
+    # recognize.
     return _Q_ACT
 
 

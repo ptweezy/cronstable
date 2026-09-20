@@ -81,9 +81,9 @@ rather than looking unresponsive.
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--name NAME` | `cronstable` | Service name, for more than one instance on a host. |
-| `-c`, `--config` | the platform default | Configuration the service reads, baked into the command line as an absolute path. |
+| `-c`, `--config` | the platform default | Configuration the service reads, saved in the command line as an absolute path. |
 | `--start-type` | `auto` | `auto`, `delayed` (after the other automatic services) or `demand`. |
-| `--log-level LEVEL` | `INFO` | Baked into the service's command line. |
+| `--log-level LEVEL` | `INFO` | Saved in the service's command line. |
 | `--log-file PATH` | a `logs` directory beside the configuration | The bootstrap log. |
 | `--no-log-file` | off | Do not open a bootstrap log. |
 | `--console` | off | Allocate a console so job termination keeps its graceful step. See `--console` and job termination. |

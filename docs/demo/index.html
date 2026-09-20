@@ -656,7 +656,9 @@
   .tabs button.active { color: var(--fg); border-bottom-color: var(--accent); }
 
   .panes { flex: 1; min-height: 0; display: flex; }
-  .pane { flex: 1; min-height: 0; display: none; flex-direction: column; }
+  /* Let panes shrink to fit the drawer. Otherwise, long job names or
+     configuration snippets can make a flex item overflow a narrow viewport. */
+  .pane { flex: 1; min-width: 0; min-height: 0; display: none; flex-direction: column; }
   .pane.active { display: flex; }
 
   .drawer-tools { display: flex; align-items: center; gap: 7px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--panel2); flex-wrap: wrap; }
@@ -692,6 +694,9 @@
   html[data-theme$="-light"] .term mark { color: #fff; }
   html[data-theme$="-light"] .term mark.cur { outline-color: #000; }
   .term-empty { color: var(--fg-faint); padding: 18px 4px; font-style: italic; }
+  /* Wrap configuration snippets inside messages so their chips fit
+     narrow drawers. */
+  .term-empty .chip { white-space: normal; }
 
   /* history pane */
   .pane-scroll { overflow: auto; padding: 14px 16px; }
@@ -769,9 +774,11 @@
   .kv dt { color: var(--fg-faint); } .kv dd { margin: 0; color: var(--fg); }
 
   /* ---------- overlay panels (palette / help / settings) ---------- */
-  .overlay { position: fixed; inset: 0; display: grid; z-index: 60; background: rgba(0,0,0,.5); opacity: 0; pointer-events: none; transition: opacity .12s ease; }
+  /* Hide the overlay after its fade transition, as with drawers. Closed
+     overlays cannot receive focus, and their controls leave the tab order. */
+  .overlay { position: fixed; inset: 0; display: grid; z-index: 60; background: rgba(0,0,0,.5); opacity: 0; pointer-events: none; visibility: hidden; transition: opacity .12s ease, visibility 0s .12s; }
   html[data-theme$="-light"] .overlay { background: rgba(0,0,0,.35); }
-  .overlay.open { opacity: 1; pointer-events: auto; }
+  .overlay.open { opacity: 1; pointer-events: auto; visibility: visible; transition-delay: 0s; }
   .palette { place-self: start center; margin-top: 12vh; width: min(640px, 94vw); background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius); box-shadow: var(--shadow-lg); overflow: hidden; }
   .palette .pin { display: flex; align-items: center; gap: 8px; padding: 11px 14px; border-bottom: 1px solid var(--border); }
   .palette .pin .prompt { color: var(--accent); }
@@ -1272,6 +1279,7 @@
   .sched-warn .sw.warn .wi { color: var(--pending); }
   .sched-warn .sw.crit { background: color-mix(in srgb, var(--fail) 8%, transparent); }
   .sched-warn .sw.crit .wi { color: var(--fail); }
+  .sched-warn .sw .wt { min-width: 0; overflow-wrap: anywhere; }
   .sched-warn .sw .wt b { color: var(--fg); }
 
   /* ---------- run ledger: degraded chip + settings ---------- */
@@ -1407,6 +1415,14 @@
      .dpane/.dtab system so the job drawer's switchTab (which toggles the global
      .pane) can never hide these panes. */
   #dagDrawer { width: min(960px, 98vw); }
+  /* On narrow screens, place actions below the title and keep the Close
+     button beside it. This preserves the title and keeps Close visible. */
+  @media (max-width: 560px) {
+    #dagDrawer .drawer-head .row1 { flex-wrap: wrap; row-gap: 7px; }
+    #dagDrawer .drawer-head .row1 h2 { order: 1; flex-basis: 40%; }
+    #dagDrawer #dgClose { order: 2; }
+    #dagDrawer .drawer-head .row1 .btn { order: 3; }
+  }
   .dtabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--bg2); }
   .dtabs button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--fg-faint);
     font: inherit; font-size: 12px; padding: 8px 11px; cursor: pointer; }
@@ -1471,7 +1487,7 @@
 
 <header>
   <div class="brand">
-    <h1 id="brandName" title="the cronstable logo, the l is self-balancing double pendulum">cronstab<span class="mark" id="mark">l</span>e</h1><span class="tm" title="cronstable is a trademark of the cronstable authors">™</span>
+    <h1 id="brandName" title="cronstable logo with a self-balancing double pendulum for the letter l">cronstab<span class="mark" id="mark">l</span>e</h1><span class="tm" title="cronstable is a trademark of the cronstable authors">™</span>
     <span class="ver" id="ver"></span>
     <span class="ver" id="jobset" title=""></span>
   </div>
@@ -1512,7 +1528,7 @@
     <button class="ghostbtn" id="radarBtn" title="Upcoming runs and a 10-minute timeline">⌁ upcoming</button>
     <button class="ghostbtn" id="heatBtn" title="Recent run activity">▦ activity</button>
     <button class="ghostbtn" id="pressBtn" title="Schedule load: see when jobs are scheduled together">▥ schedule load</button>
-    <button class="ghostbtn" id="weekBtn" title="Scheduled runs for the next 7 days, in your browser’s timezone">◫ week</button>
+    <button class="ghostbtn" id="weekBtn" title="Scheduled runs for the next 7 days, in your browser’s time zone">◫ week</button>
     <button class="ghostbtn" id="tailBtn" title="Watch logs from multiple jobs">≋ live logs</button>
     <button class="ghostbtn" id="tvBtn" title="Wallboard / TV mode (w)">▣ tv</button>
     <button class="ghostbtn" id="runFailingBtn" title="Run every failing job now">▶ run failing</button>
@@ -1568,7 +1584,7 @@
 
   <div class="card press" id="pressureCard" style="display:none">
     <div class="card-label"><span>┌─ schedule load</span><span class="grow"></span>
-      <select class="mini" id="pressTz" title="display timezone">
+      <select class="mini" id="pressTz" title="Display time zone">
         <option value="utc">UTC</option>
         <option value="browser">local</option>
       </select>
@@ -1871,7 +1887,7 @@
       </div>
       <div class="setrow"><span class="lab">Alarm escalation<small>make alerts more prominent until you silence the alarm (a)</small></span><label class="switch"><input type="checkbox" id="setEscalate"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Keyboard shortcuts</span><button class="ghostbtn" id="openHelp">view (?)</button></div>
-      <div class="setrow"><span class="lab">Pair a device<small>QR to pair your phone</small></span><button class="ghostbtn" id="openPair">pair</button></div>
+      <div class="setrow"><span class="lab">Pair a device<small>scan a QR code to pair your phone</small></span><button class="ghostbtn" id="openPair">pair</button></div>
     </div>
   </div>
 </div>
@@ -1895,11 +1911,11 @@
 <div class="overlay" id="pairWrap">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pairTitle" aria-describedby="pairMsg">
     <h3 id="pairTitle">Pair a device</h3>
-    <p id="pairMsg">Scan with your phone’s camera or the companion app to pair this server. The code includes the dashboard address and your access token, so use HTTPS or a trusted network. After pairing, compare the app’s key fingerprint with the one returned by <code>GET /push/devices</code>. They must match; a mismatch means the server has a different key from your phone.</p>
+    <p id="pairMsg">Scan the QR code with your phone’s camera or the companion app to pair your phone with this server. The code includes the dashboard address and your access token, so use HTTPS or a trusted network. After pairing, compare the app’s key fingerprint with the one returned by <code>GET /push/devices</code>. They must match; a mismatch means the server has a different key from your phone.</p>
     <div class="pair-qr" id="pairQr"></div>
     <div class="pair-hint" id="pairHint" style="display:none"><span>No token is saved in this tab. Pairing will use an unauthenticated connection.</span><button class="ghostbtn mini" id="pairToken">set token</button></div>
     <div class="pair-payload" id="pairPayload"></div>
-    <div class="pair-warn" id="pairWarn" style="display:none">This token grants full access. To limit phone access, configure a token with fewer permissions in web.authTokens.</div>
+    <div class="pair-warn" id="pairWarn" style="display:none">This token grants full access. To limit phone access, configure a token with fewer permissions in <code>web.authTokens</code>.</div>
     <div class="modal-actions">
       <button class="btn" id="pairCopy" style="margin-right:auto">Copy</button>
       <button class="btn primary" id="pairClose">Close</button>
@@ -1911,7 +1927,7 @@
 <div class="overlay" id="modalWrap">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalMsg">
     <h3 id="modalTitle">Access token required</h3>
-    <p id="modalMsg">This cronstable instance requires a bearer token. It is stored only in this browser tab.</p>
+    <p id="modalMsg">This cronstable instance requires a bearer token. The dashboard stores the token only in this browser tab.</p>
     <input id="tokenInput" type="password" placeholder="paste token…" autocomplete="off" />
     <div class="modal-actions">
       <button class="btn" id="tokenClear" style="margin-right:auto">Clear</button>
@@ -1959,7 +1975,7 @@
     <div class="sbxhead">
       <h3>schedule preview</h3>
       <label class="sbxin"><span class="prompt">◴</span><input id="sbxInput" type="text" placeholder="* * * * *  or  @daily" autocomplete="off" spellcheck="false"></label>
-      <select class="mini" id="sbxFrame" title="Preview timezone"></select>
+      <select class="mini" id="sbxFrame" title="Preview time zone"></select>
       <button class="iconbtn" id="sbxClose" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
     <div class="sbxbody" id="sbxBody"></div>
@@ -1992,7 +2008,7 @@
     <div class="zen-field" id="zenField"></div>
     <div class="zen-title">ALL SYSTEMS NOMINAL</div>
     <div class="zen-sub" id="zenSub"></div>
-    <div class="zen-hint">move / press a key to wake · esc to exit</div>
+    <div class="zen-hint">move the pointer or press a key to wake · Esc to exit</div>
   </div>
 </div>
 
@@ -6258,7 +6274,13 @@ var qrcode = function() {
     for (const k of Object.keys(prefs)) {
       const raw = localStorage.getItem(PREF_PREFIX + k);
       if (raw == null) continue;
-      try { prefs[k] = JSON.parse(raw); } catch (_) { /* ignore */ }
+      // Retain the default if a stored value has a different type.
+      // A nonnumeric pollMs could disable polling, and an invalid truthy
+      // value could enable a boolean preference.
+      try {
+        const v = JSON.parse(raw);
+        if (v !== null && typeof v === typeof prefs[k]) prefs[k] = v;
+      } catch (_) { /* ignore */ }
     }
   }
   function savePref(k) { try { localStorage.setItem(PREF_PREFIX + k, JSON.stringify(prefs[k])); } catch (_) {} }
@@ -7212,7 +7234,7 @@ var qrcode = function() {
   const COLUMNS = [
     { k: "policy", lbl: "Cluster policy" },
     { k: "sched",  lbl: "Schedule",         on: true },
-    { k: "tz",     lbl: "Timezone" },
+    { k: "tz",     lbl: "Time zone" },
     { k: "last",   lbl: "Last run",         on: true },
     { k: "dur",    lbl: "Took",             on: true },
     { k: "next",   lbl: "Next (countdown)", on: true },
@@ -7340,8 +7362,10 @@ var qrcode = function() {
       else if (key === "next" || key === "nextat") r = ((a.scheduled_in == null ? Infinity : a.scheduled_in) - (b.scheduled_in == null ? Infinity : b.scheduled_in));
       else if (key === "duration") r = ((a.last_run && a.last_run.duration) || 0) - ((b.last_run && b.last_run.duration) || 0);
       else if (key === "owner") r = _cmp(ownerSortKey(a), ownerSortKey(b));
-      // "~" sorts non-clustered jobs after every policy name
-      else if (key === "policy") r = _cmp(a.clusterPolicy || "~", b.clusterPolicy || "~");
+      // Sort jobs without a cluster policy after named policies. Use an
+      // explicit rank because the collator sorts punctuation such as "~"
+      // before letters.
+      else if (key === "policy") r = (!a.clusterPolicy - !b.clusterPolicy) || _cmp(a.clusterPolicy || "", b.clusterPolicy || "");
       // 1.5 parks no-history jobs past 100%, so the default ascending click
       // leads with the flakiest jobs and ends with the unknowns
       else if (key === "rate") { const ra = rateOf(a), rb = rateOf(b); r = (ra == null ? 1.5 : ra) - (rb == null ? 1.5 : rb); }
@@ -8575,7 +8599,9 @@ var qrcode = function() {
     untrusted: "var(--peer-bad)", conflict: "var(--peer-bad)",
     unreachable: "var(--peer-unreachable)", self: "var(--peer-self)", unknown: "var(--peer-unknown)",
   };
-  const SWIM_KEY = "cronstable.swim", SWIM_MAX = 400, SWIM_WINDOW = 20 * 60 * 1000;
+  // Store the timeline buffer separately from the panel preference.
+  // Sharing "cronstable.swim" would make each save overwrite the other value.
+  const SWIM_KEY = "cronstable.swimBuf", SWIM_MAX = 400, SWIM_WINDOW = 20 * 60 * 1000;
   function loadSwimBuf(jsid) {
     try {
       const raw = localStorage.getItem(SWIM_KEY);
@@ -10021,7 +10047,7 @@ var qrcode = function() {
     if (!state.tail.lines.length) {
       t.innerHTML = '<span class="term-empty">' + (state.tail.jobs.length
         ? "waiting for output…"
-        : "no jobs tailed — use + failing / + running, or add a job above.") + "</span>";
+        : "No jobs selected. Select + failing or + running, or enter a job name in the add job field.") + "</span>";
       updateTailCount();
       return;
     }
@@ -10193,7 +10219,7 @@ var qrcode = function() {
     if (blocked) toast("info", "stream cap " + TAIL_MAX + " reached — " + blocked + " job" + (blocked > 1 ? "s" : "") + " not added");
     renderTailChips();
     if (!state.tail.lines.length) renderTailTerm();
-    if (fresh) setTimeout(() => $("tailAddInput").focus(), 30);
+    if (fresh) focusLater($("tailWrap"), $("tailAddInput"), 30);
   }
   function closeTail() {
     if (!closeOverlay("tailWrap")) return;
@@ -10265,7 +10291,7 @@ var qrcode = function() {
       // the header chips also copy these on click, but the chips are
       // mouse-only spans -- the palette keeps both reachable by keyboard
       { ic: "❏", lbl: "Copy version", run: () => { const v = $("ver").textContent; if (v) copyText(v, "version"); } },
-      { ic: "❏", lbl: "Copy job set id", run: () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job set id"); } },
+      { ic: "❏", lbl: "Copy job-set ID", run: () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job-set ID"); } },
       { ic: "⚙", lbl: "Open settings", run: openSettings },
       { ic: "?", lbl: "Keyboard shortcuts", hint: "?", run: openHelp },
       { ic: "⚿", lbl: "Set access token", run: () => openModal() },
@@ -10331,7 +10357,7 @@ var qrcode = function() {
     state.palette.open = true; state.palette.cur = 0;
     $("paletteInput").value = "";
     renderPalette();
-    setTimeout(() => $("paletteInput").focus(), 30);
+    focusLater($("paletteWrap"), $("paletteInput"), 30);
   }
   function closePalette() {
     if (!closeOverlay("paletteWrap")) return;
@@ -10541,7 +10567,7 @@ var qrcode = function() {
     const has = !!token();
     if (opts.required) {
       $("modalTitle").textContent = "Access token required";
-      $("modalMsg").textContent = "This cronstable instance requires a bearer token. It is stored only in this browser tab.";
+      $("modalMsg").textContent = "This cronstable instance requires a bearer token. The dashboard stores the token only in this browser tab.";
     } else {
       $("modalTitle").textContent = has ? "Update access token" : "Set access token";
       $("modalMsg").textContent = publicView()
@@ -10550,7 +10576,7 @@ var qrcode = function() {
     }
     $("tokenClear").style.display = has ? "" : "none";
     $("tokenInput").value = token();
-    setTimeout(() => $("tokenInput").focus(), 40);
+    focusLater($("modalWrap"), $("tokenInput"), 40);
   }
   function closeModal() { closeOverlay("modalWrap"); }
 
@@ -10586,14 +10612,18 @@ var qrcode = function() {
     const h = on ? "#tv" : "";
     if (location.hash !== h) history.replaceState(null, "", location.pathname + location.search + h);
   }
+  // A URL fragment can contain an invalid percent escape, such as
+  // "#job/%E0%A4%A". Return null if decoding fails so the link opens no drawer.
+  function hashPart(s) { try { return decodeURIComponent(s); } catch (_) { return null; } }
   function openFromHash() {
     if (location.hash === "#tv") { setWallboard(true); return; }
     const m = location.hash.match(/^#job\/(.+)$/);
-    if (m) { const name = decodeURIComponent(m[1]); if (state.byName[name]) openDrawer(name); return; }
+    if (m) { const name = hashPart(m[1]); if (name != null && state.byName[name]) openDrawer(name); return; }
     const dm = location.hash.match(/^#dag\/([^\/]+)(?:\/(.+))?$/);
     if (dm) {
-      const dn = decodeURIComponent(dm[1]);
-      const rk = dm[2] ? decodeURIComponent(dm[2]) : null;
+      const dn = hashPart(dm[1]);
+      const rk = dm[2] ? hashPart(dm[2]) : null;
+      if (dn == null || (dm[2] && rk == null)) return;
       const open = () => { if (state.dags.byName[dn]) openDagDrawer(dn, rk, rk ? "tasks" : "runs"); };
       // dags may not have loaded yet on first paint; fetch then open.
       if (state.dags.byName[dn]) open(); else loadDags().then(open);
@@ -10660,20 +10690,66 @@ var qrcode = function() {
     const surf = $(id);
     if (!surf.classList.contains("open")) return false;
     surf.classList.remove("open");
-    popFocus();
+    popFocus(surf);
     return true;
   }
-  function pushFocus() { state.focusStack.push(document.activeElement); }
-  function popFocus() {
-    const f = state.focusStack.pop();
+  // Opening a drawer rebuilds the job's row to highlight it, removing the
+  // focused button. Save the control's data-* attribute so focus can return
+  // to its replacement in the updated row.
+  function pushFocus() {
+    const el = document.activeElement;
+    const tr = el && el.closest ? el.closest("#rows tr[data-job]") : null;
+    let again = null;
+    if (tr) {
+      const job = tr.getAttribute("data-job");
+      const attr = [...el.attributes].map((x) => x.name).find((n) => n.startsWith("data-"));
+      again = () => {
+        const row = state.rowNodes.get(job);
+        return row && attr ? row.querySelector("[" + attr + "]") : null;
+      };
+    }
+    state.focusStack.push({ el: el, again: again });
+  }
+  // Restore focus to the element focused before surf opened. If that
+  // element is the page body or has been removed, focus() might do nothing.
+  // Clear any focus left inside the closed panel so keyboard shortcuts work.
+  function popFocus(surf) {
+    const saved = state.focusStack.pop();
+    let f = saved && saved.el;
+    if (f && !f.isConnected && saved.again) f = saved.again();
     if (f && f.focus) { try { f.focus(); } catch (_) {} }
+    const a = document.activeElement;
+    if (surf && a && a !== document.body && surf.contains(a)) a.blur();
   }
   function focusFirst(surf) {
     const items = focusables(surf);
-    if (items.length) { setTimeout(() => items[0].focus(), 30); return; }
+    if (items.length) { focusLater(surf, items[0], 30); return; }
     // no focusable controls (e.g. the help sheet): focus the container itself
     surf.setAttribute("tabindex", "-1");
-    setTimeout(() => surf.focus(), 30);
+    focusLater(surf, surf, 30);
+  }
+  // Delay focus until the panel opens. If it closes during the delay,
+  // skip the focus change so keyboard shortcuts remain available.
+  //
+  // Buttons use transition: all, so their visibility can update one frame
+  // after the panel's. Retry across frames while the target remains hidden
+  // and cannot receive focus.
+  let focusTurn = 0;
+  function focusLater(surf, target, ms) {
+    // Honor only the latest request to focus a panel. If another
+    // panel opens during this delay, cancel this request so keyboard input
+    // reaches the new panel.
+    const turn = ++focusTurn;
+    const attempt = (tries) => {
+      if (turn !== focusTurn || !surf.classList.contains("open")) return;
+      // Preserve focus if the user has moved it to another control
+      // in this panel, such as the search box.
+      const held = document.activeElement;
+      if (held && held !== surf && held !== target && surf.contains(held)) return;
+      target.focus();
+      if (document.activeElement !== target && tries > 0) requestAnimationFrame(() => attempt(tries - 1));
+    };
+    setTimeout(() => attempt(6), ms);
   }
 
   document.addEventListener("keydown", (e) => {
@@ -10798,7 +10874,10 @@ var qrcode = function() {
 
   // epoch-second time helpers (DAG timestamps are float epoch seconds; only
   // logicalDate is ISO). Reuse the ISO formatters via a conversion.
-  function agoEpoch(sec) { return sec == null ? "never" : fmtAgo(new Date(sec * 1000).toISOString()); }
+  // Display "never" for nonnumeric timestamps. Otherwise, toISOString
+  // would throw for an invalid Date and stop tick() from updating the clock
+  // and countdowns.
+  function agoEpoch(sec) { return sec == null || !isFinite(sec) ? "never" : fmtAgo(new Date(sec * 1000).toISOString()); }
   function untilEpoch(sec) { return sec == null ? "—" : fmtIn(sec - Date.now() / 1000); }
   function clockEpoch(sec) { try { return sec == null ? "—" : new Date(sec * 1000).toLocaleString(); } catch (_) { return "—"; } }
 
@@ -11063,7 +11142,7 @@ var qrcode = function() {
   function renderDagRuns() {
     const holder = $("dgRuns"); if (!holder) return;
     const runs = state.dagDrawer.runs || [];
-    if (!runs.length) { holder.innerHTML = '<div class="empty">No runs yet. Trigger one above.</div>'; return; }
+    if (!runs.length) { holder.innerHTML = '<div class="empty">No runs yet. To start a run, select Trigger.</div>'; return; }
     holder.innerHTML =
       '<table class="runtable"><thead><tr><th>State</th><th>Kind</th><th>Tasks</th>' +
       "<th>Logical date</th><th>Started</th><th>Updated</th></tr></thead><tbody>" +
@@ -11185,7 +11264,7 @@ var qrcode = function() {
       }
     }
     if (spec && spec.type === "sensor" && e.pokeCount != null) {
-      let poke = "poke #" + e.pokeCount;
+      let poke = "poke #" + esc(e.pokeCount);
       if (e.nextPokeAt && st === "running") poke += ', next <span data-until-epoch="' + escAttr(e.nextPokeAt) + '">' + untilEpoch(e.nextPokeAt) + "</span>";
       bits.push('<span class="poke">⏲ ' + poke + "</span>");
     }
@@ -11686,7 +11765,7 @@ var qrcode = function() {
     if (!tabs.some((t) => t[0] === state.stateInsp.tab)) state.stateInsp.tab = "overview";
     $("stateTabs").innerHTML = tabs.map((t) =>
       '<button data-sttab="' + t[0] + '" class="' + (state.stateInsp.tab === t[0] ? "active" : "") + '">' +
-      esc(t[1]) + (t[2] ? '<span class="n">' + t[2] + "</span>" : "") + "</button>").join("");
+      esc(t[1]) + (t[2] ? '<span class="n">' + esc(t[2]) + "</span>" : "") + "</button>").join("");
     renderStateTab();
   }
   function renderStateTab() {
@@ -11766,7 +11845,7 @@ var qrcode = function() {
         docs.map((d) => {
           const k = d.key || d.name || "—";
           let val;
-          if (d.valueType !== undefined) val = '<span class="redacted">' + esc(d.valueType) + (d.valueSize != null ? " · " + d.valueSize + " B" : "") + "</span>";
+          if (d.valueType !== undefined) val = '<span class="redacted">' + esc(d.valueType) + (d.valueSize != null ? " · " + esc(d.valueSize) + " B" : "") + "</span>";
           else if (d.value !== undefined) val = '<span class="muted">' + esc(truncStr(JSON.stringify(d.value), 60)) + "</span>";
           else val = '<span class="faint">—</span>';
           const upd = d.updatedAt || d.claimedAt;
@@ -11903,7 +11982,7 @@ var qrcode = function() {
     }
     // header text is unselectable; these chips hand out their value on click
     $("ver").addEventListener("click", () => { const v = $("ver").textContent; if (v) copyText(v, "version"); });
-    $("jobset").addEventListener("click", () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job set id"); });
+    $("jobset").addEventListener("click", () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job-set ID"); });
     $("refreshBtn").addEventListener("click", loadJobs);
     $("runFailingBtn").addEventListener("click", runAllFailing);
     $("radarBtn").addEventListener("click", () => setRadar(!prefs.radar));
@@ -12231,7 +12310,7 @@ var qrcode = function() {
       const el = $("jobset");
       // show a short prefix in the header; full id in the tooltip + copied on click
       el.textContent = "#" + id.replace(/^v\d+:/, "").slice(0, 12);
-      el.title = "job set id: " + id + " (click to copy)";
+      el.title = "Job-set ID: " + id + " (click to copy)";
       el.dataset.full = id;
     } catch (_) {}
   }
@@ -12300,7 +12379,7 @@ var qrcode = function() {
       $("fleetPanel").style.display = "none";
     }
     const lease = data.lease || {};
-    const labels = { holder: "held by", expiry: "expires", fence: "fence", electionName: "election", identity: "our identity", path: "store path" };
+    const labels = { holder: "held by", expiry: "expires", fence: "fence", electionName: "election", identity: "node identity", path: "store path" };
     const order = ["holder", "expiry", "fence", "electionName", "identity", "path"];
     const seen = order.filter((k) => lease[k] != null);
     Object.keys(lease).forEach((k) => { if (lease[k] != null && seen.indexOf(k) < 0) seen.push(k); });
@@ -12431,7 +12510,7 @@ var qrcode = function() {
           var sizes = (data.conflicting_sizes || []).join(", ");
           summary +=
             " · ⚠ cluster size mismatch" +
-            (sizes ? " (peers declare " + sizes + " vs our " +
+            (sizes ? " (peers declare " + sizes + "; this node declares " +
               (data.cluster_size || "?") + ")" : "") +
             " — Leader jobs paused";
         }
@@ -12830,8 +12909,8 @@ var qrcode = function() {
     openOverlay("mitigateWrap");
     state.mitigate.open = true; state.mitigate.set = names; state.mitigate.abort = false;
     $("mitTitle").textContent = "Job actions — " + (label || (names.length + " jobs"));
-    $("mitDesc").textContent = "Acts on these " + names.length + " job" + (names.length > 1 ? "s" : "") +
-      ". Requests are sent one at a time. Stop sending to leave the remaining jobs unchanged.";
+    $("mitDesc").textContent = "Choose an action for " + (names.length > 1 ? "these " + names.length + " jobs" : "this job") +
+      ". The dashboard sends requests one at a time. Select Stop sending to leave the remaining jobs unchanged.";
     $("mitLog").style.display = "none"; $("mitLog").textContent = "";
     $("mitAbort").style.display = "none";
     renderMitList();
@@ -12932,7 +13011,7 @@ var qrcode = function() {
     if (prefillFrame) sel.value = prefillFrame; else if (sj) sel.value = frameOf(sj);
     $("sbxInput").value = prefillExpr != null ? prefillExpr : (sj ? sj.schedule : "");
     renderSandbox();
-    setTimeout(() => $("sbxInput").focus(), 30);
+    focusLater($("sandboxWrap"), $("sbxInput"), 30);
   }
   function closeSandbox() {
     if (!closeOverlay("sandboxWrap")) return;

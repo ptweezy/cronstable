@@ -1,30 +1,22 @@
-"""Per-run CPU and memory accounting for job subprocesses.
+"""Sample CPU and memory use for job subprocesses.
 
-The wall-clock duration of a run is recorded by the scheduler
-(:attr:`cronstable.cron.JobRunInfo.duration`, from ``started_at`` and
-``finished_at``); this module adds the other half of the resource picture --
-how much CPU time a run burned and how much resident memory it peaked at.
+The scheduler records run duration in
+:attr:`cronstable.cron.JobRunInfo.duration`. This module adds CPU time and
+peak resident memory measurements.
 
-asyncio's subprocess reaping only surfaces the child's exit code, never its
-``rusage``, so the numbers are gathered by *sampling* the job's process tree
-with :mod:`psutil` while it runs.  A :class:`ResourceMonitor` is created with
-the launched child's pid, polls the tree on a fixed interval, and hands back a
-:class:`ResourceUsage` when the run ends.
+Because asyncio subprocess handling returns an exit code without resource
+usage, :class:`ResourceMonitor` samples the job's process tree through
+:mod:`psutil`. It starts with the child process ID, samples at a fixed
+interval, and returns :class:`ResourceUsage` when the run ends.
 
-Two properties of the design matter:
+Resource monitoring is best effort. If a process exits during a sample or
+a read fails, the monitor returns the measurements collected so far.
+Monitoring failures do not stop a job or change its outcome.
 
-* **Best-effort, never fatal.**  Every psutil interaction is guarded: a
-  process that exits mid-sample, a platform that denies the read, or psutil
-  raising anything at all simply yields whatever was captured so far.  Resource
-  accounting must never crash a job or the scheduler loop, and it never changes
-  a job's success/failure verdict.
-
-* **Sampled, so approximate for short runs.**  Peak RSS is a sampled
-  high-water mark, and CPU time is accumulated per tree member (a departing
-  member's last reading is banked before it is forgotten), so the only CPU
-  that escapes accounting entirely is a child that spawns *and* exits within
-  a single sampling gap.  The runs whose resource use actually matters -- the
-  long, heavy ones -- are sampled many times and measured well.
+Peak resident memory is the highest sampled value. CPU time accumulates
+for each process, retaining its last reading after it exits. A child that
+starts and exits between samples can be missed, so measurements are less
+complete for short runs.
 """
 
 import asyncio
@@ -692,7 +684,7 @@ class ResourceMonitor:
         # Totals are departed + live, so sequential children (`sh -c 'a; b'`)
         # accumulate instead of plateauing at the largest instantaneous tree
         # sum.  The max() only guards against per-sample jitter in the
-        # readings ever nudging a total backwards.
+        # readings ever nudging a total backward.
         live_user = 0.0
         live_system = 0.0
         for user, system in live.values():

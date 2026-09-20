@@ -1,34 +1,22 @@
-"""The loopback endpoint that hands the durable store to job commands.
+"""Loopback HTTP API for job access to durable state.
 
-cronstable exposes its durable state to the *jobs it runs*, not just to
-the scheduler.  The mechanism is a small HTTP server bound to loopback that
-the daemon stands up alongside the dashboard, plus a per-run bearer token the
-daemon injects into every job's environment.  A job's ``cronstable
-state|cursor|
-lock|artifact|idempotent|secret`` command (see :mod:`cronstable.jobcli`) is a
-thin client of this endpoint; the identical logic is reachable offline against
-the store directly, so this server is a *front-end*, not a second source of
-truth.
+The daemon starts this server when ``state.jobApi.enabled`` is configured.
+It injects the endpoint URL and a bearer token into each run's environment.
+Job commands use :mod:`cronstable.jobcli` to call the API.
 
-Why route the primitives through the daemon at all, rather than let each job
-open the store itself?  Three of the six need the live daemon:
+The daemon manages three aspects of job state access:
 
-* a **mutex / semaphore** is a lease that must be *renewed* for as long as the
-  job holds it and *released* the instant the run ends (even on a crash) --
-  the daemon already runs exactly this machinery for cluster concurrency slots
-  (:mod:`cronstable.cron`), and a short-lived ``cronstable lock`` subprocess
-  cannot;
-* **run-scoped secrets** are resolved fresh per run and staged *in memory*, so
-  they never touch the store and vanish when the run ends -- only the daemon
-  holds them;
-* every primitive is scoped and authorised by *which run is calling*, which
-  the per-run token establishes without the job proving anything.
+* It renews mutex and semaphore leases while a run holds them and releases
+  them when the run ends. A short-lived CLI process cannot manage this
+  lifecycle.
+* It resolves secrets for each run and keeps them in memory until the run
+  ends. Secrets are never written to the state store.
+* It uses the bearer token to identify the calling run and authorize
+  access to its scopes.
 
-The KV / cursor / idempotency / artifact primitives themselves are pure
-functions over the backend (:mod:`cronstable.jobstate`); this module adds the
-per-run token registry, the secret staging, the lease-backed lock manager, and
-the HTTP surface over them.  It is imported only when a ``state`` section with
-``jobApi.enabled`` is configured, so the stateless install pays nothing.
+:mod:`cronstable.jobstate` implements key-value storage, cursors,
+idempotency keys, and artifacts as functions over the backend. This module
+adds the token registry, in-memory secrets, lock manager, and HTTP API.
 """
 
 import asyncio
@@ -64,7 +52,7 @@ LOCK_LEASE_PREFIX = "lock/"
 # the acquire loop probes SEQUENTIALLY per pass, so ``permits`` comes straight
 # from the request body and an absurd value (--permits 1000000000) would turn
 # one CLI call into up to a billion awaited store operations.  1024 is far
-# beyond any sane job-coordination semaphore while keeping a full
+# beyond typical job-coordination semaphores while keeping a full
 # under-contention pass bounded.
 MAX_LOCK_PERMITS = 1024
 
@@ -76,8 +64,8 @@ MAX_LOCK_PERMITS = 1024
 # fails as unreadable, acquire fails CLOSED, release cannot repair it and the
 # sweeper refuses to reclaim it, permanently bricking that lock fleet-wide.
 # Non-finite is rejected outright; a finite TTL is clamped into
-# [5s, MAX_LOCK_TTL] (30 days -- far beyond any sane job-coordination hold,
-# while keeping a crashed holder's lease reclaimable within the epoch).
+# [5s, MAX_LOCK_TTL]. The 30-day maximum allows long-running jobs while
+# keeping a crashed holder's lease reclaimable.
 MAX_LOCK_TTL = 30 * 86400.0
 
 
@@ -716,7 +704,7 @@ class JobStateAPI:
             except JobStateError as ex:
                 return _json_response({"error": str(ex)}, status=ex.status)
             except _json.UnsupportedValue as ex:
-                # defence in depth: the value primitives pre-validate via
+                # defense in depth: the value primitives pre-validate via
                 # _check_size, but any handler that writes a client value
                 # without it would otherwise let a non-portable value surface
                 # as a 500.  It is the caller's bad input -> a clean 400.

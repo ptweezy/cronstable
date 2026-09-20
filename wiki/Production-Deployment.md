@@ -328,7 +328,7 @@ Each row links to the authoritative section on the Clustering page.
 | Rotation ([cert rotation](Clustering-and-Leader-Election#certificate-rotation)) | in-place cert/CA reload (earlier); roll the CA with an overlap | n/a (no per-node mTLS certs) |
 | Preflight | `cronstable -c <path> --validate-config` (catches lease ordering, CA/cert paths, an `electLeader` 2-node cluster) | `cronstable -c <path> --validate-config` (same) |
 
-`cronstable -c <path> --validate-config` parses the config and exits non-zero on
+`cronstable -c <path> --validate-config` parses the config and exits nonzero on
 any error, so it belongs in CI before a cluster deploy. It enforces the lease
 timing ordering (`leaseDurationSeconds > renewDeadlineSeconds`,
 `retryPeriodSeconds < renewDeadlineSeconds`, and other lease timing rules), the
@@ -410,5 +410,5 @@ on the Installation page.
   that directory holds configuration, else `%APPDATA%\cronstable`, falling back
   to the user profile `~` if `APPDATA` is unset. When `-c` is left at the
   platform default and that path does not exist, cronstable prints an error and
-  exits non-zero. In the container, mount the config volume at
+  exits nonzero. In the container, mount the config volume at
   `/etc/cronstable.d`.

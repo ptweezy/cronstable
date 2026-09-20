@@ -1,26 +1,20 @@
-"""Shared TLS plumbing for every listener and client cronstable speaks over.
+"""Shared TLS contexts and certificate checks for listeners and clients.
 
-The cluster's gossip mesh grew the first SSL contexts, the first on-disk
-cert fingerprint and the first "is the new material loadable yet?" dry run
-(see :mod:`cronstable.cluster`).  The web listeners, the job-facing state
-API and the CLI clients all need the same three things, so they live here
-instead of being reimplemented per call site:
+The cluster, web listeners, job state API, and CLI clients use these
+helpers:
 
-* :func:`build_listener_ssl_context`, a server context requiring client
-  certificates if and only if a client CA is configured;
-* :func:`build_mutual_client_ssl_context` /
-  :func:`build_verifying_client_ssl_context`, the two client postures: the
-  strict mutual one the cluster peer channel needs and the softer
-  pin-a-private-CA one the CLI clients need;
-* :func:`tls_file_signature` and :func:`listener_tls_loadable`, noticing an
-  in-place certificate rotation, and checking the new material loads before
-  tearing a working listener down for it.
+* :func:`build_listener_ssl_context` creates a server context that requires
+  client certificates when a client CA is configured.
+* :func:`build_mutual_client_ssl_context` creates a client context for the
+  cluster's mutual TLS connections. :func:`build_verifying_client_ssl_context`
+  creates a client context that verifies server certificates and can use
+  a private CA.
+* :func:`tls_file_signature` detects changes to certificate files.
+  :func:`listener_tls_loadable` checks replacement certificates before
+  restarting a listener.
 
-This module is a deliberate leaf: it imports nothing from ``cronstable`` and
-nothing outside the standard library, so :mod:`cronstable.cluster`,
-:mod:`cronstable.cron` and :mod:`cronstable.jobapi` can all import it at
-module level without any of the import-cycle deferral those modules use for
-each other.
+This module imports only the standard library. Other cronstable modules
+can import it without creating circular dependencies.
 """
 
 import os

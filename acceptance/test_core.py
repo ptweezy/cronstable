@@ -128,3 +128,68 @@ def test_shutdown_drains_running_job(daemon):
     assert not daemon.lines("expired.log"), (
         "Workload expired instead of draining"
     )
+
+
+def test_hard_kill_mid_run_reconciles_on_restart(daemon):
+    daemon.configure("crash", "drain")
+    daemon.start()
+    daemon.request("/jobs/crash/start", method="POST")
+    daemon.wait("starting the workload", lambda: daemon.lines("started.log"))
+    assert daemon.runs("crash") == []
+    # No handler runs: the daemon cannot record a completion, close the
+    # in-flight record, or release anything.
+    daemon.kill()
+    # Let the surviving job finish so the next daemon can reconcile its
+    # record after the process exits.
+    (daemon.work / "drain.release").touch()
+    daemon.wait_for_orphans()
+
+    daemon.start()
+    (run,) = daemon.runs("crash")
+    assert run["outcome"] == "unknown" and run["exit_code"] is None
+    assert run["started_at"] is None and run["duration"] is None
+    assert run["fail_reason"].startswith("run interrupted")
+    assert "reconciled an interrupted run" in daemon.log_text()
+    assert daemon.request("/jobs/crash")["running"] is False
+    daemon.stop()
+
+    # The reconciled row is durable and final: a third daemon adds
+    # nothing to it, and nothing launched the job a second time.
+    daemon.start()
+    assert [r["outcome"] for r in daemon.runs("crash")] == ["unknown"]
+    assert "reconciled an interrupted run" not in daemon.log_text()
+    daemon.stop()
+    assert daemon.lines("started.log") == ["started"]
+    assert daemon.store_files() > 0
+
+
+def test_hard_kill_loop_leaves_a_clean_store(daemon):
+    daemon.configure("tick", "tick", scheduled=True)
+    for extra in (1, 3, 2, 1):
+        daemon.start()
+        target = len(daemon.runs("tick")) + extra
+        daemon.wait(
+            "recording more scheduled runs",
+            lambda target=target: len(daemon.runs("tick")) >= target,
+        )
+        daemon.kill()
+        daemon.wait_for_orphans()
+
+    # Whatever each kill interrupted, every file a reader can reach is a
+    # complete record, and the offline checker agrees.
+    assert daemon.store_files() > 0
+    report = daemon.cli("state", "check", "-c", str(daemon.config))
+    assert "quarantined: 0 record(s)" in report
+
+    daemon.start()
+    log = daemon.log_text()
+    assert "Traceback" not in log and "quarantin" not in log
+    ticks = len(daemon.lines("ticks.log"))
+    daemon.wait(
+        "scheduling again after the last kill",
+        lambda: len(daemon.lines("ticks.log")) >= ticks + 2,
+    )
+    outcomes = {r["outcome"] for r in daemon.runs("tick")}
+    assert "success" in outcomes and outcomes <= {"success", "unknown"}
+    daemon.stop()
+    assert daemon.store_files() > 0

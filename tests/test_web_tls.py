@@ -28,7 +28,13 @@ from cronstable.config import (
     parse_config_string,
 )
 from cronstable.cron import Cron, web_site_from_url
-from tests._helpers import _backend, _free_port, _state_cfg, _write_tls
+from tests._helpers import (
+    _backend,
+    _free_port,
+    _state_cfg,
+    _write_tls,
+    start_state,
+)
 
 # The TLS cert cluster (_gen_ca/_gen_leaf/_write_tls/_free_port) lives in
 # tests/_helpers.py; this file uses its defaults (cn="web-ca", a localhost
@@ -815,12 +821,12 @@ async def test_plaintext_job_api_has_no_tls_signature(tmp_path):
     cfg = _state_cfg("state:\n  path: " + str(tmp_path))
     cron = Cron(None)
     try:
-        await cron.start_stop_state(cfg)
+        await start_state(cron, cfg)
         first = cron._job_api
         assert first is not None
         assert cron._job_api_tls_signature is None
         # an unchanged reload reaches the rotation arm but does nothing
-        await cron.start_stop_state(cfg)
+        await start_state(cron, cfg)
         assert cron._job_api is first
     finally:
         await cron.start_stop_state(None)
@@ -837,13 +843,13 @@ async def test_job_api_in_place_rotation_restarts_only_the_listener(tmp_path):
     cfg = _state_cfg(_job_api_state_yaml(tmp_path / "store", port, tls))
     cron = Cron(None)
     try:
-        await cron.start_stop_state(cfg)
+        await start_state(cron, cfg)
         first = cron._job_api
         backend = cron.state_backend
         assert first is not None
         assert cron._job_api_tls_signature is not None
         # an unchanged config with unchanged files leaves both in place
-        await cron.start_stop_state(cfg)
+        await start_state(cron, cfg)
         assert cron._job_api is first
         assert cron.state_backend is backend
 
@@ -852,7 +858,7 @@ async def test_job_api_in_place_rotation_restarts_only_the_listener(tmp_path):
         rotated = _write_tls(tmp_path, cn="rotated")
         for field in ("cert", "key"):
             _copy_bytes(rotated[field], tls[field])
-        await cron.start_stop_state(cfg)
+        await start_state(cron, cfg)
         # the listener was rebuilt; the backend was NOT
         assert cron._job_api is not None
         assert cron._job_api is not first
@@ -882,14 +888,14 @@ async def test_job_api_half_written_rotation_keeps_the_old_listener(
     cfg = _state_cfg(_job_api_state_yaml(tmp_path / "store", port, tls))
     cron = Cron(None)
     try:
-        await cron.start_stop_state(cfg)
+        await start_state(cron, cfg)
         first = cron._job_api
         assert first is not None
         # overwrite the cert with garbage: the signature changes (a rotation is
         # detected) but the new material will not build a context
         with open(tls["cert"], "wb") as fh:
             fh.write(GARBAGE_PEM)
-        await cron.start_stop_state(cfg)
+        await start_state(cron, cfg)
         assert cron._job_api is first
         assert "not yet loadable" in caplog.text
     finally:

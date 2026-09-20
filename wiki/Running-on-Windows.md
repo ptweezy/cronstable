@@ -203,12 +203,12 @@ cronstable init
 
 ### Who may write the config directory
 
-Whoever can write the config directory decides what the scheduler runs, and a
-service runs it as SYSTEM. On Windows that is easy to get wrong without
-touching anything. `%ProgramData%` grants `BUILTIN\Users` the right to create
-files, and a directory made under it inherits that, so every local account can
-drop a `.yaml` there. A directory created at the root of a drive is worse again,
-because `C:\` hands new subdirectories `Modify` for Authenticated Users.
+Anyone with write access to the configuration directory can change the jobs
+that the service runs as SYSTEM. On Windows, inherited permissions can
+grant this access to all local accounts. `%ProgramData%` grants
+`BUILTIN\Users` permission to create files, and its subdirectories inherit
+that permission. Directories created under `C:\` inherit the **Modify**
+permission for Authenticated Users.
 
 `cronstable init` therefore checks the directory it created. If any local
 account could write to it, `init` restricts it and reports the change: full

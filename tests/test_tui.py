@@ -2042,7 +2042,8 @@ def test_health_colors_cover_the_health_vocabulary():
         for hue, palette in tui._P.items():
             assert ink in palette, (hue, ink)
     # no panel regrows its own copy of the map
-    source = open(tui.__file__, encoding="utf-8").read()
+    with open(tui.__file__, encoding="utf-8") as fobj:
+        source = fobj.read()
     assert source.count('"disabled": "off"') == 1
 
 
@@ -3606,7 +3607,7 @@ def test_render_sandbox_hashed_and_empty(tmp_path):
     app = _bare_app(tmp_path)
     paint = _paint(app)
     app.inputs["sandbox"] = ""
-    assert "type a cron expression" in _txt(app.render_sandbox(paint, 110, 30))
+    assert "enter a cron expression" in _txt(app.render_sandbox(paint, 110, 30))
     app.inputs["sandbox"] = "H * * * *"
     assert "based on the job name" in _txt(app.render_sandbox(paint, 110, 30))
     # a never-fires expression parses but lints with a finding
@@ -3806,7 +3807,7 @@ def test_dag_panel_tabs_render(tmp_path):
     # tasks tab: no run key -> hint; then a run with an awaiting gate
     app.dag_tab = "tasks"
     app.dag_run_key = None
-    assert "open a run first" in _txt(app.render_dag_panel(paint, 70, 24))
+    assert "select a run in the Runs tab" in _txt(app.render_dag_panel(paint, 70, 24))
     app.dag_run_key = "manual-1"
     app.dag_run = {
         "tasks": {
@@ -3824,7 +3825,7 @@ def test_dag_panel_tabs_render(tmp_path):
     # xcom tab: no run key, loading, values, and empty
     app.dag_tab = "xcom"
     app.dag_run_key = None
-    assert "open a run first" in _txt(app.render_dag_panel(paint, 70, 24))
+    assert "select a run in the Runs tab" in _txt(app.render_dag_panel(paint, 70, 24))
     app.dag_run_key = "manual-1"
     app.dag_xcom = None
     assert "loading task outputs" in _txt(app.render_dag_panel(paint, 70, 24))
@@ -3836,7 +3837,7 @@ def test_dag_panel_tabs_render(tmp_path):
     # logs tab: no tail selected
     app.dag_tab = "logs"
     app.dag_task_tail = None
-    assert "pick a task" in _txt(app.render_dag_panel(paint, 70, 24))
+    assert "select a task in the Tasks tab" in _txt(app.render_dag_panel(paint, 70, 24))
     tail = _stub_tail(app, [])
     tail.ended = "no-output"
     app.dag_task_tail = tail
@@ -4723,7 +4724,7 @@ def test_drawer_schedule_bad_timezone(tmp_path):
     app.by_name = {"tz": job}
     app.drawer_job = "tz"
     body = _txt(app._drawer_schedule(paint, 70, 24))
-    assert "timezone" in body
+    assert "time zone" in body
 
 
 # ===================================================================
@@ -5060,7 +5061,7 @@ def test_drawer_schedule_local_frame_uses_the_host_zone(tmp_path, monkeypatch):
     app.by_name = {"loc": job}
     app.drawer_job = "loc"
     body = _txt(app._drawer_schedule(paint, 70, 24))
-    assert "timezone: local" in body
+    assert "time zone: local" in body
     assert "next runs:" in body
     facts = app._sched_facts
     assert facts[2] == "local" and facts[4] is LOCAL_ZONE

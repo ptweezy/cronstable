@@ -6,7 +6,7 @@ job independently. Adding a replica therefore duplicates scheduled work.
 The optional **`cluster`** section lets instances verify over mutual TLS that
 they share a job set. Enabling **leader election** uses that agreement and
 quorum to select which replica runs scheduled jobs. It builds on the
-[job-set id](#the-job-set-id-foundation) and is implemented in
+[job-set ID](#the-job-set-id-foundation) and is implemented in
 `cronstable/cluster.py` (the `ClusterManager`, `ClusterView`, and the pure
 `elect_leader`/`quorum_size` functions).
 
@@ -23,7 +23,7 @@ quorum to select which replica runs scheduled jobs. It builds on the
 > [choosing a backend](#choosing-a-backend) and
 > [guarantees and trade-offs](#guarantees-and-trade-offs).
 
-**Terms used on this page.** A **job-set id** is an order-independent
+**Terms used on this page.** A **job-set ID** is an order-independent
 fingerprint of the jobs a node runs (two nodes match if and only if they hold
 the same job set). A **quorum** is a strict majority of the cluster,
 `⌊N / 2⌋ + 1` nodes. A node is **quorate** when it currently sees a quorum of
@@ -40,7 +40,7 @@ members, too thin for the two sides to confirm each other through it (see
 [From one node to a cluster](#from-one-node-to-a-cluster) ·
 [Choosing a backend](#choosing-a-backend) ·
 [At a glance](#at-a-glance) ·
-[The job-set id foundation](#the-job-set-id-foundation) ·
+[The job-set ID foundation](#the-job-set-id-foundation) ·
 [Cluster peer attestation](#cluster-peer-attestation) ·
 [Leader election](#leader-election) ·
 [Per-job policy](#per-job-policy) ·
@@ -188,15 +188,15 @@ semantics in [per-job policy](#per-job-policy), however, apply to every backend.
 | Endpoint | none | `GET /cluster`, `GET /peer` | `GET /cluster` (plus `GET /peer` on `gossip`) |
 | Double-running | n/a | yes (by design) | no for `Leader` jobs in a converged, fully-connected quorum. Best-effort: a thin bridge, a same-`N` membership change, or the ~one-`interval` window after a partition can still let two nodes both lead (see [guarantees and trade-offs](#guarantees-and-trade-offs)). |
 
-## The job-set id foundation
+## The job-set ID foundation
 
-A **job-set id** is an order-independent fingerprint of the set of jobs an
+A **job-set ID** is an order-independent fingerprint of the set of jobs an
 instance is running: two instances produce the *same* id if and only if they
 hold the same set of jobs. It is taken over the *effective* (post-merge)
 configuration of every job, embeds no secret material, and is versioned with a
 `v1:` prefix so ids are only ever compared within one scheme. The full
 treatment (exactly which fields it covers, the no-secrets guarantees, and
-every surface it appears on) is on the [job-set id](Job-Set-ID) page.
+every surface it appears on) is on the [job-set ID](Job-Set-ID) page.
 
 The id is what the cluster compares: agreement means the nodes are running the
 same jobs. It is available on the standalone [`GET /job-set-id`](HTTP-API)
@@ -211,7 +211,7 @@ With a `cluster` section but **without** `electLeader`, the cluster is
 *observe-only*: every instance still runs every job, and attestation tells you
 whether the peers agree. Each node serves a small `GET /peer` endpoint on a
 dedicated mTLS listener and periodically polls every configured peer, comparing
-job-set ids.
+job-set IDs.
 
 ```yaml
 cluster:
@@ -237,7 +237,7 @@ that load-time validation: `listen` and every `peers[].host` must be
 `host:port` with a port in 1-65535, and an IPv6 literal must be written
 bracketed (`[2001:db8::1]:8443`). The bare form is rejected with a
 `ConfigError` up front rather than mis-splitting at the last colon and
-failing opaquely at connect time. Every `tls` path must be non-empty: a
+failing opaquely at connect time. Every `tls` path must be nonempty: a
 blank `ca:` (what a template renders for an unset variable) is a
 `ConfigError` at load rather than a `/peer` listener that requires no
 client certificate. The same checks apply to the
@@ -281,7 +281,7 @@ dashboard panel carries one of these statuses (the constants live in
 
 | Status | Meaning |
 | --- | --- |
-| `agreed` | Reachable over mTLS and reporting the same job-set id. |
+| `agreed` | Reachable over mTLS and reporting the same job-set ID. |
 | `syncing` | Reachable, but its id differs and the mismatch has not yet persisted for `driftAfter` rounds (a transient/rolling-deploy mismatch). |
 | `drifted` | Reachable, but its id has differed for `driftAfter` consecutive rounds (an actual disagreement). Also used immediately (no debounce) when the peer reports a different fingerprint **scheme** (`v1:` vs another), because such ids are not comparable. |
 | `unreachable` | Connect/timeout/`OSError`: the peer could not be contacted this round. |
@@ -335,7 +335,7 @@ cluster:
 ```
 
 Each node independently elects, as leader, the **lowest `nodeName`** among the
-members it currently sees *agreeing* on the job-set id, but **only if that set
+members it currently sees *agreeing* on the job-set ID, but **only if that set
 is a quorum** (a strict majority) of the cluster. **Only the leader runs
 *scheduled* jobs.** Manual runs through the API (`POST /jobs/{name}/start`) are
 deliberately *not* gated, so you can still trigger a job on any node.
@@ -473,7 +473,7 @@ down, so no firing double-runs while the roll-out is under way.
 
 The comparison ignores job-set agreement on purpose. A resize rolled out
 together with a job change (a `peers` edit and a job edit in the same deploy)
-puts the old and new config generations on different job-set ids, so the two
+puts the old and new config generations on different job-set IDs, so the two
 sides see each other as `syncing` or `drifted` rather than `agreed`, while each
 side can still reach a quorum under its own `N`. Comparing every reachable
 peer's `N` catches that roll too: it stands **every** `Leader` job down on every
@@ -590,7 +590,7 @@ Notes:
   per-poll payload lean for the common single-instance case, `clusterPolicy` is
   **omitted** from `GET /jobs` when election is not configured.
 
-* `clusterPolicy` is part of the [job-set id](#the-job-set-id-foundation), so
+* `clusterPolicy` is part of the [job-set ID](#the-job-set-id-foundation), so
   replicas that disagree on a job's policy surface as drift.
 
 The decision for one node, one firing, is exactly:
@@ -684,7 +684,7 @@ vocabulary:
 The cross-node "already ran" record that gossip advertises peer-to-peer is
 **persisted in the lease store** instead (a Kubernetes Lease annotation, an etcd
 sibling key, append-only records in the filesystem store's `cluster/reboot-ran`
-stream), scoped to the current [job-set id](#the-job-set-id-foundation), so
+stream), scoped to the current [job-set ID](#the-job-set-id-foundation), so
 a failover holder does not re-run the one-shot.
 
 That guarantee is closed from the read side too. A node that has newly
@@ -700,7 +700,7 @@ Because the store outlives the processes, this shifts the semantics: a `Leader`
 `@reboot` runs **once per job configuration**, not once per boot. Restarting
 the whole fleet with an unchanged config does *not* re-fire it, because every
 node reads the record back and retires the one-shot without running it. It
-fires again only when the job set changes (a new job-set id invalidates the
+fires again only when the job set changes (a new job-set ID invalidates the
 stored record), so a warm-up or migration step that must run on every deploy
 cannot rely on a leader-gated `@reboot` here unless the deploy also changes the
 job set.
@@ -775,7 +775,7 @@ What to know:
   flag, **stands this node's `Leader` jobs down** (fail closed) until every node
   reconverges on one policy.
 
-  `distribution` is *not* part of the job-set id (it is cluster config, not a
+  `distribution` is *not* part of the job-set ID (it is cluster config, not a
   job property), so a mismatch does not show up as drift. Treat it like
   `electLeader` and roll it out uniformly. It is inert without `electLeader`
   (and cronstable warns if you set it anyway).
@@ -1443,8 +1443,8 @@ treat its own freshly-won lease as expired).
 * **`@reboot` one-shots.** Same semantics as the other lease backends: once
   per job **configuration**, not once per boot. The "already ran" set is
   persisted as **append-only records** (one per newly-ran job, tagged with
-  the job-set id) in the store's `cluster/reboot-ran` stream. Readers union
-  the records matching the *live* job-set id, and the stream is pruned to the
+  the job-set ID) in the store's `cluster/reboot-ran` stream. Readers union
+  the records matching the *live* job-set ID, and the stream is pruned to the
   newest **512** records (a documented bound). The set is re-read every 60 s
   and immediately on gaining leadership, so a failover leader never re-runs a
   one-shot the old leader marked moments before.
@@ -1594,7 +1594,7 @@ has the RBAC + `Deployment` to apply against any cluster (k3d/kind for local).
 
 ## See also
 
-- [job-set id](Job-Set-ID): the fingerprint the cluster compares (exact field coverage, no-secrets guarantees, every surface it appears on).
+- [job-set ID](Job-Set-ID): the fingerprint the cluster compares (exact field coverage, no-secrets guarantees, every surface it appears on).
 - [Configuration Reference](Configuration-Reference): the `cluster` section and `clusterPolicy` option schema.
 - [HTTP Control API](HTTP-API): the `GET /cluster` endpoint.
 - [Web Dashboard](Web-Dashboard): the cluster panel and per-job policy display.

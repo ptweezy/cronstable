@@ -25,7 +25,7 @@ rather than blocking import. For the operator-facing walkthrough, see
 | `cronstable/cronexpr.py` | The built-in cron expression engine: `CronTab` parsing (5/6/7-field dialect, names, `L` forms, `@`-nicknames), `next()` (strictly-future, DST-correct, 2099 horizon), and `test()`. A stdlib-only leaf module, behavior-compatible with the parse-crontab library it replaced, enforced by the golden vectors in `tests/data/cron_golden.json`. See [schedules and time zones](Schedules-and-Timezones). |
 | `cronstable/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
 | `cronstable/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`, `WebhookReporter`), and `JobRetryState`. |
-| `cronstable/fingerprint.py` | The order-independent **job-set id**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and `cluster.py` (peer comparison). |
+| `cronstable/fingerprint.py` | The order-independent **job-set ID**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and `cluster.py` (peer comparison). |
 | `cronstable/leadership.py` | The pluggable-backend seam: the `LeadershipBackend` ABC every leader-gating call in `cron.py` goes through (`start`/`stop`/`is_leader`/`leader_name`/`is_quorate`/`view_dict` plus the defaulted per-job, conflict, `@reboot`, and never-skip `available_*` families), the `LeaseBackend` shared base for the single-holder lease backends, and the `make_backend` factory, which builds the one `cluster.backend` names (`gossip` -> `cluster.ClusterManager`, `kubernetes` -> `backends.kubernetes.KubernetesBackend`, `etcd` -> `backends.etcd.EtcdBackend`, `filesystem` -> `backends.filesystem.FilesystemBackend`), through deferred imports. |
 | `cronstable/backends/kubernetes.py` | `KubernetesBackend` (a `LeaseBackend`): a `coordination.k8s.io/v1` `Lease` driven over either the official `kubernetes` client or a hand-rolled apiserver REST transport (`cluster.kubernetes.clientLibrary` chooses `auto`/`library`/`http`). |
 | `cronstable/backends/etcd.py` | `EtcdBackend` (a `LeaseBackend`): a lease-backed key/election against etcd's v3 gRPC-gateway JSON/HTTP API, a single fully-portable transport with no optional client library. |
@@ -258,7 +258,7 @@ backend's `reboot_ran` path.
 When `_stop_event` is set the `while` loop exits and `Cron.run` logs
 `"Shutting down (after currently running jobs finish)..."`, then:
 
-1. Drains pending retries: while `self.retry_state` is non-empty, it
+1. Drains pending retries: while `self.retry_state` is nonempty, it
    `cancel_job_retries(name)` for every entry concurrently with
    `asyncio.gather`, passing `settle=None`. With a `state:` section configured,
    a graceful stop leaves each pending durable ladder record in place for the
@@ -308,7 +308,7 @@ merging, and defaults application all happen inside `parse_config*`. See
 - If a runner exists and the new `web_config` is `None` or differs from the
   currently applied `self.web_config`, the old server is cleaned up and
   `self.web_runner` is reset to `None`.
-- If a `web_config` with a non-empty `listen` list exists and no runner is
+- If a `web_config` with a nonempty `listen` list exists and no runner is
   running, a new `web.Application` is built. When `authToken` is configured,
   `_resolve_web_token` resolves the bearer token from exactly one source
   (`value`, `fromFile`, or `fromEnvVar`) and raises `ConfigError` if it
@@ -373,7 +373,7 @@ tiny:
 The `@reboot` "already ran" defaults (`reboot_ran` false, `mark_reboot_ran` a
 no-op) are the one pair `LeaseBackend` **replaces** rather than inherits. It
 persists the ran-set in the lease store (a Lease annotation / etcd sibling key
-under `REBOOT_RAN_KEY`), scoped to the job-set id, so a *failover* holder does
+under `REBOOT_RAN_KEY`), scoped to the job-set ID, so a *failover* holder does
 not re-run a one-shot (see
 [clustering and leader election](Clustering-and-Leader-Election)). Gossip
 overrides every defaulted method with its richer behavior, so the gossip path
@@ -698,7 +698,7 @@ calls `await running_job.start()`, and registers the instance with
 
 5. **Failure classification.** `fail_reason` is a property evaluated against
    `failsWhen`: `always`, then `nonzeroReturn` (`retcode != 0`), then
-   `producesStdout`/`producesStderr` (true when captured output is non-empty
+   `producesStdout`/`producesStderr` (true when captured output is nonempty
    *or* lines were discarded). `failed` is `fail_reason is not None`.
 
 6. **Reporting.** `report_failure`, `report_permanent_failure`, and
@@ -816,7 +816,7 @@ one, the preceding flow is complete and retries die with the process):
 
   - a malformed record;
   - a per-job digest mismatch (`config-changed`, per-job and stricter than the
-    whole-set job-set id, so unrelated config edits do not drop the retry);
+    whole-set job-set ID, so unrelated config edits do not drop the retry);
   - a disabled job;
   - an exhausted budget;
   - a record older than the job's `startingDeadlineSeconds`;

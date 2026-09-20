@@ -1,25 +1,16 @@
-"""argparse wiring for the subcommands whose implementations must stay lazy.
+"""Argument parsers for subcommands whose implementations load on demand.
 
-One `cronstable` entry point fronts several heavyweight surfaces: the
-job-facing state verbs (:mod:`cronstable.jobcli`), the MCP stdio bridge
-(:mod:`cronstable.mcpcli`) and the terminal dashboard (:mod:`cronstable.tui`).
-Every invocation builds the full parser first (the daemon, ``--version``, and
-each job-spawned thin client such as ``state get`` or ``lock``), so the
-parser definitions cannot live in those modules: importing tui alone runs its
-~7000-line module body and pulls unicodedata's C table plus dozens of other
-modules (~50ms), and jobcli drags urllib.request/ssl/email in for ~27ms.
-The definitions live here instead; the real modules are imported only inside
-their dispatch branches (see ``cronstable.__main__.main_loop``), and
-tests/test_cli_stubs.py pins that lazy-import property.
+Every cronstable invocation builds the full parser, including ``--version``
+and commands launched by jobs, such as ``state get``. Keeping parser
+registration here avoids importing the terminal dashboard, MCP bridge, and
+job client until their commands run. ``cronstable.__main__.main_loop``
+imports each implementation in its dispatch branch.
+``tests/test_cli_stubs.py`` verifies this behavior.
 
-Like :mod:`cronstable.tlsutil`, this module is a deliberate leaf: it imports
-nothing from ``cronstable`` and nothing outside the standard library, so
-``cronstable.__main__`` and each surface module can import it at module
-level for free.  mcpcli and tui re-export their registration function and
-constants under the original public names, so ``from cronstable.tui
-import add_tui_command`` (and every test that reaches these through the
-surface modules) keeps working; jobcli imports nothing from here, its
-parsers are registered directly by ``cronstable.__main__``.
+This module imports only the standard library and has no dependencies on
+other cronstable modules. The ``mcpcli`` and ``tui`` modules re-export their
+registration functions and constants under their existing public names.
+``cronstable.__main__`` registers the job client parsers directly.
 """
 
 import argparse
@@ -59,13 +50,13 @@ def _add_scope_flags(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--scope",
         metavar="NAME",
-        help="the namespace to act in (default: this job's own name)",
+        help="namespace for this operation (default: this job's name)",
     )
     group.add_argument(
         "--global",
         dest="use_global",
         action="store_true",
-        help="act in the shared `global` scope (cross-job coordination)",
+        help="use the shared global scope to coordinate across jobs",
     )
 
 
@@ -135,14 +126,14 @@ def add_job_commands(sub: Any) -> None:
     cget.add_argument("name")
     _add_scope_flags(cget)
     cadv = cursor_actions.add_parser(
-        "advance", help="move a cursor forward (use --force to move backwards)"
+        "advance", help="move a cursor forward (use --force to move backward)"
     )
     cadv.add_argument("name")
     cadv.add_argument("value")
     cadv.add_argument(
         "--force",
         action="store_true",
-        help="set the value even if it moves the cursor backwards",
+        help="set the value even if it moves the cursor backward",
     )
     _add_scope_flags(cadv)
 
@@ -153,7 +144,7 @@ def add_job_commands(sub: Any) -> None:
     )
     lock_actions = lock.add_subparsers(dest="lock_command", metavar="ACTION")
     for verb, help_text in (
-        ("acquire", "take the lock; print its hold token"),
+        ("acquire", "acquire the lock and print its token"),
         ("run", "hold the lock while running a command"),
     ):
         p = lock_actions.add_parser(verb, help=help_text)
@@ -174,14 +165,15 @@ def add_job_commands(sub: Any) -> None:
             type=float,
             default=0.0,
             metavar="SECONDS",
-            help="how long --wait blocks before giving up",
+            help="maximum wait time with --wait, in seconds",
         )
         p.add_argument(
             "--ttl",
             type=float,
             default=None,
             metavar="SECONDS",
-            help="lease TTL (default: state.jobApi.lockTtlSeconds)",
+            help="lease duration in seconds "
+            "(default: state.jobApi.lockTtlSeconds)",
         )
         _add_scope_flags(p)
         if verb == "run":
@@ -218,7 +210,7 @@ def add_job_commands(sub: Any) -> None:
     aput.add_argument("file", nargs="?", default=None)
     _add_scope_flags(aput)
     aget = art_actions.add_parser(
-        "get", help="fetch an artifact (to -o FILE or stdout)"
+        "get", help="write an artifact to stdout or the file specified by -o"
     )
     aget.add_argument("name")
     aget.add_argument("-o", "--output", default=None, metavar="FILE")
@@ -229,9 +221,8 @@ def add_job_commands(sub: Any) -> None:
     # idempotent
     idem = sub.add_parser(
         "idempotent",
-        help="claim a key once across nodes (exit 0 for a new claim, 5 if "
-        "claimed, "
-        "1 error)",
+        help="claim a key once across nodes (exit 0 for a new claim, "
+        "5 for an existing claim, or 1 on error)",
     )
     idem.add_argument("key")
     idem.add_argument(
@@ -239,12 +230,12 @@ def add_job_commands(sub: Any) -> None:
         type=float,
         default=0.0,
         metavar="SECONDS",
-        help="expire the claim after N seconds (0 = permanent)",
+        help="expire the claim after SECONDS (0 = permanent)",
     )
     idem.add_argument(
         "--release",
         action="store_true",
-        help="drop the claim instead of making it",
+        help="release the claim instead of creating it",
     )
     _add_scope_flags(idem)
 
@@ -263,7 +254,7 @@ def add_job_commands(sub: Any) -> None:
         "pull", help="read an upstream task's output by key"
     )
     xpull.add_argument(
-        "--task", required=True, metavar="TASK", help="the upstream task id"
+        "--task", required=True, metavar="TASK", help="the upstream task ID"
     )
     xpull.add_argument("--key", required=True, help="the XCom key to read")
     xpull.add_argument(
@@ -296,14 +287,11 @@ def _add_web_client_flags(
     url_help: str,
     token_env_default: str | None = None,
 ) -> None:
-    """Declare the connection flags every web-listener client takes.
+    """Add shared connection flags for the MCP and TUI clients.
 
-    The `mcp` and `tui` subcommands accept the same seven flags with the
-    same dests, actions and defaults, so both surfaces' _resolve_token /
-    _resolve_tls plumbing sees one shape. Only the --url help (each
-    surface names its own endpoint) and the --token-env declaration
-    default vary per caller; the latter is cosmetic, both surfaces fall
-    back to WEB_ENV_TOKEN at runtime either way.
+    Both clients use the same destinations, actions, and runtime defaults.
+    Only the URL help and the displayed ``--token-env`` default vary.
+    Both clients fall back to ``WEB_ENV_TOKEN`` at runtime.
     """
     parser.add_argument(
         "--url",
@@ -315,33 +303,30 @@ def _add_web_client_flags(
         "--token",
         default=None,
         metavar="TOKEN",
-        help="web.authToken bearer value (prefer --token-env to keep it out "
-        "of the process table)",
+        help="bearer token for the web API (use --token-env to keep it out "
+        "of the process list)",
     )
     parser.add_argument(
         "--token-env",
         default=token_env_default,
         metavar="VAR",
-        help="env var holding the bearer token (default: {} if set)".format(
-            WEB_ENV_TOKEN
-        ),
+        help="environment variable containing the bearer token "
+        "(default: {} if set)".format(WEB_ENV_TOKEN),
     )
     parser.add_argument(
         "--cacert",
         default=None,
         metavar="PATH",
-        help="verify the listener against this CA file instead of the system "
-        "trust store, for an internally-issued or self-signed certificate "
+        help="verify the server certificate with this CA file instead of "
+        "the system trust store "
         "(default: {} if set)".format(WEB_ENV_CACERT),
     )
     parser.add_argument(
         "--client-cert",
         default=None,
         metavar="PATH",
-        help="client certificate to present to a listener configured with "
-        "web.tls.clientCa, which requires one (default: {} if set)".format(
-            WEB_ENV_CLIENT_CERT
-        ),
+        help="client certificate for a listener that requires one through "
+        "web.tls.clientCa (default: {} if set)".format(WEB_ENV_CLIENT_CERT),
     )
     parser.add_argument(
         "--client-key",
@@ -354,8 +339,8 @@ def _add_web_client_flags(
     parser.add_argument(
         "--insecure",
         action="store_true",
-        help="skip TLS verification entirely; the bearer token is still sent, "
-        "so it goes to whoever answers (set {}=1 for the same)".format(
+        help="disable TLS certificate verification; this can expose the "
+        "bearer token to an untrusted server (equivalent to {}=1)".format(
             WEB_ENV_INSECURE
         ),
     )
@@ -391,13 +376,11 @@ def add_mcp_command(sub: Any) -> None:
         dest="mcp_check",
         default=False,
         action="store_true",
-        help="handshake the endpoint (initialize + tools/list) and exit, "
-        "instead of proxying stdin",
+        help="check the connection with initialize and tools/list, then exit",
     )
 
 
-#: The service the SCM knows cronstable by when nothing else is said.  Also
-#: the display name's stem and the key `sc query cronstable` answers to.
+#: Default Service Control Manager name and base display name.
 SERVICE_NAME_DEFAULT = "cronstable"
 
 
@@ -420,45 +403,38 @@ def _add_service_config_flag(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_service_log_flags(parser: argparse.ArgumentParser) -> None:
-    """The bootstrap-log flags `run` needs and `install` bakes in."""
+    """Add startup logging flags for service installation and execution."""
     parser.add_argument(
         "--log-file",
         default=None,
         metavar="PATH",
-        help="bootstrap log file (default: a logs/ directory beside the "
-        "configuration). A service has no console, so without this there "
-        "is nowhere for a startup failure to be reported",
+        help="file for startup logs (default: in a logs/ directory beside "
+        "the configuration); records startup failures when the service "
+        "has no console",
     )
     parser.add_argument(
         "--no-log-file",
         default=False,
         action="store_true",
-        help="do not open a bootstrap log; use when the configuration's "
-        "own `logging:` section is the only log you want",
+        help="disable the startup log file and use only the logging section "
+        "in the configuration",
     )
     parser.add_argument(
         "--console",
         default=False,
         action="store_true",
-        help="allocate a console for the service, so a job kill can send "
-        "the trappable CTRL_BREAK step that killTimeout bounds "
-        "(off by default; see the Windows Service documentation)",
+        help="allocate a console so jobs can handle CTRL_BREAK before "
+        "killTimeout expires (off by default; see the Windows service "
+        "documentation)",
     )
 
 
 def add_import_taskscheduler_command(sub: Any) -> None:
     """Register ``cronstable import-taskscheduler``.
 
-    A flat verb rather than ``import <format>``: a nested subparser would
-    buy a second dest, another --help level and a "no format given" error
-    path today, against a compatibility break that only exists if a second
-    format ever ships. A future importer is a sibling verb, which costs
-    nothing either way.
-
-    Declared in this leaf rather than beside `init` in __main__ because,
-    unlike `init`, its implementation is a separate module that pulls in
-    the XML parser, and that is exactly the distinction this module exists
-    to draw.
+    Keep registration here so unrelated commands do not import the XML
+    parser. A separate top-level command avoids an extra subparser for
+    the single supported import format.
     """
     parser = sub.add_parser(
         "import-taskscheduler",
@@ -467,10 +443,10 @@ def add_import_taskscheduler_command(sub: Any) -> None:
         description=(
             "Convert one or more Task Scheduler exports (schtasks /query "
             "/XML ONE, or Export-ScheduledTask) into cronstable YAML. The "
-            "converted configuration goes to stdout or -o; a report of "
-            "everything that could not be carried across goes to stderr. "
-            "Review the result before loading it: exporting a task does "
-            "not unregister it."
+            "converted configuration goes to stdout or the file specified "
+            "by -o. Unsupported features are reported on stderr. "
+            "Review the result before loading it: exported tasks remain "
+            "registered in Task Scheduler."
         ),
     )
     parser.add_argument(
@@ -484,37 +460,34 @@ def add_import_taskscheduler_command(sub: Any) -> None:
         "--output",
         default=None,
         metavar="FILE",
-        help="write the configuration here instead of stdout",
+        help="write the configuration to FILE instead of stdout",
     )
     parser.add_argument(
         "--timezone",
         default=None,
         metavar="NAME",
-        help="evaluate every converted schedule in this IANA timezone "
-        "(default: keep each task's own clock, which for a task with no "
-        "stored offset is the daemon host's local time)",
+        help="evaluate every converted schedule in this IANA time zone "
+        "(default: preserve each task's offset, or use the daemon host's "
+        "local time if the task has no stored offset)",
     )
 
 
 def add_service_command(sub: Any) -> None:
     """Register ``cronstable service <action>`` on the root subparsers.
 
-    Declared here, in the stdlib-only leaf, for the reason this module
-    exists at all: ``cronstable.winservice`` pulls in ctypes, the Win32
-    surface and (in the ``run`` branch) the entire scheduler graph, and
-    every invocation of the program builds this parser first.  The real
-    module is imported only inside its dispatch branch.
+    Keep registration here so unrelated commands do not import ctypes,
+    the Windows APIs, or the scheduler through ``cronstable.winservice``.
     """
     parser = sub.add_parser(
         "service",
-        help="install, remove or control cronstable as a Windows service "
+        help="install, remove, or control cronstable as a Windows service "
         "(Windows only)",
         description=(
-            "Run cronstable as a Windows service, so it starts at boot and "
-            "keeps running whether or not anyone is logged on. `install` "
-            "registers it with the Service Control Manager and needs an "
-            "elevated prompt; `run` is what the SCM itself invokes and is "
-            "not meant to be typed."
+            "Run cronstable as a Windows service. By default, it starts at "
+            "boot and runs even when no user is signed in. Run install "
+            "from an elevated command prompt to register the service. "
+            "The Service Control Manager invokes run; do not invoke it "
+            "manually."
         ),
     )
     actions = parser.add_subparsers(dest="service_command", metavar="ACTION")
@@ -547,7 +520,7 @@ def add_service_command(sub: Any) -> None:
         "--log-level",
         default="INFO",
         metavar="LEVEL",
-        help="log level baked into the service's command line "
+        help="log level saved in the service's command line "
         "(default: %(default)s)",
     )
     install.add_argument(
@@ -586,25 +559,24 @@ def add_service_command(sub: Any) -> None:
         type=float,
         default=0.0,
         metavar="SECONDS",
-        help="how long to wait for the drain; 0 (the default) waits as "
-        "long as the running jobs take",
+        help="time to wait for running jobs to finish, in seconds; "
+        "0 (the default) waits without a timeout",
     )
     _named(
         actions.add_parser(
             "reload",
-            help="make the running service reload its configuration now, "
-            "reparsing even when file stats are unchanged (what SIGHUP "
-            "does on POSIX)",
+            help="reload the configuration even if file metadata is unchanged "
+            "(equivalent to SIGHUP on POSIX)",
         )
     )
     _named(
-        actions.add_parser("status", help="print the service's state and pid")
+        actions.add_parser("status", help="print the service's state and PID")
     )
     run = _named(
         actions.add_parser(
             "run",
             help="the entry point the Service Control Manager invokes; "
-            "not meant to be run by hand",
+            "do not invoke manually",
         )
     )
     _add_service_config_flag(run)
@@ -632,7 +604,7 @@ def add_tui_command(sub: Any) -> None:
         "--theme",
         default=None,
         choices=list(THEME_HUES) + [h + "-light" for h in THEME_HUES],
-        help="start on a specific theme (persisted for next time)",
+        help="select a theme and save it for future sessions",
     )
     parser.add_argument(
         "--tv",
@@ -658,12 +630,13 @@ def add_tui_command(sub: Any) -> None:
     parser.add_argument(
         "--ascii",
         action="store_true",
-        help="plain-ASCII status glyphs (limited fonts/terminals)",
+        help="use ASCII status symbols for terminals with limited fonts",
     )
     parser.add_argument(
         "--poll",
         type=float,
         default=None,
         metavar="SECONDS",
-        help="refresh interval; 0 pauses (default: remembered, else 3)",
+        help="refresh interval in seconds; 0 pauses (default: saved value, "
+        "or 3 if none is saved)",
     )

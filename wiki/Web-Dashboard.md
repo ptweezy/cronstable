@@ -45,7 +45,7 @@ The landing page is a single sortable, filterable table of every configured job.
 
 The header carries the wordmark (whose `l` is a live
 [pendulum simulation](#the-pendulum-wordmark)), the daemon's version, the
-[job-set id](Job-Set-ID) as a short `#…` chip, a live UTC clock, a **node
+[job-set ID](Job-Set-ID) as a short `#…` chip, a live UTC clock, a **node
 meter**, a **connection indicator**, and **summary pills** counting the total
 jobs and how many are running, failing, paused, and OK. Hover the `#…` chip for
 the full id; click either chip to copy the value. The connection indicator reads
@@ -318,7 +318,7 @@ job list and renders:
       `distribution` / `elect_leader`.
 - a **per-peer table** with the on-screen headers **Peer** | **Node** | **Owns**
   | **Status** | **Job set**. It lists each peer's address, reported node name,
-  status, and the short form of its job-set id. The **Owns** column, counting
+  status, and the short form of its job-set ID. The **Owns** column, counting
   how many jobs each node owns, is present only under
   [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load),
   so the whole job-to-node distribution is visible; it pairs with the per-job
@@ -333,8 +333,9 @@ job list and renders:
     so no status has come back.
 
 Peers the node has listed as its own address (`self`) are excluded from the
-agreement tally. This makes it easy to watch a rolling deploy (`syncing` →
-`agreed`), spot drift, or watch leadership move when a node goes down.
+agreement tally. Use the peer statuses to monitor a rolling deployment
+(`syncing` → `agreed`), detect drift, or track leadership changes when a
+node becomes unavailable.
 
 A **`▚ timeline`** button in the panel header toggles a per-peer **swimlane**:
 one lane per peer, colored by status over time, that accumulates in the browser
@@ -639,7 +640,7 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 
 Ten themes and two interface fonts. [GIF version](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-themes.gif).
 
-[![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)
+[![The boot self-test screen: firmware version, job-set ID, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-boot.png)
 
 [![The settings panel: theme, compact density, desktop notifications, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-settings.png)
 
@@ -795,7 +796,7 @@ The dashboard is a thin client over the [HTTP control API](HTTP-API):
 - the [live logs panel](#merged-multi-tail) opens up to four of those SSE streams at once (one per tailed job) and re-attaches them as runs come and go;
 - the [DAG drawer](#dag-orchestration) fetches `GET /dags/{name}/runs`, the selected run's document and XCom list, and a running task's log SSE stream; its buttons call `POST /dags/{name}/trigger`, `POST /dags/{name}/backfill`, and the approval decision endpoint;
 - the **Run** / **Stop** buttons call `POST /jobs/{name}/start` and `POST /jobs/{name}/cancel`;
-- the version in the header comes from `GET /version`, and the [job-set id](Job-Set-ID) chip beside it from `GET /job-set-id` (each fetched once at load).
+- the version in the header comes from `GET /version`, and the [job-set ID](Job-Set-ID) chip beside it from `GET /job-set-id` (each fetched once at load).
 
 By default, the daemon keeps run history (the most recent 50 runs per job)
 and captured output **in memory**, resetting both on restart. A
