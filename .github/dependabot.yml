@@ -31,12 +31,13 @@ updates:
 
   # Update Python dependencies in pyproject.toml. Regenerate derived
   # requirements with scripts/generate_build_files.py before merging.
+  # Keep requirements_min.txt visible to configured dependency scans:
+  # excluding it left GitHub's graph reporting obsolete vulnerable pins.
   - package-ecosystem: pip
     directory: "/"
     exclude-paths:
       - "requirements_dev.txt"
       - "requirements_dev_freethreaded.txt"
-      - "requirements_min.txt"
       - "pyinstaller/requirements/**"
     schedule:
       interval: weekly
