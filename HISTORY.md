@@ -1,6 +1,6 @@
 # History
 
-## Unreleased
+## 1.2.54
 
 - Make scheduled runs and occurrence lists agree across daylight-saving
   gaps. Preserve every shifted spring-forward run in calendar feeds and
