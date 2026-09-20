@@ -1561,7 +1561,7 @@ def test_version_and_job_set_chips_copy_their_values(browser, tmp_path):
             # the chip shows a short prefix; the click copies all of it
             assert len(page.text_content("#jobset")) == 13
             page.click("#jobset")
-            e2e.wait_toast(page, "copied job set id")
+            e2e.wait_toast(page, "copied job-set ID")
             assert page.evaluate("navigator.clipboard.readText()") == full
             # the node meter opens the node history card
             page.wait_for_selector("#nodeMeter .m")
