@@ -2353,23 +2353,16 @@ jobs:
             runner: macos-15-intel    # macOS 15, Intel -- shipped
             ship: true
             asset: macos-amd64
-            # cryptography 49.0.0 dropped x86_64 macOS; 48.0.1 (2026-06-09)
-            # is the last release with a universal2 wheel, and its OpenSSL
-            # 4.0.1 seals ML-KEM. The Intel rows pin below 49 so the wheel
-            # resolves, which means these two binaries carry a cryptography
-            # that receives no further fixes. Bounded on purpose: the daemon
-            # uses it for one HPKE seal per alert and nothing else (no TLS,
-            # no parsing of untrusted input), so the exposure is the KEM and
-            # AEAD code paths, and the alternative is no post-quantum sealing
-            # on Intel Macs at all.
-            pq: hard
-            pqcap: ',<49'
+            # Upstream dropped Intel wheels before the security fixes.
+            # Try patched source with Rust/OpenSSL; keep x25519 if it fails.
+            pq: soft
+            pq_src: '1'
           - arch: amd64v3
             runner: macos-15-intel    # macOS 15, Intel -- shipped
             ship: true
             asset: macos-amd64v3
-            pq: hard
-            pqcap: ',<49'
+            pq: soft
+            pq_src: '1'
     runs-on: ${{ matrix.runner }}
     # The macOS 26 rows are coverage-only: never let them gate a release.
     continue-on-error: ${{ !matrix.ship }}
@@ -2437,7 +2430,7 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         run: |
           set -euo pipefail
-          # Runner-native, all-wheels arch: install into a throwaway uv venv and
+          # Install into a throwaway uv venv on the runner's native arch and
           # freeze from it with `uv run` (uv discovers the setup-python 3.14).
           uv venv --python "${{ steps.runtime.outputs.python-path || '3.14' }}"
           uv pip install pyinstaller==6.22.1  # pin matches the Linux jobs
@@ -2459,16 +2452,25 @@ jobs:
           # ship the advertised push channel disabled).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_extra.sh pynacl "@" hard
-          # Bundle cryptography (the post-quantum half of the `push` extra) so the frozen daemon
-          # seals post-quantum X-Wing push. Every row declares `pq`: the
-          # arm64 rows take the newest release, and the Intel rows cap at
-          # `pqcap` (below 49, the last line with a universal2 wheel; see the
-          # matrix). hard everywhere, and verify_extra.py seals a real X-Wing
-          # probe before freezing.
+          # Bundle patched cryptography for X-Wing. Apple Silicon uses a
+          # wheel; Intel attempts a source build with current Rust/OpenSSL.
+          # verify_extra.py seals a real X-Wing probe before freezing.
           if [ -n "${{ matrix.pq }}" ]; then
-            PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-              sh pyinstaller/install_extra.sh cryptography "@${{ matrix.pqcap }}" \
-                ${{ matrix.pq }} "post-quantum push not bundled"
+            pq_ready=1
+            if [ -n "${{ matrix.pq_src }}" ]; then
+              if brew install openssl@3 rust && OPENSSL_DIR=$(brew --prefix openssl@3); then
+                export OPENSSL_DIR OPENSSL_STATIC=1
+              else
+                pq_ready=0
+              fi
+            fi
+            if [ "$pq_ready" = 1 ]; then
+              PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+                sh pyinstaller/install_extra.sh cryptography "@" \
+                  ${{ matrix.pq }} "post-quantum push not bundled"
+            else
+              echo "cryptography: source-build toolchain setup failed; post-quantum push not bundled"
+            fi
           fi
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on both arches, HARD failure. LGPL-2.1; in-binary notice +
@@ -2481,7 +2483,7 @@ jobs:
           # fail closed at config validation when they cannot import).
           dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
           # Gate the FROZEN artifact too (see install_extra.sh header).
-          if [ -n "${{ matrix.pq }}" ]; then
+          if uv run python -c "import cryptography" 2>/dev/null; then
             suites=$(dist/cronstable --sealable-suites)
             echo "sealable suites: $suites"
             echo "$suites" | grep -qx xwing || {
@@ -2585,14 +2587,14 @@ jobs:
             runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
             ship: false
             asset: macos26-amd64
-            pq: hard   # see the macOS 15 Intel row
-            pqcap: ',<49'
+            pq: soft
+            pq_src: '1'
           - arch: amd64v3
             runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
             ship: false
             asset: macos26-amd64v3
-            pq: hard   # see the macOS 15 Intel row
-            pqcap: ',<49'
+            pq: soft
+            pq_src: '1'
     runs-on: ${{ matrix.runner }}
     # The macOS 26 rows are coverage-only: never let them gate a release.
     continue-on-error: ${{ !matrix.ship }}
@@ -3329,17 +3331,21 @@ jobs:
             # then refuses xwing pairings (x25519 push still seals).
             pq: soft
             pq_src: '1'
+            pq_rust_host: aarch64-pc-windows-msvc
+            pq_rust_target: aarch64-pc-windows-msvc
+            pq_vcpkg_triplet: arm64-windows-static
           - arch: i686
             runner: windows-latest
             pyarch: x86
             pfsuffix: ' (x86)'
             regflag: /reg:32
-            # cryptography 49.0.0 dropped 32-bit Windows; 48.0.1 is the last
-            # release with a win32 wheel, on an OpenSSL that seals ML-KEM.
-            # Same pin and the same fixed-version tradeoff as the Intel
-            # macOS rows (see binaries-macos).
-            pq: hard
-            pqcap: ',<49'
+            # Upstream dropped win32 wheels before the security fixes.
+            # Try patched source, targeting 32 bits even on this x64 host.
+            pq: soft
+            pq_src: '1'
+            pq_rust_host: x86_64-pc-windows-msvc
+            pq_rust_target: i686-pc-windows-msvc
+            pq_vcpkg_triplet: x86-windows-static
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -3395,9 +3401,8 @@ jobs:
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_extra.sh pynacl "@" hard
           # Bundle cryptography (the post-quantum half of the `push` extra) so the frozen daemon
-          # seals post-quantum X-Wing push. amd64 and i686 take a wheel
-          # (i686 capped by `pqcap` at the last release with a win32 wheel);
-          # arm64 has none and builds from source (pq_src, see the matrix).
+          # seals post-quantum X-Wing push. amd64 takes a patched wheel;
+          # arm64 and i686 attempt source builds (pq_src, see the matrix).
           # Either way verify_extra.py seals a real X-Wing probe before
           # freezing.
           if [ -n "${{ matrix.pq }}" ]; then
@@ -3406,32 +3411,37 @@ jobs:
               # The toolchain for a source build, best effort as a whole:
               # the row is soft, so a step here that fails costs the build
               # its post-quantum suite (logged below), never the job.
-              {
+              prepare_crypto_toolchain() {
                 # A current Rust for this host. The arm64 image does not
                 # promise one, so rustup-init is fetched when cargo is absent.
                 if ! command -v cargo >/dev/null 2>&1; then
                   curl --proto '=https' --tlsv1.2 -sSfo rustup-init.exe \
-                    https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe
-                  ./rustup-init.exe -y --profile minimal --default-toolchain stable
+                    "https://static.rust-lang.org/rustup/dist/${{ matrix.pq_rust_host }}/rustup-init.exe" || return 1
+                  ./rustup-init.exe -y --profile minimal --default-toolchain stable || return 1
                   export PATH="$USERPROFILE/.cargo/bin:$PATH"
                 fi
+                rustup toolchain install stable --profile minimal || return 1
+                rustup target add --toolchain stable "${{ matrix.pq_rust_target }}" || return 1
+                export RUSTUP_TOOLCHAIN=stable
+                export CARGO_BUILD_TARGET="${{ matrix.pq_rust_target }}"
                 # A static OpenSSL 3.5+ from the runner's vcpkg, brought to
                 # the current port set first: the checkout an image carries
                 # can predate the OpenSSL release ML-KEM needs, and the probe
                 # below would then drop a build that compiled fine. vcpkg
                 # fetches its own perl, so no toolchain beyond MSVC is
                 # assumed.
-                test -n "${VCPKG_INSTALLATION_ROOT:-}"
-                git -C "$VCPKG_INSTALLATION_ROOT" pull --ff-only
-                "$VCPKG_INSTALLATION_ROOT/bootstrap-vcpkg.bat" -disableMetrics
-                "$VCPKG_INSTALLATION_ROOT/vcpkg" install openssl:arm64-windows-static
-                export OPENSSL_DIR="$VCPKG_INSTALLATION_ROOT/installed/arm64-windows-static"
+                test -n "${VCPKG_INSTALLATION_ROOT:-}" || return 1
+                git -C "$VCPKG_INSTALLATION_ROOT" pull --ff-only || return 1
+                "$VCPKG_INSTALLATION_ROOT/bootstrap-vcpkg.bat" -disableMetrics || return 1
+                "$VCPKG_INSTALLATION_ROOT/vcpkg" install "openssl:${{ matrix.pq_vcpkg_triplet }}" || return 1
+                export OPENSSL_DIR="$VCPKG_INSTALLATION_ROOT/installed/${{ matrix.pq_vcpkg_triplet }}"
                 export OPENSSL_STATIC=1
-              } || pq_ready=0
+              }
+              prepare_crypto_toolchain || pq_ready=0
             fi
             if [ "$pq_ready" = 1 ]; then
               PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
-                sh pyinstaller/install_extra.sh cryptography "@${{ matrix.pqcap }}" \
+                sh pyinstaller/install_extra.sh cryptography "@" \
                   ${{ matrix.pq }} "post-quantum push not bundled"
             else
               echo "cryptography: source-build toolchain setup failed; post-quantum push not bundled"

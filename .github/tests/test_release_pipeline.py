@@ -4,10 +4,15 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import re
+import shutil
+import subprocess
 import tarfile
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 from strictyaml.ruamel import YAML
 
 pytest.importorskip("tomllib")  # CI helpers execute on Python 3.14.
@@ -35,6 +40,99 @@ def ancestors(jobs, name):
     if isinstance(needs, str):
         needs = [needs]
     return set(needs).union(*(ancestors(jobs, n) for n in needs))
+
+
+def test_binary_crypto_policy_accepts_the_security_floor():
+    floor = (ROOT / "pyinstaller/requirements/cryptography.txt").read_text()
+    jobs = workflow()["jobs"]
+    for name in (
+        "binaries-macos",
+        "binaries-macos-experimental",
+        "binaries-windows",
+    ):
+        for row in jobs[name]["strategy"]["matrix"]["include"]:
+            source_only = (
+                name.startswith("binaries-macos") and row["arch"] != "arm64"
+            ) or (
+                name == "binaries-windows" and row["arch"] in ("i686", "arm64")
+            )
+            assert row["pq"] == ("soft" if source_only else "hard")
+            assert bool(row.get("pq_src")) == source_only
+            spec = Requirement(floor.strip() + row.get("pqcap", ""))
+            assert "50.0.1" in spec.specifier, (name, row)
+            assert "48.0.1" not in spec.specifier, (name, row)
+            if name == "binaries-windows" and source_only:
+                arch = "x86" if row["arch"] == "i686" else "arm64"
+                target = "i686" if row["arch"] == "i686" else "aarch64"
+                assert row["pq_vcpkg_triplet"] == f"{arch}-windows-static"
+                assert row["pq_rust_target"] == f"{target}-pc-windows-msvc"
+
+
+@pytest.mark.parametrize("fail_setup", [False, True])
+@pytest.mark.parametrize(
+    "name,arch",
+    [
+        ("binaries-macos", "amd64"),
+        ("binaries-windows", "arm64"),
+        ("binaries-windows", "i686"),
+    ],
+)
+def test_source_crypto_setup_failure_skips_install(
+    tmp_path, name, arch, fail_setup
+):
+    if os.name == "nt" or shutil.which("bash") is None:
+        pytest.skip("POSIX shell harness for the CI bash steps")
+    job = workflow()["jobs"][name]
+    row = next(
+        r for r in job["strategy"]["matrix"]["include"] if r["arch"] == arch
+    )
+    run = next(
+        s["run"] for s in job["steps"] if s.get("name") == "Build binary"
+    )
+    start = run.index('if [ -n "${{ matrix.pq }}" ]; then')
+    block = run[start : run.index("# Bundle zeroconf", start)]
+    block = re.sub(
+        r"\$\{\{ matrix\.(\w+) \}\}",
+        lambda match: str(row.get(match[1], "")),
+        block,
+    )
+    for command in ("bootstrap-vcpkg.bat", "vcpkg"):
+        path = tmp_path / command
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+    # Exercise the actual workflow block, substituting only external tools.
+    # A failed setup must neither install nor fetch/build more dependencies.
+    prelude = """set -eu
+brew() { return "$FAIL_SETUP"; }
+cargo() { return 0; }
+rustup() { return "$FAIL_SETUP"; }
+git() { return 0; }
+sh() {
+    echo "INSTALL:$*"
+    echo "TARGET:${CARGO_BUILD_TARGET:-native}"
+    echo "STATIC:${OPENSSL_STATIC:-0}"
+}
+"""
+    result = subprocess.run(
+        ["bash", "-c", prelude + block],
+        env={
+            **os.environ,
+            "FAIL_SETUP": str(int(fail_setup)),
+            "VCPKG_INSTALLATION_ROOT": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    if fail_setup:
+        assert "INSTALL:" not in result.stdout
+        assert "source-build toolchain setup failed" in result.stdout
+    else:
+        assert "INSTALL:pyinstaller/install_extra.sh cryptography @ soft" in (
+            result.stdout
+        )
+        assert f"TARGET:{row.get('pq_rust_target', 'native')}" in result.stdout
+        assert "STATIC:1" in result.stdout
 
 
 def test_every_required_build_and_preparation_gates_publication():

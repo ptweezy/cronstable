@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -53,6 +54,44 @@ def test_free_threaded_dependencies_omit_only_orjson(generator):
     }
     assert not free_threaded - regular
     assert any(line.startswith("orjson>=") for line in regular)
+
+
+@pytest.mark.parametrize("extra", ["push", "dev"])
+@pytest.mark.parametrize(
+    "system,machine,has_crypto",
+    [
+        ("linux", "x86_64", True),
+        ("linux", "aarch64", True),
+        ("linux", "armv7l", False),
+        ("darwin", "arm64", True),
+        ("darwin", "x86_64", False),
+        ("win32", "AMD64", True),
+        ("win32", "x86", False),
+        ("win32", "ARM64", False),
+    ],
+)
+def test_push_dependencies_resolve_without_vulnerable_legacy_crypto(
+    generator, extra, system, machine, has_crypto
+):
+    project = generator.tomllib.loads((ROOT / "pyproject.toml").read_text())
+    requirements = [
+        Requirement(line)
+        for line in project["project"]["optional-dependencies"][extra]
+    ]
+    environment = {"sys_platform": system, "platform_machine": machine}
+    active = {
+        req.name: req
+        for req in requirements
+        if req.marker is None or req.marker.evaluate(environment)
+    }
+    # X25519 remains available even where patched cryptography has no wheel.
+    assert "pynacl" in active
+    assert ("cryptography" in active) == has_crypto
+    if has_crypto:
+        spec = active["cryptography"].specifier
+        assert "50.0.1" in spec
+        for vulnerable in ("44.0.0", "48.0.0", "48.0.1", "49.0.0"):
+            assert vulnerable not in spec
 
 
 def test_dependency_bump_reaches_dev_binary_and_every_image(

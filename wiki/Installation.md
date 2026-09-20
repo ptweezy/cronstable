@@ -589,9 +589,12 @@ separate lane described later on this page, beside `armel`.
 Each build bundles the optional extras its build lane can take a wheel for
 or compile. `cryptography`, which carries post-quantum push sealing, takes a
 wheel where PyPI has one and is built from source everywhere else, so every
-build seals the `xwing` suite except `linux-mips64le` and `linux-armel`,
-which seal `x25519` only. The `macos-amd64` and `windows-i686` builds carry
-`cryptography` 48.x, the last release line with a wheel for those platforms.
+build can seal the `xwing` suite except `linux-mips64le` and `linux-armel`,
+which seal `x25519` only. Intel macOS (`macos-amd64` and `macos-amd64v3`)
+and `windows-i686` attempt patched cryptography source builds instead of
+bundling the vulnerable 48.x release line. If compilation or the sealing
+probe fails, the binary keeps `x25519` push. Existing `xwing` devices need
+to pair again under `x25519` if the upgraded daemon loses that suite.
 See [Push notifications](Push-Notifications) for what the source builds
 promise and how to check a binary.
 

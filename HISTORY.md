@@ -1,5 +1,16 @@
 # History
 
+## Unreleased
+
+- Require cryptography 50.0.1 or newer for push, development, minimum
+  dependency tests, and binary builds, addressing the OpenSSL, PKCS#7,
+  and certificate-verification security advisories. Intel macOS and
+  32-bit Windows attempt patched source builds for X-Wing instead of
+  bundling the vulnerable cryptography 48.x line. If a build cannot seal
+  X-Wing, it retains X25519 encrypted push; open the companion app to
+  reconnect and update existing X-Wing pairings before relying on push
+  delivery after such an upgrade.
+
 ## 1.2.53
 
 - Fix `onMissed` recovery after system sleep, long stalls, and forward
