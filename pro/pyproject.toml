@@ -29,3 +29,10 @@ dev = ["pytest"]
 
 [tool.setuptools]
 packages = ["cronstable_pro"]
+
+[tool.pytest.ini_options]
+# Pro tests require only pytest and the installed core and Pro packages.
+testpaths = ["tests"]
+addopts = "--strict-config --strict-markers"
+filterwarnings = ["error"]
+faulthandler_timeout = 300

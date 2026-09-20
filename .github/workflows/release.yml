@@ -385,7 +385,7 @@ jobs:
         run: |
           python -m pip install packaging pytest strictyaml
           python .github/scripts/release_inputs.py
-          python -m pytest tests/test_ci_release_pipeline.py -q
+          python -m pytest .github/tests -q
       - name: Validate Linux package recipes
         run: bash .github/scripts/build_packages.sh 1.2.3 "$RUNNER_TEMP/package-check" --check
       - name: Validate package-manager templates
@@ -4190,14 +4190,14 @@ jobs:
       - uses: astral-sh/setup-uv@v10.1.0
         with:
           version: "0.12.5"
-      - name: Build core + pro, prove the boundary, run pro's tests
+      - name: Build the core and Pro packages and run Pro tests
         run: |
           set -euo pipefail
           uv venv --python 3.14
           uv pip install .              # the MIT core (root), from local source
           uv pip install "./pro[dev]"   # cronstable-pro (its core dep is satisfied)
           uv run python -c "import cronstable_pro; print('pro', cronstable_pro.__version__, '/ core', cronstable_pro.core_version())"
-          uv run pytest pro/tests -q
+          uv run python -m pytest pro/tests -q
 
   # ---------------------------------------------------------------------------
   # Publish. Runs ONLY on a release, and ONLY after every gate job above has
