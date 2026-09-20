@@ -92,10 +92,19 @@ def render_dockerfile(template, image, orjson_requirement):
 
 def generated_files(root=ROOT):
     project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+    dev = project["optional-dependencies"]["dev"]
     files = {
         "requirements_dev.txt": GENERATED
         + "# Install with: pip install -r requirements_dev.txt\n"
-        + "\n".join(project["optional-dependencies"]["dev"])
+        + "\n".join(dev)
+        + "\n",
+        # PEP 508 markers cannot distinguish a free-threaded interpreter.
+        # orjson rejects that ABI; exercise cronstable's stdlib fallback.
+        "requirements_dev_freethreaded.txt": GENERATED
+        + "# Free-threaded Python: all dev dependencies except orjson.\n"
+        + "\n".join(
+            line for line in dev if re.match(r"[\w.-]+", line)[0] != "orjson"
+        )
         + "\n",
         "requirements_min.txt": GENERATED
         + "# Pinned minimum dependency versions for tox -e mindeps.\n"

@@ -542,8 +542,12 @@ jobs:
       # (a pass, no venv), so ubuntu-latest, windows-latest and
       # windows-11-arm all take the same line and each measures the coverage
       # profile for the OS it is on. See tox.ini's `platform` key.
-      - run: |-
+      - if: matrix.python != '3.14t'
+        run: |-
           tox -e py-windows,py-posix
+      - name: Test free-threaded Python with the stdlib JSON fallback
+        if: matrix.python == '3.14t'
+        run: tox -e py314t-posix
 
       # Test conversion of the runner's Task Scheduler library. This test
       # requires an explicit environment variable because it reads host

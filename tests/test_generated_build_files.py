@@ -36,6 +36,25 @@ def test_checked_in_build_files_are_current(generator):
     )
 
 
+def test_free_threaded_dependencies_omit_only_orjson(generator):
+    files = generator.generated_files()
+
+    def requirements(name):
+        return {
+            line
+            for line in files[name].splitlines()
+            if line and not line.startswith("#")
+        }
+
+    regular = requirements("requirements_dev.txt")
+    free_threaded = requirements("requirements_dev_freethreaded.txt")
+    assert regular - free_threaded == {
+        line for line in regular if line.startswith("orjson>=")
+    }
+    assert not free_threaded - regular
+    assert any(line.startswith("orjson>=") for line in regular)
+
+
 def test_dependency_bump_reaches_dev_binary_and_every_image(
     generator, tmp_path
 ):

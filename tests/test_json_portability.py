@@ -13,6 +13,7 @@ import importlib.util
 import json as stdlib_json
 import platform
 import sys
+import sysconfig
 
 import pytest
 
@@ -238,6 +239,8 @@ def test_orjson_is_installed_where_a_wheel_exists():
         pytest.skip("no orjson wheel for win-arm64; it builds only with Rust")
     if sys.version_info >= (3, 15):
         pytest.skip("orjson may not have built for this Python yet")
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        pytest.skip("orjson does not support free-threaded Python")
     assert importlib.util.find_spec("orjson") is not None, (
         "orjson is missing from this environment, so the orjson tests below "
         "silently skip. Check the orjson line in requirements_dev.txt."
