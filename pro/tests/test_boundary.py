@@ -1,13 +1,6 @@
 # SPDX-License-Identifier: LicenseRef-cronstable-Proprietary
 # Copyright (c) 2026 Parker Loflin. All rights reserved.
-"""Boundary smoke tests for cronstable Pro.
-
-Not part of the MIT core's tox suite; run with Pro's own tooling from the repo
-root:
-
-    pip install -e . -e "./pro[dev]"
-    pytest pro/tests
-"""
+"""Test Pro's core imports and entitlement checks."""
 
 from __future__ import annotations
 

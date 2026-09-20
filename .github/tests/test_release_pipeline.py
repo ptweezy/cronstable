@@ -1,4 +1,4 @@
-"""Exercise failures between preparation, builds and publication."""
+"""Test failures between release preparation, builds, and publication."""
 
 import hashlib
 import importlib.util
@@ -12,7 +12,7 @@ from strictyaml.ruamel import YAML
 
 pytest.importorskip("tomllib")  # CI helpers execute on Python 3.14.
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def load(name):

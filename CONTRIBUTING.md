@@ -94,6 +94,9 @@ Commit the generated files with their inputs. CI checks freshness before its
 static checks. Builds consume the checked-in files directly, including on
 Python 3.10; they do not run the generator.
 
+Dependabot updates `pyproject.toml` and excludes generated requirements.
+Regenerate the files in dependency update pull requests before merging.
+
 Simple job options declare their default, YAML validator, and fingerprint
 policy together in `cronstable.config.JOB_SCALAR_FIELDS`. Normalization and
 secret-bearing values keep explicit code paths. An added identity field must
@@ -153,7 +156,8 @@ POSIX-specific branches.
 
 ### How the suite runs
 
-`pyproject.toml` sets three rules for every pytest run:
+The root `pyproject.toml` configures the source test suite. Install the
+development dependencies before running it. The suite uses these rules:
 
 - **Warnings are errors by default.** Pytest treats warnings as errors
   unless `filterwarnings` contains an exception. Document a reason for each
@@ -211,6 +215,21 @@ pip install mutmut
 mutmut run "cronstable.redact*"
 mutmut results
 ```
+
+### Running release pipeline and Pro tests
+
+Release pipeline tests are in `.github/tests` and also run in the full test
+suite. To run them independently, use Python 3.11 or newer and run these
+commands from the repository root:
+
+```sh
+python -m pip install packaging pytest strictyaml
+python -m pytest .github/tests -q
+```
+
+Pytest discovers the configuration for each suite from its directory.
+For Pro setup and test commands, see
+[Develop and test Pro](pro/README.md#develop-and-test).
 
 ### Coverage pragmas
 
