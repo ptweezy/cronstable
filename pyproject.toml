@@ -44,12 +44,12 @@ dependencies = [
     # PyPI withdrew 1.7.0 because it causes an import error.
     "strictyaml>=1.7.3,<2",
     "aiohttp>=3.14.3,<4",
-    "sentry-sdk>=2.8,<3",
-    "aiosmtplib>=5.1.2,<6",
+    "sentry-sdk>=2.69.2,<3",
+    "aiosmtplib>=5.1.3,<6",
     "jinja2>=3.1.6,<4",
     # zoneinfo's tz database, so timezones resolve on minimal/slim images
     # that don't ship the system tzdata.
-    "tzdata>=2024.1",
+    "tzdata>=2026.4",
     # per-run CPU/memory accounting (opt-in `monitorResources`; see
     # cronstable.resources). psutil gives a portable, process-tree-aware read of
     # a job's CPU time and resident memory on Linux, macOS and Windows alike --
@@ -57,7 +57,7 @@ dependencies = [
     # is off by default, but the import is unconditional so `cronstable --help`
     # and the type checker resolve it everywhere; it ships wheels for the
     # mainstream targets and builds from source elsewhere.
-    "psutil>=5.9",
+    "psutil>=7.2.2",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -172,7 +172,7 @@ push = [
 # Zero-config LAN discovery (the opt-in `web.bonjour` mDNS advert; see
 # cronstable.discovery). Same fail-closed contract: web.bonjour without this
 # installed is a ConfigError, never a silent no-advert.
-discovery = ["zeroconf>=0.149.16"]
+discovery = ["zeroconf>=0.151.3"]
 dev = [
     # Canonical dev list: scripts/generate_build_files.py emits
     # requirements_dev.txt for tox and pip. Edit dependencies here.
@@ -188,7 +188,7 @@ dev = [
     # build rejects the free-threaded ABI (not expressible in these markers).
     "orjson>=3.11.6; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
     "pynacl>=1.6.2",
-    "zeroconf>=0.149.16",
+    "zeroconf>=0.151.3",
     # Browser-backed tests require a separate `playwright install chromium`
     # step after pip installs the library. No wheel/sdist exists on win-arm64.
     "playwright; platform_machine != 'ARM64' or sys_platform != 'win32'",
@@ -200,10 +200,10 @@ dev = [
     "openapi-spec-validator",
     # Compare the saved cron test cases with the original library in
     # tests/test_cronexpr.py on each CI runner.
-    "crontab>=1,<2",
+    "crontab>=1.0.5,<2",
     # Property tests generate schedules, configuration, Task XML, and
     # protocol payloads to check invariants (tests/test_properties_*.py).
-    "hypothesis>=6.100",
+    "hypothesis>=6.168.0",
     "pytest",
     "pytest-asyncio",
     "pytest-cov",

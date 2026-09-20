@@ -39,10 +39,14 @@
   X-Wing, it retains X25519 encrypted push; open the companion app to
   reconnect and update existing X-Wing pairings before relying on push
   delivery after such an upgrade.
-- Raise the aiosmtplib minimum to 5.1.2 for its STARTTLS response-injection
-  fix, and the strictyaml minimum to 1.7.3 to avoid an unimportable withdrawn
-  release. Keep generated minimum dependency pins visible to Dependabot
-  scans, while retaining `pyproject.toml` as their source of truth.
+- Raise the aiosmtplib minimum to 5.1.3, including its STARTTLS
+  response-injection fix, and the strictyaml minimum to 1.7.3 to avoid an
+  unimportable withdrawn release. Keep generated minimum dependency pins
+  visible to Dependabot scans, while retaining `pyproject.toml` as their
+  source of truth.
+- Refresh minimum versions of sentry-sdk, tzdata, psutil, zeroconf, crontab,
+  and Hypothesis, keeping the package declarations and generated dependency
+  lists in sync.
 - Rebuild the latest stable release's Docker images daily and on demand
   with freshly pulled base images and compatible Python dependencies,
   including rebuilt post-quantum wheels. Keep the released application
