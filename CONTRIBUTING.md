@@ -80,6 +80,11 @@ for optional dependencies. The build generator uses it to produce
 Binary build jobs select their own optional dependencies, failure policies,
 and platform-specific version limits.
 
+The generated `requirements_dev_freethreaded.txt` omits only `orjson`, which
+does not support free-threaded Python. With Python 3.14t installed, run
+`tox -e py314t-posix` to test the standard-library JSON fallback with the
+same test suite and coverage floor.
+
 The eight Dockerfiles share `docker/templates/Dockerfile`; distro-specific
 base images, packages, and runtime settings live in `docker/images.toml`.
 The supported image paths and platforms remain in `.github/docker-matrix.json`.

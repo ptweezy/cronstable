@@ -35,6 +35,7 @@ updates:
     directory: "/"
     exclude-paths:
       - "requirements_dev.txt"
+      - "requirements_dev_freethreaded.txt"
       - "requirements_min.txt"
       - "pyinstaller/requirements/**"
     schedule:
