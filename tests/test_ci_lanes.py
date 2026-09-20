@@ -146,9 +146,8 @@ def test_minimum_pins_cover_every_runtime_dependency():
 
 def test_the_unit_matrix_covers_every_shipped_desktop_os():
     matrix = _load_workflow("release.yml")["jobs"]["tox"]["strategy"]["matrix"]
-    assert {"ubuntu-latest", "windows-latest", "macos-latest"} <= set(
+    assert {"ubuntu-26.04", "windows-latest", "macos-latest"} <= set(
         matrix["os"]
     )
     included = {row["os"] for row in matrix["include"]}
-    assert {"windows-11-arm", "ubuntu-24.04-arm"} <= included
-
+    assert {"windows-11-arm", "ubuntu-26.04-arm"} <= included

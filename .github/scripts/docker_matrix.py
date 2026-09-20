@@ -50,9 +50,9 @@ def platforms(distros):
                     distro,
                     platforms=platform,
                     platform_id=platform.replace("/", "-"),
-                    runner="ubuntu-24.04-arm"
+                    runner="ubuntu-26.04-arm"
                     if platform == "linux/arm64"
-                    else "ubuntu-24.04",
+                    else "ubuntu-26.04",
                     qemu=platform
                     not in {"linux/amd64", "linux/arm64", "linux/386"},
                     wheel_group=libc if wheel else "none",
