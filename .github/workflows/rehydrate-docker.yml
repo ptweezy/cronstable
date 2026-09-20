@@ -2,7 +2,7 @@ name: Rehydrate Docker images
 
 on:
   schedule:
-    - cron: '23 */5 * * *'
+    - cron: '23 6 * * *'
   workflow_dispatch:
 
 permissions:

@@ -192,7 +192,7 @@ def test_matrix_uses_released_recipes_and_covers_required_wheels(tmp_path):
 
 def test_scheduled_refresh_gates_all_images_before_any_publication():
     refresh = workflow("rehydrate-docker")
-    assert refresh["on"]["schedule"] == [{"cron": "23 */5 * * *"}]
+    assert refresh["on"]["schedule"] == [{"cron": "23 6 * * *"}]
     assert "workflow_dispatch" in refresh["on"]
     assert refresh["concurrency"]["cancel-in-progress"] is False
     jobs = refresh["jobs"]
