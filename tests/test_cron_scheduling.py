@@ -31,7 +31,12 @@ from tests._cron_helpers import (
     _sla_report_recorder,
     fixed_current_time,  # noqa: F401
 )
-from tests._helpers import _pin_host_zone, _state_cfg, _wait_until
+from tests._helpers import (
+    _pin_host_zone,
+    _state_cfg,
+    _wait_until,
+    start_state,
+)
 from tests.test_state import (
     _NOW,
     _count_launcher,
@@ -2648,7 +2653,7 @@ def _catchup_pause(hours_from=1):
 
 async def _catchup_reboot_cron(tmp_path):
     cron = cronstable.cron.Cron(None, config_yaml=_CATCHUP_REBOOT_YAML)
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(tmp_path)))
     return cron
 
 

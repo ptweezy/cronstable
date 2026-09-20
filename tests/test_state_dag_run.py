@@ -31,6 +31,7 @@ from cronstable import dag, dagrun, jobstate
 from cronstable.cron import Cron
 from cronstable.state import Lease
 from tests._helpers import (
+    start_state,
     _drain_pending,
     _instant_sleep,
     _reap_running,
@@ -76,7 +77,7 @@ async def _make_cron(tmp_path, yaml):
     # this file uses dag_cron.
     state = "state:\n  path: {}\n".format(tmp_path)
     cron = Cron(None, config_yaml=state + yaml)
-    await cron.start_stop_state(_state_cfg(state + yaml))
+    await start_state(cron, _state_cfg(state + yaml))
     return cron
 
 
@@ -3329,7 +3330,7 @@ async def test_forget_drops_stale_terminal_summary_across_backend_swap(
         # the swap: a different path is a different store config, which is what
         # drives Cron.start_stop_state through _dag.forget().
         swap = "state:\n  path: {}\n".format(store_b) + _LINEAR
-        await cron.start_stop_state(_state_cfg(swap))
+        await start_state(cron, _state_cfg(swap))
         assert cron.state_backend is not None
 
         # the user-visible symptom, asserted first because it is the whole

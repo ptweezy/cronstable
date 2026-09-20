@@ -4,7 +4,7 @@ This page describes how cronstable decides whether a job run failed (`failsWhen`
 
 ## Overview
 
-After a job process exits, cronstable computes a single failure reason from the run's exit code and captured output. If the reason is non-empty, the run *failed*. Otherwise it *succeeded*.
+After a job process exits, cronstable computes a single failure reason from the run's exit code and captured output. If the reason is nonempty, the run *failed*. Otherwise it *succeeded*.
 
 A failure triggers `onFailure` reporting. If a retry is configured and not yet exhausted, the daemon schedules another run after a backoff delay. When retries are exhausted, or none was configured, `onPermanentFailure` reporting fires. A success cancels any pending retry and fires `onSuccess` reporting.
 
@@ -21,7 +21,7 @@ A failure triggers `onFailure` reporting. If a retry is configured and not yet e
 
 In the strictyaml schema (`cronstable/config.py`), a `failsWhen` map requires only `producesStdout`. `producesStderr`, `nonzeroReturn`, and `always` are `Opt(...)`. Defaults come from `DEFAULT_CONFIG["failsWhen"]` and are merged in before a `failsWhen` block is applied, so a partial `failsWhen` block inherits the defaults for the keys it omits.
 
-Output detection considers both retained and discarded lines. A stream counts as non-empty if it has saved content *or* if any lines were discarded (`saveLimit` exhausted, or `saveLimit: 0`). For how `captureStdout`/`captureStderr` and `saveLimit` govern what is captured, see [output capturing](Output-Capturing).
+Output detection considers both retained and discarded lines. A stream counts as nonempty if it has saved content *or* if any lines were discarded (`saveLimit` exhausted, or `saveLimit: 0`). For how `captureStdout`/`captureStderr` and `saveLimit` govern what is captured, see [output capturing](Output-Capturing).
 
 An uncaptured stream cannot produce a failure reason. `producesStderr` fires only when `captureStderr` is enabled, and `producesStdout` fires only when `captureStdout` is enabled.
 
@@ -31,8 +31,8 @@ An uncaptured stream cannot produce a failure reason. `producesStderr` fires onl
 
 1. `always` is true -> `"failsWhen=always"`.
 2. `nonzeroReturn` is true and `retcode != 0` -> `"failsWhen=nonzeroReturn and retcode={retcode}"`.
-3. `producesStdout` is true and stdout is non-empty or any stdout lines were discarded -> `"failsWhen=producesStdout and stdout is not empty"`.
-4. `producesStderr` is true and stderr is non-empty or any stderr lines were discarded -> `"failsWhen=producesStderr and stderr is not empty"`.
+3. `producesStdout` is true and stdout is nonempty or any stdout lines were discarded -> `"failsWhen=producesStdout and stdout is not empty"`.
+4. `producesStderr` is true and stderr is nonempty or any stderr lines were discarded -> `"failsWhen=producesStderr and stderr is not empty"`.
 
 The first match wins, and later conditions are not evaluated. Report templates receive the resulting string as the `fail_reason` variable, and the shell reporter receives it as `CRONSTABLE_FAIL_REASON`. The boolean `failed` is `fail_reason is not None`.
 
@@ -98,7 +98,7 @@ The ladder is a pure function of the retry config and the attempt number. That i
 
 ### Retry lifecycle
 
-- A retry state exists only when `maximumRetries` is truthy (non-zero). With `maximumRetries: 0`, no state is created and a failed run goes straight to permanent failure.
+- A retry state exists only when `maximumRetries` is truthy (nonzero). With `maximumRetries: 0`, no state is created and a failed run goes straight to permanent failure.
 - `launch_scheduled_job` calls `cancel_job_retries(name)` before starting a scheduled run, then creates a fresh `JobRetryState`. A scheduled run therefore resets any in-progress retry sequence for that job. A manually triggered run (`POST /jobs/{name}/start`, see the [HTTP control API](HTTP-API)) goes through `maybe_launch_job` directly. It does *not* reset or create retry state, and reuses whatever retry state currently exists.
 - On each failed run, `handle_job_failure` fires `onFailure` reporting. If no retry state exists or it was canceled, it fires `onPermanentFailure` and stops. Otherwise, if `count >= maximumRetries` and `maximumRetries != -1`, it cancels the retry state and fires `onPermanentFailure`. Otherwise, it schedules the next retry after `next_delay()` seconds.
 - A success (`handle_job_success`) calls `cancel_job_retries` and fires `onSuccess`, ending the sequence.
@@ -114,7 +114,7 @@ The ladder is a pure function of the retry config and the attempt number. That i
 
 Everything in this subsection applies only when a `state:` config section is present (the [durable state store](Durable-State)). Without one, the preceding lifecycle is the whole story and a pending retry dies with the process. The store is server-side, on `state.path`, and is unrelated to the web dashboard's browser-side IndexedDB run ledger.
 
-With `state:` configured, every job with a non-zero `maximumRetries` gets a durable retry ladder alongside the in-memory one:
+With `state:` configured, every job with a nonzero `maximumRetries` gets a durable retry ladder alongside the in-memory one:
 
 - When a retry is armed, a *pending* record is appended (fire-and-forget) to the job's durable retry stream, carrying the attempt number, the **absolute** `notBefore` deadline, and the job's per-job config digest (`cronstable.fingerprint.job_digest`). A write that never lands loses only the durability: the retry dies with the process, exactly the stateless behavior. A ladder that never scheduled a retry gets no durable record, so a retry-armed job that keeps succeeding costs no store writes.
 - Every way a ladder can resolve appends a *settled* record on top, so the next boot finds nothing pending. The settle reasons are `launched` (the settle-before-launch write described next), `succeeded` (the run succeeded), `superseded` (a fresh scheduled fire reset the sequence), `cancelled` (for example, a run canceled from the dashboard), `exhausted` (`maximumRetries` reached), `owner-moved` (the cluster abandonment described earlier; on a shared store the ladder is handed off instead of settled, see "Cross-node retry resume" later), `superseded-by-run` (a claim scan found a durable run newer than the ladder), and `job-removed` (the job disappeared from a reloaded config while the retry slept), plus the boot-time invalidation reasons described later.
@@ -122,7 +122,7 @@ With `state:` configured, every job with a non-zero `maximumRetries` gets a dura
 - A graceful shutdown does **not** settle. The shutdown drain cancels the in-process retry tasks but leaves the pending record on top of the stream, and the next boot re-arms exactly that record.
 - On boot, a job whose newest retry record is pending has its ladder re-armed at the persisted position. The retry counter and the next backoff delay are replayed to the recorded attempt. The task sleeps only the time remaining until the absolute `notBefore` deadline: zero if it passed while the daemon was down, in which case the retry is due immediately. The re-armed task is the ordinary `schedule_retry_job`, so the cluster-gate re-check, job-removed cleanup, and shutdown behavior match a never-restarted ladder. Live activity outranks the ledger: a job already retrying or running when the store comes up is left alone.
 - A pending record is *settled instead of re-armed* (invalidation) when:
-  - The job's per-job config digest changed. It is stricter than the whole-set job-set id, so editing an *unrelated* job does not drop the retry.
+  - The job's per-job config digest changed. It is stricter than the whole-set job-set ID, so editing an *unrelated* job does not drop the retry.
   - The job was removed or disabled.
   - The recorded attempt already exhausts `maximumRetries`.
   - The record is older than the job's `startingDeadlineSeconds` (when set).
@@ -223,7 +223,7 @@ If an `onSuccess` mail has an empty rendered body (after `strip()`), it is suppr
 
 ## Notes
 
-- `nonzeroReturn` checks `retcode != 0`, so both the synthetic `127` (launch failure) and `-100` (timeout) codes count as non-zero failures under the default.
+- `nonzeroReturn` checks `retcode != 0`, so both the synthetic `127` (launch failure) and `-100` (timeout) codes count as nonzero failures under the default.
 - The `failsWhen` evaluation runs once per completed run, including each retried run, so a retry that still produces stderr (with `producesStderr: true`) fails again and continues the backoff sequence.
 - Output-based failure (`producesStdout`/`producesStderr`) depends on stream capturing. Without `captureStdout`/`captureStderr`, the corresponding condition can never trigger, because nothing is captured.
 - During shutdown, `handle_job_failure` returns early if the stop event is set. A job that finishes failing while cronstable is shutting down is *not* reported (`onFailure`/`onPermanentFailure` do not fire) and is not retried. A job that finishes successfully during shutdown still cancels its retries and fires `onSuccess`.

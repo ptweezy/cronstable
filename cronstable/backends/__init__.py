@@ -1,24 +1,19 @@
-"""Optional lease-store leadership backends (kubernetes, etcd).
+"""Optional leadership backends that use Kubernetes and etcd lease stores.
 
-Each module here implements :class:`cronstable.leadership.LeaseBackend` against
-a
-real coordination store, over plain HTTP via the core ``aiohttp`` dependency --
-so neither adds a runtime dependency and, by avoiding grpc/protobuf wheels,
-both run on every architecture cronstable targets.
+Each backend implements :class:`cronstable.leadership.LeaseBackend`. Both
+can use HTTP through the core ``aiohttp`` dependency, so neither requires
+additional packages or gRPC and protobuf wheels.
 
-* **kubernetes** drives a ``coordination.k8s.io/v1`` ``Lease`` and has **two
-  interchangeable transports**: the official ``kubernetes`` client when it is
-  installed (and importable on this architecture), or a hand-rolled apiserver
-  REST transport otherwise.  ``cluster.kubernetes.clientLibrary`` chooses:
-  ``auto`` (default) prefers the native client and falls back to HTTP;
-  ``library`` requires it (a config error if absent); ``http`` forces the
-  hand-rolled path.
-* **etcd** uses etcd's own v3 gRPC-gateway JSON/HTTP API directly -- a single,
-  fully-portable transport, with no optional client library (the gateway is
-  etcd's first-class HTTP interface, so a native grpc client buys little).
+* The Kubernetes backend manages a ``coordination.k8s.io/v1`` ``Lease``.
+  ``cluster.kubernetes.clientLibrary`` selects the transport: ``auto``
+  prefers the official client when it is installed and importable, then
+  falls back to the built-in HTTP transport; ``library`` requires the
+  official client; ``http`` selects the built-in transport.
+* The etcd backend uses the v3 gRPC-gateway JSON/HTTP API directly. It has
+  one transport and requires no optional client library.
 
-The modules are imported lazily by :func:`cronstable.leadership.make_backend`,
-so they never enter the import graph unless ``cluster.backend`` selects them.
+:func:`cronstable.leadership.make_backend` imports a backend only when
+``cluster.backend`` selects it.
 """
 
 from cronstable.config import ConfigError

@@ -363,7 +363,7 @@ On timeout (the remaining time elapses, or was non-positive), cronstable:
    section).
 
 A `-100` return code is therefore the marker of a timeout-induced termination.
-For a normal (non-replaced) run, `retcode = -100` is non-zero, so a job with
+For a normal (non-replaced) run, `retcode = -100` is nonzero, so a job with
 the default `failsWhen.nonzeroReturn` treats the timeout as a failure, which is
 then reported and may be retried. See
 [failure detection and retries](Failure-Detection-and-Retries) for what happens

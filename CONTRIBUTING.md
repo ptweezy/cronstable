@@ -1,11 +1,9 @@
 # Contributing to cronstable
 
-Thanks for working on cronstable. This document covers local development and
-how releases are cut.
+This guide explains how to develop, test, and release cronstable.
 
-**Security problems do not go in the issue tracker.**
-[SECURITY.md](SECURITY.md) has the private reporting route and what to
-include.
+To report a security vulnerability, follow the private reporting process
+in [SECURITY.md](SECURITY.md).
 
 ## Signing off your commits (DCO)
 
@@ -18,18 +16,17 @@ the right to submit it under the project's license. The full text is in the
 Add a sign-off to each commit with `-s`:
 
 ```sh
-git commit -s -m "Fix the thing"
+git commit -s -m "Fix retry scheduling"
 ```
 
-That appends a trailer with the name and email from your git config:
+This appends a trailer with the name and email from your Git configuration:
 
 ```text
 Signed-off-by: Your Name <you@example.com>
 ```
 
 The `dco` job in continuous integration (CI) checks that every commit in a pull
-request carries this trailer. If you forgot, sign off the whole branch and
-force-push:
+request includes this trailer. To add missing sign-offs to a branch, run:
 
 ```sh
 git rebase --signoff origin/main
@@ -42,9 +39,10 @@ The project targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13, and 3.14 are
 tested) and runs on **Linux, macOS, and Windows**. The test suite runs on all
 three in CI, including Windows ARM64.
 
-For a fast development loop, cronstable uses [uv](https://docs.astral.sh/uv/).
-`tox` also runs through uv with `tox-uv`, and uv can fetch the 3.10–3.14
-interpreters the test matrix needs. With uv installed:
+cronstable uses [uv](https://docs.astral.sh/uv/) for local development.
+The `tox-uv` plugin also lets tox use uv to create environments and install
+dependencies. uv can install the Python 3.10–3.14 interpreters used by the
+test matrix. After installing uv, run:
 
 ```sh
 git clone https://github.com/ptweezy/cronstable
@@ -53,30 +51,34 @@ uv venv                                         # create .venv (uv picks a suita
 uv pip install -e ".[dev]"                      # editable install with the dev extra
 ```
 
-If you prefer stock tooling, the classic path still works unchanged:
+To use Python's built-in `venv` module and pip, run:
 
 ```sh
 python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"                         # or: pip install -r requirements_dev.txt
 ```
 
-> **Note:** all OS-specific behavior lives in
+> **Note:** OS-specific behavior lives in
 > [`cronstable/platform.py`](cronstable/platform.py) (default shell, default
-> configuration location, unix-socket support, and shutdown-signal wiring).
+> configuration location, Unix socket support, and shutdown handlers).
 > The POSIX-only `user`/`group` feature imports `grp`/`pwd` lazily and is
 > rejected on Windows. mypy is pinned to the `linux` platform. It type-checks
 > the POSIX API surface, and the Windows branches are runtime-guarded, so
-> type-checking is identical on every OS. The coverage gate is the one check
-> that reads those Windows branches, and it only does so when they are tagged:
-> write `# pragma: no cover (windows)`, not a bare `# pragma: no cover`. See
+> type checking is identical on every OS. The coverage check measures
+> Windows-specific branches on Windows when they use
+> `# pragma: no cover (windows)`. A bare `# pragma: no cover` excludes them
+> on every OS. See
 > [the pragma vocabulary](#coverage-pragmas).
 
 ## Generated build files
 
-Edit `pyproject.toml` for development dependencies and optional-extra version
-floors. `requirements_dev.txt` and `pyinstaller/requirements/*.txt` are
-generated from it. The binary lanes still choose which extras to install,
-their failure policy, and any platform-specific cap.
+Edit `pyproject.toml` to change development dependencies or minimum versions
+for optional dependencies. The build generator uses it to produce
+`requirements_dev.txt`, `requirements_min.txt`, and
+`pyinstaller/requirements/*.txt`. For `tox -e mindeps`,
+`requirements_min.txt` pins minimum runtime and test dependency versions.
+Binary build jobs select their own optional dependencies, failure policies,
+and platform-specific version limits.
 
 The eight Dockerfiles share `docker/templates/Dockerfile`; distro-specific
 base images, packages, and runtime settings live in `docker/images.toml`.
@@ -103,11 +105,10 @@ tests protect persisted retries and reboot markers from accidental changes.
 The project develops on a single branch, `main`. Open your pull request
 against it.
 
-CI collapses superseded runs: pushing again cancels the earlier run, whether it
-had already started or was still waiting in the queue, so an intermediate
-commit can land with its run cut short. Push a commit you want fully tested on
-its own. Releases are the exception. They sit in their own concurrency group,
-where they start at once and always run to completion.
+A new push cancels the previous CI run, whether that run is active or queued.
+To fully test a particular commit, wait for its checks to finish before
+pushing again. Release runs use a separate concurrency group and are not
+canceled by later pushes.
 
 ## Running the checks
 
@@ -130,26 +131,90 @@ tox -e py-windows  # Windows hosts: the Windows coverage profile explicitly
 tox -e py-posix    # POSIX hosts: the POSIX coverage profile explicitly
 ```
 
-Each interpreter row exists twice, once per OS profile, and `tox.ini`'s
-`platform` key makes the arm that does not match the machine skip. A skip
-counts as a pass as long as the invocation also names an arm that does match;
-an invocation whose only env skips exits 1.
+Two additional environments run only when selected explicitly:
 
-So a bare `tox` works everywhere, and CI names both arms in one command
-(`tox -e py-windows,py-posix`), but naming the single wrong arm for your
-machine fails. On Windows, `tox -e py-posix` prints `py-posix: skipped because
-platform win32 does not match (?!win32).*` and then `evaluation failed :(`.
+```sh
+tox -e mindeps     # the suite on the oldest dependency versions pyproject.toml allows
+tox -e deep        # thorough property tests, then three randomized full-suite runs
+```
 
-`tox -e py`, `tox -e py312` and the other unfactored envs still run the whole
-suite, at the POSIX profile that the coverage numbers have always used. On
-Windows, prefer a bare `tox` or `tox -e py-windows`: the POSIX profile hides
-the Windows branches you are editing and counts the POSIX ones you cannot run
-as missed, all against the same `--cov-fail-under`.
+Each Python version has a Windows environment and a POSIX environment.
+The `platform` setting in `tox.ini` skips environments that don't match
+your OS. If every selected environment is skipped, tox exits with code 1.
+
+Run `tox` to select the matching environments automatically, or use
+`tox -e py-windows,py-posix` as CI does. On Windows, selecting only
+`py-posix` fails because that environment is skipped.
+
+Environments without an OS suffix, such as `py` and `py312`, run the full
+suite with the POSIX coverage profile. On Windows, use `tox` or
+`tox -e py-windows` so coverage measures Windows branches and excludes
+POSIX-specific branches.
+
+### How the suite runs
+
+`pyproject.toml` sets three rules for every pytest run:
+
+- **Warnings are errors by default.** Pytest treats warnings as errors
+  unless `filterwarnings` contains an exception. Document a reason for each
+  exception.
+- **Test order is random.** `pytest-randomly` shuffles the order on every
+  run and prints the seed in the header. To replay a failing order, run
+  `pytest -p randomly --randomly-seed=N`. To run in file order, pass
+  `-p no:randomly`.
+- **Each test has a 270-second timeout.** If a test exceeds the timeout,
+  `pytest-timeout` reports the failure and prints every thread's stack.
+  When the timeout mechanism supports recovery, the test run continues.
+
+A warning from an object's finalizer, such as a warning about an unclosed
+socket or event loop, can fail a later test when garbage collection runs.
+To investigate the leak, enable the leak-reporting plugin. It collects
+garbage after each test and appends the test ID, error message, and
+available allocation trace to `leaks.txt`:
+
+```sh
+python -X tracemalloc=25 -m pytest -p tests._leakfinder -p no:randomly
+```
+
+Set `CRONSTABLE_LEAK_OUT` to change the report path. The recorded test ID
+identifies when collection ran; it doesn't prove which test caused the leak.
+
+If a helper opens a resource that the test can't close with a context
+manager, register a cleanup callback with `close_at_test_end` in
+`tests/_helpers.py`. To start a state store, call `start_state(cron, cfg)`
+from the same module. It registers cleanup for the state backend and its
+loopback job API listener.
+
+Property-based tests are in `tests/test_properties_*.py` and generate inputs
+with the Hypothesis strategies in `tests/_strategies.py`. When a test fails,
+copy its `@reproduce_failure` decorator onto the test to reproduce the input.
+If a property test finds a bug, fix the code and add the failing input as a
+regression test in the same module. Set
+`CRONSTABLE_HYPOTHESIS_PROFILE=thorough` to generate about 30 times as many
+examples.
+
+`tests/test_backend_live.py` runs the etcd and Kubernetes backends against
+real servers. Configure the servers with `CRONSTABLE_LIVE_ETCD`,
+`CRONSTABLE_LIVE_ETCD_AUTH`, or `CRONSTABLE_LIVE_K8S`; the module docstring
+explains each variable. Tests skip servers that aren't configured.
+The `backends-live` CI job provisions all three configurations and sets
+`CRONSTABLE_LIVE_REQUIRED=1` to fail if any test would skip.
+
+The scheduled `nightly` workflow runs the `deep` environment, the suite with
+`PYTHONDEVMODE=1`, and mutation tests for modules whose behavior depends on
+their inputs. Mutation testing introduces small code changes and checks
+whether the tests detect them. `[tool.mutmut]` in `pyproject.toml` selects the
+modules and tests. To test mutations in one module locally:
+
+```sh
+pip install mutmut
+mutmut run "cronstable.redact*"
+mutmut results
+```
 
 ### Coverage pragmas
 
-`# pragma: no cover` comes in three forms, and picking the wrong one is how a
-branch stops being gated:
+Choose a coverage annotation based on where the code can run:
 
 | Form | Hidden on | Measured on |
 | --- | --- | --- |
@@ -157,21 +222,17 @@ branch stops being gated:
 | `# pragma: no cover (windows)` | POSIX | Windows |
 | `# pragma: no cover (posix)` | Windows | POSIX |
 
-Use the bare form only for code no CI row can reach: defensive branches,
-unreachable raises, the etcd/kubernetes network glue, and `tui.py`'s macOS
-branch (the matrix has no macOS row, so a third token would have no profile to
-be measured in).
+Use the bare form only for code that no CI test can exercise, such as
+unreachable defensive branches. The POSIX profile also runs on macOS;
+don't exclude code solely because it is specific to macOS.
 
-A branch guarded by `IS_WINDOWS` or `sys.platform == "win32"` takes a token
-where its clause genuinely cannot run on the other OS, because it uses
-something that only exists there: `msvcrt`, `fcntl`, `grp`/`pwd`, `os.nice`,
-`os.killpg`, `ctypes.windll`. Where it does, the other side of the branch takes
-the other token, and that half is the one people forget.
+Annotate a branch guarded by `IS_WINDOWS` or `sys.platform == "win32"` when
+it uses an API unavailable on the other OS, such as `msvcrt`, `fcntl`,
+`grp`/`pwd`, `os.nice`, `os.killpg`, or `ctypes.windll`. If both branches use
+platform-specific APIs, annotate both with their respective OS labels.
 
-Plenty of platform branches here are plain Python that the tests drive from
-either machine by monkeypatching `IS_WINDOWS`. Those stay untagged on purpose,
-because they are measured on both. A few things to get right when you tag a
-branch:
+Leave platform branches unannotated when tests can exercise them on either
+OS by monkeypatching `IS_WINDOWS`. When you add annotations:
 
 - Tagging an `if` header excludes that clause only. An `else` needs its own
   tag. A fall-through tail (code after the `if` block rather than inside an
@@ -188,8 +249,8 @@ branch:
 fails a branch that is tagged on one side only.
 
 `tox.ini` declares `requires = tox-uv`, so `tox` provisions its environments and
-installs dependencies with uv automatically (much faster; behavior-identical).
-If you ever need the legacy virtualenv+pip path, force it with
+installs dependencies with uv automatically.
+To use virtualenv and pip instead, run
 `tox --runner virtualenv`.
 
 ## Performance benchmarks
@@ -221,7 +282,9 @@ The single [`CI`](.github/workflows/release.yml) GitHub Actions pipeline
 commit and, on a release, publishes it. Version numbers come from git tags with
 `setuptools_scm`; you never edit a version by hand.
 
-### Cutting a release
+<a id="cutting-a-release"></a>
+
+### Creating a release
 
 A release happens when **any commit in a push to `main`** has a release marker
 at the **start of its subject line** (the first line of the commit message):
@@ -266,7 +329,11 @@ wiki](#editing-the-wiki)). On a release it, in order:
    tag already exists);
 3. **builds and tests everything in parallel**, all at the computed version:
 
-   - `tox` (py310–py314, lint, mypy);
+   - `tox` (py310–py314 on Linux, Windows, and macOS, plus Linux and
+     Windows on arm64; lint, mypy);
+   - `tox-mindeps` (the suite with the oldest supported dependency versions)
+     and `backends-live` (backend tests against an etcd server, a second etcd
+     server with TLS and authentication, and a kind cluster);
    - the wheel + sdist;
    - the self-contained PyInstaller binaries for Linux (`amd64`, `arm64`,
      `i686`, `armv7`, `armv6`, `ppc64le`, `s390x` and `riscv64`, glibc and

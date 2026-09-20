@@ -1,20 +1,18 @@
-"""Offline administration of the durable state store (`cronstable state ...`).
+"""Offline administration of the durable state store.
 
-The operational other half of :mod:`cronstable.state`: backup/restore, store
-migration (local disk <-> an Amazon S3 Files / EFS mount -- the same POSIX
-layout either way, so a migration is a faithful file copy), manual garbage
-collection, a health/inventory check, and record-scheme migration.  All of
-it works offline, straight from the ``state`` config section, with no
-running daemon required.  Against a RUNNING daemon the commands that only
-read the store (or write through the backend's own locked paths) stay safe
--- records are immutable, copies/reads never lock -- though a backup taken
-mid-write is a point-in-time-ish snapshot rather than an exact one.  The
-exceptions are ``restore --force`` and ``migrate --force``: both write
-straight into a store's namespace and are NOT safe while a daemon uses it.
+The ``cronstable state`` admin commands back up, restore, migrate, inspect,
+and garbage-collect the store, and upgrade record formats. They read the
+``state`` configuration directly and do not require a running daemon.
+Migration copies the same filesystem layout between local disk and shared
+mounts such as Amazon S3 Files or EFS.
 
-Imported lazily by ``cronstable.__main__`` only when a ``state`` subcommand is
-used, so the daemon's import graph (and the stateless install) pays nothing
-for it.
+Read operations and operations that use the backend's locking can run
+while the daemon is active. A backup taken during writes might include
+records from different points in time. ``restore --force`` and
+``migrate --force`` write directly into the destination namespace; stop
+any daemon using that store before running either command.
+
+``cronstable.__main__`` imports this module only when an admin command runs.
 """
 
 import asyncio

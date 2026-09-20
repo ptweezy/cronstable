@@ -114,7 +114,7 @@ rather than crashing the scheduler. See
 `environment` is a list of `{key, value}` maps. Both `key` and `value` are
 strings in the schema.
 
-When `environment` is non-empty, cronstable builds the subprocess environment
+When `environment` is nonempty, cronstable builds the subprocess environment
 from the **full current process environment** (`dict(os.environ)`), applies the
 PyInstaller fixup (described later), and then sets or overwrites each
 configured variable by key:
@@ -154,7 +154,7 @@ Because this mutates the process environment, `HOSTNAME` is present in the
 inherited environment of every job.
 
 The reporting templates' `environment` variable is the constructed subprocess
-`env` dict (`self.env`), which is only populated when the job has a non-empty
+`env` dict (`self.env`), which is only populated when the job has a nonempty
 `environment` or an `env_file`. For a job with neither, `environment` is `None`
 in templates and `{{ environment.HOSTNAME }}` renders empty. See
 [reporting (mail, Sentry, shell, webhook)](Reporting).

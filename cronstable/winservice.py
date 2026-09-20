@@ -1,43 +1,27 @@
-"""Run cronstable as a Windows service, over ctypes rather than pywin32.
+"""Run cronstable as a Windows service using ctypes.
 
-"Run whether user is logged on or not" is the first checkbox on the Task
-Scheduler General tab, and until this module existed cronstable's documented
-lifecycle on Windows was a console window stopped with Ctrl-C.  ``cronstable
-service install`` registers the program with the Service Control Manager,
-and ``cronstable service run`` is what the SCM then invokes.
+``cronstable service install`` registers cronstable with the Service
+Control Manager (SCM). The SCM invokes ``cronstable service run`` to start
+the service, which runs even when no user is signed in.
 
-Three implementations were possible and this is the third:
+The implementation uses ctypes, as :mod:`cronstable.platform` does for
+other Windows APIs, so it needs no additional runtime dependency or
+service wrapper executable.
 
-* pywin32's ``win32serviceutil`` would add a Windows-only runtime
-  dependency, PyInstaller hiddenimports, and a win-arm64 wheel question on
-  an architecture where ``requirements_dev.txt`` already has to exclude
-  three packages;
-* bundling WinSW ships a second binary, needs licensing and notice work
-  like the existing zeroconf kit, and its stop path would go through
-  ``POST /shutdown`` rather than a real control handler;
-* ctypes costs more code and no dependency, and it is the shape
-  :mod:`cronstable.platform` already uses for its advapi32 and kernel32
-  work, so a service host is a new module speaking Win32 rather than a new
-  entry in the wheel.
+Pure functions construct the service command line, select accepted
+controls, build status reports, and format errors. :class:`WinApi` wraps
+OS calls so tests can replace it on any platform. Its Windows-specific
+methods use coverage annotations for the Windows test profile.
 
-The module is split so that almost all of it is testable on any OS.  Every
-decision (what to put in the ImagePath, which controls to accept in which
-state, which of the seven SERVICE_STATUS fields to report, how a Win32 error
-reads as a sentence) is a pure function; every OS call lives behind
-:class:`WinApi`, which the tests replace with a recording double.  Only
-``WinApi``'s method bodies are Windows-only, and they are tagged so the
-coverage profiles measure them on the Windows rows.
+The service installs as LocalSystem. It requires a one-directory build:
+the published ``cronstable-windows-<arch>.zip`` or ``.msi``. A one-file
+PyInstaller executable runs the application as a child of the bootloader,
+which prevents it from hosting the service. The ``install`` command
+therefore rejects the one-file ``.exe``, including the winget package.
 
-What this module deliberately does not do is described in
-``wiki/Windows-Service.md``: it installs as LocalSystem only (per-account
-identity is its own piece of work), and it refuses to install from a
-one-file frozen binary, which cannot host a service at all because the
-PyInstaller bootloader runs the application in a child process the SCM
-never sees.  The published ``cronstable-windows-<arch>.zip`` and ``.msi``
-are one-directory builds and host a service normally; the one-file ``.exe``
-(also what winget installs) is the shape ``install`` refuses.  The MSI
-registers the service itself with the same settings ``install`` writes,
-fenced by ``tests/test_msi_parity.py``.
+The MSI registers the service with the same settings as ``install``.
+``tests/test_msi_parity.py`` verifies that they match. For details, see
+``wiki/Windows-Service.md``.
 """
 
 from __future__ import annotations

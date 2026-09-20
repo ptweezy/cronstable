@@ -1,13 +1,12 @@
-"""Members the lease backends (etcd, kubernetes, filesystem) share.
+"""Shared election state and helpers for lease backends.
 
-All three keep the same local election state (a raw win flag, the
-observed holder, monotonic deadlines); etcd and kubernetes additionally
-track their on-disk client-TLS material the same way.  The previously
-duplicated helpers live here once.  The time helpers are imported into
-each backend module under their own names: call sites resolve them
-through the importing module's globals, so the tests' per-module
-monkeypatching (for example ``cronstable.backends.etcd._monotonic``)
-keeps working.
+The etcd, Kubernetes, and filesystem backends track the election result,
+observed holder, and monotonic deadlines. The etcd and Kubernetes backends
+also track client TLS files.
+
+Each backend imports the time helpers into its own module namespace. This
+lets tests replace a backend's clock independently, for example by
+monkeypatching ``cronstable.backends.etcd._monotonic``.
 """
 
 import datetime

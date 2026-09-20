@@ -13,6 +13,7 @@ import cronstable.version
 from cronstable.config import parse_config
 from cronstable.cron import ConfigError
 from cronstable.fingerprint import SCHEME_VERSION
+from tests._helpers import close_at_test_end
 
 
 class FakeCron:
@@ -33,7 +34,7 @@ class FakeCron:
 
 
 def test_good_config(monkeypatch):
-    loop = asyncio.new_event_loop()
+    loop = _loop()
     # main_loop imports Cron lazily (from cronstable.cron, inside the function)
     # so a job-facing CLI call never drags in the daemon graph; patch it at its
     # source module, not on cronstable.__main__.
@@ -75,7 +76,9 @@ def test_job_set_id_flag(cli_runner, capsys):
 
 
 def _loop():
-    return asyncio.new_event_loop()
+    loop = asyncio.new_event_loop()
+    close_at_test_end(loop.close)
+    return loop
 
 
 def test_version_prints_and_exits(monkeypatch, capsys):

@@ -34,6 +34,77 @@ _UTC = datetime.timezone.utc
 TLS_NOW = datetime.datetime(2026, 1, 1, tzinfo=_UTC)
 
 
+# --- Resource cleanup -------------------------------------------------------
+# Helpers register cleanup callbacks for resources that callers cannot manage
+# with a context manager, such as event loops or state store listeners.
+# tests/conftest.py runs these callbacks before fixture teardown closes the
+# test's event loop. The registry does nothing if no callbacks were registered.
+
+
+_AT_TEST_END: list = []
+
+
+def close_at_test_end(closer):
+    """Register ``closer()`` to run when the current test ends.
+
+    If the callback returns a coroutine or future, await it on the event
+    loop captured during registration. If that loop is closed or no loop
+    was active, await the result with ``asyncio.run``.
+    Return ``closer`` so the caller can retain the callback.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    _AT_TEST_END.append((closer, loop))
+    return closer
+
+
+def run_test_end_closers():
+    """Run cleanup callbacks in reverse registration order.
+
+    Run every callback even if one fails, then raise the first exception.
+    """
+    failure = None
+    while _AT_TEST_END:
+        closer, loop = _AT_TEST_END.pop()
+        try:
+            result = closer()
+            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                if loop is not None and not loop.is_closed():
+                    loop.run_until_complete(result)
+                else:
+                    asyncio.run(_await(result))
+        except BaseException as ex:  # noqa: BLE001 - re-raised below
+            failure = failure or ex
+    if failure is not None:
+        raise failure
+
+
+async def _await(awaitable):
+    return await awaitable
+
+
+async def start_state(cron, cfg):
+    """Start state storage and register cleanup for the end of the test.
+
+    Register cleanup before calling ``cron.start_stop_state(cfg)`` so the
+    listener closes even if startup fails.
+    """
+    if not getattr(cron, "_test_end_stop_registered", False):
+        cron._test_end_stop_registered = True
+        close_at_test_end(lambda: stop_cron_state(cron))
+    return await cron.start_stop_state(cfg)
+
+
+async def stop_cron_state(cron):
+    """Stop the state backend and its loopback job API listener."""
+    await cron.start_stop_state(None)
+    # If a test stopped or replaced cron.state_backend, start_stop_state
+    # might leave the listener open. Close it explicitly.
+    await cron._stop_job_api()
+
+
 # --- the host clock ---------------------------------------------------------
 # LOCAL_ZONE reads the host's zone through cronexpr's two C-library seams;
 # pin them to a ZoneInfo so a local-clock test is deterministic on any host.

@@ -10,9 +10,13 @@ bandit[toml]
 mypy
 mypy-extensions
 openapi-spec-validator
+crontab>=1,<2
+hypothesis>=6.100
 pytest
 pytest-asyncio
 pytest-cov
+pytest-randomly
+pytest-timeout
 ruff
 tox
 tox-uv

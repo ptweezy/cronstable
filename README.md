@@ -22,9 +22,9 @@ A cron replacement with retries, alerts, saved run history, workflows, and web a
 
 ## Why cronstable?
 
-cronstable keeps cron's model (a schedule file running your commands) and
-builds in the tooling that otherwise accumulates around it: retries,
-alerting, durable state, orchestration, clustering, and a live dashboard.
+cronstable runs your commands from a schedule file, following cron's model.
+It adds retries, alerting, durable state, orchestration, clustering, and a
+live dashboard.
 
 It's built for machines of all sizes, with efficiency in mind. The
 [benchmarks](https://github.com/ptweezy/cronstable/wiki/Performance-Benchmarks)
@@ -95,8 +95,8 @@ and catch regressions before release.
 
 ### Fleets
 
-* **Job-set id**: compare configuration fingerprints to detect drift between
-  replicas (see [job-set id](#job-set-id))
+* **Job-set ID**: compare configuration fingerprints to detect drift between
+  replicas (see [job-set ID](#job-set-id))
 * **Opt-in clustering and leader election**: coordinate job execution across
   replicas (see [clustering and leader election](#clustering-and-leader-election)
   for backend options and guarantees)
@@ -110,21 +110,21 @@ and catch regressions before release.
   binaries for Linux, macOS, BSD, illumos, and Windows (see
   [installation](#installation))
 
-[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](#web-dashboard)
+[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a color-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](#web-dashboard)
 
 > Web UI tour.
 
 ## Quick start
 
-You can have a running scheduler with a live dashboard in about a minute.
-Install it (see [installation](#installation) for Docker, Homebrew, and
-no-Python binary options):
+To run your first scheduled job with a live dashboard, install cronstable.
+For Docker, Homebrew, and standalone binaries, see
+[installation](#installation).
 
 ```shell
 pip install cronstable
 ```
 
-Describe your first job in a `cronstable.yaml`:
+Create a `cronstable.yaml` file with your first job:
 
 ```yaml
 jobs:
@@ -138,21 +138,21 @@ web:
     - http://127.0.0.1:8080      # optional: the REST API + dashboard
 ```
 
-Run it (always in the foreground):
+Start the scheduler. It runs in the foreground:
 
 ```shell
 cronstable -c cronstable.yaml
 ```
 
-Open <http://127.0.0.1:8080/> and watch `hello` fire once a minute, with its
-output tailing live in the [dashboard](#web-dashboard). From there, each of
-these is a few lines of config away:
+Open <http://127.0.0.1:8080/> to view the job's live output in the
+[dashboard](#web-dashboard). The `hello` job runs once a minute.
+You can extend this configuration to:
 
 * **Get failure alerts**: retries with backoff and a Slack/mail/Sentry
   report when a job ultimately fails ([tutorial](#tutorial-1-alert-when-a-job-fails-then-retry-it)).
-* **Survive restarts**: a one-line `state:` block makes history, retries and
-  missed-run catch-up durable ([tutorial](#tutorial-2-survive-restarts-catch-up-what-was-missed)).
-* **Chain jobs into a pipeline**: a durable DAG with data hand-off and an
+* **Survive restarts**: a `state:` block preserves history and retries and
+  enables missed-run catch-up ([tutorial](#tutorial-2-survive-restarts-catch-up-what-was-missed)).
+* **Chain jobs into a pipeline**: a durable DAG with data sharing and an
   approval gate ([tutorial](#tutorial-3-your-first-dag-a-durable-pipeline)).
 * **Coordinate replicas**: use leader election to coordinate job execution
   ([tutorial](#tutorial-4-two-replicas-zero-double-runs)).
@@ -160,11 +160,10 @@ these is a few lines of config away:
   --build` boots a nine-node cluster running every feature together
   ([example gallery](#example-gallery)).
 
-Already have a crontab? You don't have to translate it:
-`cronstable -c my.crontab` (a `crontab -l` export) runs the classic format
-as-is (see [classic crontab files](#classic-crontab-files); the six-field
-*system* format of `/etc/crontab` carries an extra user column that has to
-come out first).
+To use an existing crontab exported with `crontab -l`, run
+`cronstable -c my.crontab`. For a system crontab such as `/etc/crontab`,
+remove the extra user column first. See
+[classic crontab files](#classic-crontab-files) for format differences.
 
 ## Installation
 
@@ -173,7 +172,7 @@ come out first).
 Prebuilt multi-architecture images (seven Linux platforms) are published on
 every release to two registries, the GitHub Container Registry
 (`ghcr.io/ptweezy/cronstable`) and Docker Hub (`ptweezy/cronstable`). Mount
-your crontab and go:
+your configuration file and start the container:
 
 ```shell
 docker run --rm \
@@ -495,7 +494,7 @@ jobs:
             fromEnvVar: SLACK_WEBHOOK_URL
 ```
 
-By default a job *fails* when it exits non-zero **or** writes to a captured
+By default a job *fails* when it exits nonzero **or** writes to a captured
 stderr. Tune that per job with [`failsWhen`](#handling-failure). The webhook's
 default body is Slack-compatible (Mattermost and Teams work as-is), and mail,
 Sentry, and a shell command are equally one block away, with jinja2 templating
@@ -866,7 +865,7 @@ named `<file>:<line>`, configured to cronstable's standard defaults rather
 than an emulation of cron's environment:
 
 * Schedules run in **UTC** unless the crontab sets `CRON_TZ`.
-* Failure means a non-zero exit or stderr output (no `MAILTO` mail).
+* Failure means a nonzero exit or stderr output (no `MAILTO` mail).
 * The `%`-as-stdin feature is a load-time error instead of a silent surprise
   (`\%` still gives a literal `%`).
 
@@ -1139,7 +1138,7 @@ view show where the load actually is. The full semantics live in the
 
 ### Handling failure
 
-By default, cronstable considers a job *failed* if the process exits non-zero
+By default, cronstable considers a job *failed* if the process exits nonzero
 or writes to standard error (with stderr capturing enabled). The `failsWhen`
 option tunes this per job with four booleans: `producesStdout` (default
 false), `producesStderr` (default true), `nonzeroReturn` (default true), and
@@ -1370,7 +1369,7 @@ and the
 [full dashboard tour](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard)
 in the wiki.
 
-The API covers the daemon (version, status, summary, metrics, job-set id),
+The API covers the daemon (version, status, summary, metrics, job-set ID),
 jobs (start, cancel, pause and resume, run history, live SSE log tails,
 resources), schedules (preview, pressure, duplicates, suggest, why), DAGs,
 the durable state store, push-device pairing, the cluster and fleet views,
@@ -1418,12 +1417,12 @@ guide in the wiki: issuing the certificates, the mTLS trust model and how it
 interacts with `web.authToken`, the rotation mechanics and what they do not
 cover, the job state API's trust anchor, and the full client flag surface.
 
-### Job-set id
+### Job-set ID
 
-The **job-set id** is an order-independent fingerprint of the set of jobs a
+The **job-set ID** is an order-independent fingerprint of the set of jobs a
 cronstable instance is running. Two instances produce the *same* id if and only if
 they hold the same set of jobs, which lets several replicas deployed from the
-same configuration confirm they are running the same thing, or detect that one
+same configuration confirm they are running the same jobs, or detect that one
 has drifted from the others.
 
 The id is taken over the *effective* (post-merge) configuration of every job,
@@ -1485,7 +1484,7 @@ It is available three ways:
 By default cronstable runs as a single instance and every replica runs every job.
 An optional `cluster` section lets several replicas coordinate: each node serves
 a small `GET /peer` endpoint over **mutual TLS** and periodically polls its
-configured peers, comparing [job-set ids](#job-set-id) so they can confirm they
+configured peers, comparing [job-set IDs](#job-set-id) so they can confirm they
 are running the *same* set of jobs (cluster peer attestation). Turning on
 `electLeader` promotes that same attestation into a **quorum-gated leader
 election**, so you can run more than one replica from one config without
@@ -1509,7 +1508,7 @@ cluster:
 ```
 
 Each node independently elects, as leader, the lowest `nodeName` among the
-members it currently sees agreeing on the job-set id, but only if that set is a
+members it currently sees agreeing on the job-set ID, but only if that set is a
 **quorum** (a strict majority) of the cluster, so under a clean partition at
 most one side leads. This is best-effort, because the default `gossip` backend
 keeps no shared state. For a fenced, exactly-once guarantee, set
@@ -1590,7 +1589,7 @@ untouched, so the runtime shell expands their `${VAR}` against the job's own
 environment, not the daemon's. The `logging` section is likewise left for
 Python's `logging.config`. See
 [environment-variable interpolation](https://github.com/ptweezy/cronstable/wiki/Environment-Variable-Interpolation)
-for the full rules, including how it affects the [job-set id](#job-set-id).
+for the full rules, including how it affects the [job-set ID](#job-set-id).
 
 ### Custom logging
 
@@ -1656,7 +1655,7 @@ your commits (DCO), and
 for how releases work. cronstable is [MIT-licensed](LICENSE); see
 [LICENSING.md](LICENSING.md) for how the repository's licensing is organized.
 
-**Security.** Please report vulnerabilities privately rather than in a public
+**Security.** Report vulnerabilities privately rather than in a public
 issue; [SECURITY.md](SECURITY.md) has the disclosure process, what is in scope
 (including the hosted relay and the public demo), and what to expect.
 

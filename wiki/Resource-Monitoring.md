@@ -38,7 +38,7 @@ monitorResources:
   history: 240      # chart points kept per run (default 240; 0 = summary only)
 ```
 
-The option merges normally under `defaults:` and is **not** part of the [job-set id](Job-Set-ID) fingerprint. Turning monitoring on or off never changes a job's identity. The per-job option row and the numeric validation table also appear in the [configuration reference](Configuration-Reference#metrics).
+The option merges normally under `defaults:` and is **not** part of the [job-set ID](Job-Set-ID) fingerprint. Turning monitoring on or off never changes a job's identity. The per-job option row and the numeric validation table also appear in the [configuration reference](Configuration-Reference#metrics).
 
 ## How sampling works
 

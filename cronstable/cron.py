@@ -1997,7 +1997,7 @@ class Cron:
         self._node_sampler = NodeResourceSampler()
         # list of cron jobs we /want/ to run
         self.cron_jobs: dict[str, JobConfig] = {}
-        # orchestration DAGs; empty keeps the classic no-DAG behaviour.
+        # orchestration DAGs; empty keeps the classic no-DAG behavior.
         self.cron_dags: dict[str, DagConfig] = {}
         self.pool_config: dict[str, dict[str, int]] = {}
         # Memo caches (these four plus _memo_gen and friends below): pure
@@ -2229,7 +2229,7 @@ class Cron:
         # gossip the election mesh already IS the fleet backend).
         self.observability_mesh: Optional[LeadershipBackend] = None
         # durable state backend when a `state` section is configured; None
-        # keeps the classic stateless behaviour.
+        # keeps the classic stateless behavior.
         self.state_backend: Optional[StateBackend] = None
         # in-flight fire-and-forget durable writes, tracked so they are not
         # GC'd mid-flight and can be flushed at shutdown; durability never
@@ -2388,7 +2388,7 @@ class Cron:
         # see _retry_claim_scan).
         self._retry_claim_task: Optional[asyncio.Task] = None
         # the loopback job-state API, built when state.jobApi starts and
-        # torn down with the backend; None keeps the classic behaviour (no
+        # torn down with the backend; None keeps the classic behavior (no
         # endpoint, no injected CRONSTABLE_STATE_* env).
         self._job_api: Optional["JobStateAPI"] = None
         # job-API analogue of _web_tls_signature (same in-place-rotation
@@ -4413,7 +4413,7 @@ class Cron:
         """Launch a job now (`POST /jobs/{name}/start`, MCP `cron_run_job`).
 
         Raises :class:`ApiActionError` for an unknown (404) or disabled (409)
-        job; otherwise honours the job's concurrencyPolicy exactly as the
+        job; otherwise honors the job's concurrencyPolicy exactly as the
         scheduler would.  A PAUSED job may still be started manually: a pause
         skips scheduled fires only, and the operator asking by hand is the
         operator overriding their own pause (unlike `enabled: false`, which
@@ -9987,7 +9987,7 @@ class Cron:
         derived boot times within :data:`BOOT_TIME_TOLERANCE` (the
         derivation rides the wall clock, so NTP steps shift it slightly).
         ``False`` when neither side can be identified: an unprovable "same
-        boot" must run the job (today's behaviour) rather than eat it.
+        boot" must run the job (today's behavior) rather than eat it.
         """
         boot_id = platform.os_boot_id()
         rec_id = rec.get("bootId")
@@ -10248,7 +10248,7 @@ class Cron:
             # Gate on the SAME boolean owner check as a scheduled job
             # (_cluster_allows), not a name comparison: leader_name()
             # reports a display identity that may differ from node_name,
-            # so comparing names could make the holder fail to recognise
+            # so comparing names could make the holder fail to recognize
             # itself and never run the one-shot on any node.
             if self._cluster_allows(job):
                 del self._pending_reboot_jobs[name]
@@ -10359,7 +10359,7 @@ class Cron:
             # Election is configured but no manager is running (it failed to
             # start, or a reload tore the old one down and the rebuild raised).
             # That is precisely the "store/quorum unreachable" condition, so
-            # honour each policy's contract: Leader fails CLOSED
+            # honor each policy's contract: Leader fails CLOSED
             # (at-most-once), but PreferLeader is never-skip; it must run
             # anyway (accepting a possible double-run) rather than be silently
             # skipped on every replica, which for a fleet-wide start failure
@@ -10774,7 +10774,7 @@ class Cron:
         try:
             # register with the loopback state API BEFORE the child
             # launches, so the child's first callback is already
-            # authorised. Inside the try: staging fromFile secrets awaits
+            # authorized. Inside the try: staging fromFile secrets awaits
             # the executor, and a cancellation parked there (a client gone
             # mid-POST) must hand the slot claim back like any failed
             # spawn. Cancellation cannot strand a registered token: the
@@ -12365,7 +12365,7 @@ class Cron:
         if redact:
             # Executor-offloaded: a pathological line must degrade THIS
             # archive write, not stall dispatch/web/heartbeats. Patterns
-            # are linear (see cronstable.redact); this is defence in
+            # are linear (see cronstable.redact); this is defense in
             # depth.
             texts = await asyncio.get_running_loop().run_in_executor(
                 None, redact_lines, [line for _stream, line in raw]
@@ -12560,7 +12560,7 @@ class Cron:
             # and the retry ladder's supersede watermark: a pause across
             # the restart makes the LAST row a "skipped" one whose fresh
             # finished_at would settle every pending retry. A max fold
-            # over the non-skipped rows, not a backwards walk off the end
+            # over the non-skipped rows, not a backward walk off the end
             # of the deque: the rows above are installed in finish order,
             # but the fold is what makes this reader correct on its own,
             # and it mirrors the _last_real_outcome fold just above.
@@ -12787,7 +12787,7 @@ class Cron:
         attempt, not_before = parsed
         rec_digest = rec.get("jobDigest")
         if not retry["maximumRetries"] or rec_digest != job_digest_cached(job):
-            # retries disabled since arming, or any behaviour-affecting
+            # retries disabled since arming, or any behavior-affecting
             # field changed: the old ladder must not run the new definition
             # (nor lurk until a later config revert).
             self._persist_retry_settled(name, "config-changed", attempt)
@@ -12814,7 +12814,7 @@ class Cron:
         now = get_now(datetime.timezone.utc)
         deadline = job.startingDeadlineSeconds
         if deadline and (now - not_before).total_seconds() > deadline:
-            # same bound catch-up honours: a retry stale beyond the job's
+            # same bound catch-up honors: a retry stale beyond the job's
             # own catch-up window is not worth replaying.
             self._persist_retry_settled(name, "deadline-passed", attempt)
             return None

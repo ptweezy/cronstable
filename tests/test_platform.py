@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 import types
@@ -904,6 +905,39 @@ def test_pid_alive_reports_permission_denied_as_alive(monkeypatch):
 
     monkeypatch.setattr(platform.os, "kill", eperm)
     assert platform.pid_alive(4242) is True
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="a POSIX zombie; Windows has no equivalent"
+)
+def test_pid_alive_reports_a_zombie_as_dead():
+    # Signal 0 succeeds for an exited child that has not been reaped.
+    # Reconciliation must treat it as exited; otherwise, a container whose
+    # PID 1 never reaps children could leave the run record open indefinitely.
+    import psutil
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 60
+        while psutil.Process(proc.pid).status() != psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline, "the child never exited"
+            time.sleep(0.01)
+        # The signal probe still reports that the process exists.
+        os.kill(proc.pid, 0)
+        assert platform.pid_alive(proc.pid) is False
+    finally:
+        proc.wait()
+    assert platform.pid_alive(proc.pid) is False
+
+
+def test_is_zombie_reads_an_unreadable_status_as_not_a_zombie(monkeypatch):
+    import psutil
+
+    def denied(pid):
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(psutil, "Process", denied)
+    assert platform._is_zombie(os.getpid()) is False
 
 
 @pytest.mark.skipif(

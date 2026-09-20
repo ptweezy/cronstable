@@ -1,36 +1,25 @@
 """The ``cronstable mcp`` stdio-to-HTTP bridge for local MCP clients.
 
-Desktop MCP clients (Claude Desktop, Cursor, VS Code) launch a *stdio* server:
-a subprocess that speaks newline-delimited JSON-RPC on stdin/stdout.
-cronstable already serves MCP over HTTP (``POST /mcp``) from the daemon, so
-rather than
-re-implement every tool for a second transport, this bridge is a thin frame
-proxy: it reads each JSON-RPC frame from stdin, forwards it to a running
-daemon's ``/mcp`` endpoint over stdlib ``urllib``, and writes the reply to
-stdout.  Tool logic lives in exactly one place (the daemon, :mod:`cronstable.\
-mcp`).
+Desktop MCP clients launch a subprocess that exchanges newline-delimited
+JSON-RPC messages over stdin and stdout. This bridge forwards each request
+to a running daemon's ``POST /mcp`` endpoint through ``urllib`` and writes
+the reply to stdout. :mod:`cronstable.mcp` implements the tools in the
+daemon, so the bridge requires a reachable daemon.
 
-Like the other job-facing subcommands (:mod:`cronstable.jobcli`) it imports
-**only the standard library** plus :mod:`cronstable._cliargs` (the
-stdlib-only argparse leaf) -- never aiohttp, strictyaml, or the ``Cron``
-graph -- so it starts instantly and stays out of the daemon's import cost.  It
-therefore requires a REACHABLE running daemon; that is the right model for an
-ops tool (there is nothing to serve without one).
+The bridge uses the standard library and :mod:`cronstable._cliargs`.
+It avoids importing aiohttp, strictyaml, or the scheduler at startup.
 
-An ``https://`` URL needs no extra flags when the listener serves a publicly
-trusted certificate.  ``--cacert`` pins a private CA instead of the system
-trust store, ``--client-cert`` / ``--client-key`` answer a listener configured
-with ``web.tls.clientCa`` (which REQUIRES a client certificate), and
-``--insecure`` turns verification off; the contexts themselves come from
-:mod:`cronstable.tlsutil`, a stdlib-only leaf imported from inside
-:func:`_resolve_tls` so the module-level import block stays as stated above.
+For HTTPS listeners with publicly trusted certificates, no extra flags are
+needed. Use ``--cacert`` for a private CA and ``--client-cert`` with
+``--client-key`` when the listener requires a client certificate through
+``web.tls.clientCa``. ``--insecure`` disables certificate verification.
+:func:`_resolve_tls` imports :mod:`cronstable.tlsutil` to build the contexts.
 
-The stdio contract: **stdout carries only JSON-RPC frames; everything else
-goes to stderr.**  A notification (a frame with no ``id``) gets no reply, so
-nothing is written for it.  Being a synchronous line proxy with no
-server->client channel, the bridge cannot carry elicitation/sampling/progress;
-those work only against the endpoint directly.  The negotiated protocol version
-is sniffed from the ``initialize`` reply and stamped on every later request.
+Stdout contains only JSON-RPC messages; diagnostics go to stderr.
+Notifications have no ``id`` and receive no reply. The bridge has no
+server-to-client channel, so elicitation, sampling, and progress require
+a direct connection to the HTTP endpoint. After initialization, requests
+use the protocol version returned in the ``initialize`` response.
 """
 
 import argparse
@@ -135,8 +124,8 @@ def _resolve_tls(args: argparse.Namespace) -> Optional["ssl.SSLContext"]:
         # header is still sent, so the token goes to whoever answers the
         # connection, which is precisely what an interception would want.
         print(
-            "warning: --insecure disables TLS verification; the bearer token "
-            "is still sent, so it goes to whoever answers",
+            "warning: --insecure disables TLS certificate verification; "
+            "this can expose the bearer token to an untrusted server",
             file=sys.stderr,
         )
     try:
@@ -201,7 +190,9 @@ def _post(
         with via.open(req, timeout=timeout) as resp:  # noqa: S310
             return resp.status, resp.read()
     except urllib.error.HTTPError as ex:
-        return ex.code, ex.read()
+        # HTTPError holds the response. Close it to release the connection.
+        with ex:
+            return ex.code, ex.read()
     except urllib.error.URLError as ex:
         # urllib wraps a failed handshake as URLError(reason=ssl.SSLError),
         # which the generic arm below would report as "cannot reach": that
@@ -369,7 +360,7 @@ def _run_bridge(args: argparse.Namespace) -> int:
                     print(str(ex), file=sys.stderr)
                 continue
             # learn the negotiated protocol version from the initialize reply
-            # and stamp it on every subsequent request (how a "dumb" proxy
+            # and stamp it on every subsequent request (how a forwarding proxy
             # discovers the value it must send).
             if method == "initialize" and status == 200 and body:
                 sniffed = _sniff_protocol_version(body)

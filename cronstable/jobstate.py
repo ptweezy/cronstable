@@ -1,34 +1,30 @@
-"""The job-facing state primitives, as pure functions over a backend.
+"""Job state operations implemented as functions over a storage backend.
 
-This module is the *logic* half of "state as a first-class job primitive": it
-turns the small, general surface of a :class:`cronstable.state.StateBackend`
-(mutable documents, content-addressed blobs, append-only records, TTL leases)
-into the six primitives a job command actually reaches for:
+:class:`cronstable.state.StateBackend` provides mutable documents,
+content-addressed blobs, append-only records, and TTL leases. This module
+uses those operations to implement:
 
-* **durable key/value** -- per-job (or shared) restart-surviving settings;
-* **incremental cursor / watermark** -- a monotonic marker an ETL job advances
-  and never sees regress, even when several nodes advance it at once;
-* **idempotency keys** -- a fleet-wide create-if-absent claim so a retried or
-  duplicated run can tell "already did this" from "first time";
-* **named artifact store** -- small blobs published under a name and read back
-  by later runs or peer nodes (the cross-task hand-off DAGs build on).
+* Durable key-value storage for job-specific or shared settings.
+* Cursors that track processing progress without moving backward, even
+  when multiple nodes advance them concurrently.
+* Idempotency keys that identify work already claimed by another run.
+* Named artifacts that later runs or other nodes can retrieve, including
+  the data that DAG tasks share.
 
-The mutex/semaphore and run-scoped secrets are *not* here: those need the live
-daemon (a lease held and renewed on the run's behalf, secrets staged in
-memory) and live in :mod:`cronstable.jobapi`.
+Mutexes, semaphores, and run-scoped secrets require a running daemon and
+are implemented in :mod:`cronstable.jobapi`.
 
-Everything here is a plain ``async`` function taking the backend and a
-``scope`` string, with no aiohttp and no CLI: the loopback server
-(:mod:`cronstable.jobapi`) and the offline CLI (:mod:`cronstable.jobcli`) are
-two thin front-ends over the identical logic, and the unit tests drive it
-directly.  A ``scope`` is the isolation boundary -- by default a job's own
-name, so ``kv set`` in job A cannot read job B's keys; callers pass a shared
-scope (conventionally ``"global"``) to opt into cross-job sharing.
+Each operation is an asynchronous function that takes a backend and a
+``scope`` string. The loopback API calls these functions, and the job CLI
+calls that API. Tests can call the functions directly.
 
-Errors a caller (a job) can provoke -- an oversized value, a cursor type
-clash -- are raised as :class:`JobStateError` carrying the HTTP-ish status the
-loopback server should answer with; everything else (a dead store) propagates
-as the backend's own exception.
+A scope identifies a namespace. By default, it is the job's name. Callers
+can use a shared scope, conventionally ``global``, to share data across
+jobs, subject to the API's authorization checks.
+
+Invalid requests, such as oversized values or incompatible cursor types,
+raise :class:`JobStateError` with an HTTP status code. Backend failures
+propagate as backend exceptions.
 """
 
 import time
@@ -244,7 +240,7 @@ async def cursor_advance(
 
     By default the advance is **monotonic**: the stored value only ever moves
     to ``max(current, value)``, so an out-of-order or replayed batch cannot
-    walk an ETL watermark backwards, and two nodes racing to advance the same
+    walk an ETL watermark backward, and two nodes racing to advance the same
     cursor converge on the larger value regardless of who wins the lock.  Pass
     ``force`` to set the value unconditionally (a deliberate rewind).  The
     whole compare-and-set runs under the document's advisory lock, so the

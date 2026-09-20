@@ -50,14 +50,26 @@ teardown tracks and kills surviving descendants across process groups.
 | Scheduled CLI state and restart | At least two successful scheduled runs; a CLI read sees a prior run's random KV value; history survives restart; subsequent read-only jobs recover that value without writing it again. |
 | Pending retry and restart | A scheduled `@reboot` run fails with exit 23; a pending retry is visible; the daemon stops before retrying; restart alone produces exactly one successful retry at or after its saved deadline and retains both outcomes. |
 | Graceful drain | A real job blocks on a file controlled by the driver; shutdown acknowledges the drain; releasing the file lets the job finish; the daemon exits successfully and closes its listener. |
+| Forced termination during a run | The driver terminates the daemon with `SIGKILL` or, on Windows, `TerminateProcess` while a job runs. The job finishes independently. After restart, the daemon records exactly one run with outcome `unknown` and an interruption reason, and logs the reconciliation. Another restart adds no records. The job runs only once. |
+| Repeated forced termination | The driver terminates the daemon four times while a job runs every two seconds. Every visible state file remains valid JSON, and temporary files remain in `tmp/`. `cronstable state check` reports no quarantined records. After restart, the daemon schedules jobs without a traceback, and its history contains only `success` and `unknown` outcomes. |
 
 The driver releases the initial failure only after daemon readiness; the
 retry's 30-second delay then leaves time for shutdown and restart. Other
 scenarios synchronize on observable events, not assumed startup durations.
 The drain workload also has its own deadline so it cannot wait forever if
-the driver disappears. Forced termination, crash recovery, and service
-manager behavior are separate scenarios to add; a graceful restart does
-not establish those guarantees.
+the driver disappears.
+
+Forced termination stops the daemon and leaves its jobs running. A
+single-file bundle runs the program as a child of its bootloader. The driver
+terminates every process in that tree that uses the daemon's executable,
+starting with the program. Jobs run as native shell scripts, so they don't
+match the executable.
+
+The daemon reconciles an in-flight run after the recorded process exits.
+The mid-run termination test therefore releases the workload and waits for
+all surviving job processes to exit before restarting the daemon. State
+checks read files and JSON directly, without importing cronstable. Service
+manager behavior needs a separate test scenario.
 
 ## CI coverage
 
@@ -79,10 +91,13 @@ and BSD/illumos retain their existing smoke and ABI checks. The source
 suite remains separate under `tests/`; acceptance does not inflate source
 coverage or run implicitly in tox.
 
-## Extend toward continuous dogfooding
+<a id="extend-toward-continuous-dogfooding"></a>
 
-Add focused scenarios here for pool pressure, DAG recovery, timeouts and
-process trees, real dashboard interactions, and reporting to local sinks.
+## Extend coverage for continuous operation
+
+Add focused scenarios for pool pressure, DAG recovery after forced
+termination, forced termination with a retry pending, timeouts, process
+trees, dashboard interactions, and reporting to local destinations.
 Run the same assertions through service/package and container adapters.
 Keep native and emulated coverage explicit rather than skipping a required
 capability when it is missing.
@@ -91,4 +106,4 @@ A later soak workflow can run a reduced `example/grand-tour` workload with
 an independent observer tracking expected outputs and recovery deadlines.
 Give that workflow its own non-publishing trigger: dispatching the current
 release workflow requests a release. Neither the soak environment nor
-cross-release upgrades are part of this first suite.
+cross-release upgrades are covered by this suite.

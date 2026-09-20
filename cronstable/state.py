@@ -1,30 +1,24 @@
-"""Optional durable state backend: one filesystem seam for local disk and
-Amazon S3 Files.
+"""Optional durable state storage on local disk or a shared filesystem.
 
 cronstable is stateless by default: run history, retry counters, the
-next-fire index and the leadership view live in memory and reset on
-restart.  When a ``state`` config section is present, a
-:class:`StateBackend` adds the opt-in other half: a durable,
-restart-surviving record store and a lock to coordinate on.  Absent the
-section the backend is never constructed.
+next-fire index, and leadership view live in memory and reset on restart.
+Configuring a ``state`` section creates a :class:`StateBackend` for
+persistent records and coordination locks. Without that section, the
+daemon does not construct a state backend.
 
-A local filesystem and an Amazon S3 Files / EFS mount are the same kind
-of backend, a POSIX filesystem with atomic file rename and advisory
-``flock``, so there is one implementation,
-:class:`FilesystemStateBackend`, and the mount decides its reach: a
-local directory gives single-node restart durability; an S3 Files / EFS
-mount adds fleet-wide coordination (its advisory NFSv4 lock and atomic
-rename are honoured across every host that mounts it).
+:class:`FilesystemStateBackend` uses atomic file replacement and advisory
+locks. A local directory preserves state across restarts on one node.
+A shared mount, such as Amazon S3 Files or EFS, also supports coordination
+across nodes when it honors locks and atomic replacement across hosts.
 
-Two invariants keep that correct on every backing store:
+The record store follows two rules:
 
-* one immutable object per record: written once to a unique filename
-  (temp file + atomic rename), thereafter only read or deleted.  The
-  "last fired" cursor is derived (the max over the records), never a
-  mutable file, so nothing depends on rewriting an existing object.
-* every record is schema-versioned: a record this build cannot
-  understand is quarantined on read, never guessed at, so one poison
-  object can never brick startup.
+* Records are immutable. Each record is written to a temporary file and
+  atomically renamed to a unique filename. After that, it can only be
+  read or deleted. The last-fired cursor is derived from the records, so
+  it does not require updates to a shared file.
+* Records include a schema version. If this build cannot read a record,
+  it quarantines the record so invalid data does not prevent startup.
 
 The coordination primitive is a TTL lease guarded by an advisory
 ``flock`` over a dedicated lock file (never the data file, which the
@@ -176,7 +170,7 @@ DOC_KEEP: Any = object()
 DOC_DELETE: Any = object()
 
 # Network/shared filesystem types (as they appear in /proc/mounts) that a lock
-# is honoured across hosts on, so the backend may offer fleet-wide
+# is honored across hosts on, so the backend may offer fleet-wide
 # coordination.  An Amazon S3 Files / EFS mount presents as nfs4.  Anything not
 # listed (ext4/xfs/btrfs/apfs/overlay/tmpfs/...) is treated as single-node.
 _SHARED_FSTYPES = frozenset(
@@ -206,7 +200,7 @@ _SHARED_FSTYPES = frozenset(
 _FS_SAFE = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
 
 # Per-byte escape table for _fs_safe_fragment, and the deletion table its
-# inverse uses to recognise an already-canonical token.  Both are derived from
+# inverse uses to recognize an already-canonical token.  Both are derived from
 # _FS_SAFE so neither can drift from it.
 #
 # The escape table carries the weight, because encoding sits inside DECODING:
@@ -457,7 +451,7 @@ def _mount_entry(path: str) -> Optional[tuple[str, str]]:
     Parses ``/proc/mounts``; longest matching mountpoint wins.  Linux-only;
     ``None`` where ``/proc`` is absent, which the caller treats as "cannot
     tell -> single-node".  The options column feeds the lock-fidelity
-    check: ``nolock``/``local_lock`` NFS mounts honour flock only
+    check: ``nolock``/``local_lock`` NFS mounts honor flock only
     host-locally, which the fstype alone cannot reveal.
     """
     try:

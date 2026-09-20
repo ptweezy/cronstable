@@ -37,6 +37,7 @@ from cronstable.state import (
 )
 from tests._configs import _DEP_JOB, _ONE_JOB
 from tests._helpers import (
+    start_state,
     _UTC,
     _backend,
     _drain_state_writes,
@@ -249,7 +250,8 @@ async def test_records_are_immutable_and_versioned(fs_backend):
     stream_dir = backend._stream_dir("s")
     files = [n for n in os.listdir(stream_dir) if n.endswith(".json")]
     assert len(files) == 1
-    on_disk = json.loads((open(os.path.join(stream_dir, files[0])).read()))
+    with open(os.path.join(stream_dir, files[0])) as fobj:
+        on_disk = json.loads(fobj.read())
     assert on_disk["schemaVersion"] == state.SCHEMA_VERSION
     assert on_disk["data"] == {"k": "v"}
 
@@ -1109,11 +1111,11 @@ async def test_cron_start_stop_state(tmp_path):
     cron = Cron(None)
     assert cron.state_backend is None
     cfg = _state_cfg("state:\n  path: " + str(tmp_path) + "\n")
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     assert cron.state_backend is not None
     # unchanged config -> the same backend instance is kept (no churn).
     same = cron.state_backend
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     assert cron.state_backend is same
     # removing the section tears it down.
     await cron.start_stop_state(None)
@@ -1126,9 +1128,9 @@ async def test_cron_state_rebuilds_on_change(tmp_path):
     b = tmp_path / "b"
     a.mkdir()
     b.mkdir()
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(a) + "\n"))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(a) + "\n"))
     first = cron.state_backend
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(b) + "\n"))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(b) + "\n"))
     assert cron.state_backend is not None
     assert cron.state_backend is not first
 
@@ -1138,7 +1140,7 @@ async def test_cron_state_start_failure_is_swallowed(tmp_path, caplog):
     afile = tmp_path / "afile"
     afile.write_text("x")
     cfg = _state_cfg("state:\n  path: " + str(afile) + "\n")
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     # a bad path is logged and swallowed; jobs keep running in memory.
     assert cron.state_backend is None
     assert any(
@@ -1210,7 +1212,7 @@ async def test_max_runs_of_one_is_floored_to_two_and_logged(tmp_path, caplog):
         "state:\n  path: " + str(tmp_path) + "\n  maxRunsPerJob: 1\n"
     )
     with caplog.at_level(logging.WARNING, logger="cronstable"):
-        await cron.start_stop_state(cfg)
+        await start_state(cron, cfg)
         for i in range(_PRUNE_EVERY_APPENDS + 1):
             cron._record_run("j", _info(i))
             await _drain_state_writes(cron)
@@ -1263,7 +1265,7 @@ async def test_max_runs_above_one_is_neither_floored_nor_logged(
         "state:\n  path: " + str(tmp_path) + "\n  maxRunsPerJob: 5\n"
     )
     with caplog.at_level(logging.WARNING, logger="cronstable"):
-        await cron.start_stop_state(cfg)
+        await start_state(cron, cfg)
     for i in range(_PRUNE_EVERY_APPENDS + 1):
         cron._record_run("j", _info(i))
         await _drain_state_writes(cron)
@@ -1282,7 +1284,7 @@ async def test_max_runs_of_zero_leaves_the_ledger_unbounded(tmp_path, caplog):
         "state:\n  path: " + str(tmp_path) + "\n  maxRunsPerJob: 0\n"
     )
     with caplog.at_level(logging.WARNING, logger="cronstable"):
-        await cron.start_stop_state(cfg)
+        await start_state(cron, cfg)
     for i in range(_PRUNE_EVERY_APPENDS + 1):
         cron._record_run("j", _info(i))
         await _drain_state_writes(cron)
@@ -1341,7 +1343,7 @@ def test_job_run_info_from_dict_bad_record_returns_none():
 
 async def test_record_run_persists_to_ledger(tmp_path):
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(tmp_path)))
     cron._record_run("j", _info(1, outcome="success"))
     await _drain_state_writes(cron)
     recs = await cron.state_backend.list_records(cron._run_stream("j"))
@@ -1364,7 +1366,7 @@ async def test_prune_on_append_bounds_ledger(tmp_path):
     cfg = _state_cfg(
         "state:\n  path: " + str(tmp_path) + "\n  maxRunsPerJob: 3\n"
     )
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     # the prune folded into the append is amortised: it actually runs on the
     # first append of a stream and then every K-th, so the stream may briefly
     # exceed the bound by up to K-1 records but never more.
@@ -1380,7 +1382,7 @@ async def test_prune_on_append_bounds_ledger(tmp_path):
 
 async def test_persist_error_is_swallowed(tmp_path, caplog):
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(tmp_path)))
 
     async def boom(*a, **k):
         raise OSError("disk full")
@@ -1426,7 +1428,7 @@ async def test_cron_rehydrates_history_on_restart(fs_backend, tmp_path):
     )
     # a fresh process: same store, same job -> history warmed from the ledger.
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(tmp_path)))
     assert len(cron.run_history["j"]) == 3
     assert cron.last_run["j"].outcome == "success"
     assert (
@@ -1439,12 +1441,12 @@ async def test_rehydration_runs_once(fs_backend, tmp_path):
     await _prepopulate_ledger(fs_backend, ["2026-07-01T00:00:00+00:00"])
     cron = Cron(None, config_yaml=_ONE_JOB)
     cfg = _state_cfg("state:\n  path: " + str(tmp_path))
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     assert cron._state_rehydrated is True
     before = len(cron.run_history["j"])
     # a second housekeeping pass with the unchanged config keeps the same
     # backend and must NOT rehydrate again (which would duplicate history).
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     assert len(cron.run_history["j"]) == before
 
 
@@ -1454,7 +1456,7 @@ async def test_durable_last_run_at_watermark(fs_backend, tmp_path):
         ["2026-07-01T00:00:00+00:00", "2026-07-03T00:00:00+00:00"],
     )
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(tmp_path)))
     assert await cron.durable_last_run_at("j") == "2026-07-03T00:00:00+00:00"
 
 
@@ -1486,7 +1488,7 @@ def _catchup_yaml(
 
 async def _cron_with_watermark(tmp_path, watermark_iso, **jobkw):
     cron = Cron(None, config_yaml=_catchup_yaml(**jobkw))
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(tmp_path)))
     if watermark_iso is not None:
         await cron.state_backend.append_record(
             cron._run_stream("j"),
@@ -1746,7 +1748,7 @@ async def test_run_catch_up_revalidates_after_jitter(tmp_path):
 
 async def _dep_cron(tmp_path):
     cron = Cron(None, config_yaml=_DEP_JOB)
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(tmp_path)))
     return cron
 
 
@@ -1774,7 +1776,7 @@ def test_phase3_config_custom():
 
 async def test_depends_on_past_allows_without_flag(tmp_path):
     cron = Cron(None, config_yaml=_ONE_JOB)  # flag defaults off
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(tmp_path)))
     assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is True
 
 
@@ -1850,7 +1852,7 @@ def _info_with_output(pairs):
 
 async def test_archive_output_writes_redacted(tmp_path):
     cron = Cron(None, config_yaml=_archive_yaml(archive=True, redact=True))
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(tmp_path)))
     cron._record_run(
         "j",
         _info_with_output(
@@ -1868,7 +1870,7 @@ async def test_archive_output_writes_redacted(tmp_path):
 
 async def test_archive_output_without_redaction(tmp_path):
     cron = Cron(None, config_yaml=_archive_yaml(archive=True, redact=False))
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(tmp_path)))
     cron._record_run("j", _info_with_output([("stdout", "password=hunter2")]))
     await _drain_state_writes(cron)
     logs = await cron.state_backend.list_records(cron._log_stream("j"))
@@ -1878,7 +1880,7 @@ async def test_archive_output_without_redaction(tmp_path):
 
 async def test_no_archive_without_flag(tmp_path):
     cron = Cron(None, config_yaml=_ONE_JOB)  # archiveOutput defaults off
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(tmp_path)))
     cron._record_run("j", _info_with_output([("stdout", "x")]))
     await _drain_state_writes(cron)
     assert await cron.state_backend.list_records(cron._log_stream("j")) == []
@@ -1891,7 +1893,7 @@ async def test_archive_output_pruned_to_max(tmp_path):
     cfg = _state_cfg(
         "state:\n  path: " + str(tmp_path) + "\n  maxRunsPerJob: 2\n"
     )
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     # one past the amortisation cadence, so the folded prune has run again
     # on the archive stream (see test_prune_on_append_bounds_ledger).
     for i in range(_PRUNE_EVERY_APPENDS + 1):
@@ -5272,7 +5274,7 @@ async def test_shutdown_completes_despite_hung_state_write(
     # run() still returns.  Never asserts how fast -- only that it
     # completes at all, within a x10-generous outer bound.
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    await start_state(cron, _state_cfg("state:\n  path: " + str(tmp_path)))
     assert cron.state_backend is not None
 
     hang = asyncio.get_running_loop().create_future()

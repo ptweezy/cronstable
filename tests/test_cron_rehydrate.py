@@ -12,7 +12,13 @@ from tests._cron_helpers import (
     UTC,
     fixed_current_time,  # noqa: F401
 )
-from tests._helpers import _seed_orphan_open, _state_cfg
+from tests._helpers import (
+    _seed_orphan_open,
+    _state_cfg,
+    close_at_test_end,
+    start_state,
+    stop_cron_state,
+)
 
 # ===================== rehydrate additions =====================
 #
@@ -52,7 +58,8 @@ def _rehydrate_cfg(tmp_path):
 
 async def _rehydrate_state_cron(tmp_path, yaml=_ONE_JOB):
     cron = cronstable.cron.Cron(None, config_yaml=yaml)
-    await cron.start_stop_state(_rehydrate_cfg(tmp_path))
+    await start_state(cron, _rehydrate_cfg(tmp_path))
+    close_at_test_end(lambda: stop_cron_state(cron))
     return cron
 
 

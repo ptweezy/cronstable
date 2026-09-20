@@ -1,20 +1,17 @@
 # Listener TLS
 
-cronstable's HTTP surfaces can serve TLS themselves, with no reverse proxy in
-front. The optional **`web.tls`** block turns the `https://` entries of
-`web.listen` into real TLS listeners for the dashboard, the REST API, the
-metrics endpoint, and the MCP bridge. The separate **`state.jobApi.tls`** block
-does the same for the job-facing durable-state endpoint, and hands every job
-the trust anchor it needs to verify that endpoint back.
+cronstable's HTTP listeners support TLS without a reverse proxy. Configure
+`web.tls` to serve the dashboard, REST API, metrics, and MCP endpoint through
+the `https://` entries in `web.listen`. Configure `state.jobApi.tls` to
+encrypt connections to the job state API. The daemon then gives each job
+the CA certificate it needs to verify that API's certificate.
 
-Both are ordinary listener TLS: a certificate, its private key, and (on
-`web.tls` only) an optional client CA that turns the listener into a
-**mutual-TLS** one, where a caller must present a certificate that CA signed.
-They share plumbing with the cluster mesh through `cronstable/tlsutil.py`, but
-the configuration blocks are separate:
+Both configurations require a certificate and its private key. `web.tls`
+also accepts a client CA for mutual TLS, which requires clients to present
+certificates signed by that CA. Both use the shared helpers in
+`cronstable/tlsutil.py`. The cluster has a separate configuration:
 [`cluster.tls`](Clustering-and-Leader-Election#cluster-peer-attestation) is its
-own always-mutual block for the peer channel, and nothing on this page affects
-it.
+own mutual TLS configuration for peer connections.
 
 **On this page:**
 [When you want it](#when-you-want-it-and-when-you-do-not) ·
@@ -36,33 +33,33 @@ runner, a desktop MCP client. The API carries the bearer token
 plaintext listener therefore puts that token, and every job name, command, and
 captured output the API returns, on the wire in the clear.
 
-Three cases where it adds nothing:
+You might not need listener TLS in these deployments:
 
-* **A loopback-only dashboard.** `http://127.0.0.1:8080` never leaves the host,
-  so wrapping it in TLS adds certificates to manage and protects nothing that
-  was exposed.
+* **A loopback-only dashboard.** Traffic to `http://127.0.0.1:8080` stays on
+  the host.
 * **A `unix://` listener.** The socket lives in the host filesystem and
   [`web.socketMode`](HTTP-API#unix-socket-permissions) is its access control.
   `unix://` entries stay plaintext even when `web.tls` is set.
 * **TLS already terminated in front.** If an ingress, a service mesh sidecar,
   or an nginx block already terminates TLS and forwards to a loopback `http://`
-  listener, that is still a valid deployment. `web.tls` is the alternative for
-  when you would rather not run that hop.
+  listener, you can keep that setup. Use `web.tls` to terminate TLS in
+  cronstable instead.
 
-The one thing TLS does **not** do is authenticate the caller. Plain `https://`
-proves to the *client* which server it reached. It says nothing about who is
-connecting. Caller authentication is either
+HTTPS with a server certificate authenticates the server to the client.
+To authenticate callers, use
 [`web.authToken`](HTTP-API#authentication) or
 [mutual TLS](#mutual-tls-clientca).
 
-## Quickstart: an https dashboard
+## Quickstart: an HTTPS dashboard
 
-### 1. Mint a certificate with the right SANs
+<a id="1-mint-a-certificate-with-the-right-sans"></a>
 
-The certificate must cover **the name the client actually dials**. This is the
-single most common first-run failure: a certificate issued for `localhost` does
-not match `https://127.0.0.1:8443`, because an IP literal is matched against IP
-SANs, not DNS ones. Put both forms in, plus whatever routable name you will use:
+### 1. Create a certificate with the required SANs
+
+The certificate's subject alternative names (SANs) must include the names
+or IP addresses that clients use. A DNS SAN for `localhost` doesn't match
+`https://127.0.0.1:8443`; that URL requires an IP SAN. Include both forms
+and any network hostname that clients use:
 
 ```shell
 openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
@@ -93,16 +90,15 @@ web:
     fromEnvVar: CRONSTABLE_WEB_TOKEN
 ```
 
-Run `cronstable --validate-config` before deploying. The pairing rules described
-later are checked at parse time, so a `cert` with no `key`, or an `https://`
-listener with no certificate, is caught at rest rather than at the first
-connection.
+Before deploying, run `cronstable --validate-config`. It reports a missing
+`key` for a configured `cert`, or an `https://` listener without a
+certificate, before the daemon starts.
 
 ### 3. Point a client at it
 
-A self-signed certificate is its own CA, so the file you just minted is what
-clients verify against. For an internally-issued certificate, pass the issuing
-CA's PEM instead:
+For a self-signed certificate, pass the certificate file to clients as the
+trust anchor. For a certificate issued by an internal CA, pass the issuing
+CA's PEM file:
 
 ```shell
 cronstable tui --url https://cronstable.internal:8443 \

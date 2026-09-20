@@ -562,7 +562,7 @@ class MCPHandler:
                 "observe",
                 "cron_get_status",
                 "Job status",
-                "One-line status (running/disabled/scheduled) of every job.",
+                "Show each job's status: running, disabled, or scheduled.",
                 obj({"offset": _INT, "limit": _INT}),
                 self._t_get_status,
             ),
@@ -570,8 +570,9 @@ class MCPHandler:
                 "observe",
                 "cron_list_jobs",
                 "List jobs",
-                "List jobs with schedule, enabled/running state, next run and "
-                "last outcome. Optional name substring `filter` and `state` "
+                "List jobs with schedule, enabled/running state, next run, "
+                "and last outcome. Optional name substring `filter` "
+                "and `state` "
                 "(running/disabled/scheduled).",
                 obj(
                     {
@@ -587,7 +588,7 @@ class MCPHandler:
                 "observe",
                 "cron_get_job",
                 "Get one job",
-                "Full detail for one job (schedule, command, last run, live "
+                "Show details for one job (schedule, command, last run, live "
                 "resources, retry/slot state).",
                 obj({"name": _STR}, ["name"]),
                 self._t_get_job,
@@ -596,7 +597,7 @@ class MCPHandler:
                 "observe",
                 "cron_list_runs",
                 "Run history",
-                "Saved run history, success rate and duration "
+                "Show saved run history, success rate, and duration "
                 "statistics for one job "
                 "(most recent `limit` runs).",
                 obj({"name": _STR, "limit": _INT}, ["name"]),
@@ -625,7 +626,8 @@ class MCPHandler:
                 "cron_get_cluster",
                 "Cluster view",
                 "This node's cluster/leadership view (peers, quorum, role, "
-                "live load). enabled:false without a cluster section.",
+                "live load). Returns enabled:false if no cluster is "
+                "configured.",
                 obj({}),
                 self._t_get_cluster,
             ),
@@ -660,7 +662,7 @@ class MCPHandler:
                 "observe",
                 "cron_get_version",
                 "Version",
-                "Server version, job-set id and job count.",
+                "Show the server version, job-set ID, and job count.",
                 obj({}),
                 self._t_get_version,
             ),
@@ -690,8 +692,8 @@ class MCPHandler:
                 "cron_schedule_duplicates",
                 "Duplicate schedules",
                 "Jobs with identical run times (for example, */5 and 0-59/5 "
-                "in the same timezone). Use to find schedules that could "
-                "be spread out.",
+                "in the same time zone). Use this to find schedules "
+                "that could be spread out.",
                 obj({}),
                 self._t_schedule_duplicates,
             ),
@@ -699,7 +701,8 @@ class MCPHandler:
                 "observe",
                 "cron_suggest_slot",
                 "Suggest a quieter run time",
-                "Suggest a time with fewer scheduled runs in the next 24h. "
+                "Suggest a time with fewer scheduled runs in the next "
+                "24 hours. "
                 "For `period`, 'hourly' picks a minute, "
                 "'daily' a minute and hour; returns the cron expression, two "
                 "alternatives, and the busiest time.",
@@ -719,7 +722,7 @@ class MCPHandler:
                 "valid true/false with the engine's exact error (including "
                 "wrong-field hints for Quartz-style forms), the "
                 "plain-English description, the normalized form, advisory "
-                "warnings and the first scheduled run, all from the "
+                "warnings, and the first scheduled run, all from the "
                 "server's scheduling engine. The dialect includes L "
                 "(last day), L-n (n days before it), nW / LW (nearest / "
                 "last weekday) and Ln / d#n (last / nth weekday: L5 = last "
@@ -763,8 +766,8 @@ class MCPHandler:
                 "and Friday'), with the previous and next scheduled runs and "
                 "notes on this dialect's day-field AND rule and DST "
                 "effects. `at` is ISO 8601; timestamps without an offset use "
-                "the job's timezone. If the schedule does "
-                "match, the answer points at execution history "
+                "the job's time zone. If the schedule does "
+                "match, the answer refers to execution history "
                 "(cron_list_runs) instead.",
                 obj({"name": _STR, "at": _STR}, ["name", "at"]),
                 self._t_why_no_run,
@@ -791,7 +794,7 @@ class MCPHandler:
                 "dags",
                 "cron_get_dag_run",
                 "Get workflow run",
-                "Workflow run details: task status, timing and decisions.",
+                "Workflow run details: task status, timing, and decisions.",
                 obj({"dag": _STR, "run_key": _STR}, ["dag", "run_key"]),
                 self._t_get_dag_run,
             ),
@@ -904,7 +907,7 @@ class MCPHandler:
                 "act",
                 "cron_run_job",
                 "Run job now",
-                "Launch a job immediately (honours its concurrencyPolicy). "
+                "Launch a job immediately, following its concurrencyPolicy. "
                 "Requires confirm=true.",
                 obj({"name": _STR, "confirm": _BOOL}, ["name"]),
                 self._t_run_job,
@@ -968,8 +971,8 @@ class MCPHandler:
                 "cron_backfill_dag",
                 "Run workflow for past dates",
                 "Run a scheduled workflow for an ISO date range. dry_run "
-                "(default true) previews; a real backfill needs dry_run=false "
-                "AND confirm=true.",
+                "(default true) previews the runs. To start them, set "
+                "dry_run=false and confirm=true.",
                 obj(
                     {
                         "dag": _STR,
@@ -1738,7 +1741,7 @@ class MCPHandler:
                 "cronstable://version",
                 "version",
                 "Version",
-                "Server version, job-set id and job count.",
+                "Show the server version, job-set ID, and job count.",
                 "observe",
                 version_data,
             ),
@@ -1921,7 +1924,7 @@ class MCPHandler:
                 "name": "triage_job_failure",
                 "title": "Triage a job failure",
                 "description": "Find why a job failed using its runs, "
-                "trends, logs and host health.",
+                "trends, logs, and host health.",
                 "arguments": [arg("job", "the failing job's name")],
                 "toolset": "observe",
                 "render": triage,
@@ -1938,7 +1941,7 @@ class MCPHandler:
             {
                 "name": "fleet_health_summary",
                 "title": "Fleet health summary",
-                "description": "A summary of cluster, node and job health.",
+                "description": "A summary of cluster, node, and job health.",
                 "arguments": [],
                 "toolset": "observe",
                 "render": fleet,
@@ -1946,7 +1949,7 @@ class MCPHandler:
             {
                 "name": "why_did_dag_run_fail",
                 "title": "Diagnose a failed workflow run",
-                "description": "Review tasks, logs and outputs from a failed "
+                "description": "Review tasks, logs, and outputs from a failed "
                 "workflow run to find the cause.",
                 "arguments": [
                     arg("dag", "the workflow name"),

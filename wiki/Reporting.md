@@ -157,7 +157,7 @@ Sends an email over SMTP with `aiosmtplib`. Reporting is enabled only when both
 In the strictyaml schema, `from` and `to` are required keys when a `mail` block
 is present (they accept an empty value, mapping to `None`), while the remaining
 keys are optional. Behaviorally, mail reporting is skipped unless both resolve to
-a non-empty value.
+a nonempty value.
 
 Notes on behavior:
 
@@ -646,7 +646,7 @@ string or empty value:
 | `fromEnvVar` | Name of an environment variable holding the secret. |
 
 Resolution order is `value`, then `fromFile`, then `fromEnvVar`; the first
-non-empty source wins. If none is set, the reporter treats the secret as absent
+nonempty source wins. If none is set, the reporter treats the secret as absent
 (Sentry: disabled; mail: no login).
 
 If `fromEnvVar` is set but the named environment variable is unset or empty, the

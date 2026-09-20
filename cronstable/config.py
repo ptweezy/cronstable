@@ -68,7 +68,7 @@ def _patch_strictyaml_seq_deepcopy() -> None:
     ``self``, which the loop never mutates, and it overwrites the same six
     attributes on every call, so only the last call's objects ever survive;
     running it once after the loop installs the same result.  The
-    empty-sequence case deliberately keeps upstream's behaviour (no call at
+    empty-sequence case deliberately keeps upstream's behavior (no call at
     all) rather than the Map twin's, so the call COUNT is the only thing
     this changes.
 
@@ -1742,7 +1742,7 @@ class JobConfig:
         self.concurrencyScope = config.pop("concurrencyScope")
         self.clusterPolicy = config.pop("clusterPolicy")
         # Catch-up config is deliberately NOT part of the job-set fingerprint
-        # (cronstable.fingerprint): restart-time, node-local behaviour, so no
+        # (cronstable.fingerprint): restart-time, node-local behavior, so no
         # SCHEME_VERSION bump.  Same for the archival pair and for sla/onLate
         # (alerting-only).  onlyIfLastSucceeded IS fingerprinted, like
         # `enabled`: it gates every scheduled fire, so replicas disagreeing
@@ -1771,11 +1771,10 @@ class JobConfig:
         self.timezone: Optional[datetime.tzinfo] = self._resolve_timezone(
             config.pop("timezone")
         )
-        # Advisory schedule lint, logged so the load that introduces a
-        # footgun says so immediately, and kept on the job for the status
-        # payloads.  A dead schedule stays a WARNING, not an error: a fixed
-        # past year is the working idiom for parking a job, and failing the
-        # load over it would turn an upgrade into an outage.
+        # Log schedule findings during configuration loading and retain them
+        # on the job for status responses. A schedule with no future runs
+        # produces a warning, not an error: a past year can intentionally
+        # suspend a job, so it must not prevent the configuration from loading.
         self.schedule_findings: list[Finding] = self._lint_schedule(lint_cache)
         for finding in self.schedule_findings:
             logger.log(
@@ -2237,9 +2236,9 @@ class JobConfig:
             raise self._reject("maxLineLength must be > 0")
         if not self.killTimeout >= 0:
             raise self._reject("killTimeout must be >= 0")
-        # sampling walks the whole process table each tick, so a sub-100ms
-        # cadence is a busy-loop footgun; the history cap bounds what one run
-        # can add to a durable ledger record (0 = summary only, no series).
+        # Sampling scans the process table, so intervals shorter than 100 ms
+        # can cause excessive CPU use. The history cap limits the data in a
+        # durable run record (0 stores only the summary, with no series).
         if not self.monitorResourcesInterval >= 0.1:
             raise self._reject(
                 "monitorResources.interval must be >= 0.1 (seconds)"
@@ -2713,7 +2712,7 @@ def _cluster_base(raw: dict) -> "dict[str, Any]":
     cfg.update(raw)
     if not cfg.get("nodeName"):
         # a stable, human-readable identity for this node, used as the lease
-        # identity and so a gossip peer can recognise itself in someone else's
+        # identity and so a gossip peer can recognize itself in someone else's
         # peer list; the system hostname is a sensible default.
         cfg["nodeName"] = socket.gethostname()
     if cfg["connectTimeout"] <= 0:
@@ -3380,7 +3379,7 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
 
 
 # An RFC 3986 scheme (ALPHA *(ALPHA / DIGIT / "+" / "-" / ".")) followed by
-# ":" -- recognised as a scheme only when "//" (an authority) follows, so a
+# ":" -- recognized as a scheme only when "//" (an authority) follows, so a
 # scheme-less "user:pass@host" is NOT mistaken for scheme "user".
 _URL_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*:(?=//)")
 
@@ -3530,7 +3529,7 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
             or not parsed.hostname
             or bad_port
         ):
-            # redact too (defence in depth): the userinfo check above already
+            # redact too (defense in depth): the userinfo check above already
             # rejected any credentialed endpoint; still, never echo a raw URL.
             raise ConfigError(
                 "cluster.etcd.endpoints must be http(s)://host[:port], "
@@ -4255,7 +4254,7 @@ class CronstableConfig:
     web_config: Optional[WebConfig]
     job_defaults: JobDefaults
     logging_config: Optional[LoggingConfig]
-    # The optional sections default to None (feature off, classic behaviour)
+    # The optional sections default to None (feature off, classic behavior)
     # so existing constructors (e.g. the empty config in Cron.update_config)
     # need no change.
     cluster_config: Optional[ClusterConfig] = None
@@ -4290,7 +4289,7 @@ class CronstableConfig:
 # variable VAR (``:-default`` falls back when unset or empty, like the POSIX
 # shell; ``$$`` escapes a literal ``$``).  An unset variable with no default
 # is a hard ConfigError naming the variable and where it appeared.  Only the
-# braced forms are recognised: a lone ``$``, a bare ``$VAR``, or a malformed
+# braced forms are recognized: a lone ``$``, a bare ``$VAR``, or a malformed
 # ``${...}`` is left verbatim, so a config that never used the syntax is
 # untouched.  Expansion runs post-validation, so only fields strictyaml
 # accepted as strings are eligible (put a variable inside a string, e.g.
@@ -4444,7 +4443,7 @@ def _interpolate_env(doc: Any, path: str) -> Any:
 
     Walks the validated document, rebuilding it; see the module comment above
     :func:`_interpolate_env_value` for the grammar and the intentionally
-    skipped structural fields (which are recognised by position, not by key
+    skipped structural fields (which are recognized by position, not by key
     name, via :func:`_env_child_kind`).
     """
 

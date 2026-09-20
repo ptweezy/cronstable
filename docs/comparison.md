@@ -1,6 +1,6 @@
 # How cronstable compares
 
-**cronstable is the only cron-family scheduler with a built-in [MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)**. AI agents (Claude, Cursor, and Copilot) can observe your cronstable state and, when you opt in, act on them. All of this sits alongside durable state, a real DAG engine, leader-elected clustering, and a live dashboard, in a single hardened, dependency-free daemon.
+cronstable includes a built-in [MCP server](https://github.com/ptweezy/cronstable/wiki/MCP). AI agents such as Claude, Cursor, and Copilot can inspect jobs and workflows and, when you enable control, act on them. The same daemon provides durable state, a DAG engine, leader election, and a live dashboard. Standalone binaries bundle the runtime dependencies.
 
 **Legend:** ✅ built-in · 🟡 partial / limited · ➕ requires an add-on
 
@@ -23,7 +23,7 @@
 | Missed-run catch-up after downtime | ✅ | — | — | — | — | ✅ | 🟡 | ✅ |
 | **🔹 Orchestration & workflows** | | | | | | | | |
 | DAGs / dependency graphs | ✅ | — | — | — | 🟡 | 🟡 | ➕ | ✅ |
-| Cross-task data hand-off (XCom) | ✅ | — | — | — | — | ✅ | ➕ | ✅ |
+| Cross-task data handoff (XCom) | ✅ | — | — | — | — | ✅ | ➕ | ✅ |
 | Dynamic task mapping (fan-out · fan-in) | ✅ | — | — | — | — | — | — | ✅ |
 | Sensors (poll-until-true tasks) | ✅ | — | — | — | — | — | — | ✅ |
 | Human approval gates | ✅ | — | — | — | — | — | ➕ | ✅ |

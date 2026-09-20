@@ -27,7 +27,11 @@ from cronstable.cron import Cron, PauseInfo
 from cronstable.fingerprint import job_digest
 from cronstable.job import JobRetryState
 from cronstable.prometheus import PrometheusMetrics
-from tests._helpers import _newest, _seed_orphan_open
+from tests._helpers import (
+    _newest,
+    _seed_orphan_open,
+    start_state,
+)
 from tests.test_state import (
     _count_launcher,
     _drain_state_writes,
@@ -129,7 +133,7 @@ async def _stateful_cron(tmp_path, yaml, extra_state=""):
     cfg = _state_cfg(
         "state:\n  path: {}\n{}".format(tmp_path, extra_state)
     )
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     assert cron.state_backend is not None
     return cron
 
@@ -2831,7 +2835,7 @@ async def test_backend_swap_cancels_the_in_flight_pause_refresh(tmp_path):
         assert stale is not None
         await entered.wait()
 
-        await cron.start_stop_state(cfg_b)
+        await start_state(cron, cfg_b)
         cancelled = cron._pause_refresh_task is None
         # release before asserting: a pass left parked here would sit out
         # the whole store timeout on the way to teardown.
@@ -2857,6 +2861,10 @@ async def test_pause_taken_while_the_store_is_down_survives_its_return(
     await _drain_state_writes(cron)
     assert (await _newest(cron, "paused/p"))["kind"] == "resumed"
 
+    # Stop the backend and job API to simulate removal of the state
+    # configuration section.
+    await cron._stop_job_api()
+    await cron.state_backend.stop()
     cron.state_backend = None
     await cron.pause_job_by_name("p", duration=3600, by="parker")
     assert cron._pause_active("p") is not None
@@ -2866,7 +2874,7 @@ async def test_pause_taken_while_the_store_is_down_survives_its_return(
         for r in caplog.records
     )
 
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     await _drain_state_writes(cron)
     # the housekeeping pass that follows the store's return must find
     # the operator's pause on top of the stream, not the record it
@@ -2888,11 +2896,15 @@ async def test_resume_taken_while_the_store_is_down_survives_its_return(
     await cron.pause_job_by_name("p", duration=3600)
     await _drain_state_writes(cron)
 
+    # Stop the backend and job API to simulate removal of the state
+    # configuration section.
+    await cron._stop_job_api()
+    await cron.state_backend.stop()
     cron.state_backend = None
     await cron.resume_job_by_name("p", by="parker")
     assert cron._pause_active("p") is None
 
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     await _drain_state_writes(cron)
     await cron._refresh_pauses_from_store()
     assert cron._pause_active("p") is None
@@ -2952,7 +2964,7 @@ async def test_backend_swap_cancels_the_refresh_before_the_teardown_awaits(
             await real_stop()
 
         cron.state_backend.stop = yielding_stop  # type: ignore[method-assign]
-        await cron.start_stop_state(cfg_b)
+        await start_state(cron, cfg_b)
         await asyncio.gather(stale, return_exceptions=True)
         assert "p" not in cron._paused
         assert cron._pause_active("p") is None
@@ -3013,6 +3025,10 @@ async def test_buffered_pause_does_not_outlive_a_resume_taken_stateless(
     cron = await stateful_cron(_PAUSE_JOB)
     cfg = _state_cfg("state:\n  path: {}\n".format(tmp_path))
     await _drain_state_writes(cron)
+    # Stop the backend and job API to simulate removal of the state
+    # configuration section.
+    await cron._stop_job_api()
+    await cron.state_backend.stop()
     cron.state_backend = None  # the store goes down
     await cron.pause_job_by_name("p", duration=3600, by="parker")
     assert cron._pause_pending_writes["p"]["kind"] == "paused"
@@ -3023,7 +3039,7 @@ async def test_buffered_pause_does_not_outlive_a_resume_taken_stateless(
     assert cron._pause_active("p") is None
     assert "p" not in cron._pause_pending_writes
 
-    await cron.start_stop_state(cfg)  # the section comes back
+    await start_state(cron, cfg)  # Restore the state configuration.
     await _drain_state_writes(cron)
     await cron._refresh_pauses_from_store()
     assert cron._pause_active("p") is None
@@ -3047,7 +3063,7 @@ async def test_refresh_drops_a_job_a_reload_removed_during_its_read(tmp_path):
     cfg_file.write_text(_PAUSE_JOB)
     cron = Cron(str(cfg_file))
     cfg = _state_cfg("state:\n  path: {}\n".format(tmp_path / "store"))
-    await cron.start_stop_state(cfg)
+    await start_state(cron, cfg)
     assert cron.state_backend is not None
     try:
         until = _now_utc() + datetime.timedelta(seconds=3600)

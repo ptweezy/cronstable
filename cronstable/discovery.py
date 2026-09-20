@@ -1,17 +1,15 @@
-"""Zero-config LAN discovery: the opt-in Bonjour/mDNS advert.
+"""Optional local network discovery through Bonjour and mDNS.
 
 With ``web.bonjour`` enabled, the daemon advertises its web control API
-as a ``_cronstable._tcp`` service on the local network, so a companion
-app (or ``dns-sd -B _cronstable._tcp``) finds it without a typed URL.
-The advert carries no secrets: instance name, port, scheme and version
-only; a client still needs a bearer token to read anything.
+as a ``_cronstable._tcp`` service on the local network. A companion app or
+``dns-sd -B _cronstable._tcp`` can discover it without a URL. The service
+advertisement includes only the instance name, port, scheme, and version.
+It contains no secrets and does not grant API access.
 
-python-zeroconf is an optional extra (``pip install
-"cronstable[discovery]"``); the import is guarded and deferred, and config
-validation refuses ``web.bonjour`` when the library is absent.  Unlike push
-(an alerting channel that must fail closed), a *runtime* advert failure is
-logged and swallowed: discovery is a convenience, and an mDNS hiccup
-must never take down a scheduler.
+The ``discovery`` extra installs python-zeroconf
+(``pip install "cronstable[discovery]"``). Configuration validation rejects
+``web.bonjour`` if the library is missing. At runtime, discovery failures
+are logged without stopping the scheduler.
 """
 
 import asyncio

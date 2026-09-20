@@ -1,17 +1,15 @@
-"""Best-effort secret scrubbing for archived job output.
+"""Best-effort secret redaction for archived job output.
 
-Captured stdout/stderr routinely carries credentials -- a connection string, a
-bearer token, an API key echoed by a misbehaving script -- so before cronstable
-writes a run's output to a durable store (see
-:meth:`cronstable.cron.Cron._archive_output`) it runs each line through
-:func:`redact_secrets` (or, for a whole run's output, :func:`redact_lines`,
-which additionally tracks multi-line PEM blocks across lines).
+Captured stdout and stderr can contain credentials, such as connection
+strings, bearer tokens, and API keys. Before archiving output,
+:meth:`cronstable.cron.Cron._archive_output` applies :func:`redact_secrets`
+to individual lines or :func:`redact_lines` to a run's output. The latter
+also tracks PEM blocks that span multiple lines.
 
-This is a *defence in depth* pass, deliberately conservative: it errs toward
-redacting a bit too much rather than leaking, and it is not a guarantee that no
-secret survives.  It replaces only the sensitive span (keeping the surrounding
-key/label for context), so an archived log stays readable.  Redaction is on by
-default and can be turned off per job with ``redactArchivedSecrets: false``.
+Redaction provides defense in depth, but cannot guarantee that all secrets
+are removed. It can also redact text that is not a secret. It preserves
+surrounding keys and labels to keep logs readable. Redaction is enabled by
+default; set ``redactArchivedSecrets: false`` to disable it for a job.
 """
 
 import re
@@ -370,7 +368,7 @@ def redact_lines(lines: Iterable[str]) -> list[str]:
     Applies :func:`redact_secrets` to each line, and additionally replaces
     every line inside a ``-----BEGIN ... PRIVATE KEY----- / -----END ...-----``
     block (inclusive) with :data:`REDACTED`: the base64 body lines *are* the
-    key material, and no per-line pattern can recognise them in isolation.  A
+    key material, and no per-line pattern can recognize them in isolation.  A
     block left unterminated (truncated output) stays redacted to the end --
     erring toward over-redaction, per the module contract.
 

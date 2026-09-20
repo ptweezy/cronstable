@@ -348,9 +348,9 @@
       <span class="say">/ kraahn-stuh-bl /</span>
     </div>
 
-    <h1>As simple as <span class="hl">cron</span>, as capable as <span class="hl">Airflow</span>, in one daemon.</h1>
+    <h1><span class="hl">Cron scheduling</span> and <span class="hl">durable workflows</span> in one daemon.</h1>
 
-    <p class="lede">Point cronstable at the crontab you already run and <strong>it behaves like plain cron</strong>. Reach for DAGs, durable state, leader-elected clustering and a live dashboard only when you need them, all from one dependency-free daemon. And when you want it, a built-in Model Context Protocol server lets an AI agent drive the whole thing.</p>
+    <p class="lede">Load an existing crontab or define jobs in YAML. Add DAGs, durable state, leader election, and a live dashboard as you need them. The built-in Model Context Protocol (MCP) server lets AI agents inspect jobs and workflows and, when you enable control, act on them. Standalone binaries bundle the runtime dependencies.</p>
 
     <div class="chips">
       <span class="chip green"><span class="cd"></span><b>35 / 35</b><span>native features</span></span>
@@ -877,7 +877,7 @@
   <div class="sec-head">
     <div>
       <h2>Everything else it packs in</h2>
-      <p>The agent interface gets the attention, but most of cronstable is the scheduler under it: a DAG engine, a fenced cluster, a durable state store and a live console, all in the same dependency-free daemon.</p>
+      <p>The same daemon provides scheduling, a DAG engine, cluster coordination, durable state, and a live dashboard.</p>
     </div>
   </div>
 
@@ -1008,18 +1008,18 @@ $ cronstable mcp <span class="k">--check</span>
   <div class="takeaways">
     <div class="tk">
       <div class="n">5-in-1</div>
-      <div class="t">Orchestration without the Airflow overhead</div>
-      <p>Scheduler, durable DAG engine, a job-facing state store, a leader-elected cluster and a live console in one binary. It matches Airflow's orchestration without the metadata DB, the separate workers, or the Python-only footprint.</p>
+      <div class="t">Scheduling and orchestration</div>
+      <p>Run scheduled jobs and durable workflows, share state between jobs, coordinate a cluster, and monitor it from a live dashboard. These features run in one binary without a separate metadata database or worker service.</p>
     </div>
     <div class="tk">
       <div class="n brass">1 of 8</div>
-      <div class="t">Only cronstable ships a native MCP server</div>
-      <p>Across every tool surveyed, it's the only native agent interface. Airflow and Kubernetes reach MCP only through third-party, whole-system add-ons, and Airflow's own server is still a draft proposal.</p>
+      <div class="t">Built-in MCP server</div>
+      <p>Connect an MCP client to inspect jobs, schedules, runs, and cluster health. Access is read-only by default; enable control when you want agents to run jobs or manage workflows.</p>
     </div>
     <div class="tk">
       <div class="n">0 deps</div>
-      <div class="t">Portable and dependency-free</div>
-      <p>Pure-Python with no new dependencies, self-contained binaries for 13 OS/arch targets, and images that run non-root on a read-only root filesystem.</p>
+      <div class="t">Self-contained binaries</div>
+      <p>Standalone binaries bundle Python and runtime dependencies. Container images run as a non-root user and support a read-only root filesystem.</p>
     </div>
   </div>
 

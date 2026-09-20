@@ -53,6 +53,27 @@ def extra_floors(project):
     return floors
 
 
+def minimum_requirements(project):
+    """Pin each declared minimum version and preserve environment markers.
+
+    The ``mindeps`` tox environment installs these requirements alongside
+    ``requirements_dev.txt`` to test the oldest supported runtime and test
+    dependencies. Omit dependencies without a declared minimum version.
+    """
+    pins = []
+    lines = (
+        project["dependencies"] + project["optional-dependencies"]["dev"]
+    )
+    for line in lines:
+        requirement, _, marker = line.partition(";")
+        found = re.match(r"\s*([\w.-]+)\s*>=\s*([^,;\s]+)", requirement)
+        if found is None:
+            continue
+        pin = "{}=={}".format(found[1].lower(), found[2])
+        pins.append(pin + (";" + marker if marker else ""))
+    return pins
+
+
 def render_dockerfile(template, image, orjson_requirement):
     values = IMAGE_DEFAULTS | image
     values.setdefault("runtime", values["builder"])
@@ -75,7 +96,11 @@ def generated_files(root=ROOT):
         "requirements_dev.txt": GENERATED
         + "# Install with: pip install -r requirements_dev.txt\n"
         + "\n".join(project["optional-dependencies"]["dev"])
-        + "\n"
+        + "\n",
+        "requirements_min.txt": GENERATED
+        + "# Pinned minimum dependency versions for tox -e mindeps.\n"
+        + "\n".join(minimum_requirements(project))
+        + "\n",
     }
     floors = extra_floors(project)
     for name, requirement in floors.items():

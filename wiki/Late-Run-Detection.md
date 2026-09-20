@@ -33,7 +33,7 @@ jobs:
 | `sla.maxRuntimeSeconds` | int or null | `null` (off) | Breach while any running instance has been running longer than this. Observes only; this check never stops the run (to enforce a limit, use [`executionTimeout`](Concurrency-and-Timeouts)). Must be `> 0` when set. |
 | `onLate.report` | report block | reporter defaults | The [reporters](Reporting) fired once per breach: `mail`, `sentry`, `shell`, `webhook`. The schema matches `onFailure.report`, with overdue-specific default templates. |
 
-The three thresholds are independent; set any subset. Configuring an `onLate` reporter with no thresholds raises a load-time `ConfigError` (`onLate requires sla`). Both keys merge under a [`defaults:` block](Includes-and-Defaults) and are excluded from the [job-set id](Job-Set-ID) fingerprint.
+The three thresholds are independent; set any subset. Configuring an `onLate` reporter with no thresholds raises a load-time `ConfigError` (`onLate requires sla`). Both keys merge under a [`defaults:` block](Includes-and-Defaults) and are excluded from the [job-set ID](Job-Set-ID) fingerprint.
 
 ## The three checks
 

@@ -15,7 +15,7 @@ CA-vouched peer (Byzantine) is out of scope. This is at-most-once for
 ``Leader`` jobs under one shared N, not a fenced exactly-once guarantee.
 ``distribution: spread`` replaces the leader with per-job rendezvous
 ownership under the same quorum gate; ``PreferLeader`` drops the quorum
-gate to favour liveness (an isolated node runs, partitions may double-run).
+gate to favor liveness (an isolated node runs, partitions may double-run).
 """
 
 import asyncio
@@ -492,7 +492,7 @@ def elect_available_leader(
     node_name: str,
     agreeing_peer_names: Iterable[str],
 ) -> str:
-    """Leaderless election without the quorum gate (favours liveness).
+    """Leaderless election without the quorum gate (favors liveness).
 
     The lowest name among this node and the peers it sees agreeing; this
     node is always in the set, so a name is always returned. An isolated
@@ -628,7 +628,7 @@ class PeerState:
     # result, or a peer too old to report it. Internal; not in to_dict.
     declared_size: Optional[int] = None
     # the coordination policy the peer last declared (distribution +
-    # electLeader): behaviour-affecting yet NOT in the fingerprint, so
+    # electLeader): behavior-affecting yet NOT in the fingerprint, so
     # divergent nodes still see each other AGREED; a divergence is a
     # first-class conflict (see conflicting_policies). None when no fresh
     # result or a peer too old. Internal; not in to_dict.
@@ -1074,7 +1074,7 @@ class ClusterManager(LeadershipBackend):
     The default, best-effort gossip leadership backend (see
     :class:`cronstable.leadership.LeadershipBackend`). It defines real
     bodies for every method on the seam, so subclassing the ABC is purely
-    a conformance declaration and leaves behaviour byte-identical.
+    a conformance declaration and leaves behavior byte-identical.
     """
 
     def __init__(
@@ -2105,7 +2105,7 @@ class ClusterManager(LeadershipBackend):
             **observation,
         )
         # Remember (etag -> observation) for conditional re-polls. Only a
-        # sane tag is stored (it is echoed back every round); junk or a
+        # valid tag is stored (it is echoed back every round); junk or a
         # tagless response (an older build) clears the entry so we poll
         # unconditionally.
         if (
@@ -2333,7 +2333,7 @@ class ClusterManager(LeadershipBackend):
                 # this; fall back to one-directional agreement, or a new
                 # node among legacy peers would halt every Leader job. The
                 # node still won't defer to a legacy peer: the documented
-                # lean-toward-running upgrade behaviour, not a halt.
+                # lean-toward-running upgrade behavior, not a halt.
                 and (
                     _peer_sees_me_agreed(peer.members, self.instance_id)
                     or not peer.reports_members

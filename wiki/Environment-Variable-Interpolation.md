@@ -14,7 +14,7 @@ load, including a hot reload.
 [Skipped fields](#skipped-fields) ·
 [Unset variables](#unset-variables) ·
 [Multi-file config](#multi-file-config) ·
-[Effect on the job-set id](#effect-on-the-job-set-id) ·
+[Effect on the job-set ID](#effect-on-the-job-set-id) ·
 [Worked example](#worked-example)
 
 ## Syntax
@@ -22,7 +22,7 @@ load, including a hot reload.
 | Form | Meaning |
 | --- | --- |
 | `${VAR}` | The value of environment variable `VAR`. A set but empty variable expands to the empty string. An **unset** `VAR` is a load-time error (see [Unset variables](#unset-variables)). |
-| `${VAR:-default}` | The value of `VAR` when it is set and non-empty, otherwise the literal `default`. As in the shell's `:-`, an unset **or** empty `VAR` yields `default`. The default runs to the closing `}` and may contain any character except `}`. |
+| `${VAR:-default}` | The value of `VAR` when it is set and nonempty, otherwise the literal `default`. As in the shell's `:-`, an unset **or** empty `VAR` yields `default`. The default runs to the closing `}` and may contain any character except `}`. |
 | `$$` | A literal `$`. Use it to write a value that should contain a real dollar sign, or to keep a literal `${...}` (`$${VAR}` stays `${VAR}`). |
 
 A variable name is a letter or underscore followed by letters, digits, or
@@ -111,7 +111,7 @@ to supply a fallback
 
 The failure happens at load, so [`cronstable --validate-config`](CLI-Reference)
 catches a missing variable in continuous integration or a deploy check and exits
-non-zero before the scheduler ever starts. Supply a `:-default` for anything
+nonzero before the scheduler ever starts. Supply a `:-default` for anything
 that has a sensible fallback, and leave it off for the variables a deployment
 must provide.
 
@@ -133,9 +133,9 @@ file has changed on disk. Changing an environment variable does not change a
 file on disk, so the daemon has nothing to detect. Restart (or touch the
 config) to pick it up.
 
-## Effect on the job-set id
+## Effect on the job-set ID
 
-The [job-set id](Job-Set-ID) is a fingerprint of the **effective** config, and
+The [job-set ID](Job-Set-ID) is a fingerprint of the **effective** config, and
 expansion happens before that fingerprint is taken, so it hashes the expanded
 values. A config that interpolates environment variables into fingerprinted
 fields therefore produces a **different id per environment**. Two deployments

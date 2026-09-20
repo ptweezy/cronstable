@@ -1,40 +1,39 @@
 """Kubernetes ``Lease`` leadership backend.
 
-A single ``coordination.k8s.io/v1`` ``Lease`` object is the fence: at most one
-node holds it (``spec.holderIdentity``), and a holder must keep renewing
-``spec.renewTime`` or the lease is considered expired and another node may take
-it.  This is the standard client-go leader-election algorithm, ported
-faithfully.
+A single ``coordination.k8s.io/v1`` ``Lease`` object determines leadership.
+At most one node holds it through ``spec.holderIdentity``. The holder
+must keep updating ``spec.renewTime``; otherwise, the lease expires and
+another node can acquire it. This follows the client-go leader election
+algorithm.
 
-It runs over one of **two interchangeable transports** (see
-:class:`_K8sTransport`), chosen by ``cluster.kubernetes.clientLibrary`` via
+``cluster.kubernetes.clientLibrary`` selects one of two transports through
 :func:`cronstable.backends.select_transport`:
 
-* the official **``kubernetes`` client** when it is installed and importable on
-  this architecture (``pip install cronstable[kubernetes]``); or
-* a **hand-rolled apiserver REST transport** over the core ``aiohttp``
-  dependency (the default fallback) -- no ``kubernetes`` client, no grpc, so it
-  runs on every architecture cronstable targets.
+* The official ``kubernetes`` client, when installed and importable on the
+  host architecture (``pip install cronstable[kubernetes]``).
+* The built-in HTTP transport, which uses ``aiohttp`` to call the API
+  server. This fallback needs no Kubernetes client or gRPC dependency and
+  supports every architecture cronstable targets.
 
-The decision logic -- parsing a Lease, deciding whether it is expired, choosing
-the action (create / acquire / renew / wait), and building the object to write
-back -- lives in the small pure helpers below and is fully unit-tested; both
-transports feed it the same JSON dict shape.  The lifecycle around those
-helpers (:meth:`KubernetesBackend.start`, the renew loop, the round, the
-teardown that hands the Lease back) drives the Lease through the
-``_K8sTransport`` interface, so tests/test_backend_kubernetes.py covers it
-with an in-memory transport.  The two real transports perform the calls and
-load credentials: they are ``# pragma: no cover``, exercised by the Docker
-integration tests.
+Both transports provide the same JSON dictionary structure to pure helper
+functions. These functions parse leases, check expiration, choose whether
+to create, acquire, renew, or wait, and build the object to write.
+Lifecycle methods use the ``_K8sTransport`` interface to update the lease.
 
-The safety property is *local*: :meth:`KubernetesBackend.is_leader` is gated on
-a locally-computed expiry (``renew time + leaseDurationSeconds`` minus a small
-clock-skew margin), so a stalled renew loop self-demotes with no network call.
-``is_quorate`` reflects whether we have a *fresh* successful read of the lease
-store; when it is false ``Leader`` jobs fail closed and -- per the locked
-PreferLeader decision -- the never-skip defaults on
-:class:`cronstable.leadership.LeadershipBackend` let ``PreferLeader`` jobs run
-anyway (and possibly double-run).
+``tests/test_backend_kubernetes.py`` tests the lifecycle with an in-memory
+transport. ``tests/test_backend_kubernetes_transport.py`` tests the HTTP
+transport against a fake API server over a socket.
+``tests/test_backend_kubernetes_library.py`` tests the library transport
+with a fake ``kubernetes`` package. ``tests/test_backend_live.py`` tests
+both transports against a real API server when one is configured.
+
+:meth:`KubernetesBackend.is_leader` checks a locally computed deadline:
+the renewal time plus ``leaseDurationSeconds``, minus a clock-skew margin.
+If renewal stalls, the node gives up leadership without a network call.
+``is_quorate`` requires a recent successful read of the lease store.
+Otherwise, ``Leader`` jobs stop running. The defaults on
+:class:`cronstable.leadership.LeadershipBackend` let ``PreferLeader`` jobs
+continue, which can result in duplicate runs.
 """
 
 import asyncio
@@ -612,7 +611,7 @@ class KubernetesBackend(StoreLeaseBackend):
     # Everything here reaches the apiserver through the _K8sTransport
     # interface, so the tests drive it end to end with an in-memory one.
 
-    def _native_available(self) -> bool:  # pragma: no cover - import probe
+    def _native_available(self) -> bool:
         try:
             import kubernetes  # noqa: F401
 
@@ -921,8 +920,25 @@ def _kubeconfig_active_context(
     clusters = {c["name"]: c["cluster"] for c in data.get("clusters", [])}
     users = {u["name"]: u["user"] for u in data.get("users", [])}
     cluster: dict[str, Any] = clusters[ctx["cluster"]]
-    user: dict[str, Any] = users.get(ctx["user"], {})
+    # As in kubectl, a missing or null user entry means no credentials.
+    user: dict[str, Any] = users.get(ctx["user"]) or {}
+    if not isinstance(user, dict):
+        raise TypeError("user {!r} is not a mapping".format(ctx["user"]))
     return ctx, cluster, user
+
+
+def _kubeconfig_file(kubeconfig: str, value: Optional[str]) -> Optional[str]:
+    """Resolve a referenced file path relative to the kubeconfig directory.
+
+    This matches kubectl and the official client for ``certificate-authority``,
+    ``client-certificate``, ``client-key``, and ``tokenFile``. Both transports
+    therefore load and track the same file, regardless of the daemon's
+    working directory. Return ``None`` for a missing or empty value.
+    """
+    if not value:
+        return None
+    base = os.path.dirname(os.path.abspath(kubeconfig))
+    return os.path.normpath(os.path.join(base, value))
 
 
 def _kubeconfig_cert_files(path: str) -> list[Optional[str]]:
@@ -949,9 +965,9 @@ def _kubeconfig_cert_files(path: str) -> list[Optional[str]]:
     try:
         _ctx, cluster, user = _kubeconfig_active_context(path)
         return [
-            cluster.get("certificate-authority"),
-            user.get("client-certificate"),
-            user.get("client-key"),
+            _kubeconfig_file(path, cluster.get("certificate-authority")),
+            _kubeconfig_file(path, user.get("client-certificate")),
+            _kubeconfig_file(path, user.get("client-key")),
         ]
     except (
         OSError,
@@ -990,7 +1006,7 @@ class _K8sTransport:
         raise NotImplementedError
 
 
-class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
+class _K8sHttpTransport(_K8sTransport):
     """Hand-rolled apiserver REST transport (core aiohttp; no client library).
 
     Resolves credentials from the in-cluster service-account files (or a
@@ -1078,7 +1094,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
                 "kubernetes backend: not running in a cluster and no "
                 "cluster.kubernetes.kubeconfig or apiServer configured"
             )
-        # Defence in depth: never attach the SA bearer token to a non-https
+        # Defense in depth: never attach the SA bearer token to a non-https
         # target (config already rejects an http apiServer; this catches any
         # path that slips through before the token is read).
         if not self._base_url.lower().startswith("https://"):
@@ -1108,12 +1124,17 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
             ) from ex
 
     def _load_kubeconfig(self, path: str) -> None:
-        """Minimal kubeconfig loader (server, CA, token or client cert).
+        """Load the server, CA, and credentials from a kubeconfig file.
 
-        Uses the bundled ruamel YAML (a strictyaml transitive dependency) so no
-        new dependency is pulled in.  Supports the common shapes used by k3s /
-        kind for local testing: a bearer token, or client-certificate(+key)
-        data/files, with an embedded or referenced CA (or ``insecure``).
+        Use ruamel YAML, a transitive dependency of strictyaml, to avoid adding
+        a dependency. Support k3s and kind configurations for local testing:
+        bearer tokens and client certificates with private keys. Tokens can
+        be inline or in a ``tokenFile`` read before each request. Certificates,
+        keys, and the CA can be embedded or referenced by file path.
+        ``insecure-skip-tls-verify`` disables server certificate verification.
+
+        Resolve referenced paths relative to the kubeconfig directory; see
+        :func:`_kubeconfig_file`.
         """
         from strictyaml.ruamel.error import YAMLError, YAMLFutureWarning
 
@@ -1154,6 +1175,9 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
             # granting a lease (two leaders).
             self._base_url = self.b.api_server_override.rstrip("/")
         self.b.namespace = self.b._resolve_namespace(ctx.get("namespace"))
+        ca_file = _kubeconfig_file(path, cluster.get("certificate-authority"))
+        cert_file = _kubeconfig_file(path, user.get("client-certificate"))
+        key_file = _kubeconfig_file(path, user.get("client-key"))
 
         if cluster.get("insecure-skip-tls-verify"):
             self._ssl = ssl.create_default_context()
@@ -1163,7 +1187,8 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
             # cert is not checked, so the lease store can be MITM'd and any
             # bearer token sent to it captured (-> token theft + a forged
             # holderIdentity -> two leaders). Intended for local testing only;
-            # the silent default is a real footgun in production.
+            # silently using the default can misconfigure a production
+            # deployment.
             logger.warning(
                 "cluster: kubernetes kubeconfig sets insecure-skip-tls-verify "
                 "-- the apiserver certificate is NOT verified, exposing the "
@@ -1171,22 +1196,30 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
                 "local testing; prefer a real CA."
             )
         else:
-            self._ssl = ssl.create_default_context()
+            # Trust only the configured CA, matching client-go and the
+            # in-cluster configuration. Passing a CA to create_default_context
+            # excludes system roots. Using load_verify_locations on a default
+            # context would also trust public CAs for the API server.
+            # If no CA is configured, use the system trust store.
             ca_data = cluster.get("certificate-authority-data")
             if ca_data:
-                self._ssl.load_verify_locations(
+                self._ssl = ssl.create_default_context(
                     cadata=base64.b64decode(ca_data).decode("utf-8")
                 )
-            elif cluster.get("certificate-authority"):
-                self._ssl.load_verify_locations(
-                    cafile=cluster["certificate-authority"]
-                )
+            else:
+                self._ssl = ssl.create_default_context(cafile=ca_file)
 
-        if user.get("token"):
+        # An inline token takes precedence, matching the official client.
+        token_file = (
+            None
+            if user.get("token")
+            else _kubeconfig_file(path, user.get("tokenFile"))
+        )
+        if user.get("token") or token_file:
             if self._base_url.lower().startswith("http://"):
                 # Refuse to send the bearer token over cleartext http,
                 # matching the hard ConfigError on an http:// apiServer
-                # override (and the in-cluster defence-in-depth above). A
+                # override (and the in-cluster defense-in-depth above). A
                 # captured token lets an attacker forge a Lease holderIdentity
                 # (-> two leaders) or revoke the real holder, so warn-only is
                 # not enough.
@@ -1197,14 +1230,15 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
                         self._base_url
                     )
                 )
-            self._auth_token = user["token"]
-        cert = self._material(
-            user.get("client-certificate"),
-            user.get("client-certificate-data"),
-        )
-        key = self._material(
-            user.get("client-key"), user.get("client-key-data")
-        )
+            if token_file:
+                # A tokenFile can rotate, like an in-cluster token. Save
+                # its path so _auth_headers reads it before each request.
+                self._token_path = token_file
+                self._auth_token = self._read_token(token_file)
+            else:
+                self._auth_token = user["token"]
+        cert = self._material(cert_file, user.get("client-certificate-data"))
+        key = self._material(key_file, user.get("client-key-data"))
         if cert and key and self._ssl is not None:
             self._ssl.load_cert_chain(cert, key)
         # Track the on-disk TLS material a cert-manager/Vault rotation would
@@ -1214,12 +1248,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         # to None paths here and are dropped (a -data change is a kubeconfig
         # rewrite, caught via the kubeconfig path).
         self.b._record_tls_files(
-            [
-                self.b.kubeconfig,
-                cluster.get("certificate-authority"),
-                user.get("client-certificate"),
-                user.get("client-key"),
-            ]
+            [self.b.kubeconfig, ca_file, cert_file, key_file]
         )
         # This hand-rolled HTTP transport understands only a static bearer
         # token or a client certificate. exec-credential plugins (EKS
@@ -1275,6 +1304,25 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
             return base
         return "{}/{}".format(base, quote(self.b.lease_name, safe=""))
 
+    @staticmethod
+    def _require_status(resp: aiohttp.ClientResponse, *expected: int) -> None:
+        """Require an API server response with an ``expected`` status.
+
+        ``raise_for_status`` accepts every status less than 400. Because this
+        transport does not follow redirects, a proxy's 3xx response could
+        appear to confirm a write. The backend could then claim a lease that
+        the API server never stored, allowing two nodes to become leaders.
+        """
+        resp.raise_for_status()
+        if resp.status not in expected:
+            raise aiohttp.ClientResponseError(
+                resp.request_info,
+                resp.history,
+                status=resp.status,
+                message="unexpected apiserver status",
+                headers=resp.headers,
+            )
+
     async def observe(self) -> Optional[dict[str, Any]]:
         assert self._session is not None
         async with self._session.get(
@@ -1288,7 +1336,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         ) as resp:
             if resp.status == 404:
                 return None
-            resp.raise_for_status()
+            self._require_status(resp, 200)
             data: dict[str, Any] = await resp.json()
             return data
 
@@ -1310,7 +1358,8 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         ) as resp:
             if resp.status == 409:
                 return False
-            resp.raise_for_status()
+            # POST returns 201 Created; PUT returns 200 OK.
+            self._require_status(resp, 200, 201)
             return True
 
     async def close(self) -> None:
@@ -1325,7 +1374,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         self._tempfiles = []
 
 
-class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
+class _K8sLibraryTransport(_K8sTransport):
     """Native ``kubernetes`` client transport (used when the lib is present).
 
     The official client is synchronous, so its short, infrequent Lease calls
@@ -1382,7 +1431,7 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
         try:
             if self.b.kubeconfig:
                 kube_config.load_kube_config(config_file=self.b.kubeconfig)
-                # honour the active context's namespace, matching the HTTP
+                # honor the active context's namespace, matching the HTTP
                 # transport's kubeconfig handling so the two transports cannot
                 # contend for the Lease in two namespaces (a split-brain).
                 _contexts, active = kube_config.list_kube_config_contexts(
@@ -1406,13 +1455,13 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
                 "kubernetes backend: could not load client configuration "
                 "({})".format(ex)
             ) from ex
-        # honour cluster.kubernetes.apiServer here too, so the override is not
+        # honor cluster.kubernetes.apiServer here too, so the override is not
         # silently dropped when the native client is selected.
         config_obj = client.Configuration.get_default_copy()
         if self.b.api_server_override:
             config_obj.host = self.b.api_server_override.rstrip("/")
         if not getattr(config_obj, "verify_ssl", True):
-            # Match the HTTP transport's loud warning: load_kube_config honours
+            # Match the HTTP transport's loud warning: load_kube_config honors
             # insecure-skip-tls-verify silently, so without this a node that
             # selected the native client (an arch where the lib is installed)
             # would disable apiserver cert verification with no operator signal

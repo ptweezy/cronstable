@@ -32,7 +32,42 @@ from tests._helpers import (
     _exit,
     _settle_dag_cron,
     _state_cfg,
+    run_test_end_closers,
 )
+
+# --- Hypothesis profiles (tests/test_properties_*.py) ----------------------
+#
+# Profiles control how many examples @given tests generate, without an
+# autouse fixture or changes to other tests. Required CI jobs use `ci`;
+# the scheduled deep run selects `thorough` with
+# CRONSTABLE_HYPOTHESIS_PROFILE. Failures print a @reproduce_failure decorator
+# so contributors can reproduce CI failures locally. Guard the import so
+# environments without development dependencies can collect other tests.
+# Property test modules still fail to import if Hypothesis is missing, and
+# tests/test_dev_deps_parity.py reports the missing dependency.
+try:
+    from hypothesis import HealthCheck as _HealthCheck
+    from hypothesis import settings as _hypothesis_settings
+except ImportError:  # pragma: no cover - development dependencies absent
+    pass
+else:
+    _hypothesis_settings.register_profile(
+        "ci",
+        max_examples=150,
+        deadline=None,
+        print_blob=True,
+        suppress_health_check=[_HealthCheck.too_slow],
+    )
+    _hypothesis_settings.register_profile(
+        "thorough",
+        max_examples=5000,
+        deadline=None,
+        print_blob=True,
+        suppress_health_check=[_HealthCheck.too_slow],
+    )
+    _hypothesis_settings.load_profile(
+        os.environ.get("CRONSTABLE_HYPOTHESIS_PROFILE", "ci")
+    )
 
 
 # --- hung-test asyncio task dump (the chronic 3.12 teardown hang) ----------
@@ -129,6 +164,19 @@ def pytest_runtest_protocol(item):
         yield
     finally:
         timer.cancel()
+
+
+# --- closers registered by helpers (tests/_helpers.close_at_test_end) -------
+#
+# This hook runs callbacks registered by helpers that the test called; it
+# does not use an autouse fixture. Run it before fixture teardown so async
+# Cron cleanup callbacks can use the test's event loop while it is still open.
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_teardown(item):
+    run_test_end_closers()
+    yield
 
 
 class Req:
@@ -269,6 +317,7 @@ async def stateful_cron(tmp_path):
     yield make
     for cron in reversed(crons):
         await _drain_state_writes(cron)
+        await cron._stop_job_api()
         if cron.state_backend is not None:
             await cron.state_backend.stop()
             cron.state_backend = None

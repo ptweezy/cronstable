@@ -179,7 +179,7 @@ def render_calendar(
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
         _fold("X-WR-CALNAME:" + _escape(calname)),
-        # subscription clients honour one of these two refresh hints
+        # subscription clients honor one of these two refresh hints
         "REFRESH-INTERVAL;VALUE=DURATION:PT1H",
         "X-PUBLISHED-TTL:PT1H",
     ]

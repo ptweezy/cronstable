@@ -34,7 +34,12 @@ from tests._cron_helpers import (
     _reboot_mgr,
     fixed_current_time,  # noqa: F401
 )
-from tests._helpers import _UTC, _state_cfg, _wait_until
+from tests._helpers import (
+    _UTC,
+    _state_cfg,
+    _wait_until,
+    start_state,
+)
 from tests.conftest import Req
 from tests.test_state import (
     _NOW,
@@ -3141,7 +3146,7 @@ async def state_cron(tmp_path):
     sites).  The guard keeps the teardown a no-op for a test that already
     tore its own state layer down."""
     cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_lifecycle_state_config(tmp_path))
+    await start_state(cron, _lifecycle_state_config(tmp_path))
     assert cron.state_backend is not None
     yield cron
     if cron.state_backend is not None:
@@ -3944,7 +3949,7 @@ def _state_yaml(path):
 
 async def _dep_cron(tmp_path):
     cron = Cron(None, config_yaml=_DEP_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     return cron
 
 
@@ -4310,7 +4315,7 @@ async def test_run_catch_up_serializes_forbid_backfill(tmp_path):
     # swallowed the other N-1 and the "replayed" runs never happened.
     # The backfill must drain the previous instance before each launch.
     cron = Cron(None, config_yaml=_FORBID_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     await _put_ledger(cron, "success", "2026-07-01T10:00:00+00:00")
     now = datetime.datetime(2026, 7, 1, 10, 3, 30, tzinfo=_UTC)  # 3 owed
     launched = []
@@ -4388,7 +4393,7 @@ def _archive_yaml(save_limit=None, redact=True):
 
 async def _archive_cron(tmp_path, **kw):
     cron = Cron(None, config_yaml=_archive_yaml(**kw))
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     return cron
 
 
@@ -4503,7 +4508,7 @@ async def test_rehydration_does_not_regress_fresh_run(tmp_path):
     # run would regress last_run and scramble the history's order, so
     # rehydration must re-check after the await and stand down.
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     cron._state_rehydrated = False  # force a fresh warm-up below
     fresh = _mem_run("failure", 9)
     old_rec = {
@@ -4542,7 +4547,7 @@ async def test_state_path_change_rewarms_from_new_store(tmp_path):
     path_a = tmp_path / "a"
     path_b = tmp_path / "b"
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(path_a)))
+    await start_state(cron, _state_cfg(_state_yaml(path_a)))
     assert cron._state_rehydrated is True
     assert not cron.run_history.get("j")  # store A is empty
     # seed store B out of band, as a previous deployment would have
@@ -4552,7 +4557,7 @@ async def test_state_path_change_rewarms_from_new_store(tmp_path):
         "runs/j",
         {"outcome": "success", "finished_at": "2026-06-30T00:00:00+00:00"},
     )
-    await cron.start_stop_state(_state_cfg(_state_yaml(path_b)))
+    await start_state(cron, _state_cfg(_state_yaml(path_b)))
     assert cron._state_rehydrated is True  # re-latched by the new warm-up
     assert len(cron.run_history["j"]) == 1
     assert (
@@ -4568,9 +4573,9 @@ async def test_state_swap_resets_the_reboot_gate_health_latch(tmp_path):
     # survive into a replacement store brought up by a state-section reload,
     # or @reboot dedupe stays degraded for the life of the process.
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path / "a")))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path / "a")))
     cron._reboot_gate_sick = True  # as a hung store's timeout would latch
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path / "b")))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path / "b")))
     assert cron._reboot_gate_sick is False
 
 
@@ -4591,7 +4596,7 @@ async def test_depends_on_past_replace_policy_skips_running_block(tmp_path):
     # (the fire never reaches the policy that would reap it).  The gate then
     # judges the last FINISHED outcome, exactly as before the hardening.
     cron = Cron(None, config_yaml=_REPLACE_DEP_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     await _put_ledger(cron, "success", "2026-07-01T10:00:00+00:00")
     cron.running_jobs["j"].append(object())  # a hung RunningJob stand-in
     assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is True
@@ -4681,7 +4686,7 @@ _FORBID_CLUSTER_JOB = (
 
 async def _cluster_cron(tmp_path):
     cron = Cron(None, config_yaml=_FORBID_CLUSTER_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     return cron
 
 
@@ -4739,7 +4744,7 @@ async def test_gc_reclaims_removed_scope_artifacts_and_orphan_blobs(
     from cronstable import jobstate
 
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     try:
         backend = cron.state_backend
         old_epoch = state_mod._now() - 7200.0
@@ -4788,7 +4793,7 @@ async def test_gc_blob_sweep_skipped_when_artifact_stream_hidden(
     from cronstable import jobstate
 
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     try:
         backend = cron.state_backend
         old_epoch = state_mod._now() - 7200.0
@@ -4829,7 +4834,7 @@ async def test_gc_leaves_artifacts_unmanaged_without_scope_manifests(
     from cronstable import jobstate
 
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     try:
         backend = cron.state_backend
         old_epoch = state_mod._now() - 7200.0
@@ -4865,7 +4870,7 @@ async def test_gc_keeps_catchup_dag_streams_without_dag_manifests(
     import cronstable.state as state_mod
 
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     try:
         backend = cron.state_backend
         old_epoch = state_mod._now() - 7200.0
@@ -4899,7 +4904,7 @@ async def test_gc_collects_removed_dag_catchup_streams_when_covered(
     import cronstable.state as state_mod
 
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     try:
         backend = cron.state_backend
         old_epoch = state_mod._now() - 7200.0
@@ -4929,7 +4934,7 @@ async def test_gc_pass_reclaims_only_ephemeral_leases(tmp_path, monkeypatch):
     import cronstable.state as state_mod
 
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     try:
         backend = cron.state_backend
         old_epoch = state_mod._now() - 7200.0
@@ -5028,7 +5033,7 @@ async def test_back_to_back_runs_land_in_the_ledger_in_order(tmp_path):
     # time against the real backend on an idle box; the delay below makes
     # the overtake deterministic instead of leaving the guard to chance.)
     cron = Cron(None, config_yaml=_ONE_JOB)
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     try:
         backend = cron.state_backend
         real_append = backend.append_record
@@ -5078,7 +5083,7 @@ async def test_run_writes_chain_per_job_not_across_jobs(tmp_path):
             "  - name: k\n    command: 'true'\n    schedule: '* * * * *'\n"
         ),
     )
-    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    await start_state(cron, _state_cfg(_state_yaml(tmp_path)))
     try:
         cron._record_run("j", _mem_run("success", 1))
         cron._record_run("k", _mem_run("success", 1))

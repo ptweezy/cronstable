@@ -265,7 +265,7 @@ Stream and job names are percent-encoded into filenames injectively (safe on
 case-insensitive filesystems and around Windows reserved device names), so two
 distinct job names can never collide on one path. The per-job streams (runs,
 logs, retries, catch-up, in-flight, slots) are scoped by **job name**, not
-job-set id, so a job's durable history survives ordinary config reloads
+job-set ID, so a job's durable history survives ordinary config reloads
 instead of being orphaned by every edit.
 
 A **version stamp** (the `meta` stream) is written once at first start. When
@@ -566,7 +566,7 @@ whenever the daemon happened to come back".
 A pending record is **settled instead of re-armed** when:
 
 * the job's **per-job config digest** changed (`cronstable.fingerprint.job_digest`,
-  deliberately stricter than the whole-set job-set id, so editing an
+  deliberately stricter than the whole-set job-set ID, so editing an
   *unrelated* job does not drop this job's retry, while any
   behavior-affecting edit to *this* job does: the old ladder must not run
   the new definition);
@@ -799,7 +799,7 @@ forever. The store cleans up after itself, conservatively, anchored on
 **manifests**:
 
 * Every node records a **manifest** (stream `manifests/<host>`): its host,
-  job-set id, the job names of its loaded config, plus the shared artifact
+  job-set ID, the job names of its loaded config, plus the shared artifact
   scopes and dag names that config can write. The node writes it on backend
   start and every 6 hours.
 * A **GC pass** runs every 24 hours per process, plus on demand with
@@ -949,7 +949,7 @@ absence. `set` refuses a value larger than `maxValueBytes`.
 
 `cronstable cursor advance NAME VALUE` moves a monotonic watermark: the stored
 value only ever goes to `max(current, VALUE)`, so an out-of-order or replayed
-batch never walks it backwards, and on a shared store several nodes converge
+batch never walks it backward, and on a shared store several nodes converge
 on the furthest point. A numeric value compares numerically (`9 < 10`);
 anything else compares as the string it is, which orders ISO-8601 timestamps
 correctly (`2026-06 < 2026-07`). This is the ETL "process only what is new"
@@ -961,7 +961,7 @@ since=$(cronstable cursor get watermark 2>/dev/null || echo 0)
 cronstable cursor advance watermark "$new_max"
 ```
 
-Pass `--force` to set the value even if it moves the cursor backwards (a
+Pass `--force` to set the value even if it moves the cursor backward (a
 deliberate rewind). Both `cursor get` and `cursor advance` print the
 resulting value.
 
@@ -1082,7 +1082,7 @@ codes: `0` success, `1` error, `2` usage. Full flags and examples are in the
 | Command | Does |
 | --- | --- |
 | `cronstable state backup -o FILE.tar.gz` | Writes an owner-only (`0o600`) `.tar.gz` of the store (records, documents, blobs, and leases; `tmp/` and `quarantine/` excluded). Safe against a live daemon. |
-| `cronstable state restore FILE.tar.gz [--force]` | Restores a backup into the store; refuses a non-empty store without `--force` (which merges, keeping the newer lease fences), and sanitizes archive members. Not safe while a daemon uses the store. |
+| `cronstable state restore FILE.tar.gz [--force]` | Restores a backup into the store; refuses a nonempty store without `--force` (which merges, keeping the newer lease fences), and sanitizes archive members. Not safe while a daemon uses the store. |
 | `cronstable state migrate --dest PATH [--dest-deployment-id ID]` | Copies the store between paths/mounts (local ↔ Amazon S3 Files / EFS) with torn-read-safe atomic placement; then point `state.path` at the new home. |
 | `cronstable state gc [--dry-run]` | Runs a manual [GC pass](#garbage-collection-and-manifests); reports the reclaimed streams and orphaned artifact blobs, or why the blob sweep was skipped. |
 | `cronstable state check` | Probes writability and prints an inventory of the store. |

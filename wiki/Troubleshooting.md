@@ -145,7 +145,7 @@ unauthenticated. A `fromFile` that cannot be read raises
 API listens without auth (this is the default).
 
 **Fix.** Ensure exactly one of `value`/`fromFile`/`fromEnvVar` resolves to a
-non-empty secret. Precedence is `value`, then `fromFile`, then `fromEnvVar`. The
+nonempty secret. Precedence is `value`, then `fromFile`, then `fromEnvVar`. The
 `Bearer` scheme is matched case-insensitively and the token is compared in constant
 time (`hmac.compare_digest`). A wrong or absent token returns `401`. See the
 [HTTP control API](HTTP-API).
@@ -579,7 +579,7 @@ banner appears in the dashboard cluster panel, and `Leader` jobs stand down.
 
 **Cause.** A reachable peer is advertising a different `distribution` or
 `elect_leader` setting than this node. Because those are cluster-wide coordination
-settings (not part of the job-set id, so they do not surface as drift), a mismatch
+settings (not part of the job-set ID, so they do not surface as drift), a mismatch
 would let nodes coordinate differently and double-run.
 
 It is the **third** trigger of the umbrella `conflict` flag, alongside a duplicate

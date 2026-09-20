@@ -1,10 +1,10 @@
-"""Unit tests for the etcd leadership backend.
+"""Test etcd leadership without an etcd server.
 
-No etcd server: the pure decision helpers and the local leader/quorum state
-run directly, and the lifecycle around them (start, the renew loop, the round,
-the campaign, the @reboot-ran CAS, the teardown) runs with ``_post`` replaced
-by a fake.  ``_post`` itself, the HTTP request/failover glue, is
-``# pragma: no cover`` and the Docker integration tests exercise it.
+Test decision helpers and local leadership and quorum state directly.
+For lifecycle tests, replace ``_post`` with a fake. The lifecycle includes
+startup, renewal, election rounds, campaigns, reboot tracking, and teardown.
+``tests/test_backend_etcd_transport.py`` tests ``_post`` against a fake
+gateway over a socket.
 """
 
 import asyncio

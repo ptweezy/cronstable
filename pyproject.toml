@@ -40,7 +40,9 @@ keywords = [
 ]
 dynamic = ["version"]
 dependencies = [
-    "strictyaml>=1.7,<2",
+    # Require an importable release when testing minimum dependencies.
+    # PyPI withdrew 1.7.0 because it causes an import error.
+    "strictyaml>=1.7.3,<2",
     "aiohttp>=3.14.3,<4",
     "sentry-sdk>=2.8,<3",
     "aiosmtplib>=5.1.1,<6",
@@ -199,9 +201,22 @@ dev = [
     "mypy-extensions",
     # validates docs/openapi.yaml (.github/scripts/check_openapi.py, tox -e openapi).
     "openapi-spec-validator",
+    # Compare the saved cron test cases with the original library in
+    # tests/test_cronexpr.py on each CI runner.
+    "crontab>=1,<2",
+    # Property tests generate schedules, configuration, Task XML, and
+    # protocol payloads to check invariants (tests/test_properties_*.py).
+    "hypothesis>=6.100",
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
+    # Randomize test order to detect dependencies between tests. Use the
+    # seed printed in the header with `-p randomly --randomly-seed=N`
+    # to reproduce a failing order.
+    "pytest-randomly",
+    # Report timed-out tests and their thread stacks before the
+    # faulthandler_timeout limit terminates the session.
+    "pytest-timeout",
     "ruff",
     "tox",
     # tox-uv routes tox's env creation + installs through uv (see tox.ini).
@@ -319,6 +334,19 @@ testpaths = ["tests"]
 # timeout and report "cancelled". Armed per test; no test comes near 300s.
 faulthandler_timeout = 300
 faulthandler_exit_on_timeout = true
+# Report a test timeout and thread stacks after the asyncio task dump
+# (tests/conftest.py, at 80% of faulthandler_timeout), but before
+# faulthandler terminates the session. Recovery depends on the timeout method.
+timeout = 270
+# Treat warnings as errors, including unawaited coroutines, unclosed
+# resources, and deprecated API use. Document a reason for each exception.
+filterwarnings = [
+    "error",
+    # cron.py and the demo gateway store request values under string keys.
+    # Using web.RequestKey would import aiohttp when the daemon module loads,
+    # violating the startup constraint in tests/test_perf_invariants.py.
+    "ignore::aiohttp.web_exceptions.NotAppKeyWarning",
+]
 
 [tool.coverage.run]
 source = ["cronstable"]
@@ -328,8 +356,8 @@ omit = ["cronstable/version.py"]
 [tool.coverage.report]
 show_missing = true
 # Three pragma tokens, two profiles. A bare `# pragma: no cover` is hidden on
-# every OS (defensive branches, unreachable raises, the etcd/kubernetes
-# network glue). `# pragma: no cover (windows)` is hidden on POSIX and
+# every OS (defensive branches, unreachable raises). `# pragma: no cover
+# (windows)` is hidden on POSIX and
 # MEASURED on Windows; `# pragma: no cover (posix)` is the mirror. Without
 # them the Windows cells scored the wrong file: the Windows code that runs
 # there was excluded, and the POSIX code that cannot run there was counted
@@ -360,6 +388,33 @@ exclude_lines = [
     '^\s*(((async )?def .*?)?[\])]+(\s*->.*?)?:\s*)?\.\.\.\s*(#|$)',
     'if (typing\.)?TYPE_CHECKING:',
 ]
+
+[tool.mutmut]
+# Mutation tests run one module per nightly job. mutmut changes expressions
+# and reruns the tests that execute them. A surviving mutation can indicate
+# an assertion that is missing or insufficient. Select modules whose behavior
+# depends on their inputs to reduce timing-related failures. To run locally:
+#     pip install mutmut && mutmut run "cronstable.redact*" && mutmut results
+source_paths = [
+    "cronstable/cronexpr.py",
+    "cronstable/crontabs.py",
+    "cronstable/redact.py",
+    "cronstable/ical.py",
+    "cronstable/_json.py",
+    "cronstable/fingerprint.py",
+]
+pytest_add_cli_args_test_selection = [
+    "tests/test_cronexpr.py",
+    "tests/test_properties_cronexpr.py",
+    "tests/test_crontabs.py",
+    "tests/test_redact.py",
+    "tests/test_ical.py",
+    "tests/test_json_portability.py",
+    "tests/test_fingerprint.py",
+    "tests/test_properties_parsers.py",
+]
+also_copy = ["tests", "cronstable"]
+pytest_add_cli_args = ["-p", "no:randomly", "-p", "no:cacheprovider"]
 
 [tool.bandit]
 exclude_dirs = ["tests"]

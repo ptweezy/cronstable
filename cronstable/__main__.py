@@ -57,7 +57,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
         "--force",
         default=False,
         action="store_true",
-        help="merge into a non-empty store (stop cronstable first)",
+        help="after stopping cronstable, merge into a nonempty store",
     )
     migrate = _with_config(
         actions.add_parser(
@@ -77,7 +77,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
         "--force",
         default=False,
         action="store_true",
-        help="overwrite a non-empty destination store",
+        help="overwrite a nonempty destination store",
     )
     gc = _with_config(
         actions.add_parser(
@@ -439,7 +439,7 @@ def main_loop(loop=None):
         "--log-level",
         default="INFO",
         metavar="LEVEL",
-        help="logging level: DEBUG, INFO, WARNING, ERROR or CRITICAL "
+        help="logging level: DEBUG, INFO, WARNING, ERROR, or CRITICAL "
         "(default: INFO)",
     )
     parser.add_argument(
@@ -447,13 +447,14 @@ def main_loop(loop=None):
         "--validate-config",
         default=False,
         action="store_true",
-        help="validate the configuration and exit (-v is NOT verbose)",
+        help="validate the configuration and exit "
+        "(-v does not enable verbose logging)",
     )
     parser.add_argument(
         "--job-set-id",
         default=False,
         action="store_true",
-        help="print the job-set id (an order-independent hash of every job's "
+        help="print the job-set ID (an order-independent hash of every job's "
         "effective configuration) and exit; identical across instances "
         "running the same set of jobs",
     )
@@ -469,10 +470,8 @@ def main_loop(loop=None):
         "--sealable-suites",
         default=False,
         action="store_true",
-        help="print the push sealing suites this build can seal under, "
-        "one per line, and exit; each is proven by a real seal, so the "
-        "list reports what the binary carries, not what its build asked "
-        "for",
+        help="print supported push encryption suites, one per line, and exit; "
+        "each suite is verified by encrypting a test payload",
     )
     _add_state_subcommands(parser)
     # `lock run NAME [flags] -- CMD...` carries an arbitrary trailing command.

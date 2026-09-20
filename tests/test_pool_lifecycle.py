@@ -28,6 +28,16 @@ dags:
 )
 
 
+def _allow_retries(job, maximum=3):
+    # Without onFailure overrides, the job shares config.DEFAULT_CONFIG's
+    # mapping. Copy it before making changes so later tests retain the
+    # original defaults.
+    job.onFailure = {
+        **job.onFailure,
+        "retry": {**job.onFailure["retry"], "maximumRetries": maximum},
+    }
+
+
 async def wait_queued(cron):
     async def wait():
         while (await cron._pools.snapshot())[0]["queued"] == 0:
@@ -281,7 +291,7 @@ async def test_new_schedule_runs_without_reviving_older_retry(
 ):
     cron = await make(dag_cron, monkeypatch)
     job = cron.cron_jobs["one"]
-    job.onFailure["retry"]["maximumRetries"] = 3
+    _allow_retries(job)
     old = JobRetryState(60, 2, 120)
     old.next_delay()
     cron.retry_state["one"] = old
@@ -317,7 +327,7 @@ async def test_superseded_initial_run_keeps_its_work_but_not_its_retry(
 ):
     cron = await make(dag_cron, monkeypatch)
     job = cron.cron_jobs["one"]
-    job.onFailure["retry"]["maximumRetries"] = 3
+    _allow_retries(job)
     await cron.launch_scheduled_job(job)
     await cron.launch_scheduled_job(job)
     await cron._pools.tick()
@@ -374,7 +384,7 @@ async def test_retry_admission_survives_restart_without_duplicate_attempt(
     config = CONFIG.replace('"@reboot"', '"* * * * *"')
     a = await make(dag_cron, monkeypatch, config)
     b = await make(dag_cron, monkeypatch, config)
-    a.cron_jobs["one"].onFailure["retry"]["maximumRetries"] = 3
+    _allow_retries(a.cron_jobs["one"])
     state = JobRetryState(1, 2, 60)
     a.retry_state["one"] = state
     initial = await a._pools.enqueue_job(a.cron_jobs["one"])
@@ -384,7 +394,7 @@ async def test_retry_admission_survives_restart_without_duplicate_attempt(
     await _drain_pending(a)
     assert (await a._pools.snapshot())[0]["queued"] == 1
     job = b.cron_jobs["one"]
-    job.onFailure["retry"]["maximumRetries"] = 3
+    _allow_retries(job)
     await b._rearm_pending_retry("one", job)
     restored = b.retry_state["one"]
     assert restored.pool_retry == state.pool_retry
@@ -423,7 +433,7 @@ async def test_late_settlement_does_not_cancel_a_new_generation(
 ):
     cron = await make(dag_cron, monkeypatch)
     job = cron.cron_jobs["one"]
-    job.onFailure["retry"]["maximumRetries"] = 3
+    _allow_retries(job)
     original = cron._pools._change
     callbacks = []
 

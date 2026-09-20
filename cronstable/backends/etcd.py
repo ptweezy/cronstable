@@ -1,26 +1,30 @@
-"""etcd leadership backend (hand-rolled against the v3 JSON gateway).
+"""etcd leadership backend using the v3 JSON gateway.
 
-A single etcd key (``cluster.etcd.electionName``) is the fence: the node that
-creates it, holding our identity as the value bound to a short-TTL lease, is
-the leader.  The key is created with a create-if-absent transaction (compare
-``CREATE`` revision ``== 0``), so at most one node ever wins; if the holder
-dies its lease expires, etcd deletes the key, and another node's transaction
-wins.
+A single etcd key (``cluster.etcd.electionName``) determines leadership.
+The node that creates the key stores its identity as the value and binds
+the key to a short-lived lease. A create-if-absent transaction compares
+the ``CREATE`` revision to ``0``, so at most one node acquires the key.
+If the holder stops renewing its lease, etcd expires the lease and deletes
+the key. Another node can then acquire it.
 
-Talks to etcd over the v3 gRPC-gateway JSON/HTTP API with the core
-``aiohttp`` dependency (no etcd3/grpc/protobuf, keeping cronstable's wide
-architecture coverage); keys and values are base64-encoded per that API.
+The backend calls the v3 gRPC-gateway JSON/HTTP API through ``aiohttp``.
+It needs no etcd3, gRPC, or protobuf dependency, so it supports all of
+cronstable's target architectures. The API uses base64-encoded keys and
+values.
 
-As with the Kubernetes backend, the decision logic is in pure, unit-tested
-helpers.  The lifecycle around them (:meth:`EtcdBackend.start`, the renew
-loop, the round, the campaign, the @reboot-ran CAS, the teardown that revokes
-the lease) reaches etcd only through :meth:`_post`, so
-tests/test_backend_etcd.py drives it with ``_post`` replaced.  The HTTP
-request/failover glue inside ``_post`` is ``# pragma: no cover``, exercised by
-the Docker integration tests.  :meth:`EtcdBackend.is_leader` is gated on a
-locally-computed lease deadline, so a stalled keepalive self-demotes without
-a network call, and ``is_quorate`` reflects a fresh successful call (stale ->
-``Leader`` fails closed, never-skip ``PreferLeader`` runs anyway).
+Pure helper functions implement the decision logic. The lifecycle methods
+call etcd only through :meth:`_post`. Tests in
+``tests/test_backend_etcd.py`` replace that method with a fake.
+``tests/test_backend_etcd_transport.py`` tests HTTP requests, endpoint
+failover, and reauthentication against a fake JSON gateway over a socket.
+``tests/test_backend_live.py`` runs election scenarios against a real
+etcd server when one is configured.
+
+:meth:`EtcdBackend.is_leader` checks a locally computed lease deadline,
+so the node gives up leadership if keepalives stall, without a network
+call. ``is_quorate`` requires a recent successful call. If that result
+becomes stale, ``Leader`` jobs stop running; ``PreferLeader`` jobs can
+still run.
 """
 
 import asyncio
@@ -60,7 +64,7 @@ logger = logging.getLogger("cronstable.backends.etcd")
 # The smallest *effective* lease ttl that still leaves a usable leader window
 # (the fence is effective_ttl - clock skew). config.py rejects a CONFIGURED
 # ttl below this; etcd can still GRANT or keepalive a shorter one, which the
-# backend honours for the fence while warning, never inflating it back up
+# backend honors for the fence while warning, never inflating it back up
 # (that would keep is_leader() True past the real server lease and let a
 # second node win the freed key). Kept in sync with config.py's etcd ttl
 # floor.
@@ -438,7 +442,7 @@ class EtcdBackend(StoreLeaseBackend):
     def _narrow_effective_ttl(self, ttl: int) -> None:
         """Adopt a server-granted/keepalived ttl for the cadence and fence.
 
-        Honoured so the local fence never outlives the real server lease.  Do
+        Honored so the local fence never outlives the real server lease.  Do
         NOT floor it back up to the configured minimum: inflating the fence
         past the server's lease would keep :meth:`is_leader` ``True`` after
         etcd has freed the key (two leaders).  Below ``_MIN_USABLE_TTL`` the
@@ -518,8 +522,9 @@ class EtcdBackend(StoreLeaseBackend):
 
     # --- the lifecycle: session, campaign, renew loop, teardown ----------
     #
-    # Everything here reaches etcd through _post (the one integration-only
-    # member), so the tests drive it end to end with _post replaced.
+    # Everything here reaches etcd through _post, so the unit tests drive it
+    # end to end with _post replaced; _post has its own suite against a fake
+    # gateway (tests/test_backend_etcd_transport.py).
 
     async def start(self) -> None:
         self._ssl = self._build_ssl()
@@ -567,7 +572,7 @@ class EtcdBackend(StoreLeaseBackend):
             # up like any other -- it must not leak the open session/task.
             self._task = asyncio.create_task(self._renew_loop())
         except BaseException:
-            # Honour the "a backend cleans up its own half-started state on
+            # Honor the "a backend cleans up its own half-started state on
             # failure" contract (as KubernetesBackend.start does): without
             # this the open ClientSession leaks, once per reload, and is
             # never closed (the caller never stores the manager to stop()
@@ -635,14 +640,15 @@ class EtcdBackend(StoreLeaseBackend):
 
     async def _post(
         self, path: str, body: dict[str, Any], *, allow_reauth: bool = True
-    ) -> dict[str, Any]:  # pragma: no cover - network
+    ) -> dict[str, Any]:
         """POST ``body`` to ``path`` on the first responsive endpoint.
 
-        etcd auth tokens have a TTL: on a ``401`` re-authenticate once and
-        retry so the backend recovers on its own.  The retry passes
-        ``allow_reauth=False`` (as does ``_authenticate``) to bound recursion
-        to a single refresh; a persistent ``401`` surfaces as a normal failed
-        round.
+        When an authentication token expires, a ``401`` response triggers one
+        token refresh and a retry. Refresh the token after leaving the endpoint
+        loop to avoid repeating the refresh for each endpoint.
+
+        The retry and ``_authenticate`` pass ``allow_reauth=False`` to prevent
+        further refreshes. If the retry also receives ``401``, the round fails.
         """
         assert self._session is not None
         headers = {}
@@ -650,7 +656,7 @@ class EtcdBackend(StoreLeaseBackend):
             headers["Authorization"] = self._auth_token
         endpoints = self.endpoints
         if self.username or self.password:
-            # Defence in depth: never transmit credentials (password or
+            # Defense in depth: never transmit credentials (password or
             # bearer token) over a plaintext endpoint. Config validation
             # already rejects auth combined with any http:// endpoint, so in
             # practice this filters nothing, but it guarantees a mixed list
@@ -668,6 +674,7 @@ class EtcdBackend(StoreLeaseBackend):
         # deadline when one endpoint is half-open; see request_timeout.
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
         last_error: Optional[Exception] = None
+        stale_token = False
         for endpoint in endpoints:
             url = endpoint.rstrip("/") + path
             try:
@@ -683,9 +690,19 @@ class EtcdBackend(StoreLeaseBackend):
                     allow_redirects=False,
                 ) as resp:
                     if resp.status == 401 and self.username and allow_reauth:
-                        self._auth_token = await self._authenticate()
-                        return await self._post(path, body, allow_reauth=False)
+                        stale_token = True
+                        break
                     resp.raise_for_status()
+                    if resp.status != 200:
+                        # raise_for_status accepts 2xx and 3xx responses.
+                        # The gateway returns 200 for a successful request.
+                        # Reject other statuses so a proxy redirect or an
+                        # empty 204 response cannot reach the JSON parser.
+                        raise aiohttp.ClientError(
+                            "unexpected etcd status {} from {}".format(
+                                resp.status, endpoint
+                            )
+                        )
                     data = await resp.json()
                     if not isinstance(data, dict):
                         # A 200 with a non-object body (null / list / scalar)
@@ -714,6 +731,9 @@ class EtcdBackend(StoreLeaseBackend):
             ) as ex:
                 last_error = ex
                 continue
+        if stale_token:
+            self._auth_token = await self._authenticate()
+            return await self._post(path, body, allow_reauth=False)
         raise aiohttp.ClientError(
             "all etcd endpoints failed: {}".format(last_error)
         )
@@ -845,7 +865,7 @@ class EtcdBackend(StoreLeaseBackend):
                 self._reboot_ran_synced = False
                 lease_mono = None  # re-anchored before the grant POST below
             else:
-                # honour the TTL etcd refreshed to (may be < requested)
+                # honor the TTL etcd refreshed to (may be < requested)
                 self._narrow_effective_ttl(ttl)
         if self._lease_id is None:
             lease_mono = _monotonic()

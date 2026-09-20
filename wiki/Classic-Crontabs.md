@@ -13,7 +13,9 @@ See [deviations from cron](#deviations-from-cron) before migrating an
 existing crontab. The loader is implemented in `cronstable/crontabs.py`
 and `cronstable/config.py`.
 
-## How a crontab is recognised
+<a id="how-a-crontab-is-recognised"></a>
+
+## How a crontab is recognized
 
 The file *name* decides whenever it can:
 
@@ -126,7 +128,7 @@ that cronstable runs it, and what the same line did under classic cron:
 | Behavior | Under cronstable | Under classic cron |
 | --- | --- | --- |
 | time basis (`utc` / `timezone`) | **UTC** (set `CRON_TZ` to change) | local time |
-| failure detection (`failsWhen`) | non-zero exit **or any stderr output** is a failure | exit status ignored; output mailed |
+| failure detection (`failsWhen`) | nonzero exit **or any stderr output** is a failure | exit status ignored; output mailed |
 | output (`captureStderr` / `captureStdout`) | stderr is read by cronstable (for failure detection, reports, and the dashboard log tail) and re-emitted into its log with a `[<job> stderr]` prefix. By contrast, stdout is not read: it flows straight through to cronstable's own stdout, visible there but not to reports or the dashboard | both mailed to `MAILTO` |
 | concurrency (`concurrencyPolicy`) | `Allow` (overlapping runs permitted) | overlapping runs permitted |
 | retries (`onFailure.retry`) | none | none |
