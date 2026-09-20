@@ -147,15 +147,12 @@ speedups = [
 # target image and reads the wheelhouse the workflow's pq-wheels job fills
 # for the platforms PyPI has no wheel for.
 #
-# Intel macOS and 32-bit Windows take a second line, capped: cryptography
-# 49.0.0 dropped both, and 48.0.1 (June 2026) is the last release with a
-# universal2 and a win32 wheel, built on an OpenSSL that seals ML-KEM.  The
-# cap is what makes the extra resolve there at all, and it is also the
-# cost: that cryptography receives no further fixes.  The daemon uses it
-# for one HPKE seal per alert and nothing else, which bounds the exposure
-# to the KEM and AEAD code paths, and an environment that needs a newer
-# cryptography for something else can install cronstable plus `pynacl` by
-# hand and stay on x25519.
+# Require the patched cryptography release, including its updated OpenSSL
+# wheels (GHSA-537c-gmf6-5ccf, GHSA-g6cj-pr64-35w5,
+# GHSA-m2h6-j472-rp4c, GHSA-jwv3-5hgf-82ww). Intel macOS and 32-bit
+# Windows lost upstream support in 49.0.0; install PyNaCl alone there
+# instead of retaining a vulnerable cryptography 48.x cap. Those targets
+# keep x25519 push. Binary CI attempts patched source builds for X-Wing.
 #
 # One residual rides along, because no PEP 508 marker can express it:
 # `platform_machine` is the raw `uname -m`, which reports the KERNEL.  A
@@ -166,12 +163,11 @@ speedups = [
 # the 32-bit machine so the marker excludes cryptography and the install
 # lands PyNaCl alone.  Windows has the same shape with no `linux32`: a
 # 32-bit Python on 64-bit Windows reports `AMD64`, takes the uncapped
-# line, and finds no win32 wheel past 48.0.1.  Install cronstable plus
-# `pynacl` and `cryptography>=48,<49` by hand there.
+# line, and finds no supported win32 wheel. Install cronstable plus
+# `pynacl` by hand there, or use a 64-bit Python installation.
 push = [
     "pynacl>=1.6.2",
-    "cryptography>=48,<51; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
-    "cryptography>=48,<49; (sys_platform == 'darwin' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'x86')",
+    "cryptography>=50.0.1,<51; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
 ]
 # Zero-config LAN discovery (the opt-in `web.bonjour` mDNS advert; see
 # cronstable.discovery). Same fail-closed contract: web.bonjour without this
@@ -184,8 +180,7 @@ dev = [
     # wheel markers and skip those tests where no wheel is available.
     # On a 32-bit Linux userland with a 64-bit kernel, install under
     # linux32 so the marker sees the userland architecture (see push).
-    "cryptography>=48,<51; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
-    "cryptography>=48,<49; (sys_platform == 'darwin' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'x86')",
+    "cryptography>=50.0.1,<51; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     # Exercise the real accelerated JSON, push-sealing and mDNS paths.
     # orjson is wheel-only in dev: omit platforms/interpreters that would
     # need a Rust source build. PyNaCl and zeroconf cover every CI runner.

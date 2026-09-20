@@ -36,8 +36,8 @@ and images do:
 
 | How you run cronstable | Post-quantum sealing |
 | --- | --- |
-| `pip install "cronstable[push]"` | Linux x86_64 and aarch64, macOS (Apple Silicon and Intel), and Windows x64 and 32-bit x86 |
-| Release binary | Every Linux build except `linux-mips64le` and `linux-armel`; every macOS, Windows, FreeBSD, OpenBSD, NetBSD, and illumos build |
+| `pip install "cronstable[push]"` | Linux x86_64 and aarch64, macOS Apple Silicon, and Windows x64 |
+| Release binary | Every Linux build except `linux-mips64le` and `linux-armel`; every macOS, Windows, FreeBSD, OpenBSD, NetBSD, and illumos build, subject to successful source builds where wheels are unavailable |
 | Docker image | Every platform of every tag |
 
 The binaries and images reach past pip because CI builds `cryptography`
@@ -54,23 +54,27 @@ Everywhere else, the extra installs PyNaCl alone and the daemon seals
 can seal at startup. If you expected post-quantum sealing and did not get
 it, that line says so. To ask a binary directly, run
 `cronstable --sealable-suites`, which prints one suite per line. On a
-platform without a wheel, you can still get post-quantum sealing by
-building `cryptography` 48 or newer from source
-(`pip install "cryptography>=48"`, which needs a Rust toolchain and the
+platform without a wheel, you can attempt post-quantum sealing by
+building `cryptography` 50.0.1 or newer from source
+(`pip install "cryptography>=50.0.1,<51"`, which needs a Rust toolchain and the
 OpenSSL 3.5 headers on that host).
 
-Intel macOS and 32-bit Windows run on `cryptography` 48.x. Release 49.0.0
-dropped both platforms, so 48.0.1 (June 2026) is the last release with a
-wheel for them, and its bundled OpenSSL seals ML-KEM. The `push` extra and
-the `macos-amd64` and `windows-i686` binaries pin below 49 there, which
-means that copy of `cryptography` receives no further fixes. The daemon
-uses it for one HPKE seal per alert and nothing else, so the exposure is
-the KEM and AEAD code paths. If you need a newer `cryptography` for
-another package, install cronstable with `pynacl` alone and stay on
-`x25519`. A 32-bit Python on 64-bit Windows reports the
-64-bit machine, so the extra takes the uncapped line there and finds no
-wheel; install cronstable plus `pynacl` and `cryptography>=48,<49` by hand
-on such a host.
+Cryptography 49.0.0 dropped support for Intel macOS and 32-bit Windows
+before the latest security fixes. The `push` extra installs PyNaCl alone
+there, while release binaries attempt to compile patched cryptography
+with Rust and a static OpenSSL. On Windows the build targets 32-bit Rust
+and OpenSSL explicitly, even when the build host is 64-bit. These source
+builds are best effort: only a build that passes the X-Wing sealing probe
+is bundled, and there is no fallback to the vulnerable 48.x release line.
+
+If a new binary no longer lists `xwing` in `--sealable-suites`, existing
+`xwing` pairings need to be paired again under `x25519`; open the companion
+app and connect to the upgraded daemon so it can update the pairing.
+Until then, the daemon reports those devices as unsealable and cannot
+deliver their alerts. A 32-bit Python on 64-bit Windows reports the
+64-bit machine, so its dependency marker still requests cryptography;
+use 64-bit Python, or install cronstable plus `pynacl` by hand if a
+source build is not possible.
 
 The pip route stops at two Linux architectures because a dependency marker
 cannot see which libc you are on, and `cryptography` publishes `ppc64le` and

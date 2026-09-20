@@ -60,9 +60,9 @@ def _has_cryptography_wheel():
     if sys.platform == "linux":
         return machine in ("x86_64", "aarch64")
     if sys.platform == "darwin":
-        return machine in ("arm64", "x86_64")
+        return machine == "arm64"
     if sys.platform == "win32":
-        return machine in ("AMD64", "x86")
+        return machine == "AMD64"
     return False
 
 

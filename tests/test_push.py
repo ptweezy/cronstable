@@ -738,7 +738,7 @@ async def test_refresh_warns_once_about_records_it_cannot_seal(
     assert len(warnings) == 1
     assert "cannot seal" in warnings[0]
     assert "phone (dev-1, xwing)" in warnings[0]
-    assert "cryptography>=48" in warnings[0]
+    assert "cryptography>=50.0.1,<51" in warnings[0]
 
     # a standing mismatch does not re-warn on every refresh
     caplog.clear()
@@ -888,7 +888,7 @@ def test_a_backend_without_mlkem_is_blamed_on_the_library_not_the_key(
     with pytest.raises(push.PushError) as excinfo:
         push.validate_public_key(public_b64, push.SUITE_XWING)
     assert "cannot seal X-Wing" in str(excinfo.value)
-    assert "cryptography>=48" in str(excinfo.value)
+    assert "cryptography>=50.0.1,<51" in str(excinfo.value)
     with pytest.raises(push.PushError) as excinfo:
         push.seal_to_device(public_b64, b"{}", push.SUITE_XWING)
     assert "cannot seal X-Wing" in str(excinfo.value)
@@ -1023,7 +1023,7 @@ def test_capability_log_separates_an_old_cryptography_from_none(
     # daemon cannot seal that the probe exists to keep out.
     assert any("push: sealing suites: x25519" == m for m in messages)
     reason = [m for m in messages if "post-quantum xwing sealing is off" in m]
-    assert reason and "cryptography>=48" in reason[0]
+    assert reason and "cryptography>=50.0.1,<51" in reason[0]
     assert "too old" in reason[0]
     assert "no cryptography" not in reason[0]
 
@@ -1091,7 +1091,7 @@ def test_pairing_refuses_a_suite_the_daemon_cannot_seal_to(monkeypatch):
         )
     assert "not sealable" in str(excinfo.value)
     # the refusal names what would lift it
-    assert "cryptography>=48" in str(excinfo.value)
+    assert "cryptography>=50.0.1,<51" in str(excinfo.value)
 
 
 def test_pairing_checks_key_length_against_its_own_suite():
@@ -1153,7 +1153,7 @@ def test_seal_rejects_a_suite_with_no_implementation(monkeypatch):
     with pytest.raises(push.PushError) as excinfo:
         push.seal_to_device(key, b"{}", push.SUITE_XWING)
     assert "cannot seal" in str(excinfo.value)
-    assert "cryptography>=48" in str(excinfo.value)
+    assert "cryptography>=50.0.1,<51" in str(excinfo.value)
 
 
 def test_fit_payload_honors_a_narrower_suite_budget():
