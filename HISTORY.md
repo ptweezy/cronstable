@@ -1,7 +1,36 @@
 # History
 
-## Unreleased
+## 1.2.54
 
+- Make scheduled runs and occurrence lists agree across daylight-saving
+  gaps. Preserve every shifted spring-forward run in calendar feeds and
+  schedule calculations, and retain real local-time matches between shifted
+  runs during half-hour transitions such as Australia/Lord_Howe.
+- Treat exited but unreaped POSIX processes as dead during crash recovery.
+  Zombie children left behind after a daemon crash no longer keep runs
+  open indefinitely or prevent `@reboot` jobs and DAG tasks from recovering.
+- Require the expected success statuses from etcd and Kubernetes lease
+  APIs, so redirects and unexpected responses cannot be mistaken for a
+  successful lease operation. Limit etcd token refresh to one retry per
+  request, including when several endpoints fail.
+- Support rotating kubeconfig `tokenFile` credentials in the built-in
+  Kubernetes transport, with inline tokens taking precedence. Resolve CA,
+  client-certificate, client-key, and token paths relative to the kubeconfig
+  directory. When a CA is configured, trust that CA without adding system
+  roots. Accept an empty user entry and report malformed entries as
+  configuration errors.
+- Harden dashboard rendering by escaping additional counters and state
+  values, ignoring malformed URL fragments, retaining defaults for stored
+  preferences with the wrong type, and handling non-finite timestamps.
+  Correct cluster-policy sorting and separate swimlane history storage from
+  its on/off preference; existing browser swimlane history is reset once.
+- Improve dashboard keyboard focus when opening overlapping panels and
+  returning to a refreshed job row. Remove closed overlays from the tab
+  order, and keep long text, configuration chips, schedule warnings, and
+  workflow drawer controls usable on narrow screens. Update the demo copy
+  of the dashboard with the same fixes.
+- Close HTTP error responses promptly in the job CLI and MCP CLI instead
+  of leaving their connections open until garbage collection.
 - Require cryptography 50.0.1 or newer for push, development, minimum
   dependency tests, and binary builds, addressing the OpenSSL, PKCS#7,
   and certificate-verification security advisories. Intel macOS and
@@ -10,6 +39,58 @@
   X-Wing, it retains X25519 encrypted push; open the companion app to
   reconnect and update existing X-Wing pairings before relying on push
   delivery after such an upgrade.
+- Raise the aiosmtplib minimum to 5.1.2 for its STARTTLS response-injection
+  fix, and the strictyaml minimum to 1.7.3 to avoid an unimportable withdrawn
+  release. Keep generated minimum dependency pins visible to Dependabot
+  scans, while retaining `pyproject.toml` as their source of truth.
+- Rebuild the latest stable release's Docker images daily and on demand
+  with freshly pulled base images and compatible Python dependencies,
+  including rebuilt post-quantum wheels. Keep the released application
+  version, update its versioned and `latest` image aliases, and publish
+  dated `-rebuild-` tags. Validate the complete platform set before
+  publication and skip publishing if the latest release changed meanwhile.
+- Refresh OS packages in rebuilt container runtimes and remove unused
+  Python packaging tools and Ubuntu's Pebble executable. Preserve the
+  configured runtime user and include matching dependency source notices.
+  Run release tests, per-platform runtime and license checks, and Trivy
+  scans before publishing; fixable high or critical vulnerabilities block
+  a refreshed image, with scan reports retained as CI artifacts.
+- Make the macOS demo installer wait for old daemon and gateway processes
+  to exit and release their ports before restarting. Verify that listeners
+  belong to the newly launched agents and report the deployed version;
+  refuse to replace an unrelated port owner. Parse Cloudflare tunnel JSON
+  separately from stderr warnings so an outdated-version warning cannot
+  hide an existing tunnel.
+- Add real-process crash and restart tests for runs, retries, pauses,
+  workflows, approval gates, and shared-store takeover, plus hard-kill
+  scenarios for frozen binaries. Exercise cross-process state contention,
+  lease and pool ownership, failed writes and renames, disk-full and
+  permission errors, and compatibility with a saved version-1 state store.
+- Test etcd and both Kubernetes transports against socket-based fake
+  servers, and add a required CI job against real etcd and Kubernetes
+  servers, including TLS and authentication. Add property-based tests for
+  schedules, daylight-saving transitions, configuration and crontab
+  parsing, Task Scheduler imports, redaction, JSON, and calendar output.
+- Expand browser tests against a real daemon to cover hostile content,
+  authentication and scopes, connection recovery, job actions, log
+  streaming, workflow controls, keyboard navigation, preferences, mobile
+  layouts, and dashboard views. Require these suites to execute in the
+  Chromium CI job and distinguish expected failures from skipped tests.
+- Extend required tests to macOS and Linux ARM64, test the declared minimum
+  dependencies on Python 3.10, and exercise real Windows Task Scheduler
+  exports. Add experimental free-threaded Python 3.14 coverage with a
+  generated dependency list that omits orjson and tests the standard-library
+  JSON fallback. Guard against optional test dependencies silently missing.
+- Add nightly extended property tests, repeated randomized suite runs,
+  Python development-mode checks, and mutation tests. Treat warnings as
+  errors, report timed-out tests before the process timeout, and clean up
+  test resources explicitly. Isolate release-helper and Pro test settings,
+  include release-helper tests in source distributions, and refresh pinned
+  CI actions and the container vulnerability scanner.
+- Rewrite README, CLI help, dashboard messages, module explanations, and
+  wiki pages for clearer setup and troubleshooting. Expand TLS and
+  clustering guidance, dashboard and terminal references, and contributor
+  instructions for generated files, test environments, and Pro tests.
 
 ## 1.2.53
 
