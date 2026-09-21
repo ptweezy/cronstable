@@ -191,6 +191,11 @@ async def _cancel_fleet_tasks(cron):
     for task in list(cron._slot_renewers.values()):
         task.cancel()
     cron._slot_renewers.clear()
+    # Reaping the job can finish before Windows' final taskkill helper.
+    # Match daemon shutdown: let replacement cancellation finish before
+    # pytest closes the loop (and cancels subprocess creation mid-flight).
+    if cron._replace_cancel_tasks:
+        await asyncio.gather(*list(cron._replace_cancel_tasks))
 
 
 async def _stop_state(cron):
@@ -729,6 +734,9 @@ async def test_claim_respects_the_staleness_grace(fleet_cron):
     await taker.state_backend.append_record("retries/j", stale)
     await taker._maybe_claim_retry("j", taker.cron_jobs["j"])
     assert "j" in taker.retry_state  # crashed owner: claimed
+    # This test checks the claim. Stop the immediately due retry before it
+    # can replace that record with its own pending/settled state.
+    await taker.cancel_job_retries("j", settle=None)
     rec = await _newest(taker, "retries/j")
     assert rec["kind"] == "pending"
     assert rec["host"] == "node-b"
