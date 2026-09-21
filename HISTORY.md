@@ -75,6 +75,9 @@
   addressing GitHub Actions cache-poisoning findings.
 - Run required tests and source-package checks before the expensive CI build
   fan-out, so emulated builds cannot occupy workers ahead of basic checks.
+  Bound Nix dependency build concurrency to avoid oversubscribing Intel
+  workers. Retain an Ubuntu 24 host for the FreeBSD ARM64 VM, which fails
+  to boot on Ubuntu 26; other Linux workers use Ubuntu 26.
 - Treat partial APT index downloads as failures across CI and Docker builds,
   so network retries refresh the index before dependency installation.
 - Rebuild the latest stable release's Docker images daily and on demand
