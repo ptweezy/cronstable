@@ -26,6 +26,9 @@
   preferences with the wrong type, and handling non-finite timestamps.
   Correct cluster-policy sorting and separate swimlane history storage from
   its on/off preference; existing browser swimlane history is reset once.
+- Refresh the dashboard's next-run time when it crosses a minute boundary,
+  keeping incremental row updates consistent with a fresh render. Anchor
+  absolute next-run times to each response so clock jitter cannot shift them.
 - Improve dashboard keyboard focus when opening overlapping panels and
   returning to a refreshed job row. Remove closed overlays from the tab
   order, and keep long text, configuration chips, schedule warnings, and
@@ -44,6 +47,8 @@
   renewals, while retaining separate coverage of the automatic renewal loop.
   Keep etcd connection-failure diagnostics useful when a timeout has no
   message, and test kubeconfig certificate paths using native OS paths.
+  Close the Task Scheduler export file before the live Windows import test
+  reads it, retaining strict resource-warning checks.
 - Require cryptography 50.0.1 or newer for push, development, minimum
   dependency tests, and binary builds, addressing the OpenSSL, PKCS#7,
   and certificate-verification security advisories. Intel macOS and
@@ -71,6 +76,8 @@
 - Make Sentry's Nix dependency test wait for its asynchronous request rather
   than a fixed 100 ms. Separate Nix evaluation, dependency builds, and CLI
   smoke tests so each failure is identifiable.
+  Give Intel Nix SMTP tests a local hostname so sandboxed DNS cannot stall
+  their client and server fixtures; retain all protocol and security tests.
 - Keep Python 3.10 TLS tests running under strict warning checks, with a
   narrowly scoped exception for its upstream SSL wrapper cleanup bug.
 - Upgrade affected CI workers to a patched Docker engine through a shared

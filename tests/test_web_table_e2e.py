@@ -150,6 +150,10 @@ class _Jobs:
 
 def _refresh(page):
     _click(page, "#refreshBtn")
+    # Names may be unchanged while the request is still applying new state.
+    page.wait_for_function(
+        "!document.querySelector('#refreshBtn').classList.contains('spin')"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -548,17 +552,71 @@ def _step(page, names, kept=(), rebuilt=()):
     _check(page, names)
 
 
+def test_next_at_reconciles_across_a_minute_boundary(browser, tmp_path):
+    with e2e.Daemon(tmp_path) as daemon:
+        with e2e.open_page(
+            browser, daemon.url + "?perf=1", prefs={"pollMs": 0}
+        ) as page:
+            result = page.evaluate(
+                """() => {
+                  const now = Date.now, monotonic = performance.now;
+                  try {
+                    Date.now = () => Date.UTC(2026, 2, 7, 12);
+                    performance.now = () => 1000;
+                    const perf = window.__perf, state = perf.state();
+                    perf.seedJobs(1);
+                    state.fetchedAt = 1000;
+                    const job = state.jobs[0];
+                    job.running = false;
+                    job.scheduled_in = 3599.99;
+                    perf.renderRows();
+                    const before = document.querySelector('.col-nextat span')
+                      .getAttribute('title');
+                    job.scheduled_in = 3600.01;
+                    perf.renderRowsDiff();
+                    const after = document.querySelector('.col-nextat span')
+                      .getAttribute('title');
+                    const live = document.getElementById('rows').innerHTML;
+                    perf.renderRows();
+                    const fresh = document.getElementById('rows').innerHTML;
+                    // A wall-clock correction must not move this response's
+                    // absolute target back into the preceding minute.
+                    Date.now = () => state.fetchedWallAt + 59999;
+                    performance.now = () => 61000;
+                    perf.renderRows();
+                    const later = document.querySelector('.col-nextat span')
+                      .getAttribute('title');
+                    return {before, after, later, same: live === fresh};
+                  } finally {
+                    Date.now = now;
+                    performance.now = monotonic;
+                  }
+                }"""
+            )
+            assert result["before"] != result["after"]
+            assert result["same"]
+            assert result["later"] == result["after"]
+
+
 def test_reconcile_matches_a_fresh_render_through_every_change(
     browser, tmp_path
 ):
     with e2e.Daemon(tmp_path) as daemon:
         jobs = _Jobs(daemon)
+
+        def install(page):
+            jobs.install(page)
+            # These scripted payloads hold scheduled_in constant. Hold browser
+            # time constant too, so only payload changes can rebuild a row.
+            page.clock.install(time="2026-01-01T12:00:00Z")
+            page.clock.pause_at("2026-01-01T12:01:00Z")
+
         with e2e.open_page(
             browser,
             daemon.url + "?perf=1",
             # a manual refresh drives every step
             prefs={"pollMs": 0},
-            before_goto=jobs.install,
+            before_goto=install,
         ) as page:
             _wait_names(page, list("abcde"))
             page.evaluate(_STAMP)

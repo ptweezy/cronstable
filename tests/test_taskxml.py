@@ -1048,11 +1048,12 @@ def test_a_real_export_converts_and_loads(tmp_path):
     import subprocess
 
     export = tmp_path / "all.xml"
-    subprocess.run(
-        ["schtasks", "/query", "/XML", "ONE"],
-        stdout=export.open("wb"),
-        check=True,
-    )
+    with export.open("wb") as stream:
+        subprocess.run(
+            ["schtasks", "/query", "/XML", "ONE"],
+            stdout=stream,
+            check=True,
+        )
     out = tmp_path / "jobs.yaml"
     assert taskxml.dispatch(_args([str(export)], output=str(out))) == 0
     parse_config_string(out.read_text(encoding="utf-8"), "")
