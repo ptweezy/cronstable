@@ -855,7 +855,11 @@ jobs:
   # reason to hold a release that ships no Nix artifact.
   nix:
     needs: tox-static
-    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-26-intel]
+    runs-on: ${{ matrix.os }}
     continue-on-error: true
     timeout-minutes: 60
     steps:
@@ -867,6 +871,7 @@ jobs:
       # --print-build-logs so a dependency that fails to build says why in the
       # job log instead of only naming the derivation.
       - run: |
+          nix flake check --all-systems --no-build
           nix flake check --print-build-logs
           nix run .#cronstable -- --version
           nix run .#cronstable -- --help > /dev/null
