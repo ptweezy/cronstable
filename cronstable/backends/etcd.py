@@ -674,6 +674,7 @@ class EtcdBackend(StoreLeaseBackend):
         # deadline when one endpoint is half-open; see request_timeout.
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
         last_error: Optional[Exception] = None
+        last_endpoint = None
         stale_token = False
         for endpoint in endpoints:
             url = endpoint.rstrip("/") + path
@@ -730,12 +731,15 @@ class EtcdBackend(StoreLeaseBackend):
                 ValueError,
             ) as ex:
                 last_error = ex
+                last_endpoint = endpoint
                 continue
         if stale_token:
             self._auth_token = await self._authenticate()
             return await self._post(path, body, allow_reauth=False)
         raise aiohttp.ClientError(
-            "all etcd endpoints failed: {}".format(last_error)
+            "all etcd endpoints failed: {}: {}".format(
+                last_endpoint, str(last_error) or type(last_error).__name__
+            )
         )
 
     async def _grant_lease(

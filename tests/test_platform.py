@@ -474,6 +474,48 @@ async def test_kill_process_group_windows_break_failure_tree_kills(
     assert taskkills == [4242]
 
 
+@pytest.mark.parametrize("interrupt", ["timeout", "cancel"])
+async def test_taskkill_reaps_its_helper_when_interrupted(
+    monkeypatch, interrupt
+):
+    # Use a real process so an abandoned subprocess transport is observable
+    # on every OS. Only replace the Windows taskkill executable with a sleeper.
+    create = asyncio.create_subprocess_exec
+    started = asyncio.Event()
+    proc = None
+
+    async def spawn(*args, **kwargs):
+        nonlocal proc
+        assert args[0] == "taskkill"
+        proc = await create(
+            sys.executable, "-c", "import time; time.sleep(60)", **kwargs
+        )
+        started.set()
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    if interrupt == "timeout":
+        monkeypatch.setattr(platform, "TASKKILL_TIMEOUT", 0.01)
+    task = asyncio.create_task(platform._taskkill_tree(4242))
+    try:
+        await asyncio.wait_for(started.wait(), 10)
+        if interrupt == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert await task is False
+        assert proc.returncode is not None, "taskkill helper was not reaped"
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if proc is not None:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+
+
 def _windows_pid_alive(pid):
     # OpenProcess/GetExitCodeProcess, not a tasklist subprocess per poll: on a
     # degraded CI runner every process spawn crawled, and the polling in the

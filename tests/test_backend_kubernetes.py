@@ -588,6 +588,9 @@ def test_kubeconfig_cert_files_extracts_referenced_paths(tmp_path):
     # cert rotation rebuilds the backend. _kubeconfig_cert_files returns the
     # active context's referenced files; embedded -data forms resolve to None.
     kubeconfig = tmp_path / "kubeconfig"
+    ca, cert, key = [
+        tmp_path / name for name in ("ca.crt", "tls.crt", "tls.key")
+    ]
     kubeconfig.write_text(
         "apiVersion: v1\n"
         "current-context: ctx\n"
@@ -600,17 +603,17 @@ def test_kubeconfig_cert_files_extracts_referenced_paths(tmp_path):
         "  - name: c\n"
         "    cluster:\n"
         "      server: https://1.2.3.4:6443\n"
-        "      certificate-authority: /etc/certs/ca.crt\n"
+        f"      certificate-authority: {ca.as_posix()}\n"
         "users:\n"
         "  - name: u\n"
         "    user:\n"
-        "      client-certificate: /etc/certs/tls.crt\n"
-        "      client-key: /etc/certs/tls.key\n"
+        f"      client-certificate: {cert.as_posix()}\n"
+        f"      client-key: {key.as_posix()}\n"
     )
     assert _kubeconfig_cert_files(str(kubeconfig)) == [
-        "/etc/certs/ca.crt",
-        "/etc/certs/tls.crt",
-        "/etc/certs/tls.key",
+        str(ca),
+        str(cert),
+        str(key),
     ]
 
 

@@ -138,8 +138,10 @@ async def test_post_times_out_when_the_only_endpoint_hangs():
         stuck.inject(hang=True)
         b = _backend([stuck.endpoint], ttl=3, timeout=1)
         async with _session(b):
-            with pytest.raises(aiohttp.ClientError, match="all etcd"):
+            with pytest.raises(aiohttp.ClientError, match="all etcd") as err:
                 await b._post("/v3/kv/range", RANGE_BODY)
+    assert stuck.endpoint in str(err.value)
+    assert "TimeoutError" in str(err.value)
 
 
 async def test_post_rotates_the_probe_order_by_round():

@@ -566,12 +566,18 @@ async def _taskkill_tree(pid: int) -> bool:  # pragma: no cover (windows)
         return False
     try:
         retcode = await asyncio.wait_for(proc.wait(), TASKKILL_TIMEOUT)
-    except asyncio.TimeoutError:
-        logger.warning(
-            "taskkill for pid %s did not finish; abandoning it", pid
-        )
+    except (asyncio.TimeoutError, asyncio.CancelledError) as ex:
+        # A lease renewer can be cancelled while its taskkill is running.
+        # Always reap our helper before propagating cancellation or returning
+        # a timeout; otherwise its transport outlives the owning event loop.
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
+        await proc.wait()
+        if isinstance(ex, asyncio.CancelledError):
+            raise
+        logger.warning(
+            "taskkill for pid %s did not finish; terminated it", pid
+        )
         return False
     # 128 is taskkill's "process not found": the tree is already gone, so
     # nothing was signalled and the caller's fallback is a no-op either way.
