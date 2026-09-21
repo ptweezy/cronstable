@@ -1,5 +1,12 @@
 # History
 
+## 1.2.55
+
+- With no arguments and a missing default configuration, `cronstable` prints
+  setup help and exits `0`. Explicit configuration requests exit `1` when
+  configuration is missing or invalid. MSI smoke tests exercise WinGet's
+  launch check in a clean Windows profile before release.
+
 ## 1.2.54
 
 - Make scheduled runs and occurrence lists agree across daylight-saving
