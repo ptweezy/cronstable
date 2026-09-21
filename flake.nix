@@ -20,6 +20,15 @@
       forAllSystems = f:
         nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
+      # Share the build/runtime dependency lists with pip, Docker and binary
+      # builds. Nixpkgs spells Python distribution names with hyphens.
+      pyproject = builtins.fromTOML (builtins.readFile ./pyproject.toml);
+      dependencyName = requirement:
+        builtins.replaceStrings [ "_" ] [ "-" ]
+          (builtins.head (builtins.match "([A-Za-z0-9_-]+).*" requirement));
+      dependenciesFrom = packages: requirements:
+        map (requirement: packages.${dependencyName requirement}) requirements;
+
       # The version comes from the top heading of HISTORY.md, which is the
       # release being prepared. Reading it here rather than hardcoding keeps
       # `nix run` from reporting a version this tree is not, and setuptools_scm
@@ -80,24 +89,13 @@
           src = ./.;
           pyproject = true;
 
-          build-system = with pkgs.python3Packages; [
-            setuptools
-            setuptools-scm
-          ];
+          build-system = dependenciesFrom pkgs.python3Packages pyproject.build-system.requires;
 
           # setuptools_scm derives the version from git metadata, which a store
           # path does not carry, so it is told outright.
           env.SETUPTOOLS_SCM_PRETEND_VERSION = version;
 
-          dependencies = with pythonPackages; [
-            strictyaml
-            aiohttp
-            sentry-sdk
-            aiosmtplib
-            jinja2
-            tzdata
-            psutil
-          ];
+          dependencies = dependenciesFrom pythonPackages pyproject.project.dependencies;
 
           # The test suite wants a writable HOME, network namespaces and a
           # handful of platform tools; `nix flake check` proves the package
