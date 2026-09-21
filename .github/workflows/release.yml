@@ -873,6 +873,10 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+            # Each Python dependency starts its own test workers. Prevent
+            # concurrent builds from oversubscribing the hosted Intel Macs.
+            max-jobs = 1
+            cores = 2
       # --print-build-logs so a dependency that fails to build says why in the
       # job log instead of only naming the derivation.
       - name: Evaluate all supported Nix systems
@@ -2684,7 +2688,10 @@ jobs:
             orjson: '0'
             pq: '1'
             cflags: -I/usr/local/include -include sys/cdefs.h
-    runs-on: ubuntu-26.04
+    # The ARM guest fails to boot with Ubuntu 26's QEMU/firmware stack.
+    # Keep only this emulated host on the last working LTS until the VM
+    # action supports that combination; the FreeBSD target stays the same.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04' || 'ubuntu-26.04' }}
     timeout-minutes: 360
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
