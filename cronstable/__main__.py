@@ -587,6 +587,17 @@ def main_loop(loop=None):
         )
 
     if args.config == CONFIG_DEFAULT and not os.path.exists(args.config):
+        # With no arguments and no default config, show setup help. WinGet
+        # checks the installed executable this way.
+        if not argv:
+            print(
+                "cronstable: no configuration at the default location "
+                f"({CONFIG_DEFAULT}). Run `cronstable init` to create a "
+                "starter configuration, or use -c/--config to select an "
+                "existing file or directory.\n"
+            )
+            parser.print_help()
+            sys.exit(0)
         print(
             "cronstable error: configuration file not found at the default "
             "location ({}). Run `cronstable init` to create a starter "

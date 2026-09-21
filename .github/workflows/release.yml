@@ -3628,6 +3628,8 @@ jobs:
           sc qfailure cronstable | grep -qi 'RESTART'
           # The installed exe runs from Program Files.
           "/c/Program Files${PFSUFFIX}/cronstable/cronstable.exe" --version
+          python .github/scripts/smoke_windows_first_run.py \
+            "/c/Program Files${PFSUFFIX}/cronstable/cronstable.exe"
           msi_uninstall "dist/cronstable-windows-${ARCH}.msi" msi-uninstall.log
           # Service and files are gone.
           if sc query cronstable >/dev/null 2>&1; then
@@ -4486,6 +4488,8 @@ jobs:
             msi_install "$msi" signed-install.log
             sc query cronstable | grep -q 'STOPPED'
             "/c/Program Files/cronstable/cronstable.exe" --version
+            python .github/scripts/smoke_windows_first_run.py \
+              "/c/Program Files/cronstable/cronstable.exe"
             msi_uninstall "$msi" signed-uninstall.log
           done
       # Validate WinGet artifacts while the other platform builds run.

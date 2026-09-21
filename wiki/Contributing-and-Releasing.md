@@ -235,7 +235,12 @@ The scan uses `-DisableRemediation` to preserve detected files for inspection.
 Detections fail the job. Missing Defender, a signature update failure, or a scan
 error also fails the signing job and blocks release publication. The other
 build jobs continue independently. The build and signing jobs test MSI
-installation and uninstallation.
+installation and uninstallation. Each native Windows build also launches the
+installed executable with no arguments in a temporary, unconfigured profile.
+The signing job repeats this check for its x64 MSIs. The check requires setup
+guidance, usage help, and exit `0`, with no stderr output or configuration
+creation. It also verifies that `--validate-config` exits `1` for that missing
+configuration. Each process has a 30-second timeout.
 
 The manifest renderer reads `ProductCode`, `UpgradeCode`, display version,
 publisher, and architecture from the MSIs. It sets the installer type to `wix`
@@ -250,6 +255,13 @@ manifests with `wingetcreate submit`. Release downloads, GitHub submission,
 and Microsoft's upstream validation depend on published assets and run at
 this stage. Missing signing credentials fail preflight; the `winget` job also
 requires signed MSIs as a final check.
+
+For `Validation-Executable-Error`, open the validation artifact linked from
+the PR's **Validation Completed** check. Inspect `ExeRunInfo` in
+`InstallationVerification_Result.json` for the executable's output and exit
+code. WinGet launches installed executables without arguments; a fresh
+cronstable installation shows setup help and exits successfully. The MSI
+smoke checks exercise this launch before publication.
 
 Defender can flag a signed MSI or its payload. If validation fails, follow the
 [Microsoft validation guide](https://github.com/microsoft/winget-pkgs/blob/master/doc/ValidationFailureGuide.md).

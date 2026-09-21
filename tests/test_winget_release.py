@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,25 @@ spec = importlib.util.spec_from_file_location(
 )
 verifier = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verifier)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows profile paths")
+def test_windows_first_run_smoke_checks_real_cli(monkeypatch, tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "smoke_windows_first_run",
+        ROOT / ".github/scripts/smoke_windows_first_run.py",
+    )
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    monkeypatch.setattr(smoke.tempfile, "tempdir", str(tmp_path))
+    smoke.check(
+        [
+            sys.executable,
+            "-c",
+            f"import sys, runpy; sys.path.insert(0, {str(ROOT)!r}); "
+            "runpy.run_module('cronstable', run_name='__main__')",
+        ]
+    )
 
 
 @pytest.fixture

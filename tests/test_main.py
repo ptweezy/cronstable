@@ -259,20 +259,77 @@ def test_tui_routes_to_tui(monkeypatch):
     assert seen["command"] == "tui"
 
 
-def test_missing_default_config_exits_1(monkeypatch, capsys):
-    # No -c given (args.config stays at CONFIG_DEFAULT) and the default path
-    # does not exist -> print an error, dump help, exit 1.
-    monkeypatch.setattr("cronstable.__main__.os.path.exists", lambda p: False)
+def test_first_run_without_arguments_shows_setup(
+    monkeypatch, tmp_path, capsys
+):
+    config = tmp_path / "missing config"
+    monkeypatch.setattr(main, "CONFIG_DEFAULT", str(config))
     monkeypatch.setattr(sys, "argv", ["cronstable"])
     with pytest.raises(SystemExit) as exc:
-        main.main_loop(_loop())
+        main.main_loop()
+    assert exc.value.code == 0
+    out, err = capsys.readouterr()
+    assert "usage: cronstable" in out
+    assert "cronstable init" in out
+    assert str(config) in out
+    assert err == ""
+    assert not config.exists()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["-v"],
+        ["--validate-config"],
+        ["--job-set-id"],
+        ["-l", "INFO"],
+        ["-c", "{default}"],
+        ["--config={default}"],
+    ],
+)
+def test_missing_default_config_with_arguments_exits_1(
+    monkeypatch, tmp_path, capsys, arguments
+):
+    config = str(tmp_path / "missing config")
+    monkeypatch.setattr(main, "CONFIG_DEFAULT", config)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cronstable", *[a.format(default=config) for a in arguments]],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop()
     assert exc.value.code == 1
-    err = capsys.readouterr().err
+    out, err = capsys.readouterr()
+    assert out == ""
     assert "configuration file not found" in err
-    # the error names the path it looked in and the way out; before it did
-    # neither, and the reader had to find the default in the wiki.
-    assert main.CONFIG_DEFAULT in err
+    assert config in err
     assert "cronstable init" in err
+
+
+def test_no_arguments_runs_existing_default_config(monkeypatch):
+    config = str(Path(__file__).parent / "testconfig.yaml")
+    monkeypatch.setattr(main, "CONFIG_DEFAULT", config)
+    monkeypatch.setattr("cronstable.cron.Cron", FakeCron)
+    monkeypatch.setattr(sys, "argv", ["cronstable"])
+    seen = []
+    monkeypatch.setattr(
+        main, "_run_daemon", lambda cron, loop: seen.append(cron)
+    )
+    main.main_loop()
+    assert len(seen) == 1
+    assert isinstance(seen[0], FakeCron)
+
+
+def test_no_arguments_rejects_invalid_default_config(monkeypatch, caplog):
+    config = str(Path(__file__).parent / "testbrokenconfig.yaml")
+    monkeypatch.setattr(main, "CONFIG_DEFAULT", config)
+    monkeypatch.setattr("cronstable.cron.Cron", FakeCron)
+    monkeypatch.setattr(sys, "argv", ["cronstable"])
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop()
+    assert exc.value.code == 1
+    assert "Configuration error" in caplog.text
 
 
 def test_init_writes_a_starter_the_daemon_can_load(

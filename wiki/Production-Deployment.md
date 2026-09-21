@@ -408,7 +408,7 @@ on the Installation page.
 * **Config not found**: the default config path is platform-specific:
   `/etc/cronstable.d` on POSIX. On Windows it is `%ProgramData%\cronstable` when
   that directory holds configuration, else `%APPDATA%\cronstable`, falling back
-  to the user profile `~` if `APPDATA` is unset. When `-c` is left at the
-  platform default and that path does not exist, cronstable prints an error and
-  exits nonzero. In the container, mount the config volume at
-  `/etc/cronstable.d`.
+  to the user profile `~` if `APPDATA` is unset. With no arguments and no
+  default configuration, cronstable prints setup guidance and exits `0`.
+  Pass `-c` explicitly in a supervised command so a missing configuration
+  exits `1`. In the container, mount the config volume at `/etc/cronstable.d`.

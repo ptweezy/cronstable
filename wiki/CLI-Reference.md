@@ -24,6 +24,8 @@ cronstable import-taskscheduler PATH... [-o FILE] [--timezone NAME]
 ```
 
 Without a subcommand, `cronstable` is the scheduler daemon described later.
+When invoked with no arguments and the default configuration path is absent,
+it prints setup guidance and usage help to stdout and exits `0`.
 With the `state` subcommand it is an offline administration tool for the
 durable state store; see the [`state` subcommand](#the-state-subcommand).
 
@@ -97,23 +99,23 @@ The argument may be a single file or a directory:
 
 #### Default-path special case
 
-The default is the platform default configuration path (`DEFAULT_CONFIG_PATH`
-from `cronstable/platform.py`; see the preceding footnote for the per-platform
-values). The condition
-`args.config == DEFAULT_CONFIG_PATH and not os.path.exists(args.config)`
-triggers the special case. If the configuration argument equals the platform
-default and that path does not exist, cronstable prints the following to stderr
-(with the resolved default filled in), prints the usage help, and exits `1`:
+With no arguments and no default configuration path, `cronstable` prints the
+resolved path, instructions to run `cronstable init`, and usage help to stdout,
+then exits `0`. It creates no files and starts no scheduler. If the default
+path exists, a bare `cronstable` loads it and runs the scheduler; configuration
+errors exit `1`.
+
+Explicit configuration requests require an existing path. If you pass
+`--validate-config`, `--job-set-id`, `-l`, or `-c` and the resolved path equals
+the missing platform default, cronstable prints the following to stderr,
+prints the usage help, and exits `1`:
 
 ```
 cronstable error: configuration file not found at the default location (<default path>). Run `cronstable init` to create a starter configuration there, or point -c/--config at an existing file or directory.
 ```
 
-Because the check compares the argument value (not whether `-c` was supplied),
-it fires both when `-c` is omitted and when you pass `-c` set to the platform
-default explicitly. For any other non-existent path passed with `-c`, you
-instead get the generic configuration-error path (a logged
-`Configuration error: ...` and exit `1`).
+Any other missing path passed with `-c` logs `Configuration error: ...` and
+exits `1`.
 
 #### The `init` subcommand
 
@@ -636,8 +638,8 @@ See [running on Windows](Running-on-Windows).
 
 | Code | Condition |
 | --- | --- |
-| `0` | `--version` printed; `--validate-config` succeeded; `--job-set-id` printed; `--help`; a `state` action succeeded; or normal shutdown after a signal. |
-| `1` | Configuration error (parse/schema/validation failure or unreadable configuration); the default `-c` path (platform-specific; see the footnote under [arguments](#arguments)) does not exist and no `-c` was given; an `init` refusal; or a `state` action failed (see [`state` exit codes](#state-exit-codes)). |
+| `0` | Setup guidance for a bare invocation with no default configuration; `--version` printed; `--validate-config` succeeded; `--job-set-id` printed; `--help`; a `state` action succeeded; or normal shutdown after a signal. |
+| `1` | Configuration error (parse/schema/validation failure or unreadable configuration); a missing default path when arguments request configuration loading; an `init` refusal; or a `state` action failed (see [`state` exit codes](#state-exit-codes)). |
 | `2` | Usage error (argparse builtin): unknown option or missing required option (such as `state backup` without `-o`); an invalid `--log-level` value; `cronstable state` invoked with no action; or a `--` separator in any invocation other than `lock run` (see [`lock`](#lock-acquirereleaserun-distributed-mutexsemaphore)). |
 
 ## Examples

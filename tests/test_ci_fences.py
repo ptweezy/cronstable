@@ -288,6 +288,22 @@ def test_msi_build_recipe_is_shared_and_pinned():
         )
 
 
+def test_msi_smoke_checks_first_launch_before_uninstall():
+    for job_name, step_name in [
+        ("binaries-windows", "Smoke-test MSI (install, verify, uninstall)"),
+        (
+            "sign-windows",
+            "Smoke-test the signed amd64 MSI (install, uninstall)",
+        ),
+    ]:
+        step = _named_steps(_workflow()["jobs"][job_name])[step_name]
+        assert not step.get("continue-on-error", False)
+        run = step["run"]
+        smoke = run.index("python .github/scripts/smoke_windows_first_run.py")
+        assert run.index("msi_install ") < smoke
+        assert smoke < run.rindex("msi_uninstall ")
+
+
 def test_msi_smoke_steps_share_the_msiexec_helpers():
     # The msiexec incantation (MSYS2_ARG_CONV_EXCL, exit 3010 counted
     # as the reboot-required success it is, the log tail on failure)

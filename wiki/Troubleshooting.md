@@ -26,11 +26,11 @@ directory holds configuration, otherwise `%APPDATA%\cronstable` (for example
 `C:\Users\<you>\AppData\Roaming\cronstable`, falling back to the user profile `~`
 if `APPDATA` is unset).
 
-When that default is in effect *and* the path does not exist
-(`args.config == CONFIG_DEFAULT and not os.path.exists(args.config)`), cronstable
-prints the error and exits before constructing the scheduler. The not-found special
-case keys off the *platform default value*, not the literal string
-`/etc/cronstable.d`. See [running on Windows](Running-on-Windows).
+When that default is in effect and the path is missing, requests to load
+configuration (`--validate-config`, `--job-set-id`, `-l`, or `-c`) print the
+error and exit before constructing the scheduler. A bare `cronstable` with
+no default configuration prints setup guidance and help to stdout and exits
+`0`. See [running on Windows](Running-on-Windows).
 
 **Fix.** Run `cronstable init` (optionally with a target directory) to create the
 directory with a commented starter file, or create it yourself and place

@@ -271,21 +271,23 @@ refuses it beside `/grant`. Both commands need an elevated prompt.
 
 ### "Configuration file not found" applies to this path
 
-There is a special-case exit for a missing **default** configuration path. If
-the `-c` argument is left at the platform default and that path does not
-exist, cronstable prints the following to stderr (with the resolved default
-path filled in), prints the usage help, and exits `1`:
+Running `cronstable` with no arguments and no default configuration prints
+setup guidance and usage help to stdout, then exits `0`. Run `cronstable init`
+to create a starter configuration. Once the default path exists, a bare
+`cronstable` loads it and starts the scheduler.
+
+If you request configuration loading with `--validate-config`, `--job-set-id`,
+`-l`, or `-c` and the resolved default path is missing, cronstable prints the
+following to stderr, prints the usage help, and exits `1`:
 
 ```text
 cronstable error: configuration file not found at the default location (<default path>). Run `cronstable init` to create a starter configuration there, or point -c/--config at an existing file or directory.
 ```
 
-This check keys off the **platform default value**, not the literal string
-`/etc/cronstable.d`. On Windows it therefore fires when the directory does not
-exist and `-c` resolves to the platform default given earlier,
-whether you omit `-c` or pass that path explicitly. If you pass any *other*
-non-existent path with `-c`, you get the generic configuration-error path
-instead: a logged `Configuration error: ...` and exit `1`.
+This check uses the resolved platform default, including when you pass that
+path explicitly with `-c`. Any other missing path passed with `-c` produces a
+logged `Configuration error: ...` and exit `1`. Invalid or unreadable
+configuration also exits `1`.
 
 See the [command-line reference](CLI-Reference) for the full argument and
 exit-code reference, and [troubleshooting and FAQ](Troubleshooting) for the
