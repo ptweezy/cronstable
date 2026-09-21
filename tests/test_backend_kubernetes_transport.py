@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import ssl
+from unittest.mock import AsyncMock
 
 import aiohttp
 import pytest
@@ -1014,6 +1015,12 @@ async def _cluster(tmp_path, names=("node-a", "node-b")):
     async with FakeKubeApiserver() as api:
         path = _write_kubeconfig(tmp_path / "kubeconfig", server=api.url)
         nodes = [_kubeconfig_backend(path, node=name) for name in names]
+        # These scenarios advance elections explicitly through _renew_once.
+        # A background renewal can change the lease after a follower observes
+        # it, invalidating a simulated expiry. The automatic lease-recovery
+        # test below exercises the real renewal loop separately.
+        for node in nodes:
+            node._renew_loop = AsyncMock()
         try:
             yield api, nodes
         finally:

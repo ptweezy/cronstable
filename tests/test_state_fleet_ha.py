@@ -185,8 +185,12 @@ async def _cancel_fleet_tasks(cron):
     # finish any spawned report+retry-arm sequences before teardown (the
     # reaper used to run them inline within _handle_finished_job).
     await cron._drain_completions()
+    retries = [s.task for s in cron.retry_state.values() if s.task is not None]
     for name in list(cron.retry_state):
         await cron.cancel_job_retries(name, settle=None)
+    # A retry can be inside subprocess creation. Join its cancellation before
+    # loop teardown also cancels asyncio's pipe-connection helper tasks.
+    await asyncio.gather(*retries, return_exceptions=True)
     cron._cancel_coordination_tasks()
     for task in list(cron._slot_renewers.values()):
         task.cancel()
@@ -879,6 +883,8 @@ async def test_concurrent_claims_yield_exactly_one_owner(fleet_cron):
     # fails the acquire or sees the winner's fresh pending on its re-read.
     a = await fleet_cron(_RETRY_JOB, resume_host="node-a")
     b = await fleet_cron(_RETRY_JOB, resume_host="node-b")
+    calls, fake = _count_launcher()
+    a.maybe_launch_job = b.maybe_launch_job = fake
     stale = _now_utc() - datetime.timedelta(seconds=120)
     await a.state_backend.append_record(
         "retries/j",
@@ -899,6 +905,12 @@ async def test_concurrent_claims_yield_exactly_one_owner(fleet_cron):
         c._state_host for c in (a, b) if "j" in c.retry_state
     ]
     assert len(claimed_by) == 1
+    # Let the immediate retry finish through the launch seam. This test
+    # checks ownership, and must not leave a real subprocess half-started.
+    await asyncio.gather(
+        *(c.retry_state["j"].task for c in (a, b) if "j" in c.retry_state)
+    )
+    assert calls == ["j"]
 
 
 async def test_claim_scan_spawned_from_housekeeping(fleet_cron):
