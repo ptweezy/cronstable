@@ -4,11 +4,9 @@
   # nixpkgs is the only input: no flake-utils, so `nix flake check` resolves one
   # thing and the lock file stays a single entry.
   #
-  # nixos-unstable rather than the 26.05 release, because three of this project's
-  # floors land above what 26.05 carries: aiohttp 3.14.3 against its 3.13.5,
-  # aiosmtplib 5.1.1 against its 5.1.0, and setuptools 83 against its 80.10.1.
-  # unstable satisfies all three today. Move this to the release branch once one
-  # catches up; nothing else here depends on which branch it is.
+  # nixos-unstable supplies the newer Python dependencies this project needs.
+  # PyPI releases can still arrive first; the source overrides below bridge
+  # those gaps until nixpkgs catches up, preserving our dependency floors.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs = { self, nixpkgs }:
@@ -38,7 +36,44 @@
         builtins.head (builtins.match "## ([0-9.]+).*" (builtins.head headings));
     in
     {
-      packages = forAllSystems (pkgs: rec {
+      packages = forAllSystems (pkgs:
+        let
+          # Keep nixpkgs' build recipes and checks, using verified PyPI sources
+          # only while its versions lag. Prefer newer nixpkgs packages as soon
+          # as they satisfy these floors, so the overrides cannot hold them back.
+          pythonPackages = pkgs.python3Packages // {
+            sentry-sdk =
+              let version = "2.69.2"; in
+              if pkgs.lib.versionAtLeast pkgs.python3Packages.sentry-sdk.version version
+              then pkgs.python3Packages.sentry-sdk
+              else pkgs.python3Packages.sentry-sdk.overridePythonAttrs (old: {
+                inherit version;
+                src = pkgs.fetchPypi {
+                  pname = "sentry_sdk";
+                  inherit version;
+                  hash = "sha256-tNiRWlJuYmsLFKKSWQdVS3ItO44+N4FXD8NXkXEq8yM=";
+                };
+                meta = old.meta // {
+                  changelog = "https://github.com/getsentry/sentry-python/blob/${version}/CHANGELOG.md";
+                };
+              });
+            tzdata =
+              let version = "2026.4"; in
+              if pkgs.lib.versionAtLeast pkgs.python3Packages.tzdata.version version
+              then pkgs.python3Packages.tzdata
+              else pkgs.python3Packages.tzdata.overridePythonAttrs (old: {
+                inherit version;
+                src = pkgs.fetchPypi {
+                  pname = "tzdata";
+                  inherit version;
+                  hash = "sha256-8bi9Nl2NIQxVNT9Nf41thWHAulDXBLcA0ZWpQku6DXk=";
+                };
+                meta = old.meta // {
+                  changelog = "https://github.com/python/tzdata/blob/${version}/NEWS.md";
+                };
+              });
+          };
+        in rec {
         cronstable = pkgs.python3Packages.buildPythonApplication {
           pname = "cronstable";
           inherit version;
@@ -54,7 +89,7 @@
           # path does not carry, so it is told outright.
           env.SETUPTOOLS_SCM_PRETEND_VERSION = version;
 
-          dependencies = with pkgs.python3Packages; [
+          dependencies = with pythonPackages; [
             strictyaml
             aiohttp
             sentry-sdk
