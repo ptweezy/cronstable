@@ -10,7 +10,7 @@ ARG DEPS_REFRESH=""
 RUN set -eux; \
     : "deps-refresh=${DEPS_REFRESH}"; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
-    retry apt-get -o Acquire::Retries=5 update; \
+    retry apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update; \
     retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev git; \
     rm -rf /var/lib/apt/lists/*
 
@@ -38,7 +38,7 @@ RUN /opt/venv/bin/python -c 'from nacl.public import PrivateKey, SealedBox; k = 
 COPY docker/install_orjson.sh /tmp/deps/install_orjson.sh
 COPY pyinstaller/verify_extra.py /tmp/deps/verify_extra.py
 RUN set -eux; \
-    RUST_SETUP="apt-get -o Acquire::Retries=5 update \
+    RUST_SETUP="apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update \
         && apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates \
         && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" \
     sh /tmp/deps/install_orjson.sh "orjson>=3.11.6"; \

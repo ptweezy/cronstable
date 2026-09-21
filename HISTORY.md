@@ -52,7 +52,19 @@
   Nix dependency lists from `pyproject.toml` and smoke-test the installed CLI
   after static checks pass. Preserve Intel Mac Nix support with the 26.05
   toolchain and current Python package recipes; validate all advertised Nix
-  systems and build on both Linux and Intel macOS in CI.
+  systems and build on both Linux and Intel macOS in CI. Isolate Intel Nix
+  compatibility in one adapter and document continued support and eventual
+  retirement across binary, Homebrew, pip, and Nix delivery.
+- Make Sentry's Nix dependency test wait for its asynchronous request rather
+  than a fixed 100 ms. Separate Nix evaluation, dependency builds, and CLI
+  smoke tests so each failure is identifiable.
+- Keep Python 3.10 TLS tests running under strict warning checks, with a
+  narrowly scoped exception for its upstream SSL wrapper cleanup bug.
+- Upgrade affected CI workers to a patched Docker engine through a shared
+  setup action, restoring 32-bit networking on Ubuntu 26 while retaining
+  container security protections across binary, wheel, and image builds.
+- Treat partial APT index downloads as failures across CI and Docker builds,
+  so network retries refresh the index before dependency installation.
 - Rebuild the latest stable release's Docker images daily and on demand
   with freshly pulled base images and compatible Python dependencies,
   including rebuilt post-quantum wheels. Keep the released application

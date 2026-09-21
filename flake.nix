@@ -44,33 +44,15 @@
         );
       dependenciesFrom =
         pkgs: packages: requirements:
-        let
-          # Current SMTP tests use pytest-asyncio's loop-factory hook, which
-          # the 26.05 plugin predates. Backport its recipe with the application
-          # recipe, leaving the stable Python package set otherwise intact.
-          recipeArguments.aiosmtplib.pytest-asyncio = pkgs.python3Packages.callPackage (
-            nixpkgs + "/pkgs/development/python-modules/pytest-asyncio"
-          ) { };
-        in
         map (
           requirement:
           let
             name = dependencyName requirement;
             floor = builtins.head (builtins.match "[A-Za-z0-9_-]+>=([^,; ]+).*" requirement);
-            packaged = packages.${name};
-            # Reuse upstream recipes with this system's Python and toolchain.
-            # This keeps Intel macOS current without copying build definitions
-            # or rebuilding the entire stable Python package set.
-            selected =
-              if pkgs.lib.versionAtLeast packaged.version floor then
-                packaged
-              else
-                pkgs.python3Packages.callPackage (nixpkgs + "/pkgs/development/python-modules/${name}") (
-                  recipeArguments.${name} or { }
-                );
+            selected = packages.${name};
           in
           assert pkgs.lib.assertMsg (pkgs.lib.versionAtLeast selected.version floor)
-            "Nix dependency ${name} is below ${floor}; update its source override in flake.nix";
+            "Nix dependency ${name} is below ${floor}; update nix/python-packages.nix";
           selected
         ) requirements;
 
@@ -90,47 +72,17 @@
       packages = forAllSystems (
         pkgs:
         let
-          # Keep nixpkgs' build recipes and checks, using verified PyPI sources
-          # only while its versions lag. Prefer newer nixpkgs packages as soon
-          # as they satisfy these floors, so the overrides cannot hold them back.
-          pythonPackages = pkgs.python3Packages // {
-            sentry-sdk =
-              let
-                version = "2.69.2";
-              in
-              if pkgs.lib.versionAtLeast pkgs.python3Packages.sentry-sdk.version version then
-                pkgs.python3Packages.sentry-sdk
-              else
-                pkgs.python3Packages.sentry-sdk.overridePythonAttrs (old: {
-                  inherit version;
-                  src = pkgs.fetchPypi {
-                    pname = "sentry_sdk";
-                    inherit version;
-                    hash = "sha256-tNiRWlJuYmsLFKKSWQdVS3ItO44+N4FXD8NXkXEq8yM=";
-                  };
-                  meta = old.meta // {
-                    changelog = "https://github.com/getsentry/sentry-python/blob/${version}/CHANGELOG.md";
-                  };
-                });
-            tzdata =
-              let
-                version = "2026.4";
-              in
-              if pkgs.lib.versionAtLeast pkgs.python3Packages.tzdata.version version then
-                pkgs.python3Packages.tzdata
-              else
-                pkgs.python3Packages.tzdata.overridePythonAttrs (old: {
-                  inherit version;
-                  src = pkgs.fetchPypi {
-                    pname = "tzdata";
-                    inherit version;
-                    hash = "sha256-8bi9Nl2NIQxVNT9Nf41thWHAulDXBLcA0ZWpQku6DXk=";
-                  };
-                  meta = old.meta // {
-                    changelog = "https://github.com/python/tzdata/blob/${version}/NEWS.md";
-                  };
-                });
-          };
+          currentPackages = import ./nix/python-packages.nix { inherit pkgs; };
+          # The compatibility adapter is the only consumer of backported recipes.
+          # Retirement steps: wiki/Contributing-and-Releasing.md, Intel Mac support.
+          pythonPackages =
+            if pkgs.stdenv.hostPlatform.system == "x86_64-darwin" then
+              import ./nix/intel-darwin.nix {
+                inherit pkgs nixpkgs pyproject;
+                packages = currentPackages;
+              }
+            else
+              currentPackages;
         in
         rec {
           cronstable = pkgs.python3Packages.buildPythonApplication {
