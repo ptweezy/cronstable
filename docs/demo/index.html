@@ -6289,7 +6289,7 @@ var qrcode = function() {
   //  app state
   // ===================================================================
   const state = {
-    jobs: [], byName: {}, fetchedAt: 0,
+    jobs: [], byName: {}, fetchedAt: 0, fetchedWallAt: 0,
     filter: "", statusFilter: "all", sort: "name", sortDir: 1,
     view: [],                  // jobs after filter+sort (drives j/k nav)
     selected: null,            // selected job name (keyboard cursor)
@@ -6461,6 +6461,11 @@ var qrcode = function() {
     if (job.scheduled_in == null) return null;
     const elapsed = (performance.now() - state.fetchedAt) / 1000;
     return job.scheduled_in - elapsed;
+  }
+  function nextRunAt(job) {
+    // Anchor the absolute target once per response. Recombining Date.now()
+    // and performance.now() on every render can drift across a minute edge.
+    return job.scheduled_in == null ? null : state.fetchedWallAt + job.scheduled_in * 1000;
   }
   function queuedEntries(job) { return (job.pool || {}).queued || []; }
   function capturesLogs(job) { return !!(job.captureStdout || job.captureStderr || (job.verification || {}).configured); }
@@ -7472,9 +7477,9 @@ var qrcode = function() {
     return JSON.stringify([
       j.name, j.enabled, j.running,
       // the absolute fire minute — stable between polls (the countdown ticks
-      // client-side) but changes exactly when the target run changes, which
+      // client-side). Floor to the displayed minute so crossing its boundary
       // re-renders the "next at" cell (it has no per-second tick).
-      j.scheduled_in == null ? "-" : Math.round((Date.now() / 1000 + nextRunSeconds(j)) / 60),
+      j.scheduled_in == null ? "-" : Math.floor(nextRunAt(j) / 60000),
       // schedule + reference frame + command render as cells, and a config
       // reload can change any of them without touching a run-derived field.
       j.schedule, tzCell(j), j.command,
@@ -7523,7 +7528,7 @@ var qrcode = function() {
     const next = (job.running || !job.enabled || job.paused)
       ? '<span class="faint">—</span>'
       : '<span class="nowrap" data-next="' + escAttr(job.name) + '">' + fmtIn(nsec) + "</span>";
-    const atMs = nsec == null ? null : Date.now() + nsec * 1000;
+    const atMs = nextRunAt(job);
     const nextAt = (job.running || !job.enabled || job.paused || atMs == null)
       ? '<span class="faint">—</span>'
       : '<span class="nowrap" title="' + escAttr(fmtAtTitle(atMs)) + '">' + fmtAt(atMs) + "</span>";
@@ -8933,6 +8938,7 @@ var qrcode = function() {
       state.byName = {};
       jobs.forEach((j) => { state.byName[j.name] = j; });
       state.fetchedAt = performance.now();
+      state.fetchedWallAt = Date.now();
       setConnected(true);
       const first = !state.seenFirst;
       maybeNotify(jobs);
@@ -13582,6 +13588,7 @@ var qrcode = function() {
       seedJobs(n) {
         const jobs = Array.from({ length: n }, (_, i) => _pjob(i));
         state.jobs = jobs; state.byName = {};
+        state.fetchedAt = performance.now(); state.fetchedWallAt = Date.now();
         jobs.forEach((j) => { state.byName[j.name] = j; });
       },
       renderRows() { state.lastRowSig = null; renderRows(); },
