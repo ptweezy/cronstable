@@ -5,7 +5,9 @@
 - Make scheduled runs and occurrence lists agree across daylight-saving
   gaps. Preserve every shifted spring-forward run in calendar feeds and
   schedule calculations, and retain real local-time matches between shifted
-  runs during half-hour transitions such as Australia/Lord_Howe.
+  runs during half-hour transitions such as Australia/Lord_Howe. Avoid
+  scanning the transition boundary when the next competing match already
+  determines the answer, keeping DST lookup within the performance gate.
 - Treat exited but unreaped POSIX processes as dead during crash recovery.
   Zombie children left behind after a daemon crash no longer keep runs
   open indefinitely or prevent `@reboot` jobs and DAG tasks from recovering.

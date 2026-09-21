@@ -1491,6 +1491,17 @@ class CronTab:
             civil = max(target, resolved_civil)
         if resolved_civil == target:
             return resolved_utc
+        # Most schedules have no competing match before the shifted fire,
+        # especially when now is already past the transition. Avoid locating
+        # the gap boundary at all in that case. If the first rival is a valid
+        # local time, it is already the earliest post-gap match we need.
+        shown = now_utc.astimezone(tz).replace(tzinfo=None)
+        rival = self._next_civil(max(target, shown))
+        if rival is None or rival >= resolved_civil:
+            return resolved_utc
+        rival_utc = rival.replace(tzinfo=tz).astimezone(_UTC)
+        if rival_utc.astimezone(tz).replace(tzinfo=None) == rival:
+            return rival_utc
         # target falls in a gap and shifts to resolved_civil. Use binary
         # search to find the first valid second after the gap. A matching
         # local time between that point and resolved_civil can occur first.
@@ -1506,7 +1517,6 @@ class CronTab:
                 high = mid
             else:
                 low = mid
-        shown = now_utc.astimezone(tz).replace(tzinfo=None)
         rival = self._next_civil(max(high - _ONE_SECOND, shown))
         if rival is not None and rival < resolved_civil:
             return rival.replace(tzinfo=tz).astimezone(_UTC)
