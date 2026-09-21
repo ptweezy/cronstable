@@ -504,7 +504,7 @@ def test_compare_gates_regression_and_honors_floor(tmp_path):
     assert "startup.version" in proc.stdout
     assert "micro.jitter" not in proc.stdout.split("gate:")[-1]
     text = md.read_text(encoding="utf-8")
-    assert "Gate: FAILED" in text
+    assert "Regression check: failed" in text
     assert svg.read_text(encoding="utf-8").startswith("<svg")
 
     # --warn-only and --accept both downgrade the failure to exit 0.
@@ -536,7 +536,7 @@ def test_compare_identical_passes_and_merges_rounds(tmp_path):
         ]
     )
     assert proc.returncode == 0, proc.stdout
-    assert "Gate: passed" in md.read_text(encoding="utf-8")
+    assert "Regression check: passed" in md.read_text(encoding="utf-8")
     merged_doc = json.loads(merged.read_text(encoding="utf-8"))
     # Two rounds with compare="min" merge to the faster round.
     assert merged_doc["results"][0]["value"] == 0.100
@@ -636,7 +636,7 @@ def test_compare_gates_own_share_regression_under_the_raw_floor(tmp_path):
     assert proc.returncode == 1, proc.stdout
     assert "1 gate violation" in proc.stdout
     assert "startup.import_cronexpr" in proc.stdout
-    assert "Gate: FAILED" in md.read_text(encoding="utf-8")
+    assert "Regression check: failed" in md.read_text(encoding="utf-8")
 
 
 def test_startup_gate_cuts_over_at_the_declared_gate_pct(tmp_path):
@@ -750,11 +750,14 @@ def test_compare_reports_metrics_skipped_on_both_sides(tmp_path):
     assert "not compared" in proc.stdout
     assert "webui.wallboard" in proc.stdout
     text = md.read_text(encoding="utf-8")
-    assert "Not measured on either side (ungated): webui.wallboard." in text
+    assert (
+        "Not measured in either version; regression checks "
+        "could not run: webui.wallboard." in text
+    )
     # The pass line must carry the compared/total count; the bare form claims
     # coverage the run did not have.
-    assert "**Gate: passed.**" not in text
-    assert "**Gate: passed** over 1 of 2 gated metrics" in text
+    assert "**Regression check: passed.**" not in text
+    assert "**Regression check: passed** for 1 of 2 metrics" in text
 
 
 def test_compare_reports_a_metric_the_baseline_had_and_this_run_lost(tmp_path):
@@ -788,8 +791,8 @@ def test_compare_reports_a_metric_the_baseline_had_and_this_run_lost(tmp_path):
     assert "::warning::" in proc.stdout
     assert "webui.wallboard" in proc.stdout
     text = md.read_text(encoding="utf-8")
-    assert "**Gate: passed.**" not in text
-    assert "**Gate: passed** over 1 of 2 gated metrics" in text
+    assert "**Regression check: passed.**" not in text
+    assert "**Regression check: passed** for 1 of 2 metrics" in text
 
 
 def test_gate_coverage_ignores_info_only_metrics(tmp_path):
@@ -812,7 +815,7 @@ def test_gate_coverage_ignores_info_only_metrics(tmp_path):
     assert "::warning::" not in proc.stdout
     text = md.read_text(encoding="utf-8")
     # nothing gateable was lost, so the unqualified pass line is honest here
-    assert "**Gate: passed.**" in text
+    assert "**Regression check: passed.**" in text
 
 
 def test_rel_cov_is_robust_to_one_outlier_round():
@@ -892,7 +895,7 @@ def test_svg_large_change_labels_stay_within_the_plot():
             inside.append(txt)
     # both the big win and the big gated regression were drawn inside the bar
     assert any(t.startswith("-") for t in inside), inside
-    assert any("gate" in t for t in inside), inside
+    assert any("regression" in t for t in inside), inside
 
 
 def test_svg_expanded_chart_includes_every_compared_metric():
@@ -929,7 +932,7 @@ def test_svg_expanded_chart_includes_every_compared_metric():
     # a metric with no baseline has no change to draw, so it gets no row;
     # the footnote owns up to it instead of dropping it silently
     assert ">suite.no_baseline</text>" not in svg
-    assert "1 metric(s) have no baseline to compare" in svg
+    assert "Metrics without a percentage comparison: 1." in svg
     # the chart grew to hold all 40 rows rather than clipping them
     height = int(re.search(r'height="(\d+)"', svg).group(1))
     assert height >= 78 + 40 * 24
@@ -946,7 +949,7 @@ def test_compare_without_baseline_records_first_release(tmp_path):
     proc = _run([COMPARE, "--current", cur, "--md", str(md)])
     assert proc.returncode == 0, proc.stdout
     text = md.read_text(encoding="utf-8")
-    assert "no previous release to compare against" in text
+    assert "No baseline results are available" in text
     assert "startup.version" in text
 
 
@@ -985,8 +988,10 @@ def test_budget_breach_fails_and_accept_does_not_excuse_it(tmp_path):
     )
     assert proc.returncode == 1, proc.stdout
     assert "::error::perf budget:" in proc.stdout
-    assert "absolute budget" in proc.stdout
-    assert "Absolute budget: FAILED" in md.read_text(encoding="utf-8")
+    assert "absolute limit" in proc.stdout
+    assert "Absolute performance limits: exceeded" in md.read_text(
+        encoding="utf-8"
+    )
 
     # [perf:accept] acknowledges a relative regression; the ceiling has its
     # own ritual (a reviewed edit to budgets.json) and stays failed.
@@ -1088,7 +1093,7 @@ def test_expected_gated_dead_gate_fails(tmp_path):
     assert "::error::perf gate integrity:" in proc.stdout
     assert "tui.drawer" in proc.stdout
     assert "startup.version" not in proc.stdout.split("integrity")[-1]
-    assert "Gate integrity: FAILED" in md.read_text(encoding="utf-8")
+    assert "Required comparisons: missing" in md.read_text(encoding="utf-8")
 
     # not [perf:accept]-able; --warn-only still downgrades.
     proc = _run(
@@ -1205,7 +1210,7 @@ def test_effective_gate_percentage_is_reported(tmp_path):
     assert "eff. 500%" in proc.stdout
     assert "big.well_sized" not in proc.stdout  # not floor-bound: no notice
     text = md.read_text(encoding="utf-8")
-    assert "Gate (eff.)" in text
+    assert "Regression limit" in text
     assert "**500%** (declared 15%)" in text
 
 

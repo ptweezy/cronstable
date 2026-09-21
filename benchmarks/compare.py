@@ -164,8 +164,7 @@ def _budget_failures(budgets, current):
             continue
         if entry["value"] > spec["max"]:
             breaches.append(
-                "%s measured %s, over its absolute budget of %s (raising "
-                "the budget is a deliberate edit to benchmarks/budgets.json)"
+                "%s measured %s, exceeding its absolute limit of %s"
                 % (
                     name,
                     _fmt(entry["value"], entry.get("unit", "s")),
@@ -487,15 +486,17 @@ def _compare(baseline, current):
         if over_gate and significant:
             gated = True
             violations.append(
-                "%s regressed %+.1f%% (%s to %s, gate %.0f%%, noise band "
-                "+-%s)"
+                "%s increased by %.1f%% (%s to %s; declared limit %.0f%%; "
+                "noise: %s)"
                 % (
                     name,
                     delta,
                     _fmt(base["value"], cur["unit"]),
                     _fmt(cur["value"], cur["unit"]),
                     gate_pct,
-                    "%.1f%%" % (noise * 100) if noise is not None else "n/a",
+                    "±%.1f%%" % (noise * 100)
+                    if noise is not None
+                    else "not available",
                 )
             )
         rows.append(
@@ -642,17 +643,16 @@ def build_svg(rows, base_label, cur_label):
         '<text class="t1" x="20" y="30" font-size="14" font-weight="600">'
         "cronstable %s: performance vs %s</text>" % (cur_label, base_label),
         '<text class="t2" x="20" y="50" font-size="11">'
-        "% change in runtime and memory for every compared benchmark. "
-        "Lower is better; bars left of zero are faster than the previous "
-        "release.</text>",
+        "Change in runtime or memory vs baseline. "
+        "Left: less time or memory. Right: more time or memory.</text>",
         # Legend: identity for the two directions, text in ink tokens.
         '<rect class="fast" x="%d" y="21" width="10" height="10" rx="2"/>'
         % (width - 180),
-        '<text class="t2" x="%d" y="30" font-size="11">faster</text>'
+        '<text class="t2" x="%d" y="30" font-size="11">lower</text>'
         % (width - 165),
         '<rect class="slow" x="%d" y="21" width="10" height="10" rx="2"/>'
         % (width - 112),
-        '<text class="t2" x="%d" y="30" font-size="11">slower</text>'
+        '<text class="t2" x="%d" y="30" font-size="11">higher</text>'
         % (width - 97),
     ]
 
@@ -701,7 +701,7 @@ def build_svg(rows, base_label, cur_label):
         )
         label = "%+.1f%%" % delta
         if row["gated"]:
-            label += " (gate)"
+            label += " (regression)"
         rightward = delta > 0
         if length >= 0.75:
             cls = "slow" if rightward else "fast"
@@ -737,8 +737,9 @@ def build_svg(rows, base_label, cur_label):
     if uncompared > 0:
         parts.append(
             '<text class="t3" x="20" y="%d" font-size="10">'
-            "%d metric(s) have no baseline to compare; first numbers in "
-            "the release-notes table.</text>" % (plot_bottom + 36, uncompared)
+            "Metrics without a percentage comparison: %d. "
+            "See the full report for details.</text>"
+            % (plot_bottom + 36, uncompared)
         )
     parts.append("</svg>")
     return "\n".join(parts) + "\n"
@@ -767,12 +768,17 @@ def build_md(
     budget_breaches=None,
     expected_missing=None,
 ):
-    lines = ["### Performance vs %s" % (base_label or "(no baseline)")]
+    lines = [
+        "### Performance benchmarks"
+        if baseline_missing
+        else "### Performance compared with %s" % base_label
+    ]
     lines.append("")
     if baseline_missing:
         lines.append(
-            "There is no previous release to compare against, so this run "
-            "only records its numbers. The next release diffs against them."
+            "No baseline results are available, so this report records "
+            "runtime and memory usage without a comparison to a previous "
+            "release."
         )
         lines.append("")
     if img_url:
@@ -784,12 +790,14 @@ def build_md(
     if not baseline_missing:
         if violations and accept:
             lines.append(
-                "**Gate: regressions accepted** (a `[perf:accept]` marker "
-                "acknowledged them):"
+                "**Regressions accepted for this release.** The following "
+                "changes exceeded their regression thresholds:"
             )
+            lines.append("")
             lines.extend("- %s" % v for v in violations)
         elif violations:
-            lines.append("**Gate: FAILED**")
+            lines.append("**Regression check: failed.**")
+            lines.append("")
             lines.extend("- %s" % v for v in violations)
         else:
             # Qualified by how many metrics the gate could actually compare.
@@ -803,51 +811,47 @@ def build_md(
             )
             if missed:
                 lines.append(
-                    "**Gate: passed** over %d of %d gated metrics."
+                    "**Regression check: passed** for %d of %d metrics "
+                    "with regression limits. The remaining metrics could "
+                    "not be compared."
                     % (cov.get("compared", 0), cov.get("compared", 0) + missed)
                 )
             else:
                 lines.append(
-                    "**Gate: passed.** Every metric stayed inside its "
-                    "regression limit."
+                    "**Regression check: passed.** No compared metric "
+                    "exceeded its regression thresholds."
                 )
         if budget_breaches:
             lines.append("")
             lines.append(
-                "**Absolute budget: FAILED.** These metrics are over the "
-                "ceilings in `benchmarks/budgets.json`, and raising a ceiling "
-                "takes an edit to that file:"
+                "**Absolute performance limits: exceeded.** These metrics "
+                "exceeded their configured runtime or memory ceilings:"
             )
+            lines.append("")
             lines.extend("- %s" % b for b in budget_breaches)
         if expected_missing:
             lines.append("")
             lines.append(
-                "**Gate integrity: FAILED.** `benchmarks/expected_gated.txt` "
-                "lists these metrics, but the run never compared them, so "
-                "their gates are dead rather than passing: %s."
-                % ", ".join(expected_missing)
+                "**Required comparisons: missing.** These metrics were "
+                "required but could not be compared, so their regression "
+                "checks could not run: %s." % ", ".join(expected_missing)
             )
         lines.append("")
         lines.append(
-            "Both versions ran interleaved on one runner. Time metrics "
-            "compare the best round of each and memory metrics the median. "
-            "A negative change means faster or smaller."
-        )
-        lines.append("")
-        lines.append(
-            "A regression gates only when it exceeds both its declared limit "
-            "and %.0f noise bands. The +- column is that band: the "
-            "round-to-round scatter of the two sides, combined in "
-            "quadrature." % _SIG_SIGMA
+            "Both versions were benchmarked in alternating rounds on the "
+            "same machine. Results use the lowest runtime and median memory "
+            "usage across rounds. Negative changes mean less time or "
+            "memory; positive changes mean more."
         )
         lines.append("")
         suppressed = [r for r in rows if r.get("suppressed")]
         if suppressed:
             lines.append(
-                "Some moves cleared their raw limit but stayed inside the "
-                "noise band, so they are reported without gating: %s."
+                "These increases exceeded the regression limit but stayed "
+                "within the measurement noise threshold, so they did not "
+                "fail the check: %s."
                 % ", ".join(
-                    "%s (%+.1f%%, noise +-%.1f%%)"
+                    "%s (%+.1f%%; noise ±%.1f%%)"
                     % (r["name"], r["delta_pct"], r["noise_pct"] or 0.0)
                     for r in sorted(suppressed, key=lambda r: -r["delta_pct"])
                 )
@@ -858,21 +862,43 @@ def build_md(
         comparable.sort(key=lambda r: -abs(r["delta_pct"]))
         lines.append("<details>")
         lines.append(
-            "<summary>All benchmark results (%d metrics)</summary>"
+            "<summary>Benchmark comparisons (%d metrics)</summary>"
             % len(comparable)
         )
         lines.append("")
         lines.append(
-            "| Benchmark | %s | %s | Change | Noise +- | Gate (eff.) |"
+            "`Noise (±)` estimates run-to-run variation across both "
+            "versions. A result fails the regression check only if the "
+            "increase exceeds its percentage limit, its minimum absolute "
+            "change, and %.0f times the noise estimate. `n/a` means too few "
+            "rounds to estimate noise; the other limits still apply."
+            % _SIG_SIGMA
+        )
+        lines.append("")
+        lines.append(
+            "The `Regression limit` column accounts for the minimum "
+            "absolute change, expressed as a percentage of the baseline. "
+            "`Not enforced` marks informational metrics."
+        )
+        lines.append("")
+        lines.append(
+            "Startup times include Python startup overhead. Their "
+            "percentage changes exclude that overhead when it can be "
+            "measured separately and leaves a positive runtime in both "
+            "versions."
+        )
+        lines.append("")
+        lines.append(
+            "| Benchmark | %s | %s | Change | Noise (±) | Regression limit |"
             % (base_label, cur_label)
         )
         lines.append("|---|---:|---:|---:|---:|---:|")
         for row in comparable:
             entry = row["entry"]
             if row["gated"]:
-                mark = " **(gate)**"
+                mark = " **(regression)**"
             elif row.get("suppressed"):
-                mark = " (within noise)"
+                mark = " (within noise threshold)"
             else:
                 mark = ""
             noise = row.get("noise_pct")
@@ -885,7 +911,7 @@ def build_md(
             # is visible in the release table rather than only in the
             # harness's source.
             if declared is None:
-                gate_cell = "info"
+                gate_cell = "Not enforced"
             elif effective is not None and effective > declared * 1.05:
                 gate_cell = "**%s** (declared %s)" % (
                     _pct(effective),
@@ -912,7 +938,7 @@ def build_md(
         if new_metrics:
             lines.append("")
             lines.append(
-                "New in this release (no baseline yet): %s."
+                "No percentage comparison available: %s."
                 % ", ".join(sorted(new_metrics))
             )
         dropped = sorted(
@@ -924,7 +950,7 @@ def build_md(
         if dropped:
             lines.append("")
             lines.append(
-                "Measured in %s but not in this run: %s."
+                "Measured in %s but unavailable in this run: %s."
                 % (base_label, ", ".join(dropped))
             )
         both_sides = (coverage or {}).get("both", ())
@@ -935,8 +961,8 @@ def build_md(
             # gate line imply they passed.
             lines.append("")
             lines.append(
-                "Not measured on either side (ungated): %s."
-                % ", ".join(sorted(both_sides))
+                "Not measured in either version; regression checks "
+                "could not run: %s." % ", ".join(sorted(both_sides))
             )
     else:
         lines.append("| Benchmark | %s |" % cur_label)
