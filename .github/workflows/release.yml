@@ -860,8 +860,10 @@ jobs:
   # wait on it because releases ship no Nix artifact. flake.lock pins both
   # toolchains so reruns test the same dependency recipes; input updates must
   # pass evaluation and native builds before their compatibility is confirmed.
+  # Wait with the other builds so advisory Intel Nix does not occupy a scarce
+  # macOS worker while a required Python test is still queued.
   nix:
-    needs: tox-static
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
