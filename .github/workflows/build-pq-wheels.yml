@@ -24,9 +24,18 @@ jobs:
     continue-on-error: ${{ !inputs.refresh }}
     timeout-minutes: 300
     steps:
+      # Runner setup comes from the workflow revision, even when refreshing
+      # a release whose source tree predates the shared compatibility action.
       - uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-docker
+        if: matrix.platform == 'linux/386'
+      - name: Check out the application revision
+        if: inputs.ref != ''
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
       - name: Download resolved cryptography source
         uses: actions/download-artifact@v8.0.1
@@ -68,7 +77,7 @@ jobs:
           # IPC::Cmd for the OpenSSL Configure script, Time::Piece for the
           # Makefile it writes, and bigint for the s390x assembler
           # generators.
-          PQ_TOOLS: ${{ matrix.libc == 'musl' && '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && '. /src/.github/scripts/retry.sh && retry 5 yum install -y perl-IPC-Cmd perl-Time-Piece perl-bignum' || '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev zlib1g-dev libzstd-dev pkg-config' }}
+          PQ_TOOLS: ${{ matrix.libc == 'musl' && '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && '. /src/.github/scripts/retry.sh && retry 5 yum install -y perl-IPC-Cmd perl-Time-Piece perl-bignum' || '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev zlib1g-dev libzstd-dev pkg-config' }}
           RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/src/.pq-cache/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
           # The probe below installs the project, whose version comes from
           # this rather than from git: the python images carry no git (the

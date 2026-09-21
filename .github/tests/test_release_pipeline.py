@@ -68,6 +68,40 @@ def test_binary_crypto_policy_accepts_the_security_floor():
                 assert row["pq_rust_target"] == f"{target}-pc-windows-msvc"
 
 
+@pytest.mark.parametrize(
+    "name,job,field",
+    [
+        ("release", "binaries-container", "platform"),
+        ("build-pq-wheels", "wheel", "platform"),
+        ("build-docker", "build", "platforms"),
+    ],
+)
+def test_native_i686_uses_patched_docker_before_containers(name, job, field):
+    steps = workflow(name)["jobs"][job]["steps"]
+    setup = next(
+        s for s in steps if s.get("uses") == "./.github/actions/setup-docker"
+    )
+    assert setup["if"] == f"matrix.{field} == 'linux/386'"
+    first_container = next(
+        s
+        for s in steps
+        if "docker/setup-" in s.get("uses", "")
+        or "docker pull" in s.get("run", "")
+        or "pull_base " in s.get("run", "")
+    )
+    assert steps.index(setup) < steps.index(first_container)
+    if name != "release":
+        # The shared action must exist even for a refresh of an old release.
+        checkout = next(
+            s
+            for s in steps
+            if s.get("name") == "Check out the application revision"
+        )
+        assert steps.index(setup) < steps.index(checkout)
+        assert checkout["with"]["ref"] == "${{ inputs.ref }}"
+        assert "ref" not in steps[0].get("with", {})
+
+
 @pytest.mark.parametrize("fail_setup", [False, True])
 @pytest.mark.parametrize(
     "name,arch",

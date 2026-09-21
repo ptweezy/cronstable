@@ -870,9 +870,12 @@ jobs:
             experimental-features = nix-command flakes
       # --print-build-logs so a dependency that fails to build says why in the
       # job log instead of only naming the derivation.
-      - run: |
-          nix flake check --all-systems --no-build
-          nix flake check --print-build-logs
+      - name: Evaluate all supported Nix systems
+        run: nix flake check --all-systems --no-build
+      - name: Build and check Nix dependencies
+        run: nix flake check --print-build-logs --keep-going
+      - name: Smoke-test the installed Nix application
+        run: |
           nix run .#cronstable -- --version
           nix run .#cronstable -- --help > /dev/null
 
@@ -1371,9 +1374,9 @@ jobs:
             # and trixie's glibc is three years newer than i686 hosts need.
             image: python:3.14-slim-trixie
             suffix: ''
-            toolchain: 'retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev'
+            toolchain: 'retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev'
             nacl_tools: 'retry 3 apt-get -o Acquire::Retries=5 install -y --no-install-recommends libffi-dev make >/dev/null 2>&1 || true'
-            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
             # The trixie counterpart of the musl pq_tools: rustc 1.85 and
             # OpenSSL 3.5.7 on every port trixie ships, headers in
             # libssl-dev. Only the trixie row uses it (riscv64); the
@@ -1454,7 +1457,7 @@ jobs:
             pq_src: '1'
             pq_openssl: '1'
             pq_tools: 'retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates perl make pkg-config'
-            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --default-host i686-unknown-linux-gnu --profile minimal --no-modify-path'
+            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --default-host i686-unknown-linux-gnu --profile minimal --no-modify-path'
           - {libc: glibc, arch: riscv64, image: python:3.14-slim-trixie, floor: '2.41', pq: soft, pq_src: '1'}
     runs-on: ${{ matrix.runner }}
     steps:
@@ -1491,6 +1494,8 @@ jobs:
       # Register binfmt/QEMU so `docker run --platform` can execute a foreign-arch
       # container. amd64/arm64/i686 run natively and skip this.
         continue-on-error: true
+      - uses: ./.github/actions/setup-docker
+        if: matrix.platform == 'linux/386'
       - if: ${{ matrix.qemu }}
         uses: docker/setup-qemu-action@v4.4.0
       # Pull the base image in its own retried step. Docker Hub times out often
@@ -1818,7 +1823,7 @@ jobs:
               rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
               # Python plus a C toolchain: aiohttp, psutil and the extras below
               # are all source builds, and so is the PyInstaller bootloader.
-              retry 5 apt-get -o Acquire::Retries=5 -qq update
+              retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any -qq update
               retry 5 apt-get -o Acquire::Retries=5 -qq install -y --no-install-recommends \
                 python3 python3-venv python3-dev build-essential zlib1g-dev libffi-dev pkg-config
               # pip runs as root; the mounted checkout belongs to the runner.
@@ -2015,7 +2020,7 @@ jobs:
               fi
               # Python plus a C toolchain: every dependency here is a source
               # build, and so is the PyInstaller bootloader.
-              retry 5 apt-get -o Acquire::Retries=5 -qq update
+              retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any -qq update
               retry 5 apt-get -o Acquire::Retries=5 -qq install -y --no-install-recommends \
                 python3 python3-venv python3-dev build-essential zlib1g-dev libffi-dev pkg-config
               python3 -VV
@@ -2183,7 +2188,7 @@ jobs:
             # sid-slim and forky-slim tags there share one digest from a
             # snapshot.debian.org slice and have not moved since March.
             image: ghcr.io/loong64/python:3.14-slim-trixie
-            toolchain: 'retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev curl ca-certificates'
+            toolchain: 'retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev curl ca-certificates'
             rust_setup: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
             # What the cryptography source build needs beyond the rustup
             # Rust: trixie's OpenSSL 3.5 headers (the extension links the
@@ -2343,6 +2348,8 @@ jobs:
   # Tahoe build never blocks a release, and it is neither signed nor attached.
   # `ship` picks the shipped rows; `asset` names the artifact (the shipped ones
   # keep the bare `macos-<arch>` names the Release + Homebrew formula expect).
+  # Intel compatibility rows stay gated and ship with ARM. Retirement map:
+  # wiki/Contributing-and-Releasing.md, "Intel Mac support".
   binaries-macos:
     needs:
       - version
@@ -3787,7 +3794,7 @@ jobs:
             tianon/raspbian:bookworm-slim sh -euc '
               . /src/.github/scripts/retry.sh
               export DEBIAN_FRONTEND=noninteractive
-              retry 5 apt-get -o Acquire::Retries=5 -qq update
+              retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any -qq update
               # A C toolchain for OpenSSL and the crate build, perl for the
               # OpenSSL Configure script, binutils for the readelf checks.
               retry 5 apt-get -o Acquire::Retries=5 -qq install -y --no-install-recommends \
@@ -3941,7 +3948,7 @@ jobs:
             --platforms "$PLATFORMS" --version "$VERSION" --revision "$GITHUB_SHA" --output layout
           tar -cf image.tar -C layout .
           sha256sum image.tar > image.sha256
-          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update
           sudo apt-get -o Acquire::Retries=5 install -y skopeo
           skopeo copy --all --preserve-digests oci-archive:image.tar:release oci:verified:release
       - uses: actions/upload-artifact@v7.0.1
@@ -5091,7 +5098,7 @@ jobs:
         run: |
           set -euo pipefail
           sha256sum -c image.sha256
-          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update
           sudo apt-get -o Acquire::Retries=5 install -y skopeo
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
