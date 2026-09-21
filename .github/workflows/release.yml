@@ -5,7 +5,7 @@ name: CI
 # with the build fan-out. It builds PyInstaller binaries
 # for Linux (amd64, arm64, i686, armv7, ppc64le, s390x and riscv64 in both glibc
 # and musl/Alpine flavors, plus armv6 in musl only), macOS (arm64 + amd64 on
-# macOS 15, shipped; plus macOS 26/Tahoe as non-gating CI coverage) and Windows
+# macOS 15, shipped; plus macOS 26 and 27 as advisory CI coverage) and Windows
 # (amd64 + arm64), and every Docker image (8 distros, full arch set, build-only)
 # -- and gates on ALL of it. The `perf` job runs in the same fan-out: it
 # benchmarks this commit against the latest release tag (paired on one runner,
@@ -508,6 +508,12 @@ jobs:
     timeout-minutes: 30
     steps: &tox-steps
       - uses: actions/checkout@v7.0.1
+      - name: Verify macOS 27 runner
+        if: matrix.os == 'xcode-27'
+        run: |
+          sw_vers
+          test "$(sw_vers -productVersion | cut -d. -f1)" = 27
+          test "$(uname -m)" = arm64
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python }}
@@ -629,6 +635,11 @@ jobs:
         # interpreter lock (GIL).
         python: ['3.15', '3.14t']
         experimental: [true]
+        include:
+          # GitHub hosts macOS 27 on the xcode-27 ARM64 preview image.
+          - os: xcode-27
+            python: '3.14'
+            experimental: true
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
     # The suite runs in 2-9 min per cell (Windows is the slow end); 30 still
@@ -825,10 +836,9 @@ jobs:
   # this file, and it is the prerequisite artifact for a later nixpkgs
   # submission, so it needs a gate that notices when it stops evaluating.
   #
-  # CI-ONLY, like the macOS 26 row: continue-on-error, and the release does not
-  # wait on it because releases ship no Nix artifact. flake.lock pins both
-  # toolchains so reruns test the same dependency recipes; input updates must
-  # pass evaluation and native builds before their compatibility is confirmed.
+  # Nix checks are advisory. flake.lock pins both toolchains so reruns test
+  # the same dependency recipes; input updates must pass evaluation and
+  # native builds before their compatibility is confirmed.
   # Wait for required tests so advisory Intel Nix does not occupy a scarce
   # macOS worker while a required Python test is still queued.
   nix:
@@ -2325,12 +2335,10 @@ jobs:
         if: github.ref == 'refs/heads/main' && steps.cache-size.outputs.fits == 'true'
         continue-on-error: true
 
-  # Self-contained macOS binaries. The shipped pair is macOS 15 (arm64 + amd64),
-  # signed + notarized on a release. macOS 26 (Tahoe) is built too for early
-  # OS-version breakage signal, but it is CI-ONLY: continue-on-error so a flaky
-  # Tahoe build never blocks a release, and it is neither signed nor attached.
-  # `ship` picks the shipped rows; `asset` names the artifact (the shipped ones
-  # keep the bare `macos-<arch>` names the Release + Homebrew formula expect).
+  # Release binaries build on macOS 15 for OS compatibility. Advisory builds
+  # exercise macOS 26 and 27 and upload unsigned CI artifacts. The `ship` flag
+  # controls signing and release status; `asset` names each artifact. Release
+  # assets use the macos-<arch> names expected by the Homebrew formula.
   # Intel compatibility rows stay gated and ship with ARM. Retirement map:
   # wiki/Contributing-and-Releasing.md, "Intel Mac support".
   binaries-macos:
@@ -2363,13 +2371,19 @@ jobs:
             pq: soft
             pq_src: '1'
     runs-on: ${{ matrix.runner }}
-    # The macOS 26 rows are coverage-only: never let them gate a release.
+    # Rows with ship: false provide advisory coverage.
     continue-on-error: ${{ !matrix.ship }}
     steps: &macos-steps
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
       # setuptools_scm never walks history here, and its git file-finder (which
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
+      - name: Verify macOS 27 runner
+        if: matrix.runner == 'xcode-27'
+        run: |
+          sw_vers
+          test "$(sw_vers -productVersion | cut -d. -f1)" = 27
+          test "$(uname -m)" = arm64
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
@@ -2587,6 +2601,11 @@ jobs:
             ship: false
             asset: macos26-arm64
             pq: hard   # see the macOS 15 arm64 row
+          - arch: arm64
+            runner: xcode-27         # macOS 27, Apple Silicon preview
+            ship: false
+            asset: macos27-arm64
+            pq: hard
           - arch: amd64
             runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
             ship: false
@@ -2600,7 +2619,7 @@ jobs:
             pq: soft
             pq_src: '1'
     runs-on: ${{ matrix.runner }}
-    # The macOS 26 rows are coverage-only: never let them gate a release.
+    # Rows with ship: false provide advisory coverage.
     continue-on-error: ${{ !matrix.ship }}
     steps: *macos-steps
 
@@ -4917,10 +4936,8 @@ jobs:
             git push origin "refs/tags/$NEW"
           fi
 
-      # Pull in every per-arch binary the gate built (fast + slow). The pattern
-      # is broad and flattens them into ./binaries; the CI-only macOS 26 assets
-      # (cronstable-macos26-*) land here too but are neither hashed nor attached
-      # below (the lists are explicit).
+      # Publish the prepared release assets. Advisory macOS artifacts use
+      # versioned names and are excluded from the explicit file list.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3.0.3
         with:

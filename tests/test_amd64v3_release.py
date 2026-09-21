@@ -45,7 +45,7 @@ def test_every_shipped_amd64_format_has_a_v3_counterpart():
         len(baseline) == 14
     )  # Both Linux libcs, native binaries and packages.
     assert {p.replace("-amd64", "-amd64v3") for p in baseline} <= assets
-    assert not any("macos26" in p for p in assets)
+    assert not any(re.search(r"cronstable-macos\d+-", p) for p in assets)
 
 
 def test_native_jobs_build_v3_and_select_the_new_interpreter():
@@ -135,8 +135,15 @@ def test_docker_variants_have_separate_tags_and_caches():
         "PYTHON_VARIANT=${{ matrix.python_variant }}"
         in build["with"]["build-args"]
     )
-    assert "matrix.distro" in build["with"]["cache-from"]
-    assert "matrix.platform_id" in build["with"]["cache-from"]
+    cache = next(
+        s for s in builds["jobs"]["build"]["steps"] if s.get("id") == "cache"
+    )
+    assert cache["env"]["CACHE_SCOPE"] == (
+        "${{ matrix.distro }}-${{ matrix.platform_id }}"
+    )
+    assert "$CACHE_SCOPE" in cache["run"]
+    assert "steps.cache.outputs.ref" in build["with"]["cache-from"]
+    assert "steps.cache.outputs.ref" in build["with"]["cache-to"]
     push = workflow()["jobs"]["docker-push"]
     assert "docker-release-${{ matrix.distro }}" in str(push["steps"])
     assert "docker/build-push-action" not in str(push["steps"])
