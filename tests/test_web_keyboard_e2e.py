@@ -503,6 +503,32 @@ def _tab_walk(page, presses, shift=False):
     return stops
 
 
+def test_dialog_buttons_are_focusable_as_soon_as_it_opens(browser, tmp_path):
+    with e2e.Daemon(tmp_path) as daemon:
+        with e2e.open_page(browser, daemon.url, prefs={"pollMs": 0}) as page:
+            result = page.evaluate(
+                """() => {
+                  const button = document.getElementById('tokenCancel');
+                  // Hold opening animations at their first frame. Controls
+                  // must accept focus while visual transitions are unfinished.
+                  const closed = getComputedStyle(button).visibility;
+                  document.getElementById('authBtn').click();
+                  for (const animation of button.getAnimations()) {
+                    animation.pause();
+                    animation.currentTime = 0;
+                  }
+                  button.focus();
+                  return {closed, focused: document.activeElement === button,
+                    visibility: getComputedStyle(button).visibility};
+                }"""
+            )
+            assert result == {
+                "closed": "hidden",
+                "focused": True,
+                "visibility": "visible",
+            }
+
+
 @pytest.mark.parametrize(
     "opener,surface",
     [

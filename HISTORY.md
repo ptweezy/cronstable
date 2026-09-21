@@ -33,7 +33,8 @@
   returning to a refreshed job row. Remove closed overlays from the tab
   order, and keep long text, configuration chips, schedule warnings, and
   workflow drawer controls usable on narrow screens. Update the demo copy
-  of the dashboard with the same fixes.
+  of the dashboard with the same fixes. Make dialog buttons focusable as soon
+  as their panel opens, so Tab cannot escape during its opening animation.
 - Close HTTP error responses promptly in the job CLI and MCP CLI instead
   of leaving their connections open until garbage collection.
 - Reap Windows taskkill helpers when their caller is cancelled or the helper
