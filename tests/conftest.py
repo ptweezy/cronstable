@@ -106,14 +106,15 @@ def pytest_configure(config):
         # CPython #90476: the old SSL protocol leaves its wrapper marked open
         # after connection_lost has disposed of the underlying transport.
         # Reproduced with _ssl_protocol._transport is None, including rejected
-        # mTLS handshakes. Fixed by the SSL rewrite in 3.11. Limit the exception
-        # to that wrapper on 3.10; socket/session and all other warnings remain
-        # errors. Remove with Python 3.10 support.
+        # mTLS handshakes. Fixed by the SSL rewrite in 3.11. Limit this to the
+        # wrapper on 3.10; socket/session and all other warnings remain errors.
+        # Remove with Python 3.10 support.
         # https://github.com/python/cpython/issues/90476
         config.addinivalue_line(
             "filterwarnings",
             r"ignore:unclosed transport <asyncio\.sslproto\."
-            r"_SSLProtocolTransport object at .*:ResourceWarning:asyncio\.sslproto",
+            r"_SSLProtocolTransport object at .*"
+            r":ResourceWarning:asyncio\.sslproto",
         )
     timeout = float(config.getini("faulthandler_timeout") or 0)
     if timeout:

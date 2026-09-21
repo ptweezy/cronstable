@@ -1,6 +1,6 @@
 FROM ubuntu:26.04
 
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive \
+RUN apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && DEBIAN_FRONTEND=noninteractive \
 	apt-get install -y -q \
 		curl git ca-certificates build-essential zlib1g-dev \
 		libbz2-dev libssl-dev libreadline-dev libffi-dev \
