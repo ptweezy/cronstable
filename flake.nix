@@ -2,7 +2,7 @@
   description = "cronstable, a cron daemon with a schedule model you can inspect";
 
   # nixos-unstable supplies the newer Python dependencies this project needs.
-  # PyPI releases can still arrive first; the source overrides below bridge
+  # PyPI releases can still arrive first; nix/python-packages.nix bridges
   # those gaps until nixpkgs catches up, preserving our dependency floors.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   # 26.05 is the final nixpkgs release supporting Intel macOS. Keep its native

@@ -850,9 +850,9 @@ jobs:
   # submission, so it needs a gate that notices when it stops evaluating.
   #
   # CI-ONLY, like the macOS 26 row: continue-on-error, and the release does not
-  # wait on it. Everything it builds comes from a nixpkgs branch that moves
-  # outside this repository, so a red here is information about nixpkgs, not a
-  # reason to hold a release that ships no Nix artifact.
+  # wait on it because releases ship no Nix artifact. flake.lock pins both
+  # toolchains so reruns test the same dependency recipes; input updates must
+  # pass evaluation and native builds before their compatibility is confirmed.
   nix:
     needs: tox-static
     strategy:
