@@ -35,6 +35,10 @@
   of leaving their connections open until garbage collection.
 - Reap Windows taskkill helpers when their caller is cancelled or the helper
   times out, preventing subprocess transports from surviving shutdown.
+  Stop the pool scheduler even when an older Python event waiter loses its
+  cancellation during shutdown.
+  Drain replacement-cancellation tasks before fleet tests close their loops.
+  Stop claimed retries before tests inspect their durable claim records.
   Keep etcd connection-failure diagnostics useful when a timeout has no
   message, and test kubeconfig certificate paths using native OS paths.
 - Require cryptography 50.0.1 or newer for push, development, minimum
@@ -75,6 +79,7 @@
   addressing GitHub Actions cache-poisoning findings.
 - Run required tests and source-package checks before the expensive CI build
   fan-out, so emulated builds cannot occupy workers ahead of basic checks.
+  Finish every required Python test row to report failures across platforms.
   Bound Nix dependency build concurrency to avoid oversubscribing Intel
   workers. Retain an Ubuntu 24 host for the FreeBSD ARM64 VM, which fails
   to boot on Ubuntu 26; other Linux workers use Ubuntu 26.

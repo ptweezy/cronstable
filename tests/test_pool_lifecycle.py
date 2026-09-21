@@ -7,10 +7,9 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from cronstable.job import JobRetryState
-from cronstable.pools import NAMESPACE, PoolError
+from cronstable.pools import NAMESPACE, PoolError, PoolScheduler
 from tests._helpers import _drain_pending, _reap_running
 from tests.test_pools import CONFIG, make
-
 
 SENSOR = (
     CONFIG
@@ -44,6 +43,46 @@ async def wait_queued(cron):
             await asyncio.sleep(0.01)
 
     await asyncio.wait_for(wait(), 5)
+
+
+async def test_close_survives_a_lost_waiter_cancellation(monkeypatch):
+    scheduler = PoolScheduler(Mock(pool_config={"database": {}}))
+    tick = AsyncMock()
+    monkeypatch.setattr(scheduler, "tick", tick)
+    waiting = asyncio.Event()
+    swallowed = asyncio.Event()
+    wait_for = asyncio.wait_for
+
+    async def racing_wait_for(awaitable, timeout):
+        waiting.set()
+        try:
+            return await wait_for(awaitable, timeout)
+        except asyncio.CancelledError:
+            # Python 3.10's wait_for can lose cancellation when its inner
+            # waiter completes at the same time (CPython issue #86296).
+            if swallowed.is_set():
+                raise
+            swallowed.set()
+
+    monkeypatch.setattr(asyncio, "wait_for", racing_wait_for)
+    scheduler.service()
+    worker, heartbeat = scheduler._task, scheduler._heartbeat
+    await waiting.wait()
+    closing = asyncio.create_task(scheduler.close())
+    try:
+        done, _ = await asyncio.wait({closing}, timeout=1)
+        assert swallowed.is_set()
+        assert closing in done, "pool shutdown depended on cancellation alone"
+        await closing
+        tick.assert_awaited_once()
+        assert worker.done() and heartbeat.done()
+        assert scheduler._task is scheduler._heartbeat is None
+    finally:
+        for task in (closing, worker, heartbeat):
+            task.cancel()
+        await asyncio.gather(
+            closing, worker, heartbeat, return_exceptions=True
+        )
 
 
 async def test_full_queue_does_not_interrupt_due_slots(dag_cron, monkeypatch):

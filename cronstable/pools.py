@@ -106,10 +106,12 @@ class PoolScheduler:
 
     async def close(self) -> None:
         tasks = [t for t in (self._task, self._heartbeat) if t is not None]
+        # Retire ownership before cancellation: older asyncio.wait_for can
+        # swallow it when the awaited operation completes at the same time.
+        self._task = self._heartbeat = None
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        self._task = self._heartbeat = None
 
     async def _renew_loop(self) -> None:
         while True:
@@ -124,7 +126,8 @@ class PoolScheduler:
             raise PoolError("pool lease was lost before launch")
 
     async def _run(self) -> None:
-        while True:
+        me = asyncio.current_task()
+        while self._task is me:
             self._wake.clear()
             try:
                 await self.tick()
@@ -132,6 +135,8 @@ class PoolScheduler:
                 raise
             except Exception:
                 logger.exception("pool queue service failed; retrying")
+            if self._task is not me:
+                return
             try:
                 await asyncio.wait_for(self._wake.wait(), 1.0)
             except asyncio.TimeoutError:

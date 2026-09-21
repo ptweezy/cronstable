@@ -478,7 +478,9 @@ jobs:
 
   tox:
     strategy:
-      fail-fast: ${{ needs.version.outputs.release == 'true' }}
+      # Complete the failure inventory on every OS/Python. Preflight already
+      # prevents expensive builds from starting when any required row fails.
+      fail-fast: false
       matrix:
         # Test macOS with the POSIX profile. Its process, signal, fsync,
         # and pipe behavior differs from Linux, and releases include macOS
