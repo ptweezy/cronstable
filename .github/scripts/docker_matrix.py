@@ -62,6 +62,24 @@ def platforms(distros):
     return rows
 
 
+def wheel_groups(distros, wheels):
+    rows = platforms(distros)
+    return {
+        group: [
+            dict(
+                wheel,
+                docker=[
+                    row
+                    for row in rows
+                    if row["wheel"] == f"pq-wheel-{group}-{wheel['arch']}"
+                ],
+            )
+            for wheel in recipes
+        ]
+        for group, recipes in wheels.items()
+    }
+
+
 if __name__ == "__main__":
     config = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
@@ -79,5 +97,5 @@ if __name__ == "__main__":
                 ]
                 output.write(f"docker-{group}={json.dumps(rows)}\n")
             wheels = json.loads((config / "pq-wheel-matrix.json").read_text())
-            for group, rows in wheels.items():
+            for group, rows in wheel_groups(distros, wheels).items():
                 output.write(f"pq-{group}={json.dumps(rows)}\n")

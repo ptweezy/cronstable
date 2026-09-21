@@ -10,6 +10,8 @@
 .pytest_cache
 .pip-cache
 .pq-cache
+.pq-pip-cache
+.freebsd-pip-cache
 release-inputs
 dist
 build

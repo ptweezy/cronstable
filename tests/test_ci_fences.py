@@ -1,13 +1,7 @@
-"""release.yml keeps its silent-skip fences pointed at live matrix cells.
+"""Keep browser test enforcement attached to a live CI matrix cell.
 
-The web engine differential (tests/test_web_engine_parity.py) self-skips
-wherever Chromium is missing, so exactly one tox cell installs the browser
-and then re-drives the file, requiring that nothing skipped.  Both steps
-gate on hardcoded matrix literals in their ``if:``; if the tox matrix moves
-on, those literals go stale, GitHub skips the steps without a word, and the
-differential quietly runs nowhere again.  This pins the literals to the
-matrix they select from, and pins the enforcement to junitxml counts
-instead of a stdout grep.
+One tox cell installs Chromium and checks its full-session JUnit report.
+Every browser module must have results, with no unexpected skips.
 """
 
 import fnmatch
@@ -69,12 +63,11 @@ def test_parity_fence_steps_gate_on_a_live_matrix_cell():
 
 def test_parity_enforcement_reads_junitxml_counts():
     run = _named_steps(_tox_job())[ENFORCE_STEP]["run"]
-    assert "--junitxml" in run
-    assert "skipped" in run
-    # the old fence grepped stdout for the literal "1 passed", which a
-    # second test in the file flips to a false red and which "11 passed"
-    # also satisfies.
-    assert '"1 passed"' not in run
+    assert "check_browser_tests.py" in run
+    assert ".tox/py-posix/junit.xml" in run
+    assert "-m pytest" not in run
+    with open(os.path.join(ROOT, "tox.ini"), encoding="utf-8") as fobj:
+        assert "--junitxml={envdir}/junit.xml" in fobj.read()
 
 
 # --------------------------------------------------------------------------
@@ -225,7 +218,7 @@ def test_every_browser_backed_test_module_is_fenced():
     missing = sorted(n for n in browser_backed if n not in run)
     assert not missing, (
         "these browser-backed modules self-skip everywhere and are not "
-        "re-driven by the enforcement step, so nothing proves they ever "
+        "checked by the enforcement step, so nothing proves they ever "
         "ran: {}".format(missing)
     )
 
