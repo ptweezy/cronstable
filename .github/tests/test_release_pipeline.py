@@ -212,6 +212,19 @@ def test_every_required_build_and_preparation_gates_publication():
     assert "pq-wheels" not in ancestors(jobs, "docker-musl")
 
 
+def test_required_tests_finish_before_expensive_builds_take_workers():
+    jobs = workflow()["jobs"]
+    checks = {"tox", "tox-mindeps", "backends-live", "dist"}
+    for name in checks:
+        assert "tox-static" in ancestors(jobs, name)
+        assert "preflight" not in ancestors(jobs, name)
+    for name in jobs:
+        if name.startswith(("binaries", "docker", "pq-wheel")):
+            assert checks <= ancestors(jobs, name), name
+    # The license check must scan the resolved version used in the bundles.
+    assert "preflight" in ancestors(jobs, "licenses")
+
+
 def test_publication_consumes_only_prepared_artifacts():
     jobs = workflow()["jobs"]
     steps = jobs["release"]["steps"]

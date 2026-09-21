@@ -33,6 +33,10 @@
   of the dashboard with the same fixes.
 - Close HTTP error responses promptly in the job CLI and MCP CLI instead
   of leaving their connections open until garbage collection.
+- Reap Windows taskkill helpers when their caller is cancelled or the helper
+  times out, preventing subprocess transports from surviving shutdown.
+  Keep etcd connection-failure diagnostics useful when a timeout has no
+  message, and test kubeconfig certificate paths using native OS paths.
 - Require cryptography 50.0.1 or newer for push, development, minimum
   dependency tests, and binary builds, addressing the OpenSSL, PKCS#7,
   and certificate-verification security advisories. Intel macOS and
@@ -69,6 +73,8 @@
   main-branch history before checkout or execution. Reusable image and wheel
   builders reject mutable, divergent, and non-refresh source overrides,
   addressing GitHub Actions cache-poisoning findings.
+- Run required tests and source-package checks before the expensive CI build
+  fan-out, so emulated builds cannot occupy workers ahead of basic checks.
 - Treat partial APT index downloads as failures across CI and Docker builds,
   so network retries refresh the index before dependency installation.
 - Rebuild the latest stable release's Docker images daily and on demand

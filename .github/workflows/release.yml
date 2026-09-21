@@ -1,8 +1,8 @@
 name: CI
 
 # ONE pipeline for everything. On EVERY push (any branch) and pull request it
-# builds and tests the whole product in parallel -- the full tox matrix
-# (lint/mypy/pytest), the wheel + sdist, the self-contained PyInstaller binaries
+# verifies the full tox matrix before the expensive build fan-out
+# (lint/mypy/pytest and wheel + sdist), then builds PyInstaller binaries
 # for Linux (amd64, arm64, i686, armv7, ppc64le, s390x and riscv64 in both glibc
 # and musl/Alpine flavors, plus armv6 in musl only), macOS (arm64 + amd64 on
 # macOS 15, shipped; plus macOS 26/Tahoe as non-gating CI coverage) and Windows
@@ -320,17 +320,22 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # Gate: tests + all binaries + all Docker images. Runs on EVERY event, in
-  # parallel. The publish jobs below need every one of these to succeed.
+  # Gate: tests, then all binaries + Docker images in parallel, on EVERY
+  # event. The publish jobs below need every required check to succeed.
   # ---------------------------------------------------------------------------
 
-  # Cheap static, configuration and packaging checks precede the build fan-out.
+  # Finish required tests before emulated builds occupy the runner pool.
+  # Reuse preflight as the gate; its resolved sources still feed every build.
   preflight:
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     needs:
       - version
       - tox-static
+      - tox
+      - tox-mindeps
+      - backends-live
+      - dist
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
@@ -642,7 +647,7 @@ jobs:
 
     needs:
       - version
-      - preflight
+      - tox-static
 
   tox-experimental:
     strategy:
@@ -681,7 +686,7 @@ jobs:
       - run: tox -e mindeps
     needs:
       - version
-      - preflight
+      - tox-static
 
   # Test the etcd and Kubernetes backends against real servers.
   # tests/test_backend_live.py runs election scenarios and checks that the
@@ -779,7 +784,7 @@ jobs:
           docker logs etcd-auth || true
     needs:
       - version
-      - preflight
+      - tox-static
 
   # Wheel + sdist, built and `twine check`ed exactly as it will be published to
   # PyPI. Uploaded as an artifact the `release` job publishes verbatim (so the
@@ -787,7 +792,7 @@ jobs:
   dist:
     needs:
       - version
-      - preflight
+      - tox-static
     runs-on: ubuntu-26.04
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
