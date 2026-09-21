@@ -39,6 +39,9 @@
   cancellation during shutdown.
   Drain replacement-cancellation tasks before fleet tests close their loops.
   Stop claimed retries before tests inspect their durable claim records.
+  Await retry launch and cancellation cleanup before closing test loops.
+  Drive simulated Kubernetes failover rounds without competing background
+  renewals, while retaining separate coverage of the automatic renewal loop.
   Keep etcd connection-failure diagnostics useful when a timeout has no
   message, and test kubeconfig certificate paths using native OS paths.
 - Require cryptography 50.0.1 or newer for push, development, minimum

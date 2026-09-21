@@ -176,6 +176,7 @@ async def test_setup_from_a_kubeconfig(
     (tmp_path / "namespace").write_text("from-the-pod")
     monkeypatch.setattr(kubernetes_backend, "_SA_DIR", str(tmp_path))
     kubeconfig = tmp_path / "kubeconfig"
+    client_key = tmp_path / "client.key"
     kubeconfig.write_text(
         json.dumps(
             {
@@ -193,7 +194,10 @@ async def test_setup_from_a_kubeconfig(
                     }
                 ],
                 "users": [
-                    {"name": "u", "user": {"client-key": "/abs/client.key"}}
+                    {
+                        "name": "u",
+                        "user": {"client-key": client_key.as_posix()},
+                    }
                 ],
             }
         )
@@ -218,7 +222,7 @@ async def test_setup_from_a_kubeconfig(
             os.path.normpath(
                 os.path.join(os.path.dirname(b.kubeconfig), "pki/ca.crt")
             ),
-            os.path.abspath("/abs/client.key"),
+            str(client_key),
         ]
     finally:
         await t.close()
