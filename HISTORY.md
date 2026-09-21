@@ -54,6 +54,8 @@
   reads it, retaining strict resource-warning checks.
   Drain job completion work before test fixtures close their pools, matching
   daemon shutdown and preventing late completions from restarting workers.
+  Bound pool contention stress tests by their total workload deadline,
+  preserving capacity checks under slow Windows file locks and coverage.
 - Require cryptography 50.0.1 or newer for push, development, minimum
   dependency tests, and binary builds, addressing the OpenSSL, PKCS#7,
   and certificate-verification security advisories. Intel macOS and

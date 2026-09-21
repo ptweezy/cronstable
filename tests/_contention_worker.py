@@ -191,7 +191,14 @@ async def main(argv):
     elif mode == "leases":
         result = await _leases(backend, worker, count, scratch)
     elif mode == "tickets":
-        result = await _tickets(backend, worker, count, scratch, int(argv[4]))
+        # This process stress-tests mutual exclusion, not operation latency.
+        # Six writers plus coverage can starve one Windows file-lock waiter
+        # beyond the daemon's five-second limit. Bound the WHOLE workload
+        # instead, without weakening capacity assertions or production limits.
+        pools.OP_TIMEOUT = DEADLINE
+        result = await asyncio.wait_for(
+            _tickets(backend, worker, count, scratch, int(argv[4])), DEADLINE
+        )
     else:
         raise SystemExit("unknown mode " + mode)
     with open(out + ".tmp", "w", encoding="utf-8") as fobj:
