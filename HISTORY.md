@@ -48,7 +48,9 @@
   and Hypothesis, keeping the package declarations and generated dependency
   lists in sync.
 - Build current sentry-sdk and tzdata sources for Nix when nixpkgs lags
-  behind the required minimum versions, retaining dependency checks.
+  behind the required minimum versions, retaining dependency checks. Read
+  Nix dependency lists from `pyproject.toml` and smoke-test the installed CLI
+  after static checks pass.
 - Rebuild the latest stable release's Docker images daily and on demand
   with freshly pulled base images and compatible Python dependencies,
   including rebuilt post-quantum wheels. Keep the released application

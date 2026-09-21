@@ -854,6 +854,7 @@ jobs:
   # outside this repository, so a red here is information about nixpkgs, not a
   # reason to hold a release that ships no Nix artifact.
   nix:
+    needs: tox-static
     runs-on: ubuntu-26.04
     continue-on-error: true
     timeout-minutes: 60
@@ -865,7 +866,10 @@ jobs:
             experimental-features = nix-command flakes
       # --print-build-logs so a dependency that fails to build says why in the
       # job log instead of only naming the derivation.
-      - run: nix flake check --print-build-logs
+      - run: |
+          nix flake check --print-build-logs
+          nix run .#cronstable -- --version
+          nix run .#cronstable -- --help > /dev/null
 
   # Self-contained glibc PyInstaller binaries, one per architecture, built
   # inside a manylinux image against a python-build-standalone interpreter.
