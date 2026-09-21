@@ -106,6 +106,8 @@
   to boot on Ubuntu 26; other Linux workers use Ubuntu 26.
 - Treat partial APT index downloads as failures across CI and Docker builds,
   so network retries refresh the index before dependency installation.
+- Retry macOS signing when Apple's timestamp service is unavailable, while
+  retaining mandatory secure timestamps, verification, and notarization.
 - Rebuild the latest stable release's Docker images daily and on demand
   with freshly pulled base images and compatible Python dependencies,
   including rebuilt post-quantum wheels. Keep the released application

@@ -174,6 +174,62 @@ sh() {
         assert "STATIC:1" in result.stdout
 
 
+@pytest.mark.parametrize(
+    "sign_failures,verify_failure,notary_failure",
+    [(1, 0, 0), (3, 0, 0), (0, 1, 0), (0, 0, 1)],
+)
+def test_macos_signing_retries_but_never_bypasses_verification(
+    tmp_path, sign_failures, verify_failure, notary_failure
+):
+    if os.name == "nt" or shutil.which("bash") is None:
+        pytest.skip("POSIX shell harness for the CI bash steps")
+    step = next(
+        s for s in workflow()["jobs"]["binaries-macos"]["steps"]
+        if s.get("name") == "Sign and notarize"
+    )
+    prelude = """
+signing=0
+codesign() {
+    if [ "$1" = --verify ]; then
+        echo VERIFY
+        return "$FAIL_VERIFY"
+    fi
+    signing=$((signing + 1))
+    echo "SIGN:$*"
+    [ "$signing" -gt "$FAIL_SIGN" ]
+}
+sleep() { :; }
+ditto() { :; }
+xcrun() { echo NOTARY; return "$FAIL_NOTARY"; }
+"""
+    result = subprocess.run(
+        ["bash", "-c", prelude + step["run"]],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "RUNNER_TEMP": str(tmp_path),
+            "MACOS_CERT_P12_BASE64": "configured",
+            "MACOS_SIGN_IDENTITY": "test-identity",
+            "MACOS_NOTARY_KEY_BASE64": "dGVzdA==",
+            "MACOS_NOTARY_KEY_ID": "test-key",
+            "MACOS_NOTARY_ISSUER_ID": "test-issuer",
+            "FAIL_SIGN": str(sign_failures),
+            "FAIL_VERIFY": str(verify_failure),
+            "FAIL_NOTARY": str(notary_failure),
+        },
+        capture_output=True,
+        text=True,
+    )
+    signed = sign_failures < 3
+    assert (result.returncode == 0) == (
+        signed and not verify_failure and not notary_failure
+    ), result.stderr
+    assert result.stdout.count("SIGN:") == min(sign_failures + 1, 3)
+    assert "--options runtime --timestamp" in result.stdout
+    assert ("VERIFY" in result.stdout) == signed
+    assert ("NOTARY" in result.stdout) == (signed and not verify_failure)
+
+
 def test_every_required_build_and_preparation_gates_publication():
     jobs = workflow()["jobs"]
     gate = ancestors(jobs, "release")
