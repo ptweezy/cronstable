@@ -90,6 +90,8 @@
 - Run required tests and source-package checks before the expensive CI build
   fan-out, so emulated builds cannot occupy workers ahead of basic checks.
   Finish every required Python test row to report failures across platforms.
+  Schedule advisory Nix builds after these checks so they cannot hold a
+  macOS worker ahead of a required Python test.
   Bound Nix dependency build concurrency to avoid oversubscribing Intel
   workers. Retain an Ubuntu 24 host for the FreeBSD ARM64 VM, which fails
   to boot on Ubuntu 26; other Linux workers use Ubuntu 26.

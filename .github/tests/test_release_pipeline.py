@@ -203,6 +203,7 @@ def test_every_required_build_and_preparation_gates_publication():
             "tox-experimental",
             "binaries-macos-experimental",
             "compiler-cache-budget",
+            "nix",
         }
         & gate
     )
@@ -219,7 +220,9 @@ def test_required_tests_finish_before_expensive_builds_take_workers():
         assert "tox-static" in ancestors(jobs, name)
         assert "preflight" not in ancestors(jobs, name)
     for name in jobs:
-        if name.startswith(("binaries", "docker", "pq-wheel")):
+        if name == "nix" or name.startswith(
+            ("binaries", "docker", "pq-wheel")
+        ):
             assert checks <= ancestors(jobs, name), name
     # The license check must scan the resolved version used in the bundles.
     assert "preflight" in ancestors(jobs, "licenses")
