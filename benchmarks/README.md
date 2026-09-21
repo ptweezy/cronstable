@@ -144,7 +144,7 @@ audits found the relative gate alone could not deliver them:
   `100*floor/value`, however tight its declared `gate_pct` reads. The floor
   is deliberate harness policy (jitter on a tiny metric must never gate);
   what was missing was anything REPORTING when it binds. The comparison
-  table's "Gate (eff.)" column and a job-log notice now name every
+  table's "Regression limit" column and a job-log notice now name every
   floor-bound metric, so an undersized workload is visible and fixable
   instead of silently ungated.
 - **Comparability.** The two sides must agree on python version, platform,

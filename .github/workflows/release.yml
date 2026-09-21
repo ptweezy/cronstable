@@ -4173,9 +4173,9 @@ jobs:
             # verdict of FAILED further down reads as what it is there:
             # information, not the gate.
             {
-              echo "### Performance gate overridden"
+              echo "### Performance checks overridden"
               echo ""
-              echo "This release was published with the perf gate overridden ($PERF_SOURCE). The comparison below is informational: nothing in it, and no failure of the perf job itself, held the release."
+              echo "Performance checks were overridden for this release ($PERF_SOURCE). The results below are informational. Regressions, exceeded performance limits, missing comparisons, and benchmark job failures did not block publication."
               echo ""
               cat perf/perf-summary.md
             } > perf/perf-summary.stamped.md
@@ -4799,7 +4799,7 @@ jobs:
               echo ""
               echo "### Performance"
               echo ""
-              echo "The perf gate was overridden ($PERF_SOURCE) and the perf job produced no report for this run."
+              echo "Performance checks were overridden for this release ($PERF_SOURCE). The benchmark job did not produce a report, so no performance comparison is available."
             } >> release-notes.md
           fi
 
