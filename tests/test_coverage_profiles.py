@@ -46,9 +46,9 @@ import configparser
 import os
 import re
 
-import pytest
-
 import coverage.config
+import pytest
+from strictyaml.ruamel import YAML
 
 tomllib = pytest.importorskip("tomllib")  # py3.11+; the other cells enforce
 
@@ -458,17 +458,23 @@ def test_commands_is_unconditional():
 
 
 def test_ci_runs_both_arms_and_names_the_right_envdir():
-    """The workflow's two touchpoints, which fail silently if missed.
-
-    The matrix step needs both arms (the non-matching one skips), and the
-    web-engine differential re-drives pytest through the tox env's own
-    interpreter by path, so the envdir rename has to reach it or the one
-    step that compares the dashboard's cron engine against the daemon's
-    stops running.
-    """
-    workflow = _read(
-        os.path.join(ROOT, ".github", "workflows", "release.yml")
+    """CI selects both OS profiles and checks the POSIX env's test report."""
+    workflow = YAML(typ="safe").load(
+        _read(os.path.join(ROOT, ".github", "workflows", "release.yml"))
     )
-    assert "tox -e py-windows,py-posix" in workflow
-    assert ".tox/py/bin/python" not in workflow
-    assert workflow.count(".tox/py-posix/bin/python") == 2
+    steps = workflow["jobs"]["tox"]["steps"]
+    commands = [step["run"].strip() for step in steps if "run" in step]
+    assert "tox -e py-windows,py-posix" in commands
+    assert all(".tox/py/bin/python" not in command for command in commands)
+    enforce = next(
+        step["run"]
+        for step in steps
+        if step.get("name")
+        == "Enforce the web engine differential ran (no silent skip)"
+    )
+    assert (
+        ".tox/py-posix/bin/python .github/scripts/check_browser_tests.py"
+        in enforce
+    )
+    assert ".tox/py-posix/junit.xml" in enforce
+    assert "--junitxml={envdir}/junit.xml" in (_tox()["testenv"]["commands"])
