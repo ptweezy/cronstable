@@ -2440,7 +2440,8 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           # Exercise the configured identity/private key before compilation.
           cp /usr/bin/true "$RUNNER_TEMP/signing-probe"
-          codesign --force --options runtime --timestamp --keychain "$KEYCHAIN" \
+          . .github/scripts/retry.sh
+          retry 3 codesign --force --options runtime --timestamp --keychain "$KEYCHAIN" \
             --sign "$MACOS_SIGN_IDENTITY" "$RUNNER_TEMP/signing-probe"
 
           echo "$MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
@@ -2549,8 +2550,10 @@ jobs:
           if [ -z "${MACOS_CERT_P12_BASE64:-}" ]; then exit 0; fi
           KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
           # Sign with the hardened runtime + secure timestamp (both required for
-          # notarization) and the PyInstaller entitlements, then verify.
-          codesign --force --options runtime --timestamp \
+          # notarization) and the PyInstaller entitlements, then verify. Apple's
+          # timestamp service can fail transiently after the credential probe.
+          . .github/scripts/retry.sh
+          retry 3 codesign --force --options runtime --timestamp \
             --entitlements pyinstaller/entitlements.plist \
             --keychain "$KEYCHAIN" \
             --sign "$MACOS_SIGN_IDENTITY" dist/cronstable
