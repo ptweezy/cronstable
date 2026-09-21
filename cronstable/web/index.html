@@ -431,11 +431,16 @@
     70% { box-shadow: 0 0 0 5px transparent; } 100% { box-shadow: 0 0 0 0 transparent; }
   }
 
+  /* Inherited visibility must change with the panel, so its controls are
+     focusable immediately. Animate appearance without delaying Tab access. */
+  .iconbtn, .ghostbtn, .btn {
+    transition: background-color .12s ease, border-color .12s ease, color .12s ease, opacity .12s ease;
+  }
   .iconbtn, .ghostbtn {
     display: inline-grid; place-items: center;
     height: 30px; min-width: 30px; padding: 0 8px; border-radius: var(--radius);
     background: var(--panel); border: 1px solid var(--border);
-    color: var(--fg-dim); cursor: pointer; transition: all .12s ease;
+    color: var(--fg-dim); cursor: pointer;
   }
   .ghostbtn { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; }
   .iconbtn:hover, .ghostbtn:hover { background: var(--hover); color: var(--fg); border-color: var(--border2); }
@@ -601,7 +606,7 @@
     display: inline-flex; align-items: center; gap: 5px;
     padding: 4px 9px; border-radius: var(--radius); font-size: 11.5px; font-weight: 600;
     border: 1px solid var(--border); background: var(--panel2); color: var(--fg);
-    cursor: pointer; transition: all .12s ease; white-space: nowrap;
+    cursor: pointer; white-space: nowrap;
   }
   .btn:hover:not(:disabled) { background: var(--hover); border-color: var(--border2); }
   .btn:disabled { opacity: .4; cursor: not-allowed; }
@@ -9789,9 +9794,8 @@ var qrcode = function() {
   // Delay focus until the panel opens. If it closes during the delay,
   // skip the focus change so keyboard shortcuts remain available.
   //
-  // Buttons use transition: all, so their visibility can update one frame
-  // after the panel's. Retry across frames while the target remains hidden
-  // and cannot receive focus.
+  // Retry across frames while a target remains hidden and cannot receive
+  // focus, without stealing it after the user moves to another control.
   let focusTurn = 0;
   function focusLater(surf, target, ms) {
     // Honor only the latest request to focus a panel. If another
