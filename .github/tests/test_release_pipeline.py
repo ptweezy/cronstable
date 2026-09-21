@@ -185,6 +185,8 @@ def test_every_required_build_and_preparation_gates_publication():
     assert {
         "binaries",
         "tox",
+        "tox-mindeps",
+        "backends-live",
         "tox-static",
         "licenses",
         "preflight",
@@ -213,17 +215,27 @@ def test_every_required_build_and_preparation_gates_publication():
     assert "pq-wheels" not in ancestors(jobs, "docker-musl")
 
 
-def test_required_tests_finish_before_expensive_builds_take_workers():
+def test_builds_overlap_tests_but_advisory_jobs_wait_for_required_rows():
     jobs = workflow()["jobs"]
     checks = {"tox", "tox-mindeps", "backends-live", "dist"}
     for name in checks:
         assert "tox-static" in ancestors(jobs, name)
         assert "preflight" not in ancestors(jobs, name)
     for name in jobs:
-        if name == "nix" or name.startswith(
-            ("binaries", "docker", "pq-wheel")
+        if (
+            name.startswith(("binaries", "docker", "pq-wheel"))
+            and "experimental" not in name
+            and name != "docker-push"
         ):
-            assert checks <= ancestors(jobs, name), name
+            parents = ancestors(jobs, name)
+            assert {"tox-static", "dist"} <= parents, name
+            assert not (checks - {"dist"}) & parents, name
+    for name in ("nix", "tox-experimental", "binaries-macos-experimental"):
+        assert {"preflight", "tox"} <= ancestors(jobs, name), name
+        assert jobs[name]["if"] == (
+            "${{ !cancelled() && needs.preflight.result == 'success' }}"
+        ), name
+    assert checks <= ancestors(jobs, "release")
     # The license check must scan the resolved version used in the bundles.
     assert "preflight" in ancestors(jobs, "licenses")
 

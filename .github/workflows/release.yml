@@ -1,8 +1,8 @@
 name: CI
 
 # ONE pipeline for everything. On EVERY push (any branch) and pull request it
-# verifies the full tox matrix before the expensive build fan-out
-# (lint/mypy/pytest and wheel + sdist), then builds PyInstaller binaries
+# runs static and package checks first, then overlaps the full tox matrix
+# with the build fan-out. It builds PyInstaller binaries
 # for Linux (amd64, arm64, i686, armv7, ppc64le, s390x and riscv64 in both glibc
 # and musl/Alpine flavors, plus armv6 in musl only), macOS (arm64 + amd64 on
 # macOS 15, shipped; plus macOS 26/Tahoe as non-gating CI coverage) and Windows
@@ -320,21 +320,18 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # Gate: tests, then all binaries + Docker images in parallel, on EVERY
-  # event. The publish jobs below need every required check to succeed.
+  # Tests and builds overlap after the quick static/package checks on EVERY
+  # event. Publication still waits for every required check to succeed.
   # ---------------------------------------------------------------------------
 
-  # Finish required tests before emulated builds occupy the runner pool.
-  # Reuse preflight as the gate; its resolved sources still feed every build.
+  # Static checks release the required tests first; the package smoke test
+  # and source preflight then release builds without waiting for full suites.
   preflight:
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     needs:
       - version
       - tox-static
-      - tox
-      - tox-mindeps
-      - backends-live
       - dist
     runs-on: ubuntu-26.04
     timeout-minutes: 10
@@ -478,8 +475,8 @@ jobs:
 
   tox:
     strategy:
-      # Complete the failure inventory on every OS/Python. Preflight already
-      # prevents expensive builds from starting when any required row fails.
+      # Complete the failure inventory on every OS/Python. Publication waits
+      # for every required row, while artifact builds run alongside the tests.
       fail-fast: false
       matrix:
         # Test macOS with the POSIX profile. Its process, signal, fsync,
@@ -652,6 +649,9 @@ jobs:
       - tox-static
 
   tox-experimental:
+    # Wait for supported rows to finish, but still report experimental
+    # failures if one of those rows failed. Cancelled runs stay cancelled.
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -671,6 +671,7 @@ jobs:
     needs:
       - version
       - preflight
+      - tox
 
   # Run the suite with the minimum dependency versions in pyproject.toml.
   # The mindeps environment installs the generated requirements_min.txt.
@@ -860,10 +861,11 @@ jobs:
   # wait on it because releases ship no Nix artifact. flake.lock pins both
   # toolchains so reruns test the same dependency recipes; input updates must
   # pass evaluation and native builds before their compatibility is confirmed.
-  # Wait with the other builds so advisory Intel Nix does not occupy a scarce
+  # Wait for required tests so advisory Intel Nix does not occupy a scarce
   # macOS worker while a required Python test is still queued.
   nix:
-    needs: preflight
+    needs: [preflight, tox]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -2603,6 +2605,8 @@ jobs:
     needs:
       - version
       - preflight
+      - tox
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:

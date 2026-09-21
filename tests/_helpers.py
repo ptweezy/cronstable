@@ -228,11 +228,13 @@ async def _settle_dag_cron(cron):
 
     Draining alone stops the hang but still orphans the launched child, so
     reap the running tasks too, then drain the completions that reaping
-    records.
+    records. Drain report/retry completion tasks as well: settling a pool
+    retry can restart its service after the fixture has closed the pool.
     """
     await _drain_pending(cron)
     while True:
         await _reap_running(cron)
+        await cron._drain_completions()
         await _drain_pending(cron)
         # Completion writes can launch downstream tasks that also need
         # reaping before the event loop closes.

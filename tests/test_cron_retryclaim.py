@@ -1,5 +1,7 @@
 import asyncio
 import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -278,6 +280,39 @@ async def test_retryclaim_web_resume_job_rejects_nonstring_by():
 
 
 # --- schedule_retry_job gate/pause returns --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retry_waits_out_an_early_timer_wakeup(monkeypatch):
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    elapsed = 0.0
+    sleeps = []
+
+    async def early_sleep(delay):
+        nonlocal elapsed
+        sleeps.append(delay)
+        # Windows 3.10's event-loop clock can wake a timer one tick early.
+        elapsed += max(0, delay - 0.01) if len(sleeps) == 1 else delay
+
+    monkeypatch.setattr(
+        cronstable.cron,
+        "time",
+        SimpleNamespace(perf_counter=lambda: elapsed),
+    )
+    monkeypatch.setattr(asyncio, "sleep", early_sleep)
+    monkeypatch.setattr(
+        cron, "_retry_consume_decision", AsyncMock(return_value="launch")
+    )
+
+    async def launch(job):
+        assert elapsed >= 1.0, "retry launched before its deadline"
+        return True
+
+    launched = AsyncMock(side_effect=launch)
+    monkeypatch.setattr(cron, "maybe_launch_job", launched)
+    await cron.schedule_retry_job("alpha", 1.0, 1)
+    launched.assert_awaited_once_with(cron.cron_jobs["alpha"])
+    assert sleeps == pytest.approx([1.0, 0.01])
 
 
 @pytest.mark.asyncio

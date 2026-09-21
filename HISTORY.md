@@ -11,6 +11,8 @@
 - Treat exited but unreaped POSIX processes as dead during crash recovery.
   Zombie children left behind after a daemon crash no longer keep runs
   open indefinitely or prevent `@reboot` jobs and DAG tasks from recovering.
+- Respect the full retry delay even when an event-loop timer wakes early,
+  including retries restored after a restart on Windows.
 - Require the expected success statuses from etcd and Kubernetes lease
   APIs, so redirects and unexpected responses cannot be mistaken for a
   successful lease operation. Limit etcd token refresh to one retry per
@@ -50,6 +52,8 @@
   message, and test kubeconfig certificate paths using native OS paths.
   Close the Task Scheduler export file before the live Windows import test
   reads it, retaining strict resource-warning checks.
+  Drain job completion work before test fixtures close their pools, matching
+  daemon shutdown and preventing late completions from restarting workers.
 - Require cryptography 50.0.1 or newer for push, development, minimum
   dependency tests, and binary builds, addressing the OpenSSL, PKCS#7,
   and certificate-verification security advisories. Intel macOS and
@@ -88,11 +92,13 @@
   main-branch history before checkout or execution. Reusable image and wheel
   builders reject mutable, divergent, and non-refresh source overrides,
   addressing GitHub Actions cache-poisoning findings.
-- Run required tests and source-package checks before the expensive CI build
-  fan-out, so emulated builds cannot occupy workers ahead of basic checks.
+- Start required tests after static checks, then overlap binary and image
+  builds with those tests once package checks and source preflight pass.
+  Keep every required test and artifact check in the publication gate.
   Finish every required Python test row to report failures across platforms.
-  Schedule advisory Nix builds after these checks so they cannot hold a
-  macOS worker ahead of a required Python test.
+  Schedule advisory Nix builds and experimental coverage after the required
+  Python matrix so they cannot hold workers ahead of required tests; run
+  those checks even if a required test fails, to expose independent failures.
   Bound Nix dependency build concurrency to avoid oversubscribing Intel
   workers. Retain an Ubuntu 24 host for the FreeBSD ARM64 VM, which fails
   to boot on Ubuntu 26; other Linux workers use Ubuntu 26.
@@ -131,6 +137,8 @@
   streaming, workflow controls, keyboard navigation, preferences, mobile
   layouts, and dashboard views. Require these suites to execute in the
   Chromium CI job and distinguish expected failures from skipped tests.
+  Use an explicitly slow job and initialized browser history for the run
+  anomaly test, avoiding assumptions about host process-startup speed.
 - Extend required tests to macOS and Linux ARM64, test the declared minimum
   dependencies on Python 3.10, and exercise real Windows Task Scheduler
   exports. Add experimental free-threaded Python 3.14 coverage with a

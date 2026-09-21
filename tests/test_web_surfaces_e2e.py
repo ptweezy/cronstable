@@ -1147,13 +1147,28 @@ def test_ledger_flags_a_slow_run_against_its_own_history(browser, tmp_path):
       };
     })();
     """
-    with e2e.Daemon(tmp_path) as daemon:
+    slow = e2e.job(
+        "alpha-ok", e2e.py_cmd("import time; time.sleep(0.05)")
+    )
+    with e2e.Daemon(tmp_path, jobs=[slow]) as daemon:
         with e2e.open_page(
             browser,
             daemon.url,
-            prefs={"pollMs": 1000, "ledger": True},
+            prefs={"pollMs": 1000},
             init_scripts=[seed],
         ) as page:
+            # Commit the seed before the app reads it; IndexedDB opens and
+            # transactions finish asynchronously during page startup.
+            e2e.wait_until(
+                lambda: len(page.evaluate(_LEDGER_ROWS) or []) == 10, page
+            )
+            _click(page, "#settingsBtn")
+            page.evaluate("document.getElementById('setLedger').click()")
+            page.wait_for_function(
+                "document.getElementById('ledgerStat').textContent"
+                ".startsWith('10 runs · 1 jobs')"
+            )
+            page.keyboard.press("Escape")
             assert not page.query_selector("#rows .slow-chip")
             daemon.run_and_wait("alpha-ok", outcome="success")
             page.wait_for_selector('#rows tr[data-job="alpha-ok"] .slow-chip')
