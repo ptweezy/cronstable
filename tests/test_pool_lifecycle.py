@@ -8,7 +8,7 @@ import pytest
 
 from cronstable.job import JobRetryState
 from cronstable.pools import NAMESPACE, PoolError, PoolScheduler
-from tests._helpers import _drain_pending, _reap_running
+from tests._helpers import _drain_pending, _reap_running, _settle_dag_cron
 from tests.test_pools import CONFIG, make
 
 SENSOR = (
@@ -43,6 +43,34 @@ async def wait_queued(cron):
             await asyncio.sleep(0.01)
 
     await asyncio.wait_for(wait(), 5)
+
+
+async def test_teardown_waits_for_completion_before_closing_pools(
+    dag_cron, monkeypatch
+):
+    cron = await make(dag_cron, monkeypatch)
+    await _drain_pending(cron)
+    release = asyncio.Event()
+    service = Mock()
+    monkeypatch.setattr(cron._pools, "service", service)
+
+    async def completion():
+        await release.wait()
+        # Successful job completion settles retries and wakes the pool.
+        await cron.cancel_job_retries("one")
+
+    cron._spawn_completion(completion())
+    settling = asyncio.create_task(_settle_dag_cron(cron))
+    try:
+        await asyncio.sleep(0)
+        assert not settling.done(), "completion can restart a closed pool"
+        service.assert_not_called()
+    finally:
+        release.set()
+        await settling
+        await cron._drain_completions()
+    service.assert_called_once()
+    assert not cron._completion_tasks
 
 
 async def test_close_survives_a_lost_waiter_cancellation(monkeypatch):

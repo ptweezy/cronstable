@@ -19,6 +19,7 @@ import logging.config
 import os
 import socket
 import ssl
+import time
 import zlib
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -13284,7 +13285,16 @@ class Cron:
                 armed_state.next_retry_at = not_before
                 armed_state.scheduled_delay = delay
                 armed_state.armed_at = now_arm
-        await asyncio.sleep(delay)
+        # Event-loop timers may wake one clock tick early (notably on
+        # Windows 3.10). Preserve the minimum delay using a high-resolution
+        # monotonic clock, including when restoring a persisted deadline.
+        deadline = time.perf_counter() + delay
+        remaining = delay
+        while True:
+            await asyncio.sleep(remaining)
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
         deferrals = 0
         while True:
             try:
