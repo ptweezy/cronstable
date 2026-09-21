@@ -30,6 +30,23 @@ def release_version(release):
     return tag.removeprefix("v")
 
 
+def trusted_revision(revision, workflow_sha):
+    """Admit only immutable source already in the workflow's main history."""
+    if not all(
+        re.fullmatch(r"[a-f0-9]{40}", value)
+        for value in (revision, workflow_sha)
+    ):
+        raise ValueError("Source and workflow revisions must be commit SHAs")
+    comparison = api(f"compare/{revision}...{workflow_sha}")
+    if (
+        comparison.get("status") not in {"ahead", "identical"}
+        or comparison.get("base_commit", {}).get("sha") != revision
+        or comparison.get("merge_base_commit", {}).get("sha") != revision
+    ):
+        raise ValueError("Source revision is outside the workflow's history")
+    return comparison["base_commit"]["sha"]
+
+
 def plan(release, revision, run_id, attempt, date):
     version = release_version(release)
     if not re.fullmatch(r"[a-f0-9]{40}", revision):
@@ -76,8 +93,26 @@ def write_outputs(values):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("select", "check", "tags"))
+    parser.add_argument(
+        "command", choices=("select", "check", "tags", "validate-ref")
+    )
     args = parser.parse_args()
+    if args.command == "validate-ref":
+        if (
+            os.environ.get("REFRESH") != "true"
+            or os.environ.get("GITHUB_REF") != "refs/heads/main"
+        ):
+            raise ValueError(
+                "Alternate source is only allowed for main refreshes"
+            )
+        write_outputs(
+            {
+                "revision": trusted_revision(
+                    os.environ["REF_TO_VALIDATE"], os.environ["GITHUB_SHA"]
+                )
+            }
+        )
+        return
     if args.command == "tags":
         print(
             "\n".join(
@@ -94,6 +129,7 @@ def main():
     release_version(release)
     revision = api("commits/" + quote(release["tag_name"], safe=""))["sha"]
     if args.command == "select":
+        revision = trusted_revision(revision, os.environ["GITHUB_SHA"])
         if bool(os.environ.get("DOCKERHUB_USERNAME")) != bool(
             os.environ.get("DOCKERHUB_TOKEN")
         ):

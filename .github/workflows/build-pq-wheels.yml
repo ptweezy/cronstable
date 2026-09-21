@@ -31,11 +31,19 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-docker
         if: matrix.platform == 'linux/386'
+      - name: Validate the released source against trusted history
+        if: inputs.ref != ''
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_TO_VALIDATE: ${{ inputs.ref }}
+          REFRESH: ${{ inputs.refresh }}
+        run: python3 .github/scripts/docker_refresh.py validate-ref
       - name: Check out the application revision
         if: inputs.ref != ''
         uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ steps.source.outputs.revision }}
           persist-credentials: false
       - name: Download resolved cryptography source
         uses: actions/download-artifact@v8.0.1

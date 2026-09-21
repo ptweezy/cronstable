@@ -124,6 +124,9 @@ The `.github/workflows/release.yml` workflow (named `CI`) runs on every `push` (
 
 Native `linux/386` binary, wheel, and image jobs use `.github/actions/setup-docker` before starting containers or BuildKit. It replaces runner Docker versions older than 29.4.3 with a pinned patched engine: 29.4.2's `socketcall` restriction breaks 32-bit networking. Newer runner engines pass through unchanged. Keep container security profiles enabled. APT index refreshes use `APT::Update::Error-Mode=any`, so a partial DNS/download failure reaches the existing retry logic instead of producing misleading package-not-found errors.
 
+Container refreshes accept only immutable release commits that are ancestors of the trusted workflow commit on `main`. Selection and the reusable builders validate this before checking out or executing the released source. A free-form ref, an unmerged branch, or an override outside a refresh fails closed. Validation code runs from the workflow checkout; refresh jobs still avoid saving compiler and image caches.
+
+
 
 The `tox-static` job runs `tox -e lint,mypy,bandit,openapi` on Ubuntu. The `tox` matrix runs Python 3.10–3.14 on Linux, Windows, and macOS. It also tests Linux ARM64 with Python 3.10 and 3.14, and Windows ARM64 with Python 3.14. Each runner selects both OS profiles with `tox -e py-windows,py-posix`; the profile that doesn't match the OS skips. Experimental Linux jobs test Python 3.15 and the free-threaded Python 3.14 build without blocking releases. Separate `tox-mindeps` and `backends-live` jobs check minimum dependency versions and real backend servers.
 
