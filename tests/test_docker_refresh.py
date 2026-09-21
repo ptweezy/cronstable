@@ -13,6 +13,7 @@ from strictyaml.ruamel import YAML
 ROOT = Path(__file__).resolve().parents[1]
 REVISION = "a" * 40
 RELEASE = {"id": 42, "tag_name": "v1.2.3", "draft": False, "prerelease": False}
+WORKFLOW_SHA = "b" * 40
 
 
 def load(name):
@@ -35,6 +36,76 @@ def ancestors(jobs, name):
     if isinstance(needs, str):
         needs = [needs]
     return set(needs).union(*(ancestors(jobs, n) for n in needs))
+
+
+@pytest.mark.parametrize("status", ["ahead", "identical"])
+def test_refresh_source_must_belong_to_trusted_workflow_history(
+    monkeypatch, status
+):
+    refresh = load("docker_refresh")
+    calls = []
+
+    def compare(path):
+        calls.append(path)
+        return {
+            "status": status,
+            "base_commit": {"sha": REVISION},
+            "merge_base_commit": {"sha": REVISION},
+        }
+
+    monkeypatch.setattr(refresh, "api", compare)
+    assert refresh.trusted_revision(REVISION, WORKFLOW_SHA) == REVISION
+    assert calls == [f"compare/{REVISION}...{WORKFLOW_SHA}"]
+
+
+@pytest.mark.parametrize(
+    "comparison",
+    [
+        {"status": "behind"},
+        {"status": "diverged"},
+        {"status": "ahead", "merge_base_commit": {"sha": "c" * 40}},
+        {"status": "ahead", "base_commit": {"sha": "c" * 40}},
+        {},
+    ],
+)
+def test_unmerged_or_unverifiable_source_is_rejected(monkeypatch, comparison):
+    refresh = load("docker_refresh")
+    response = {
+        "base_commit": {"sha": REVISION},
+        "merge_base_commit": {"sha": REVISION},
+        **comparison,
+    }
+    monkeypatch.setattr(refresh, "api", lambda path: response)
+    with pytest.raises(ValueError, match="outside"):
+        refresh.trusted_revision(REVISION, WORKFLOW_SHA)
+
+
+@pytest.mark.parametrize(
+    "revision", ["main", "v1.2.3", "a" * 39, REVISION + "\n"]
+)
+def test_mutable_or_malformed_source_never_reaches_github(
+    monkeypatch, revision
+):
+    refresh = load("docker_refresh")
+    monkeypatch.setattr(refresh, "api", lambda path: pytest.fail(path))
+    with pytest.raises(ValueError, match="commit SHAs"):
+        refresh.trusted_revision(revision, WORKFLOW_SHA)
+
+
+@pytest.mark.parametrize(
+    "refresh_mode,ref",
+    [("false", "refs/heads/main"), ("true", "refs/heads/feature")],
+)
+def test_source_override_cannot_escape_main_refresh_jobs(
+    monkeypatch, refresh_mode, ref
+):
+    refresh = load("docker_refresh")
+    monkeypatch.setattr(sys, "argv", ["docker_refresh.py", "validate-ref"])
+    monkeypatch.setenv("REFRESH", refresh_mode)
+    monkeypatch.setenv("GITHUB_REF", ref)
+    monkeypatch.setattr(refresh, "api", lambda path: pytest.fail(path))
+    with pytest.raises(ValueError, match="main refreshes"):
+        refresh.main()
 
 
 @pytest.mark.parametrize("tag", ["1.2.3", "v1.2.3"])

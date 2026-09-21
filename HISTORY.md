@@ -65,6 +65,10 @@
 - Upgrade affected CI workers to a patched Docker engine through a shared
   setup action, restoring 32-bit networking on Ubuntu 26 while retaining
   container security protections across binary, wheel, and image builds.
+- Validate container refresh source commits against the trusted workflow's
+  main-branch history before checkout or execution. Reusable image and wheel
+  builders reject mutable, divergent, and non-refresh source overrides,
+  addressing GitHub Actions cache-poisoning findings.
 - Treat partial APT index downloads as failures across CI and Docker builds,
   so network retries refresh the index before dependency installation.
 - Rebuild the latest stable release's Docker images daily and on demand

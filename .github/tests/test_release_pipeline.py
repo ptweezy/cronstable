@@ -98,7 +98,12 @@ def test_native_i686_uses_patched_docker_before_containers(name, job, field):
             if s.get("name") == "Check out the application revision"
         )
         assert steps.index(setup) < steps.index(checkout)
-        assert checkout["with"]["ref"] == "${{ inputs.ref }}"
+        assert (
+            checkout["with"]["ref"] == "${{ steps.source.outputs.revision }}"
+        )
+        validation = next(s for s in steps if s.get("id") == "source")
+        assert steps.index(validation) < steps.index(checkout)
+        assert validation["run"].endswith("docker_refresh.py validate-ref")
         assert "ref" not in steps[0].get("with", {})
 
 
