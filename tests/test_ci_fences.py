@@ -192,7 +192,7 @@ def test_perf_gate_override_is_resolved_once_and_honoured_everywhere():
     assert scan not in compare["run"], "a second marker scan"
     assert '"$PERF_MODE" = "ignore"' in compare["run"]
     assert '"$PERF_MODE" = "accept"' in compare["run"]
-    assert "Performance gate overridden" in compare["run"]
+    assert "Performance checks overridden" in compare["run"]
 
     release = wf["jobs"]["release-prepare"]
     steps = _named_steps(release)
