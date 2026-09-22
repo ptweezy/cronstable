@@ -42,8 +42,9 @@ async def test_failed_command_skips_verification(tmp_path):
 
 async def test_verifier_inherits_working_directory_and_environment(tmp_path):
     run = job(
-        "open('result', 'w').write('done')",
-        "import os; assert open('result').read() == os.environ['EXPECTED']",
+        "from pathlib import Path; Path('result').write_text('done')",
+        "import os; from pathlib import Path; "
+        "assert Path('result').read_text() == os.environ['EXPECTED']",
     )
     run.config.workingDirectory = str(tmp_path)
     run.config.environment = [{"key": "EXPECTED", "value": "done"}]

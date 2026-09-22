@@ -241,9 +241,9 @@ async def test_e2e_fanout_and_xcom(tmp_path, dag_cron):
     )
     # each mapped worker writes its injected item to work/<index>.
     worker = (
-        "import os;"
-        "open(os.path.join(r'{}', os.environ['CRONSTABLE_DAG_MAP_INDEX']),"
-        "'w').write(os.environ['CRONSTABLE_DAG_MAP_ITEM'])".format(outdir)
+        "import os; from pathlib import Path;"
+        "Path(r'{}', os.environ['CRONSTABLE_DAG_MAP_INDEX'])"
+        ".write_text(os.environ['CRONSTABLE_DAG_MAP_ITEM'])".format(outdir)
     )
     _set_cmd(cron, "fan", "work", [_PY, "-c", worker])
     _set_cmd(cron, "fan", "collect", [_PY, "-c", "pass"])
