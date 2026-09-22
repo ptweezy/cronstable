@@ -598,6 +598,7 @@ jobs:
             tests/test_web_logs_e2e.py \
             tests/test_web_keyboard_e2e.py \
             tests/test_web_dag_e2e.py \
+            tests/test_web_perf_e2e.py \
             tests/test_web_prefs_e2e.py \
             tests/test_web_surfaces_e2e.py
       # Every matrix cell uploads its own coverage.xml; Codecov merges them by
