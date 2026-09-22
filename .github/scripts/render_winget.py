@@ -63,7 +63,7 @@ def render(version, metadata, output):
         "installer": {
             "InstallerType": "wix",
             "Scope": "machine",
-            "ElevationRequirement": "elevationRequired",
+            "ElevationRequirement": "elevatesSelf",
             "UpgradeBehavior": "install",
             "Commands": ["cronstable"],
             "Installers": installers,

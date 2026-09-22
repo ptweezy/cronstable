@@ -86,7 +86,7 @@ def test_published_msi_metadata_and_identity(metadata, tmp_path):
     installer = manifests["installer"]
     assert installer["InstallerType"] == "wix"
     assert installer["Scope"] == "machine"
-    assert installer["ElevationRequirement"] == "elevationRequired"
+    assert installer["ElevationRequirement"] == "elevatesSelf"
     assert installer["UpgradeBehavior"] == "install"
     assert len(installer["Installers"]) == 2
     for entry, (arch, source) in zip(
