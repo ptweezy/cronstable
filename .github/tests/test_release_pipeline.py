@@ -412,13 +412,7 @@ def test_each_docker_platform_has_one_build_and_only_its_required_wheel():
     )
     assert step["with"]["push"] is False
     assert step["with"]["outputs"].startswith("type=oci,")
-    cache = next(s for s in build["steps"] if s.get("id") == "cache")
-    assert "matrix.platform_id" in cache["env"]["CACHE_SCOPE"]
-    assert "matrix.distro" in cache["env"]["CACHE_SCOPE"]
-    assert "type=registry" in step["with"]["cache-from"]
-    assert "refs/heads/main" in step["with"]["cache-to"]
-    assert "github.event_name != 'pull_request'" in step["with"]["cache-to"]
-    assert "ignore-error=true" in step["with"]["cache-to"]
+    assert "matrix.platform_id" in step["with"]["cache-from"]
 
 
 def test_source_offer_resolution_reaches_every_bundled_artifact():

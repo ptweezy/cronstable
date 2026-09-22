@@ -88,9 +88,6 @@ target/
 # CI-only: the QEMU binary jobs persist pip's cache here via actions/cache
 # (see binaries-container in .github/workflows/release.yml); never tracked.
 /.pip-cache/
-/.pq-cache/
-/.pq-pip-cache/
-/.freebsd-pip-cache/
 
 # mutmut working tree (tox/nightly mutation runs)
 /mutants/

@@ -4,15 +4,8 @@ import json
 import os
 import subprocess
 
-PREFIXES = (
-    "pq-work-",
-    "pq-pip-",
-    "armv6-work-",
-    "armv6-pip-",
-    "slow-pip-",
-    "freebsd-pip-",
-)
-BUDGET = 6 * 1024**3
+PREFIXES = ("pq-work-", "armv6-work-", "slow-pip-")
+BUDGET = 2 * 1024**3
 
 
 def victims(caches, budget=BUDGET):
@@ -50,10 +43,7 @@ def main():
             ["gh", "api", f"{endpoint}/{cache_id}", "--method", "DELETE"],
             check=True,
         )
-        print(
-            f"Removed compiler cache {cache_id} "
-            f"({BUDGET // 1024**3} GiB budget)"
-        )
+        print(f"Removed compiler cache {cache_id} (2 GiB total budget)")
 
 
 if __name__ == "__main__":

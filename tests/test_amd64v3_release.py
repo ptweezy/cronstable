@@ -135,15 +135,11 @@ def test_docker_variants_have_separate_tags_and_caches():
         "PYTHON_VARIANT=${{ matrix.python_variant }}"
         in build["with"]["build-args"]
     )
-    cache = next(
-        s for s in builds["jobs"]["build"]["steps"] if s.get("id") == "cache"
+    assert build["with"]["cache-from"] == (
+        "type=gha,scope=${{ matrix.distro }}-${{ matrix.platform_id }}"
     )
-    assert cache["env"]["CACHE_SCOPE"] == (
-        "${{ matrix.distro }}-${{ matrix.platform_id }}"
-    )
-    assert "$CACHE_SCOPE" in cache["run"]
-    assert "steps.cache.outputs.ref" in build["with"]["cache-from"]
-    assert "steps.cache.outputs.ref" in build["with"]["cache-to"]
+    assert "type=gha,mode=max,scope={0}-{1}" in build["with"]["cache-to"]
+    assert "matrix.distro, matrix.platform_id" in build["with"]["cache-to"]
     push = workflow()["jobs"]["docker-push"]
     assert "docker-release-${{ matrix.distro }}" in str(push["steps"])
     assert "docker/build-push-action" not in str(push["steps"])

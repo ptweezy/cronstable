@@ -16,7 +16,6 @@ env:
   PIP_TIMEOUT: '60'
 jobs:
   wheel:
-    name: Wheel (${{ matrix.libc }}, ${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -74,16 +73,6 @@ jobs:
         with:
           path: .pq-cache
           key: pq-work-${{ matrix.libc }}-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ inputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/build-pq-wheels.yml') }}
-        continue-on-error: true
-      - name: Restore Python build dependencies
-        id: pip-cache
-        if: ${{ !inputs.refresh }}
-        uses: actions/cache/restore@v6.1.0
-        with:
-          path: .pq-pip-cache
-          key: pq-pip-${{ matrix.libc }}-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ inputs.crypto-sha }}-${{ hashFiles('.github/scripts/compiler_fingerprint.py', '.github/workflows/build-pq-wheels.yml') }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            pq-pip-${{ matrix.libc }}-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ inputs.crypto-sha }}-${{ hashFiles('.github/scripts/compiler_fingerprint.py', '.github/workflows/build-pq-wheels.yml') }}-
         continue-on-error: true
       - name: Build the cryptography wheel (${{ matrix.libc }} ${{ matrix.arch }})
         env:
@@ -165,9 +154,6 @@ jobs:
               toolchain=$($PY .github/scripts/compiler_fingerprint.py)
               export CARGO_TARGET_DIR="/src/.pq-cache/target/$toolchain"
               export CARGO_HOME=/src/.pq-cache/cargo
-              export PIP_CACHE_DIR="/src/.pq-pip-cache/$toolchain"
-              mkdir -p "$PIP_CACHE_DIR"
-              chown -R root:root "$PIP_CACHE_DIR"
               $PY -m pip install --upgrade pip
               rm -rf /src/wheelhouse
               # The preflight resolves this source from pyproject and checks its hash.
@@ -195,15 +181,14 @@ jobs:
               ls -l /src/wheelhouse
             '
       - name: Make the caches readable by the cache save
-        if: ${{ !inputs.refresh }}
         run: |
           set -euo pipefail
-          for d in .pq-cache .pq-pip-cache wheelhouse .openssl-${{ matrix.arch }}; do
+          for d in .pq-cache wheelhouse .openssl-${{ matrix.arch }}; do
             if [ -d "$d" ]; then
               sudo chown -R "$(id -u):$(id -g)" "$d"
             fi
           done
-          python3 .github/scripts/cache_size.py .pq-cache --trim
+          python3 .github/scripts/cache_size.py .pq-cache
         id: cache-size
       - name: Save compiler work (trunk only)
         uses: actions/cache/save@v6.1.0
@@ -211,17 +196,6 @@ jobs:
           path: .pq-cache
           key: pq-work-${{ matrix.libc }}-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ inputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/build-pq-wheels.yml') }}
         if: ${{ !inputs.refresh && github.ref == 'refs/heads/main' && steps.cache-size.outputs.fits == 'true' }}
-        continue-on-error: true
-      - name: Bound the Python build dependency cache
-        id: pip-cache-size
-        if: ${{ !inputs.refresh }}
-        run: python3 .github/scripts/cache_size.py .pq-pip-cache --trim
-      - name: Save Python build dependencies (trunk only)
-        if: ${{ !inputs.refresh && github.ref == 'refs/heads/main' && steps.pip-cache-size.outputs.fits == 'true' && steps.pip-cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v6.1.0
-        with:
-          path: .pq-pip-cache
-          key: ${{ steps.pip-cache.outputs.cache-primary-key }}
         continue-on-error: true
       - name: Save the OpenSSL build (manylinux rows, trunk only)
         if: ${{ !inputs.refresh && matrix.manylinux && steps.openssl-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}

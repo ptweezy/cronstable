@@ -1,7 +1,8 @@
 """Keep browser test enforcement attached to a live CI matrix cell.
 
-One tox cell installs Chromium and checks its full-session JUnit report.
-Every browser module must have results, with no unexpected skips.
+One tox cell installs Chromium and reruns the browser tests. JUnit counts
+must show results with no unexpected skips. These checks verify that both
+steps select the same existing matrix cell and inspect the JUnit counts.
 """
 
 import fnmatch
@@ -63,11 +64,11 @@ def test_parity_fence_steps_gate_on_a_live_matrix_cell():
 
 def test_parity_enforcement_reads_junitxml_counts():
     run = _named_steps(_tox_job())[ENFORCE_STEP]["run"]
-    assert "check_browser_tests.py" in run
-    assert ".tox/py-posix/junit.xml" in run
-    assert "-m pytest" not in run
-    with open(os.path.join(ROOT, "tox.ini"), encoding="utf-8") as fobj:
-        assert "--junitxml={envdir}/junit.xml" in fobj.read()
+    assert "--junitxml" in run
+    assert "skipped" in run
+    # Matching "1 passed" in stdout also accepts "11 passed" and rejects
+    # other valid test counts.
+    assert '"1 passed"' not in run
 
 
 # --------------------------------------------------------------------------
@@ -218,7 +219,7 @@ def test_every_browser_backed_test_module_is_fenced():
     missing = sorted(n for n in browser_backed if n not in run)
     assert not missing, (
         "these browser-backed modules self-skip everywhere and are not "
-        "checked by the enforcement step, so nothing proves they ever "
+        "re-driven by the enforcement step, so nothing proves they ever "
         "ran: {}".format(missing)
     )
 

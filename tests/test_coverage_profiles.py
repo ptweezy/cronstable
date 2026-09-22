@@ -458,7 +458,7 @@ def test_commands_is_unconditional():
 
 
 def test_ci_runs_both_arms_and_names_the_right_envdir():
-    """CI selects both OS profiles and checks the POSIX env's test report."""
+    """CI selects both OS profiles and reruns browser tests in POSIX."""
     workflow = YAML(typ="safe").load(
         _read(os.path.join(ROOT, ".github", "workflows", "release.yml"))
     )
@@ -472,9 +472,6 @@ def test_ci_runs_both_arms_and_names_the_right_envdir():
         if step.get("name")
         == "Enforce the web engine differential ran (no silent skip)"
     )
-    assert (
-        ".tox/py-posix/bin/python .github/scripts/check_browser_tests.py"
-        in enforce
-    )
-    assert ".tox/py-posix/junit.xml" in enforce
-    assert "--junitxml={envdir}/junit.xml" in (_tox()["testenv"]["commands"])
+    assert ".tox/py-posix/bin/python -m pytest" in enforce
+    assert "--junitxml=parity-enforce.xml" in enforce
+    assert ".tox/py-posix/bin/python - <<'EOF'" in enforce
