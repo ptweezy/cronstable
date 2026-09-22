@@ -112,6 +112,60 @@ def test_dashboard_caches_wire_bytes_without_decoding(monkeypatch):
         cron._index_gzip.cache_clear()
 
 
+async def test_job_queues_scan_each_pool_once():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    class Entries(list):
+        scans = 0
+
+        def __iter__(self):
+            self.scans += 1
+            return super().__iter__()
+
+    def entry(key, job="job0", state="queued", **extra):
+        return {"id": key, "job": job, "state": state, **extra}
+
+    shared = Entries(
+        [
+            entry("first"),
+            entry("running", state="running"),
+            entry("task", task="extract"),
+            entry("second", task=None),
+            entry("other-job", job="job1"),
+            entry("done", state="finished"),
+        ]
+    )
+    other = Entries([entry("other-pool"), entry("third", job="job2")])
+    cron = SimpleNamespace(
+        pool_config={"shared": {}, "other": {}},
+        _pools=SimpleNamespace(
+            snapshot=AsyncMock(
+                return_value=[
+                    {"name": "shared", "entries": shared},
+                    {"name": "other", "entries": other},
+                ]
+            )
+        ),
+    )
+    jobs = [
+        {"name": f"job{i}", "pool": {"name": "shared"}} for i in range(25)
+    ] + [
+        {"name": "job2", "pool": {"name": "other"}},
+        {"name": "missing", "pool": {"name": "missing"}},
+        {"name": "unpooled"},
+    ]
+    await Cron._attach_job_queues(cron, jobs)
+    assert [e["id"] for e in jobs[0]["pool"]["queued"]] == ["first", "second"]
+    assert [e["id"] for e in jobs[1]["pool"]["queued"]] == ["other-job"]
+    assert jobs[2]["pool"]["queued"] == []
+    assert [e["id"] for e in jobs[-3]["pool"]["queued"]] == ["third"]
+    assert jobs[-2]["pool"]["queued"] == []
+    assert "pool" not in jobs[-1]
+    assert shared.scans == other.scans == 1
+    cron._pools.snapshot.assert_awaited_once()
+
+
 # --- 1. the fsync barrier protocol ----------------------------------------
 #
 # Each appended record must be made durable by exactly one file fsync AND

@@ -22,27 +22,16 @@ import ssl
 import time
 import zlib
 from collections import defaultdict, deque
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache, partial, wraps
-from typing import (  # noqa
+from typing import (
     TYPE_CHECKING,
     Any,
-    Awaitable,
-    Callable,
-    Coroutine,
-    Deque,
-    Dict,
-    FrozenSet,
     Generic,
-    Iterable,
-    List,
     NamedTuple,
     Optional,
-    Set,
-    Tuple,
-    Type,
     TypeVar,
-    Union,
 )
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -5738,16 +5727,18 @@ class Cron:
                 if "pool" in job:
                     job["pool"]["queueUnavailable"] = True
             return
+        # Keep each pool's queue order, but scan its entries only once even
+        # when hundreds of jobs share the pool.
+        queued = defaultdict(list)
+        for name, pool in pools.items():
+            for entry in pool.get("entries", []):
+                if entry["state"] == "queued" and not entry.get("task"):
+                    queued[name, entry.get("job")].append(entry)
         for job in jobs:
             if "pool" in job:
-                pool = pools.get(job["pool"]["name"], {})
-                job["pool"]["queued"] = [
-                    e
-                    for e in pool.get("entries", [])
-                    if e["state"] == "queued"
-                    and e.get("job") == job["name"]
-                    and not e.get("task")
-                ]
+                job["pool"]["queued"] = queued.get(
+                    (job["pool"]["name"], job["name"]), []
+                )
 
     def _bust_response_memos(self) -> None:
         """Drop the shared endpoint products so a local change renders now.

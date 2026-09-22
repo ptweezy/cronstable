@@ -12,14 +12,7 @@ import types
 from collections import Counter, OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import (
-    Any,
-    Literal,
-    NamedTuple,
-    NewType,
-    Optional,
-    Union,  # noqa
-)
+from typing import Any, Literal, NamedTuple, NewType, Optional
 from urllib.parse import ParseResult, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 

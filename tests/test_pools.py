@@ -98,6 +98,54 @@ async def test_queue_expiration_and_cancel_are_durable(dag_cron, monkeypatch):
     assert await cron._pools.acquire("database", one["id"]) is None
 
 
+async def test_admission_breaks_priority_and_time_ties_by_id(
+    dag_cron, monkeypatch
+):
+    cron = await make(dag_cron, monkeypatch)
+    for key in ("z", "b", "a", "low"):
+        await cron._pools.enqueue(cron.cron_jobs["one"], key=key)
+
+    def arrange(body):
+        for key, entry in body["entries"].items():
+            entry["priority"] = 0 if key == "low" else 10
+            entry["queuedAt"] = 1 if key in ("z", "low") else 2
+        return body, None
+
+    await cron.state_backend.mutate_document(NAMESPACE, "database", arrange)
+    for key in ("z", "a", "b", "low"):
+        if key != "low":
+            assert await cron._pools.acquire("database", "low") is None
+        ticket = await cron._pools.acquire("database", key)
+        assert ticket is not None
+        await cron._pools.finish(ticket)
+
+
+@pytest.mark.parametrize("limit", [0, 1, 32, 200, None])
+def test_waiting_selection_preserves_queue_order(limit):
+    import random
+
+    from cronstable.pools import _waiting
+
+    rng = random.Random(42)
+    entries = [
+        {
+            "id": str(i),
+            "priority": rng.randrange(-3, 4),
+            "queuedAt": rng.randrange(5),
+            "state": rng.choice(["queued", "running", "finished"]),
+        }
+        for i in range(100)
+    ]
+    expected = sorted(
+        (e for e in entries if e["state"] == "queued"),
+        key=lambda e: (-e["priority"], e["queuedAt"], e["id"]),
+    )[:limit]
+    assert (
+        _waiting({"entries": {e["id"]: e for e in entries}}, limit) == expected
+    )
+    assert _waiting({"entries": {}}, limit) == []
+
+
 async def test_pool_queue_bound(dag_cron, monkeypatch):
     cron = await make(dag_cron, monkeypatch)
     for _ in range(4):

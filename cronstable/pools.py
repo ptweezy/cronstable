@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import hashlib
+import heapq
 import json
 import logging
 import time
@@ -78,11 +79,15 @@ def _maintain(body: dict[str, Any], now: float) -> None:
         entries.pop(entry["id"], None)
 
 
-def _waiting(body):
-    return sorted(
-        (e for e in body["entries"].values() if e["state"] == "queued"),
-        key=lambda e: (-e["priority"], e["queuedAt"], e["id"]),
-    )
+def _queue_order(entry):
+    return (-entry["priority"], entry["queuedAt"], entry["id"])
+
+
+def _waiting(body, limit=None):
+    entries = (e for e in body["entries"].values() if e["state"] == "queued")
+    if limit is not None:
+        return heapq.nsmallest(limit, entries, key=_queue_order)
+    return sorted(entries, key=_queue_order)
 
 
 class PoolScheduler:
@@ -194,7 +199,7 @@ class PoolScheduler:
             if body["slots"] != conf["slots"]:
                 raise PoolError("pool is draining before a capacity change")
             if (
-                len(_waiting(body))
+                sum(e["state"] == "queued" for e in body["entries"].values())
                 + sum(_unobserved_task(e) for e in body["entries"].values())
                 >= conf["maxQueued"]
             ):
@@ -427,10 +432,18 @@ class PoolScheduler:
                 for e in body["entries"].values()
                 if e["state"] == "running"
             )
-            waiting = _waiting(body)
+            first = min(
+                (
+                    e
+                    for e in body["entries"].values()
+                    if e["state"] == "queued"
+                ),
+                key=_queue_order,
+                default=None,
+            )
             if (
-                not waiting
-                or waiting[0]["id"] != key
+                first is None
+                or first["id"] != key
                 or used + entry["slots"] > body["slots"]
             ):
                 return False
@@ -604,7 +617,7 @@ class PoolScheduler:
             body = await self._change(
                 pool, lambda body, now: copy.deepcopy(body)
             )
-        for entry in _waiting(body)[:32]:
+        for entry in _waiting(body, limit=32):
             payload = entry["payload"]
             if payload.get("kind") != "job":
                 continue

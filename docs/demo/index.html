@@ -7358,17 +7358,16 @@ var qrcode = function() {
     });
     const dir = state.sortDir;
     const key = state.sort;
-    // Decorate once for the Last-run sort: lastTs parses an ISO-8601 string,
-    // and calling it from inside the comparator is ~9000 Date parses for 500
-    // jobs when 500 answers are needed. WeakMap so a job object dropped by the
-    // next poll takes its key with it.
-    const tsKey = key === "last" ? new WeakMap() : null;
-    if (tsKey) for (const j of v) tsKey.set(j, lastTs(j));
+    // Parse last-run timestamps or count successful runs once per job, not
+    // on every comparison. Rebuild the keys each sort so changed histories
+    // are reflected even when a caller updates the same job object.
+    const sortKeys = key === "last" || key === "rate" ? new WeakMap() : null;
+    if (sortKeys) for (const j of v) sortKeys.set(j, key === "last" ? lastTs(j) : rateOf(j));
     v.sort((a, b) => {
       let r = 0;
       if (key === "name") r = _cmp(a.name, b.name);
       else if (key === "status") r = STATUS_ORDER[health(a).key] - STATUS_ORDER[health(b).key];
-      else if (key === "last") r = (tsKey.get(a) - tsKey.get(b));
+      else if (key === "last") r = (sortKeys.get(a) - sortKeys.get(b));
       else if (key === "next" || key === "nextat") r = ((a.scheduled_in == null ? Infinity : a.scheduled_in) - (b.scheduled_in == null ? Infinity : b.scheduled_in));
       else if (key === "duration") r = ((a.last_run && a.last_run.duration) || 0) - ((b.last_run && b.last_run.duration) || 0);
       else if (key === "owner") r = _cmp(ownerSortKey(a), ownerSortKey(b));
@@ -7378,7 +7377,7 @@ var qrcode = function() {
       else if (key === "policy") r = (!a.clusterPolicy - !b.clusterPolicy) || _cmp(a.clusterPolicy || "", b.clusterPolicy || "");
       // 1.5 parks no-history jobs past 100%, so the default ascending click
       // leads with the flakiest jobs and ends with the unknowns
-      else if (key === "rate") { const ra = rateOf(a), rb = rateOf(b); r = (ra == null ? 1.5 : ra) - (rb == null ? 1.5 : rb); }
+      else if (key === "rate") { const ra = sortKeys.get(a), rb = sortKeys.get(b); r = (ra == null ? 1.5 : ra) - (rb == null ? 1.5 : rb); }
       if (r === 0) r = _cmp(a.name, b.name);
       return r * dir;
     });
@@ -9319,9 +9318,21 @@ var qrcode = function() {
     for (const p of c.pts) { if (p[1] > v) v = p[1]; }
     return c.max != null ? Math.max(c.max, rcNiceCeil(v)) : rcNiceCeil(v * 1.12);
   }
-  function rcClock(t) { try { return new Date(t * 1000).toLocaleTimeString([], { hour12: false }); } catch (_) { return "—"; } }
   function rcRender(host, charts, opts) {
     opts = opts || {};
+    // Reuse locale setup throughout a chart's hover events. A redraw picks
+    // up the browser's current locale and timezone for both axes and hover.
+    let clockFormat = null;
+    function rcClock(t) {
+      try {
+        const d = new Date(t * 1000);
+        if (isNaN(d.getTime())) return d.toString();
+        if (!clockFormat) clockFormat = new Intl.DateTimeFormat([], {
+          hour12: false, hour: "numeric", minute: "numeric", second: "numeric",
+        });
+        return clockFormat.format(d);
+      } catch (_) { return "—"; }
+    }
     host.classList.add("rcgroup");
     let t0 = Infinity, t1 = -Infinity;
     charts.forEach((c) => { for (const p of c.pts) { if (p[0] < t0) t0 = p[0]; if (p[0] > t1) t1 = p[0]; } });
