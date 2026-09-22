@@ -6,11 +6,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 
 def fingerprint():
     digest = hashlib.sha256(sys.version.encode())
+    digest.update(sysconfig.get_platform().encode())
+    digest.update(str(sysconfig.get_config_var("SOABI")).encode())
     commands = [shlex.split(os.environ.get("CC", "cc")) + ["--version"]]
     if shutil.which("rustc"):
         commands.append(["rustc", "-vV"])
@@ -18,6 +21,7 @@ def fingerprint():
         ("apk", ["info", "-v"]),
         ("dpkg-query", ["-W"]),
         ("rpm", ["-qa"]),
+        ("pkg", ["query", "-a", "%n-%v"]),
     ):
         if shutil.which(tool):
             commands.append([tool, *args])
@@ -32,6 +36,8 @@ def fingerprint():
         "OPENSSL_DIR",
         "OPENSSL_LIB_DIR",
         "OPENSSL_STATIC",
+        "_PYTHON_HOST_PLATFORM",
+        "SODIUM_INSTALL",
     ):
         digest.update((key + "=" + os.environ.get(key, "")).encode())
     # Source-built OpenSSL isn't in the system package database.

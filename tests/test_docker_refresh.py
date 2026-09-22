@@ -270,8 +270,6 @@ def test_scheduled_refresh_gates_all_images_before_any_publication():
     assert {
         "prepare",
         "test",
-        "pq-wheels",
-        "pq-wheels-musl",
         "docker",
         "docker-glibc",
         "docker-musl",
@@ -281,14 +279,18 @@ def test_scheduled_refresh_gates_all_images_before_any_publication():
         "docker",
         "docker-glibc",
         "docker-musl",
-        "pq-wheels",
-        "pq-wheels-musl",
     ):
         assert jobs[name]["with"]["refresh"] is True
         assert (
             jobs[name]["with"]["ref"]
             == "${{ needs.prepare.outputs.revision }}"
         )
+    chained = workflow("build-docker-with-wheel")["jobs"]
+    assert chained["images"]["needs"] == "wheel"
+    assert chained["wheel"]["uses"].endswith("/build-pq-wheels.yml")
+    for job in chained.values():
+        assert job["with"]["refresh"] == "${{ inputs.refresh }}"
+        assert job["with"]["ref"] == "${{ inputs.ref }}"
     publish = jobs["publish"]
     assert (
         publish["concurrency"]

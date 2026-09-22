@@ -1,7 +1,7 @@
-# GitHub-hosted preview images not yet recognized by actionlint 1.7.12.
-# Remove these entries once actionlint includes the labels.
-# https://github.com/actions/runner-images/issues/14226
+# GitHub-hosted labels missing from actionlint 1.7.12's runner catalog.
+# https://github.com/actions/runner-images#available-images
 self-hosted-runner:
   labels:
     - ubuntu-26.04
     - ubuntu-26.04-arm
+    - xcode-27

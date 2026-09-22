@@ -5,7 +5,7 @@ name: CI
 # with the build fan-out. It builds PyInstaller binaries
 # for Linux (amd64, arm64, i686, armv7, ppc64le, s390x and riscv64 in both glibc
 # and musl/Alpine flavors, plus armv6 in musl only), macOS (arm64 + amd64 on
-# macOS 15, shipped; plus macOS 26/Tahoe as non-gating CI coverage) and Windows
+# macOS 15, shipped; plus macOS 26 and 27 as advisory CI coverage) and Windows
 # (amd64 + arm64), and every Docker image (8 distros, full arch set, build-only)
 # -- and gates on ALL of it. The `perf` job runs in the same fan-out: it
 # benchmarks this commit against the latest release tag (paired on one runner,
@@ -508,6 +508,12 @@ jobs:
     timeout-minutes: 30
     steps: &tox-steps
       - uses: actions/checkout@v7.0.1
+      - name: Verify macOS 27 runner
+        if: matrix.os == 'xcode-27'
+        run: |
+          sw_vers
+          test "$(sw_vers -productVersion | cut -d. -f1)" = 27
+          test "$(uname -m)" = arm64
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python }}
@@ -574,22 +580,14 @@ jobs:
           assert int(suite.get("skipped", 0)) == 0, "the live test skipped"
           EOF
 
-      # The differential self-skips wherever Chromium is missing (every other
-      # cell, by design), so THIS cell must prove it actually ran: re-drive it
-      # through the tox env's own interpreter (and therefore the env's own
-      # resolved playwright, the one that must find the browser fetched above)
-      # and require a pass, not a skip. Cheap (<1s after the suite), and
-      # without it a pip/uv resolution skew quietly restores the
-      # "nothing compares the second engine" state this cell exists to end.
-      # The check reads pytest's junitxml counts (at least one test, zero
-      # failures, zero errors, zero skips) rather than grepping stdout for a
-      # literal "1 passed", which a second test in the file would flip to a
-      # false red.
+      # Read the full suite's report and require results for every browser
+      # module. Expected failures are allowed; unexpected skips fail the job.
       - name: Enforce the web engine differential ran (no silent skip)
         if: matrix.os == 'ubuntu-26.04' && matrix.python == '3.14'
         run: |
           set -euo pipefail
-          .tox/py-posix/bin/python -m pytest \
+          .tox/py-posix/bin/python .github/scripts/check_browser_tests.py \
+            .tox/py-posix/junit.xml \
             tests/test_web_engine_parity.py \
             tests/test_web_heat_e2e.py \
             tests/test_web_drawer_e2e.py \
@@ -607,31 +605,7 @@ jobs:
             tests/test_web_keyboard_e2e.py \
             tests/test_web_dag_e2e.py \
             tests/test_web_prefs_e2e.py \
-            tests/test_web_surfaces_e2e.py \
-            -v -rs --junitxml=parity-enforce.xml
-          .tox/py-posix/bin/python - <<'EOF'
-          import xml.etree.ElementTree as ET
-          totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
-          for suite in ET.parse("parity-enforce.xml").getroot().iter("testsuite"):
-              for key in totals:
-                  totals[key] += int(suite.get(key, 0))
-          # JUnit XML includes expected failures in the skipped count.
-          # Exclude pytest.xfail results because those tests ran and failed
-          # as expected.
-          root = ET.parse("parity-enforce.xml").getroot()
-          totals["skipped"] -= sum(
-              1
-              for mark in root.iter("skipped")
-              if mark.get("type") == "pytest.xfail"
-          )
-          print("parity differential:", totals)
-          assert totals["tests"] >= 1, "no parity test was collected"
-          assert totals["failures"] == 0 and totals["errors"] == 0
-          assert totals["skipped"] == 0, (
-              "a parity test skipped in the one cell that provisions "
-              "Chromium: the browser install or resolution went stale"
-          )
-          EOF
+            tests/test_web_surfaces_e2e.py
       # Every matrix cell uploads its own coverage.xml; Codecov merges them by
       # flag into one combined number. fail_ci_if_error stays false so a Codecov
       # outage never reds the build (and fork PRs with no token still pass).
@@ -661,6 +635,11 @@ jobs:
         # interpreter lock (GIL).
         python: ['3.15', '3.14t']
         experimental: [true]
+        include:
+          # GitHub hosts macOS 27 on the xcode-27 ARM64 preview image.
+          - os: xcode-27
+            python: '3.14'
+            experimental: true
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
     # The suite runs in 2-9 min per cell (Windows is the slow end); 30 still
@@ -857,10 +836,9 @@ jobs:
   # this file, and it is the prerequisite artifact for a later nixpkgs
   # submission, so it needs a gate that notices when it stops evaluating.
   #
-  # CI-ONLY, like the macOS 26 row: continue-on-error, and the release does not
-  # wait on it because releases ship no Nix artifact. flake.lock pins both
-  # toolchains so reruns test the same dependency recipes; input updates must
-  # pass evaluation and native builds before their compatibility is confirmed.
+  # Nix checks are advisory. flake.lock pins both toolchains so reruns test
+  # the same dependency recipes; input updates must pass evaluation and
+  # native builds before their compatibility is confirmed.
   # Wait for required tests so advisory Intel Nix does not occupy a scarce
   # macOS worker while a required Python test is still queued.
   nix:
@@ -2357,12 +2335,10 @@ jobs:
         if: github.ref == 'refs/heads/main' && steps.cache-size.outputs.fits == 'true'
         continue-on-error: true
 
-  # Self-contained macOS binaries. The shipped pair is macOS 15 (arm64 + amd64),
-  # signed + notarized on a release. macOS 26 (Tahoe) is built too for early
-  # OS-version breakage signal, but it is CI-ONLY: continue-on-error so a flaky
-  # Tahoe build never blocks a release, and it is neither signed nor attached.
-  # `ship` picks the shipped rows; `asset` names the artifact (the shipped ones
-  # keep the bare `macos-<arch>` names the Release + Homebrew formula expect).
+  # Release binaries build on macOS 15 for OS compatibility. Advisory builds
+  # exercise macOS 26 and 27 and upload unsigned CI artifacts. The `ship` flag
+  # controls signing and release status; `asset` names each artifact. Release
+  # assets use the macos-<arch> names expected by the Homebrew formula.
   # Intel compatibility rows stay gated and ship with ARM. Retirement map:
   # wiki/Contributing-and-Releasing.md, "Intel Mac support".
   binaries-macos:
@@ -2395,13 +2371,19 @@ jobs:
             pq: soft
             pq_src: '1'
     runs-on: ${{ matrix.runner }}
-    # The macOS 26 rows are coverage-only: never let them gate a release.
+    # Rows with ship: false provide advisory coverage.
     continue-on-error: ${{ !matrix.ship }}
     steps: &macos-steps
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
       # setuptools_scm never walks history here, and its git file-finder (which
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
+      - name: Verify macOS 27 runner
+        if: matrix.runner == 'xcode-27'
+        run: |
+          sw_vers
+          test "$(sw_vers -productVersion | cut -d. -f1)" = 27
+          test "$(uname -m)" = arm64
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
@@ -2619,6 +2601,11 @@ jobs:
             ship: false
             asset: macos26-arm64
             pq: hard   # see the macOS 15 arm64 row
+          - arch: arm64
+            runner: xcode-27         # macOS 27, Apple Silicon preview
+            ship: false
+            asset: macos27-arm64
+            pq: hard
           - arch: amd64
             runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
             ship: false
@@ -2632,7 +2619,7 @@ jobs:
             pq: soft
             pq_src: '1'
     runs-on: ${{ matrix.runner }}
-    # The macOS 26 rows are coverage-only: never let them gate a release.
+    # Rows with ship: false provide advisory coverage.
     continue-on-error: ${{ !matrix.ship }}
     steps: *macos-steps
 
@@ -2709,6 +2696,15 @@ jobs:
       # setuptools_scm never walks history here, and its git file-finder (which
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
+      - name: Restore FreeBSD source wheels
+        id: pip-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .freebsd-pip-cache
+          key: freebsd-pip-14.3-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', 'pyinstaller/*.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/release.yml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            freebsd-pip-14.3-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', 'pyinstaller/*.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/release.yml') }}-
+        continue-on-error: true
       - name: Build binary (FreeBSD ${{ matrix.vmarch }})
         uses: vmactions/freebsd-vm@v1.5.7
         env:
@@ -2746,8 +2742,6 @@ jobs:
             fi
             "$runtime" -m venv --without-pip venv
             retry 5 fetch -o get-pip.py https://bootstrap.pypa.io/get-pip.py
-            venv/bin/python get-pip.py
-
             # install_extra.sh / install_orjson.sh read these; the venv has
             # no activate step in a non-interactive sh.
             PIP="venv/bin/pip"
@@ -2767,6 +2761,14 @@ jobs:
             CFLAGS="${{ matrix.cflags }}"
             LDFLAGS="-L/usr/local/lib"
             export CFLAGS LDFLAGS
+            # Each installed toolchain and OpenSSL version gets its own wheels.
+            toolchain=$(OPENSSL_DIR=/usr/local OPENSSL_STATIC=1 SODIUM_INSTALL=system \
+              "$runtime" .github/scripts/compiler_fingerprint.py)
+            PIP_CACHE_DIR="$PWD/.freebsd-pip-cache/$toolchain"
+            export PIP_CACHE_DIR
+            mkdir -p "$PIP_CACHE_DIR"
+            chown -R root:wheel "$PIP_CACHE_DIR"
+            venv/bin/python get-pip.py
 
             # Deliberately NOT wrapped in retry: no FreeBSD wheel exists, so
             # this COMPILES the bootloader rather than downloading one, and
@@ -2867,10 +2869,21 @@ jobs:
             test -x /usr/local/etc/rc.d/cronstable
             pw usershow cronstable >/dev/null
             mv dist/pkgout/cronstable-*.pkg "dist/cronstable-freebsd-${{ matrix.arch }}.pkg"
-            # Keep the copyback to the artifact: the venv and PyInstaller's
-            # work tree are hundreds of megabytes of rsync the host has no
-            # use for.
+            # Copy back the artifacts and dependency cache. Discard temporary
+            # build files before syncing the workspace to the host.
             rm -rf venv build get-pip.py freebsd-pkg-work dist/pkgout
+      - name: Bound the FreeBSD source-wheel cache
+        id: cache-size
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" .freebsd-pip-cache
+          python3 .github/scripts/cache_size.py .freebsd-pip-cache --trim
+      - name: Save FreeBSD source wheels (trunk only)
+        if: github.ref == 'refs/heads/main' && steps.cache-size.outputs.fits == 'true' && steps.pip-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .freebsd-pip-cache
+          key: ${{ steps.pip-cache.outputs.cache-primary-key }}
+        continue-on-error: true
       - name: Check every declared binary artifact
         shell: bash
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-freebsd-${{ matrix.arch }}" "dist/cronstable-freebsd-${{ matrix.arch }}.pkg"
@@ -3726,56 +3739,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  # cryptography wheels for the image platforms PyPI publishes none for, so
-  # every image seals post-quantum push on every arch it ships. Built once
-  # per (libc, arch) here and handed to Docker platform jobs as a wheelhouse
-  # (docker/wheelhouse/<libc>/, which the Dockerfiles COPY beside
-  # pyproject.toml and pip reads with --find-links), rather than compiled
-  # inside each image build: six images build s390x, and one QEMU Rust
-  # compile of cryptography is an hour or more.
-  #
-  # Each row builds in the container the wheel must load in: Alpine 3.23 for
-  # the musl rows (distro rust + OpenSSL 3.5, static), Debian trixie for the
-  # glibc i686 and riscv64 rows (same, from apt; every consumer of those two
-  # arches is trixie or newer), and manylinux_2_28 for glibc s390x, whose
-  # consumers span RHEL 10 (glibc 2.39) through Ubuntu 26.04, so the wheel
-  # is built against the oldest of them with a rustup Rust and an OpenSSL
-  # built from source (build_openssl.sh, cached). Every row builds with
-  # CPython 3.11: the build interpreter sets the floor of the abi3 tag on
-  # the wheel, and cp311-abi3 (the tag the PyPI wheels carry) loads on
-  # every image interpreter, where a newer floor would keep the wheel out
-  # of the rhel (3.12) and opensuse (3.13) images. The wheel carries the
-  # plain linux_<arch> tag of an unrepaired build, or the manylinux tag
-  # that maturin assigns inside a manylinux image; extract_deps.py matches
-  # the machine either way, and the per-libc directories keep a musl wheel
-  # away from a glibc image and a glibc wheel away from a musl image.
-  #
-  # Every row is best-effort at the job level (continue-on-error), so a
-  # failed compile costs that platform its post-quantum suite (the image
-  # then seals x25519 only, which extract_deps.py reports) rather than the
-  # release. Every run resolves fresh sources; compiler work is reused only
-  # within a matching source, image and installed toolchain. Cache writes are
-  # bounded and trunk-only. libc groups release their Docker consumers separately.
-  pq-wheels:
-    needs: [version, preflight]
-    uses: ./.github/workflows/build-pq-wheels.yml
-    with:
-      matrix: ${{ needs.version.outputs.pq-glibc }}
-      version: ${{ needs.version.outputs.new }}
-      release: ${{ needs.version.outputs.release == 'true' }}
-      cryptography: ${{ needs.preflight.outputs.cryptography }}
-      crypto-sha: ${{ needs.preflight.outputs.crypto-sha }}
-
-  pq-wheels-musl:
-    needs: [version, preflight]
-    uses: ./.github/workflows/build-pq-wheels.yml
-    with:
-      matrix: ${{ needs.version.outputs.pq-musl }}
-      version: ${{ needs.version.outputs.new }}
-      release: ${{ needs.version.outputs.release == 'true' }}
-      cryptography: ${{ needs.preflight.outputs.cryptography }}
-      crypto-sha: ${{ needs.preflight.outputs.crypto-sha }}
-
+  # The ARMv6 binary consumes a separate glibc cryptography wheel with static
+  # OpenSSL. The wheel must pass the daemon's X-Wing probe and the ARMv6/VFPv2
+  # instruction checks. A failed optional build leaves the x25519 fallback.
+  # Compiler work and Python build dependencies are cached by toolchain;
+  # cache uploads are bounded and restricted to main.
   pq-wheel-armv6:
     needs:
       - version
@@ -3804,6 +3772,15 @@ jobs:
         with:
           path: .pq-cache
           key: armv6-work-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/release.yml') }}
+        continue-on-error: true
+      - name: Restore ARMv6 Python build dependencies
+        id: pip-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .pq-pip-cache
+          key: armv6-pip-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('.github/scripts/compiler_fingerprint.py', '.github/workflows/release.yml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            armv6-pip-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('.github/scripts/compiler_fingerprint.py', '.github/workflows/release.yml') }}-
         continue-on-error: true
       - name: Build the cryptography wheel (glibc armv6)
         env:
@@ -3845,6 +3822,9 @@ jobs:
               export OPENSSL_DIR OPENSSL_STATIC
               toolchain=$(/v/bin/python .github/scripts/compiler_fingerprint.py)
               export CARGO_TARGET_DIR="/src/.pq-cache/target/$toolchain"
+              export PIP_CACHE_DIR="/src/.pq-pip-cache/$toolchain"
+              mkdir -p "$PIP_CACHE_DIR"
+              chown -R root:root "$PIP_CACHE_DIR"
               rm -rf /src/wheelhouse
               # The preflight resolves this source from pyproject and checks its hash.
               /v/bin/pip wheel --no-deps --wheel-dir /src/wheelhouse /src/release-inputs/cryptography-${{ needs.preflight.outputs.cryptography }}.tar.gz
@@ -3880,8 +3860,8 @@ jobs:
       - name: Make the wheelhouse readable by the cache save
         run: |
           set -euo pipefail
-          sudo chown -R "$(id -u):$(id -g)" .pq-cache wheelhouse
-          python3 .github/scripts/cache_size.py .pq-cache
+          sudo chown -R "$(id -u):$(id -g)" .pq-cache .pq-pip-cache wheelhouse
+          python3 .github/scripts/cache_size.py .pq-cache --trim
         id: cache-size
       - name: Save ARMv6 compiler work (trunk only)
         uses: actions/cache/save@v6.1.0
@@ -3889,6 +3869,16 @@ jobs:
           path: .pq-cache
           key: armv6-work-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/release.yml') }}
         if: github.ref == 'refs/heads/main' && steps.cache-size.outputs.fits == 'true'
+        continue-on-error: true
+      - name: Bound the ARMv6 Python build dependency cache
+        id: pip-cache-size
+        run: python3 .github/scripts/cache_size.py .pq-pip-cache --trim
+      - name: Save ARMv6 Python build dependencies (trunk only)
+        if: github.ref == 'refs/heads/main' && steps.pip-cache-size.outputs.fits == 'true' && steps.pip-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .pq-pip-cache
+          key: ${{ steps.pip-cache.outputs.cache-primary-key }}
         continue-on-error: true
       - uses: actions/upload-artifact@v7.0.1
         with:
@@ -3899,7 +3889,7 @@ jobs:
 
   # Cache maintenance is best-effort and never gates publication.
   compiler-cache-budget:
-    needs: [pq-wheels, pq-wheels-musl, pq-wheel-armv6, binaries-mips, binaries-loong64]
+    needs: [docker-glibc, docker-musl, pq-wheel-armv6, binaries-mips, binaries-loong64, binaries-freebsd]
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'ptweezy/cronstable' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 5
@@ -3914,11 +3904,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/prune_ci_caches.py
 
-  # Each platform builds once. Native/wheel-independent platforms start at
-  # once; foreign platforms wait only for their libc wheel group. Assembly
+  # Each platform builds once. Platforms that need a source wheel wait for
+  # that architecture's wheel. Other platforms start after preflight. Assembly
   # checks every image before the release; publishing copies those same bytes.
   docker:
     needs: [version, preflight]
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/build-docker.yml
     with:
       matrix: ${{ needs.version.outputs.docker-none }}
@@ -3927,22 +3920,44 @@ jobs:
       zeroconf: ${{ needs.preflight.outputs.zeroconf }}
 
   docker-glibc:
-    needs: [version, preflight, pq-wheels]
-    uses: ./.github/workflows/build-docker.yml
+    name: Docker glibc (${{ matrix.arch }})
+    needs: [version, preflight]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
+      matrix:
+        include: ${{ fromJSON(needs.version.outputs.pq-glibc) }}
+    uses: ./.github/workflows/build-docker-with-wheel.yml
     with:
-      matrix: ${{ needs.version.outputs.docker-glibc }}
+      wheel: ${{ toJSON(matrix) }}
+      matrix: ${{ toJSON(matrix.docker) }}
       version: ${{ needs.version.outputs.new }}
       release: ${{ needs.version.outputs.release == 'true' }}
       zeroconf: ${{ needs.preflight.outputs.zeroconf }}
+      cryptography: ${{ needs.preflight.outputs.cryptography }}
+      crypto-sha: ${{ needs.preflight.outputs.crypto-sha }}
 
   docker-musl:
-    needs: [version, preflight, pq-wheels-musl]
-    uses: ./.github/workflows/build-docker.yml
+    name: Docker musl (${{ matrix.arch }})
+    needs: [version, preflight]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: ${{ needs.version.outputs.release == 'true' }}
+      matrix:
+        include: ${{ fromJSON(needs.version.outputs.pq-musl) }}
+    uses: ./.github/workflows/build-docker-with-wheel.yml
     with:
-      matrix: ${{ needs.version.outputs.docker-musl }}
+      wheel: ${{ toJSON(matrix) }}
+      matrix: ${{ toJSON(matrix.docker) }}
       version: ${{ needs.version.outputs.new }}
       release: ${{ needs.version.outputs.release == 'true' }}
       zeroconf: ${{ needs.preflight.outputs.zeroconf }}
+      cryptography: ${{ needs.preflight.outputs.cryptography }}
+      crypto-sha: ${{ needs.preflight.outputs.crypto-sha }}
 
   docker-assemble:
     needs: [version, docker, docker-glibc, docker-musl]
@@ -4893,10 +4908,8 @@ jobs:
             git push origin "refs/tags/$NEW"
           fi
 
-      # Pull in every per-arch binary the gate built (fast + slow). The pattern
-      # is broad and flattens them into ./binaries; the CI-only macOS 26 assets
-      # (cronstable-macos26-*) land here too but are neither hashed nor attached
-      # below (the lists are explicit).
+      # Publish the prepared release assets. Advisory macOS artifacts use
+      # versioned names and are excluded from the explicit file list.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3.0.3
         with:

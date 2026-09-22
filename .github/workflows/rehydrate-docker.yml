@@ -104,32 +104,11 @@ jobs:
           python -m pip install -r requirements_dev.txt '.[speedups,push,discovery]'
           python -m pytest -q
 
-  pq-wheels:
-    needs: prepare
-    uses: ./.github/workflows/build-pq-wheels.yml
-    with:
-      matrix: ${{ needs.prepare.outputs.pq-glibc }}
-      version: ${{ needs.prepare.outputs.version }}
-      release: false
-      ref: ${{ needs.prepare.outputs.revision }}
-      refresh: true
-      cryptography: ${{ needs.prepare.outputs.cryptography }}
-      crypto-sha: ${{ needs.prepare.outputs.crypto-sha }}
-
-  pq-wheels-musl:
-    needs: prepare
-    uses: ./.github/workflows/build-pq-wheels.yml
-    with:
-      matrix: ${{ needs.prepare.outputs.pq-musl }}
-      version: ${{ needs.prepare.outputs.version }}
-      release: false
-      ref: ${{ needs.prepare.outputs.revision }}
-      refresh: true
-      cryptography: ${{ needs.prepare.outputs.cryptography }}
-      crypto-sha: ${{ needs.prepare.outputs.crypto-sha }}
-
   docker:
     needs: prepare
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/build-docker.yml
     with:
       matrix: ${{ needs.prepare.outputs.docker-none }}
@@ -140,26 +119,48 @@ jobs:
       zeroconf: ${{ needs.prepare.outputs.zeroconf }}
 
   docker-glibc:
-    needs: [prepare, pq-wheels]
-    uses: ./.github/workflows/build-docker.yml
+    name: Docker glibc (${{ matrix.arch }})
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.pq-glibc) }}
+    uses: ./.github/workflows/build-docker-with-wheel.yml
     with:
-      matrix: ${{ needs.prepare.outputs.docker-glibc }}
+      wheel: ${{ toJSON(matrix) }}
+      matrix: ${{ toJSON(matrix.docker) }}
       version: ${{ needs.prepare.outputs.version }}
       release: false
       ref: ${{ needs.prepare.outputs.revision }}
       refresh: true
       zeroconf: ${{ needs.prepare.outputs.zeroconf }}
+      cryptography: ${{ needs.prepare.outputs.cryptography }}
+      crypto-sha: ${{ needs.prepare.outputs.crypto-sha }}
 
   docker-musl:
-    needs: [prepare, pq-wheels-musl]
-    uses: ./.github/workflows/build-docker.yml
+    name: Docker musl (${{ matrix.arch }})
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.pq-musl) }}
+    uses: ./.github/workflows/build-docker-with-wheel.yml
     with:
-      matrix: ${{ needs.prepare.outputs.docker-musl }}
+      wheel: ${{ toJSON(matrix) }}
+      matrix: ${{ toJSON(matrix.docker) }}
       version: ${{ needs.prepare.outputs.version }}
       release: false
       ref: ${{ needs.prepare.outputs.revision }}
       refresh: true
       zeroconf: ${{ needs.prepare.outputs.zeroconf }}
+      cryptography: ${{ needs.prepare.outputs.cryptography }}
+      crypto-sha: ${{ needs.prepare.outputs.crypto-sha }}
 
   assemble:
     needs: [prepare, test, docker, docker-glibc, docker-musl]
