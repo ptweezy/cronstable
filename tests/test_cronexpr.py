@@ -1042,7 +1042,11 @@ def test_field_caches_are_bounded_and_keep_parsing(monkeypatch):
     assert not cronexpr._SORTED_CACHE
 
 
-def test_field_cache_shares_values_between_tabs():
+def test_field_cache_shares_values_between_tabs(monkeypatch):
+    # Empty caches: the shared ones stop interning at the cap, which a
+    # Hypothesis run earlier in a randomized order can reach.
+    for name in ("_PLAIN_CACHE", "_DOM_CACHE", "_DOW_CACHE", "_SORTED_CACHE"):
+        monkeypatch.setattr(cronexpr, name, {})
     a = CronTab("*/5 8-18 1,15 * *")
     b = CronTab("*/5 8-18 1,15 * *")
     # identity, not just equality: this is the whole point of the cache
