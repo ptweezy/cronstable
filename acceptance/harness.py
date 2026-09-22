@@ -298,6 +298,20 @@ class Daemon:
 
         self.wait("waiting for orphaned jobs to exit", gone, alive=False)
 
+    def inflight_open(self, job):
+        """Whether the store holds a visible ``open`` record for ``job``.
+
+        The daemon writes this record after it spawns the job, so the job
+        can produce output before the record is visible.
+        """
+        records = (self.work / "state").glob(
+            f"*/records/inflight%2F{job}/*.json"
+        )
+        return any(
+            json.loads(path.read_bytes())["data"].get("kind") == "open"
+            for path in records
+        )
+
     def store_files(self):
         """Read every visible state file, parsing JSON where applicable.
 

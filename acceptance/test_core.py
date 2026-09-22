@@ -136,6 +136,11 @@ def test_hard_kill_mid_run_reconciles_on_restart(daemon):
     daemon.request("/jobs/crash/start", method="POST")
     daemon.wait("starting the workload", lambda: daemon.lines("started.log"))
     assert daemon.runs("crash") == []
+    # A kill before the in-flight record is visible leaves nothing to
+    # reconcile.
+    daemon.wait(
+        "recording the run as in flight", lambda: daemon.inflight_open("crash")
+    )
     # No handler runs: the daemon cannot record a completion, close the
     # in-flight record, or release anything.
     daemon.kill()
