@@ -1,5 +1,10 @@
 # History
 
+## 1.2.57
+
+- Windows installers and executables identify themselves as `cronstable`
+  in User Account Control (UAC) prompts, including installs through WinGet.
+
 ## 1.2.56
 
 - Reduce shared-pool overhead by scanning each pool's entries once when

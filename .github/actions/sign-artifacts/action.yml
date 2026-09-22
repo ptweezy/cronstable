@@ -36,6 +36,8 @@ inputs:
     description: Extension to sign within that folder (exe, msi).
     required: true
 
+# Windows uses the Authenticode description for the application name in
+# User Account Control (UAC) prompts, including cached MSI packages.
 runs:
   using: composite
   steps:
@@ -50,6 +52,7 @@ runs:
         files-folder: ${{ inputs.files-folder }}
         files-folder-filter: ${{ inputs.files-folder-filter }}
         files-folder-recurse: false
+        description: cronstable
         file-digest: SHA256
         timestamp-rfc3161: http://timestamp.acs.microsoft.com
         timestamp-digest: SHA256
@@ -73,6 +76,7 @@ runs:
         files-folder: ${{ inputs.files-folder }}
         files-folder-filter: ${{ inputs.files-folder-filter }}
         files-folder-recurse: false
+        description: cronstable
         file-digest: SHA256
         timestamp-rfc3161: http://timestamp.acs.microsoft.com
         timestamp-digest: SHA256
@@ -98,6 +102,7 @@ runs:
         files-folder: ${{ inputs.files-folder }}
         files-folder-filter: ${{ inputs.files-folder-filter }}
         files-folder-recurse: false
+        description: cronstable
         file-digest: SHA256
         timestamp-rfc3161: http://timestamp.acs.microsoft.com
         timestamp-digest: SHA256
