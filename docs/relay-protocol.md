@@ -243,10 +243,13 @@ path.
 A relay may bound how many alerts it forwards to one device per UTC
 calendar month, and lift that bound for devices holding a paid
 entitlement. The hosted relay does: `RELAY_FREE_MONTHLY_FORWARDS`
-(500) forwards per device per month on the free plan, unlimited with a
-Cronstable Pro entitlement. Only alerts that reach APNs count; coalesced,
-suppressed, and rate-limited envelopes do not, and neither do digests.
-The month rolls over at 00:00 UTC on the first.
+(500) forwards per device per month without a subscription, unlimited with a
+verified Cronstable Pro subscription for iOS. Only alerts that reach APNs
+count; coalesced, suppressed, and rate-limited envelopes do not, and neither
+do digests. The month rolls over at 00:00 UTC on the first.
+
+These quotas are relay service policy. The daemon's push reporter requires
+no subscription or license key, and a self-hosted relay chooses its own policy.
 
 Past the bound the relay stops forwarding individual alerts and answers
 each envelope with:
@@ -267,9 +270,9 @@ per-alert pushes until the month resets or the device becomes entitled.
 
 ## Entitlement proof
 
-A device proves a paid entitlement to the relay with the App Store's own
-signed transaction (a StoreKit 2 `jwsRepresentation`, ES256 JWS with an
-`x5c` chain to Apple Root CA G3). The relay verifies it offline: the
+A device proves its Cronstable Pro subscription for iOS to the relay with the
+App Store's own signed transaction (a StoreKit 2 `jwsRepresentation`, ES256 JWS
+with an `x5c` chain to Apple Root CA G3). The relay verifies it offline: the
 chain (pinned root, validity windows, Apple's in-app purchase marker
 extension `1.2.840.113635.100.6.11.1` on the leaf), the signature, the
 `bundleId` against the relay's APNs topic, a `productId` in the relay's

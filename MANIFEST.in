@@ -25,9 +25,6 @@ recursive-exclude * __pycache__
 recursive-exclude * *.py[co]
 recursive-exclude env *
 
-# Proprietary trees are never shipped in the public MIT sdist (PyPI).
-prune pro
-
 # docs/ is the website tree. setuptools_scm's git file finder seeds the sdist
 # with every tracked file before this file is even read, so the ~116 MB of
 # screenshots and diagrams under docs/ rode along and pushed the 1.2.31 sdist

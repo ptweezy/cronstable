@@ -1,41 +1,14 @@
 # Licensing
 
-This repository is **MIT-licensed by default**. The full text is in
-[LICENSE](LICENSE). It applies to everything in the repository **except** a
-directory that ships its own `LICENSE` file, which governs that directory
-instead.
+cronstable's source code, documentation, tests, and packaging are licensed
+under the [MIT License](LICENSE). The rendered brand artwork listed below is
+excluded from that grant. Third-party code and dependencies retain their own
+licenses; their notices and distribution details are described below.
 
-This file travels with the code: it is packaged (alongside
-[TRADEMARKS.md](TRADEMARKS.md)) into every wheel's `dist-info/licenses/`
-directory. Paths in this document are **repository paths**. A distribution does
-not contain most of them, because `pro/` and the `docs/` website tree are pruned
-from everything published (see `MANIFEST.in`). The paths still identify exactly
-which files each statement is about, and you can inspect all of them at
-<https://github.com/ptweezy/cronstable>.
-
-## Why this file exists
-
-This project is planned to grow.
-
-## The rule
-
-1. The root [LICENSE](LICENSE) (MIT) governs the whole repository by default.
-2. A directory that contains its own `LICENSE` file is governed **only** by that
-   license, for that directory and everything under it.
-3. For any file, the nearest `LICENSE` found walking up the directory tree wins.
-   If none is found before the root, the root MIT LICENSE applies.
-
-## Current layout
-
-| Path | License | Notes |
-| --- | --- | --- |
-| `/` core (`cronstable/`, docs, tests, CI, packaging, and other core files) | MIT | See [LICENSE](LICENSE). |
-| `pro/` | Proprietary | cronstable Pro (the `cronstable-pro` package). See [pro/LICENSE](pro/LICENSE). Not open source. |
-| rendered brand artwork under `docs/` | Reserved | The finished logo. See [Brand assets](#brand-assets) later. |
-
-As more proprietary components are added, each gets its own `LICENSE` file under
-the same rule, and a row here. Proprietary directories are pruned from the public
-MIT sdist (see `MANIFEST.in`), so they are never distributed through PyPI.
+This file is packaged alongside [TRADEMARKS.md](TRADEMARKS.md) in every wheel's
+`dist-info/licenses/` directory. Paths in this document refer to the
+[source repository](https://github.com/ptweezy/cronstable). Most website assets
+are excluded from the source distribution; see [MANIFEST.in](MANIFEST.in).
 
 ## Brand assets
 
@@ -75,24 +48,6 @@ Two things this deliberately does **not** do:
 - **It is not retroactive.** Anyone who already received these files under the
   MIT License keeps that grant for the copies they received. The reservation
   applies going forward, which is the most any license change can do.
-
-## Keeping the boundary clean
-
-- Proprietary code may **import** the MIT core; MIT permits proprietary software
-  to build on it.
-- Do **not** copy MIT-licensed source *into* a proprietary directory. Importing
-  the core is fine. Vendoring its source there would pull MIT-covered code (and
-  its attribution obligation) into a proprietary tree. Keep the boundary at the
-  import level.
-- New files in a proprietary directory carry an SPDX header so the license is
-  unambiguous even out of context:
-
-  ```text
-  # SPDX-License-Identifier: LicenseRef-cronstable-Proprietary
-  ```
-
-  Core files rely on the root LICENSE and need no header. They may optionally
-  carry `# SPDX-License-Identifier: MIT`.
 
 ## Third-party code and dependencies
 

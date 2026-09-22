@@ -245,7 +245,7 @@ def test_dockerignore_excludes_the_heavy_untouched_trees():
             for line in fobj
             if line.strip() and not line.startswith("#")
         }
-    for name in ("docs", "wiki", "benchmarks", "packaging", "pro", "tests"):
+    for name in ("docs", "wiki", "benchmarks", "packaging", "tests"):
         assert name in entries, ".dockerignore no longer excludes " + name
     # ... and the two that MUST stay, because pyproject.toml reads them at
     # build time and setuptools_scm reads .git.

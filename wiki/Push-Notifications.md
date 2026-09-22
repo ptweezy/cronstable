@@ -162,9 +162,12 @@ and under `notify.report`:
 
 ## Delivery quota on the hosted relay
 
+The daemon's push reporter requires no subscription or license key. Delivery
+quotas apply to the relay service you choose.
+
 The hosted relay forwards up to 500 alerts per device per UTC calendar
-month for devices on the app's free plan, and without bound for devices
-holding a Cronstable Pro entitlement. Only alerts that reach APNs count;
+month without a subscription, and without bound for devices with a
+Cronstable Pro subscription for iOS. Only alerts that reach APNs count;
 coalesced, suppressed, and rate-limited envelopes do not. Past the bound
 the relay answers the daemon with `{"outcome": "digested"}` (a 2xx, so
 the daemon logs no failure) and sends the device at most one fixed

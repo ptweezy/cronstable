@@ -221,7 +221,7 @@ mutmut run "cronstable.redact*"
 mutmut results
 ```
 
-### Running release pipeline and Pro tests
+### Running release pipeline tests
 
 Release pipeline tests are in `.github/tests` and also run in the full test
 suite. To run them independently, use Python 3.11 or newer and run these
@@ -232,9 +232,7 @@ python -m pip install packaging pytest strictyaml
 python -m pytest .github/tests -q
 ```
 
-Pytest discovers the configuration for each suite from its directory.
-For Pro setup and test commands, see
-[Develop and test Pro](pro/README.md#develop-and-test).
+Pytest discovers this suite's configuration in `.github/tests/pytest.ini`.
 
 ### Coverage pragmas
 
