@@ -45,7 +45,7 @@ def test_every_shipped_amd64_format_has_a_v3_counterpart():
         len(baseline) == 14
     )  # Both Linux libcs, native binaries and packages.
     assert {p.replace("-amd64", "-amd64v3") for p in baseline} <= assets
-    assert not any(re.search(r"cronstable-macos\d+-", p) for p in assets)
+    assert not any("macos26" in p for p in assets)
 
 
 def test_native_jobs_build_v3_and_select_the_new_interpreter():

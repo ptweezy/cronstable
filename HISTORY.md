@@ -1,5 +1,44 @@
 # History
 
+## 1.2.56
+
+- Reduce shared-pool overhead by scanning each pool's entries once when
+  attaching queues to job status responses. Avoid sorting the entire queue
+  to count waiting entries, select the next admission, or recover the first
+  32 queued entries. Preserve priority, enqueue-time, and ID ordering, with
+  regression tests for queue selection and scan counts. Clean up unused
+  and legacy typing imports.
+- Speed up dashboard success-rate sorting by counting each job's history
+  once per sort. Reuse one local-time formatter for chart axes and hover
+  labels until the next redraw. Apply both changes to the demo dashboard,
+  with browser tests for updated histories, sort order, and formatting
+  across locales and timezones.
+- Start each architecture's Docker images as soon as its own cryptography
+  wheel build finishes, allowing other architectures to progress
+  independently. Use the same scheduling for releases and container
+  refreshes, retaining complete image validation before publication.
+- Move Docker build caches to registry tags scoped by distribution and
+  platform, with writes restricted to main-branch builds outside pull
+  requests. Container refreshes bypass build caches, and release
+  publication continues to use the verified OCI artifacts.
+- Cache Python build dependencies for post-quantum and ARMv6 wheel builds,
+  and source-built wheels for FreeBSD binaries. Include Python platform,
+  ABI, installed FreeBSD packages, and relevant build settings in toolchain
+  fingerprints. Trim rebuildable cache data before enforcing the 512 MiB
+  upload limit, preserve built wheels and source archives where possible,
+  and raise the combined managed cache budget to 6 GiB. Add regression
+  coverage for cache isolation, trimming, and architecture scheduling.
+- Validate browser coverage from the full test suite's JUnit report,
+  removing the second browser-suite run. Require results for every listed
+  browser module and reject failures, errors, and unexpected skips while
+  accepting expected failures. Update the browser-report and release
+  workflow regression checks for the new enforcement path.
+- Clarify performance reports and release notices with explicit regression
+  limits, measurement noise, absolute runtime and memory limits, missing
+  comparisons, and override outcomes. Describe startup-overhead adjustment
+  and label chart changes as lower or higher time or memory usage, keeping
+  the existing performance checks intact.
+
 ## 1.2.55
 
 - With no arguments and a missing default configuration, `cronstable` prints
