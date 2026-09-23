@@ -339,16 +339,20 @@ def test_url_userinfo_pattern_is_linear_not_quadratic():
     # the run: O(n^2), event-loop starvation on job-controlled stdout.  The
     # anchored+bounded scheme keeps it amortised linear; assert via growth
     # ratio (4x runtime per 2x input before the fix, ~2x after) rather than
-    # wall-clock, so a slow CI box cannot flake this.
+    # wall-clock.  One sample of about a millisecond can absorb a scheduler
+    # stall on a shared CI runner, so each size keeps its best of five
+    # interleaved runs, and an 8x input gap keeps linear (~8x) far from
+    # quadratic (~64x).
     import time
 
-    timings = []
-    for n in (16_000, 32_000, 64_000):
-        line = "cdn-node." * (n // 9) + "://" + "x" * n
-        started = time.perf_counter()
-        redact_secrets(line)
-        timings.append(time.perf_counter() - started)
-    assert timings[2] < timings[0] * 8, timings  # quadratic would be ~16x
+    lines = ["cdn-node." * (n // 9) + "://" + "x" * n for n in (8_000, 64_000)]
+    timings = [float("inf")] * len(lines)
+    for _ in range(5):
+        for i, line in enumerate(lines):
+            started = time.perf_counter()
+            redact_secrets(line)
+            timings[i] = min(timings[i], time.perf_counter() - started)
+    assert timings[1] < timings[0] * 24, timings
     # the anchor loses no real redactions
     out = redact_secrets("postgres://user:s3cret@db:5432/app")
     assert "s3cret" not in out and "user:" + REDACTED + "@db" in out
