@@ -20,9 +20,6 @@
 
 A cron replacement with retries, alerts, saved run history, workflows, and web and terminal dashboards. Run it on one machine or across a cluster.
 
-The scheduler, web and terminal dashboards, workflows, and clustering are
-[MIT-licensed](LICENSE) and require no subscription or license key.
-
 ## Why cronstable?
 
 cronstable runs your commands from a schedule file, following cron's model.
