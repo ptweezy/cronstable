@@ -4,6 +4,10 @@
 
 - Windows installers and executables identify themselves as `cronstable`
   in User Account Control (UAC) prompts, including installs through WinGet.
+- Build Nix dependency overrides and Intel Mac recipe backports without
+  their upstream test suites. No binary cache holds these builds, so every
+  CI run repeated those suites, and their timing tests failed on the Intel
+  Mac runner. Builds still check imports and smoke-test the installed CLI.
 
 ## 1.2.56
 

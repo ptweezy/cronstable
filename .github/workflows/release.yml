@@ -873,10 +873,6 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-            # Each Python dependency starts its own test workers. Prevent
-            # concurrent builds from oversubscribing the hosted Intel Macs.
-            max-jobs = 1
-            cores = 2
       # --print-build-logs so a dependency that fails to build says why in the
       # job log instead of only naming the derivation.
       - name: Evaluate all supported Nix systems
