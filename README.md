@@ -2,6 +2,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/cronstable.svg?logo=pypi&logoColor=white&color=0073b7)](https://pypi.org/project/cronstable/)
 [![GitHub release](https://img.shields.io/github/v/release/ptweezy/cronstable?logo=github&color=8a2be2)](https://github.com/ptweezy/cronstable/releases/latest)
+[![App Store](https://img.shields.io/itunes/v/6801933039?logo=apple&logoColor=white&label=App%20Store&color=0d96f6)](https://apps.apple.com/app/cronstable/id6801933039)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 [![PyPI status](https://img.shields.io/pypi/status/cronstable.svg?color=2ea44f)](https://pypi.org/project/cronstable/)
@@ -18,7 +19,7 @@
 
 / kraahn-stuh-bl /
 
-A cron replacement with retries, alerts, saved run history, workflows, and web and terminal dashboards. Run it on one machine or across a cluster.
+A cron replacement with retries, alerts, saved run history, workflows, and web, terminal, and iOS dashboards. Run it on one machine or across a cluster.
 
 ## Why cronstable?
 
@@ -53,8 +54,9 @@ and catch regressions before release.
 * Configurable failure conditions
 * Automatic retries with exponential backoff
 * Failure notifications through Sentry, email, and Slack-compatible webhooks
-* **End-to-end encrypted push notifications**: send alerts that only paired
-  devices can decrypt (see [push notifications](#push-notifications))
+* **End-to-end encrypted push notifications**: send alerts to the
+  [iOS app](#ios-app) that only paired devices can decrypt (see
+  [push notifications](#push-notifications))
 * **Per-job SLA monitoring**: detect missing or late runs and excessive
   runtimes, with alerts and dashboard status (see
   [late-run detection](#late-run-detection-sla-monitoring))
@@ -76,9 +78,9 @@ and catch regressions before release.
 
 ### Observability and control
 
-* **[Web](#web-dashboard) and [terminal](#terminal-dashboard) dashboards**:
-  follow live logs, review history, control jobs and workflows, and monitor
-  the cluster
+* **[Web](#web-dashboard), [terminal](#terminal-dashboard), and
+  [iOS](#ios-app) dashboards**: follow live logs, review history, control jobs
+  and workflows, and monitor the cluster
 * Optional **HTTP REST API** for job status, history, and control
 * **Runtime pause/resume**: pause scheduled runs for maintenance without
   editing configuration (see
@@ -156,6 +158,8 @@ You can extend this configuration to:
   approval gate ([tutorial](#tutorial-3-your-first-dag-a-durable-pipeline)).
 * **Coordinate replicas**: use leader election to coordinate job execution
   ([tutorial](#tutorial-4-two-replicas-zero-double-runs)).
+* **Watch from your phone**: pair the [iOS app](#ios-app) from the dashboard
+  for the jobs board, live logs, and encrypted alerts on iPhone and iPad.
 * **See it all at once**: `docker compose -f example/grand-tour/docker-compose.yml up
   --build` boots a nine-node cluster running every feature together
   ([example gallery](#example-gallery)).
@@ -463,6 +467,72 @@ Use `--token-env` for authentication, `--job` to open a specific job, or
 `--ascii` when your terminal lacks the status glyphs. The
 [terminal dashboard guide](https://github.com/ptweezy/cronstable/wiki/Terminal-Dashboard)
 covers all options, shortcuts, panels, themes, and screenshots.
+
+## iOS app
+
+<p align="center">
+  <a href="https://apps.apple.com/app/cronstable/id6801933039"><img src="https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/ios-icon.png" alt="The Cronstable app icon: the wordmark's double pendulum, balanced upright on its cart" width="112" height="112"></a>
+</p>
+
+<p align="center">
+  <strong>Cronstable for iPhone and iPad</strong><br>
+  The on-call companion and native dashboard for your cronstable servers.
+</p>
+
+<p align="center">
+  <a href="https://apps.apple.com/app/cronstable/id6801933039"><img src="https://toolbox.marketingtools.apple.com/api/v2/badges/download-on-the-app-store/black/en-us" alt="Download on the App Store" height="48"></a>
+</p>
+
+The app puts the whole dashboard in your pocket and receives
+[encrypted push alerts](#push-notifications). It connects directly to your
+servers over the LAN, Tailscale, or HTTPS. It has no account, sign-up,
+analytics, or ads, and it keeps access tokens in the device Keychain.
+
+* **Alerts**: failed runs, SLA breaches, workflow failures, and approval gates,
+  each sealed to the device's key before it leaves your server. Approve or
+  reject a gate from the lock screen.
+* **The whole dashboard**: the jobs board, run history, live log tails,
+  workflow runs, run trends, CPU and memory charts, and node and cluster views.
+* **Schedule tools**: pressure heatmaps, duplicate detection, a cron expression
+  sandbox, and an answer to "why did this run?"
+* **At a glance**: Home Screen widgets for fleet health, and your job schedule
+  as a calendar subscription.
+* **Push is optional**: without the `push` reporter, the app polls your servers
+  directly, every 1 to 300 seconds.
+
+<p align="center">
+  <a href="https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/ios-jobs.png"><img src="https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/ios-jobs.png" alt="The app's jobs board in dark mode: a failing-jobs banner above each job's status, schedule, next-run countdown, and run sparkline" width="180"></a>
+  <a href="https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/ios-approval.png"><img src="https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/ios-approval.png" alt="A workflow run in light mode, waiting at an approval gate with Approve and Reject buttons above its task list" width="180"></a>
+  <a href="https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/ios-log.png"><img src="https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/ios-log.png" alt="A job's live log tail in dark mode, below its run stats and resource panel" width="180"></a>
+  <a href="https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/ios-schedule.png"><img src="https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/ios-schedule.png" alt="The schedule view in light mode: scheduled runs for the next 24 hours, the busiest minute, and an hour-by-minute pressure heatmap" width="180"></a>
+</p>
+
+<p align="center"><sub>Jobs board · Approval gates · Live log tail · Schedule pressure</sub></p>
+
+To connect a server:
+
+1. Install [Cronstable](https://apps.apple.com/app/cronstable/id6801933039)
+   from the App Store.
+2. Enable the [HTTP interface](#remote-webhttp-interface) on an address your
+   phone can reach, such as a LAN, Tailscale, or HTTPS address rather than
+   `127.0.0.1`. Then open the [web dashboard](#web-dashboard) at that address.
+3. Choose **Pair a device** in the command palette (`Ctrl-K` / `⌘K`) or
+   settings, and scan the QR with the phone's camera or the app's
+   **Scan QR code** button. The QR carries the page's address and its access
+   token, so pair over HTTPS or a trusted network, and give the phone a
+   [scoped token](https://github.com/ptweezy/cronstable/wiki/HTTP-API#scoped-tokens-webauthtokens)
+   rather than the all-scopes one.
+4. For lock-screen alerts, enable the [`push` reporter](#push-notifications).
+
+The app can also **Find nearby servers** when the daemon advertises itself
+with `web.bonjour: true` (see
+[LAN discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)),
+or connect to an address you enter by hand. No server yet? **Try the demo**
+on the welcome screen connects to a live sample fleet, so you can explore every
+screen first.
+
+The app is optional. The web and terminal dashboards, the API, and every other
+reporter work without it.
 
 ## Tutorials
 
@@ -953,7 +1023,8 @@ the shell reporter's `CRONSTABLE_*` environment.
 
 ### Push notifications
 
-The `push` reporter delivers end-to-end encrypted alerts to paired devices.
+The `push` reporter delivers end-to-end encrypted alerts to devices paired
+with the [iOS app](#ios-app).
 Each alert is sealed to the device's public key before it leaves the daemon:
 an X25519 device gets a libsodium sealed box, and an X-Wing device (the
 post-quantum ML-KEM-768 + X25519 hybrid) gets single-shot HPKE. The hosted
@@ -989,7 +1060,7 @@ live in the durable store and are visible to every node sharing it.)
 
 Pair a device from the dashboard, with **Pair a device** in the command
 palette or settings. The QR is a deep link, so a phone-camera scan opens the
-companion app, or a landing page with install pointers when the app is
+[iOS app](#ios-app), or a landing page with install pointers when the app is
 missing. Or pair with one call:
 
 [![The dashboard's Pair a device panel: a QR code deep-linking the connection payload into the app being paired, the same payload as a copyable JSON string, and a warning that the embedded token holds every scope](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
@@ -1002,7 +1073,8 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 
 Setting `web.bonjour: true` (with the `discovery` extra installed)
 additionally advertises the web API as a `_cronstable._tcp` mDNS service on
-the local network, so a companion app finds the daemon without a typed URL.
+the local network, so the [iOS app](#ios-app) finds the daemon without a
+typed URL.
 See [LAN discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)
 in the wiki.
 

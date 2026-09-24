@@ -29,6 +29,7 @@ The list:
 | --- | --- |
 | `docs/**/logo-balance.gif`, `docs/**/logo-balance.webp` | the animated wordmark, dark |
 | `docs/**/logo-balance-light.gif`, `docs/**/logo-balance-light.webp` | the animated wordmark, light |
+| `docs/**/ios-icon.png` | the iOS app icon |
 
 These are the finished logo, not source. They may be reproduced **unmodified**
 when referring to cronstable itself. That is the same latitude the nominative
