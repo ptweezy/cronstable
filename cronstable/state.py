@@ -43,6 +43,7 @@ import queue
 import stat
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import (
@@ -1132,7 +1133,10 @@ class FilesystemStateBackend(StateBackend):
         # bytes of a record that read back valid.  Insertion order is the
         # LRU order.  Locked: the byte total is a running sum, so
         # plain-dict atomicity under the GIL is not enough on its own.
-        self._record_cache: dict[str, bytes] = {}
+        # An OrderedDict, not a dict: evicting from the front of a plain
+        # dict leaves deleted slots that every later next(iter()) walks
+        # until the next resize, so a full cache's eviction degrades.
+        self._record_cache: OrderedDict[str, bytes] = OrderedDict()
         self._record_cache_bytes = 0
         self._record_cache_lock = threading.Lock()
 
@@ -1762,10 +1766,9 @@ class FilesystemStateBackend(StateBackend):
         with self._record_cache_lock:
             raw = self._record_cache.get(path)
             if raw is not None:
-                # move to the fresh end: a dict iterates in insertion order,
-                # which is the LRU order the eviction below evicts from.
-                del self._record_cache[path]
-                self._record_cache[path] = raw
+                # move to the fresh end: insertion order is the LRU order
+                # the eviction below evicts from.
+                self._record_cache.move_to_end(path)
             return raw
 
     def _record_cache_put(self, path: str, raw: bytes) -> None:
@@ -1780,8 +1783,8 @@ class FilesystemStateBackend(StateBackend):
                 len(self._record_cache) > _RECORD_CACHE_MAX_ENTRIES
                 or self._record_cache_bytes > _RECORD_CACHE_MAX_BYTES
             ):
-                oldest = next(iter(self._record_cache))
-                self._record_cache_bytes -= len(self._record_cache.pop(oldest))
+                _oldest, evicted = self._record_cache.popitem(last=False)
+                self._record_cache_bytes -= len(evicted)
 
     def _read_record(
         self, stream_dir: str, name: str, *, strict: bool = False
@@ -1811,7 +1814,11 @@ class FilesystemStateBackend(StateBackend):
         cached = raw is not None
         if raw is None:
             try:
-                with open(path, "rb") as fobj:
+                # unbuffered: a whole-file read gains nothing from a buffer,
+                # and skipping it saves an object, an lseek and (before
+                # 3.14) an isatty ioctl per read. The other whole-file
+                # readers below do the same.
+                with open(path, "rb", buffering=0) as fobj:
                     raw = fobj.read()
             except FileNotFoundError:
                 # raced away (pruned/quarantined) between listdir and open.
@@ -2339,7 +2346,7 @@ class FilesystemStateBackend(StateBackend):
         its live holder.  The unlocked observer stays best-effort.
         """
         try:
-            with open(lease_path, "rb") as fobj:
+            with open(lease_path, "rb", buffering=0) as fobj:
                 obj = _json.loads(fobj.read())
         except FileNotFoundError:
             return None
@@ -2560,7 +2567,7 @@ class FilesystemStateBackend(StateBackend):
         Without ``strict`` it returns ``None`` for every one of those.
         """
         try:
-            with open(doc_path, "rb") as fobj:
+            with open(doc_path, "rb", buffering=0) as fobj:
                 obj = _json.loads(fobj.read())
         except FileNotFoundError:
             return None
@@ -2785,7 +2792,7 @@ class FilesystemStateBackend(StateBackend):
 
     def _get_blob_sync(self, digest: str) -> Optional[bytes]:
         try:
-            with open(self._blob_path(digest), "rb") as fobj:
+            with open(self._blob_path(digest), "rb", buffering=0) as fobj:
                 return fobj.read()
         except FileNotFoundError:
             return None

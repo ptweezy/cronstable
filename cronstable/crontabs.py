@@ -373,21 +373,14 @@ def _unescape_percent(command: str, where: str) -> str:
     """
     if "%" not in command:
         # a command without a percent is already its own literal form;
-        # the character walk below applies only to commands that carry one
+        # the split below applies only to commands that carry one
         return command
-    out: list[str] = []
-    index = 0
-    while index < len(command):
-        char = command[index]
-        if (
-            char == "\\"
-            and index + 1 < len(command)
-            and command[index + 1] == "%"
-        ):
-            out.append("%")
-            index += 2
-            continue
-        if char == "%":
+    # Splitting on ``\%`` takes the same pairs a left-to-right walk would
+    # (the pattern cannot overlap itself), so any ``%`` left inside a part
+    # is an unescaped one.
+    parts = command.split("\\%")
+    for part in parts:
+        if "%" in part:
             raise CrontabError(
                 "{}: unescaped '%' in command: cron would treat the rest "
                 "of the line as the command's standard input, which "
@@ -395,6 +388,4 @@ def _unescape_percent(command: str, where: str) -> str:
                 "percent (e.g. date +\\%F), or move this job to a YAML "
                 "config to use stdin redirection instead.".format(where)
             )
-        out.append(char)
-        index += 1
-    return "".join(out)
+    return "%".join(parts)

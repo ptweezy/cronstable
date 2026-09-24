@@ -1231,8 +1231,10 @@ _LOG_BASE = [
 _SGR_TOKEN_RE = re.compile(r"\x1b\[([0-9;]*)m")
 
 #: bound in the row-cutting loop, which runs these once per escape of every
-#: painted row of every frame
-_sgr_match = _SGR_TOKEN_RE.match
+#: painted row of every frame. The SGR matcher takes a whole run of tokens
+#: (the painter emits reset+bg+fg back to back) in one call: cells cannot
+#: change between adjacent tokens, so the run copies through as a unit.
+_sgr_match = re.compile(r"(?:\x1b\[[0-9;]*m)+").match
 _ansi_match = _ANSI_RE.match
 
 
@@ -2592,11 +2594,17 @@ def cut_to_width(row: str, width: int) -> str:
         # instead of a per-character walk
         chunk = row[idx:end]
         if chunk.isascii():
-            take = min(len(chunk), width - used)
-            out.append(chunk if take == len(chunk) else chunk[:take])
-            used += take
-            idx += take
-            continue
+            room = width - used
+            if end - idx <= room:
+                out.append(chunk)
+                used += end - idx
+                idx = end
+                continue
+            out.append(chunk[:room])
+            used = width
+            break
+        # walk for widths only, then copy what fits as one slice
+        taken = 0
         for ch in chunk:
             if used >= width:
                 break  # a zero-width mark at the edge is cut, as before
@@ -2607,11 +2615,13 @@ def cut_to_width(row: str, width: int) -> str:
                 w = _char_width_memo(ch) if memo is None else memo
             if used + w > width:
                 break
-            out.append(ch)
             used += w
-            idx += 1
+            taken += 1
         else:
+            out.append(chunk)
+            idx = end
             continue
+        out.append(chunk[:taken])
         break
     out.append(" " * (width - used))
     out.append(RESET)
@@ -6937,7 +6947,8 @@ class AppOverlays(AppRender):
                         pad_to(truncate(text, cell_w - 1), cell_w), color
                     )
                 )
-            body.append(cut_to_width("".join(spans), width - 4))
+            # uncut: panel_frame cuts every body row to width - 4 itself
+            body.append("".join(spans))
         if not rows:
             body.append(
                 paint.style(
@@ -7580,17 +7591,22 @@ class AppDrawers(AppOverlays):
         timestamps = self.timestamps
         wrap = self.wrap
         content_width = width - 4 - (9 if timestamps else 0)
-        # per-frame constants the rows share: the two stream markers, and
-        # the attribute lookups render() needs, resolved once per frame
+        # per-frame constants the rows share: the two stream markers (with
+        # the row's leading space already on), and the attribute lookups
+        # render() needs, resolved once per frame. The memo is only ever
+        # cleared or trimmed in place, so its bound get stays current, and
+        # a hit (nearly every row of a steady paint) skips the method call.
         style = paint.style
         ansi_line = self._ansi_line
-        mark_err = style("▏", "fail")
-        mark_out = style("▏", "border")
+        ansi_get = self._ansi_cache.get
+        mark_err = " " + style("▏", "fail")
+        mark_out = " " + style("▏", "border")
 
         def render(stream: str, line: str, when: float) -> list[str]:
             if stream == "meta":  # inline end-of-run separator
                 return [style("  ── %s ──" % line, "dim")]
-            text, plain = ansi_line(line)
+            hit = ansi_get(line)
+            text, plain = hit if hit is not None else ansi_line(line)
             prefix = ""
             if timestamps:
                 stamp = datetime.datetime.fromtimestamp(when)
@@ -7603,10 +7619,10 @@ class AppDrawers(AppOverlays):
                 start = 0
                 while start < len(plain):
                     chunk = plain[start : start + content_width]
-                    chunks.append(" " + marker + prefix + style(chunk, "fg"))
+                    chunks.append(marker + prefix + style(chunk, "fg"))
                     start += content_width
                 return chunks
-            return [" " + marker + prefix + text]
+            return [marker + prefix + text]
 
         suffix: list[str] = []
         if tail.error:
@@ -8421,9 +8437,10 @@ class AppDrawers(AppOverlays):
         max_scroll = max(0, total - available)
         self.panel_scroll = min(self.panel_scroll, max_scroll)
         end = total - self.panel_scroll
-        # the two stream markers are per-frame constants, not per-row
-        mark_err = paint.style("▏", "fail")
-        mark_out = paint.style("▏", "border")
+        # the two stream markers (leading space included) are per-frame
+        # constants, not per-row
+        mark_err = " " + paint.style("▏", "fail")
+        mark_out = " " + paint.style("▏", "border")
         for idx in range(max(0, end - available), end):
             if idx >= n:
                 rows.append(suffix[idx - n])
@@ -8433,7 +8450,7 @@ class AppDrawers(AppOverlays):
                 rows.append(paint.style("  ── end of log ──", "dim"))
                 continue
             marker = mark_err if stream == "stderr" else mark_out
-            rows.append(" " + marker + self._ansi_line(line)[0])
+            rows.append(marker + self._ansi_line(line)[0])
         return rows
 
     # ---- multi-tail console -----------------------------------------

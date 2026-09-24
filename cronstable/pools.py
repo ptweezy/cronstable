@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from cronstable import _json
 from cronstable.fingerprint import job_digest_cached
 from cronstable.state import DOC_KEEP
 
@@ -90,6 +91,12 @@ def _waiting(body, limit=None):
     return sorted(entries, key=_queue_order)
 
 
+def _read_body(body, now):
+    # a read-only _change action: the transform already works on a private
+    # copy of the stored document, so that copy can go to the caller as-is
+    return body
+
+
 class PoolScheduler:
     def __init__(self, cron: Any) -> None:
         self.cron = cron
@@ -160,7 +167,9 @@ class PoolScheduler:
 
         def transform(current):
             body = (
-                copy.deepcopy(current)
+                # current is freshly parsed JSON, so a JSON round trip is a
+                # faithful (and with orjson several times faster) deep copy
+                _json.deepcopy_json(current)
                 if current is not None
                 else {
                     "slots": conf["slots"] if conf is not None else 0,
@@ -507,9 +516,7 @@ class PoolScheduler:
     async def snapshot(self):
         result = []
         for name, conf in self.cron.pool_config.items():
-            body = await self._change(
-                name, lambda body, now: copy.deepcopy(body)
-            )
+            body = await self._change(name, _read_body)
             entries = list(body["entries"].values())
             waiting = _waiting(body)
             positions = {e["id"]: i + 1 for i, e in enumerate(waiting)}
@@ -612,11 +619,9 @@ class PoolScheduler:
 
     async def _tick_pool(self, pool):
         await self._flush_retry_settlements(pool)
-        body = await self._change(pool, lambda body, now: copy.deepcopy(body))
+        body = await self._change(pool, _read_body)
         if await self._retire_tasks(pool, body):
-            body = await self._change(
-                pool, lambda body, now: copy.deepcopy(body)
-            )
+            body = await self._change(pool, _read_body)
         for entry in _waiting(body, limit=32):
             payload = entry["payload"]
             if payload.get("kind") != "job":

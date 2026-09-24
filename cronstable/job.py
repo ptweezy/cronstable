@@ -470,7 +470,9 @@ class JobOutputStream:
         # each item is (stream_name, line) with stream_name "stdout"/"stderr"
         # Silent runs and rehydrated summaries need no ring at all.
         self._lines: Optional[deque[tuple[str, str]]] = None
-        self._subscribers: list["asyncio.Queue"] = []
+        # created by the first subscribe(): most runs never get a live
+        # viewer, and every retained history record holds one of these
+        self._subscribers: Optional[list["asyncio.Queue"]] = None
         self.closed = False
         # total lines ever published: `published - len(lines)` is the
         # ring's eviction count, so an archiver (Cron._archive_output) can
@@ -514,14 +516,17 @@ class JobOutputStream:
             if self._lines is None:
                 self._lines = deque(maxlen=self._limit)
             self._lines.append(item)
-        for queue in self._subscribers:
-            if self._offer(queue, item):
-                self.dropped += 1
+        if self._subscribers:
+            for queue in self._subscribers:
+                if self._offer(queue, item):
+                    self.dropped += 1
 
     def subscribe(self) -> "asyncio.Queue":
         queue: asyncio.Queue = asyncio.Queue(
             maxsize=LIVE_LOG_SUBSCRIBER_QUEUE_LIMIT
         )
+        if self._subscribers is None:
+            self._subscribers = []
         self._subscribers.append(queue)
         if self.closed:
             # run already finished: deliver the end sentinel now so a late
@@ -530,6 +535,8 @@ class JobOutputStream:
         return queue
 
     def unsubscribe(self, queue: "asyncio.Queue") -> None:
+        if not self._subscribers:
+            return
         try:
             self._subscribers.remove(queue)
         except ValueError:
@@ -542,8 +549,9 @@ class JobOutputStream:
         # None is the end-of-stream sentinel for subscriber read loops. Route
         # it through _offer so a saturated queue still receives it (dropping an
         # oldest line to make room) and the reader loop terminates.
-        for queue in self._subscribers:
-            self._offer(queue, None)
+        if self._subscribers:
+            for queue in self._subscribers:
+                self._offer(queue, None)
 
     def release_lines(self) -> None:
         """Drop the retained ring buffer; counters and subscribers stay.
@@ -691,6 +699,11 @@ class StreamReader:
         # stays linear instead of quadratic on the event-loop thread.
         tail_parts: list[bytes] = []
         tail_len = 0
+        # Output is decoded as plain strict UTF-8 until a line fails to be,
+        # then per line through _decode_output_line for the rest of the
+        # stream: same text either way, minus a call per line for the
+        # common all-UTF-8 stream.
+        strict = True
         while True:
             chunk = await stream.read(_READ_CHUNK)
             if chunk:
@@ -713,11 +726,21 @@ class StreamReader:
                     # a segment cannot outgrow the buffer it was cut from,
                     # so the per-line cap check only runs once the buffer
                     # itself has passed the cap.
-                    parts = [p for p in parts if not self._too_long(p, cap)]
-                # decoded per line: strict UTF-8 with an OEM-code-page
-                # retry on Windows, never an exception (see
-                # _decode_output_line).
-                lines = [_decode_output_line(raw) + "\n" for raw in parts]
+                    parts = [
+                        p
+                        for p in parts
+                        if len(p) <= cap or not self._too_long(p, cap)
+                    ]
+                if strict:
+                    try:
+                        lines = [raw.decode("utf-8") + "\n" for raw in parts]
+                    except UnicodeDecodeError:
+                        strict = False
+                if not strict:
+                    # decoded per line: strict UTF-8 with an OEM-code-page
+                    # retry on Windows, never an exception (see
+                    # _decode_output_line).
+                    lines = [_decode_output_line(raw) + "\n" for raw in parts]
             elif tail_len and not self._over_cap(tail_len, cap):
                 lines = [_decode_output_line(b"".join(tail_parts))]
             else:
