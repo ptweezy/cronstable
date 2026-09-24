@@ -1717,6 +1717,16 @@ def _metrics_response_product(
     return body, _gzip_body(body) if len(body) >= _GZIP_MIN_BYTES else None
 
 
+# Each frame's bytes up to the encoded line, for every stream name a job
+# publishes (RunningJob's output_prefix makes the verify.* pair). Splicing
+# the line's JSON string in skips building and encoding a dict per line and
+# yields the bytes the dict encodes to, on either JSON backend.
+_SSE_LINE_HEADS = {
+    name: b'event: line\ndata: {"stream":"' + name.encode() + b'","line":'
+    for name in ("stdout", "stderr", "verify.stdout", "verify.stderr")
+}
+
+
 def _sse_frame(stream_name: str, line: str) -> bytes:
     """One ``event: line`` SSE frame, built in bytes throughout.
 
@@ -1724,6 +1734,13 @@ def _sse_frame(stream_name: str, line: str) -> bytes:
     the job's output: both values are ``str``, and the portability walk only
     ever rejects non-finite floats.
     """
+    head = _SSE_LINE_HEADS.get(stream_name)
+    if head is not None:
+        return (
+            head
+            + _json.dumps_bytes(line.rstrip("\n"), trusted=True)
+            + b"}\n\n"
+        )
     return (
         b"event: line\ndata: "
         + _json.dumps_bytes(
@@ -2873,7 +2890,7 @@ class Cron:
         # mid-run would let the finishing run recreate the series from zero
         # (a phantom counter reset). The per-job maps below prune on the
         # same keep-set through _kept.
-        keep = set(self.cron_jobs) | set(self.running_jobs)
+        keep = self.cron_jobs.keys() | self.running_jobs.keys()
         self.metrics.prune(keep)
         # Drop last-run slots for removed jobs (churning names must not
         # grow the map); a still-running job keeps its slot until a later
@@ -2898,12 +2915,11 @@ class Cron:
         # forget a name only when nothing can still take its mutex (no
         # config entry, instance, refcount, lease, renewer, pursuit, holder
         # or waiter).
-        slot_live = (
-            keep
-            | set(self._slot_refs)
-            | set(self._slot_leases)
-            | set(self._slot_renewers)
-            | set(self._slot_pursuits)
+        slot_live = keep.union(
+            self._slot_refs,
+            self._slot_leases,
+            self._slot_renewers,
+            self._slot_pursuits,
         )
         self._slot_locks = {
             name: lock
@@ -5508,11 +5524,17 @@ class Cron:
                 str(job.timezone) if job.timezone is not None else None
             ),
             "running": bool(running),
-            "pids": [
-                runjob.proc.pid
-                for runjob in running
-                if runjob.proc is not None
-            ],
+            # most jobs are idle, so skip the comprehension for them: on
+            # 3.10/3.11 even an empty one costs a function call per job
+            "pids": (
+                [
+                    runjob.proc.pid
+                    for runjob in running
+                    if runjob.proc is not None
+                ]
+                if running
+                else []
+            ),
             "scheduled_in": scheduled_in,
             "never_fires": never_fires,
             # advisory lint from config load (see JobConfig), so the
@@ -5533,10 +5555,14 @@ class Cron:
         if job.verify is not None:
             result["verification"] = {
                 "configured": True,
-                "running": any(
-                    r.verification
-                    and r.verification.get("outcome") == "running"
-                    for r in running
+                "running": (
+                    any(
+                        r.verification
+                        and r.verification.get("outcome") == "running"
+                        for r in running
+                    )
+                    if running
+                    else False
                 ),
             }
         if job.pool is not None:
@@ -5558,18 +5584,19 @@ class Cron:
         # its aggregate footprint; omitted entirely when nothing is monitored
         # or no sample has landed yet, so an unmonitored job's payload is
         # unchanged.
-        live_snaps = [
-            snap
-            for runjob in running
-            if (snap := runjob.live_resources()) is not None
-        ]
-        if live_snaps:
-            result["running_resources"] = {
-                "cpu_percent": sum(s["cpu_percent"] for s in live_snaps),
-                "cpu_seconds": sum(s["cpu_seconds"] for s in live_snaps),
-                "rss_bytes": sum(s["rss_bytes"] for s in live_snaps),
-                "instances": len(live_snaps),
-            }
+        if running:
+            live_snaps = [
+                snap
+                for runjob in running
+                if (snap := runjob.live_resources()) is not None
+            ]
+            if live_snaps:
+                result["running_resources"] = {
+                    "cpu_percent": sum(s["cpu_percent"] for s in live_snaps),
+                    "cpu_seconds": sum(s["cpu_seconds"] for s in live_snaps),
+                    "rss_bytes": sum(s["rss_bytes"] for s in live_snaps),
+                    "instances": len(live_snaps),
+                }
         # armed retry ladder: attempt/backoff for the dashboard chip.
         # Gated on count > 0: the ladder is created eagerly at launch with
         # count 0, so presence alone would flag healthy jobs.

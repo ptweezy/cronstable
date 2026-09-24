@@ -1805,16 +1805,18 @@ class DagScheduler:
         soonest = now + 60.0
         for entry in body.get("tasks", {}).values():
             state = entry.get("state")
-            if state == dag.RUNNING and entry.get("awaitingApproval"):
-                soonest = min(soonest, now + APPROVAL_POLL_INTERVAL)
-            elif state == dag.RUNNING and entry.get("nextPokeAt") is not None:
-                # only an IDLE sensor's due instant is a wake candidate: with
-                # a poke in flight (proc/pid set) a stale past nextPokeAt --
-                # written before claims cleared it -- would pin the loop's
-                # sleep at 0 for the poke's whole duration.  The completion
-                # itself forces the next advance.
-                if entry.get("proc") is None and entry.get("pid") is None:
-                    soonest = min(soonest, float(entry["nextPokeAt"]))
+            if state == dag.RUNNING:
+                if entry.get("awaitingApproval"):
+                    soonest = min(soonest, now + APPROVAL_POLL_INTERVAL)
+                elif entry.get("nextPokeAt") is not None:
+                    # only an IDLE sensor's due instant is a wake candidate:
+                    # with a poke in flight (proc/pid set) a stale past
+                    # nextPokeAt -- written before claims cleared it -- would
+                    # pin the loop's sleep at 0 for the poke's whole
+                    # duration.  The completion itself forces the next
+                    # advance.
+                    if entry.get("proc") is None and entry.get("pid") is None:
+                        soonest = min(soonest, float(entry["nextPokeAt"]))
             elif state == dag.UP_FOR_RETRY and entry.get("nextRetryAt"):
                 soonest = min(soonest, float(entry["nextRetryAt"]))
         return soonest

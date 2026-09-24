@@ -4082,6 +4082,10 @@ def _validate_eventlog_config(config: "CronstableConfig") -> None:
     that asked, and is emitted by ``--validate-config`` too.
     """
     users = _eventlog_report_users(config)
+    if not users:
+        # users names every enabled block, and only enabled blocks are
+        # checked below: skip walking the whole fleet a second time
+        return
 
     def _blocks() -> Any:
         holders = [(job.name, job) for job in config.jobs]
@@ -4146,9 +4150,9 @@ def _validate_push_config(config: "CronstableConfig") -> None:
     silently self-disables is a missed page at 2 a.m., the one failure mode
     this feature exists to prevent.
     """
-    users = _push_report_users(config)
     push_conf = config.push_config
     if push_conf is None:
+        users = _push_report_users(config)
         if users:
             raise ConfigError(
                 "report.push.enabled is set ({}) but no `push:` section "
@@ -4322,14 +4326,14 @@ def _resolve_env(
     inside the document (e.g. ``web.listen[0]``); it appears only in the
     unset-variable error so the operator can find the offending key.
     """
-    present = name in os.environ
-    value = os.environ.get(name, "")
+    # one lookup: environ values are always str, so None means unset
+    value = os.environ.get(name)
     if default is not None:
         # `:-` falls back to the default when unset OR set-but-empty.
-        return value if (present and value != "") else default
+        return value or default
     # A bare `${VAR}` yields the value whenever the variable is set (even to
     # the empty string); only a genuinely unset variable is an error.
-    if present:
+    if value is not None:
         return value
     where = "config value {}".format(location) if location else "the config"
     raise ConfigError(
@@ -4907,9 +4911,14 @@ def parse_config_with_sources(
     """
     sources: set = set()
     config = parse_config(config_arg, sources)
-    for job in config.jobs:
-        if job.env_file is not None:
-            sources.add(os.path.abspath(job.env_file))
+    # jobs commonly share an env_file (it inherits through defaults), so
+    # resolve each distinct path once
+    sources.update(
+        map(
+            os.path.abspath,
+            {job.env_file for job in config.jobs if job.env_file is not None},
+        )
+    )
     # DAG task templates read their env_file at parse time exactly like jobs
     # do, so an edit to one must bust the reparse-skip signature the same way.
     for dag_cfg in config.dags:
@@ -5000,10 +5009,14 @@ def _parse_file_cached(
     config = parse_config_file(path, seen, file_sources)
     file_included = frozenset(seen) - before
     # env_files are read at parse time, so a change to one must invalidate
-    # the cached parse too: fold them into the fingerprint.
-    for job in config.jobs:
-        if job.env_file is not None:
-            file_sources.add(os.path.abspath(job.env_file))
+    # the cached parse too: fold them into the fingerprint (each distinct
+    # path resolved once, as in parse_config_with_sources).
+    file_sources.update(
+        map(
+            os.path.abspath,
+            {job.env_file for job in config.jobs if job.env_file is not None},
+        )
+    )
     for dag_cfg in config.dags:
         for template in dag_cfg.task_templates.values():
             if template.env_file is not None:

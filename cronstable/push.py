@@ -722,10 +722,15 @@ def seal_to_device(
     return base64.b64encode(sealed).decode("ascii")
 
 
+# json.dumps builds a fresh encoder per call for non-default options, and a
+# fit encodes each alert several times.
+_PLAINTEXT_ENCODER = json.JSONEncoder(
+    separators=(",", ":"), ensure_ascii=False
+)
+
+
 def _encode(payload: dict[str, Any]) -> bytes:
-    return json.dumps(
-        payload, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+    return _PLAINTEXT_ENCODER.encode(payload).encode("utf-8")
 
 
 def build_payload(

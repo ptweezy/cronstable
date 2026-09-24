@@ -949,6 +949,16 @@ def _propagate_and_claim(
                 continue
             verdict: Optional[str] = None
             if entry.get("state") == PENDING:
+                if (
+                    result.deferred
+                    and not task.depends_on
+                    and task.type != APPROVAL
+                ):
+                    # quota spent: a root is always ready, so _advance_task
+                    # would return at its deferred check untouched. Skipping
+                    # both calls keeps a wide DAG's backlog of pending roots
+                    # cheap on every pass once the claims are made.
+                    continue
                 verdict = _deps_verdict(spec, body, task)
             _advance_task(
                 spec,
