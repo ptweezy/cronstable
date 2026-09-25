@@ -19,7 +19,7 @@
 
 / kraahn-stuh-bl /
 
-A cron replacement with retries, alerts, saved run history, workflows, and web, terminal, and iOS dashboards. Run it on one machine or across a cluster.
+A cron replacement with retries, alerts, saved run history, and workflows, plus dashboards for the web, the terminal, and iOS. Run it on one machine or across a cluster.
 
 ## Why cronstable?
 
@@ -27,7 +27,7 @@ cronstable runs your commands from a schedule file, following cron's model.
 It adds retries, alerting, durable state, orchestration, clustering, and a
 live dashboard.
 
-It's built for machines of all sizes, with efficiency in mind. The
+It's designed to run efficiently on machines of all sizes. The
 [benchmarks](https://github.com/ptweezy/cronstable/wiki/Performance-Benchmarks)
 compare speed and memory use against the latest release on every commit
 and catch regressions before release.
@@ -41,7 +41,7 @@ and catch regressions before release.
   [business-day schedules](https://github.com/ptweezy/cronstable/wiki/Business-Day-Schedules))
 * **Schedule linting**: flag impossible schedules, uneven intervals, and
   daylight-saving surprises (see [schedule introspection](#schedule-introspection))
-* Arbitrary time zone support
+* Support for any time zone
 * **iCal calendar export**: subscribe to upcoming runs in your calendar app
   or view them in the dashboard's week calendar (see
   [calendar export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export))
@@ -89,7 +89,7 @@ and catch regressions before release.
   certificates, and reload web certificates without restarting (see
   [serving the API over TLS](#serving-the-api-over-tls))
 * **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)**: let AI agents
-  inspect jobs and debug schedules. Read-only by default, with optional control
+  inspect jobs and debug schedules (read-only by default, with optional control)
 * **Prometheus and statsd metrics**: track outcomes, durations, retries, and
   cluster health (see [metrics](#metrics))
 * **Per-job resource monitoring**: track CPU time and peak memory across each
@@ -150,18 +150,18 @@ Open <http://127.0.0.1:8080/> to view the job's live output in the
 [dashboard](#web-dashboard). The `hello` job runs once a minute.
 You can extend this configuration to:
 
-* **Get failure alerts**: retries with backoff and a Slack/mail/Sentry
-  report when a job ultimately fails ([tutorial](#tutorial-1-alert-when-a-job-fails-then-retry-it)).
-* **Survive restarts**: a `state:` block preserves history and retries and
-  enables missed-run catch-up ([tutorial](#tutorial-2-survive-restarts-catch-up-what-was-missed)).
+* **Get failure alerts**: retries with backoff, and a Slack, email, or Sentry
+  report when a job still fails after its retries ([tutorial](#tutorial-1-alert-when-a-job-fails-then-retry-it)).
+* **Survive restarts**: a `state:` block preserves history and retries, and
+  catches up missed runs ([tutorial](#tutorial-2-survive-restarts-catch-up-what-was-missed)).
 * **Chain jobs into a pipeline**: a durable DAG with data sharing and an
   approval gate ([tutorial](#tutorial-3-your-first-dag-a-durable-pipeline)).
-* **Coordinate replicas**: use leader election to coordinate job execution
-  ([tutorial](#tutorial-4-two-replicas-zero-double-runs)).
+* **Coordinate replicas**: use leader election so that replicas don't run the
+  same job twice ([tutorial](#tutorial-4-two-replicas-zero-double-runs)).
 * **Watch from your phone**: pair the [iOS app](#ios-app) from the dashboard
-  for the jobs board, live logs, and encrypted alerts on iPhone and iPad.
+  to get the jobs board, live logs, and encrypted alerts on iPhone and iPad.
 * **See it all at once**: `docker compose -f example/grand-tour/docker-compose.yml up
-  --build` boots a nine-node cluster running every feature together
+  --build` starts a nine-node cluster that uses every feature
   ([example gallery](#example-gallery)).
 
 To use an existing crontab exported with `crontab -l`, run
@@ -173,8 +173,8 @@ remove the extra user column first. See
 
 ### Run with Docker
 
-Prebuilt multi-architecture images (seven Linux platforms) are published on
-every release to two registries, the GitHub Container Registry
+Every release publishes prebuilt multi-architecture images for seven Linux
+platforms to two registries: the GitHub Container Registry
 (`ghcr.io/ptweezy/cronstable`) and Docker Hub (`ptweezy/cronstable`). Mount
 your configuration file and start the container:
 
@@ -184,28 +184,28 @@ docker run --rm \
   ghcr.io/ptweezy/cronstable:latest
 ```
 
-The image runs as a non-root user and reads its configuration from
-`/etc/cronstable.d` by default. The default image is built on Debian (slim).
-Alpine, Ubuntu, RHEL/UBI, Fedora, openSUSE, Amazon Linux, and distroless
-variants are published from the same release under a `-<distro>` tag suffix.
-The platform list, the variant table, and each variant's architecture coverage
-are in
+The default image is built on Debian slim, runs as a non-root user, and reads
+its configuration from `/etc/cronstable.d`. Each release also publishes Alpine,
+Ubuntu, RHEL/UBI, Fedora, openSUSE, Amazon Linux, and distroless variants,
+tagged with a `-<distro>` suffix. For the platform list, the variant table, and
+each variant's architecture coverage, see
 [installation](https://github.com/ptweezy/cronstable/wiki/Installation) in the
-wiki. For production, pin a specific version instead of `latest`, and see
+wiki. In production, pin a specific version instead of `latest`, and see
 [production container deployment](#production-container-deployment) for the
-hardened Kubernetes/Docker setup.
+hardened Kubernetes and Docker setup.
 
 ### Install using pip
 
-cronstable requires Python >= 3.10 (for systems with an older Python, use the
-binary instead). Install it in a virtual environment:
+cronstable requires Python 3.10 or later. On a system with an older Python,
+use the [binary](#install-using-binary) instead. Install cronstable in a virtual
+environment:
 
 ```shell
 pip install cronstable
 ```
 
-or let [pipx](https://github.com/pipxproject/pipx) create an isolated one
-for you:
+Or let [pipx](https://github.com/pipxproject/pipx) create an isolated
+environment for you:
 
 ```shell
 pipx install cronstable
@@ -214,7 +214,7 @@ pipx install cronstable
 ### Install using Homebrew or winget
 
 Both package managers install the self-contained release binary for your
-platform, so no Python is required.
+platform, so you don't need Python.
 
 macOS or Linux:
 
@@ -231,40 +231,47 @@ winget install ptweezy.cronstable
 Upgrade later with `brew upgrade cronstable` or
 `winget upgrade ptweezy.cronstable`.
 
-The WinGet release workflow submits signed, per-machine MSIs. When you install
-an MSI, approve the administrator prompt and open a new shell to use `cronstable`
-from `PATH`. The installer registers the Windows service, which stays stopped
-until you configure and start it. See the
-[WinGet installation guide](https://github.com/ptweezy/cronstable/wiki/Installation#install-using-winget)
-for package availability and instructions to switch from a portable install.
+winget installs a signed, per-machine MSI. Approve the administrator prompt,
+and then open a new shell so that `cronstable` is on your `PATH`. The installer
+registers the Windows service but leaves it stopped until you configure and
+start it. For package availability and how to switch from a portable install,
+see the
+[WinGet installation guide](https://github.com/ptweezy/cronstable/wiki/Installation#install-using-winget).
 
 ### Install using binary
 
-Alternatively, download a self-contained binary from GitHub:
-<https://github.com/ptweezy/cronstable/releases>. Every release attaches
-binaries for Linux (glibc and musl builds for `amd64`, `amd64v3`, `arm64`, `i686`,
-`armv7`, `armv6`, `ppc64le`, `s390x`, `riscv64` and `loong64`, plus a glibc-only
-`mips64le` and `armel`), macOS (`amd64`, `amd64v3` and `arm64`, signed and notarized by
-Apple), FreeBSD (`amd64`, `amd64v3` and `arm64`), OpenBSD, NetBSD, illumos
-(`amd64` and `amd64v3`) and
-Windows (`amd64`, `amd64v3`, `arm64` and `i686`), plus `.deb`, `.rpm`, Alpine `.apk` and
-FreeBSD `.pkg` packages. The `amd64`, `amd64v3`, `arm64`, and `s390x` glibc builds need
-only glibc 2.17, so they run on everything from RHEL 7 onward; `ppc64le`
-needs 2.28 (RHEL 8 onward). Python is not required on the target
-system; it is embedded in the executable.
+You can also download a self-contained binary from the
+[releases page](https://github.com/ptweezy/cronstable/releases). Every release
+attaches these builds:
 
-For x64 downloads, choose:
+* Linux: glibc and musl builds for `amd64`, `amd64v3`, `arm64`, `i686`,
+  `armv7`, `armv6`, `ppc64le`, `s390x`, `riscv64`, and `loong64`, plus
+  glibc-only builds for `mips64le` and `armel`
+* macOS: `amd64`, `amd64v3`, and `arm64`, signed and notarized by Apple
+* FreeBSD: `amd64`, `amd64v3`, and `arm64`
+* OpenBSD and NetBSD
+* illumos: `amd64` and `amd64v3`
+* Windows: `amd64`, `amd64v3`, `arm64`, and `i686`
+* Packages: `.deb`, `.rpm`, Alpine `.apk`, and FreeBSD `.pkg`
 
-- **`amd64v3` — Recommended for compatible CPUs.** Uses an optimized embedded
+The `amd64`, `amd64v3`, `arm64`, and `s390x` glibc builds need only glibc 2.17,
+so they run on RHEL 7 and later. The `ppc64le` build needs glibc 2.28 (RHEL 8
+and later). Python is embedded in the executable, so the target system doesn't
+need it.
+
+For x64 downloads, choose one of these builds:
+
+* **`amd64v3`** (recommended for compatible CPUs): uses an optimized embedded
   Python runtime and requires the full x86-64-v3 feature set.
-- **`amd64` — Compatibility build.** Choose this when the CPU or VM does not
-  support v3, or when you are unsure.
+* **`amd64`** (compatibility build): choose this build when the CPU or VM
+  doesn't support x86-64-v3, or when you're unsure.
 
 Every amd64 binary and package format has a v3 counterpart. All eight Docker
-distros offer explicit `-amd64v3` tags, recommended for compatible hosts
-(for example, `latest-amd64v3` and `latest-alpine-amd64v3`). Existing `amd64`
-asset URLs and Docker tags retain their current requirements; Homebrew, Scoop
-and winget keep their baseline downloads. See [CPU requirements and variant selection](https://github.com/ptweezy/cronstable/wiki/Installation#amd64v3-cpu-requirements).
+image variants also have `-amd64v3` tags, such as `latest-amd64v3` and
+`latest-alpine-amd64v3`; use them on compatible hosts. The `amd64` assets and
+Docker tags target baseline x86-64 CPUs, and Homebrew, Scoop, and winget
+install the baseline downloads. For details, see
+[CPU requirements and variant selection](https://github.com/ptweezy/cronstable/wiki/Installation#amd64v3-cpu-requirements).
 
 ```shell
 # Recommended for an x86-64-v3-capable Linux CPU (glibc).
@@ -275,57 +282,63 @@ chmod +x cronstable
 ./cronstable --version
 ```
 
-The binary unpacks an embedded Python runtime at startup, so under a
-read-only root filesystem it needs a small writable and executable temp mount.
-The container image and `pip`/`pipx` installs never self-extract. The full
-asset table, the glibc/musl compatibility notes, and the tmpfs/`emptyDir`
-recipe are in
+At startup, the binary unpacks its embedded Python runtime, so on a read-only
+root filesystem it needs a small temporary mount that is writable and
+executable. The container image and pip or pipx installs don't self-extract.
+For the full asset table, glibc and musl compatibility notes, and a tmpfs or
+`emptyDir` recipe, see
 [installation](https://github.com/ptweezy/cronstable/wiki/Installation) in the
 wiki.
 
-Windows releases additionally attach `cronstable-windows-<arch>.zip`, a
-one-directory build that extracts to a single `cronstable` folder and can
-host the [Windows
-service](https://github.com/ptweezy/cronstable/wiki/Windows-Service), and
-`cronstable-windows-<arch>.msi`, a machine-wide installer that registers
-the service for GPO/Intune/SCCM deployment (see the [Windows
-MSI](https://github.com/ptweezy/cronstable/wiki/Windows-MSI) wiki page).
+Windows releases also attach two more formats:
+
+* `cronstable-windows-<arch>.zip`: a one-directory build that extracts to a
+  single `cronstable` folder and can host the
+  [Windows service](https://github.com/ptweezy/cronstable/wiki/Windows-Service).
+* `cronstable-windows-<arch>.msi`: a machine-wide installer that registers the
+  service, for deployment through Group Policy, Intune, or SCCM. See the
+  [Windows MSI](https://github.com/ptweezy/cronstable/wiki/Windows-MSI) wiki
+  page.
 
 ## Running on Windows
 
-cronstable runs natively on Windows (x64, ARM64 and 32-bit x86). Install it
-with `pip install cronstable`, or take one of the builds on the
+cronstable runs natively on Windows (x64, ARM64, and 32-bit x86). Install it
+with `pip install cronstable`, or use one of these builds from the
 [releases page](https://github.com/ptweezy/cronstable/releases), none of which
-need Python: the self-contained `cronstable-windows-amd64v3.exe`
-(recommended for compatible x64 CPUs), `cronstable-windows-amd64.exe`
-(compatibility build), or
-`cronstable-windows-arm64.exe` / `cronstable-windows-i686.exe`, the
-one-directory
-`cronstable-windows-<arch>.zip` (the shape that can host the Windows service),
-or the machine-wide `cronstable-windows-<arch>.msi`. Everything else, like the
-YAML crontab, scheduling, reporting, retries, the HTTP API and the
-[web dashboard](#web-dashboard), works the same as on POSIX. A few platform
-details differ:
+need Python:
 
-* **Default config location.** Without `-c`, cronstable looks in the
-  machine-wide `%ProgramData%\cronstable` (the Windows analog of
-  `/etc/cronstable.d`) whenever that directory holds configuration, and in the
-  per-user `%APPDATA%\cronstable` otherwise (for example,
-  `C:\Users\you\AppData\Roaming\cronstable`). `cronstable init` writes a
-  commented starter configuration into whichever one applies, and `-c`
-  overrides the choice with any path:
+* `cronstable-windows-amd64v3.exe`: the self-contained build, recommended for
+  compatible x64 CPUs
+* `cronstable-windows-amd64.exe`: the self-contained compatibility build
+* `cronstable-windows-arm64.exe` and `cronstable-windows-i686.exe`: the
+  self-contained builds for ARM64 and 32-bit x86
+* `cronstable-windows-<arch>.zip`: the one-directory build, which can host the
+  Windows service
+* `cronstable-windows-<arch>.msi`: the machine-wide installer
+
+The YAML crontab, scheduling, reporting, retries, the HTTP API, and the
+[web dashboard](#web-dashboard) work the same as on POSIX systems. These
+platform details differ:
+
+* **Default config location.** If you don't pass `-c`, cronstable uses the
+  machine-wide `%ProgramData%\cronstable` directory (the Windows equivalent of
+  `/etc/cronstable.d`) when it contains configuration. Otherwise, it uses the
+  per-user `%APPDATA%\cronstable` directory, for example
+  `C:\Users\you\AppData\Roaming\cronstable`. `cronstable init` writes a
+  commented starter configuration to whichever directory applies. To use any
+  other path, pass `-c`:
 
   ```shell
   cronstable -c C:\path\to\cronstable.yaml
   ```
 
-* **Default shell.** A string `command` with no explicit `shell` runs through
-  the native command processor (`%ComSpec%`, that is, `cmd.exe`), which fills
-  the same role `/bin/sh` fills on POSIX. `shell: cmd` and `shell: powershell`
-  both work as written: cronstable gives cmd.exe the `/c` invocation and
-  quoting it expects, and every other shell `-c`. For PowerShell, or any other
-  interpreter, set `shell:` or pass `command` as a list, which bypasses the
-  shell entirely:
+* **Default shell.** A string `command` without an explicit `shell` runs
+  through the native command processor (`%ComSpec%`, which is `cmd.exe`). It
+  plays the role that `/bin/sh` plays on POSIX. You can set `shell: cmd` or
+  `shell: powershell` directly: cronstable passes `cmd.exe` the `/c` flag and
+  the quoting it expects, and passes `-c` to every other shell. For PowerShell
+  or any other interpreter, set `shell:`, or pass `command` as a list to bypass
+  the shell entirely:
 
   ```yaml
   jobs:
@@ -341,77 +354,82 @@ details differ:
 * **Graceful shutdown.** Press `Ctrl-C` to stop cronstable. It shuts down once
   the running jobs finish, the same as `SIGTERM` on POSIX. Each job runs in its
   own console process group, so the keystroke never reaches the jobs
-  themselves. Closing the console window and shutting the machine down drain
-  the same way, within the few seconds of grace the OS allows.
+  themselves. Closing the console window or shutting down the machine also
+  lets running jobs finish, within the few seconds that Windows allows.
 
-  The authenticated `POST /shutdown` route stops a console-less daemon, and
-  stops the Windows service cleanly, without tripping its recovery actions.
-  Logging off does not stop it: an unattended daemon sees that event for every
+  To stop a daemon that has no console, call the authenticated
+  `POST /shutdown` route. It also stops the Windows service cleanly, without
+  triggering the service's recovery actions. Signing out doesn't stop the
+  daemon, because an unattended daemon receives the sign-out event for every
   user on the machine.
 
-* **Running unattended, as a real Windows service.** `cronstable service
-  install -c C:\ProgramData\cronstable` registers the scheduler with the
-  Service Control Manager, so it starts at boot, runs whether or not anyone is
-  logged on, appears in `services.msc`, and gets Windows' own recovery
-  actions. Stopping it drains the running jobs first, and it keeps telling the
-  SCM the stop is still in progress for as long as that takes. `cronstable
-  service reload` makes it reparse the configuration immediately, the forced
-  reload that `SIGHUP` triggers on POSIX. The whole thing is a ctypes shim over
-  advapi32, so it adds no dependency.
+* **Running unattended as a Windows service.** `cronstable service install
+  -c C:\ProgramData\cronstable` registers the scheduler with the Service
+  Control Manager (SCM). The service starts at boot, runs whether or not anyone
+  is signed in, appears in `services.msc`, and uses the Windows recovery
+  actions. When you stop the service, it lets running jobs finish first, and
+  it reports the stop as in progress to the SCM until they do.
+  `cronstable service reload` rereads the configuration immediately, like
+  `SIGHUP` on POSIX. The service support is a ctypes shim over advapi32, so it
+  adds no dependencies.
 
-  The published one-file `.exe` cannot host a service, because its bootloader
-  runs the program in a child process the SCM never sees. The `install`
-  command says so. Install with pip or pipx for that, or use the `schtasks`
-  recipe. See
+  The published one-file `.exe` can't host a service, because its bootloader
+  runs the program in a child process that the SCM never sees; the `install`
+  command reports this. To run as a service, install with pip or pipx, use the
+  one-directory `.zip` build, or use the `schtasks` recipe. For details, see
   [Windows Service](https://github.com/ptweezy/cronstable/wiki/Windows-Service)
   and
   [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows).
 
 * **Migrating from Task Scheduler.** `cronstable import-taskscheduler
-  tasks.xml -o jobs.yaml` converts an estate's exports into cronstable jobs.
-  It maps time, calendar and boot triggers, `Exec` actions, working
-  directories, execution time limits, instance policy and priority. It is a
-  one-shot converter rather than a loader, because exporting a task does not
-  unregister it. It lists everything it cannot carry across, with the reason,
-  instead of dropping it, and on a whole-machine export that list is long:
-  most registered tasks on a stock Windows install are COM-handler or
-  event-driven internals rather than schedules. See
+  tasks.xml -o jobs.yaml` converts exported Task Scheduler tasks into
+  cronstable jobs. It maps time, calendar, and boot triggers; `Exec` actions;
+  working directories; execution time limits; instance policy; and priority.
+  It's a one-time converter rather than a loader, because exporting a task
+  doesn't unregister it. It lists everything it can't convert, with the
+  reason, instead of dropping it. On a whole-machine export, that list is
+  long, because most tasks on a stock Windows installation are COM handlers or
+  event-driven internals rather than schedules. For details, see
   [Importing from Task Scheduler](https://github.com/ptweezy/cronstable/wiki/Importing-Task-Scheduler).
 
-* **Not supported on Windows.** Per-job `user`/`group` switching has no
-  `setuid`/`setgid` equivalent, so cronstable rejects it with a configuration
-  error, and it skips `unix://` web listeners with a warning. Use an `http://`
-  listener instead.
+* **Not supported on Windows.** Windows has no `setuid` or `setgid`
+  equivalent, so cronstable rejects per-job `user` and `group` settings with a
+  configuration error. It also skips `unix://` web listeners with a warning;
+  use an `http://` listener instead.
 
 ## Production container deployment
 
-cronstable is built to run unmodified under the hardened security contexts that
-corporate and enterprise Kubernetes / container platforms enforce. At runtime
-the daemon only *reads* its configuration and secrets and writes its output to
-stdout/stderr. It never needs a writable working directory, temp files, or log
-files, so it can run as an unprivileged non-root user with the `RuntimeDefault`
-seccomp profile, a read-only root filesystem, all Linux capabilities dropped,
-and config/secret volumes mounted with an `fsGroup`.
+cronstable runs unmodified under the hardened security contexts that
+enterprise Kubernetes and container platforms enforce. At runtime, the daemon
+only reads its configuration and secrets, and it writes its output to stdout
+and stderr. It doesn't need a writable working directory, temporary files, or
+log files. It can run as an unprivileged non-root user with the
+`RuntimeDefault` seccomp profile, a read-only root filesystem, all Linux
+capabilities dropped, and configuration and secret volumes mounted with an
+`fsGroup`.
 
-Only the optional per-job [user/group switching](#change-to-another-usergroup)
-requires root. Two exceptions need a small writable mount: a `unix://` web
-listener's socket, and the standalone binary's temp directory (see
+Only the optional per-job
+[user and group switching](#change-to-another-usergroup) requires root. Two
+features need a small writable mount: the socket for a `unix://` web listener,
+and the standalone binary's temporary directory (see
 [install using binary](#install-using-binary)).
 
-The published image (`ghcr.io/ptweezy/cronstable` and `docker.io/ptweezy/cronstable`)
-is already built this way (non-root, with `cronstable -c /etc/cronstable.d` as its
-entrypoint and no writable paths required), so for most deployments you can use
-it directly and mount your crontab read-only.
+The published images (`ghcr.io/ptweezy/cronstable` and
+`docker.io/ptweezy/cronstable`) are built this way: they run as non-root, use
+`cronstable -c /etc/cronstable.d` as the entrypoint, and need no writable
+paths. For most deployments, you can use an image directly and mount your
+crontab read-only. For the full setup, see
 [Production deployment](https://github.com/ptweezy/cronstable/wiki/Production-Deployment)
-in the wiki has the full setup: a Kubernetes `Deployment` with a fully
-restricted security context, baking configuration into your own image, the
-writable-path exceptions in detail, and health checks.
+in the wiki. It covers a Kubernetes `Deployment` with a fully restricted
+security context, baking configuration into your own image, the writable-path
+exceptions, and health checks.
 
 ## Web dashboard
 
-The built-in web dashboard is a self-contained page served by the daemon,
-with no build step or external assets. Enable the
-[HTTP interface](#remote-webhttp-interface), then open its address in a browser.
+The daemon serves the built-in web dashboard as a self-contained page, with no
+build step or external assets. To open it, enable the
+[HTTP interface](#remote-webhttp-interface), and then open its address in a
+browser.
 
 [![cronstable web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)
 
@@ -428,18 +446,18 @@ history, or inspect its schedule. You can also:
 | :---: | :---: | :---: |
 | [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png) | [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png) |
 
-Press `Ctrl-K` / `⌘K` for the command palette, `?` for shortcuts, or `Enter`
-to open the selected job. Ten themes, adjustable fonts and UI scale,
-color-vision-safe palettes, and reduced-motion support help with readability.
-Status is shown through text and symbols as well as color.
+Press `Ctrl-K` or `⌘K` for the command palette, `?` for shortcuts, or `Enter`
+to open the selected job. For readability, the dashboard has ten themes,
+adjustable fonts and UI scale, color-vision-safe palettes, and reduced-motion
+support. It shows status with text and symbols in addition to color.
 
 Run history and live logs stay in memory unless you enable the
 [durable state store](https://github.com/ptweezy/cronstable/wiki/Durable-State).
-The page is served with a strict Content-Security-Policy. See the
-[web dashboard guide](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard)
-for the full panel tour, screenshots, shortcuts, and settings.
+The daemon serves the page with a strict Content Security Policy. For the full
+panel tour, screenshots, shortcuts, and settings, see the
+[web dashboard guide](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard).
 
-**Try it:** start a demo node with:
+To try the dashboard, start a demo node:
 
 ```shell
 docker compose -f example/zen-demo/docker-compose.yml up
@@ -451,9 +469,10 @@ failure reporters.
 
 ## Terminal dashboard
 
-`cronstable tui` brings the dashboard to your terminal, including SSH and tmux
-sessions. It uses the same HTTP API and keyboard shortcuts as the web dashboard,
-with job logs, history, workflows, cluster views, and incident tools.
+The `cronstable tui` command brings the dashboard to your terminal, including
+over SSH and in tmux sessions. It uses the same HTTP API and keyboard shortcuts
+as the web dashboard, and it has job logs, history, workflows, cluster views,
+and incident tools.
 
 [![The cronstable TUI: a live 70-job board with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, cluster owner column, and the fleet verdict bar](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/tui-overview.png)
 
@@ -464,9 +483,9 @@ cronstable tui --tv                       # open the wallboard
 ```
 
 Use `--token-env` for authentication, `--job` to open a specific job, or
-`--ascii` when your terminal lacks the status glyphs. The
-[terminal dashboard guide](https://github.com/ptweezy/cronstable/wiki/Terminal-Dashboard)
-covers all options, shortcuts, panels, themes, and screenshots.
+`--ascii` when your terminal lacks the status glyphs. For all options,
+shortcuts, panels, themes, and screenshots, see the
+[terminal dashboard guide](https://github.com/ptweezy/cronstable/wiki/Terminal-Dashboard).
 
 ## iOS app
 
@@ -483,22 +502,26 @@ covers all options, shortcuts, panels, themes, and screenshots.
   <a href="https://apps.apple.com/app/cronstable/id6801933039"><img src="https://toolbox.marketingtools.apple.com/api/v2/badges/download-on-the-app-store/black/en-us" alt="Download on the App Store" height="48"></a>
 </p>
 
-The app puts the whole dashboard in your pocket and receives
+The app is a full native dashboard, and it receives
 [encrypted push alerts](#push-notifications). It connects directly to your
-servers over the LAN, Tailscale, or HTTPS. It has no account, sign-up,
-analytics, or ads, and it keeps access tokens in the device Keychain.
+servers over the LAN, Tailscale, or HTTPS. It doesn't need an account or a
+sign-up, has no analytics or ads, and keeps access tokens in the device
+Keychain.
 
-* **Alerts**: failed runs, SLA breaches, workflow failures, and approval gates,
-  each sealed to the device's key before it leaves your server. Approve or
-  reject a gate from the lock screen.
-* **The whole dashboard**: the jobs board, run history, live log tails,
-  workflow runs, run trends, CPU and memory charts, and node and cluster views.
-* **Schedule tools**: pressure heatmaps, duplicate detection, a cron expression
+The app includes these features:
+
+* Alerts for failed runs, SLA breaches, workflow failures, and approval gates.
+  Each alert is sealed to the device's key before it leaves your server, and
+  you can approve or reject a gate from the lock screen.
+* The jobs board, run history, live log tails, workflow runs, run trends, CPU
+  and memory charts, and node and cluster views.
+* Schedule tools: pressure heatmaps, duplicate detection, a cron expression
   sandbox, and an answer to "why did this run?"
-* **At a glance**: Home Screen widgets for fleet health, and your job schedule
-  as a calendar subscription.
-* **Push is optional**: without the `push` reporter, the app polls your servers
-  directly, every 1 to 300 seconds.
+* Home Screen widgets for fleet health, and your job schedule as a calendar
+  subscription.
+
+Push notifications are optional. Without the `push` reporter, the app polls
+your servers directly, every 1 to 300 seconds.
 
 <p align="center">
   <a href="https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/ios-jobs.png"><img src="https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/ios-jobs.png" alt="The app's jobs board in dark mode: a failing-jobs banner above each job's status, schedule, next-run countdown, and run sparkline" width="180"></a>
@@ -509,41 +532,44 @@ analytics, or ads, and it keeps access tokens in the device Keychain.
 
 <p align="center"><sub>Jobs board · Approval gates · Live log tail · Schedule pressure</sub></p>
 
-To connect a server:
+To connect the app to a server, follow these steps:
 
 1. Install [Cronstable](https://apps.apple.com/app/cronstable/id6801933039)
    from the App Store.
-2. Enable the [HTTP interface](#remote-webhttp-interface) on an address your
-   phone can reach, such as a LAN, Tailscale, or HTTPS address rather than
-   `127.0.0.1`. Then open the [web dashboard](#web-dashboard) at that address.
-3. Choose **Pair a device** in the command palette (`Ctrl-K` / `⌘K`) or
-   settings, and scan the QR with the phone's camera or the app's
-   **Scan QR code** button. The QR carries the page's address and its access
-   token, so pair over HTTPS or a trusted network, and give the phone a
+2. Enable the [HTTP interface](#remote-webhttp-interface) on an address that
+   your phone can reach, such as a LAN, Tailscale, or HTTPS address. A phone
+   can't reach `127.0.0.1`.
+3. Open the [web dashboard](#web-dashboard) at that address.
+4. In the command palette (`Ctrl-K` or `⌘K`) or in settings, select
+   **Pair a device**.
+5. Scan the QR code with the phone's camera, or tap **Scan QR code** in the
+   app. The QR code contains the page's address and its access token, so pair
+   over HTTPS or a trusted network, and give the phone a
    [scoped token](https://github.com/ptweezy/cronstable/wiki/HTTP-API#scoped-tokens-webauthtokens)
-   rather than the all-scopes one.
-4. For lock-screen alerts, enable the [`push` reporter](#push-notifications).
+   instead of the all-scopes token.
+6. To get lock-screen alerts, enable the
+   [`push` reporter](#push-notifications).
 
-The app can also **Find nearby servers** when the daemon advertises itself
-with `web.bonjour: true` (see
+If the daemon advertises itself with `web.bonjour: true` (see
 [LAN discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)),
-or connect to an address you enter by hand. No server yet? **Try the demo**
-on the welcome screen connects to a live sample fleet, so you can explore every
-screen first.
+the app can find it with **Find nearby servers**. You can also enter a server
+address manually. To explore the app before you set up a server, tap
+**Try the demo** on the welcome screen to connect to a live sample fleet.
 
 The app is optional. The web and terminal dashboards, the API, and every other
 reporter work without it.
 
 ## Tutorials
 
-Four short walkthroughs you can copy and run, each built on the
-[quick start](#quick-start) config and each pointing at the wiki page that
-covers it in full.
+These four short walkthroughs build on the [quick start](#quick-start)
+configuration. You can copy and run each one, and each links to the wiki page
+that covers its topic in full.
 
 ### Tutorial 1: Alert when a job fails, then retry it
 
-Classic cron mails root. Instead: retry with exponential backoff, and page a
-Slack channel only if the job *ultimately* fails.
+Classic cron sends mail to root. This example instead retries with
+exponential backoff, and it posts to a Slack channel only if the job still
+fails after its last retry.
 
 ```yaml
 jobs:
@@ -564,18 +590,19 @@ jobs:
             fromEnvVar: SLACK_WEBHOOK_URL
 ```
 
-By default a job *fails* when it exits nonzero **or** writes to a captured
-stderr. Tune that per job with [`failsWhen`](#handling-failure). The webhook's
-default body is Slack-compatible (Mattermost and Teams work as-is), and mail,
-Sentry, and a shell command are equally one block away, with jinja2 templating
-over the run's name, output, and exit code. Deeper:
+By default, a job fails when it exits with a nonzero status or writes to a
+captured stderr. To change that for a job, use
+[`failsWhen`](#handling-failure). The webhook's default body is
+Slack-compatible, and Mattermost and Teams accept it as is. Email, Sentry, and
+shell command reports each take one more block, with Jinja2 templating over
+the run's name, output, and exit code. For details, see
 [failure detection and retries](https://github.com/ptweezy/cronstable/wiki/Failure-Detection-and-Retries)
 and [reporting](https://github.com/ptweezy/cronstable/wiki/Reporting) in the wiki.
 
 ### Tutorial 2: Survive restarts, catch up what was missed
 
-Stateless is the default. When a deploy or a reboot lands mid-schedule, one
-`state:` block gives jobs a memory:
+By default, cronstable keeps no state across restarts. To handle a deploy or
+a reboot in the middle of a schedule, add a `state:` block:
 
 ```yaml
 state:
@@ -595,26 +622,33 @@ jobs:
         backoffMultiplier: 2
 ```
 
-With the `state.path` line alone, run history survives restarts (the
-dashboard rehydrates it), armed retries re-arm at their absolute deadlines,
-`@reboot` means once per *boot* rather than once per daemon start, and
-Prometheus counters stop resetting to zero.
+The `state.path` line alone has these effects:
 
-`onMissed` adds catch-up on top: `run-once` coalesces any number of missed
-slots into one launch, `run-all` replays each one, bounded by
-`startingDeadlineSeconds`. Jobs recover after a restart and when the same
-daemon resumes after system sleep or a long stall. A normal start after
-resume satisfies `run-once`; failed catch-up attempts count as attempted
-and do not arm retries. The same store also hands your job *commands*
-durable primitives (key/value, cursors, fleet-wide locks, idempotency keys,
-artifacts, run-scoped secrets) over a loopback endpoint:
-`cronstable state|cursor|lock|idempotent|artifact|secret`. Deeper:
+* Run history survives restarts, and the dashboard reloads it.
+* Pending retries resume at their original deadlines.
+* `@reboot` runs once per boot instead of once per daemon start.
+* Prometheus counters no longer reset to zero when the daemon restarts.
+
+The `onMissed` setting adds catch-up. `run-once` combines any number of
+missed runs into one launch, and `run-all` replays each missed run.
+`startingDeadlineSeconds` limits how old a missed run can be. Catch-up
+applies after a restart, and also when the same daemon resumes after system
+sleep or a long stall. With `run-once`, a regular run after the daemon resumes
+counts as the catch-up run. A failed catch-up attempt counts as attempted and
+doesn't schedule retries.
+
+The same store also gives your job commands durable primitives over a loopback
+endpoint: key-value storage, cursors, fleet-wide locks, idempotency keys,
+artifacts, and run-scoped secrets. Your commands use them through the
+`cronstable state`, `cursor`, `lock`, `idempotent`, `artifact`, and `secret`
+subcommands. For details, see
 [durable state](https://github.com/ptweezy/cronstable/wiki/Durable-State).
 
 ### Tutorial 3: Your first DAG, a durable pipeline
 
 A `dags:` block turns the scheduler into a small, durable workflow engine.
-This one builds, waits for a human, then publishes:
+This example runs a build, waits for a person to approve it, and then
+publishes:
 
 ```yaml
 state:
@@ -635,8 +669,8 @@ dags:
         retryDelaySeconds: 60
 ```
 
-Trigger it and approve the gate (or click **Approve** in the dashboard's DAG
-drawer):
+Trigger the DAG and approve the gate, or click **Approve** in the dashboard's
+DAG drawer instead:
 
 ```shell
 curl -X POST http://127.0.0.1:8080/dags/release-train/trigger
@@ -645,18 +679,18 @@ curl -X POST http://127.0.0.1:8080/dags/release-train/runs/<runKey>/tasks/approv
      -H 'Content-Type: application/json' -d '{"decision": "approve", "by": "alice"}'
 ```
 
-Every transition is durable: restart the daemon mid-run and the run resumes
-exactly where it was, and across a fleet the run advances under a lease so a
-task never launches twice. Scheduled DAGs add catch-up and `backfill` over a
-date range. Tasks can pass data with `cronstable xcom push/pull`, fan out
-dynamically over a list an upstream task produced, and poll for conditions
-with `type: sensor`. Deeper:
+Every transition is durable. If you restart the daemon during a run, the run
+resumes where it stopped. Across a fleet, the run advances under a lease, so a
+task never launches twice. Scheduled DAGs also support catch-up and `backfill`
+over a date range. Tasks can pass data with `cronstable xcom push` and
+`cronstable xcom pull`, fan out over a list that an upstream task produced,
+and poll for conditions with `type: sensor`. For details, see
 [orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs).
 
 ### Tutorial 4: Two replicas, zero double-runs
 
-Run the same config on two (or nine) hosts that share a POSIX mount, and let
-them elect a leader through a fenced lease file, with no certificates and no
+Run the same configuration on two or more hosts that share a POSIX mount. The
+hosts elect a leader through a fenced lease file, without certificates or a
 coordination service:
 
 ```yaml
@@ -677,38 +711,42 @@ jobs:
     clusterPolicy: Leader          # the default: exactly the leader runs it
 ```
 
-Only the elected leader fires `Leader` jobs. Stop it, and a follower adopts
-the lease within its TTL. Per job, `clusterPolicy` picks the trade-off:
-`Leader` (never double-runs, may skip when quorum is lost), `PreferLeader`
-(never skips, may double-run under a partition), or `EveryNode` (genuinely
-per-node work).
+Only the elected leader runs `Leader` jobs. If the leader stops, a follower
+takes over the lease within the lease's time to live (TTL). Each job's
+`clusterPolicy` sets the trade-off:
 
-Without a shared mount, the `gossip` backend elects over mutual TLS with no
-shared store at all, `kubernetes` uses a `coordination.k8s.io` Lease, and
-`etcd` a lease-bound key. `distribution: spread` load-balances job ownership
-across the fleet instead of concentrating it on one leader. Deeper:
+* `Leader`: never runs a job twice, but can skip a run when quorum is lost.
+* `PreferLeader`: never skips a run, but can run a job twice during a network
+  partition.
+* `EveryNode`: runs the job on every node, for work that belongs on each node.
+
+Without a shared mount, use another backend. The `gossip` backend elects a
+leader over mutual TLS with no shared store, `kubernetes` uses a
+`coordination.k8s.io` Lease, and `etcd` uses a lease-bound key. To spread job
+ownership across the fleet instead of giving every job to one leader, set
+`distribution: spread`. For details, see
 [clustering and leader election](https://github.com/ptweezy/cronstable/wiki/Clustering-and-Leader-Election).
 
 ## Example gallery
 
-Every example in [`example/`](example) is a self-contained, annotated,
-runnable project. Each compose file lives in its example's folder (the `demo`
-quickstart uses the root `docker-compose.yml`). Highlights:
+Every example in [`example/`](example) is a self-contained, annotated project
+that you can run. Each Compose file is in its example's folder, except for the
+`demo` quick start, which uses the root `docker-compose.yml`. Some highlights:
 
-| Example | One command | Shows off |
+| Example | One command | What it shows |
 | --- | --- | --- |
-| [`demo`](example/demo) | `docker compose up` | The dashboard playground: varied jobs, live logs, retries, a long-runner, an on-demand job. |
-| [`grand-tour`](example/grand-tour) | `docker compose -f example/grand-tour/docker-compose.yml up --build` | **Everything at once**: a 9-node mTLS cluster, shared durable state, five DAG patterns, second-level probes, all five cross-platform reporters wired to live sinks. |
-| [`cluster`](example/cluster) | `docker compose -f example/cluster/docker-compose.yml up` | A 3-node gossip cluster: peer attestation, quorum, leader election, live failover. |
+| [`demo`](example/demo) | `docker compose up` | The dashboard playground: varied jobs, live logs, retries, a long-running job, and an on-demand job. |
+| [`grand-tour`](example/grand-tour) | `docker compose -f example/grand-tour/docker-compose.yml up --build` | Everything at once: a 9-node mTLS cluster, shared durable state, five DAG patterns, second-level probes, and all five cross-platform reporters connected to live sinks. |
+| [`cluster`](example/cluster) | `docker compose -f example/cluster/docker-compose.yml up` | A 3-node gossip cluster: peer attestation, quorum, leader election, and live failover. |
 | [`cluster-large`](example/cluster-large) | `docker compose -f example/cluster-large/docker-compose.yml up` | A 10-node, CPU-heavy fleet for watching `distribution: spread` and the load meters. |
-| [`dag`](example/dag) | `cronstable -c example/dag` | Orchestration alone, single node: dependencies, XCom, fan-out, a sensor, an approval gate. |
-| [`dag-cluster`](example/dag-cluster) | `docker compose -f example/dag-cluster/docker-compose.yml up` | DAGs coordinating across three nodes on one shared store: crash-resume, exactly-once tasks. |
-| [`job-state`](example/job-state) | `cronstable -c example/job-state` | The job-facing state primitives: KV, cursors, locks, idempotency keys, artifacts, secrets. |
+| [`dag`](example/dag) | `cronstable -c example/dag` | Orchestration on a single node: dependencies, XCom, fan-out, a sensor, and an approval gate. |
+| [`dag-cluster`](example/dag-cluster) | `docker compose -f example/dag-cluster/docker-compose.yml up` | DAGs coordinating across three nodes on one shared store: crash recovery and exactly-once tasks. |
+| [`job-state`](example/job-state) | `cronstable -c example/job-state` | The state primitives for jobs: key-value storage, cursors, locks, idempotency keys, artifacts, and secrets. |
 | [`mcp`](example/mcp) | `docker compose -f example/mcp/docker-compose.yml up --build` | The MCP server: an AI agent (Claude, Cursor, Copilot) observing and driving the scheduler over `POST /mcp`, or the `cronstable mcp` stdio bridge. |
-| [`pulse-monitor`](example/pulse-monitor) | `docker compose -f example/pulse-monitor/docker-compose.yml up` | Second-level scheduling as a real-time uptime / SLA monitor. |
-| [`pulse-cluster`](example/pulse-cluster) | `docker compose -f example/pulse-cluster/docker-compose.yml up` | The same probes fanned across a 3-node leader-electing cluster. |
+| [`pulse-monitor`](example/pulse-monitor) | `docker compose -f example/pulse-monitor/docker-compose.yml up` | Second-level scheduling as a real-time uptime and SLA monitor. |
+| [`pulse-cluster`](example/pulse-cluster) | `docker compose -f example/pulse-cluster/docker-compose.yml up` | The same probes spread across a 3-node cluster with leader election. |
 | [`zen-demo`](example/zen-demo) | `docker compose -f example/zen-demo/docker-compose.yml up` | A deliberately calm board, for the wallboard's zen screensaver. |
-| [`crontab`](example/crontab) | `cronstable -c example/crontab` | Classic Vixie crontabs running as-is next to YAML jobs. |
+| [`crontab`](example/crontab) | `cronstable -c example/crontab` | Classic Vixie crontabs running unchanged next to YAML jobs. |
 | [`kubernetes`](example/kubernetes) | `kubectl apply -f example/kubernetes/deployment.yaml` | Leader election through a `coordination.k8s.io/v1` Lease. |
 | [`etcd`](example/etcd) | `docker compose -f example/etcd/docker-compose.yml up` | Leader election through an etcd lease, over plain HTTP. |
 | [`docker`](example/docker) | `docker build` | The minimal "add cronstable to your own image" recipe. |
@@ -722,12 +760,11 @@ file or directory path as the `-c` argument. For example:
 cronstable -c /tmp/my-crontab.yaml
 ```
 
-This starts cronstable (always in the foreground!), reading
-`/tmp/my-crontab.yaml` as configuration file. If the path is a directory, any
-`*.yaml` or `*.yml` files inside that directory are taken as
-configuration files, along with any classic crontabs (`*.crontab`, `*.cron`,
-or a file named `crontab`; see
-[classic crontab files](#classic-crontab-files)).
+This command starts cronstable, which always runs in the foreground, and reads
+`/tmp/my-crontab.yaml` as its configuration file. If the path is a directory,
+cronstable reads every `*.yaml` and `*.yml` file in it as configuration, along
+with any classic crontabs (`*.crontab`, `*.cron`, or a file named `crontab`;
+see [classic crontab files](#classic-crontab-files)).
 
 ### Configuration basics
 
@@ -741,12 +778,12 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-The command can be a string or a list of strings. If command is a string,
-cronstable runs it through a shell, which is `/bin/bash` in the preceding
-example, but is `/bin/sh` by default.
+The command can be a string or a list of strings. If `command` is a string,
+cronstable runs it through a shell: `/bin/sh` by default, or `/bin/bash` in the
+preceding example.
 
-If the command is a list of strings, cronstable runs it directly, without a
-shell. The command's ARGV comes straight from the configuration:
+If `command` is a list of strings, cronstable runs it directly, without a
+shell, and uses the list as the command's arguments:
 
 ```yaml
 jobs:
@@ -757,18 +794,19 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-The `schedule` option can be a string in the classic crontab format (5, 6 or 7
-fields; ranges, steps, lists, `jan`/`mon` names, and Quartz's `?` standing
-alone in a day field), parsed by cronstable's built-in cron engine. For the
-full dialect, see
+The `schedule` option can be a string in the classic crontab format, which
+cronstable's built-in cron engine parses. The format accepts 5, 6, or 7
+fields; ranges, steps, lists, and names such as `jan` and `mon`; and Quartz's
+`?` on its own in a day field. For the full dialect, see
 [schedules and time zones](https://github.com/ptweezy/cronstable/wiki/Schedules-and-Timezones).
-Expressions in other dialects (Quartz `#`/`W`, the seconds-first 6-field
-layout) fail with an error naming the dialect and how to convert.
+Expressions from other dialects, such as Quartz `#` and `W` or the
+seconds-first 6-field layout, fail with an error that names the dialect and
+explains how to convert the expression.
 
-You can also include `@reboot`, which runs the job only when cronstable first
-starts up. The `schedule` option can also be an object with properties. The
-following configuration runs a command every 5 minutes, but only on the
-specific date 2017-07-19, and does not run it on any other date:
+You can also use `@reboot`, which runs the job only when cronstable first
+starts. The `schedule` option can also be an object with properties. The
+following configuration runs a command every 5 minutes, but only on July 19,
+2017:
 
 ```yaml
 jobs:
@@ -786,41 +824,45 @@ jobs:
 
 Six features answer questions about schedules, each with its own wiki page:
 
-* Schedule linting: cronstable lints every schedule at config load for legal
-  expressions that probably do not mean what they say (no future occurrence,
-  the day-of-month AND day-of-week rule, non-dividing `*/n` steps, wall
-  times DST skips or repeats). Findings surface on `/jobs` and `/status`,
-  and `GET /schedule/preview` checks any expression before it becomes a job
+* Schedule linting: when cronstable loads the configuration, it flags valid
+  expressions that probably don't mean what they say. Examples include an
+  expression with no future occurrence, a schedule that sets both day of month
+  and day of week, `*/n` steps that don't divide evenly, and wall-clock times
+  that daylight saving time skips or repeats. Findings appear on `/jobs` and
+  `/status`, and `GET /schedule/preview` checks any expression before it
+  becomes a job
   ([Schedule Linting](https://github.com/ptweezy/cronstable/wiki/Schedule-Linting)).
-* Hashed schedules: an `H` field hashes a stable slot from the job's name,
-  so a fleet of hourly jobs spreads across the hour instead of stampeding
-  at `:00`
+* Hashed schedules: an `H` field picks a stable time from a hash of the
+  job's name, so a fleet of hourly jobs spreads across the hour instead of all
+  starting at `:00`
   ([Hashed Schedules](https://github.com/ptweezy/cronstable/wiki/Hashed-Schedules)).
-* Schedule load: `GET /schedule/pressure` buckets the next 24 hours of
-  fires into a collision heatmap, drawn in both dashboards
+* Schedule load: `GET /schedule/pressure` groups the next 24 hours of
+  scheduled runs into a collision heatmap, which both dashboards display
   ([Schedule Pressure](https://github.com/ptweezy/cronstable/wiki/Schedule-Pressure)).
 * Duplicate detection: `GET /schedule/duplicates` groups jobs whose
-  schedules fire on identical instants, by semantic equality
+  schedules run at exactly the same times, even when the expressions are
+  written differently
   ([Duplicate Schedule Detection](https://github.com/ptweezy/cronstable/wiki/Duplicate-Schedule-Detection)).
-* Suggest a slot: `GET /schedule/suggest` recommends the least-loaded slot
-  for a new job from the fleet's real fires
+* Suggest a slot: `GET /schedule/suggest` recommends the least busy time for
+  a new job, based on the fleet's actual runs
   ([Suggest a Slot](https://github.com/ptweezy/cronstable/wiki/Suggest-a-Slot)).
-* Why didn't it run: `GET /schedule/why?job=<name>&at=<timestamp>`
-  decomposes the scheduler's own match test field by field for one job and
-  one instant
+* Why didn't it run: `GET /schedule/why?job=<name>&at=<timestamp>` shows,
+  field by field, how the scheduler's match test evaluates one job at one
+  moment
   ([Why Didn't It Run?](https://github.com/ptweezy/cronstable/wiki/Why-No-Run)).
 
 #### Second-level schedules
 
-Schedules are minute-granular by default, but cronstable can also run jobs at
-**second granularity**. There are two equivalent spellings:
+By default, schedules have one-minute granularity, but cronstable can also run
+jobs at one-second granularity. You can write a second-level schedule in two
+equivalent ways:
 
-* a full **seven-field** crontab string, where the first field is the second
-  (`second minute hour dayOfMonth month dayOfWeek year`); or
-* the object form with a `second:` property.
+* A seven-field crontab string, where the first field is the second
+  (`second minute hour dayOfMonth month dayOfWeek year`).
+* The object form with a `second:` property.
 
-Both of the following jobs run every 15 seconds (at seconds 0, 15, 30 and 45 of
-every minute):
+Both of the following jobs run every 15 seconds, at seconds 0, 15, 30, and 45
+of every minute:
 
 ```yaml
 jobs:
@@ -833,31 +875,30 @@ jobs:
       second: "*/15"
 ```
 
-The second field accepts the same syntax as the others (`*`, `*/5`, `0,30`,
-`10-20`, ...). `second: "*"` (or `* * * * * * *`) fires every second.
+The seconds field accepts the same syntax as the other fields, such as `*`,
+`*/5`, `0,30`, and `10-20`. A schedule of `second: "*"` or `* * * * * * *`
+runs every second.
 
 While any enabled job specifies seconds, the scheduler wakes once per second
-instead of once per minute. Minute-granular jobs are unaffected and still fire
-exactly once in their scheduled minute. If no job uses seconds, cronstable
-keeps its original once-a-minute cadence, so there is no overhead for the
-common case.
+instead of once per minute. Minute-level jobs still run exactly once in their
+scheduled minute. If no job uses seconds, cronstable wakes once a minute, so
+the common case has no extra overhead.
 
-Second-level scheduling is a YAML feature: [classic crontab files](#classic-crontab-files)
-keep their standard five-field, minute-granular format. (A **six-field** string
-is read as the classic five fields plus a trailing `year` column, *not* as
-seconds; seconds require the full seven fields.)
+Second-level scheduling is available only in YAML.
+[Classic crontab files](#classic-crontab-files) keep the standard five-field,
+minute-level format. A six-field string means the classic five fields plus a
+trailing `year` field, not seconds; seconds require all seven fields.
 
-For a runnable end-to-end example, see
-[`example/pulse-monitor`](example/pulse-monitor), a small real-time uptime / SLA
-monitor that probes a service every few seconds
-(`docker compose -f example/pulse-monitor/docker-compose.yml up`), and its clustered sibling
-[`example/pulse-cluster`](example/pulse-cluster), which fans the probes across a
-three-node leader-electing cluster
-(`docker compose -f example/pulse-cluster/docker-compose.yml up`).
+For a runnable example, see [`example/pulse-monitor`](example/pulse-monitor), a
+small real-time uptime and SLA monitor that probes a service every few seconds.
+Its clustered version, [`example/pulse-cluster`](example/pulse-cluster), spreads
+the probes across a three-node cluster that elects a leader. To start them,
+run `docker compose -f example/pulse-monitor/docker-compose.yml up` or
+`docker compose -f example/pulse-cluster/docker-compose.yml up`.
 
-Important: by default cronstable interprets all time as UTC, but you can
-request local time instead. For instance, the following cron job runs
-every day at 19h27 *local time* because of the `utc: false` option:
+**Important:** cronstable interprets all times as UTC by default. To use local
+time, set `utc: false`. For example, the following job runs every day at 19:27
+local time:
 
 ```yaml
 jobs:
@@ -868,8 +909,8 @@ jobs:
     captureStdout: true
 ```
 
-You can also request that the schedule be interpreted in an arbitrary time
-zone, using the `timezone` attribute:
+To interpret the schedule in a specific time zone, use the `timezone`
+attribute:
 
 ```yaml
 jobs:
@@ -880,7 +921,8 @@ jobs:
     captureStdout: true
 ```
 
-You can ask for environment variables to be defined for the command:
+To define environment variables for the command, use the `environment`
+option:
 
 ```yaml
 jobs:
@@ -893,7 +935,7 @@ jobs:
         value: /bin:/usr/bin
 ```
 
-Load environment variables for the command from a file:
+To load environment variables from a file, use `env_file`:
 
 ```yaml
 jobs:
@@ -904,18 +946,17 @@ jobs:
     env_file: .env
 ```
 
-The env file must be a list of `KEY=VALUE` pairs. Empty lines and lines
-starting with `#` are ignored.
+The file must contain a list of `KEY=VALUE` pairs. cronstable ignores empty
+lines and lines that start with `#`.
 
-Variables declared in the `environment` option override those found in the
-`env_file`.
+Variables in the `environment` option override variables from `env_file`.
 
 ### Classic crontab files
 
-Already have a crontab? The daemon runs it as-is. A file named `*.crontab`,
-`*.cron`, or plain `crontab` (so `-c /etc/crontab` works) is read in the
-classic Vixie format, whether passed directly to `-c`, dropped into a config
-directory next to YAML files, or pulled in with `include:`:
+The daemon can run an existing crontab unchanged. It reads a file named
+`*.crontab`, `*.cron`, or `crontab` in the classic Vixie format, so
+`-c /etc/crontab` works. You can pass the file directly to `-c`, put it in a
+configuration directory next to YAML files, or load it with `include:`:
 
 ```crontab
 SHELL=/bin/bash
@@ -928,28 +969,30 @@ PATH=/usr/local/bin:/usr/bin:/bin
 0 0 * * *  pg_dump mydb > /backup/mydb-$(date +\%F).sql
 ```
 
-Comments, `NAME=value` environment lines (position-sensitive, `SHELL` and
-`CRON_TZ` honored), the `@reboot`/`@daily`/... nicknames, and `\%` escapes
-all work as in `man 5 crontab`. Each entry becomes an ordinary cronstable job
-named `<file>:<line>`, configured to cronstable's standard defaults rather
-than an emulation of cron's environment:
+Comments, `NAME=value` environment lines, nicknames such as `@reboot` and
+`@daily`, and `\%` escapes all work as described in `man 5 crontab`. An
+environment line applies to the entries after it, and cronstable honors
+`SHELL` and `CRON_TZ`. Each entry becomes an ordinary cronstable job named
+`<file>:<line>`, with cronstable's standard defaults rather than an emulation
+of cron's environment:
 
-* Schedules run in **UTC** unless the crontab sets `CRON_TZ`.
-* Failure means a nonzero exit or stderr output (no `MAILTO` mail).
-* The `%`-as-stdin feature is a load-time error instead of a silent surprise
-  (`\%` still gives a literal `%`).
+* Schedules run in UTC unless the crontab sets `CRON_TZ`.
+* A run fails when it exits with a nonzero status or writes to stderr.
+  cronstable doesn't send `MAILTO` mail.
+* An unescaped `%`, which cron passes to the command as standard input,
+  causes an error when the file loads. `\%` still produces a literal `%`.
 
-When an entry needs retries, reporting, timeouts, or any other per-job option,
-move it to YAML. The full mapping and every deviation are documented in
-[classic crontabs](https://github.com/ptweezy/cronstable/wiki/Classic-Crontabs),
-and a runnable example (a config directory mixing a crontab with YAML and the
-dashboard) lives in [example/crontab](example/crontab).
+To give an entry retries, reporting, timeouts, or any other per-job option,
+move it to YAML. For the full mapping and every difference from cron, see
+[classic crontabs](https://github.com/ptweezy/cronstable/wiki/Classic-Crontabs)
+in the wiki. For a runnable example, see [example/crontab](example/crontab), a
+configuration directory that combines a crontab with YAML jobs and the
+dashboard.
 
 ### Specifying defaults
 
-The config can have a special `defaults` section. Any attributes defined in
-this section provide default values for cron jobs to inherit, although cron
-jobs can still override the defaults as needed:
+The configuration can have a `defaults` section. Jobs inherit the attributes
+in this section as default values, and each job can override them:
 
 ```yaml
 defaults:
@@ -968,20 +1011,19 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-Note: if the configuration option is a directory holding several
-configuration files, each file's `defaults` section provides default options
-only for cron jobs inside that same file. The defaults have no effect beyond
-any individual YAML file.
+**Note:** If the configuration path is a directory with several configuration
+files, each file's `defaults` section applies only to the jobs in that file.
 
 ### Reporting
 
 cronstable has six built-in reporters: `sentry`, `mail`, `shell`, `webhook`
-(Slack-compatible with no extra configuration), and `push`
-([end-to-end encrypted push notifications](#push-notifications), later on this
-page). Each can fire on the `onFailure`, `onPermanentFailure`, `onSuccess`,
-and `onLate` hooks. The mail `subject`/`body` and sentry `body` are jinja2
-templates over the run's outcome and captured output, and secrets (DSNs,
-passwords, webhook URLs) can come from `value`, `fromFile`, or `fromEnvVar`:
+(Slack-compatible with no extra configuration), `push` (see
+[push notifications](#push-notifications)), and `eventlog` (see
+[Windows Event Log](#windows-event-log)). Each reporter can run on the
+`onFailure`, `onPermanentFailure`, `onSuccess`, and `onLate` hooks. The mail
+`subject` and `body` and the Sentry `body` are Jinja2 templates that can use
+the run's outcome and captured output. Secrets such as DSNs, passwords, and
+webhook URLs can come from `value`, `fromFile`, or `fromEnvVar`:
 
 ```yaml
 - name: test-01
@@ -1012,35 +1054,37 @@ passwords, webhook URLs) can come from `value`, `fromFile`, or `fromEnvVar`:
           fromEnvVar: SLACK_WEBHOOK_URL
 ```
 
-A report includes the output streams the job captures (`captureStderr` is on
-by default, `captureStdout` off; see
-[output capturing](https://github.com/ptweezy/cronstable/wiki/Output-Capturing)
-for the capture options, including the `streamPrefix` line prefix).
-[Reporting](https://github.com/ptweezy/cronstable/wiki/Reporting) in the wiki
-documents every reporter's options (HTML mail, sentry fingerprints, webhook
-method/headers/body and per-service examples), the template variables, and
-the shell reporter's `CRONSTABLE_*` environment.
+A report includes the output streams that the job captures. `captureStderr`
+is on by default, and `captureStdout` is off. For the capture options,
+including the `streamPrefix` line prefix, see
+[output capturing](https://github.com/ptweezy/cronstable/wiki/Output-Capturing).
+For every reporter's options, see
+[Reporting](https://github.com/ptweezy/cronstable/wiki/Reporting) in the wiki.
+It covers HTML mail; Sentry fingerprints; the webhook method, headers, and
+body, with per-service examples; the template variables; and the shell
+reporter's `CRONSTABLE_*` environment variables.
 
 ### Push notifications
 
-The `push` reporter delivers end-to-end encrypted alerts to devices paired
-with the [iOS app](#ios-app).
-Each alert is sealed to the device's public key before it leaves the daemon:
-an X25519 device gets a libsodium sealed box, and an X-Wing device (the
-post-quantum ML-KEM-768 + X25519 hybrid) gets single-shot HPKE. The hosted
-relay that forwards it to the platform push service (APNs) sees only
-ciphertext and routing metadata, never job names, hostnames, or log lines.
+The `push` reporter sends end-to-end encrypted alerts to devices paired with
+the [iOS app](#ios-app). The daemon seals each alert to the device's public
+key before sending it. An X25519 device gets a libsodium sealed box, and an
+X-Wing device gets single-shot HPKE. X-Wing is the post-quantum hybrid of
+ML-KEM-768 and X25519. The hosted relay forwards each alert to the Apple Push
+Notification service (APNs) and sees only ciphertext and routing metadata. It
+never sees job names, hostnames, or log lines.
 
-The reporter needs the `push` extra (`pip install "cronstable[push]"`), a
-daemon-global `push:` section, and an opt-in on the reporting hooks. The
-extra carries both sealing libraries: PyNaCl for X25519 on every platform,
-and `cryptography` for X-Wing on every platform it publishes a wheel for
-(see
-[Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
-for the list). The daemon lists what it can seal in `sealableSuites` on
-`GET /whoami`, and the app pairs under `xwing` on its own whenever that
-list carries it. If a config enables push without the extra or the
-section, cronstable refuses to start rather than silently dropping alerts:
+The reporter needs three things: the `push` extra
+(`pip install "cronstable[push]"`), a daemon-wide `push:` section, and `push`
+enabled on the reporting hooks. The extra includes both sealing libraries:
+PyNaCl for X25519 on every platform, and `cryptography` for X-Wing on every
+platform that `cryptography` publishes a wheel for. For the list of platforms,
+see
+[Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications).
+The daemon lists the suites it can seal in the `sealableSuites` field of
+`GET /whoami`, and the app pairs with `xwing` automatically when that list
+includes it. If a configuration enables push without the extra or the `push:`
+section, cronstable refuses to start, so it never drops alerts silently:
 
 ```yaml
 push:
@@ -1055,13 +1099,14 @@ defaults:
         enabled: true
 ```
 
-(With a `state:` section configured, `devicesFile` can be dropped: pairings
-live in the durable store and are visible to every node sharing it.)
+If you configure a `state:` section, you can omit `devicesFile`. Pairings are
+then kept in the durable store, and every node that shares the store can see
+them.
 
-Pair a device from the dashboard, with **Pair a device** in the command
-palette or settings. The QR is a deep link, so a phone-camera scan opens the
-[iOS app](#ios-app), or a landing page with install pointers when the app is
-missing. Or pair with one call:
+To pair a device, select **Pair a device** in the dashboard's command palette
+or settings. The QR code is a deep link: scanning it with the phone's camera
+opens the [iOS app](#ios-app), or a landing page that explains how to install
+the app if it's missing. You can also pair with one API call:
 
 [![The dashboard's Pair a device panel: a QR code deep-linking the connection payload into the app being paired, the same payload as a copyable JSON string, and a warning that the embedded token holds every scope](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
 
@@ -1071,25 +1116,25 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
     http://127.0.0.1:8080/push/devices
 ```
 
-Setting `web.bonjour: true` (with the `discovery` extra installed)
-additionally advertises the web API as a `_cronstable._tcp` mDNS service on
-the local network, so the [iOS app](#ios-app) finds the daemon without a
-typed URL.
-See [LAN discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)
-in the wiki.
+If you install the `discovery` extra and set `web.bonjour: true`, the daemon
+also advertises the web API as a `_cronstable._tcp` mDNS service on the local
+network. The [iOS app](#ios-app) can then find the daemon without a typed URL.
+For details, see
+[LAN discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery) in
+the wiki.
 
-See
+For the report options, pairing and revocation, storage, size limits, and the
+relay trust model, see
 [push notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
-in the wiki for the report options, pairing and revocation, storage, size
-limits, and the relay trust model.
+in the wiki.
 
 ### Windows Event Log
 
-On Windows, the `eventlog` reporter writes each outcome to the Event Log,
-where a Windows shop's monitoring already looks: Event Viewer, a Windows
-Event Forwarding subscription, SCOM, and every SIEM connector. It needs no
-extra and no dependency, and each record carries a stable event ID plus a
-fixed set of insertion strings, so a rule written against it keeps working:
+On Windows, the `eventlog` reporter writes each outcome to the Windows Event
+Log, which Windows monitoring tools already read: Event Viewer, Windows Event
+Forwarding subscriptions, SCOM, and SIEM connectors. It needs no extra or
+dependency. Each record has a stable event ID and a fixed set of insertion
+strings, so rules that match on them keep working:
 
 ```yaml
 defaults:
@@ -1104,24 +1149,24 @@ Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'cronst
 ```
 
 Jobs use event IDs 1000 (succeeded), 1001 (failed), 1002 (failed
-permanently) and 1003 (overdue). Daemon and orchestration events use 1010
-and 1011. cronstable does not register its event source, so Event Viewer
+permanently), and 1003 (overdue). Daemon and orchestration events use 1010
+and 1011. cronstable doesn't register its event source, so Event Viewer
 prefixes the rendered text with its generic "description cannot be found"
-note. The provider, ID, level and every insertion string are unaffected, so
-the XML view, `wevtutil`, forwarding and SIEM connectors read the record
-normally. On any other platform the reporter does nothing, and the config
-load says so once.
+note. The provider, ID, level, and insertion strings are unaffected, so the
+XML view, `wevtutil`, forwarding, and SIEM connectors read the record
+normally. On other platforms, the reporter does nothing, and cronstable
+reports this once when it loads the configuration.
 
-See
+For the full ID and field tables, the optional source registration, and the
+reasons behind both defaults, see
 [Windows Event Log](https://github.com/ptweezy/cronstable/wiki/Windows-Event-Log)
-in the wiki for the full ID and field tables, the optional source
-registration, and the reasons behind both defaults.
+in the wiki.
 
 ### Metrics
 
-The daemon exposes built-in Prometheus metrics whenever the
-[HTTP REST API](https://github.com/ptweezy/cronstable/wiki/HTTP-API) is
-enabled, with no exporter sidecar needed:
+When the [HTTP REST API](https://github.com/ptweezy/cronstable/wiki/HTTP-API)
+is enabled, the daemon exposes built-in Prometheus metrics, so you don't need
+an exporter sidecar:
 
 ```yaml
 web:
@@ -1129,13 +1174,14 @@ web:
     - http://127.0.0.1:8080
 ```
 
-`GET /metrics` then serves job run outcomes, duration histograms, retries,
-next-run times, config-reload health, and cluster/leader-election state, in
-both the Prometheus text format and OpenMetrics. See
-[metrics with Prometheus](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Prometheus)
-for the full metric reference, scrape configuration, and example alert rules.
+The `GET /metrics` endpoint then serves job run outcomes, duration
+histograms, retries, next-run times, configuration reload health, and cluster
+and leader election state, in both the Prometheus text format and
+OpenMetrics. For the full metric reference, scrape configuration, and example
+alert rules, see
+[metrics with Prometheus](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Prometheus).
 
-The daemon also has built-in support for pushing per-job metrics to
+The daemon can also push per-job metrics to
 [statsd](https://github.com/etsy/statsd):
 
 ```yaml
@@ -1149,8 +1195,8 @@ jobs:
       prefix: my.cron.jobs.prefix.test01
 ```
 
-With this config, cronstable writes the following metrics over UDP
-to the statsd listening on `my-statsd.example.com:8125`:
+With this configuration, cronstable sends the following metrics over UDP to
+the statsd server at `my-statsd.example.com:8125`:
 
 ```text
 my.cron.jobs.prefix.test01.start:1|g  # this one is sent when the job starts
@@ -1161,8 +1207,9 @@ my.cron.jobs.prefix.test01.duration:3|ms
 
 ### Resource monitoring
 
-To find out which cron job is consuming the machine, turn on per-job resource
-accounting with a single flag (or once under `defaults:` for every job):
+To find out which job uses the most resources, turn on per-job resource
+accounting. Set `monitorResources: true` on a job, as in the following
+example, or set it under `defaults:` to cover every job:
 
 ```yaml
 jobs:
@@ -1172,53 +1219,57 @@ jobs:
     monitorResources: true
 ```
 
-While the job runs, cronstable samples its **whole process tree** (children and
-shell-outs included) with [psutil](https://github.com/giampaolo/psutil), and
-the run ends with its **total CPU time (user + system)** and **peak resident
-memory**. The numbers surface everywhere the run does:
+While the job runs, cronstable uses [psutil](https://github.com/giampaolo/psutil)
+to sample its whole process tree, including child processes and shell-outs.
+When the run ends, cronstable records its total CPU time (user plus system)
+and its peak resident memory. The numbers appear everywhere the run appears:
 
-* **live** on the dashboard job row and drawer while it runs (`cpu 61% · 288 MiB`);
-* per run and aggregated (avg/max CPU, peak memory) in the dashboard
-  **History** tab and `GET /jobs/{name}/runs`;
-* as **CPU/memory charts** in the dashboard's **Resources** tab (a live
-  view of the running instance, the recorded profile of any recent run, and
-  per-run trend strips), plus a node-wide history chart behind the header
-  meter (`GET /jobs/{name}/resources`, `GET /node/history`);
-* as Prometheus families on `GET /metrics`
-  (`cronstable_job_cpu_seconds_total`, `cronstable_job_last_run_max_rss_bytes`, ...)
-  and over [statsd](#metrics) when the job has a sink;
-* in the durable run record's `resources` object when a
+* Live, on the dashboard's job row and drawer while the job runs
+  (`cpu 61% · 288 MiB`).
+* Per run and aggregated (average and maximum CPU, and peak memory) in the
+  dashboard's **History** tab and `GET /jobs/{name}/runs`.
+* As CPU and memory charts in the dashboard's **Resources** tab: a live view
+  of the running instance, the recorded profile of any recent run, and
+  per-run trend strips. A node-wide history chart sits behind the header
+  meter (`GET /jobs/{name}/resources` and `GET /node/history`).
+* As Prometheus metric families on `GET /metrics`, such as
+  `cronstable_job_cpu_seconds_total` and
+  `cronstable_job_last_run_max_rss_bytes`, and over [statsd](#metrics) when
+  the job has a statsd sink.
+* In the durable run record's `resources` object when a
   [state store](https://github.com/ptweezy/cronstable/wiki/Durable-State) is
-  configured, so it survives restarts;
-* in report templates (`cpu_seconds` / `max_rss_bytes`) and the shell
-  reporter's environment (`CRONSTABLE_CPU_SECONDS` / `CRONSTABLE_MAX_RSS_BYTES`),
-  so a failure page can say how big the run was when it died.
+  configured, so the numbers survive restarts.
+* In report templates (`cpu_seconds` and `max_rss_bytes`) and the shell
+  reporter's environment (`CRONSTABLE_CPU_SECONDS` and
+  `CRONSTABLE_MAX_RSS_BYTES`), so a failure alert can show how large the run
+  was when it failed.
 
-Resource monitoring is observability only: it never changes a run's verdict.
-It is off by default, with zero overhead when off. The numbers are sampled, so
-short-lived runs are approximate, although the long, heavy runs that matter
-are sampled many times.
+Resource monitoring only observes: it never changes whether a run succeeds or
+fails. It's off by default and adds no overhead when it's off. Because the
+numbers are sampled, figures for short runs are approximate, but long, heavy
+runs are sampled many times.
 
-The map form tunes the sampling cadence and how many chart points each run
-keeps (`monitorResources: { interval: 0.5, history: 240 }`). Series are
-downsampled in place, so even a days-long run stays a few KB. DAG tasks accept
-the same flag, and their usage lands in the task record of the `dag_run`
-document. On a cluster, `cluster.observability` additionally shares each
-node's **whole-host** CPU/memory, so the dashboard's cluster panel and fleet
-view show where the load actually is. The full semantics live in the
+To tune the sampling interval and how many chart points each run keeps, use
+the map form: `monitorResources: { interval: 0.5, history: 240 }`. cronstable
+downsamples each series in place, so even a run that lasts days stays at a few
+KB. DAG tasks accept the same setting, and their usage is recorded in the task
+record of the `dag_run` document. On a cluster, `cluster.observability` also
+shares each node's whole-host CPU and memory use, so the dashboard's cluster
+panel and fleet view show where the load is. For the full details, see the
 [configuration reference](https://github.com/ptweezy/cronstable/wiki/Configuration-Reference).
 
 ### Handling failure
 
-By default, cronstable considers a job *failed* if the process exits nonzero
-or writes to standard error (with stderr capturing enabled). The `failsWhen`
-option tunes this per job with four booleans: `producesStdout` (default
-false), `producesStderr` (default true), `nonzeroReturn` (default true), and
-`always` (default false).
+By default, cronstable considers a job failed if the process exits with a
+nonzero status, or if it writes to standard error while stderr capturing is
+enabled. To change this for a job, set the four Boolean fields of the
+`failsWhen` option: `producesStdout` (default `false`), `producesStderr`
+(default `true`), `nonzeroReturn` (default `true`), and `always` (default
+`false`).
 
-A `retry` option inside `onFailure` retries failing jobs with exponential
-backoff, and `onPermanentFailure` reports only after all retries are
-exhausted and cronstable gives up:
+A `retry` option inside `onFailure` retries failed jobs with exponential
+backoff. The `onPermanentFailure` hook reports only after all retries are used
+up:
 
 ```yaml
 - name: test-01
@@ -1242,22 +1293,22 @@ exhausted and cronstable gives up:
         smtpHost: 127.0.0.1
 ```
 
-`maximumRetries: -1` retries forever, mostly useful with an `@reboot`
-schedule to restart a long-running process when it fails. Retries are
-in-memory by default, so a daemon restart forgets an armed retry. With a
-`state:` section configured they survive restarts and resume where they left
-off. See
+To retry forever, set `maximumRetries: -1`. This is most useful with an
+`@reboot` schedule, to restart a long-running process when it fails. By
+default, retries are kept in memory, so a daemon restart forgets a pending
+retry. If you configure a `state:` section, retries survive restarts and
+resume where they left off. For details, see
 [failure detection and retries](https://github.com/ptweezy/cronstable/wiki/Failure-Detection-and-Retries)
 and [durable state](https://github.com/ptweezy/cronstable/wiki/Durable-State)
 in the wiki.
 
 ### Late-run detection (SLA monitoring)
 
-Failure hooks only see runs that happened. An `sla:` block watches for the
-runs that did not: each job can declare up to three independent thresholds,
-evaluated once per minute by an in-process monitor. A dedicated `onLate`
-reporting hook fires once when a threshold is breached, and takes the same
-`report` block (mail, Sentry, shell, webhook) as `onFailure`:
+Failure hooks only see runs that happened. To detect runs that are late,
+missing, or taking too long, add an `sla:` block. Each job can set up to three
+independent thresholds, and an in-process monitor checks them once per minute.
+When a threshold is breached, the `onLate` hook runs once. It takes the same
+`report` block as `onFailure`:
 
 ```yaml
 - name: nightly-etl
@@ -1274,17 +1325,17 @@ reporting hook fires once when a threshold is breached, and takes the same
           fromEnvVar: SLACK_WEBHOOK_URL
 ```
 
-Breaches latch: one report per breach, not one per minute, with a recovery
-log line and no report when the check clears. `maxRuntimeSeconds` observes and
-never stops a run (use `executionTimeout` to enforce a limit). The monitor
-skips paused and disabled jobs, and under leader election only the job's
-owning node evaluates, so one breach pages once.
+Each breach produces one report, not one per minute. When the check clears,
+cronstable logs a recovery line and sends no report. `maxRuntimeSeconds` only
+observes a run and never stops it; to enforce a limit, use `executionTimeout`.
+The monitor skips paused and disabled jobs. Under leader election, only the
+node that owns the job checks it, so each breach sends a single alert.
 
-Breaches surface as an **OVERDUE** badge in both dashboards, an `sla` object
-on `GET /jobs`, and `cronstable_job_late{job_name, check}` /
-`cronstable_job_sla_breaches_total{job_name, check}` in the metrics. The
-monitor runs inside the daemon and cannot report its own death, so pair it
-with an external Prometheus staleness alert. See
+Breaches appear as an **OVERDUE** badge in both dashboards, as an `sla` object
+on `GET /jobs`, and as the `cronstable_job_late{job_name, check}` and
+`cronstable_job_sla_breaches_total{job_name, check}` metrics. The monitor runs
+inside the daemon and can't report that the daemon itself has stopped, so pair
+it with an external Prometheus staleness alert. For details, see
 [late-run detection](https://github.com/ptweezy/cronstable/wiki/Late-Run-Detection)
 in the wiki.
 
@@ -1293,20 +1344,15 @@ in the wiki.
 If a job is still running when its next scheduled run is due,
 `concurrencyPolicy` determines what happens:
 
-Allow
-: allows concurrently running jobs (default)
-
-Forbid
-: forbids concurrent runs, skipping next run if previous hasn't finished yet
-
-Replace
-: cancels currently running job and replaces it with a new one
+* `Allow` (default): allows concurrent runs.
+* `Forbid`: skips the next run if the previous run hasn't finished.
+* `Replace`: cancels the running job and starts a new run in its place.
 
 ### Execution timeout
 
-Set `executionTimeout` to terminate a job after a specified number of seconds.
-This job would take two seconds to complete, but cronstable terminates it
-after one:
+To stop a job after a set number of seconds, set `executionTimeout`. The
+following job would take two seconds to finish, but cronstable stops it after
+one second:
 
 ```yaml
 - name: test-03
@@ -1320,12 +1366,13 @@ after one:
   executionTimeout: 1  # in seconds
 ```
 
-`killTimeout` sets how long cronstable waits for a job to exit gracefully
-before forcing termination. On Unix, it sends `SIGTERM`, waits up to
-`killTimeout` seconds (30 by default), then sends `SIGKILL` if the process
-is still running.
+The `killTimeout` option sets how long cronstable waits for a job to exit
+gracefully before it forces the job to stop. On Unix, cronstable sends
+`SIGTERM`, waits up to `killTimeout` seconds (30 by default), and then sends
+`SIGKILL` if the process is still running.
 
-This job ignores `SIGTERM`, so cronstable sends `SIGKILL` half a second later:
+The following job ignores `SIGTERM`, so cronstable sends `SIGKILL` half a
+second later:
 
 ```yaml
 - name: test-03
@@ -1343,11 +1390,10 @@ This job ignores `SIGTERM`, so cronstable sends `SIGKILL` half a second later:
 
 ### Change to another user/group
 
-You can request that cronstable change to another user, group, or both for a
-specific cron job. The field `user` indicates the user (uid or user name) that
-the subprocess must run as. The field `group` (gid or group name) indicates
-the group id. If only `user` is given, the group defaults to the main group of
-that user. Example:
+You can run a job as another user, group, or both. The `user` field sets the
+user (UID or username) that the job's process runs as, and the `group` field
+sets the group (GID or group name). If you set only `user`, the group defaults
+to that user's primary group. For example:
 
 ```yaml
 - name: test-03
@@ -1358,20 +1404,19 @@ that user. Example:
   user: www-data
 ```
 
-To have permissions to change to another user, cronstable must be running as
-root.
+To switch to another user, cronstable must run as root.
 
-This feature is POSIX-only (it relies on `setuid`/`setgid`). On Windows, a job
-with `user` or `group` set is rejected with a configuration error; see
-[Running on Windows](#running-on-windows).
+This feature is available only on POSIX systems, because it relies on `setuid`
+and `setgid`. On Windows, cronstable rejects a job that sets `user` or `group`
+with a configuration error; see [Running on Windows](#running-on-windows).
 
 ### Working directory
 
-By default a job starts in whatever directory cronstable itself is running in.
-`workingDirectory` names the directory instead. It matters most on Windows,
-where an elevated console starts the daemon in the system directory, so every
-relative path in a script resolves somewhere unintended. It is the equivalent
-of the "Start in" box on a Task Scheduler action.
+By default, a job starts in cronstable's own working directory. To start it
+in a different directory, set `workingDirectory`. This setting matters most on
+Windows, where an elevated console starts the daemon in the system directory,
+so relative paths in a script resolve to the wrong place. It's equivalent to
+the **Start in** box on a Task Scheduler action.
 
 ```yaml
 - name: nightly-import
@@ -1382,17 +1427,18 @@ of the "Start in" box on a Task Scheduler action.
   workingDirectory: C:\jobs\importer
 ```
 
-cronstable expands `~` and `${VAR}` and makes the result absolute at config
-load. The OS checks that the directory exists at spawn, not at load, so a
-missing one fails that one run at launch instead of rejecting the whole
-config. You can also set the key in a `defaults:` block and on a DAG task. See
+When it loads the configuration, cronstable expands `~` and `${VAR}` and
+makes the path absolute. The operating system checks that the directory exists
+when the job starts, so a missing directory fails only that run instead of
+rejecting the whole configuration. You can also set `workingDirectory` in a
+`defaults:` block and on a DAG task. For details, see
 [commands and environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment#workingdirectory).
 
 ### Process priority
 
-`priority` says how a job should be scheduled against everything else on the
-machine, in five levels: `idle`, `below-normal`, `normal`, `above-normal`,
-`high`.
+The `priority` option sets a job's scheduling priority relative to the other
+processes on the machine. It has five levels: `idle`, `below-normal`,
+`normal`, `above-normal`, and `high`.
 
 ```yaml
 - name: nightly-reindex
@@ -1403,21 +1449,22 @@ machine, in five levels: `idle`, `below-normal`, `normal`, `above-normal`,
   priority: idle
 ```
 
-On Windows the level becomes the process's priority class at creation. On
-POSIX cronstable renices the job's process group right after the spawn
-(`idle` is nice 19, `high` is nice -10). Descendants inherit a lowered level
-on both platforms.
+On Windows, the level becomes the process's priority class when the process
+is created. On POSIX systems, cronstable renices the job's process group right
+after it starts the job: `idle` is nice 19, and `high` is nice -10. On both
+platforms, child processes inherit a lowered priority.
 
-On Windows, child processes do not automatically inherit above-normal or
-high priority; they start at `NORMAL` unless explicitly configured. On POSIX,
-cronstable adjusts the whole process group. The default, `normal`, leaves
-the inherited priority unchanged. Raising priority requires privilege on POSIX;
-if denied, the job continues at its inherited priority. See
+On Windows, child processes don't automatically inherit above-normal or high
+priority; they start at `NORMAL` unless configured otherwise. On POSIX
+systems, cronstable adjusts the whole process group. The default, `normal`,
+leaves the inherited priority unchanged. On POSIX systems, raising the
+priority requires privileges; if the change is denied, the job continues at
+its inherited priority. For details, see
 [commands and environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment#priority).
 
 ### Remote web/HTTP interface
 
-Enable the HTTP API to control cronstable remotely:
+To control cronstable remotely, enable the HTTP API:
 
 ```yaml
 web:
@@ -1426,27 +1473,36 @@ web:
      - unix:///tmp/cronstable.sock
 ```
 
-With the web interface enabled, cronstable also serves the
-[web dashboard](#web-dashboard) at the root path (`/`) of any `http://`
-listener. To expose only the REST API, set `ui: false`. With `web.authToken`
-set, the dashboard page loads without a token, then prompts for one and
-stores it only in that browser tab.
+When the web interface is enabled, cronstable also serves the
+[web dashboard](#web-dashboard) at the root path (`/`) of every `http://`
+listener. To expose only the REST API, set `ui: false`. If you set
+`web.authToken`, the dashboard page loads without a token, and then it prompts
+for one and stores it only in that browser tab.
 
-Adding `web.anonymousScopes: [view]` alongside the tokens turns the same page
-into a public read-only board: credential-less requests hold the `view` scope,
-the dashboard skips the prompt and draws view-only chrome, and every mutating
-route still requires a token. See
+To turn the same page into a public read-only board, add
+`web.anonymousScopes: [view]` alongside the tokens. Requests without
+credentials then get the `view` scope, the dashboard skips the token prompt
+and shows a view-only interface, and every route that changes state still
+requires a token. For details, see
 [public read-only access](https://github.com/ptweezy/cronstable/wiki/HTTP-API#public-read-only-access-webanonymousscopes)
 and the
 [full dashboard tour](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard)
 in the wiki.
 
-The API covers the daemon (version, status, summary, metrics, job-set ID),
-jobs (start, cancel, pause and resume, run history, live SSE log tails,
-resources), schedules (preview, pressure, duplicates, suggest, why), DAGs,
-the durable state store, push-device pairing, the cluster and fleet views,
-and an iCal feed of upcoming fires. For example, pausing a job for a
-two-hour maintenance window (HTTPie shown):
+The API covers these areas:
+
+* The daemon: version, status, summary, metrics, and job-set ID
+* Jobs: start, cancel, pause and resume, run history, live log tails over
+  server-sent events (SSE), and resources
+* Schedules: preview, pressure, duplicates, suggest, and why
+* DAGs
+* The durable state store
+* Push device pairing
+* The cluster and fleet views
+* An iCal feed of upcoming runs
+
+For example, the following HTTPie command pauses a job for a two-hour
+maintenance window:
 
 ```shell
 $ http post http://127.0.0.1:8080/jobs/test-02/pause durationSeconds:=7200 note="db migration"
@@ -1455,18 +1511,18 @@ HTTP/1.1 200 OK
 {"paused": {"since": "2026-07-19T14:00:00+00:00", "until": "2026-07-19T16:00:00+00:00", "note": "db migration", "by": "api", "channel": "api"}}
 ```
 
-Every endpoint, with request and response shapes, is documented in the
-[HTTP API](https://github.com/ptweezy/cronstable/wiki/HTTP-API) reference in
-the wiki. The repo also ships a machine-readable
+The [HTTP API](https://github.com/ptweezy/cronstable/wiki/HTTP-API) reference
+in the wiki documents every endpoint, with its request and response shapes.
+The repository also includes a machine-readable
 [OpenAPI specification](docs/openapi.yaml).
 
 #### Serving the API over TLS
 
-`web.listen` also accepts `https://` addresses, served from a `web.tls` block.
-Each entry keeps its own transport, so one runner can serve the same API and
-dashboard in plaintext on loopback and over TLS on a routable interface.
-`unix://` listeners are always plaintext, where the socket's own permissions
-(`socketMode`) are the access control.
+The `web.listen` option also accepts `https://` addresses, which use the
+certificate and key from a `web.tls` block. Each listener keeps its own
+transport, so one daemon can serve the same API and dashboard in plaintext on
+loopback and over TLS on a routable interface. `unix://` listeners are always
+plaintext; the socket's own permissions (`socketMode`) control access.
 
 ```yaml
 web:
@@ -1479,66 +1535,67 @@ web:
     clientCa: /etc/cronstable/callers-ca.pem      # optional: require client certs
 ```
 
-Set `clientCa` to require mutual TLS, which authenticates clients as well as
-encrypting connections. Web certificates rotate in place without a daemon
-restart. The clients (`cronstable tui`, `cronstable mcp`) take matching
-`--cacert` / `--client-cert` / `--client-key` / `--insecure` flags.
-The rest is covered in depth in the
-[listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS)
-guide in the wiki: issuing the certificates, the mTLS trust model and how it
-interacts with `web.authToken`, the rotation mechanics and what they do not
-cover, the job state API's trust anchor, and the full client flag surface.
+To require mutual TLS, which authenticates clients as well as encrypting
+connections, set `clientCa`. Web certificates rotate in place without a daemon
+restart. The `cronstable tui` and `cronstable mcp` clients take matching
+`--cacert`, `--client-cert`, `--client-key`, and `--insecure` flags. For more
+details, see the
+[listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS) guide
+in the wiki. It covers issuing the certificates, the mTLS trust model and how
+it interacts with `web.authToken`, how rotation works and what it doesn't
+cover, the job state API's trust anchor, and every client flag.
 
 ### Job-set ID
 
-The **job-set ID** is an order-independent fingerprint of the set of jobs a
-cronstable instance is running. Two instances produce the *same* id if and only if
-they hold the same set of jobs, which lets several replicas deployed from the
-same configuration confirm they are running the same jobs, or detect that one
-has drifted from the others.
+The job-set ID is a fingerprint of the set of jobs that a cronstable instance
+runs, and it doesn't depend on job order. Two instances produce the same ID
+exactly when they have the same set of jobs. Replicas deployed from the same
+configuration can compare IDs to confirm that they run the same jobs, or to
+detect that one has drifted from the others.
 
-The id is taken over the *effective* (post-merge) configuration of every job,
-which gives it some useful properties:
+The ID is computed from each job's effective configuration, after merging,
+which gives it these properties:
 
-* it is **independent of job order**, and of whether a setting was written
-  inline on each job or hoisted into a `defaults` block;
-* **equivalent schedule spellings match**: the `minute:`/`hour:` object form
-  fingerprints the same as the equivalent five-field crontab string;
-* it covers **every behavior-affecting field** (`command`, `schedule`,
-  `shell`, the *names* of `environment` variables, capture flags, `failsWhen`,
-  retry/reporting policy, `timezone`, `enabled`, and other behavior-affecting
-  fields), so any meaningful change to a job changes the id. It deliberately
-  leaves out per-host values, `workingDirectory` among them, so a Windows
-  replica and a Linux one running the same jobs from paths they spell
-  differently still agree;
-* `user`/`group` are fingerprinted **as configured** (`www-data`, for
-  example), not as the resolved numeric uid/gid, which can differ host to
-  host;
-* **secret/value material is never embedded**: inline reporting secrets
-  (Sentry DSN, mail password, webhook URL and header values) are redacted,
-  and only the *names* of `environment` variables are hashed, not their
-  values (env commonly holds secrets, and a per-host value, such as one from
-  `env_file`, would otherwise make identical configs differ across hosts).
-  The id is safe to log and serve, and rotating a secret or changing an env
-  value does not change it.
+* It doesn't depend on job order, or on whether a setting is written inline on
+  each job or moved into a `defaults` block.
+* Equivalent schedules match: the `minute:` and `hour:` object form produces
+  the same fingerprint as the equivalent five-field crontab string.
+* It covers every field that affects behavior, such as `command`, `schedule`,
+  `shell`, the names of `environment` variables, capture flags, `failsWhen`,
+  retry and reporting policy, `timezone`, and `enabled`. Any meaningful change
+  to a job changes the ID. It leaves out per-host values such as
+  `workingDirectory`, so a Windows replica and a Linux replica that run the
+  same jobs from differently spelled paths still agree.
+* `user` and `group` are fingerprinted as configured (for example,
+  `www-data`), not as the resolved numeric UID or GID, which can differ
+  between hosts.
+* The ID never includes secret values. Inline reporting secrets (the Sentry
+  DSN, the mail password, and webhook URL and header values) are redacted.
+  Only the names of `environment` variables are hashed, not their values,
+  because environment variables often hold secrets, and a per-host value, such
+  as one from `env_file`, would make identical configurations differ across
+  hosts. The ID is safe to log and serve, and rotating a secret or changing an
+  environment value doesn't change it.
 
-Because it reflects *effective* config, it also reflects platform-dependent
-defaults (the default `shell` is `/bin/sh` on POSIX, `cmd.exe` on Windows), so
-compare instances running on the same platform, which replicas are. The scheme
-is versioned with a `v1:` prefix, and ids are only comparable within a scheme
-version.
+Because the ID reflects the effective configuration, it also reflects
+platform-dependent defaults. For example, the default `shell` is `/bin/sh` on
+POSIX systems and `cmd.exe` on Windows. Compare only instances that run on the
+same platform, as replicas do. The scheme is versioned with a `v1:` prefix, and
+IDs are comparable only within the same scheme version.
 
-It is available three ways:
+You can get the ID in three ways:
 
-* **CLI**: print it and exit (useful in scripts and health checks):
+* **CLI**: print the ID and exit, which is useful in scripts and health
+  checks:
 
   ```shell
   $ cronstable -c /etc/cronstable.d --job-set-id
   v1:b834d7565aee0da50cd017f666651a5ba3b2e6b161daf0cb6e430f23f51ce90b
   ```
 
-* **HTTP**: `GET /job-set-id` on the [web interface](#remote-webhttp-interface)
-  (also `application/json`), and shown in the dashboard header:
+* **HTTP**: call `GET /job-set-id` on the
+  [web interface](#remote-webhttp-interface), which also supports
+  `application/json`. The dashboard header shows the ID too:
 
   ```shell
   $ http get http://127.0.0.1:8080/job-set-id
@@ -1548,19 +1605,19 @@ It is available three ways:
   {"job_set_id": "v1:b834d7…51ce90b", "jobs": 3}
   ```
 
-* **Logs**: it is logged once at startup, and again whenever a config reload
-  changes it.
+* **Logs**: cronstable logs the ID once at startup, and again whenever a
+  configuration reload changes it.
 
 ### Clustering and leader election
 
-By default cronstable runs as a single instance and every replica runs every job.
-An optional `cluster` section lets several replicas coordinate: each node serves
-a small `GET /peer` endpoint over **mutual TLS** and periodically polls its
-configured peers, comparing [job-set IDs](#job-set-id) so they can confirm they
-are running the *same* set of jobs (cluster peer attestation). Turning on
-`electLeader` promotes that same attestation into a **quorum-gated leader
-election**, so you can run more than one replica from one config without
-double-running scheduled jobs:
+By default, cronstable runs as a single instance, and every replica runs every
+job. An optional `cluster` section lets several replicas coordinate. Each node
+serves a small `GET /peer` endpoint over mutual TLS and periodically polls its
+configured peers. The nodes compare [job-set IDs](#job-set-id) to confirm that
+they run the same set of jobs, which is called cluster peer attestation. If you
+turn on `electLeader`, the nodes also use that attestation to elect a leader,
+which requires a quorum. You can then run more than one replica from one
+configuration without running scheduled jobs twice:
 
 ```yaml
 cluster:
@@ -1579,27 +1636,28 @@ cluster:
   electLeader: true               # observe-only if false (the default)
 ```
 
-Each node independently elects, as leader, the lowest `nodeName` among the
-members it currently sees agreeing on the job-set ID, but only if that set is a
-**quorum** (a strict majority) of the cluster, so under a clean partition at
-most one side leads. This is best-effort, because the default `gossip` backend
+Each node independently chooses as leader the member with the lowest
+`nodeName` among the members that it currently sees agreeing on the job-set
+ID. It chooses a leader only if those members form a quorum (a strict
+majority) of the cluster, so during a clean partition at most one side has a
+leader. This election is best effort, because the default `gossip` backend
 keeps no shared state. For a fenced, exactly-once guarantee, set
 `cluster.backend: kubernetes` or `cluster.backend: etcd` to elect through a
-`coordination.k8s.io/v1` `Lease` or a lease-bound etcd key instead.
+`coordination.k8s.io/v1` `Lease` or a lease-bound etcd key.
 
-Each job can override the cluster-wide default with a per-job `clusterPolicy`
-(`Leader`, the default, may skip under a partition; `PreferLeader` never
-skips but may double-run; `EveryNode` runs everywhere), picking its own
-point on the liveness-vs-duplication trade-off.
+Each job can override the cluster-wide default with its own `clusterPolicy`,
+which sets the job's trade-off between liveness and duplicate runs. `Leader`,
+the default, can skip runs during a partition; `PreferLeader` never skips but
+can run a job twice; and `EveryNode` runs the job on every node.
 
-The current view (members, elected leader, quorum, and any conflicts) is
-available at `GET /cluster` and shown as a panel in the dashboard. The full
-trust model, per-peer status table, quorum math, sizing guidance,
-`distribution: spread` load-balancing, and the fenced lease backends are all
-covered in depth in the
+The `GET /cluster` endpoint returns the current view: members, the elected
+leader, quorum, and any conflicts. The dashboard shows the same view in a
+panel. For the full trust model, per-peer status table, quorum math, sizing
+guidance, `distribution: spread` load balancing, and the fenced lease
+backends, see the
 [clustering and leader election](https://github.com/ptweezy/cronstable/wiki/Clustering-and-Leader-Election)
-guide in the wiki. Try a cluster from the [example gallery](#example-gallery)
-to watch leader election in the dashboard.
+guide in the wiki. To watch leader election in the dashboard, try a cluster
+from the [example gallery](#example-gallery).
 
 ### Includes
 
@@ -1607,7 +1665,7 @@ Use `include` to share defaults and other configuration across files. It
 accepts a list of filenames, which cronstable parses and merges into the
 current configuration.
 
-For example, the main configuration:
+For example, here's the main configuration:
 
 ```yaml
 include:
@@ -1619,7 +1677,7 @@ jobs:
     ...
 ```
 
-And the shared defaults in `_inc.yaml`:
+Here are the shared defaults in `_inc.yaml`:
 
 ```yaml
 defaults:
@@ -1632,15 +1690,15 @@ defaults:
 
 ### Environment variable interpolation
 
-Any string value in the config can pull from cronstable's environment with
-`${VAR}`, or `${VAR:-default}` for a fallback, so one config file serves many
-environments without a wrapper script templating it. Write `$$` for a literal
-`$`.
+Any string value in the configuration can read cronstable's environment
+variables with `${VAR}`, or with `${VAR:-default}` to set a fallback. One
+configuration file can then serve many environments without a wrapper script
+that templates it. To write a literal `$`, use `$$`.
 
-Interpolation runs after the file is validated, so it reaches any string-typed
-field (a listen address, a state path, a time zone, a webhook URL). A `${VAR}`
-that is unset and has no default is a hard configuration error that names the
-variable, caught by `cronstable --validate-config`.
+Interpolation runs after the file is validated, so it works in any string
+field, such as a listen address, a state path, a time zone, or a webhook URL.
+If a `${VAR}` is unset and has no default, cronstable reports a configuration
+error that names the variable, and `cronstable --validate-config` catches it.
 
 ```yaml
 web:
@@ -1656,18 +1714,17 @@ jobs:
     timezone: ${TZ:-UTC}
 ```
 
-The daemon deliberately leaves a job's (and reporter's) `command` and `shell`
-untouched, so the runtime shell expands their `${VAR}` against the job's own
-environment, not the daemon's. The `logging` section is likewise left for
-Python's `logging.config`. See
-[environment-variable interpolation](https://github.com/ptweezy/cronstable/wiki/Environment-Variable-Interpolation)
-for the full rules, including how it affects the [job-set ID](#job-set-id).
+The daemon doesn't interpolate the `command` and `shell` of jobs and
+reporters, so the shell expands their `${VAR}` references at run time against
+the job's own environment, not the daemon's. The daemon also leaves the
+`logging` section for Python's `logging.config`. For the full rules, including
+how interpolation affects the [job-set ID](#job-set-id), see
+[environment variable interpolation](https://github.com/ptweezy/cronstable/wiki/Environment-Variable-Interpolation).
 
 ### Custom logging
 
-You can provide a custom logging configuration with the `logging`
-configuration section. For example, the following configuration displays log
-lines with an embedded timestamp for each message.
+To customize logging, add a `logging` section. For example, the following
+configuration adds a timestamp to each log line:
 
 ```yaml
 logging:
@@ -1695,9 +1752,8 @@ logging:
 
 #### enabled: true|false (default true)
 
-You can disable a specific cron job by adding an `enabled: false`
-option. Jobs with `enabled: false` are skipped, as if they aren't there, apart
-from validating the configuration.
+To disable a job, add `enabled: false`. cronstable skips a disabled job as if
+it weren't there, except that it still validates the job's configuration.
 
 ```yaml
 jobs:
@@ -1711,8 +1767,8 @@ jobs:
 ## Documentation map
 
 Every feature has its own page in the
-[wiki](https://github.com/ptweezy/cronstable/wiki). The sidebar there is the
-full index. Good starting points:
+[wiki](https://github.com/ptweezy/cronstable/wiki), and the wiki's sidebar is
+the full index. Good places to start are
 [Installation](https://github.com/ptweezy/cronstable/wiki/Installation),
 the [Configuration Reference](https://github.com/ptweezy/cronstable/wiki/Configuration-Reference),
 the [Web Dashboard tour](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard),
@@ -1720,21 +1776,23 @@ and [Troubleshooting](https://github.com/ptweezy/cronstable/wiki/Troubleshooting
 
 ## Contributing and license
 
-Bug reports, feature ideas, and pull requests are welcome; see
-[CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, how to sign off
-your commits (DCO), and
-[Contributing and Releasing](https://github.com/ptweezy/cronstable/wiki/Contributing-and-Releasing)
-for how releases work. cronstable is [MIT-licensed](LICENSE); see
-[LICENSING.md](LICENSING.md) for how the repository's licensing is organized.
+Bug reports, feature ideas, and pull requests are welcome. For the
+development setup and how to sign off your commits under the Developer
+Certificate of Origin (DCO), see [CONTRIBUTING.md](CONTRIBUTING.md). For how
+releases work, see
+[Contributing and Releasing](https://github.com/ptweezy/cronstable/wiki/Contributing-and-Releasing).
+cronstable is [MIT-licensed](LICENSE); for how the repository's licensing is
+organized, see [LICENSING.md](LICENSING.md).
 
-**Security.** Report vulnerabilities privately rather than in a public
-issue; [SECURITY.md](SECURITY.md) has the disclosure process, what is in scope
+**Security.** Report vulnerabilities privately, not in a public issue.
+[SECURITY.md](SECURITY.md) describes the disclosure process, what's in scope
 (including the hosted relay and the public demo), and what to expect.
 
 **Trademarks.** The MIT License covers the code, not the brand. cronstable™ and
 the cronstable logo are trademarks of Parker Loflin; see
-[TRADEMARKS.md](TRADEMARKS.md). The rendered logo artwork is also reserved
-rather than MIT-granted, while the code that draws it stays MIT; see
+[TRADEMARKS.md](TRADEMARKS.md). The rendered logo artwork is also excluded
+from the MIT grant, but the code that draws it is MIT-licensed; see
 [Brand assets](LICENSING.md#brand-assets).
 
-cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
+cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron) by
+Gustavo Carneiro, and it continues development from yacron version 0.19.
