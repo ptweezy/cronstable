@@ -3065,8 +3065,13 @@ jobs:
           envs: 'SETUPTOOLS_SCM_PRETEND_VERSION'
           # pkgin is not in NetBSD base and is not on this image; pkg_add from
           # base is the package manager here, with PKG_PATH already set.
+          # -u because the image ships some of these (libffi, sqlite3, ...)
+          # preinstalled, and once PKG_PATH points at a newer pkgsrc quarterly
+          # a plain pkg_add refuses them with "A different version ... is
+          # already installed" and fails the step. -u updates those in place
+          # and installs the rest as before.
           prepare: |
-            /usr/sbin/pkg_add python313 libsodium py313-psutil py313-multidict py313-yarl py313-propcache py313-aiohappyeyeballs py313-jinja2 py313-uvloop py313-orjson rust openssl gmake pkgconf libffi sqlite3 xz bzip2
+            /usr/sbin/pkg_add -u python313 libsodium py313-psutil py313-multidict py313-yarl py313-propcache py313-aiohappyeyeballs py313-jinja2 py313-uvloop py313-orjson rust openssl gmake pkgconf libffi sqlite3 xz bzip2
           run: |
             set -eu
             . .github/scripts/retry.sh
