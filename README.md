@@ -63,7 +63,7 @@ and catch regressions before release.
 
 ### Durability and orchestration
 
-* **Shared resource pools**: limit capacity across jobs and DAG tasks, with
+* **Shared resource pools**: limit capacity across jobs and workflow tasks, with
   priority queues and deadlines (see
   [resource pools](https://github.com/ptweezy/cronstable/wiki/Resource-Pools))
 * **Selective workflow recovery**: retry failed tasks or replay failed dates
@@ -72,9 +72,9 @@ and catch regressions before release.
 * **Opt-in durable state**: preserve history and retries across restarts,
   catch up missed runs, and share state between jobs (see
   [durable state](https://github.com/ptweezy/cronstable/wiki/Durable-State))
-* **Orchestration DAGs**: build durable workflows with task dependencies,
+* **Durable workflows**: coordinate tasks with dependencies,
   data sharing, dynamic fan-out, sensors, and approval gates (see
-  [orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs))
+  [workflow orchestration](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs))
 
 ### Observability and control
 
@@ -112,7 +112,7 @@ and catch regressions before release.
   binaries for Linux, macOS, BSD, illumos, and Windows (see
   [installation](#installation))
 
-[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a color-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](#web-dashboard)
+[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a workflow's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a color-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](#web-dashboard)
 
 > Web UI tour.
 
@@ -148,16 +148,19 @@ cronstable -c cronstable.yaml
 
 Open <http://127.0.0.1:8080/> to view the job's live output in the
 [dashboard](#web-dashboard). The `hello` job runs once a minute.
+Schedules use UTC by default. To use a different time zone, set `timezone`
+on the job (see [time zones](#time-zones)).
+
 You can extend this configuration to:
 
 * **Get failure alerts**: retries with backoff, and a Slack, email, or Sentry
-  report when a job still fails after its retries ([tutorial](#tutorial-1-alert-when-a-job-fails-then-retry-it)).
+  report when a job still fails after its retries ([tutorial](#tutorial-1-retry-failed-jobs-and-alert-when-retries-fail)).
 * **Survive restarts**: a `state:` block preserves history and retries, and
   catches up missed runs ([tutorial](#tutorial-2-survive-restarts-catch-up-what-was-missed)).
-* **Chain jobs into a pipeline**: a durable DAG with data sharing and an
+* **Chain jobs into a pipeline**: a durable workflow with data sharing and an
   approval gate ([tutorial](#tutorial-3-your-first-dag-a-durable-pipeline)).
-* **Coordinate replicas**: use leader election so that replicas don't run the
-  same job twice ([tutorial](#tutorial-4-two-replicas-zero-double-runs)).
+* **Coordinate replicas**: use leader election to assign scheduled jobs to a
+  leader ([tutorial](#tutorial-4-coordinate-two-replicas)).
 * **Watch from your phone**: pair the [iOS app](#ios-app) from the dashboard
   to get the jobs board, live logs, and encrypted alerts on iPhone and iPad.
 * **See it all at once**: `docker compose -f example/grand-tour/docker-compose.yml up
@@ -166,7 +169,7 @@ You can extend this configuration to:
 
 To use an existing crontab exported with `crontab -l`, run
 `cronstable -c my.crontab`. For a system crontab such as `/etc/crontab`,
-remove the extra user column first. See
+convert its entries to YAML to preserve per-job users. See
 [classic crontab files](#classic-crontab-files) for format differences.
 
 ## Installation
@@ -399,30 +402,38 @@ platform details differ:
 
 ## Production container deployment
 
-cronstable runs unmodified under the hardened security contexts that
-enterprise Kubernetes and container platforms enforce. At runtime, the daemon
-only reads its configuration and secrets, and it writes its output to stdout
-and stderr. It doesn't need a writable working directory, temporary files, or
-log files. It can run as an unprivileged non-root user with the
-`RuntimeDefault` seccomp profile, a read-only root filesystem, all Linux
+In its default stateless configuration, the cronstable container needs no
+writable filesystem paths. The daemon reads its configuration and secrets
+and writes its output to stdout and stderr. It can run as a non-root user with
+the `RuntimeDefault` seccomp profile, a read-only root filesystem, all Linux
 capabilities dropped, and configuration and secret volumes mounted with an
 `fsGroup`.
 
-Only the optional per-job
-[user and group switching](#change-to-another-usergroup) requires root. Two
-features need a small writable mount: the socket for a `unix://` web listener,
-and the standalone binary's temporary directory (see
-[install using binary](#install-using-binary)).
+Mount writable storage for the optional features you enable:
+
+* Durable state needs a writable directory at `state.path` for history,
+  retries, workflows, and any archived output.
+* Filesystem clustering needs a writable shared directory at
+  `cluster.filesystem.path` that supports locks across hosts.
+* Push device pairing needs a writable directory containing `push.devicesFile`,
+  or a writable state store when `devicesFile` is omitted.
+* A `unix://` web listener needs a writable directory for its socket.
+* The standalone binary needs a writable, executable temporary directory
+  (see [install using binary](#install-using-binary)). The container images
+  and pip installations don't self-extract.
+
+Job commands and custom file logging can also need writable paths or
+additional permissions. Per-job
+[user and group switching](#change-to-another-usergroup) requires root.
 
 The published images (`ghcr.io/ptweezy/cronstable` and
-`docker.io/ptweezy/cronstable`) are built this way: they run as non-root, use
-`cronstable -c /etc/cronstable.d` as the entrypoint, and need no writable
-paths. For most deployments, you can use an image directly and mount your
-crontab read-only. For the full setup, see
+`docker.io/ptweezy/cronstable`) run as non-root and use
+`cronstable -c /etc/cronstable.d` as the entrypoint. Mount your configuration
+read-only and provide writable mounts for the features and jobs that need
+them. For deployment examples, see
 [Production deployment](https://github.com/ptweezy/cronstable/wiki/Production-Deployment)
-in the wiki. It covers a Kubernetes `Deployment` with a fully restricted
-security context, baking configuration into your own image, the writable-path
-exceptions, and health checks.
+in the wiki. It covers a Kubernetes `Deployment` with a restricted security
+context, baking configuration into your own image, and health checks.
 
 ## Web dashboard
 
@@ -444,15 +455,17 @@ history, or inspect its schedule. You can also:
 
 | Live logs | Workflow task graph | Fleet view |
 | :---: | :---: | :---: |
-| [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png) | [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png) |
+| [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-logs.png) | [![The workflow drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-fleet.png) |
 
 Press `Ctrl-K` or `⌘K` for the command palette, `?` for shortcuts, or `Enter`
 to open the selected job. For readability, the dashboard has ten themes,
 adjustable fonts and UI scale, color-vision-safe palettes, and reduced-motion
 support. It shows status with text and symbols in addition to color.
 
-Run history and live logs stay in memory unless you enable the
-[durable state store](https://github.com/ptweezy/cronstable/wiki/Durable-State).
+Run history and captured output stay in memory by default. Enable the
+[durable state store](https://github.com/ptweezy/cronstable/wiki/Durable-State)
+to preserve run history across restarts. To also save captured output when a
+run finishes, set `archiveOutput: true` on the job or under `defaults:`.
 The daemon serves the page with a strict Content Security Policy. For the full
 panel tour, screenshots, shortcuts, and settings, see the
 [web dashboard guide](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard).
@@ -565,7 +578,9 @@ These four short walkthroughs build on the [quick start](#quick-start)
 configuration. You can copy and run each one, and each links to the wiki page
 that covers its topic in full.
 
-### Tutorial 1: Alert when a job fails, then retry it
+<a id="tutorial-1-alert-when-a-job-fails-then-retry-it"></a>
+
+### Tutorial 1: Retry failed jobs and alert when retries fail
 
 Classic cron sends mail to root. This example instead retries with
 exponential backoff, and it posts to a Slack channel only if the job still
@@ -637,18 +652,18 @@ sleep or a long stall. With `run-once`, a regular run after the daemon resumes
 counts as the catch-up run. A failed catch-up attempt counts as attempted and
 doesn't schedule retries.
 
-The same store also gives your job commands durable primitives over a loopback
-endpoint: key-value storage, cursors, fleet-wide locks, idempotency keys,
-artifacts, and run-scoped secrets. Your commands use them through the
+The same store gives job commands persistent storage and coordination tools
+through a loopback endpoint: key-value storage, cursors, fleet-wide locks,
+idempotency keys, artifacts, and run-scoped secrets. Your commands use them through the
 `cronstable state`, `cursor`, `lock`, `idempotent`, `artifact`, and `secret`
 subcommands. For details, see
 [durable state](https://github.com/ptweezy/cronstable/wiki/Durable-State).
 
 ### Tutorial 3: Your first DAG, a durable pipeline
 
-A `dags:` block turns the scheduler into a small, durable workflow engine.
-This example runs a build, waits for a person to approve it, and then
-publishes:
+A `dags:` block defines a durable workflow as a directed acyclic graph (DAG)
+of tasks. This example runs a build, waits for a person to approve it, and
+then publishes:
 
 ```yaml
 state:
@@ -660,7 +675,7 @@ dags:
       - id: build
         command: make dist
       - id: approve
-        type: approval             # parks the graph on a human decision
+        type: approval             # waits for approval
         dependsOn: [build]
       - id: publish
         dependsOn: [approve]
@@ -679,19 +694,26 @@ curl -X POST http://127.0.0.1:8080/dags/release-train/runs/<runKey>/tasks/approv
      -H 'Content-Type: application/json' -d '{"decision": "approve", "by": "alice"}'
 ```
 
-Every transition is durable. If you restart the daemon during a run, the run
-resumes where it stopped. Across a fleet, the run advances under a lease, so a
-task never launches twice. Scheduled DAGs also support catch-up and `backfill`
-over a date range. Tasks can pass data with `cronstable xcom push` and
+Workflow progress is saved in the state store, so the daemon can resume a run
+after a restart. Across a fleet, a lease coordinates which node advances each
+run. Recovery can retry an interrupted task even if its earlier process is
+still running. Make task side effects safe to repeat, for example by using an
+[idempotency key](https://github.com/ptweezy/cronstable/wiki/Durable-State#idempotency-keys).
+
+Scheduled DAGs also support catch-up and `backfill` over a date range.
+Tasks can pass data with `cronstable xcom push` and
 `cronstable xcom pull`, fan out over a list that an upstream task produced,
 and poll for conditions with `type: sensor`. For details, see
 [orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs).
 
-### Tutorial 4: Two replicas, zero double-runs
+<a id="tutorial-4-two-replicas-zero-double-runs"></a>
+
+### Tutorial 4: Coordinate two replicas
 
 Run the same configuration on two or more hosts that share a POSIX mount. The
 hosts elect a leader through a fenced lease file, without certificates or a
-coordination service:
+coordination service. The mount must support locks across hosts, and every
+host must keep its clock synchronized with NTP:
 
 ```yaml
 state:
@@ -711,19 +733,21 @@ jobs:
     clusterPolicy: Leader          # the default: exactly the leader runs it
 ```
 
-Only the elected leader runs `Leader` jobs. If the leader stops, a follower
-takes over the lease within the lease's time to live (TTL). Each job's
-`clusterPolicy` sets the trade-off:
+Only the elected leader starts scheduled `Leader` jobs. If the leader stops,
+a follower can take over after the lease is released or expires, provided it
+can reach the shared mount. The lease coordinates which node can start jobs;
+it does not make job side effects exactly-once. Each job's `clusterPolicy`
+sets the behavior during a coordination failure:
 
-* `Leader`: never runs a job twice, but can skip a run when quorum is lost.
-* `PreferLeader`: never skips a run, but can run a job twice during a network
-  partition.
+* `Leader`: skips scheduled runs when leadership cannot be confirmed.
+* `PreferLeader`: allows runs when the coordination store is unreachable, so
+  multiple replicas can run the same job.
 * `EveryNode`: runs the job on every node, for work that belongs on each node.
 
 Without a shared mount, use another backend. The `gossip` backend elects a
 leader over mutual TLS with no shared store, `kubernetes` uses a
 `coordination.k8s.io` Lease, and `etcd` uses a lease-bound key. To spread job
-ownership across the fleet instead of giving every job to one leader, set
+ownership across the fleet, use the `gossip` backend with
 `distribution: spread`. For details, see
 [clustering and leader election](https://github.com/ptweezy/cronstable/wiki/Clustering-and-Leader-Election).
 
@@ -740,13 +764,13 @@ that you can run. Each Compose file is in its example's folder, except for the
 | [`cluster`](example/cluster) | `docker compose -f example/cluster/docker-compose.yml up` | A 3-node gossip cluster: peer attestation, quorum, leader election, and live failover. |
 | [`cluster-large`](example/cluster-large) | `docker compose -f example/cluster-large/docker-compose.yml up` | A 10-node, CPU-heavy fleet for watching `distribution: spread` and the load meters. |
 | [`dag`](example/dag) | `cronstable -c example/dag` | Orchestration on a single node: dependencies, XCom, fan-out, a sensor, and an approval gate. |
-| [`dag-cluster`](example/dag-cluster) | `docker compose -f example/dag-cluster/docker-compose.yml up` | DAGs coordinating across three nodes on one shared store: crash recovery and exactly-once tasks. |
+| [`dag-cluster`](example/dag-cluster) | `docker compose -f example/dag-cluster/docker-compose.yml up` | DAGs coordinating across three nodes on one shared store, with leases and crash recovery. |
 | [`job-state`](example/job-state) | `cronstable -c example/job-state` | The state primitives for jobs: key-value storage, cursors, locks, idempotency keys, artifacts, and secrets. |
 | [`mcp`](example/mcp) | `docker compose -f example/mcp/docker-compose.yml up --build` | The MCP server: an AI agent (Claude, Cursor, Copilot) observing and driving the scheduler over `POST /mcp`, or the `cronstable mcp` stdio bridge. |
 | [`pulse-monitor`](example/pulse-monitor) | `docker compose -f example/pulse-monitor/docker-compose.yml up` | Second-level scheduling as a real-time uptime and SLA monitor. |
 | [`pulse-cluster`](example/pulse-cluster) | `docker compose -f example/pulse-cluster/docker-compose.yml up` | The same probes spread across a 3-node cluster with leader election. |
 | [`zen-demo`](example/zen-demo) | `docker compose -f example/zen-demo/docker-compose.yml up` | A deliberately calm board, for the wallboard's zen screensaver. |
-| [`crontab`](example/crontab) | `cronstable -c example/crontab` | Classic Vixie crontabs running unchanged next to YAML jobs. |
+| [`crontab`](example/crontab) | `cronstable -c example/crontab` | Five-field user crontabs alongside YAML jobs. |
 | [`kubernetes`](example/kubernetes) | `kubectl apply -f example/kubernetes/deployment.yaml` | Leader election through a `coordination.k8s.io/v1` Lease. |
 | [`etcd`](example/etcd) | `docker compose -f example/etcd/docker-compose.yml up` | Leader election through an etcd lease, over plain HTTP. |
 | [`docker`](example/docker) | `docker build` | The minimal "add cronstable to your own image" recipe. |
@@ -805,8 +829,7 @@ explains how to convert the expression.
 
 You can also use `@reboot`, which runs the job only when cronstable first
 starts. The `schedule` option can also be an object with properties. The
-following configuration runs a command every 5 minutes, but only on July 19,
-2017:
+following configuration runs a command every 5 minutes on July 19 each year:
 
 ```yaml
 jobs:
@@ -816,7 +839,6 @@ jobs:
       minute: "*/5"
       dayOfMonth: 19
       month: 7
-      year: 2017
       dayOfWeek: "*"
 ```
 
@@ -896,7 +918,9 @@ the probes across a three-node cluster that elects a leader. To start them,
 run `docker compose -f example/pulse-monitor/docker-compose.yml up` or
 `docker compose -f example/pulse-cluster/docker-compose.yml up`.
 
-**Important:** cronstable interprets all times as UTC by default. To use local
+#### Time zones
+
+cronstable interprets schedules in UTC by default. To use the machine's local
 time, set `utc: false`. For example, the following job runs every day at 19:27
 local time:
 
@@ -920,6 +944,8 @@ jobs:
     timezone: America/Los_Angeles
     captureStdout: true
 ```
+
+#### Job environment
 
 To define environment variables for the command, use the `environment`
 option:
@@ -953,10 +979,23 @@ Variables in the `environment` option override variables from `env_file`.
 
 ### Classic crontab files
 
-The daemon can run an existing crontab unchanged. It reads a file named
-`*.crontab`, `*.cron`, or `crontab` in the classic Vixie format, so
-`-c /etc/crontab` works. You can pass the file directly to `-c`, put it in a
-configuration directory next to YAML files, or load it with `include:`:
+cronstable reads five-field user crontabs in the classic Vixie format. Export
+your crontab and pass the file to `-c`:
+
+```shell
+crontab -l > my.crontab
+cronstable -c my.crontab
+```
+
+System crontabs such as `/etc/crontab` and files in `/etc/cron.d` contain an
+extra user column that cronstable does not parse. To preserve per-job users,
+convert these entries to YAML and set each job's
+[`user` field](#change-to-another-usergroup). If all jobs should run as the
+daemon's user, remove the user column from a copy of the file instead.
+
+You can also put files named `*.crontab`, `*.cron`, or `crontab` in a
+configuration directory next to YAML files, or load them with `include:`.
+For example, a user crontab can contain:
 
 ```crontab
 SHELL=/bin/bash
@@ -1611,13 +1650,15 @@ You can get the ID in three ways:
 ### Clustering and leader election
 
 By default, cronstable runs as a single instance, and every replica runs every
-job. An optional `cluster` section lets several replicas coordinate. Each node
-serves a small `GET /peer` endpoint over mutual TLS and periodically polls its
-configured peers. The nodes compare [job-set IDs](#job-set-id) to confirm that
-they run the same set of jobs, which is called cluster peer attestation. If you
+job. An optional `cluster` section lets several replicas coordinate. With the
+default `gossip` backend, each node serves a small `GET /peer` endpoint over
+mutual TLS and periodically polls its configured peers. The nodes compare
+[job-set IDs](#job-set-id) to confirm that they run the same set of jobs, which
+is called cluster peer attestation. If you
 turn on `electLeader`, the nodes also use that attestation to elect a leader,
-which requires a quorum. You can then run more than one replica from one
-configuration without running scheduled jobs twice:
+which requires a quorum. The following configuration uses the default
+`gossip` backend. It coordinates scheduled jobs across replicas, but can
+duplicate or skip runs during failures or changes in cluster membership:
 
 ```yaml
 cluster:
@@ -1639,16 +1680,22 @@ cluster:
 Each node independently chooses as leader the member with the lowest
 `nodeName` among the members that it currently sees agreeing on the job-set
 ID. It chooses a leader only if those members form a quorum (a strict
-majority) of the cluster, so during a clean partition at most one side has a
-leader. This election is best effort, because the default `gossip` backend
-keeps no shared state. For a fenced, exactly-once guarantee, set
+majority) of the cluster. Because peer views can differ or become stale,
+multiple nodes can consider themselves leader. This election is best effort:
+the default `gossip` backend keeps no shared state. To coordinate
+leadership through a shared lease, set
 `cluster.backend: kubernetes` or `cluster.backend: etcd` to elect through a
-`coordination.k8s.io/v1` `Lease` or a lease-bound etcd key.
+`coordination.k8s.io/v1` `Lease` or a lease-bound etcd key. The `filesystem`
+backend uses a shared mount with locks across hosts and bounded clock skew,
+as shown in [tutorial 4](#tutorial-4-coordinate-two-replicas). These backends
+fence leadership while the coordination store is reachable; jobs can still
+miss runs, and the lease does not make their side effects exactly-once.
 
 Each job can override the cluster-wide default with its own `clusterPolicy`,
-which sets the job's trade-off between liveness and duplicate runs. `Leader`,
-the default, can skip runs during a partition; `PreferLeader` never skips but
-can run a job twice; and `EveryNode` runs the job on every node.
+which controls how it runs during coordination failures. `Leader`, the
+default, skips runs when leadership cannot be confirmed. `PreferLeader`
+allows runs without confirmed leadership, so multiple replicas can run the
+same job. `EveryNode` runs the job on every node.
 
 The `GET /cluster` endpoint returns the current view: members, the elected
 leader, quorum, and any conflicts. The dashboard shows the same view in a
@@ -1748,12 +1795,13 @@ logging:
       - console
 ```
 
-### Obscure configuration options
+<a id="obscure-configuration-options"></a>
+<a id="enabled-truefalse-default-true"></a>
 
-#### enabled: true|false (default true)
+### Disable a job
 
-To disable a job, add `enabled: false`. cronstable skips a disabled job as if
-it weren't there, except that it still validates the job's configuration.
+Jobs are enabled by default. To disable a job, add `enabled: false`.
+cronstable validates disabled jobs but skips their execution.
 
 ```yaml
 jobs:
