@@ -19,18 +19,13 @@
 
 / kraahn-stuh-bl /
 
-A cron replacement with retries, alerts, saved run history, and workflows, plus dashboards for the web, the terminal, and iOS. Run it on one machine or across a cluster.
+A cron replacement with retries, alerts, saved run history, and workflows, plus dashboards for the web, the terminal, and iOS. Built to run efficiently on one machine or many, large or small.
 
 ## Why cronstable?
 
 cronstable runs your commands from a schedule file, following cron's model.
 It adds retries, alerting, durable state, orchestration, clustering, and a
 live dashboard.
-
-It's designed to run efficiently on machines of all sizes. The
-[benchmarks](https://github.com/ptweezy/cronstable/wiki/Performance-Benchmarks)
-compare speed and memory use against the latest release on every commit
-and catch regressions before release.
 
 ### Scheduling
 
@@ -1829,6 +1824,11 @@ development setup and how to sign off your commits under the Developer
 Certificate of Origin (DCO), see [CONTRIBUTING.md](CONTRIBUTING.md). For how
 releases work, see
 [Contributing and Releasing](https://github.com/ptweezy/cronstable/wiki/Contributing-and-Releasing).
+
+The [performance benchmarks](https://github.com/ptweezy/cronstable/wiki/Performance-Benchmarks)
+compare speed and memory use against the latest release on every commit
+to catch regressions before release.
+
 cronstable is [MIT-licensed](LICENSE); for how the repository's licensing is
 organized, see [LICENSING.md](LICENSING.md).
 
