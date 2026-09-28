@@ -1761,7 +1761,7 @@ async def test_template_vars_schedule_renders_object_form():
 async def test_execution_timeout():
     job = _running_job(
         "jobs:\n  - name: test\n"
-        + yaml_command(cmd_print_sleep_print("hello", 1, "world"))
+        + yaml_command(cmd_print_sleep_print("hello", 30, "world"))
         + """
     executionTimeout: 0.25
     schedule: "* * * * *"
@@ -1770,7 +1770,9 @@ async def test_execution_timeout():
 """
     )
     await job.start()
+    await _wait_until(lambda: bool(job.output.lines))
     await job.wait()
+    assert job.retcode == -100
     assert job.stdout == "hello\n"
 
 
@@ -1812,6 +1814,7 @@ async def test_execution_timeout_kills_the_whole_process_group():
     # helper too, so the pipe closes and the run completes.
     job = _running_job(_spawner_yaml())
     await job.start()
+    await _wait_until(lambda: bool(job.output.lines))
     # before the fix this hangs forever, not for `timeout` seconds.
     await asyncio.wait_for(job.wait(), 20)
     assert job.retcode == -100  # cancelled by executionTimeout
@@ -1841,6 +1844,7 @@ async def test_killed_job_with_an_escaped_descendant_still_finishes(
     monkeypatch.setattr(cronstable.job, "KILLED_STREAM_DRAIN_TIMEOUT", 1.0)
     job = _running_job(_spawner_yaml())
     await job.start()
+    await _wait_until(lambda: bool(job.output.lines))
     # without the bound this hangs on the surviving helper's pipe forever.
     await asyncio.wait_for(job.wait(), 20)
     assert job.retcode == -100

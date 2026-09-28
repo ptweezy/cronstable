@@ -1441,21 +1441,18 @@ class FilesystemStateBackend(StateBackend):
     # --- record store ----------------------------------------------------
 
     @staticmethod
-    def _retry_sharing_violation(op: Callable[[], None]) -> None:
+    def _retry_sharing_violation(op: Callable[[], _T]) -> _T:
         """Run ``op``, retrying briefly on a Windows sharing violation.
 
-        The retry ladder behind :meth:`_replace` and :meth:`_unlink`:
-        such holds clear in milliseconds, so a short backoff beats
-        surfacing a spurious error from a healthy store.
+        File reads, replacements, and deletions can fail while another
+        handle is open. Retry temporary holds with a bounded backoff.
         """
-        for attempt in range(5):
+        for attempt in range(4):
             try:
-                op()
-                return
+                return op()
             except PermissionError:
-                if attempt == 4:
-                    raise
                 time.sleep(0.02 * (attempt + 1))
+        return op()
 
     @staticmethod
     def _replace(src: str, dest: str) -> None:
@@ -2566,9 +2563,13 @@ class FilesystemStateBackend(StateBackend):
         closed rather than clobbering a live value or reading a torn one.
         Without ``strict`` it returns ``None`` for every one of those.
         """
-        try:
+
+        def read():
             with open(doc_path, "rb", buffering=0) as fobj:
-                obj = _json.loads(fobj.read())
+                return _json.loads(fobj.read())
+
+        try:
+            obj = self._retry_sharing_violation(read) if IS_WINDOWS else read()
         except FileNotFoundError:
             return None
         except Exception as ex:  # noqa: BLE001 - classified below

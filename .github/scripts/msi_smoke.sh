@@ -44,3 +44,39 @@ msi_install() {
 msi_uninstall() {
   msi_run /x "$1" "$2"
 }
+
+msi_wait_for_service() {
+  _msi_service=$1
+  for _msi_attempt in $(seq 1 45); do
+    _msi_status=$(sc query "$_msi_service") || return 1
+    if printf '%s\n' "$_msi_status" | grep -q 'STATE.*RUNNING'; then
+      return 0
+    fi
+    if printf '%s\n' "$_msi_status" | grep -q 'STATE.*STOPPED'; then
+      printf '%s\n' "$_msi_status" >&2
+      return 1
+    fi
+    sleep 2
+  done
+  printf 'Service %s did not reach RUNNING within 90 seconds.\n%s\n' \
+    "$_msi_service" "$_msi_status" >&2
+  return 1
+}
+
+msi_service_diagnostics() {
+  sc query "$1" || true
+  sc qc "$1" || true
+  if [ -f "$2" ]; then
+    tail -n 100 "$2"
+  fi
+  MSYS2_ARG_CONV_EXCL='*' wevtutil qe Application \
+    "/q:*[System[Provider[@Name='$1']]]" /c:10 /rd:true /f:xml || true
+  MSYS2_ARG_CONV_EXCL='*' wevtutil qe System \
+    "/q:*[System[Provider[@Name='Service Control Manager']]]" \
+    /c:10 /rd:true /f:text || true
+  for _msi_logfile in upgrade-v1.log upgrade-v2.log; do
+    if [ -f "$_msi_logfile" ]; then
+      tail -n 100 "$_msi_logfile"
+    fi
+  done
+}
