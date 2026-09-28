@@ -638,7 +638,7 @@ the endpoint the [web dashboard](Web-Dashboard) polls.
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`, whose ordering note covers this tail too. |
 | `paused` | Always present: the active [runtime pause](Pausing-Jobs), `{since, until, note, by, channel}` (ISO-8601 instants), or `null` when the job is not paused. |
 | `sla` | Present only for jobs with a configured [`sla:` block](Late-Run-Detection): `{thresholds, state, breaches}`, where `thresholds` holds the non-null threshold keys, `state` is `"ok"` or `"late"`, and `breaches` lists each latched check as `{check, since, observed_seconds, threshold_seconds}` (`observed_seconds` re-measured at payload time). |
-| `retry` | Present only while a [retry ladder](Failure-Detection-and-Retries) is armed for the job: `{attempt, maxAttempts, nextRetryAt, delaySeconds}`. `maxAttempts` is `null` for an unlimited ladder (`maximumRetries: -1`). |
+| `retry` | Present only while a [retry sequence](Failure-Detection-and-Retries) is active for the job: `{attempt, maxAttempts, nextRetryAt, delaySeconds}`. `maxAttempts` is `null` for unlimited retries (`maximumRetries: -1`). |
 | `rebootPending` | Present (as `true`) only for a deferred `@reboot` one-shot awaiting its boot run (the cluster had not elected an owner at boot, or a pause is holding it), so a client can tell "pending boot run" from "already ran". |
 | `concurrencyScope`, `slot` | Present only for `concurrencyScope: cluster` jobs: the literal scope, and `slot` as `{held, holder, refs}`: whether this node holds the job's [cluster-wide concurrency slot](Clustering-and-Leader-Election) lease, the holding node's name (`null` when unheld), and how many live instances reference it. |
 | `priority` | Present only when the job sets a non-default [scheduling priority](Commands-and-Environment#priority): one of `idle`, `below-normal`, `above-normal`, `high`. A job at the default level (`normal`, the one level never applied) carries no key. |
@@ -962,7 +962,7 @@ endpoints.
 
 Store health and topology plus an inventory: per-prefix stream and document
 counts, capped scope lists, active leases, the quarantine count, and this
-node's live retry ladders and held concurrency slots. Returns
+node's active retry sequences and held concurrency slots. Returns
 `{"enabled": false}` when no `state:` section is configured; an unreadable
 store degrades to health-only rather than erroring.
 
@@ -1118,9 +1118,10 @@ $ curl -X POST -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/shutdown
 
 ### `GET /job-set-id`
 
-Returns this instance's job-set ID: the order-independent fingerprint of every
-job's effective configuration that replicas compare to confirm they hold the
-same set of jobs (see [job-set ID](Job-Set-ID)).
+Returns this instance's job-set ID: an order-independent fingerprint of selected
+fields in each configured job's effective configuration. Replicas compare it to
+detect differences in those fields, independently of which jobs are currently
+executing. See [job-set ID](Job-Set-ID) for the included and excluded fields.
 The response is `text/plain` by default. When `Accept` lists
 `application/json` among its media ranges, it is a JSON object that also
 carries the job count (wildcards keep the text default, as on

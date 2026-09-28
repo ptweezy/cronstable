@@ -26,7 +26,7 @@ rather than blocking import. For the operator-facing walkthrough, see
 | `cronstable/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
 | `cronstable/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`, `WebhookReporter`), and `JobRetryState`. |
 | `cronstable/fingerprint.py` | The order-independent **job-set ID**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and `cluster.py` (peer comparison). |
-| `cronstable/leadership.py` | The pluggable-backend seam: the `LeadershipBackend` ABC every leader-gating call in `cron.py` goes through (`start`/`stop`/`is_leader`/`leader_name`/`is_quorate`/`view_dict` plus the defaulted per-job, conflict, `@reboot`, and never-skip `available_*` families), the `LeaseBackend` shared base for the single-holder lease backends, and the `make_backend` factory, which builds the one `cluster.backend` names (`gossip` -> `cluster.ClusterManager`, `kubernetes` -> `backends.kubernetes.KubernetesBackend`, `etcd` -> `backends.etcd.EtcdBackend`, `filesystem` -> `backends.filesystem.FilesystemBackend`), through deferred imports. |
+| `cronstable/leadership.py` | The `LeadershipBackend` abstract base class defines the interface `cron.py` uses to check whether a node may run a job. `LeaseBackend` provides the shared implementation for backends with a single lease holder. The `make_backend` factory lazily imports and constructs the backend selected by `cluster.backend`: `ClusterManager` for `gossip`, or `KubernetesBackend`, `EtcdBackend`, or `FilesystemBackend` for the corresponding lease backend. |
 | `cronstable/backends/kubernetes.py` | `KubernetesBackend` (a `LeaseBackend`): a `coordination.k8s.io/v1` `Lease` driven over either the official `kubernetes` client or a hand-rolled apiserver REST transport (`cluster.kubernetes.clientLibrary` chooses `auto`/`library`/`http`). |
 | `cronstable/backends/etcd.py` | `EtcdBackend` (a `LeaseBackend`): a lease-backed key/election against etcd's v3 gRPC-gateway JSON/HTTP API, a single fully-portable transport with no optional client library. |
 | `cronstable/backends/filesystem.py` | `FilesystemBackend` (a `LeaseBackend`): leader election through the flock-guarded, fence-counted TTL lease of `state.FilesystemStateBackend` over a shared POSIX mount (Amazon S3 Files / EFS / NFSv4). No coordination service: the mount is the store. Stdlib-only. |
@@ -40,7 +40,7 @@ rather than blocking import. For the operator-facing walkthrough, see
 
 The dependency direction is `__main__` -> `cron` -> (`config`, `job`,
 `fingerprint`, `leadership`) -> (`statsd`, `config`). `cron.py` imports
-`make_backend` from `leadership`, so the leadership seam fans out as
+`make_backend` from `leadership`, giving this dependency chain:
 `cron` -> `leadership` -> {`cluster` (gossip), `backends.kubernetes`,
 `backends.etcd`, `backends.filesystem`}. `make_backend` imports those backend
 modules lazily, so `backends/` never enters the import graph unless
@@ -261,7 +261,7 @@ When `_stop_event` is set the `while` loop exits and `Cron.run` logs
 1. Drains pending retries: while `self.retry_state` is nonempty, it
    `cancel_job_retries(name)` for every entry concurrently with
    `asyncio.gather`, passing `settle=None`. With a `state:` section configured,
-   a graceful stop leaves each pending durable ladder record in place for the
+   a graceful stop leaves each pending durable retry record in place for the
    next boot's re-arm (see "Retry state machine").
 2. If a leadership backend is running, logs `"Stopping cluster manager"` and
    `await self.cluster_manager.stop()` (which releases leadership best-effort
@@ -333,20 +333,18 @@ For the request/response contract, see the [HTTP control API](HTTP-API).
 
 ## Cluster manager
 
-Leader election sits behind a pluggable-backend seam. The
-scheduler never talks to a concrete cluster implementation directly: it only ever
-asks *am I allowed to run this job?* through a handful of methods on whatever
-object `cluster.backend` selected. That seam is the `LeadershipBackend` ABC in
-`cronstable/leadership.py`, and `make_backend(cluster_config, get_job_set_id)` is
-the factory that builds the chosen one (through deferred imports, so a lease
-backend never enters the import graph for the common gossip case):
+The scheduler checks whether a node may run a job through the
+`LeadershipBackend` abstract base class in `cronstable/leadership.py`.
+`make_backend(cluster_config, get_job_set_id)` constructs the implementation
+selected by `cluster.backend`. It imports backend modules only when needed,
+so using gossip does not load the lease implementations:
 
 - **`gossip`** (default) -> `cluster.ClusterManager`, the original mTLS,
   no-shared-state, best-effort quorum election (detailed later). Zero new
   dependencies.
 - **`kubernetes`** -> `backends.kubernetes.KubernetesBackend`, a
-  `coordination.k8s.io/v1` `Lease`. Fenced, exactly-once while the lease store is
-  reachable.
+  `coordination.k8s.io/v1` `Lease`. Provides fenced leadership with a single
+  lease holder while the store is reachable.
 - **`etcd`** -> `backends.etcd.EtcdBackend`, a lease-backed key/election against
   an etcd cluster, same fenced guarantee.
 - **`filesystem`** -> `backends.filesystem.FilesystemBackend`, a flock-guarded,
@@ -356,8 +354,8 @@ backend never enters the import graph for the common gossip case):
   clocks, so unlike the kubernetes/etcd backends it requires NTP-bounded skew
   on every node. Stdlib-only.
 
-The `LeadershipBackend` surface is split three ways so a new lease backend stays
-tiny:
+The `LeadershipBackend` interface has three groups of methods, allowing lease
+backends to reuse common behavior:
 
 - The *core abstract* methods every backend implements: `start`, `stop`,
   `is_leader`, `leader_name`, `is_quorate`, and `view_dict`.
@@ -376,14 +374,14 @@ persists the ran-set in the lease store (a Lease annotation / etcd sibling key
 under `REBOOT_RAN_KEY`), scoped to the job-set ID, so a *failover* holder does
 not re-run a one-shot (see
 [clustering and leader election](Clustering-and-Leader-Election)). Gossip
-overrides every defaulted method with its richer behavior, so the gossip path
-is byte-identical to before the seam existed.
+overrides these defaults to preserve its existing behavior.
 
-The two lease backends share `LeaseBackend`, which pins `distribution` to
-`"single-leader"` and provides the common lease-shaped `view_dict()`. Both talk
-to their store over plain HTTP through the core `aiohttp` dependency (no
-grpc/protobuf wheels), keeping the wide architecture coverage intact. For the
-operator-facing model and the lease backends' fencing, see
+The lease backends share `LeaseBackend`, which pins `distribution` to
+`"single-leader"` and provides the common lease status fields in `view_dict()`.
+The built-in Kubernetes and etcd transports use HTTP APIs through the core
+`aiohttp` dependency, with HTTPS supported. The filesystem backend uses the
+standard library. None requires grpc/protobuf wheels, preserving the supported
+architectures. For the operator-facing model and the lease backends' fencing, see
 [clustering and leader election](Clustering-and-Leader-Election).
 
 `start_stop_cluster(cluster_config)` reconciles the single backend held in
@@ -771,14 +769,14 @@ Flow:
   pending retry, then `report_success()` runs.
 - **`cancel_job_retries(name)`** pops the state (no-op if absent), sets
   `cancelled = True`, and awaits or cancels the pending `task`. It takes a
-  `settle` reason (default `"superseded"`) for the durable ladder described
+  `settle` reason (default `"superseded"`) for the durable retry state described
   next; the shutdown drain passes `settle=None` so a graceful stop settles
   nothing.
 
 With a `state:` section configured, the machine gains a durable half (without
 one, the preceding flow is complete and retries die with the process):
 
-- **Durable ladder records.** `schedule_retry_job` persists a fire-and-forget
+- **Durable retry records.** `schedule_retry_job` asynchronously persists a
   `pending` record (stream `retries/<job>`, `_persist_retry_pending`) carrying
   the attempt number, the **absolute** `notBefore` deadline, and the job's
   `fingerprint.job_digest`. Every resolution appends a `settled` record on top
@@ -788,10 +786,10 @@ one, the preceding flow is complete and retries die with the process):
 
   When cross-node retry resume is active (a shared-topology store plus leader
   election) the stream carries a third kind: an ownership move writes a
-  `handoff` record (`_abandon_retry`) instead of settling the ladder dead, and
-  the claiming node's fresh `pending` carries a `claimedFrom` field naming the
-  host it took the ladder from. On a single-node store `owner-moved` remains
-  the settle.
+  `handoff` record (`_abandon_retry`) so another node can resume the retry
+  sequence. The claiming node's new `pending` record carries a `claimedFrom`
+  field naming the previous owner. With a single-node store, an ownership
+  change instead settles the retry as `owner-moved`.
 
   Just before the relaunch, `_retry_consume_ok` settles the pending record with
   reason `launched`: record-before-run, so a crash right after the launch
@@ -803,25 +801,26 @@ one, the preceding flow is complete and retries die with the process):
   pending record is the restart handoff.
 
 - **Boot re-arm** (`_rehydrate_retries`). When the backend first comes up,
-  each configured retry-enabled job whose newest ladder record is `pending`
+  each configured retry-enabled job whose newest retry record is `pending`
   (and which has no live retry state or running instance; live activity takes
   precedence over the ledger) is re-armed at the persisted position. A fresh
   `JobRetryState` is replayed to the recorded attempt (`count` and the next
   delay as if the process never restarted) and the ordinary
   `schedule_retry_job` is scheduled with only the time remaining until
   `notBefore` (zero if it passed while down), so the cluster-gate re-check and
-  job-vanished cleanup behave identically to a never-restarted ladder.
+  cleanup for removed jobs behave just as they would without a restart.
 
   A record is settled instead of re-armed on:
 
   - a malformed record;
-  - a per-job digest mismatch (`config-changed`, per-job and stricter than the
-    whole-set job-set ID, so unrelated config edits do not drop the retry);
+  - a per-job digest mismatch (`config-changed`, covering only that job's
+    fingerprinted settings, so unrelated config edits do not discard the retry);
   - a disabled job;
   - an exhausted budget;
   - a record older than the job's `startingDeadlineSeconds`;
   - an `@reboot` job whose boot marker does not cover the current OS boot
-    (`superseded-by-reboot`: the fresh boot run supersedes the stale ladder).
+    (`superseded-by-reboot`: the new boot run supersedes the previous retry
+    sequence).
 
   Conversely, a *covered* marker re-arms the pending retry, which is what lets
   an `@reboot` `maximumRetries: -1` keep-alive survive daemon restarts. Every

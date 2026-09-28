@@ -492,8 +492,8 @@ the one-file `.exe`. The [MSI](Windows-MSI) registers the service by itself,
 so none of them are needed there. A service host therefore needs no Python
 installed.
 
-See [Windows service](Windows-Service) for the full command set, the logging
-story, and the one install shape that cannot host a service: the published
+See [Windows service](Windows-Service) for the full command set, logging
+behavior, and the installation format that cannot host a service: the published
 one-file `.exe` (also what winget installs), whose bootloader runs the program
 in a child process the SCM never sees.
 

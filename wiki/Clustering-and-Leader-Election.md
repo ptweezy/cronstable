@@ -10,22 +10,21 @@ quorum to select which replica runs scheduled jobs. It builds on the
 `cronstable/cluster.py` (the `ClusterManager`, `ClusterView`, and the pure
 `elect_leader`/`quorum_size` functions).
 
-> **The default `gossip` backend is best-effort coordination, not fenced
-> exactly-once.** It keeps no shared state, so it is simple to operate and
-> cannot wedge on a missing consensus store. The trade-off is that there are
-> narrow windows where a firing may be skipped or (under some policies)
-> double-run. If you need a hard exactly-once guarantee **and** already run a
-> coordination store, set `cluster.backend: kubernetes` or `etcd` (described
-> later) to elect through a `Lease` or a lease-bound key instead. If the nodes
-> already share a POSIX mount, `cluster.backend: filesystem` elects through a
-> fenced lease file on the mount itself (fenced under NTP-bounded clock skew),
-> with no extra service at all. See
+> **The default `gossip` backend provides best-effort coordination.** It keeps
+> no shared state and needs no coordination service. During leadership changes
+> or network partitions, a scheduled run may be skipped or duplicated. For
+> **fenced leadership**, use `cluster.backend: kubernetes` or `etcd`: a shared
+> store controls a single lease holder. If nodes already share a POSIX mount,
+> `cluster.backend: filesystem` uses a lease file on that mount, with fencing
+> dependent on NTP-bounded clock skew. Fencing controls leadership; it does not
+> guarantee that every scheduled job executes exactly once. See
 > [choosing a backend](#choosing-a-backend) and
 > [guarantees and trade-offs](#guarantees-and-trade-offs).
 
 **Terms used on this page.** A **job-set ID** is an order-independent
-fingerprint of the jobs a node runs (two nodes match if and only if they hold
-the same job set). A **quorum** is a strict majority of the cluster,
+fingerprint of selected fields in the node's effective job configuration.
+Matching IDs indicate agreement on those fields, including jobs that are not
+currently executing. A **quorum** is a strict majority of the cluster,
 `⌊N / 2⌋ + 1` nodes. A node is **quorate** when it currently sees a quorum of
 agreeing members. **Fenced** means a shared store guarantees a single holder
 (the lease backends). A **lease** is a short-lived, auto-expiring claim on that
@@ -147,23 +146,22 @@ over at once.
 
 * Stay on the default `gossip` when you want zero-dependency replicas and can
   tolerate an occasional skip or double-run in narrow windows.
-* Pick `kubernetes` (already on Kubernetes) or `etcd` (already run etcd) when
-  you need a **fenced, exactly-once** guarantee and already run that store.
+* Pick `kubernetes` or `etcd` when you already run that service and want
+  **fenced leadership** through a shared store with a single lease holder.
 * Pick `filesystem` when the nodes already share a POSIX mount (Amazon S3
   Files / EFS / NFS) and you want fenced leadership with zero extra services.
 
-All four present the same **per-job** seam (`clusterPolicy`) to the scheduler,
-so switching backends does not change how jobs are written. Only the
-*coordination* underneath, and therefore how the cluster is **observed**,
-differs.
+All four support the same **per-job policy** (`clusterPolicy`), so switching
+backends does not require rewriting jobs. The coordination mechanism, failure
+behavior, and cluster status fields differ.
 
 | | `gossip` *(default)* | `kubernetes` | `etcd` | `filesystem` |
 | --- | --- | --- | --- | --- |
 | Coordination | embedded mTLS gossip, no shared state | a `coordination.k8s.io/v1` `Lease` | a lease-bound etcd key | a flock-guarded TTL lease file on a shared POSIX mount |
-| Guarantee | best-effort (may skip or double-run in narrow windows) | **fenced, exactly-once** while the apiserver is reachable | **fenced, exactly-once** while etcd is reachable | **fenced** under NTP-bounded clock skew (~2 s budget) while the mount is reachable |
+| Leadership guarantee | best-effort (may skip or double-run in narrow windows) | **fenced, single lease holder** while the apiserver is reachable | **fenced, single lease holder** while etcd is reachable | **fenced** under NTP-bounded clock skew (~2 s budget) while the mount is reachable |
 | Extra dependency | none | none (optional `cronstable[kubernetes]`) | none | none |
 | Needs | per-node mTLS certs + a static peer list | in-cluster (or kubeconfig) apiserver access + a Lease RBAC | reachable etcd endpoint(s) | a shared POSIX mount (S3 Files / EFS / NFSv4) with real cross-host locks, NTP on every node |
-| Best when | zero-dependency replicas, occasional skip/dup tolerable | already on Kubernetes and want a hard guarantee | already run etcd | you already have a shared mount and want fenced leadership with zero extra services |
+| Best when | zero-dependency replicas, occasional skip/dup tolerable | already on Kubernetes and want fenced leadership | already run etcd | you already have a shared mount and want fenced leadership with zero extra services |
 
 The per-backend config keys (`cluster.kubernetes.*`, `cluster.etcd.*`,
 `cluster.filesystem.*`) are in the
@@ -190,16 +188,14 @@ semantics in [per-job policy](#per-job-policy), however, apply to every backend.
 
 ## The job-set ID foundation
 
-A **job-set ID** is an order-independent fingerprint of the set of jobs an
-instance is running: two instances produce the *same* id if and only if they
-hold the same set of jobs. It is taken over the *effective* (post-merge)
-configuration of every job, embeds no secret material, and is versioned with a
-`v1:` prefix so ids are only ever compared within one scheme. The full
-treatment (exactly which fields it covers, the no-secrets guarantees, and
-every surface it appears on) is on the [job-set ID](Job-Set-ID) page.
+A **job-set ID** is an order-independent fingerprint of selected fields in each
+job's *effective* (post-merge) configuration. It excludes secret values and
+certain host-specific settings, and has a `v1:` prefix so ids are compared only
+within one scheme. See [job-set ID](Job-Set-ID) for field coverage, secret
+handling, and where to find the id.
 
-The id is what the cluster compares: agreement means the nodes are running the
-same jobs. It is available on the standalone [`GET /job-set-id`](HTTP-API)
+The cluster compares these ids to check agreement on the fingerprinted settings.
+The id is available on the standalone [`GET /job-set-id`](HTTP-API)
 endpoint and in the dashboard header, and the daemon logs it at startup and
 whenever a reload changes it. `clusterPolicy` (described later) is part of the
 id, so two replicas that disagree on a job's policy show up as drift rather
@@ -317,9 +313,10 @@ listener caps request size but not concurrent connections) are in
 
 ## Leader election
 
-Setting `electLeader: true` turns the same attestation into a **quorum-gated
-leader election**, so you can run more than one replica from the same config
-without double-running jobs:
+Setting `electLeader: true` enables **quorum-gated leader election** using the
+same attestation. Replicas can then coordinate scheduled jobs from one shared
+configuration, subject to the [guarantees and trade-offs](#guarantees-and-trade-offs)
+described later:
 
 ```yaml
 cluster:
@@ -343,18 +340,18 @@ deliberately *not* gated, so you can still trigger a job on any node.
 Automatic *retries* re-check the gate before every relaunch. A transient
 fail-closed denial (lost quorum, a detected conflict, a rebuilt manager's
 still-converging view) defers the retry and re-checks it, while a
-*positively observed* ownership move ends the local ladder so it cannot
-double-run against the new owner.
+confirmed ownership change stops the local retry sequence so this node does
+not launch the attempt after learning that another node owns it.
 
 What happens to the pending attempt then depends on the state store. On a
 **shared** [durable state](Durable-State#restart-surviving-retries) store with
-leader election, the ladder is **handed off** rather than dropped: the old
-owner writes a durable `handoff` record instead of settling the ladder dead (no
-`cancelled` run-history record, because the attempt moves rather than dying),
-and the new owner resumes the remaining attempts from it. Without a shared
-store the retry is **abandoned** (a `WARNING` plus a `cancelled` run-history
-record). `EveryNode` and `@reboot` ladders never move between nodes. The full
-defer-vs-abandon-vs-handoff lifecycle is documented in
+leader election, the retry sequence is **handed off**: the old owner writes a
+durable `handoff` record, and the new owner resumes the remaining attempts.
+No `cancelled` run-history record is written because the sequence continues
+on the new owner. Without a shared store the retry is **abandoned** (a
+`WARNING` plus a `cancelled` run-history record). Retries for `EveryNode` and
+`@reboot` jobs never move between nodes. The conditions for deferring,
+abandoning, or transferring retries are documented in
 [failure detection and retries](Failure-Detection-and-Retries#retry-lifecycle).
 
 ### Cluster size and quorum
@@ -539,10 +536,11 @@ scheduled-job leadership.
 
 ## Per-job policy
 
-The cluster-wide `electLeader` switch sets the *default* behavior, but each job
-can override it with **`clusterPolicy`** to pick its own point on the
-liveness-vs-duplication trade-off. **No option is true exactly-once**: each
-gives up one side. `Leader` may *skip*, `PreferLeader` may *double-run*.
+The cluster-wide `electLeader` switch sets the *default* behavior. Each job can
+override it with **`clusterPolicy`** to choose how it handles unavailable
+leadership. **No policy guarantees exactly-once execution**: `Leader` may
+*skip* a run, `PreferLeader` may run it *more than once*, and `EveryNode`
+deliberately runs it on every node.
 
 | `clusterPolicy` | Healthy (quorate) | Partitioned / sub-quorum | Guarantee by backend | Use for |
 | --- | --- | --- | --- | --- |
@@ -1014,10 +1012,9 @@ shared mounts". The `kubernetes`/`etcd` takeover is judged on a single clock
 (the challenger's own, or etcd's server), so those two carry no such budget.
 `EveryNode` is never gated on any backend.
 
-This gossip design intentionally keeps **no shared state**, which is what makes
-it simple to run, but it means the guarantee is *best-effort*, not fenced
-exactly-once. Because each node acts on a view only as fresh as its last poll
-(`interval`), there are narrow windows where behavior degrades:
+The gossip backend keeps **no shared state** and provides *best-effort*
+coordination. Each node acts on a view only as fresh as its last poll
+(`interval`), leaving narrow windows where behavior degrades:
 
 * **Immediately after a leader dies**, a `Leader` firing may be *skipped* until
   the survivors notice (up to one `interval`) and re-elect.
@@ -1058,12 +1055,13 @@ exactly-once. Because each node acts on a view only as fresh as its last poll
 * A `PreferLeader` job **may double-run** across a partition (that is the point
   of the policy: it never skips).
 
-If you need a hard exactly-once guarantee, you need a shared store (etcd, a
-Kubernetes `Lease`, or, given NTP-bounded clocks, a shared mount through the
-`filesystem` backend), which this design deliberately avoids. If a job
-must *never* be skipped or doubled, run a single replica (`replicas: 1`) or use
-an external coordinator. Tuning the `interval` shorter narrows the degraded
-windows at the cost of more polling traffic.
+For fenced leadership, use a shared store: etcd, a Kubernetes `Lease`, or a
+shared mount through the `filesystem` backend with NTP-bounded clocks. The
+job's `clusterPolicy` still determines whether unavailable leadership causes
+a skipped run or permits a possible duplicate. A single replica avoids
+cross-replica duplicates but can still miss scheduled runs during downtime.
+Tuning the gossip `interval` shorter narrows the degraded windows at the cost
+of more polling traffic.
 
 ## Certificate rotation
 
@@ -1085,20 +1083,20 @@ trust overlap, and recovering from an `untrusted` cascade), see
 ## Operating the lease backends (Kubernetes and etcd)
 
 The `kubernetes`, `etcd`, and `filesystem` backends replace the gossip protocol
-with a shared store, giving a **fenced** election while the store is reachable
-(exactly-once on `kubernetes`/`etcd`; on `filesystem`, fenced under NTP-bounded
-clock skew). They share one code path (`cronstable.leadership.LeaseBackend`) and
-differ only in which store they talk to. This section covers how they elect, how
+with a shared store that controls a single lease holder while the store is
+reachable. This provides **fenced leadership**; the `filesystem` backend also
+requires NTP-bounded clock skew. They share a base implementation,
+`cronstable.leadership.LeaseBackend`, and differ in how they access their stores.
+This section covers how they elect, how
 to deploy each, their failure modes, and how to monitor them. The config keys
 are in the [configuration reference](Configuration-Reference#cluster).
 
-How the lease backends talk to their store: `kubernetes` and `etcd` speak
-**plain HTTP over the core `aiohttp` dependency**, namely the Kubernetes
-apiserver's REST API and etcd's v3 gRPC-gateway JSON API, while `filesystem`
-talks to no service at all (its store is a directory, driven with the standard
-library). So the **core install gains no new dependency**, and by avoiding
-grpc/protobuf wheels every lease backend runs on the full set of architectures
-that cronstable ships for.
+The built-in `kubernetes` and `etcd` transports use **HTTP APIs through the core
+`aiohttp` dependency, with HTTPS supported**: the Kubernetes apiserver's REST
+API and etcd's v3 gRPC-gateway JSON API. The `filesystem` backend accesses a
+directory through the standard library. These transports add **no new
+dependencies**, including no grpc/protobuf wheels, preserving cronstable's
+architecture support.
 
 The Kubernetes backend can optionally use the **official `kubernetes` client**
 when it is installed (`pip install cronstable[kubernetes]`):
@@ -1110,14 +1108,14 @@ has no optional client.
 
 ### Lease backends at a glance
 
-* **No peer list, no mTLS, no quorum math.** The store is the single source of
-  truth, so the gossip-only keys `listen`, `tls`, `peers`, `interval`, and
+* **No peer list, no peer mTLS, no quorum math.** The store decides leadership,
+  so the gossip-only keys `listen`, `tls`, `peers`, `interval`, and
   `driftAfter` are ignored (the daemon logs a one-line startup advisory for
   each). A lease backend **always elects**, so `electLeader` is implied and
   `electLeader: false` is likewise ignored with an advisory (configuring a
   lease backend *is* opting into leadership). The cluster is logically a single
-  holder (`cluster_size` / `quorum` report `1`), and `GET /cluster` returns a
-  lease-shaped view. Its full field list is under
+  holder (`cluster_size` / `quorum` report `1`), and `GET /cluster` returns
+  lease status fields. Its full field list is under
   [observing the cluster](#observing-the-cluster).
 
 * **The lease is the fence, not a name.** Leadership is decided by the

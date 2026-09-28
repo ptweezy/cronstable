@@ -2,7 +2,7 @@
 # Pinned minimum dependency versions for tox -e mindeps.
 strictyaml==1.7.3
 aiohttp==3.14.3
-sentry-sdk==2.69.2
+sentry-sdk==2.70.0
 aiosmtplib==5.1.3
 jinja2==3.1.6
 tzdata==2026.4

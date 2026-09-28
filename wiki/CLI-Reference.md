@@ -59,7 +59,7 @@ route on any platform (see the [HTTP control API](HTTP-API)).
 | `-c`, `--config` | path (file or directory) | platform default[^cfgdefault] | Configuration file, or a directory containing configuration files. From a directory, cronstable loads every `*.yml`/`*.yaml` file and every classic crontab (`*.crontab`, `*.cron`, or a file named `crontab`), skipping entries whose name starts with `_` or `.`. See [includes, defaults, and multi-file config](Includes-and-Defaults) and [classic crontabs](Classic-Crontabs). |
 | `-l`, `--log-level` | string | `INFO` | Root log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`, in upper or lower case. `logging` module aliases such as `WARN` and `FATAL` also resolve. An unknown name is a usage error (exit `2`). |
 | `-v`, `--validate-config` | flag | off | Parse and validate the configuration, then exit: `0` if valid, `1` on a configuration error. Does not start the scheduler or web server. |
-| `--job-set-id` | flag | off | Parse the configuration, print the [job-set ID](Job-Set-ID) (an order-independent hash of every job's effective configuration) to stdout, and exit `0`. Identical across instances running the same set of jobs. Exits `1` on a configuration error. |
+| `--job-set-id` | flag | off | Parse the configuration, print the [job-set ID](Job-Set-ID) to stdout, and exit `0`. The id hashes selected fields in each job's effective configuration, independently of job order. Exits `1` on a configuration error. |
 | `--version` | flag | off | Print the cronstable version to stdout and exit `0`. |
 | `-h`, `--help` | flag | — | Print usage (argparse builtin) and exit `0`. |
 
@@ -170,9 +170,10 @@ exits `1` with the not-found message rather than the
 
 Constructs the scheduler from the resolved configuration exactly like
 `--validate-config`, then prints the job-set ID to stdout and exits `0`. The id
-is an order-independent hash of every job's effective configuration, identical
-across instances running the same set of jobs regardless of file order or how
-the jobs are split across files.
+is an order-independent hash of selected fields in each job's effective
+configuration. Matching values for those fields produce the same id regardless
+of file order or how the jobs are split across files. It describes configured
+jobs, including those that are not currently executing.
 
 The [`GET /job-set-id`](HTTP-API) endpoint serves the same value, and cluster
 peers compare it (see
@@ -573,7 +574,7 @@ Exit codes for the whole subcommand: `0` success, `1` a Windows failure
 
 The [Windows service](Windows-Service) page covers the full command set, the
 recovery-action behavior, where a service logs, the configuration-path rule,
-and the one install shape that cannot host a service.
+and the installation format that cannot host a service.
 
 ## Runtime model
 

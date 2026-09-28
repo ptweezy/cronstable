@@ -4,7 +4,7 @@ cronstable is an asyncio-based cron replacement for Linux, macOS, and Windows. D
 
 An optional [durable state store](Durable-State) preserves run history across restarts and enables missed-run catch-up, job state, and [DAG workflows](Orchestration-and-DAGs). The [MCP server](MCP) lets AI agents inspect the daemon and, with control enabled, act on jobs and DAGs.
 
-When one instance is not enough, opt-in [clustering and leader election](Clustering-and-Leader-Election) lets several replicas run one config without double-running jobs, coordinated by mTLS gossip or fenced through a Kubernetes or etcd lease.
+When one instance is not enough, opt-in [clustering and leader election](Clustering-and-Leader-Election) coordinates which replicas run scheduled jobs. Choose mTLS gossip or a lease backed by Kubernetes, etcd, or a shared filesystem. Execution guarantees depend on the backend and each job's cluster policy.
 
 The daemon runs in the foreground, logs to stdout/stderr, and supports arbitrary time zones, which suits Docker, Kubernetes, and 12-factor deployments.
 

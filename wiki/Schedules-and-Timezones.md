@@ -1,6 +1,6 @@
 # Schedules and timezones
 
-Every job's `schedule` determines *when* it runs; `utc` and `timezone` determine *in which clock* the schedule is evaluated. This page documents the three accepted `schedule` forms, how the daemon wakes and tests them, and how the effective time zone is resolved.
+Every job's `schedule` determines *when* it runs; `utc` and `timezone` determine *in which time zone* the schedule is evaluated. This page documents the three accepted `schedule` forms, how the daemon wakes and tests them, and how the effective time zone is resolved.
 
 ## The `schedule` option
 

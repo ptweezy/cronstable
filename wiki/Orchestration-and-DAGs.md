@@ -85,7 +85,7 @@ wins on any key it sets.
 A task's `onFailure` / `onSuccess` reporters (set per-task or inherited) fire
 on each of its runs, every failed attempt included. Per-task the two hooks
 accept a `report` block only, because a task's retries come from the node's
-`retries` field, not a job-level `onFailure.retry` ladder (an inherited one is
+`retries` field, not a job-level `onFailure.retry` policy (an inherited one is
 ignored for tasks).
 
 Only the **launch** fields inherit. The DAG-node fields that shape the graph

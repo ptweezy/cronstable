@@ -1,12 +1,14 @@
 # Job-set ID
 
-The **job-set ID** is a deterministic, order-independent fingerprint of the set
-of jobs a cronstable instance is running: two instances produce the *same* id if
-and only if they hold the same set of jobs. It exists so several replicas
-deployed from one configuration can confirm they run the same jobs, or detect
-that one has drifted from the others. It is the agreement key for
-[cluster peer attestation](Clustering-and-Leader-Election). It is useful
-without clustering too: print it in a deploy script, compare it across a fleet
+The **job-set ID** is a deterministic, order-independent fingerprint of selected
+fields in each configured job's effective configuration. Replicas with matching
+values for those fields produce the same id, even if host-specific settings or
+secret values differ. The id lets you compare configurations across replicas
+and detect drift; it does not describe which jobs are currently executing.
+
+The id is the agreement key for
+[cluster peer attestation](Clustering-and-Leader-Election). You can also use it
+without clustering: print it in a deploy script, compare it across a fleet
 through metrics, or read it off the dashboard header. The fingerprint is
 computed in `cronstable/fingerprint.py`.
 
@@ -25,8 +27,9 @@ v1:b834d7565aee0da50cd017f666651a5ba3b2e6b161daf0cb6e430f23f51ce90b
 
 ## What the id covers
 
-The id is taken over the **effective (post-merge) configuration** of every job,
-not the raw YAML text, which gives it these properties:
+The id uses selected fields from every job's **effective (post-merge)
+configuration**, with the included and excluded fields described below. It has
+these properties:
 
 * **Independent of job order**, of how the jobs are split across
   [included files](Includes-and-Defaults), and of whether a setting is written
@@ -42,8 +45,8 @@ not the raw YAML text, which gives it these properties:
 * **`user` / `group` are fingerprinted as configured** (for example,
   `www-data`), not as the resolved numeric uid/gid, which can differ host to
   host.
-* **It covers every behavior-affecting field**, so any meaningful change to a
-  job changes the id. The fields are exactly:
+* **It covers the shared job settings used to compare replicas.** These
+  include the fields below, with values normalized and secrets redacted:
   * `name`, `command` (a shell string and an argv list are kept distinct).
   * The normalized schedule.
   * `shell`, `concurrencyPolicy`, `clusterPolicy`, `captureStdout` /
@@ -166,11 +169,11 @@ the scheme version to yield the final `v1:<64 hex>` id. An empty job set yields
 a stable, well-defined id.
 
 The per-job digest is also used on its own: [durable state](Durable-State)
-records that must not outlive a job's definition (restart-surviving retry
-ladders, `@reboot` markers, and in-flight run records) are stamped with the
-owning job's digest and invalidated when *that job's* behavior-affecting config
-changes. That is stricter than whole-set invalidation, which would drop every
-pending record whenever any job in the set changed.
+records that must not outlive a job's definition (pending retries, `@reboot`
+markers, and in-flight run records) are stamped with the owning job's digest
+and invalidated when *that job's* fingerprinted settings change. This limits
+invalidation to the affected job; using the whole-set ID would drop every
+pending record whenever any job's fingerprint changed.
 
 ## See also
 
