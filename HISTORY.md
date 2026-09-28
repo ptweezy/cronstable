@@ -17,9 +17,9 @@
   write access.
 - The MSI creates `C:\ProgramData\cronstable` when it does not exist,
   with the same ownership and permissions as `cronstable init`:
-  Administrators owns the directory, and only SYSTEM and Administrators
-  can write to it. Uninstalling keeps the directory. The MSI preserves
-  existing directories and their permissions.
+  the Administrators group owns the directory, and only SYSTEM and
+  Administrators can write to it. Uninstalling keeps the directory. The
+  MSI preserves existing directories and their permissions.
   The service starts at the next boot with no jobs and loads configuration
   added later within a minute.
 

@@ -121,9 +121,8 @@ If you can write to a per-user configuration directory, you can modify jobs
 that the service runs as SYSTEM. `install` therefore also rejects an explicit
 path to that directory. The service applies the same checks from its own
 profile under `system32`. After you restrict write access with the printed
-`icacls` commands, `install` accepts the path and warns that moving or deleting
-your profile can break the service. A machine-wide directory avoids that
-dependency.
+`icacls` commands, `install` accepts the path and recommends a machine-wide
+directory such as `%ProgramData%\cronstable`.
 
 ## Reloading the configuration
 

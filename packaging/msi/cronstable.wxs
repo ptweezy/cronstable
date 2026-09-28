@@ -122,10 +122,11 @@
          These settings apply only to a directory this transaction creates.
          The service host checks an existing directory's ownership and
          permissions.
-         Permanent, so neither uninstall nor an upgrade's early
-         RemoveExistingProducts deletes it. Created whatever CONFIGDIR is,
-         because an interactive `cronstable` looks here first. A directory
-         key path cannot take a generated GUID. -->
+         The component is permanent so neither uninstall nor an upgrade's
+         early RemoveExistingProducts deletes the directory. It creates
+         the directory regardless of CONFIGDIR because an interactive
+         `cronstable` looks here first. A directory key path requires an
+         explicit GUID. -->
     <StandardDirectory Id="CommonAppDataFolder">
       <Directory Id="DefaultConfigFolder" Name="cronstable">
         <Component Id="DefaultConfigDirectory" Permanent="yes"

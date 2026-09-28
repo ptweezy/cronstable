@@ -1660,8 +1660,9 @@ def eventlog_start_refused_strings(service: str, reason: str) -> list[str]:
     """Build Event Log fields for a Windows service start refused before
     its bootstrap log opens.
 
-    Use :data:`EVENTLOG_STRING_FIELDS` order and the same length limits as
-    other reports so consumers can read all records by position.
+    Use the field order in :data:`EVENTLOG_STRING_FIELDS` and the same
+    length limits as other reports so consumers can read all records by
+    position.
     ``reason`` is the summary, and ``name`` holds the service name.
     """
     field = EVENTLOG_MAX_FIELD_CHARS

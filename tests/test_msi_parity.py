@@ -250,10 +250,10 @@ def test_config_probe_follows_the_remembered_configdir():
 
 
 def test_default_config_dir_matches_init_permissions():
-    # A LocalSystem service registered against a directory any local
-    # account could create first is a way to run jobs as SYSTEM, so the
-    # package creates the default one itself: owned by Administrators,
-    # with the same ownership and permissions as `cronstable init`.
+    # A local account could create a missing configuration directory and
+    # add jobs that the service runs as SYSTEM. The package creates the
+    # default directory with the same ownership and permissions as
+    # `cronstable init`: an Administrators owner and a protected DACL.
     # Compare against init's constants to keep the two consistent.
     root = _root()
     program_data = next(

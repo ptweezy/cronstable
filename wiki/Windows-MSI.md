@@ -89,7 +89,7 @@ Pass public properties on the `msiexec` command line
 
 | Property | Default | Effect |
 | --- | --- | --- |
-| `CONFIGDIR` | `C:\ProgramData\cronstable` | The configuration directory in the service's command line. The MSI creates only the default directory. If you specify a custom path, create it with write access limited to SYSTEM and Administrators before starting the service, for example, with `cronstable init`. |
+| `CONFIGDIR` | `C:\ProgramData\cronstable` | The configuration directory in the service's command line. The MSI creates only the default directory. Before starting the service with a custom path, create a directory writable only by SYSTEM and Administrators, for example, with `cronstable init`. |
 | `ADDPATH` | `1` | `0` skips adding the install directory to the system `PATH`. |
 | `STARTSERVICE` | unset | `1` starts the service at the end of the install, including a first install. Pass it when the configuration is deployed ahead of the package. |
 | `INSTALLFOLDER` | `C:\Program Files\cronstable` | The install directory. |
