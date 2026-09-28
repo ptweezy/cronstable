@@ -2700,7 +2700,7 @@ jobs:
       # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
       - name: Build binary (FreeBSD ${{ matrix.vmarch }})
-        uses: vmactions/freebsd-vm@v1.5.7
+        uses: vmactions/freebsd-vm@v1.5.8
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
