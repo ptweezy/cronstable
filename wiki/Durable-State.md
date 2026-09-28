@@ -298,7 +298,7 @@ process on the same mount, so an interleaved append can leave an older run
 last.
 
 Everything that answers "the latest run" folds by finish time instead: the
-rehydrated `last_run`, the retry ladder's superseded-by-run watermark, the
+rehydrated `last_run`, the retry sequence's superseded-by-run watermark, the
 `maxTimeSinceSuccess` reference, the `onlyIfLastSucceeded` memo, and the
 `last_duration`, `last_cpu_seconds` and `last_rss_bytes` fields in the `stats`
 block. Two runs sharing a finish instant resolve to the later one in the
@@ -388,9 +388,9 @@ How the evaluation works:
   a cycle recounts it from its watermark.
   Scheduled [DAGs](Orchestration-and-DAGs) keep the same discipline in their
   own `catchup-dag/<dag>` streams.
-* **Backfills are plain runs, minus the ladder.** Each backfilled launch
+* **Backfilled runs do not retry.** Each backfilled launch
   respects `concurrencyPolicy` (serialized, waiting for the job to go idle;
-  `Forbid` waits unbounded) but launches *without* the retry ladder, so a
+  `Forbid` waits unbounded) but launches *without* retries, so a
   failing backfill cannot cancel a legitimate pending retry or burn the
   shared retry budget toward a premature `onPermanentFailure`.
 
@@ -410,7 +410,7 @@ waiting or jittering recovery checks again before launching. For `run-all`,
 the backfill covers skipped slots before the current scheduling slot, so it
 does not replay that normal fire. Only one backfill per job can run at a
 time, including an unfinished startup backfill. A failed catch-up attempt
-does not arm a retry ladder or re-arm recovery on every scheduling pass;
+does not start a retry sequence or re-arm recovery on every scheduling pass;
 another detected gap can create a new recovery cycle.
 
 The default `onMissed: skip` and jobs without `state` keep the usual cron
@@ -503,7 +503,7 @@ jobs:
   never blocked.
 * **Only scheduled and `@reboot` fires are gated.** Retries, catch-up
   backfills, and manual `POST /jobs/{name}/start` triggers deliberately
-  bypass it: the retry ladder exists precisely to run after a failure, and a
+  bypass it: retries are intended to run after a failure, and a
   manual trigger is the operator overriding the gate.
 * **Store trouble follows the policy.** When the ledger cannot be read, the
   gate decides from the in-memory view under the default `degrade` (fail
@@ -540,88 +540,85 @@ additionally created `0o600` (see [operational notes](#operational-notes)).
 
 ## Restart-surviving retries
 
-Without a store, a pending retry is an in-memory timer: restart the daemon
-mid-ladder and the remaining attempts are gone. With `state` configured, the
-ladder becomes durable **automatically** for every job with
-`onFailure.retry`, with no new per-job option:
+Without a store, pending retries exist only in memory and are lost when the
+daemon restarts. With `state` configured, retry state is persisted
+**automatically** for every job with `onFailure.retry`, with no new per-job
+option:
 
 * **Arming persists a `pending` record** (stream `retries/<job>`) carrying
   the attempt number, the **absolute** `notBefore` deadline, and the job's
   per-job config digest.
 * **Record-before-run:** immediately before a retry launches, the record is
   settled (`launched`), so a crash right after the launch does not replay it.
-  Every other end of the ladder settles too: succeeded, superseded by a fresh
-  scheduled fire, cancelled, budget exhausted, ownership moved, job removed.
+  A pending retry is also settled when the job succeeds, a fresh scheduled run
+  supersedes it, it is cancelled, its budget is exhausted, the job is removed,
+  or ownership changes without cross-node resume.
 * **A graceful shutdown deliberately does *not* settle.** The pending record
   is exactly what the next boot re-arms.
 
-On boot, a pending record **re-arms the ladder at its persisted position**:
+On boot, a pending record **resumes the retry sequence at its saved position**:
 the task sleeps only the *remaining* time to `notBefore` (zero if the
 deadline passed while the daemon was down), and then re-checks the
-[cluster gate](Clustering-and-Leader-Election) exactly like a never-restarted
-ladder. Because the deadline is absolute, a retry armed for 04:00 fires at
+[cluster gate](Clustering-and-Leader-Election) just as it would without a restart.
+Because the deadline is absolute, a retry scheduled for 04:00 becomes due at
 04:00 (or immediately, if you restart at 05:00), not "backoff seconds after
 whenever the daemon happened to come back".
 
 A pending record is **settled instead of re-armed** when:
 
-* the job's **per-job config digest** changed (`cronstable.fingerprint.job_digest`,
-  deliberately stricter than the whole-set job-set ID, so editing an
-  *unrelated* job does not drop this job's retry, while any
-  behavior-affecting edit to *this* job does: the old ladder must not run
-  the new definition);
+* the job's **configuration digest** changed (`cronstable.fingerprint.job_digest`):
+  editing this job's fingerprinted settings invalidates its saved retry, while
+  editing an *unrelated* job does not;
 * the job was **removed or disabled**;
 * the retry **budget is exhausted** under the current config;
 * the record is **older than the job's `startingDeadlineSeconds`** (when
   set), the same "not worth replaying" bound catch-up honors;
 * for an `@reboot` job, the machine **actually rebooted**: the fresh boot run
-  supersedes the stale ladder.
+  supersedes the previous retry sequence.
 
-Ambiguity always settles: with live ladders, cluster gates, and boot markers
-involved, the wrong move is a double-run, so **the bias is no-run over
-double-run** (at-most-once on the launch side, because of record-before-run).
-The at-least-once residue lives on the write side instead: the pending-record
-write is fire-and-forget, so a hard crash in the instant between arming a
-retry and the record landing loses that re-arm (counted in
-`cronstable_state_dropped_writes_total{kind="retry"}` when the store rejects the
-write outright).
+If a saved retry's validity is ambiguous, cronstable settles it rather than
+risk launching a duplicate. Persistence has its own failure window: the initial
+`pending` record is written asynchronously, so a crash before the write
+completes can prevent that retry from being restored. Rejected writes increment
+`cronstable_state_dropped_writes_total{kind="retry"}`. A failed `launched` write
+follows [`onStoreUnavailable`](#when-the-store-is-unavailable-onstoreunavailable):
+`degrade` permits the launch despite the risk of replay after a restart, while
+`fail-closed` defers it.
 
 **`@reboot` keep-alive continuity.** An `@reboot` job with
 `maximumRetries: -1` is a minimal process supervisor: start a process at
 boot, restart it forever when it dies. Without durable retries, a daemon
-restart breaks that loop (the job already "ran this boot", and the in-memory
-ladder died with the old process). With a store, when the
+restart breaks that loop (the job already "ran this boot", and the pending
+retry was lost with the old process). With a store, when the
 [boot marker](#reboot-once-per-os-boot) shows the boot run already happened
 during *this* OS boot, the pending retry is re-armed instead of superseded,
 so the supervised process keeps getting restarted across cronstable's own
 restarts.
 
-**Cross-node retry resume.** On a shared store the ladder can also survive
-the *node*, not only the process. Resume is active only when all three hold:
+**Cross-node retry resume.** A shared store also lets another node resume
+pending retries after a failure or ownership change. Resume is active only
+when all three conditions hold:
 the store's resolved topology is `shared`, leader election is configured
 (`electLeader`), and the cluster manager is running.
 
-Resume applies to `Leader` / `PreferLeader` ladders that are not `@reboot`.
-`EveryNode` ladders stay strictly per-node (every node runs its own copy, so
-a foreign pending on the shared stream is another node's live ladder), and
-`@reboot` ladders are anchored to a host's boot, so an abandoned `@reboot`
-keep-alive still ends cluster-wide, as described earlier. While resume is
-active:
+Resume applies to retries for `Leader` and `PreferLeader` jobs whose schedule
+is not `@reboot`. Each node manages its own `EveryNode` retries and must not
+claim another node's pending record. Retries for `@reboot` jobs belong to the
+host's current boot, so an abandoned `@reboot` keep-alive still ends
+cluster-wide, as described earlier. While resume is active:
 
-* **An ownership move hands the ladder off.** When the cluster moves a job's
-  ownership off-node mid-ladder, the old owner writes a `handoff` record
-  (attempt, job digest, a now-due deadline, `fromHost`) instead of settling
-  the ladder dead, and writes *no* `cancelled` run-history record: the
-  attempt is moving, not dying. On a single-node store the legacy behavior
-  is unchanged (settled `owner-moved`, plus the cancelled row).
+* **An ownership change transfers the retry sequence.** The old owner writes
+  a `handoff` record containing the attempt, job digest, an immediately due
+  deadline, and `fromHost`. It writes no `cancelled` run-history record because
+  the new owner can resume that attempt. With a single-node store, it instead
+  settles the retry as `owner-moved` and records a cancelled run.
 * **A crashed owner's `pending` stays newest.** The new owner's claim scan
   (spawned from the housekeeping pass about once a minute) claims a
   `handoff` immediately, because the owner positively relinquished it. It
   claims a *foreign* `pending` only after that record is stale, 30 seconds
   past due. That grace covers a live owner whose fire is slightly late. It
-  deliberately cannot cover an owner deferring on a closed cluster gate,
-  whose re-check cadence is its own ladder delay; the consume-time re-check
-  described later covers that case.
+  does not cover a retry waiting longer because its leadership check failed.
+  The ownership check immediately before launch handles that case.
 * **Claims are leased and re-checked.** To claim a record, the claimer:
 
   * validates it (digest match, job enabled, retry budget,
@@ -629,25 +626,25 @@ active:
   * acquires the job's `retry-claim/<job>` lease (TTL 30 seconds);
   * **re-reads** the newest record under the lease, which must be unchanged;
   * checks superseded-by-run against the **durable** ledger, because the run
-    that resolved the ladder most likely happened on another host, which this
+    that ended the retry sequence may have happened on another host, which this
     node's in-memory history knows nothing about. A newer durable run settles
     the record `superseded-by-run` instead of claiming it.
 
   Only then does the claimer append its own `pending` (with its host and
-  `claimedFrom`), wait for that write to land before releasing the lease,
-  and re-arm the local ladder exactly like rehydration: absolute deadline,
-  only the remaining delay slept.
+  `claimedFrom`) and wait for the write to complete before releasing the lease.
+  It then resumes the retry, waiting only for the time remaining until the
+  saved deadline.
 
-* **The consume-time re-check is load-bearing.** While resume is active, a
-  due retry's launch decision serializes on the *same* claim lease and
-  re-checks that the newest ladder record still belongs to this host. When
-  the newest record is foreign (a claimer's `pending`, or its settled
-  `launched` after it already fired), this node stops its local ladder
-  silently, writing no settle, so the claimer's record stays newest. This,
-  not the staleness grace, is what protects a gate-deferred owner. Read or
-  acquire failures follow
+* **Ownership is checked again before launch.** While resume is active, the
+  node acquires the *same* claim lease before launching a due retry and checks
+  that the newest retry record still belongs to it. If another node has
+  claimed or already launched the attempt, this node stops its local retry
+  sequence and logs a warning. It writes no settled record, leaving the new
+  owner's record unchanged. This check also covers retries that waited beyond
+  the grace period because leadership was unavailable. Store errors follow
   [`onStoreUnavailable`](#when-the-store-is-unavailable-onstoreunavailable):
-  `degrade` proceeds unserialized, `fail-closed` defers.
+  `degrade` permits a launch without this coordination, while `fail-closed`
+  defers it.
 * **The contract is at-least-once, not exactly-once.** The lease, the
   re-read and the re-check close every race a responsive store lets them
   close. A store outage at the wrong instant can still let a claimed attempt
@@ -655,8 +652,8 @@ active:
   guarantee on this page.
 * **Mixed-version fleets are safe.** Older builds treat the unknown
   `handoff` record kind as not-pending and skip it: a partially upgraded
-  fleet may lose a handoff (the ladder is not resumed there), but it never
-  double-runs one.
+  fleet may lose a handoff (the retry sequence is not resumed there), but it
+  never double-runs one.
 
 ## `@reboot` once per OS boot
 
@@ -780,7 +777,7 @@ gated on the store under either policy**:
 | Philosophy | behave exactly as the stateless daemon would | prefer not running over running wrong |
 | Failed durable writes | dropped with a warning, counted in `cronstable_state_dropped_writes_total` | same (writes are never blocking) |
 | `onlyIfLastSucceeded` gate | decides from the in-memory history (fail open) | **blocks** the fire |
-| A due durable retry | proceeds on the in-memory ladder | **defers** and re-checks, like a closed cluster gate |
+| A due durable retry | proceeds using the in-memory retry state | **defers** and re-checks, like a closed cluster gate |
 | The cluster concurrency slot claim ([`concurrencyScope: cluster`](Clustering-and-Leader-Election)) | launches with **node-local** enforcement only for that run (a warning names the reason) | **skips** the launch, like a closed cluster gate |
 | Serializing a due retry with [cross-node claims](#restart-surviving-retries) | proceeds unserialized (at-least-once) | **defers** and re-checks |
 | `@reboot` boot marker unreadable/unwritable | runs the job (at-least-once) | **skips** the boot run |
@@ -1173,7 +1170,7 @@ documents the UI.
 - [Orchestration and DAGs](Orchestration-and-DAGs): the durable workflow tier built entirely on this store (dag_run documents, XCom over the artifact store, per-run advance leases).
 - [Configuration Reference](Configuration-Reference): the `state` section and per-job option schema.
 - [Command-Line Reference](CLI-Reference): the `cronstable state` administration subcommands.
-- [Failure Detection and Retries](Failure-Detection-and-Retries): the retry ladder these records make durable.
+- [Failure Detection and Retries](Failure-Detection-and-Retries): the retry sequence preserved by these records.
 - [Clustering and Leader Election](Clustering-and-Leader-Election): the owner gate catch-up and retries re-check.
 - [Output Capturing](Output-Capturing): what `archiveOutput` persists.
 - [HTTP Control API](HTTP-API): `GET /jobs/{name}/trends`, the run endpoints, and the job-facing `/v1/` loopback endpoints.

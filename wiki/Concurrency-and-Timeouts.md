@@ -1,13 +1,14 @@
 # Concurrency and timeouts
 
-This page documents how cronstable handles overlapping runs of the same job
-(`concurrencyPolicy`, and how far that policy reaches: `concurrencyScope`)
-and how it bounds the duration of a single run (`executionTimeout`,
-`killTimeout`). These options are per-job (settable in `defaults`) and govern
-only one launch of a job. They have no effect across different jobs. By
-default they also reach no further than one daemon process.
-`concurrencyScope` can widen `Forbid` and `Replace` to a whole fleet sharing
-a [durable state store](Durable-State).
+`concurrencyPolicy` controls overlapping runs of the same job.
+`executionTimeout` limits each run's duration, and `killTimeout` sets how long
+cancellation waits before forcing termination. These settings apply separately
+to each job and can also be set in `defaults`. They do not coordinate different
+jobs.
+
+By default, the concurrency policy applies within one daemon process.
+`concurrencyScope` can extend `Forbid` and `Replace` to all nodes sharing a
+[durable state store](Durable-State).
 
 **On this page:**
 [Overview](#overview) ·

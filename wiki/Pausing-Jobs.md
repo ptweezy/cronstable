@@ -80,5 +80,5 @@ Scheduling never reads the store. Fire-time checks are memory-only. If the store
 - [Late-Run Detection](Late-Run-Detection): the SLA checks a pause suppresses.
 - [HTTP Control API](HTTP-API): the endpoint reference, authentication, and error shapes.
 - [Durable State](Durable-State): the store behind restart survival and fleet-wide pauses.
-- [Failure Detection and Retries](Failure-Detection-and-Retries): the retry ladder that defers across a pause.
+- [Failure Detection and Retries](Failure-Detection-and-Retries): how pending retries wait until a pause ends.
 - [Why Didn't It Run?](Why-No-Run): probing one timestamp, pause note included.

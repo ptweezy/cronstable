@@ -47,9 +47,9 @@ and after the timestamp, computed in the job's time zone.
   hour, day-of-month, month, day-of-week, year). `value` is the probe's
   value in cron terms (Sunday is `0`). `label` is its human name.
   `allowed` renders the field's accepted values as prose: an
-  unrestricted field reads `any`, runs collapse (`1-3 and 7`,
-  `Monday-Friday`), and the `L` forms are spelled out (`the month's
-  last day (L)`, `the month's last Friday`).
+  unrestricted field reads `any`, consecutive allowed values are shown as
+  ranges (`1-3 and 7`, `Monday-Friday`), and the `L` forms are spelled out
+  (`the month's last day (L)`, `the month's last Friday`).
 - **`matches` is exactly the engine's verdict.** The explainer
   decomposes `CronTab.test` itself, one term per row, so `matches`
   always equals what the scheduler would compute for that civil instant.

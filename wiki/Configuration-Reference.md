@@ -152,14 +152,14 @@ bridge's flags.
 
 ### `cluster`
 
-Optional. Gates scheduled jobs on a **leadership backend** so several replicas
-can run from one configuration without double-running jobs. `cluster.backend`
-chooses how:
+Optional. A **leadership backend** coordinates scheduled jobs across replicas
+using one configuration. Execution guarantees depend on the backend and each
+job's `clusterPolicy`. `cluster.backend` selects the coordination mechanism:
 
 - The default **`gossip`** backend attests, over mutual TLS, that a static list
   of peers is running the same job set, and runs a best-effort quorum election.
 - The **`kubernetes`** and **`etcd`** backends use a coordination store (a
-  `Lease` / a lease-bound key) for a fenced, exactly-once election.
+  `Lease` / a lease-bound key) for fenced leadership with a single lease holder.
 - The **`filesystem`** backend elects through a fenced TTL lease on a shared
   POSIX mount, with no coordination service at all. Its safety additionally
   rests on synchronized clocks; see its table later.
@@ -172,7 +172,7 @@ only when a `cluster` section is present.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `backend` | `Enum(["gossip", "kubernetes", "etcd", "filesystem"])` | `gossip` | Which leadership backend gates jobs. `gossip` (default) is the embedded mTLS best-effort election; `kubernetes`/`etcd`/`filesystem` are fenced lease backends. `kubernetes`/`etcd` talk to their store over plain HTTP through the core `aiohttp` dependency, and `filesystem` needs only a shared POSIX mount, so none of them adds a runtime dependency. |
+| `backend` | `Enum(["gossip", "kubernetes", "etcd", "filesystem"])` | `gossip` | Which leadership backend gates jobs. `gossip` (default) is the embedded mTLS best-effort election; `kubernetes`/`etcd`/`filesystem` are fenced lease backends. The built-in Kubernetes and etcd transports use HTTP APIs through the core `aiohttp` dependency, with HTTPS supported. `filesystem` needs only a shared POSIX mount, so none of these transports adds a runtime dependency. |
 
 **Gossip backend** (`backend: gossip`). `listen`, `tls`, and `peers` are
 required **only for this backend**:
@@ -737,7 +737,7 @@ in-memory history alone (the gate then resets on restart). See
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `onMissed` | `Enum(["skip", "run-once", "run-all"])` | `skip` | Job catch-up after downtime or same-process sleep/stalls. Startup uses the durable last-run watermark; resume uses the skipped scheduling window. `skip` keeps classic cron behavior. `run-once` coalesces missed slots into one attempt (a normal start after resume also satisfies it). `run-all` replays each missed occurrence, bounded. Inert without a `state` section. |
-| `startingDeadlineSeconds` | `Int` or null | none | Only occurrences missed within this many seconds are caught up; unset means no deadline. Bounds `run-all` to a recent window so a long outage cannot stampede (like the Kubernetes CronJob field of the same name). Also invalidates a persisted retry ladder older than the deadline. Must be `> 0` when set. Only meaningful with a `state` section. |
+| `startingDeadlineSeconds` | `Int` or null | none | Only occurrences missed within this many seconds are caught up; unset means no deadline. Bounds `run-all` to a recent window so a long outage cannot stampede (like the Kubernetes CronJob field of the same name). Also invalidates a persisted retry sequence older than the deadline. Must be `> 0` when set. Only meaningful with a `state` section. |
 | `catchupJitterSeconds` | `Int` | `0` | Spread catch-up launches of different jobs over `[0, N)` seconds, deterministic per job name, on restart or resume. `0` fires them together. Must be `>= 0`. Only meaningful with a `state` section. |
 | `onlyIfLastSucceeded` | `Bool` | `false` | Depends-on-past gate: skip a scheduled fire when the job's most recent finished run did not succeed, or when a previous instance is still running (unless `concurrencyPolicy: Replace`). The last real outcome is the newest of the in-memory history and the durable run ledger. Cancelled and skipped runs are ignored, and retries, catch-up backfills, and manual API triggers deliberately bypass the gate. Works without a `state` section from the in-memory history alone (resetting on restart); with one, the gate's memory survives restarts. |
 | `archiveOutput` | `Bool` | `false` | Persist each finished run's captured output durably to the state store (the job's `logs/` stream). Encryption at rest is the mount's job (EFS/S3 SSE, an encrypted volume). Inert without a `state` section (a startup warning notes it archives nothing). |

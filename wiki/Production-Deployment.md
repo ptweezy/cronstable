@@ -2,8 +2,8 @@
 
 This page covers running cronstable in hardened Linux container and Kubernetes
 environments: the published image, the security context it is built to satisfy,
-the Kubernetes `Deployment` manifest, the FROM-the-published-image build
-pattern, and the few cases that require a writable path. The published Docker
+the Kubernetes `Deployment` manifest, building a custom image from the published
+image, and the few cases that require a writable path. The published Docker
 image is Linux-only. See [installation](Installation) for the package/binary
 install methods and the [HTTP control API](HTTP-API) for the optional web
 interface. For native Windows deployment with the
@@ -161,14 +161,15 @@ spec:
 `replicas: 1` is the safe default: cronstable holds the schedule in-process, so
 two replicas with no coordination each run every job independently.
 
-To run more than one replica without double-running jobs, enable
+To coordinate scheduled jobs across replicas, enable
 [leader election](Clustering-and-Leader-Election) with a `cluster` section.
-Pick a backend by whether you already run a coordination store:
+Execution guarantees depend on the backend and each job's `clusterPolicy`.
+Choose a backend based on the coordination services you already run:
 
 * **`backend: kubernetes` (recommended on Kubernetes).** A
-  `coordination.k8s.io/v1` `Lease` gives a **fenced, exactly-once** election
-  while the apiserver is reachable. No mTLS, no peer list, no odd-replica
-  rule: a plain `Deployment` with any replica count works. You only grant the
+  `coordination.k8s.io/v1` `Lease` provides **fenced leadership** with a single
+  lease holder while the apiserver is reachable. No peer mTLS, no peer list,
+  no odd-replica rule: a plain `Deployment` with any replica count works. You only grant the
   `Lease` RBAC (`get`/`create`/`update`). Likewise `backend: etcd` if you run
   etcd. See
   [operating the lease backends](Clustering-and-Leader-Election#operating-the-lease-backends-kubernetes-and-etcd)
@@ -181,11 +182,11 @@ Pick a backend by whether you already run a coordination store:
     refuses to start with `electLeader` and a 2-node cluster, and warns on even
     sizes. Spread replicas across nodes/zones with `topologySpreadConstraints`.
     Correlated failures defeat quorum regardless of count.
-  * **A minority partition stands down** (runs nothing) to guarantee at most one
-    leader. The view is only as fresh as the poll `interval`, so this is
-    best-effort, not fenced exactly-once. If a job must *never* be skipped or
-    doubled, use one of the lease backends described earlier, or keep
-    `replicas: 1`.
+  * **A minority partition skips `Leader` jobs once it detects lost quorum.**
+    Each node's view is only as fresh as its last poll, so a leadership change
+    can briefly cause skipped or duplicate runs. Use a lease backend for
+    fenced leadership. No backend guarantees that every scheduled job runs
+    exactly once; see the [per-job policies](Clustering-and-Leader-Election#per-job-policy).
   * Provision the per-pod certificates from your own PKI (for example,
     cert-manager) and give each pod a stable `nodeName`. A StatefulSet's ordinal
     hostnames make both the cert SANs and the peer list straightforward.
