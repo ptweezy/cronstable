@@ -3677,14 +3677,22 @@ jobs:
           cfgwin='C:\cronstable-ci-upgrade-cfg'
           mkdir -p "$cfg"
           cp pyinstaller/smoke-push.yaml "$cfg/"
-          # A directory at the root of C: inherits Modify for Authenticated
-          # Users, and the service refuses to load one another account can
-          # write. Restrict it with the recipe the refusal prints, so the
-          # service reaching RUNNING below also proves that recipe.
+          # Apply the repair commands the service prints for writable
+          # configuration directories. Reset explicit grants as well as
+          # removing inherited grants before assigning access.
+          MSYS2_ARG_CONV_EXCL='*' icacls "$cfgwin" /reset
           MSYS2_ARG_CONV_EXCL='*' icacls "$cfgwin" /inheritance:r \
             /grant '*S-1-5-18:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' \
             /grant '*S-1-5-11:(OI)(CI)RX' /grant '*S-1-3-4:(OI)(CI)RX'
           MSYS2_ARG_CONV_EXCL='*' icacls "$cfgwin" /setowner '*S-1-5-32-544'
+          uv run python - <<'EOF'
+          from cronstable import platform
+          path = r"C:\cronstable-ci-upgrade-cfg"
+          sddl = platform._read_security_sddl(path)
+          print(sddl)
+          assert sddl and "D:P" in sddl, "the configuration DACL must be protected"
+          assert platform.service_write_grantee(path) is None, platform.service_write_grantee(path)
+          EOF
           cleanup_upgrade() {
             upgrade_result=$?
             if [ "$upgrade_result" -ne 0 ]; then

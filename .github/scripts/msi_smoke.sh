@@ -70,7 +70,7 @@ msi_service_diagnostics() {
     tail -n 100 "$2"
   fi
   MSYS2_ARG_CONV_EXCL='*' wevtutil qe Application \
-    "/q:*[System[Provider[@Name='$1']]]" /c:10 /rd:true /f:text || true
+    "/q:*[System[Provider[@Name='$1']]]" /c:10 /rd:true /f:xml || true
   MSYS2_ARG_CONV_EXCL='*' wevtutil qe System \
     "/q:*[System[Provider[@Name='Service Control Manager']]]" \
     /c:10 /rd:true /f:text || true

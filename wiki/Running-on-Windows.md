@@ -255,7 +255,8 @@ TrustedInstaller:
 ```text
 C:\ProgramData\cronstable can be written by BUILTIN\Users, so any local
 account can add or change a job, and a service runs them as SYSTEM.
-Restrict it with: icacls "C:\ProgramData\cronstable" /inheritance:r
+Restrict it with: icacls "C:\ProgramData\cronstable" /reset, then icacls
+"C:\ProgramData\cronstable" /inheritance:r
 /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F
 /grant *S-1-5-11:(OI)(CI)RX /grant *S-1-3-4:(OI)(CI)RX, then icacls
 "C:\ProgramData\cronstable" /setowner *S-1-5-32-544
@@ -274,7 +275,9 @@ The recipe names SIDs rather than group names so it pastes unchanged on a
 localized install, where `BUILTIN\Administrators` is spelled in the local
 language. `S-1-5-11` keeps read for Authenticated Users, `S-1-3-4` is
 `OWNER RIGHTS`, and `/setowner` is its own `icacls` command because `icacls`
-refuses it beside `/grant`. Both commands need an elevated prompt.
+refuses it beside `/grant`. The initial `/reset` removes explicit grants;
+`/inheritance:r` removes inherited grants. Run all three commands from an
+elevated prompt.
 
 ### "Configuration file not found" applies to this path
 

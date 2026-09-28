@@ -247,11 +247,27 @@ JOB_THAT_HANGS = (
 
 
 @pytest.mark.asyncio
-async def test_execution_timeout(tracing_running_job):
+@pytest.mark.parametrize("spawn_delay", [0, 0.3])
+async def test_execution_timeout(tracing_running_job, monkeypatch, spawn_delay):
     cron = cronstable.cron.Cron(None, config_yaml=JOB_THAT_HANGS)
+    spawn = asyncio.create_subprocess_exec
+    start = tracing_running_job.start
+
+    async def delayed_spawn(*args, **kwargs):
+        await asyncio.sleep(spawn_delay)
+        return await spawn(*args, **kwargs)
+
+    async def start_with_output(self):
+        await start(self)
+        # Wait for the child's output before the scheduler enforces the
+        # deadline. Interpreter startup can exceed the execution timeout.
+        await _wait_until(lambda: bool(self.output.lines))
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    monkeypatch.setattr(tracing_running_job, "start", start_with_output)
 
     events = []
-    jobs_stdout = {}
+    completed_jobs = {}
 
     async def wait_and_quit():
         known_jobs = {}
@@ -268,7 +284,7 @@ async def test_execution_timeout(tracing_running_job):
             print(ts, event, jobnum)
             events.append((jobnum, event))
             if jobnum == 1 and event == "report_permanent_failure":
-                jobs_stdout[jobnum] = job.stdout
+                completed_jobs[jobnum] = job
                 break
         cron.signal_shutdown()
 
@@ -285,7 +301,8 @@ async def test_execution_timeout(tracing_running_job):
         (1, "report_failure"),
         (1, "report_permanent_failure"),
     ]
-    assert jobs_stdout[1] == "starting...\n"
+    assert completed_jobs[1].retcode == -100
+    assert completed_jobs[1].stdout == "starting...\n"
 
 
 @pytest.mark.parametrize("policy", ["Allow", "Forbid", "Replace"])

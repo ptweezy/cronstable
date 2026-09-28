@@ -1198,15 +1198,14 @@ _REPARSE_GRANTEE = (
 
 
 def config_dir_icacls_recipe(path: str) -> str:
-    """The paste-able icacls commands for :data:`_CONFIG_DIR_SDDL`.
+    """Return icacls commands that apply :data:`_CONFIG_DIR_SDDL`.
 
-    Kept beside the SDDL so the printed advice cannot drift from what
-    :func:`harden_config_dir` applies.  ``RX`` is the icacls spelling of
-    ``FRFX``; the AU grant stays for the reason given above.  Two commands
-    because icacls refuses ``/setowner`` in the same invocation as
-    ``/grant``.
+    Reset explicit permissions before removing inherited permissions and
+    granting access. ``/inheritance:r`` alone leaves explicit write grants
+    intact. Assign the owner separately because icacls requires it.
     """
     return (
+        'icacls "{0}" /reset, then '
         'icacls "{0}" /inheritance:r /grant *S-1-5-18:(OI)(CI)F '
         "/grant *S-1-5-32-544:(OI)(CI)F "
         "/grant *S-1-5-11:(OI)(CI)RX "

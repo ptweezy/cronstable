@@ -1220,9 +1220,8 @@ def test_the_recipe_hands_the_directory_to_administrators():
     recipe = platform.config_dir_icacls_recipe(r"C:\ProgramData\cronstable")
     assert "/setowner *S-1-5-32-544" in recipe
     assert "/grant *S-1-3-4:(OI)(CI)RX" in recipe
-    # two commands: icacls refuses /setowner in the same invocation as
-    # /grant (measured: "Invalid parameter", exit 87)
-    assert recipe.count('icacls "C:\\ProgramData\\cronstable"') == 2
+    assert recipe.startswith('icacls "C:\\ProgramData\\cronstable" /reset, then ')
+    assert recipe.count('icacls "C:\\ProgramData\\cronstable"') == 3
 
 
 def test_the_hardened_dacl_holds_against_its_owner():
@@ -1610,6 +1609,24 @@ def test_the_owner_and_reparse_rules_live(monkeypatch, tmp_path):
     finding = platform.any_user_write_grantee(str(link))
     assert finding is not None
     assert "junction or symbolic link" in finding
+
+
+@pytest.mark.skipif(not platform.IS_WINDOWS, reason="writes a real DACL")
+@pytest.mark.parametrize("sid", ["S-1-5-11", "S-1-5-32-545", "S-1-1-0"])
+def test_config_repair_removes_explicit_write_grants(tmp_path, sid):
+    target = tmp_path / "confdir"
+    target.mkdir()
+    subprocess.run(
+        ["icacls", str(target), "/grant", "*{}:(OI)(CI)M".format(sid)],
+        check=True,
+        capture_output=True,
+    )
+    assert platform.service_write_grantee(str(target)) is not None
+    commands = platform.config_dir_icacls_recipe(str(target)).split(", then ")
+    for command in commands[:2]:
+        subprocess.run(command, check=True, capture_output=True)
+    assert platform.service_write_grantee(str(target)) is None
+    target.rmdir()
 
 
 @pytest.mark.skipif(not platform.IS_WINDOWS, reason="writes a real DACL")
