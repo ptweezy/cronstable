@@ -33,6 +33,7 @@ from cronstable.job import (
     _eventlog_outcome,
     close_event_log_writers,
     eventlog_event_strings,
+    eventlog_start_refused_strings,
     retire_event_log_writers,
 )
 
@@ -166,7 +167,22 @@ def test_eventlog_event_ids_are_the_documented_table():
         "late": (1003, platform.EVENTLOG_WARNING_TYPE, 1),
         "event": (1010, platform.EVENTLOG_INFORMATION_TYPE, 2),
         "event-alert": (1011, platform.EVENTLOG_ERROR_TYPE, 2),
+        "start-refused": (1020, platform.EVENTLOG_ERROR_TYPE, 2),
     }
+
+
+def test_a_refused_service_start_keeps_the_record_shape():
+    # the service host writes this one, under the same provider, so it
+    # carries the same eleven capped fields in the same order
+    strings = eventlog_start_refused_strings("cronstable", "x" * 5000)
+    assert len(strings) == len(EVENTLOG_STRING_FIELDS)
+    assert all(isinstance(s, str) for s in strings)
+    assert len(strings[0]) == EVENTLOG_MAX_FIELD_CHARS
+    assert strings[0].endswith("...[truncated]")
+    field = EVENTLOG_STRING_FIELDS.index
+    assert strings[field("name")] == "cronstable"
+    assert strings[field("outcome")] == "start-refused"
+    assert strings[field("host")]
 
 
 def test_eventlog_string_fields_arity_and_order():

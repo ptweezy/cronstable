@@ -239,8 +239,15 @@ directory at all, which makes the machine-wide path stop resolving for
 that account. If your configuration holds secrets inline rather than in
 [`fromFile`](Reporting#secrets) sources, tighten it further.
 
-For a directory that already exists, the daemon says so once at startup and
-prints the same fix, and `cronstable service install` prints the same note.
+If the security check flags an existing configuration directory, `cronstable`
+running in the foreground warns once at startup and prints the fix. The
+Windows service refuses to start with that directory. If the check fails
+during a reload, the service keeps the jobs it already loaded.
+`cronstable service install` rejects the directory during installation. The
+[MSI](Windows-MSI#the-configuration-directory) creates
+`C:\ProgramData\cronstable` with the restricted permissions when that
+directory does not exist yet.
+
 The finding names the account that can write, or the owner of a machine-wide
 directory when that owner is neither SYSTEM, Administrators nor
 TrustedInstaller:
@@ -260,8 +267,8 @@ target holds, and the finding stands whether or not that target lets the
 daemon read a descriptor. Other reparse points, such as a cloud-file
 placeholder, redirect nothing, and the check leaves them alone. A machine-wide
 path is one outside the user profiles. A service runs from a profile of its
-own under `system32`, so every user's directory counts as outside for it, and
-a service reading one is told who owns it.
+own under `system32`, so it applies these checks to every user's directory.
+The service rejects a user-owned directory if that user can still write to it.
 
 The recipe names SIDs rather than group names so it pastes unchanged on a
 localized install, where `BUILTIN\Administrators` is spelled in the local

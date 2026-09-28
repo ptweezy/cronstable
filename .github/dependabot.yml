@@ -21,7 +21,9 @@ updates:
   # each one as outdated and open a reviewable bump -- a moving major tag (@v7)
   # would hide minor/patch drift behind a mutable ref instead.
   - package-ecosystem: github-actions
-    directory: "/" # scans .github/workflows/ (and any composite actions)
+    directories:
+      - "/" # scans .github/workflows/ and root action.yml only
+      - "/.github/actions/*"
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
@@ -62,4 +64,14 @@ updates:
     open-pull-requests-limit: 10
     groups:
       docker:
+        patterns: ["*"]
+
+  # Follow the branches in flake.nix, including Intel macOS's 26.05 lane.
+  - package-ecosystem: nix
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      nix:
         patterns: ["*"]

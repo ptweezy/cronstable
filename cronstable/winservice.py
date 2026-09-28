@@ -145,11 +145,12 @@ _LOG_BYTES = 10 * 1024 * 1024
 _LOG_BACKUPS = 5
 
 #: Service-specific exit codes, reported alongside ERROR_SERVICE_SPECIFIC_
-#: ERROR so `sc query` distinguishes the three ways a start can fail from
-#: each other and from a clean stop.
+#: ERROR so `sc query` distinguishes the ways a start can fail from each
+#: other and from a clean stop.
 EXIT_RUN_FAILED = 1
 EXIT_CONFIG_FAILED = 2
 EXIT_LOG_FAILED = 3
+EXIT_CONFIG_UNSAFE = 4
 
 
 class ServiceError(Exception):
@@ -417,6 +418,21 @@ def config_is_user_scoped(config: str, user_profile: Optional[str]) -> bool:
     caller's decision, not this function's.
     """
     return platform.path_is_user_scoped(config, user_profile)
+
+
+def refuse_writable_config(config: str) -> None:
+    """Raise ConfigError when an account other than SYSTEM and
+    Administrators can write ``config``.
+
+    The service host runs this guard before every parse. It rejects an
+    unsafe directory even if the directory is replaced while the service
+    is running.
+    """
+    grantee = platform.service_write_grantee(config)
+    if grantee is not None:
+        from cronstable.config import ConfigError
+
+        raise ConfigError(platform.service_refusal(config, grantee))
 
 
 #: One sentence per Win32 error this module can actually produce.  These are
@@ -1070,6 +1086,35 @@ class WinApi:
         self._thunks.append(thunk)
         kernel32.SetConsoleCtrlHandler(thunk, True)
 
+    def report_event(  # pragma: no cover (windows)
+        self,
+        source: str,
+        *,
+        event_type: int,
+        category: int,
+        event_id: int,
+        strings: list[str],
+    ) -> None:
+        """Write one Application log record, best effort.
+
+        Record startup failures that occur before the bootstrap log opens.
+        If Event Log is unavailable, ``service status`` still explains the
+        exit code.
+        """
+        handle = platform.open_event_log(source)
+        if handle is None:
+            return
+        try:
+            platform.write_event_log(
+                handle,
+                event_type=event_type,
+                category=category,
+                event_id=event_id,
+                strings=strings,
+            )
+        finally:
+            platform.close_event_log(handle)
+
 
 # --- The service host ------------------------------------------------------
 class ServiceHost:
@@ -1185,6 +1230,8 @@ class ServiceHost:
                 wait_hint_ms=_STATUS_WAIT_HINT_MS,
             )
             self._start_pump(SERVICE_START_PENDING)
+            if self._refuse_untrusted_config():
+                return
             self._open_bootstrap_log()
             logger.info(
                 "cronstable service %s starting: argv=%r config=%r",
@@ -1211,12 +1258,55 @@ class ServiceHost:
             else:
                 self._report(SERVICE_STOPPED)
 
+    def _refuse_untrusted_config(self) -> bool:
+        """Refuse this start when the configuration is missing or another
+        account can write it.  True when refused.
+
+        Checked before the bootstrap log opens, because that log goes
+        beside the configuration, where a junction another account planted
+        at ``logs`` would decide what SYSTEM writes.  The reason goes to
+        the Application log instead.
+        """
+        config = getattr(self.args, "config", "") or ""
+        if not os.path.exists(config):
+            code = EXIT_CONFIG_FAILED
+            message = (
+                "{} does not exist, so the service has nothing to run. "
+                "Create it with `cronstable init {}`.".format(config, config)
+            )
+        else:
+            grantee = platform.service_write_grantee(config)
+            if grantee is None:
+                return False
+            code = EXIT_CONFIG_UNSAFE
+            message = platform.service_refusal(config, grantee)
+        self._specific_exit = code
+        logger.error(
+            "cronstable service %s refused to start: %s", self.name, message
+        )
+        from cronstable.job import (
+            EVENTLOG_EVENTS,
+            eventlog_start_refused_strings,
+        )
+
+        event_id, event_type, category = EVENTLOG_EVENTS["start-refused"]
+        self._api.report_event(
+            self.name,
+            event_type=event_type,
+            category=category,
+            event_id=event_id,
+            strings=eventlog_start_refused_strings(self.name, message),
+        )
+        return True
+
     def _build_and_run(self) -> None:
         from cronstable.config import ConfigError
         from cronstable.cron import Cron
 
         try:
-            self._cron = Cron(self.args.config)
+            self._cron = Cron(
+                self.args.config, config_guard=refuse_writable_config
+            )
         except ConfigError as err:
             logger.error("Configuration error: %s", err)
             self._specific_exit = EXIT_CONFIG_FAILED
@@ -1416,42 +1506,39 @@ def install(args: Any, api: WinApi) -> int:
             "cronstable service install: {} does not exist. Create it "
             "first with `cronstable init {}`.".format(config, config)
         )
-    if config_is_user_scoped(config, os.environ.get("USERPROFILE")):
-        # Whether a per-user path is fatal depends on whether it was
-        # chosen. Left at the platform default it is not a choice at all,
-        # it is the per-user fallback the resolver lands on, and a service
-        # running as LocalSystem resolves that same default somewhere else
-        # entirely; installing it would produce a service that starts and
-        # schedules nothing. Named explicitly it is a deliberate act that
-        # works, because LocalSystem can read the profile, so it earns a
-        # warning about the fragility rather than a refusal.
-        if config == platform.DEFAULT_CONFIG_PATH:
-            return _fail(
-                "cronstable service install: {} is your own per-user "
-                "configuration directory, and a service runs as "
-                "LocalSystem, which resolves that default to a different "
-                "directory entirely, so the installed service would "
-                "schedule nothing. Put the configuration somewhere "
-                "machine-wide and name it: `cronstable init "
-                "C:\\ProgramData\\cronstable`, then `cronstable service "
-                "install -c C:\\ProgramData\\cronstable`.".format(config)
-            )
+    user_scoped = config_is_user_scoped(config, os.environ.get("USERPROFILE"))
+    # Left at the platform default, a per-user path is not a choice at
+    # all: it is the per-user fallback the resolver lands on, and a
+    # service running as LocalSystem resolves that same default somewhere
+    # else entirely, so installing it would produce a service that starts
+    # and schedules nothing.
+    if user_scoped and config == platform.DEFAULT_CONFIG_PATH:
+        return _fail(
+            "cronstable service install: {} is your own per-user "
+            "configuration directory, and a service runs as "
+            "LocalSystem, which resolves that default to a different "
+            "directory entirely, so the installed service would "
+            "schedule nothing. Put the configuration somewhere "
+            "machine-wide and name it: `cronstable init "
+            "C:\\ProgramData\\cronstable`, then `cronstable service "
+            "install -c C:\\ProgramData\\cronstable`.".format(config)
+        )
+    # The service host refuses this at every start, so a service installed
+    # over it could never run. A per-user directory named explicitly lands
+    # here too until it is restricted, because its owner is that user.
+    grantee = platform.service_write_grantee(config)
+    if grantee is not None:
+        return _fail(
+            "cronstable service install: "
+            + platform.service_refusal(config, grantee)
+        )
+    if user_scoped:
         print(
             "cronstable service install: note, {} is inside your user "
             "profile. The service runs as LocalSystem and can still read "
             "it, but a machine-wide directory such as "
             "%ProgramData%\\cronstable is the durable place for "
             "it.".format(config),
-            file=sys.stderr,
-        )
-    grantee = platform.any_user_write_grantee(config)
-    if grantee is not None:
-        # A note rather than a refusal: the service reads the directory
-        # the operator named, and the daemon says the same thing once at
-        # every start until the recipe is applied.
-        print(
-            "cronstable service install: note, "
-            + platform.writable_config_advice(config, grantee),
             file=sys.stderr,
         )
     start_type, delayed = start_type_code(getattr(args, "start_type", "auto"))
@@ -1592,6 +1679,10 @@ def status(args: Any, api: WinApi) -> int:
                     EXIT_RUN_FAILED: "the scheduler stopped with an error",
                     EXIT_CONFIG_FAILED: "the configuration did not parse",
                     EXIT_LOG_FAILED: "the service log could not be opened",
+                    EXIT_CONFIG_UNSAFE: (
+                        "the configuration can be written by an account "
+                        "other than SYSTEM and Administrators"
+                    ),
                 }.get(fields[4], "service-specific code {}".format(fields[4]))
             )
         )

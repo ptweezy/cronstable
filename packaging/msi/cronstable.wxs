@@ -91,10 +91,12 @@
     <Property Id="STARTSERVICE" Secure="yes" />
 
     <!-- Does the PREVIOUS install's configuration directory exist?
-         Feeds the start-on-upgrade condition below: "a config is
-         present" approximates "the service was running before". Probing
-         the remembered value rather than a literal default path gives
-         custom-CONFIGDIR deployments their restart too. -->
+         Feeds the start-on-upgrade condition below: "the directory is
+         there" approximates "the service was running before", as an
+         automatic-start service with a directory to read runs from the
+         next boot on. Probing the remembered value rather than a literal
+         default path gives custom-CONFIGDIR deployments their restart
+         too. -->
     <Property Id="CRONSTABLE_CONFIG_FOUND">
       <RegistrySearch Id="RememberedConfigDirProbe" Root="HKLM"
                       Key="SOFTWARE\cronstable" Name="ConfigDir"
@@ -102,6 +104,40 @@
         <DirectorySearch Id="RememberedConfigDirExists" />
       </RegistrySearch>
     </Property>
+
+    <!-- Does the default configuration directory exist before this
+         transaction? Gates the permissions on DefaultConfigDirectory
+         below, so they land only on a directory this package creates. -->
+    <Property Id="CRONSTABLE_DEFAULT_CONFIG_FOUND">
+      <DirectorySearch Id="DefaultConfigDirExists"
+                       Path="[CommonAppDataFolder]cronstable" />
+    </Property>
+
+    <!-- The default configuration directory, created restricted:
+         %ProgramData% lets any local account create a directory and own
+         it, and whoever owns it can plant jobs for the LocalSystem
+         service. The SDDL sets the same ownership and permissions as
+         `cronstable init` (platform._CONFIG_DIR_OWNER_SID and
+         _CONFIG_DIR_SDDL), as verified by tests/test_msi_parity.py.
+         These settings apply only to a directory this transaction creates.
+         The service host checks an existing directory's ownership and
+         permissions.
+         The component is permanent so neither uninstall nor an upgrade's
+         early RemoveExistingProducts deletes the directory. It creates
+         the directory regardless of CONFIGDIR because an interactive
+         `cronstable` looks here first. A directory key path requires an
+         explicit GUID. -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DefaultConfigFolder" Name="cronstable">
+        <Component Id="DefaultConfigDirectory" Permanent="yes"
+                   Guid="6e94cb2d-0e6f-4662-b646-2ae8ca638d12">
+          <CreateFolder>
+            <PermissionEx Sddl="O:S-1-5-32-544D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;AU)(A;OICI;FRFX;;;OW)"
+                          Condition="NOT CRONSTABLE_DEFAULT_CONFIG_FOUND" />
+          </CreateFolder>
+        </Component>
+      </Directory>
+    </StandardDirectory>
 
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="cronstable">
@@ -152,10 +188,9 @@
           </ServiceInstall>
           <!-- Stop on install, repair, upgrade and uninstall; unregister on
                uninstall only. Deliberately no Start here: a first install
-               has no configuration yet, and starting an unconfigured
-               service would burn its recovery retries and park it in an
-               error state. The conditional component below is the only
-               place a start is expressed. -->
+               has no jobs yet, so the service waits for the next boot or
+               for `cronstable service start`. The conditional component
+               below is the only place a start is expressed. -->
           <ServiceControl Id="CronstableServiceLifecycle"
                           Name="cronstable"
                           Stop="both" Remove="uninstall" Wait="yes" />

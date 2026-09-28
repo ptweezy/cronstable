@@ -1387,6 +1387,56 @@ async def test_run_survives_config_error(tmp_path, monkeypatch, run_cron):
     assert cron.metrics._last_reload_ok is False
 
 
+@pytest.mark.asyncio
+async def test_config_guard_runs_before_every_parse(
+    tmp_path, monkeypatch, run_cron
+):
+    # The Windows service host uses this hook to check configuration
+    # ownership before parsing, so it never reads a rejected location.
+    # Rejection has the same effect as invalid configuration: construction
+    # fails, and a reload keeps the current jobs.
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(TWO_JOBS)
+    refused = []
+    asked = []
+
+    def guard(config_arg):
+        asked.append(config_arg)
+        if refused:
+            raise ConfigError(refused[0])
+
+    parsed = []
+    real_parse = cronstable.cron.parse_config_with_sources
+
+    def recording_parse(arg):
+        parsed.append(arg)
+        return real_parse(arg)
+
+    monkeypatch.setattr(
+        "cronstable.cron.parse_config_with_sources", recording_parse
+    )
+    refused.append("another account can write it")
+    with pytest.raises(ConfigError, match="another account"):
+        Cron(str(cfg), config_guard=guard)
+    assert parsed == []
+    refused.clear()
+    cron = Cron(str(cfg), config_guard=guard)
+    assert asked == [str(cfg), str(cfg)]
+    assert set(cron.cron_jobs) == {"alpha", "beta"}
+
+    monkeypatch.setattr("cronstable.cron.next_sleep_interval", lambda *a: 0.01)
+    refused.append("another account can write it")
+    cfg.write_text("jobs: []\n")
+    parsed.clear()
+    task = run_cron(cron)
+    await asyncio.sleep(0.1)
+    assert not task.done()
+    assert len(asked) > 2
+    assert parsed == []
+    assert set(cron.cron_jobs) == {"alpha", "beta"}
+    assert cron.metrics._last_reload_ok is False
+
+
 def test_cluster_allows_per_policy():
     import types
 

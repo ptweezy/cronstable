@@ -1511,6 +1511,39 @@ def test_writable_config_advice_has_one_wording_per_finding():
     assert "icacls" not in text
 
 
+def test_service_refusal_has_one_wording_per_finding():
+    path = r"C:\ProgramData\cronstable"
+    text = platform.service_refusal(path, r"BUILTIN\Users")
+    assert text.startswith(path + r" can be written by BUILTIN\Users")
+    assert "the service does not load it" in text
+    recipe = platform.config_dir_icacls_recipe(path)
+    assert text.endswith("Restrict it with: " + recipe)
+    text = platform.service_refusal(path, platform._REPARSE_GRANTEE)
+    assert text.startswith(path + " is a junction or symbolic link")
+    assert "the service does not load it" in text
+    assert "icacls" not in text
+
+
+def test_service_write_grantee_judges_every_path_as_machine_wide(monkeypatch):
+    # The interactive check accepts user ownership inside a user profile.
+    # The service check rejects it because the owner could modify jobs
+    # that run as SYSTEM.
+    owned = "O:S-1-5-21-1-2-3-1001D:(A;OICI;FA;;;S-1-5-21-1-2-3-1001)"
+    monkeypatch.setattr(platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(platform, "_read_security_sddl", lambda path: owned)
+    monkeypatch.setattr(platform, "is_reparse_point", lambda path: False)
+    monkeypatch.setattr(platform, "is_machine_wide", lambda path: False)
+    path = r"C:\Users\someone\cronstable"
+    assert platform.any_user_write_grantee(path) is None
+    assert (
+        platform.service_write_grantee(path) == "its owner S-1-5-21-1-2-3-1001"
+    )
+    # The ownership and permissions set by init pass the service check.
+    hardened = "O:BA" + platform._CONFIG_DIR_SDDL
+    monkeypatch.setattr(platform, "_read_security_sddl", lambda path: hardened)
+    assert platform.service_write_grantee(path) is None
+
+
 def _dacl_grants(sddl):
     # who holds what: (type, rights, principal) per ACE, without the
     # inheritance flags, which an owner change rewrites (see
@@ -1577,6 +1610,24 @@ def test_the_owner_and_reparse_rules_live(monkeypatch, tmp_path):
     finding = platform.any_user_write_grantee(str(link))
     assert finding is not None
     assert "junction or symbolic link" in finding
+
+
+@pytest.mark.skipif(not platform.IS_WINDOWS, reason="writes a real DACL")
+def test_service_write_grantee_live(tmp_path):
+    # Check a directory in the caller's profile using the service's rules.
+    # An unelevated caller owns it. Hardening adds an OWNER RIGHTS entry
+    # that limits the owner to read-only access, resolving the finding.
+    # Keep the directory empty so the parent's delete-child permission
+    # allows cleanup.
+    target = tmp_path / "confdir"
+    target.mkdir()
+    owner = platform._sddl_owner(platform._read_security_sddl(str(target)))
+    expected = "its owner {}".format(owner)
+    if owner in platform._TRUSTED_OWNERS:
+        expected = None
+    assert platform.service_write_grantee(str(target)) == expected
+    assert platform.harden_config_dir(str(target)) is True
+    assert platform.service_write_grantee(str(target)) is None
 
 
 @pytest.mark.skipif(not platform.IS_WINDOWS, reason="writes a real DACL")

@@ -34,9 +34,30 @@ availability and steps to switch from a portable install.
 * The install directory on the system `PATH`, so `cronstable` works in any
   new shell. Shells that were already open do not see the change until
   they are restarted.
+* The configuration directory `C:\ProgramData\cronstable`, when it does not
+  exist yet. See [the configuration directory](#the-configuration-directory).
 
-Uninstalling removes all three. Install, upgrade, and uninstall never touch
-configuration and logs under `C:\ProgramData\cronstable`.
+Uninstalling removes the program, the service, and the `PATH` entry. It
+keeps `C:\ProgramData\cronstable` and everything in it.
+
+## The configuration directory
+
+The service runs as LocalSystem, so whoever can add a file to its
+configuration directory can run commands as SYSTEM, and `%ProgramData%` lets
+any local account create a directory and become its owner. The MSI therefore
+creates `C:\ProgramData\cronstable` with the same ownership and permissions
+as `cronstable init`: ownership by the Administrators group, full control for
+SYSTEM and Administrators, read access for everyone else, and no permissions
+inherited from `%ProgramData%`. It sets these permissions only on a directory
+it creates and preserves existing directories and their permissions.
+
+Before it reads anything, the service checks its configuration directory. It
+refuses to start when the directory is missing, is a junction or symbolic
+link, or can be written by any account other than SYSTEM and Administrators,
+and it repeats the check before every reload. [Where a service
+logs](Windows-Service#where-a-service-logs) describes how the service reports
+a refusal, and [who may write the config
+directory](Running-on-Windows#who-may-write-the-config-directory) has the fix.
 
 ## Quick start
 
@@ -55,10 +76,11 @@ The full paths matter: the shell that ran `msiexec` predates the `PATH`
 change the installer made, so a bare `cronstable` only works in shells
 opened later.
 
-By default, a first install leaves the service stopped so you can create
-its configuration. Run `cronstable init` to write a commented starter config
-and restrict directory permissions where needed. Then run
-`cronstable service start`, or let the service start at the next boot.
+A first install leaves the service stopped until the next boot. While the
+directory holds no configuration, the service runs with no jobs, and it loads
+new files within a minute. To start it now, run `cronstable init` to write a
+commented starter configuration into the directory the MSI created, then run
+`cronstable service start`.
 
 ## Properties
 
@@ -67,7 +89,7 @@ Pass public properties on the `msiexec` command line
 
 | Property | Default | Effect |
 | --- | --- | --- |
-| `CONFIGDIR` | `C:\ProgramData\cronstable` | The configuration directory baked into the service's command line. |
+| `CONFIGDIR` | `C:\ProgramData\cronstable` | The configuration directory in the service's command line. The MSI creates only the default directory. Before starting the service with a custom path, create a directory writable only by SYSTEM and Administrators, for example, with `cronstable init`. |
 | `ADDPATH` | `1` | `0` skips adding the install directory to the system `PATH`. |
 | `STARTSERVICE` | unset | `1` starts the service at the end of the install, including a first install. Pass it when the configuration is deployed ahead of the package. |
 | `INSTALLFOLDER` | `C:\Program Files\cronstable` | The install directory. |
@@ -83,6 +105,13 @@ the configuration files first (or in the same policy) and install with
 ```shell
 msiexec /i cronstable-windows-amd64v3.msi /qn STARTSERVICE=1
 ```
+
+A directory that your deployment tool creates under `%ProgramData%`
+inherits permission for every local account to add files, and the service
+refuses it. Restrict the directory before the service starts, using the
+`icacls` commands in [who may write the config
+directory](Running-on-Windows#who-may-write-the-config-directory), or install
+the MSI first and deploy the files into the directory it creates.
 
 When a deployment misbehaves, log the install with `/l*v install.log`. The
 log names the exact action that failed.

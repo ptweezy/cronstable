@@ -1992,9 +1992,27 @@ class _StopEvent(asyncio.Event):
         self._wake.set()
 
 
+def _parse_guarded(
+    config_arg: str, guard: Optional[Callable[[str], None]]
+) -> tuple[CronstableConfig, frozenset[str]]:
+    """Parse ``config_arg`` after the optional ``guard`` accepts it.
+
+    Call :func:`parse_config_with_sources` only if the guard succeeds.
+    A guard raises ConfigError to reject the configuration. As with an
+    invalid file, this prevents startup or keeps the current jobs on reload.
+    """
+    if guard is not None:
+        guard(config_arg)
+    return parse_config_with_sources(config_arg)
+
+
 class Cron:
     def __init__(
-        self, config_arg: Optional[str], *, config_yaml: Optional[str] = None
+        self,
+        config_arg: Optional[str],
+        *,
+        config_yaml: Optional[str] = None,
+        config_guard: Optional[Callable[[str], None]] = None,
     ) -> None:
         # Prometheus accumulators (GET /metrics); owned here so counters
         # survive web-app restarts, and created before update_config.
@@ -2142,6 +2160,9 @@ class Cron:
         self._config_sources: frozenset[str] = frozenset()
         self._config_sig: Optional[tuple] = None
         self._last_config: Optional[CronstableConfig] = None
+        # Run the Windows service host's ownership check before every
+        # file parse, including startup (see _parse_guarded).
+        self._config_guard = config_guard
         # the optional `notify:` block; None keeps job-runs-only reporting.
         # Set in both the config_yaml (test) path below and _apply_reload.
         self._notify_config: Optional[dict[str, Any]] = None
@@ -2777,7 +2798,9 @@ class Cron:
         if self.config_arg is None:
             return self._empty_config()
         try:
-            config, sources = parse_config_with_sources(self.config_arg)
+            config, sources = _parse_guarded(
+                self.config_arg, self._config_guard
+            )
         except ConfigError:
             # feeds cronstable_config_last_reload_successful, the standard
             # "config broken on disk" alert signal.
@@ -2811,7 +2834,7 @@ class Cron:
             gc.disable()
         try:
             config, sources = await loop.run_in_executor(
-                None, parse_config_with_sources, self.config_arg
+                None, _parse_guarded, self.config_arg, self._config_guard
             )
         except ConfigError:
             # feeds cronstable_config_last_reload_successful; recorded here
