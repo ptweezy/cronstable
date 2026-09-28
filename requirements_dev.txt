@@ -10,7 +10,7 @@ mypy
 mypy-extensions
 openapi-spec-validator
 crontab>=1.0.5,<2
-hypothesis>=6.168.0
+hypothesis>=6.168.1
 pytest
 pytest-asyncio
 pytest-cov
