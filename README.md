@@ -19,7 +19,7 @@
 
 / kraahn-stuh-bl /
 
-A cron replacement with retries, alerts, saved run history, and workflows, plus dashboards for the web, the terminal, and iOS. Built to run efficiently on one machine or many, large or small.
+A cron replacement with retries, alerts, saved run history, and workflows, plus dashboards for the web, the terminal, and iOS. Built for efficiency and machines of all sorts and sizes.
 
 ## Why cronstable?
 
