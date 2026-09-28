@@ -9,7 +9,7 @@ pkgs.python3Packages
 // {
   sentry-sdk =
     let
-      version = "2.69.2";
+      version = "2.70.0";
     in
     if pkgs.lib.versionAtLeast pkgs.python3Packages.sentry-sdk.version version then
       pkgs.python3Packages.sentry-sdk
@@ -19,7 +19,7 @@ pkgs.python3Packages
         src = pkgs.fetchPypi {
           pname = "sentry_sdk";
           inherit version;
-          hash = "sha256-tNiRWlJuYmsLFKKSWQdVS3ItO44+N4FXD8NXkXEq8yM=";
+          hash = "sha256-J+S1EvR76TE2ZF2+jwLUMEc+5zo4nOQwsrcQS6pmz3U=";
         };
         doCheck = false;
         meta = old.meta // {
