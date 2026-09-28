@@ -693,7 +693,10 @@ on [concurrency and timeouts](Concurrency-and-Timeouts).
 
 Read the bootstrap log first: by default
 `<config directory>\logs\cronstable-service.log`. A service has no stderr,
-so that file is where a startup failure is recorded.
+so that file is where a startup failure is recorded. The service refuses a
+`-c` path that does not exist, or that another account can write, before that
+log opens, and records the reason in the Application event log as event ID
+1020. See [where a service logs](Windows-Service#where-a-service-logs).
 
 `cronstable service status` decodes the last failure without opening
 anything:
@@ -701,6 +704,7 @@ anything:
 | It says | Fix |
 | --- | --- |
 | `the configuration did not parse` | Run `cronstable -v -c <path>` interactively against the same path. |
+| `the configuration can be written by an account other than SYSTEM and Administrators` | Run the `icacls` commands from event ID 1020, or see [who may write the config directory](Running-on-Windows#who-may-write-the-config-directory). |
 | `the service log could not be opened` | The log directory is not writable by LocalSystem. Pass `--log-file` somewhere it is, or `--no-log-file` with a `logging:` section. |
 | `the scheduler stopped with an error` | The scheduler raised. The bootstrap log has the traceback. |
 

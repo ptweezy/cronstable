@@ -315,6 +315,7 @@ class _FakeApi:
         self.dispatch_error = dispatch_error
         self.console = []
         self.alloc_ok = True
+        self.events = []
 
     # the service side
     def dispatch_service(self, name, service_main):
@@ -339,6 +340,9 @@ class _FakeApi:
     def swallow_console_events(self, on_shutdown):
         self.console.append("handler")
 
+    def report_event(self, source, *, event_type, category, event_id, strings):
+        self.events.append((source, event_type, category, event_id, strings))
+
     def states(self):
         return [fields[1] for fields in self.statuses]
 
@@ -360,8 +364,9 @@ class _FakeLoop:
 
 
 class _FakeCron:
-    def __init__(self, config):
+    def __init__(self, config, config_guard=None):
         self.config = config
+        self.config_guard = config_guard
         self.signalled = 0
         self.reloaded = []
 
@@ -372,10 +377,24 @@ class _FakeCron:
         self.reloaded.append(source)
 
 
+@pytest.fixture(autouse=True)
+def _config_writers_trusted(monkeypatch):
+    # The host rejects configuration that another account can write.
+    # On Windows, the real check would depend on the ownership and
+    # permissions of the checkout and temporary directories. Tests that
+    # need a security finding override this stub.
+    monkeypatch.setattr(platform, "service_write_grantee", lambda path: None)
+
+
+#: An existing directory for the host's configuration, which it refuses to
+#: start without.
+_CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 def _args(**over):
     values = {
         "name": "cronstable",
-        "config": "cfg",
+        "config": _CONFIG_DIR,
         "log_file": None,
         "no_log_file": True,
         "console": False,
@@ -385,15 +404,15 @@ def _args(**over):
     return types.SimpleNamespace(**values)
 
 
-def _host(monkeypatch, api, *, during=None, cron_error=None):
+def _host(monkeypatch, api, *, during=None, cron_error=None, args=None):
     loop = _FakeLoop()
     seen = {}
 
     class _Cron(_FakeCron):
-        def __init__(self, config):
+        def __init__(self, config, config_guard=None):
             if cron_error is not None:
                 raise cron_error
-            super().__init__(config)
+            super().__init__(config, config_guard)
             seen["cron"] = self
 
     monkeypatch.setattr("cronstable.cron.Cron", _Cron)
@@ -406,7 +425,7 @@ def _host(monkeypatch, api, *, during=None, cron_error=None):
             during()
 
     host = ServiceHost(
-        _args(),
+        args or _args(),
         run_daemon=run_daemon,
         new_event_loop=lambda: loop,
         api=api,
@@ -514,6 +533,90 @@ def test_host_reports_a_config_failure_as_a_specific_exit_code(monkeypatch):
     assert final[1] == SERVICE_STOPPED
     assert final[3] == ERROR_SERVICE_SPECIFIC_ERROR
     assert final[4] == winservice.EXIT_CONFIG_FAILED
+
+
+def test_host_refuses_a_config_another_account_can_write(
+    monkeypatch, tmp_path
+):
+    # A LocalSystem service never loads jobs another account can add, and
+    # it refuses before the bootstrap log opens: that log goes beside the
+    # configuration, so opening it first would already be SYSTEM writing
+    # into a directory another account controls.
+    monkeypatch.setattr(
+        platform,
+        "service_write_grantee",
+        lambda path: "its owner S-1-5-21-1-2-3-1001",
+    )
+    api = _FakeApi()
+    host, _loop, seen = _host(
+        monkeypatch,
+        api,
+        args=_args(config=str(tmp_path), no_log_file=False),
+    )
+    assert host.run() == 1
+    assert api.states() == [SERVICE_START_PENDING, SERVICE_STOPPED]
+    final = api.statuses[-1]
+    assert final[3] == ERROR_SERVICE_SPECIFIC_ERROR
+    assert final[4] == winservice.EXIT_CONFIG_UNSAFE
+    assert "cron" not in seen
+    assert not (tmp_path / "logs").exists()
+    # the reason goes where an administrator looks for a failed start,
+    # as the provider's documented record
+    ((source, event_type, category, event_id, strings),) = api.events
+    assert source == "cronstable"
+    assert (event_id, event_type, category) == (
+        1020,
+        platform.EVENTLOG_ERROR_TYPE,
+        2,
+    )
+    summary, name, outcome = strings[:3]
+    assert (name, outcome) == ("cronstable", "start-refused")
+    assert "can be written by its owner S-1-5-21-1-2-3-1001" in summary
+    assert "does not load it" in summary
+    assert "/setowner *S-1-5-32-544" in summary
+
+
+def test_host_refuses_a_missing_config_before_writing_beside_it(
+    monkeypatch, tmp_path
+):
+    # The log would go in a `logs` directory beside the missing path, in a
+    # parent (%ProgramData% for the default) that any account can create
+    # entries in.
+    api = _FakeApi()
+    host, _loop, seen = _host(
+        monkeypatch,
+        api,
+        args=_args(config=str(tmp_path / "cronstable"), no_log_file=False),
+    )
+    assert host.run() == 1
+    assert api.statuses[-1][4] == winservice.EXIT_CONFIG_FAILED
+    assert "cron" not in seen
+    assert list(tmp_path.iterdir()) == []
+    ((_source, _type, _category, _event_id, strings),) = api.events
+    assert "does not exist" in strings[0]
+    assert "cronstable init" in strings[0]
+
+
+def test_host_guards_every_parse_of_its_config(monkeypatch):
+    # The guard repeats the startup check before every parse. It rejects
+    # an unsafe directory even if the directory is replaced while the
+    # service is running.
+    api = _FakeApi()
+    host, _loop, seen = _host(monkeypatch, api)
+    assert host.run() == 0
+    assert seen["cron"].config_guard is winservice.refuse_writable_config
+    assert api.events == []
+
+
+def test_refuse_writable_config_raises_a_config_error(monkeypatch):
+    from cronstable.config import ConfigError
+
+    winservice.refuse_writable_config(r"C:\ProgramData\cronstable")
+    monkeypatch.setattr(
+        platform, "service_write_grantee", lambda path: r"BUILTIN\Users"
+    )
+    with pytest.raises(ConfigError, match=r"written by BUILTIN\\Users"):
+        winservice.refuse_writable_config(r"C:\ProgramData\cronstable")
 
 
 def test_host_reports_a_run_failure_as_a_specific_exit_code(monkeypatch):
@@ -799,6 +902,26 @@ def test_status_explains_a_service_specific_exit(capsys):
     assert "configuration did not parse" in capsys.readouterr().out
 
 
+def test_status_explains_a_refused_config(capsys):
+    class _Refused(_FakeApi):
+        def query_status(self, name):
+            return (
+                SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_STOPPED,
+                0,
+                ERROR_SERVICE_SPECIFIC_ERROR,
+                winservice.EXIT_CONFIG_UNSAFE,
+                0,
+                0,
+                0,
+                0,
+            )
+
+    assert winservice.status(_args(), _Refused()) == 0
+    out = capsys.readouterr().out
+    assert "other than SYSTEM and Administrators" in out
+
+
 def test_stop_waits_for_the_drain():
     # a scheduler with a two hour job is draining, not hung, so the default
     # is to wait rather than to declare failure.
@@ -915,24 +1038,54 @@ def WinApiUnderTest():
     return winservice.WinApi()
 
 
-def test_install_notes_a_directory_another_account_can_write(
+def test_install_refuses_a_directory_another_account_can_write(
     monkeypatch, tmp_path, capsys
 ):
-    # The same finding the daemon reports once at start, said at install
-    # time as well, where the operator is already at an elevated prompt.
-    # A note, never a refusal: the service reads the directory it was
-    # given.
+    # The service host refuses this at every start, so install refuses it
+    # too, at the elevated prompt where the operator can fix it.
     monkeypatch.delattr(winservice.sys, "_MEIPASS", raising=False)
     monkeypatch.setattr(platform, "DEFAULT_CONFIG_PATH", r"C:\elsewhere")
     monkeypatch.delenv("USERPROFILE", raising=False)
     monkeypatch.setattr(
         platform,
-        "any_user_write_grantee",
+        "service_write_grantee",
         lambda path: "its owner S-1-5-21-1-2-3-1001",
     )
     api = _RecordingInstallApi()
-    assert winservice.install(_args(config=str(tmp_path)), api) == 0
-    assert api.created is not None
+    assert winservice.install(_args(config=str(tmp_path)), api) == 2
+    assert api.created is None
     err = capsys.readouterr().err
     assert "can be written by its owner S-1-5-21-1-2-3-1001" in err
     assert "/setowner *S-1-5-32-544" in err
+
+
+def test_install_judges_a_per_user_directory_as_the_service_will(
+    monkeypatch, tmp_path, capsys
+):
+    # A per-user directory's owner could modify jobs that the service runs
+    # as SYSTEM. Install rejects that directory using the service's checks.
+    # It prints the per-user path warning only after write access is
+    # restricted.
+    monkeypatch.delattr(winservice.sys, "_MEIPASS", raising=False)
+    profile = tmp_path / "profile"
+    config = profile / "jobs"
+    config.mkdir(parents=True)
+    monkeypatch.setenv("USERPROFILE", str(profile))
+    monkeypatch.setattr(platform, "DEFAULT_CONFIG_PATH", r"C:\elsewhere")
+    asked = []
+
+    def grantee(path):
+        asked.append(path)
+        return "its owner S-1-5-21-1-2-3-1001"
+
+    monkeypatch.setattr(platform, "service_write_grantee", grantee)
+    api = _RecordingInstallApi()
+    assert winservice.install(_args(config=str(config)), api) == 2
+    assert asked == [str(config)]
+    err = capsys.readouterr().err
+    assert "does not load it" in err
+    assert "inside your user profile" not in err
+    # restricted, it installs with the note about the profile's fragility
+    monkeypatch.setattr(platform, "service_write_grantee", lambda path: None)
+    assert winservice.install(_args(config=str(config)), api) == 0
+    assert "inside your user profile" in capsys.readouterr().err

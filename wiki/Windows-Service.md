@@ -26,6 +26,12 @@ the path, `init` refuses and prints the fix: remove the directory or run the
 printed `icacls` commands, then run `init` again. See [who may write the
 config directory](Running-on-Windows#who-may-write-the-config-directory).
 
+The service applies the same rule to its own configuration. It refuses to
+start when any account other than SYSTEM and Administrators can write the
+`-c` path, or when that path is a junction or symbolic link, and it repeats
+the check before every reload. `install` refuses such a path up front and
+prints the same fix.
+
 `cronstable service status` reports the state and the process ID. `sc query
 cronstable` and the Services console (`services.msc`) see it like any other
 service.
@@ -111,9 +117,13 @@ cronstable init C:\ProgramData\cronstable
 cronstable service install -c C:\ProgramData\cronstable
 ```
 
-A per-user path you name explicitly is a deliberate act and works, because
-LocalSystem can read the profile. `install` prints a note about the
-fragility and proceeds.
+If you can write to a per-user configuration directory, you can modify jobs
+that the service runs as SYSTEM. `install` therefore also rejects an explicit
+path to that directory. The service applies the same checks from its own
+profile under `system32`. After you restrict write access with the printed
+`icacls` commands, `install` accepts the path and warns that moving or deleting
+your profile can break the service. A machine-wide directory avoids that
+dependency.
 
 ## Reloading the configuration
 
@@ -157,6 +167,7 @@ exit code rather than by crashing.
 | Reported as | Meaning |
 | --- | --- |
 | `the configuration did not parse` | The `-c` path is missing or the YAML is invalid. |
+| `the configuration can be written by an account other than SYSTEM and Administrators` | The service refused the `-c` path. The Application event log names the account and the fix. |
 | `the service log could not be opened` | The bootstrap log path is not writable. |
 | `the scheduler stopped with an error` | The scheduler itself raised. |
 
@@ -179,6 +190,19 @@ when a service fails to start.
 If that file cannot be opened, the service refuses to start rather than
 running mute, because a service with no console and no log cannot be
 diagnosed at all.
+
+Two refusals come before the bootstrap log opens: a `-c` path that does not
+exist, and one that another account can write. Opening the log first would
+have the service write, as SYSTEM, beside a configuration it does not trust.
+A junction that another account planted at `logs` would then decide where
+that write lands. The service therefore records these two refusals in the
+Application event log as event ID 1020. The event's source is the service
+name, and its summary field holds the reason and the fix. See [Windows Event
+Log](Windows-Event-Log#event-ids) for the record's layout.
+
+```powershell
+Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'cronstable'; ID = 1020 } -MaxEvents 1 | Format-List Message
+```
 
 A `logging:` section in the configuration still takes precedence. The daemon
 applies it on the first housekeeping pass, replacing the bootstrap handler.

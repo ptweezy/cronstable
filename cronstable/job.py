@@ -1459,6 +1459,9 @@ EVENTLOG_EVENTS: dict[str, tuple[int, int, int]] = {
     "late": (1003, platform.EVENTLOG_WARNING_TYPE, 1),
     "event": (1010, platform.EVENTLOG_INFORMATION_TYPE, 2),
     "event-alert": (1011, platform.EVENTLOG_ERROR_TYPE, 2),
+    # written by the Windows service host, never by the reporter; see
+    # eventlog_start_refused_strings
+    "start-refused": (1020, platform.EVENTLOG_ERROR_TYPE, 2),
 }
 
 #: What each insertion string means, BY POSITION, which is the other half of
@@ -1651,6 +1654,23 @@ def eventlog_event_strings(
         _eventlog_safe(_eventlog_detail(outcome, tvars), field),
         output,
     ]
+
+
+def eventlog_start_refused_strings(service: str, reason: str) -> list[str]:
+    """Build Event Log fields for a Windows service start refused before
+    its bootstrap log opens.
+
+    Use :data:`EVENTLOG_STRING_FIELDS` order and the same length limits as
+    other reports so consumers can read all records by position.
+    ``reason`` is the summary, and ``name`` holds the service name.
+    """
+    field = EVENTLOG_MAX_FIELD_CHARS
+    strings = [""] * len(EVENTLOG_STRING_FIELDS)
+    strings[0] = _eventlog_safe(reason, field)
+    strings[1] = _eventlog_safe(service, field)
+    strings[2] = "start-refused"
+    strings[3] = _eventlog_safe(report_hostname(), field)
+    return strings
 
 
 class _EventLogWriter:

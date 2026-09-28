@@ -1,5 +1,28 @@
 # History
 
+## 1.2.58
+
+- The Windows service refuses to load a configuration that any account
+  other than SYSTEM and Administrators can write, or one reached through a
+  junction or symbolic link. It checks before it opens its log or reads a
+  file, records the reason and the `icacls` fix in the Application event log
+  as event ID 1020, and stops with a code that `cronstable service status`
+  explains. It repeats the check before every reload, and a reload that
+  fails the check keeps the jobs already loaded. `cronstable service
+  install` refuses the same paths, including a per-user directory named
+  with `-c`. A local account that creates `C:\ProgramData\cronstable`
+  before `cronstable init` runs therefore cannot have its jobs run as
+  SYSTEM. If another account can write to the configuration directory,
+  the service remains stopped until the printed `icacls` commands restrict
+  write access.
+- The MSI creates `C:\ProgramData\cronstable` when it does not exist,
+  with the same ownership and permissions as `cronstable init`:
+  Administrators owns the directory, and only SYSTEM and Administrators
+  can write to it. Uninstalling keeps the directory. The MSI preserves
+  existing directories and their permissions.
+  The service starts at the next boot with no jobs and loads configuration
+  added later within a minute.
+
 ## 1.2.57
 
 - Windows installers and executables identify themselves as `cronstable`

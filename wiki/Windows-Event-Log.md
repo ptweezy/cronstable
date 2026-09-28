@@ -56,9 +56,14 @@ meaning.
 | 1003 | Warning | 1 | an SLA threshold was breached (`onLate`) |
 | 1010 | Information | 2 | a daemon or orchestration event (`notify:`) |
 | 1011 | Error | 2 | a daemon or orchestration event reporting failure |
+| 1020 | Error | 2 | the [Windows service](Windows-Service#where-a-service-logs) refused to start |
 
 Jobs occupy a contiguous 1000 to 1003 band so one rule can express "anything
-that happened to a job", and daemon events start a fresh decade at 1010. An
+that happened to a job", and daemon events start a fresh decade at 1010. The
+service host writes 1020 whenever it refuses a start before its log opens,
+whether or not any `report:` block enables the Event Log. Its source is the
+service's name, which is `cronstable` unless you installed the service under
+another name. An
 overdue job is a Warning rather than an Error on purpose. It has not failed,
 and an operator who pages on `Level=2` in the Application log should not be
 paged by a threshold they set to be advisory.
@@ -80,8 +85,8 @@ string rather than absent, so the arity never changes.
 | # | Field | Contents |
 | --- | --- | --- |
 | 0 | `summary` | the one line a human reads in the Event Viewer list |
-| 1 | `name` | the job name (a DAG task's is `<dag>.<taskId>`) |
-| 2 | `outcome` | `success`, `failure`, `permanent-failure`, `late`, `event` or `event-alert` |
+| 1 | `name` | the job name (a DAG task's is `<dag>.<taskId>`), or the service name for 1020 |
+| 2 | `outcome` | `success`, `failure`, `permanent-failure`, `late`, `event`, `event-alert` or `start-refused` |
 | 3 | `host` | the reporting host |
 | 4 | `exitCode` | the run's exit code |
 | 5 | `failReason` | why cronstable judged the run failed |

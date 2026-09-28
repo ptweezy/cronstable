@@ -13,7 +13,7 @@ import ast
 import os
 import xml.etree.ElementTree as ET
 
-from cronstable import _cliargs, winservice
+from cronstable import _cliargs, platform, winservice
 from cronstable._cliargs import SERVICE_NAME_DEFAULT
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -135,8 +135,7 @@ def test_lifecycle_controls():
     assert stops[0].get("Wait") == "yes"
     assert stops[0].get("Start") is None
     # Exactly one start, and only under the explicit ask or the
-    # upgrade-with-config condition: a first install has no configuration,
-    # and starting an unconfigured service burns its recovery retries.
+    # upgrade-with-config condition: a first install has no jobs yet.
     assert len(starts) == 1
     assert starts[0].get("Start") == "install"
     holder = [
@@ -248,6 +247,48 @@ def test_config_probe_follows_the_remembered_configdir():
     # The nested DirectorySearch turns "the value exists" into "the
     # directory it names exists".
     assert search.find("wxs:DirectorySearch", NS) is not None
+
+
+def test_default_config_dir_matches_init_permissions():
+    # A LocalSystem service registered against a directory any local
+    # account could create first is a way to run jobs as SYSTEM, so the
+    # package creates the default one itself: owned by Administrators,
+    # with the same ownership and permissions as `cronstable init`.
+    # Compare against init's constants to keep the two consistent.
+    root = _root()
+    program_data = next(
+        d
+        for d in root.findall(".//wxs:StandardDirectory", NS)
+        if d.get("Id") == "CommonAppDataFolder"
+    )
+    folder = program_data.find("wxs:Directory", NS)
+    assert folder.get("Name") == "cronstable"
+    (component,) = folder.findall("wxs:Component", NS)
+    # Neither uninstall nor an upgrade's early RemoveExistingProducts may
+    # delete the directory that holds the configuration.
+    assert component.get("Permanent") == "yes"
+    (permission,) = component.findall("wxs:CreateFolder/wxs:PermissionEx", NS)
+    assert permission.get("Sddl") == "O:{}{}".format(
+        platform._CONFIG_DIR_OWNER_SID, platform._CONFIG_DIR_SDDL
+    )
+    # Apply these permissions only to a directory this transaction creates.
+    # Preserve an existing directory's ownership and permissions for the
+    # service host to check.
+    assert permission.get("Condition") == "NOT CRONSTABLE_DEFAULT_CONFIG_FOUND"
+    found = next(
+        p
+        for p in root.findall(".//wxs:Property", NS)
+        if p.get("Id") == "CRONSTABLE_DEFAULT_CONFIG_FOUND"
+    )
+    probe = found.find("wxs:DirectorySearch", NS)
+    assert probe.get("Path") == "[CommonAppDataFolder]cronstable"
+    # ...which is where CONFIGDIR defaults to.
+    (default,) = [
+        s
+        for s in root.findall(".//wxs:SetProperty", NS)
+        if s.get("Id") == "CONFIGDIR" and s.get("Condition") == "NOT CONFIGDIR"
+    ]
+    assert default.get("Value") == probe.get("Path")
 
 
 def test_install_sets_nothing_the_msi_does_not():

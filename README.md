@@ -231,9 +231,10 @@ Upgrade later with `brew upgrade cronstable` or
 
 winget installs a signed, per-machine MSI. Approve the administrator prompt,
 and then open a new shell so that `cronstable` is on your `PATH`. The installer
-registers the Windows service but leaves it stopped until you configure and
-start it. For package availability and how to switch from a portable install,
-see the
+registers the Windows service without starting it. It also creates the
+configuration directory, which only SYSTEM and Administrators can write. The
+service starts at the next boot and runs no jobs until you add configuration.
+For package availability and how to switch from a portable install, see the
 [WinGet installation guide](https://github.com/ptweezy/cronstable/wiki/Installation#install-using-winget).
 
 ### Install using binary

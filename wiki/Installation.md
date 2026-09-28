@@ -239,8 +239,9 @@ lacks an MSI manifest, download the MSI from the GitHub Release directly.
 
 The MSI needs administrator approval, adds the program to the system `PATH`,
 and registers the Windows service. It includes Python. Open a new shell after
-installation. The service stays stopped until you initialize its configuration
-and start it; follow the [MSI quick start](Windows-MSI#quick-start).
+installation. The service starts at the next boot and runs no jobs until you
+add configuration. To add a starter configuration and start the service now,
+follow the [MSI quick start](Windows-MSI#quick-start).
 
 To switch from a portable install to an MSI, back up any configuration stored
 beside the portable executable, then uninstall the portable package:

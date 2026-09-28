@@ -119,13 +119,13 @@ def _windows_config_home(environ: Mapping[str, str]) -> str:
     Machine-wide first: ``%ProgramData%\\cronstable`` is the actual Windows
     analog of ``/etc/cronstable.d`` (machine-scoped, shared by every
     account), so when it holds configuration it wins.  It is never created
-    implicitly; ``cronstable init`` or an administrator creates it, and from
-    then on the same command resolves to the same config for an interactive
-    admin and for a service account, whose ``%APPDATA%`` points into an
-    invisible ``systemprofile`` directory nobody edits.  Otherwise the
-    default stays the historical per-user location: roaming AppData, falling
-    back to the user profile if APPDATA is somehow unset (rare; e.g. a bare
-    service account with no roaming profile).
+    implicitly; ``cronstable init``, the MSI or an administrator creates
+    it, and from then on the same command resolves to the same config for
+    an interactive admin and for a service account, whose ``%APPDATA%``
+    points into an invisible ``systemprofile`` directory nobody edits.
+    Otherwise the default stays the historical per-user location: roaming
+    AppData, falling back to the user profile if APPDATA is somehow unset
+    (rare; e.g. a bare service account with no roaming profile).
 
     The directory has to hold configuration, not merely exist.  An empty
     ``%ProgramData%\\cronstable`` parses to zero jobs, and because the
@@ -1235,6 +1235,24 @@ def writable_config_advice(path: str, grantee: str) -> str:
     )
 
 
+def service_refusal(path: str, grantee: str) -> str:
+    """Why a service does not load ``path``, and the fix: the service
+    host's wording of :func:`writable_config_advice`.
+    """
+    if grantee == _REPARSE_GRANTEE:
+        return (
+            "{} is a junction or symbolic link, so the service does not load "
+            "it: whoever placed the link decides what runs as SYSTEM. "
+            "Replace it with a real directory.".format(path)
+        )
+    return (
+        "{} can be written by {}, so the service does not load it: a job "
+        "added there would run as SYSTEM. Restrict it with: {}".format(
+            path, grantee, config_dir_icacls_recipe(path)
+        )
+    )
+
+
 #: SDDL aliases for "any account on this machine", the only principals a
 #: write grant to is reported as a finding.  CREATOR OWNER (``CO``) is
 #: deliberately absent: it appears on ``%ProgramData%`` itself and resolves
@@ -1518,6 +1536,24 @@ def any_user_write_grantee(path: str) -> Optional[str]:
     return _security_finding(  # pragma: no cover (windows)
         _read_security_sddl(path),
         machine_wide=is_machine_wide(path),
+        reparse=is_reparse_point(path),
+    )
+
+
+def service_write_grantee(path: str) -> Optional[str]:
+    """:func:`any_user_write_grantee` as a LocalSystem service sees ``path``.
+
+    LocalSystem's profile is under ``system32``, outside normal user
+    profiles. Apply the machine-wide ownership and reparse-point checks
+    to every path, regardless of the caller's profile. This keeps
+    ``service install`` and the service host consistent when the operator
+    runs the install command from their own profile.
+    """
+    if not IS_WINDOWS:  # pragma: no cover (posix) - no ACLs to read
+        return None
+    return _security_finding(  # pragma: no cover (windows)
+        _read_security_sddl(path),
+        machine_wide=True,
         reparse=is_reparse_point(path),
     )
 
