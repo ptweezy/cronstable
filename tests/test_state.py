@@ -646,6 +646,37 @@ async def test_document_delete_fsyncs_namespace_directory(
     assert await backend.read_document("ns", "k") is None
 
 
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("held_reads", [1, 4, 5])
+async def test_document_read_retries_windows_sharing_violations(
+    fs_backend, monkeypatch, strict, held_reads
+):
+    await fs_backend.mutate_document("ns", "k", lambda c: ({"v": 1}, None))
+    _, path = fs_backend._doc_paths("ns", "k")
+    real_open = open
+    attempts = 0
+
+    def held_open(filename, *args, **kwargs):
+        nonlocal attempts
+        if filename == path:
+            attempts += 1
+            if attempts <= held_reads:
+                raise PermissionError("sharing violation")
+        return real_open(filename, *args, **kwargs)
+
+    monkeypatch.setattr(state, "IS_WINDOWS", True)
+    monkeypatch.setattr(state, "open", held_open, raising=False)
+    monkeypatch.setattr(state.time, "sleep", lambda _: None)
+    if held_reads == 5 and strict:
+        with pytest.raises(state._DocumentUnreadable):
+            fs_backend._read_doc_file(path, strict=True)
+    else:
+        result = fs_backend._read_doc_file(path, strict=strict)
+        assert result == (None if held_reads == 5 else {"v": 1})
+    assert attempts == min(held_reads + 1, 5)
+    assert fs_backend._read_doc_file(path, strict=True) == {"v": 1}
+
+
 # --- corrupt-record quarantine -------------------------------------------
 
 
