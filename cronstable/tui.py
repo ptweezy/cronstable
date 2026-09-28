@@ -2416,9 +2416,10 @@ class LogTail:
         self._on_change = on_change
         self._task: Optional["asyncio.Task[None]"] = None
 
-    def start(self) -> None:
+    def start(self) -> "asyncio.Task[None]":
         if self._task is None or self._task.done():
             self._task = asyncio.get_running_loop().create_task(self._run())
+        return self._task
 
     def stop(self) -> None:
         if self._task is not None:
@@ -3065,6 +3066,7 @@ class App:
         self._dirty_event = asyncio.Event()
         self._poll_wakeup = asyncio.Event()
         self._tasks: list["asyncio.Task[None]"] = []
+        self._background_tasks: set["asyncio.Task[None]"] = set()
         self._paint_gate = 0.0
 
     # ---------------------------------------------------------------
@@ -3203,12 +3205,9 @@ class App:
             )
             if do_boot:
                 await self._boot_sequence()
-            # first load runs OFF the critical path: the input and
-            # paint loops are live first, so against an unreachable
-            # daemon the header says "disconnected" and q/Ctrl-C work
-            # instead of freezing a blank, un-quittable screen while
-            # the startup probes time out.
-            startup = asyncio.get_running_loop().create_task(self._startup())
+            # Run startup requests in the background so input and painting
+            # remain responsive while the daemon is unavailable.
+            self._spawn(self._startup())
             self._tasks = [
                 asyncio.get_running_loop().create_task(coro)
                 for coro in (
@@ -3219,14 +3218,9 @@ class App:
                     self._mark_loop(),
                 )
             ]
-            done, pending = await asyncio.wait(
+            done, _ = await asyncio.wait(
                 self._tasks, return_when=asyncio.FIRST_COMPLETED
             )
-            startup.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await startup
-            for task in pending:
-                task.cancel()
             for task in done:  # surface a crashed task's traceback
                 exc = task.exception()
                 if exc is not None and not isinstance(
@@ -3238,6 +3232,11 @@ class App:
             self._close_dag_streams()
             for tail in self.tails:
                 tail.stop()
+            # Finish request and stream cleanup before closing the session.
+            tasks = [*self._tasks, *self._background_tasks]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             with contextlib.suppress(Exception):
                 self.keys.close()
             await self.api.close()
@@ -3363,16 +3362,13 @@ class App:
         self.mark()
 
     def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
-        # in the base class (not AppActions) because the poll loop's fanout
-        # spawns the heat load through it as well as user actions.
-        task: "asyncio.Task[None]" = asyncio.get_running_loop().create_task(
-            coro
-        )
-        # retrieve the exception so a failed task never logs "exception
-        # was never retrieved"; a cancelled task is skipped, because
-        # Task.exception() RAISES CancelledError there and the callback's
-        # own traceback would land on the restored terminal after quit
-        # tears the loop down mid-fetch.
+        self._track_task(asyncio.get_running_loop().create_task(coro))
+
+    def _track_task(self, task: "asyncio.Task[None]") -> None:
+        """Keep background tasks available for shutdown until they finish."""
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        # Retrieve failures so they do not produce an unhandled-task warning.
         task.add_done_callback(
             lambda t: None if t.cancelled() else t.exception()
         )
@@ -4134,7 +4130,7 @@ class AppActions(App):
             name,
             self.mark,
         )
-        self.log_tail.start()
+        self._track_task(self.log_tail.start())
 
     def _close_drawer_streams(self) -> None:
         if self.log_tail is not None:
@@ -4179,7 +4175,7 @@ class AppActions(App):
         tail = LogTail(
             self.api, "/jobs/%s/logs" % _quote(name), name, self.mark
         )
-        tail.start()
+        self._track_task(tail.start())
         self.tails.append(tail)
         self.mark()
 
@@ -5383,7 +5379,7 @@ class AppKeys(AppPalette):
             self.mark,
         )
         self.dag_task_tail.follow = False  # a finished task's log ends
-        self.dag_task_tail.start()
+        self._track_task(self.dag_task_tail.start())
         self.dag_tab = "logs"
         self.panel_scroll = 0
 
@@ -8678,13 +8674,14 @@ async def _race_skip(
     """Await a boot-probe API call, but let the skip key win the race:
     a hung daemon must not hold the keyboard hostage during boot."""
     task = asyncio.get_running_loop().create_task(coro)
-    await asyncio.wait({task, skip}, return_when=asyncio.FIRST_COMPLETED)
-    if not task.done():
-        task.cancel()
-        with contextlib.suppress(BaseException):
+    try:
+        await asyncio.wait({task, skip}, return_when=asyncio.FIRST_COMPLETED)
+        return task.result() if task.done() else default
+    finally:
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
-        return default
-    return task.result()
 
 
 # The `cronstable tui` parser definition lives in cronstable._cliargs so

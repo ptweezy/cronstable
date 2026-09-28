@@ -1465,6 +1465,86 @@ async def test_quit_key_ends_the_app(tmp_path):
         await h.stop()
 
 
+@pytest.mark.parametrize("shutdown", ["quit", "cancel", "crash"])
+@pytest.mark.parametrize(
+    "work", ["startup", "poll", "action", "drawer", "dag", "tail"]
+)
+async def test_app_shutdown_waits_for_background_work(
+    tmp_path, monkeypatch, shutdown, work
+):
+    app = _bare_app(tmp_path)
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    closed_after_work = []
+    owned_tasks = set()
+
+    async def background_work():
+        owned_tasks.add(asyncio.current_task())
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            finished.set()
+
+    async def idle():
+        owned_tasks.add(asyncio.current_task())
+        await asyncio.Event().wait()
+
+    async def close_api():
+        closed_after_work.append(finished.is_set())
+
+    async def tail_work(self):
+        await background_work()
+
+    async def fail_on_key(key):
+        raise RuntimeError("input failed")
+
+    monkeypatch.setattr(
+        app, "_startup", background_work if work == "startup" else idle
+    )
+    monkeypatch.setattr(
+        app, "_poll_loop", background_work if work == "poll" else idle
+    )
+    monkeypatch.setattr(app, "_load_drawer_runs", idle)
+    monkeypatch.setattr(app.api, "close", close_api)
+    monkeypatch.setattr(tui.LogTail, "_run", tail_work)
+    run = asyncio.create_task(app.run())
+    try:
+        if work == "action":
+            app._spawn(background_work())
+        elif work == "drawer":
+            app.open_drawer("job")
+        elif work == "dag":
+            app.dag_name = "dag"
+            app.dag_run_key = "run"
+            app._open_dag_task_logs("task")
+        elif work == "tail":
+            app.by_name = {"job": _job("job")}
+            app.add_tail("job")
+        await asyncio.wait_for(started.wait(), 5)
+        if shutdown == "quit":
+            app.keys.send("ctrl+c")
+            await asyncio.wait_for(run, 5)
+        elif shutdown == "cancel":
+            run.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(run, 5)
+        else:
+            monkeypatch.setattr(app, "handle_key", fail_on_key)
+            app.keys.send("x")
+            with pytest.raises(RuntimeError, match="input failed"):
+                await asyncio.wait_for(run, 5)
+        assert closed_after_work == [True]
+        assert all(task.done() for task in owned_tasks)
+    finally:
+        tasks = [run, *app._tasks, *owned_tasks]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def test_manual_refresh_works_while_paused(tmp_path):
     """--poll 0 is a first-class mode: g (and every post-action
     refresh) must still fetch exactly once per press."""
@@ -1588,6 +1668,32 @@ async def test_race_skip_lets_the_skip_key_win():
 
     assert await tui._race_skip(fast(), pending, "skipped") == "value"
     pending.cancel()
+
+
+async def test_cancelling_boot_waits_for_the_probe():
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def probe():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            finished.set()
+
+    skip = asyncio.create_task(asyncio.Event().wait())
+    boot = asyncio.create_task(tui._race_skip(probe(), skip, None))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        boot.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(boot, 5)
+        assert finished.is_set()
+    finally:
+        skip.cancel()
+        boot.cancel()
+        await asyncio.gather(skip, boot, return_exceptions=True)
 
 
 def test_dispatch_refuses_without_a_tty(monkeypatch):
