@@ -203,7 +203,7 @@ dev = [
     "crontab>=1.0.5,<2",
     # Property tests generate schedules, configuration, Task XML, and
     # protocol payloads to check invariants (tests/test_properties_*.py).
-    "hypothesis>=6.168.0",
+    "hypothesis>=6.168.1",
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
