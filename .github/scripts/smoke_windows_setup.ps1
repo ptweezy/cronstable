@@ -29,6 +29,7 @@ function Assert-Installed {
 }
 function Assert-BundleRegistration {
     $entries = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+        Select-Object DisplayName, SystemComponent, DisplayIcon |
         Where-Object DisplayName -eq 'cronstable' |
         Where-Object SystemComponent -ne 1)
     if ($entries.Count -ne 1 -or -not $entries[0].DisplayIcon) {
