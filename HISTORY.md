@@ -1,5 +1,13 @@
 # History
 
+## 1.2.59
+
+- WinGet installs and upgrades use signed setup executables that display
+  the full cronstable logo in User Account Control (UAC) prompts. Windows
+  executables and installed application entries use the same logo. The setup
+  installers support upgrades from existing MSI installations. Standalone
+  MSI packages are also available.
+
 ## 1.2.58
 
 - The Windows service refuses to load a configuration that any account

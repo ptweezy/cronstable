@@ -19,19 +19,25 @@ def verify(version, metadata, assets):
         if match:
             sums[match[2]] = match[1].lower()
     for arch, item in metadata.items():
-        name = f"cronstable-windows-{arch}.msi"
         if item["ProductVersion"] != version:
-            raise ValueError(f"{name}: scanned version differs from release")
-        expected = item["Sha256"].lower()
-        digest = hashlib.sha256()
-        with (assets / name).open("rb") as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                digest.update(chunk)
-        if digest.hexdigest() != expected or sums.get(name) != expected:
-            raise ValueError(
-                f"{name}: published bytes differ from scanned SHA256"
+            raise ValueError(f"{arch}: scanned version differs from release")
+        for suffix, field in (
+            (".msi", "Sha256"),
+            ("-setup.exe", "BundleSha256"),
+        ):
+            name = f"cronstable-windows-{arch}{suffix}"
+            expected = item[field].lower()
+            digest = hashlib.sha256()
+            with (assets / name).open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected or sums.get(name) != expected:
+                raise ValueError(
+                    f"{name}: published bytes differ from scanned SHA256"
+                )
+            print(
+                f"{name}: published SHA256 matches scanned file ({expected})"
             )
-        print(f"{name}: published SHA256 matches scanned file ({expected})")
 
 
 if __name__ == "__main__":

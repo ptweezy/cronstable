@@ -28,6 +28,9 @@
 
     <SummaryInformation Description="cronstable job scheduler" />
 
+    <Icon Id="cronstable.ico" SourceFile="$(sys.SOURCEFILEDIR)..\windows\cronstable.ico" />
+    <Property Id="ARPPRODUCTICON" Value="cronstable.ico" />
+
     <!-- Early RemoveExistingProducts: the old product (whose own
          ServiceControl stops and deletes a running service) is fully
          removed before this one's files are costed in, which is what makes

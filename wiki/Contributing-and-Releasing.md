@@ -211,18 +211,26 @@ On a release, the `sign-windows` job Authenticode-signs the Windows assets with 
 
 The job runs on the x64 runner because the signing client does not support Windows ARM runners. Authenticode is architecture-agnostic, so one runner signs every Windows variant. It signs the one-file exes and each zip's inner `cronstable.exe`, re-zips, rebuilds all MSIs from the signed payload with the same shared build script the gate used (`.github/scripts/build_msi.sh`), signs those, verifies every signature, and installs and uninstalls the signed amd64 MSI for real. The `release-prepare` job then overlays the signed set before `SHA256SUMS`, so the sums, the Release assets, and the winget manifests describe the signed bytes. Every signature carries an RFC 3161 timestamp because Artifact Signing rotates its leaf certificates within days. `tests/test_ci_fences.py` pins the wiring.
 
-A signing failure that survives three attempts fails the release. Repair the credentials or resolve the signing-service failure before retrying; removing a secret fails preflight and cannot bypass the signed-MSI requirement.
+The job wraps the signed amd64, amd64v3, and arm64 MSIs in setup executables
+using `.github/scripts/build_setup.sh`. It signs each detached Burn engine,
+reattaches it, and signs the complete bundle. The engine signature identifies
+the publisher during elevation, including repair and uninstall. The signing
+job also installs and uninstalls both signed x64 setup executables. WinGet
+uses the baseline amd64 bundle and the arm64 bundle.
+
+A signing failure that survives three attempts fails the release. Repair the credentials or resolve the signing-service failure before retrying; removing a secret fails preflight and cannot bypass the signed-installer requirement.
 
 ### WinGet submission and Defender failures
 
 Configure Windows signing before you submit a release to WinGet. On signed
-releases, `sign-windows` validates the amd64 and arm64 MSIs as soon as the
-Windows builds and signing finish, while the other platform builds run. It
+releases, `sign-windows` validates the amd64 and arm64 MSIs and setup bundles
+as soon as Windows builds and signing finish, while other platform builds run. It
 records the signed files' SHA256 hashes, verifies their timestamped Authenticode
 signatures, and updates Microsoft Defender's signatures before scanning each
-MSI and its extracted payload. WiX extracts both architectures as data and uses
-the build script's version pin. The inner `cronstable.exe` also requires a valid
-timestamped signature.
+MSI, bundle, and their extracted payloads. WiX extracts both architectures as
+data and uses the build script's version pin. The inner `cronstable.exe` and
+the detached Burn engine also require valid timestamped signatures. Each
+bundle's embedded MSI must match the standalone release MSI byte for byte.
 
 The preflight updates signatures with `MpCmdRun.exe -SignatureUpdate -MMPC`,
 which downloads from Microsoft's update service. It makes up to three attempts,
@@ -242,19 +250,20 @@ guidance, usage help, and exit `0`, with no stderr output or configuration
 creation. It also verifies that `--validate-config` exits `1` for that missing
 configuration. Each process has a 30-second timeout.
 
-The manifest renderer reads `ProductCode`, `UpgradeCode`, display version,
-publisher, and architecture from the MSIs. It sets the installer type to `wix`
-and the scope to `machine` independently of the manifest in winget-pkgs.
+The manifest renderer reads product identities and hashes from the validated
+bundle and MSI metadata. It sets the installer type to `burn` and the scope to
+`machine`. Each manifest includes both installed package types so WinGet can
+upgrade an MSI installation through the setup executable.
 `sign-windows` runs `winget validate` and saves the manifests with the scan
 metadata. You can find these files and the scan and extraction logs in the
 `winget-validation` Actions artifact for 14 days, including on failure.
 
-After publication, the `winget` job downloads the release MSIs and `SHA256SUMS`
-and verifies that both match the scanned hashes. It submits the validated
-manifests with `wingetcreate submit`. Release downloads, GitHub submission,
+After publication, the `winget` job downloads the release MSIs, setup bundles,
+and `SHA256SUMS` and verifies them against the scanned hashes. It submits the
+validated manifests with `wingetcreate submit`. Release downloads, GitHub submission,
 and Microsoft's upstream validation depend on published assets and run at
 this stage. Missing signing credentials fail preflight; the `winget` job also
-requires signed MSIs as a final check.
+requires signed installers as a final check.
 
 For `Validation-Executable-Error`, open the validation artifact linked from
 the PR's **Validation Completed** check. Inspect `ExeRunInfo` in
@@ -330,6 +339,7 @@ The GitHub Release (`softprops/action-gh-release@v3`) attaches:
 - `cronstable-windows-amd64.exe`, `cronstable-windows-amd64v3.exe`, `cronstable-windows-arm64.exe`, `cronstable-windows-i686.exe`
 - `cronstable-windows-amd64.zip`, `cronstable-windows-amd64v3.zip`, `cronstable-windows-arm64.zip`, `cronstable-windows-i686.zip` (one-directory builds, the shape that hosts the [Windows service](Windows-Service))
 - `cronstable-windows-amd64.msi`, `cronstable-windows-amd64v3.msi`, `cronstable-windows-arm64.msi`, `cronstable-windows-i686.msi` (machine-wide installers; see [Windows MSI](Windows-MSI))
+- `cronstable-windows-amd64-setup.exe`, `cronstable-windows-amd64v3-setup.exe`, `cronstable-windows-arm64-setup.exe` (setup bundles with the MSI embedded and cronstable's icon in the administrator prompt)
 - `cronstable.json`: the [Scoop](https://scoop.sh) manifest for this release, rendered from `SHA256SUMS` by `.github/scripts/render_scoop.py`. It is submitted to `ScoopInstaller/Extras` once; after that its Excavator bot re-reads `checkver`/`autoupdate` every four hours and bumps the manifest from the same `SHA256SUMS` asset, so nothing here pushes to it again.
 - `perf-summary.md`, `perf-results.json`: the performance comparison against the previous release (see [performance benchmarks](Performance-Benchmarks); the diff chart `perf-chart.svg` ships in the run's `perf-report` artifact)
 

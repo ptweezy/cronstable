@@ -26,16 +26,45 @@ The service values in `cronstable.wxs` mirror `cronstable service install`
 and are fenced by `tests/test_msi_parity.py`; change either side only in
 lockstep. User-facing behavior is documented in `wiki/Windows-MSI.md`.
 
-The `sign-windows` job runs `.github/scripts/prepare_winget.ps1` on the signed
-amd64 and arm64 MSIs while the other platform builds run. The script verifies
-hashes and signatures, reads MSI product metadata, and scans each installer
-and its extracted payload with current Microsoft Defender signatures.
-`render_winget.py` generates manifests from that metadata, including each MSI's
-`ProductCode`, and `winget validate` checks them before publication. The renderer
-sets the installer type to `wix` and the scope to `machine` independently of the
-manifest in winget-pkgs.
+WinGet uses the WiX Burn bundle in `setup.wxs` so that its administrator prompt
+shows cronstable's icon. Build the setup executable after the MSI:
 
-The `winget` job uses `verify_winget_release.py` to compare the published MSIs
+```shell
+sh .github/scripts/build_setup.sh amd64 dist/cronstable-test.msi dist/cronstable-windows-amd64-setup.exe
+```
+
+The bundle takes its version from the embedded MSI. Its upgrade identity is
+separate from the MSI's `UpgradeCode`; keep both stable across releases.
+Setup executables support `amd64`, `amd64v3`, and `arm64`; WinGet uses the
+baseline `amd64` build and the `arm64` build.
+The bundle handles MSI and setup upgrades and provides the installed application
+entry. Use the MSI directly for deployment properties such as `CONFIGDIR`.
+
+The Windows artwork uses the full wordmark from the first frame of
+`docs/img/logo-balance.webp`, with the pendulum upright.
+`packaging/windows/cronstable-logo.png` preserves its proportions on a square
+transparent canvas for the setup window. `packaging/windows/cronstable.ico`
+contains the same image at 16, 20, 24, 32, 40, 48, 64, 128, and 256 pixels.
+PyInstaller embeds the icon in both Windows executable layouts, the MSI uses
+it for `ARPPRODUCTICON`, and the bundle uses it for its executable and elevation
+helper. The artwork follows the
+[brand asset policy](../../LICENSING.md#brand-assets).
+
+The signing job builds each bundle from a signed MSI, detaches and signs the
+Burn engine, reattaches it, and signs the complete bundle. Both signatures need
+timestamps because the engine also handles repair and uninstall elevation.
+
+The `sign-windows` job runs `.github/scripts/prepare_winget.ps1` on the signed
+amd64 and arm64 MSIs and setup bundles while the other platform builds run. The
+script verifies hashes and signatures, reads product metadata, and scans each
+installer and its extracted payload with current Microsoft Defender signatures.
+It checks that the embedded MSI matches the standalone MSI and that the detached
+engine has a timestamped signature. `render_winget.py` generates manifests from
+that metadata, and `winget validate` checks them before publication. The renderer
+sets the installer type to `burn` and the scope to `machine`. It includes the
+bundle and MSI identities so WinGet can match either installed package type.
+
+The `winget` job uses `verify_winget_release.py` to compare the published installers
 and `SHA256SUMS` with the scanned hashes before submitting the saved manifests.
 See `wiki/Contributing-and-Releasing.md` for steps to investigate validation
 failures and resubmit a package.

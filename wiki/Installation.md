@@ -234,31 +234,35 @@ winget install ptweezy.cronstable
 ```
 
 WinGet installs the package available in its catalog. The release workflow
-submits signed [Windows MSIs](Windows-MSI) for `amd64` and `arm64`. If the catalog
-lacks an MSI manifest, download the MSI from the GitHub Release directly.
+submits signed setup executables for `amd64` and `arm64`. Each setup embeds the
+[Windows MSI](Windows-MSI) and displays cronstable's icon in the administrator
+prompt. If the catalog lacks the package, download the setup executable or MSI
+from the GitHub Release directly.
 
-The MSI needs administrator approval, adds the program to the system `PATH`,
+The installer needs administrator approval, adds the program to the system `PATH`,
 and registers the Windows service. It includes Python. Open a new shell after
 installation. The service starts at the next boot and runs no jobs until you
 add configuration. To add a starter configuration and start the service now,
 follow the [MSI quick start](Windows-MSI#quick-start).
 
-To switch from a portable install to an MSI, back up any configuration stored
-beside the portable executable, then uninstall the portable package:
+To switch from a portable install to the service installer, back up any
+configuration stored beside the portable executable, then uninstall the
+portable package:
 
 ```shell
 winget uninstall --exact --id ptweezy.cronstable
 ```
 
-Install the MSI from the catalog:
+Install the setup package from the catalog:
 
 ```shell
-winget install --exact --id ptweezy.cronstable --installer-type wix --scope machine
+winget install --exact --id ptweezy.cronstable --installer-type burn --scope machine
 ```
 
 Point the service at your job configuration as described in
 [Windows MSI](Windows-MSI). You manage the configuration separately from
-WinGet. To upgrade an MSI installation, run `winget upgrade ptweezy.cronstable`.
+WinGet. To upgrade an MSI or setup installation, run
+`winget upgrade ptweezy.cronstable`.
 
 ## Install using Scoop
 

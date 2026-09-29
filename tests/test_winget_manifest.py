@@ -1,4 +1,4 @@
-"""Verify that WinGet manifests match the release MSI metadata."""
+"""Verify that WinGet manifests match setup and MSI metadata."""
 
 import copy
 import importlib.util
@@ -39,6 +39,11 @@ def metadata():
             "ProductName": "cronstable",
             "Manufacturer": "cronstable",
             "Sha256": str(i) * 64,
+            "BundleSha256": str(i + 2) * 64,
+            "BundleCode": "{87654321-4321-4321-4321-1234567890A"
+            + str(i)
+            + "}",
+            "BundleUpgradeCode": "{E8D4C05B-5ED5-4850-826D-8BA6163E4F8A}",
         }
         for i, (arch, architecture) in enumerate(
             renderer.ARCHES.items(), start=1
@@ -84,7 +89,7 @@ def test_published_msi_metadata_and_identity(metadata, tmp_path):
         assert manifest["PackageIdentifier"] == "ptweezy.cronstable"
         assert manifest["PackageVersion"] == "1.2.50"
     installer = manifests["installer"]
-    assert installer["InstallerType"] == "wix"
+    assert installer["InstallerType"] == "burn"
     assert installer["Scope"] == "machine"
     assert installer["ElevationRequirement"] == "elevatesSelf"
     assert installer["UpgradeBehavior"] == "install"
@@ -95,11 +100,17 @@ def test_published_msi_metadata_and_identity(metadata, tmp_path):
         assert entry["Architecture"] == source["Architecture"]
         assert entry["InstallerUrl"] == (
             "https://github.com/ptweezy/cronstable/releases/download/1.2.50/"
-            f"cronstable-windows-{arch}.msi"
+            f"cronstable-windows-{arch}-setup.exe"
         )
-        assert entry["InstallerSha256"] == source["Sha256"]
-        assert entry["ProductCode"] == source["ProductCode"]
-        arp = entry["AppsAndFeaturesEntries"][0]
+        assert entry["InstallerSha256"] == source["BundleSha256"]
+        assert entry["ProductCode"] == source["BundleCode"]
+        bundle, arp = entry["AppsAndFeaturesEntries"]
+        assert bundle["ProductCode"] == source["BundleCode"]
+        assert bundle["UpgradeCode"] == source["BundleUpgradeCode"]
+        assert bundle["DisplayName"] == source["ProductName"]
+        assert bundle["Publisher"] == source["Manufacturer"]
+        assert bundle["DisplayVersion"] == source["ProductVersion"]
+        assert bundle["InstallerType"] == "burn"
         assert arp["ProductCode"] == source["ProductCode"]
         assert arp["UpgradeCode"] == source["UpgradeCode"]
         assert arp["DisplayVersion"] == source["ProductVersion"]
@@ -223,8 +234,11 @@ def test_manifest_generation_and_publication_cli(metadata, tmp_path):
         ("ProductVersion", "1.2.49"),
         ("Architecture", "arm64"),
         ("Sha256", "missing"),
+        ("BundleSha256", "missing"),
         ("ProductCode", "not-a-guid"),
         ("UpgradeCode", "not-a-guid"),
+        ("BundleCode", "not-a-guid"),
+        ("BundleUpgradeCode", "not-a-guid"),
     ],
 )
 def test_invalid_metadata_writes_no_manifest(metadata, tmp_path, field, value):
@@ -249,11 +263,11 @@ def test_missing_architecture_is_not_silently_dropped(metadata, tmp_path):
 def test_rebuild_uses_new_product_codes_and_hashes(metadata, tmp_path):
     renderer.render("1.2.50", metadata, tmp_path)
     rebuilt = copy.deepcopy(metadata)
-    rebuilt["amd64"]["ProductCode"] = metadata["arm64"]["ProductCode"]
-    rebuilt["amd64"]["Sha256"] = "a" * 64
+    rebuilt["amd64"]["BundleCode"] = metadata["arm64"]["BundleCode"]
+    rebuilt["amd64"]["BundleSha256"] = "a" * 64
     renderer.render("1.2.50", rebuilt, tmp_path)
     entry = read_manifests(tmp_path)["installer"]["Installers"][0]
-    assert entry["ProductCode"] == rebuilt["amd64"]["ProductCode"]
+    assert entry["ProductCode"] == rebuilt["amd64"]["BundleCode"]
     assert entry["InstallerSha256"] == "A" * 64
 
 
@@ -273,7 +287,13 @@ def test_submission_requires_signed_scanned_validated_msis():
     early_gates = [
         "Rebuild the MSIs from the signed payload",
         "Sign the MSIs",
+        "Build setup bundles and detach their engines",
+        "Sign the setup engines",
+        "Reattach the signed setup engines",
+        "Sign the setup bundles",
+        "Stage the signed setup bundles",
         "Verify every signature",
+        "Smoke-test the signed amd64 setups",
         "Prepare winget checksums",
         "Verify and Defender-scan winget installers",
         "Generate winget manifests",
@@ -311,6 +331,8 @@ def test_submission_requires_signed_scanned_validated_msis():
     assert '"$SIGNED" != true' in download["run"]
     assert "cronstable-windows-amd64.msi" in download["run"]
     assert "cronstable-windows-arm64.msi" in download["run"]
+    assert "cronstable-windows-amd64-setup.exe" in download["run"]
+    assert "cronstable-windows-arm64-setup.exe" in download["run"]
     assert "SHA256SUMS" in download["run"]
     evidence = early["Preserve winget validation evidence"]
     assert evidence["if"] == (

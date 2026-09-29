@@ -64,6 +64,12 @@ function Invoke-FakeScan {
     if ($global:case -eq 'payload-detected' -and $global:scans -eq 2) {
         $global:LASTEXITCODE = 2
     }
+    if ($global:case -eq 'bundle-detected' -and $global:scans -eq 3) {
+        $global:LASTEXITCODE = 2
+    }
+    if ($global:case -eq 'engine-detected' -and $global:scans -eq 4) {
+        $global:LASTEXITCODE = 2
+    }
 }
 function Get-ChildItem {
     param($Path, [switch]$Recurse, [switch]$File, $Filter)
@@ -80,6 +86,12 @@ function Get-AuthenticodeSignature {
     $valid = $global:case -ne 'unsigned'
     if ($global:case -eq 'payload-unsigned' -and
         $Path.EndsWith('CronstableExe')) {
+        $valid = $false
+    }
+    if ($global:case -eq 'bundle-unsigned' -and $Path.EndsWith('-setup.exe')) {
+        $valid = $false
+    }
+    if ($global:case -eq 'engine-unsigned' -and $Path.EndsWith('engine.exe')) {
         $valid = $false
     }
     [pscustomobject]@{
@@ -135,6 +147,43 @@ function New-Object {
     return $instance
 }
 function Invoke-FakeWix {
+    if ($args[0] -eq 'burn') {
+        if ($args[1] -eq 'detach') {
+            Set-Content $args[4] 'test engine'
+            $global:LASTEXITCODE = 0
+            if ($global:case -eq 'engine-extract') { $global:LASTEXITCODE = 1 }
+            return
+        }
+        if ($args[1] -ne 'extract') { throw 'unexpected burn command' }
+        $target = Join-Path $args[4] 'WixAttachedContainer'
+        $ux = $args[6]
+        New-Item -ItemType Directory -Force $target, $ux | Out-Null
+        $arch = $(if ($args[2] -match 'amd64') { 'amd64' } else { 'arm64' })
+        $msiName = "cronstable-windows-$arch.msi"
+        Copy-Item (Join-Path $Assets $msiName) (Join-Path $target $msiName)
+        if ($global:case -eq 'different-msi') {
+            Set-Content (Join-Path $target $msiName) 'wrong MSI'
+        }
+        $version = '1.2.50'
+        if ($global:case -eq 'bundle-version') { $version = '1.2.49' }
+        $xml = @"
+<BurnManifest>
+  <Registration Code="{87654321-4321-4321-4321-123456789012}"
+      Version="$version" PerMachine="yes">
+    <Arp DisplayName="cronstable" DisplayVersion="$version"
+        Publisher="cronstable" />
+  </Registration>
+  <RelatedBundle Code="{E8D4C05B-5ED5-4850-826D-8BA6163E4F8A}"
+      Action="Upgrade" />
+  <Chain><MsiPackage ProductCode="{12345678-1234-1234-1234-123456789012}"
+    UpgradeCode="{B995CBA8-16CD-48F1-A13B-C4C4B927E7BE}" /></Chain>
+</BurnManifest>
+"@
+        Set-Content (Join-Path $ux 'manifest.xml') $xml
+        $global:LASTEXITCODE = 0
+        if ($global:case -eq 'bundle-extract') { $global:LASTEXITCODE = 1 }
+        return
+    }
     if ($args[0] -ne 'msi' -or $args[1] -ne 'decompile') {
         throw 'must decompile'
     }
@@ -162,7 +211,9 @@ try {
 } finally {
     Write-Host "DELAYS $($global:delays -join ',')"
 }
-if ($global:scans -ne 4) { throw 'must scan both MSIs and both payloads' }
+if ($global:scans -ne 8) {
+    throw 'must scan both MSIs, bundles, and extracted payloads'
+}
 """
 
 
@@ -185,6 +236,15 @@ if ($global:scans -ne 4) { throw 'must scan both MSIs and both payloads' }
         ("extract", False),
         ("missing-payload", False),
         ("missing-extracted-file", False),
+        ("bundle-hash", False),
+        ("bundle-unsigned", False),
+        ("engine-unsigned", False),
+        ("bundle-extract", False),
+        ("engine-extract", False),
+        ("bundle-detected", False),
+        ("engine-detected", False),
+        ("different-msi", False),
+        ("bundle-version", False),
     ],
 )
 def test_preflight(tmp_path, case, success):
@@ -198,6 +258,13 @@ def test_preflight(tmp_path, case, success):
         (assets / name).write_bytes(b"test MSI")
         digest = hashlib.sha256(b"test MSI").hexdigest()
         sums.append(f"{digest if case != 'hash' else '0' * 64}  {name}")
+        bundle_name = f"cronstable-windows-{arch}-setup.exe"
+        (assets / bundle_name).write_bytes(b"test bundle")
+        bundle_digest = hashlib.sha256(b"test bundle").hexdigest()
+        sums.append(
+            f"{bundle_digest if case != 'bundle-hash' else '0' * 64}  "
+            f"{bundle_name}"
+        )
     (assets / "SHA256SUMS").write_text("\n".join(sums), encoding="utf-8")
     harness = tmp_path / "harness.ps1"
     harness.write_text(HARNESS, encoding="utf-8")
@@ -234,6 +301,15 @@ def test_preflight(tmp_path, case, success):
             "extract": "MSI extraction failed",
             "missing-payload": "expected one payload executable",
             "missing-extracted-file": "missing extracted payload",
+            "bundle-hash": "SHA256SUMS mismatch",
+            "bundle-unsigned": "Authenticode signature",
+            "engine-unsigned": "invalid setup engine",
+            "bundle-extract": "Bundle extraction failed",
+            "engine-extract": "Bundle engine extraction failed",
+            "bundle-detected": "Defender rejected",
+            "engine-detected": "Defender rejected",
+            "different-msi": "embeds a different MSI",
+            "bundle-version": "metadata differs from its MSI",
         }
         assert expected[case] in result.stdout + result.stderr
     if case in {"update", "update-retry"}:
@@ -251,3 +327,7 @@ def test_preflight(tmp_path, case, success):
         assert data["amd64"]["Architecture"] == "x64"
         assert data["arm64"]["Architecture"] == "arm64"
         assert data["amd64"]["Sha256"].lower() == digest
+        assert data["amd64"]["BundleSha256"].lower() == bundle_digest
+        assert data["amd64"]["BundleCode"] == (
+            "{87654321-4321-4321-4321-123456789012}"
+        )

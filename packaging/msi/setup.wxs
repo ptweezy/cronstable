@@ -1,0 +1,23 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <Bundle Name="cronstable"
+          Manufacturer="cronstable"
+          Copyright="MIT License. (c) the cronstable authors."
+          Version="!(bind.packageVersion.CronstableMsi)"
+          UpgradeCode="e8d4c05b-5ed5-4850-826d-8ba6163e4f8a"
+          IconSourceFile="$(sys.SOURCEFILEDIR)..\windows\cronstable.ico"
+          Compressed="yes"
+          DisableModify="yes">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+          Theme="hyperlinkLicense"
+          LicenseUrl=""
+          LogoFile="$(sys.SOURCEFILEDIR)..\windows\cronstable-logo.png"
+          SuppressOptionsUI="yes" />
+    </BootstrapperApplication>
+    <Chain>
+      <MsiPackage Id="CronstableMsi" SourceFile="$(var.Msi)"
+                  Compressed="yes" Visible="no" Vital="yes" />
+    </Chain>
+  </Bundle>
+</Wix>

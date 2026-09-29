@@ -18,8 +18,14 @@ See [Windows service](Windows-Service) for the service the MSI registers,
 [running on Windows](Running-on-Windows) for the platform behavior, and
 [installation](Installation) for every other install method.
 
-The WinGet release workflow submits these signed MSIs to winget-pkgs. You can
-install an MSI through WinGet when the catalog includes its manifest. See
+WinGet uses `cronstable-windows-amd64-setup.exe` and
+`cronstable-windows-arm64-setup.exe`. These signed setup executables embed the
+corresponding MSI and display cronstable's icon in the administrator prompt.
+The release also includes `cronstable-windows-amd64v3-setup.exe` for
+compatible CPUs.
+They upgrade existing MSI and setup installations. Direct MSI installations
+use Windows Installer's icon in that prompt; the installed application entry
+and `cronstable.exe` use cronstable's icon. See
 [the installation instructions](Installation#install-using-winget) for package
 availability and steps to switch from a portable install.
 

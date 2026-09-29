@@ -3739,6 +3739,26 @@ jobs:
             echo "service still registered after upgrade uninstall" >&2
             exit 1
           fi
+      - name: Build and smoke-test WinGet setup
+        if: matrix.arch != 'i686'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          sh .github/scripts/build_setup.sh "$ARCH" \
+            "dist/cronstable-windows-${ARCH}.msi" "dist/cronstable-windows-${ARCH}-setup.exe"
+          sh .github/scripts/build_setup.sh "$ARCH" upgrade-twin.msi upgrade-setup.exe
+          pwsh -NoProfile -File .github/scripts/smoke_windows_setup.ps1 \
+            -Setup "dist/cronstable-windows-${ARCH}-setup.exe" \
+            -PreviousMsi "dist/cronstable-windows-${ARCH}.msi" -UpgradeSetup upgrade-setup.exe
+      - uses: actions/upload-artifact@v7.0.1
+        if: matrix.arch != 'i686'
+        with:
+          name: cronstable-windows-${{ matrix.arch }}-setup
+          path: dist/cronstable-windows-${{ matrix.arch }}-setup.exe
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
       - name: Check every declared binary artifact
         shell: bash
         run: python .github/scripts/check_artifacts.py "dist/cronstable-windows-${{ matrix.arch }}.msi"
@@ -4330,9 +4350,7 @@ jobs:
           else
             echo "signed=true" >> "$GITHUB_OUTPUT"
           fi
-      # The twelve Windows artifacts, flattened. The MSIs ride along for
-      # the pattern but are rebuilt below; an MSI's payload cannot be
-      # swapped after the fact.
+      # Rebuild the MSI and setup artifacts from the signed payloads.
       - name: Download Windows artifacts
         if: steps.decide.outputs.signed == 'true'
         uses: actions/download-artifact@v8.0.1
@@ -4452,6 +4470,52 @@ jobs:
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
           files-folder: ${{ github.workspace }}\out
           files-folder-filter: msi
+      - name: Build setup bundles and detach their engines
+        if: steps.decide.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          export PATH="$PATH:$(cygpath -u "$USERPROFILE")/.dotnet/tools"
+          mkdir -p bundles engines
+          for arch in amd64 amd64v3 arm64; do
+            sh .github/scripts/build_setup.sh "$arch" \
+              "out/cronstable-windows-${arch}.msi" "bundles/cronstable-windows-${arch}-setup.exe"
+            wix burn detach "bundles/cronstable-windows-${arch}-setup.exe" \
+              -engine "engines/cronstable-windows-${arch}-setup.exe"
+          done
+      - name: Sign the setup engines
+        if: steps.decide.outputs.signed == 'true'
+        uses: ./.github/actions/sign-artifacts
+        with:
+          label: the setup engines
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\engines
+          files-folder-filter: exe
+      - name: Reattach the signed setup engines
+        if: steps.decide.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          export PATH="$PATH:$(cygpath -u "$USERPROFILE")/.dotnet/tools"
+          mkdir -p setups
+          for arch in amd64 amd64v3 arm64; do
+            wix burn reattach "bundles/cronstable-windows-${arch}-setup.exe" \
+              -engine "engines/cronstable-windows-${arch}-setup.exe" \
+              -o "setups/cronstable-windows-${arch}-setup.exe"
+          done
+      - name: Sign the setup bundles
+        if: steps.decide.outputs.signed == 'true'
+        uses: ./.github/actions/sign-artifacts
+        with:
+          label: the setup bundles
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\setups
+          files-folder-filter: exe
+      - name: Stage the signed setup bundles
+        if: steps.decide.outputs.signed == 'true'
+        run: cp setups/*-setup.exe out/
       # The action can exit 0 having signed nothing (a filter typo), so
       # check the exact bytes being uploaded. The set is DERIVED, not
       # enumerated: everything in out/ except the zips, plus each
@@ -4464,9 +4528,10 @@ jobs:
         shell: pwsh
         run: |
           $files = @(Get-ChildItem out -File | Where-Object Extension -ne '.zip') +
-                   @(Get-ChildItem work\*\cronstable\*.exe -File)
-          if ($files.Count -lt 12) {
-            throw "expected at least 12 signed files (4 exes, 4 MSIs, 4 payload exes), found $($files.Count)"
+                   @(Get-ChildItem work\*\cronstable\*.exe -File) +
+                   @(Get-ChildItem engines\*.exe -File)
+          if ($files.Count -lt 18) {
+            throw "expected at least 18 signed files, found $($files.Count)"
           }
           foreach ($f in $files) {
             $sig = Get-AuthenticodeSignature $f.FullName
@@ -4497,12 +4562,20 @@ jobs:
           done
       # Validate WinGet artifacts while the other platform builds run.
       # A failure blocks publication through release's sign-windows dependency.
+      - name: Smoke-test the signed amd64 setups
+        if: steps.decide.outputs.signed == 'true'
+        shell: pwsh
+        run: |
+          foreach ($arch in @('amd64', 'amd64v3')) {
+            ./.github/scripts/smoke_windows_setup.ps1 -Setup "out/cronstable-windows-$arch-setup.exe"
+          }
       - name: Prepare winget checksums
         if: steps.decide.outputs.signed == 'true'
         run: |
           set -euo pipefail
           cd out
-          sha256sum cronstable-windows-amd64.msi cronstable-windows-arm64.msi > SHA256SUMS
+          sha256sum cronstable-windows-amd64.msi cronstable-windows-arm64.msi \
+            cronstable-windows-amd64-setup.exe cronstable-windows-arm64-setup.exe > SHA256SUMS
       - name: Verify and Defender-scan winget installers
         if: steps.decide.outputs.signed == 'true'
         timeout-minutes: 20
@@ -4579,6 +4652,9 @@ jobs:
             out/cronstable-windows-amd64v3.msi
             out/cronstable-windows-arm64.msi
             out/cronstable-windows-i686.msi
+            out/cronstable-windows-amd64-setup.exe
+            out/cronstable-windows-amd64v3-setup.exe
+            out/cronstable-windows-arm64-setup.exe
           if-no-files-found: error
           retention-days: 7
 
@@ -4727,6 +4803,8 @@ jobs:
              binaries/cronstable-windows-amd64.msi binaries/cronstable-windows-arm64.msi \
              binaries/cronstable-windows-amd64v3.msi \
              binaries/cronstable-windows-i686.msi \
+             binaries/cronstable-windows-amd64-setup.exe binaries/cronstable-windows-arm64-setup.exe \
+             binaries/cronstable-windows-amd64v3-setup.exe \
              "$work"/
           ( cd "$work" && sha256sum -- * ) > SHA256SUMS
           cat SHA256SUMS
@@ -5035,6 +5113,9 @@ jobs:
             binaries/cronstable-windows-amd64v3.msi
             binaries/cronstable-windows-arm64.msi
             binaries/cronstable-windows-i686.msi
+            binaries/cronstable-windows-amd64-setup.exe
+            binaries/cronstable-windows-amd64v3-setup.exe
+            binaries/cronstable-windows-arm64-setup.exe
 
     timeout-minutes: 20
 
@@ -5230,7 +5311,9 @@ jobs:
           gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" \
             --dir winget-assets --pattern SHA256SUMS \
             --pattern cronstable-windows-amd64.msi \
-            --pattern cronstable-windows-arm64.msi
+            --pattern cronstable-windows-arm64.msi \
+            --pattern cronstable-windows-amd64-setup.exe \
+            --pattern cronstable-windows-arm64-setup.exe
       - name: Download validated winget manifests
         uses: actions/download-artifact@v8.0.1
         with:

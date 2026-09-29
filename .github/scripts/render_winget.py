@@ -1,7 +1,7 @@
-"""Render MSI manifests from metadata read from the signed installers.
+"""Render WinGet manifests from the signed setup bundles and their MSIs.
 
 The renderer sets the installer type and scope independently of the manifest
-in winget-pkgs. Product codes and hashes come from the release MSIs.
+in winget-pkgs. Product codes and hashes come from the release artifacts.
 """
 
 import json
@@ -29,9 +29,15 @@ def render(version, metadata, output):
             raise ValueError(f"{arch}: MSI version differs from release")
         if item["Architecture"] != architecture:
             raise ValueError(f"{arch}: MSI architecture mismatch")
-        if not re.fullmatch(r"[A-Fa-f0-9]{64}", item["Sha256"]):
-            raise ValueError(f"{arch}: Invalid SHA256")
-        for field in ("ProductCode", "UpgradeCode"):
+        for field in ("Sha256", "BundleSha256"):
+            if not re.fullmatch(r"[A-Fa-f0-9]{64}", item[field]):
+                raise ValueError(f"{arch}: Invalid {field}")
+        for field in (
+            "ProductCode",
+            "UpgradeCode",
+            "BundleCode",
+            "BundleUpgradeCode",
+        ):
             if not re.fullmatch(
                 r"\{[A-Fa-f0-9]{8}(?:-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}\}",
                 item[field],
@@ -42,11 +48,19 @@ def render(version, metadata, output):
                 "Architecture": architecture,
                 "InstallerUrl": (
                     f"{REPO}/releases/download/{version}/"
-                    f"cronstable-windows-{arch}.msi"
+                    f"cronstable-windows-{arch}-setup.exe"
                 ),
-                "InstallerSha256": item["Sha256"].upper(),
-                "ProductCode": item["ProductCode"],
+                "InstallerSha256": item["BundleSha256"].upper(),
+                "ProductCode": item["BundleCode"],
                 "AppsAndFeaturesEntries": [
+                    {
+                        "DisplayName": item["ProductName"],
+                        "Publisher": item["Manufacturer"],
+                        "DisplayVersion": item["ProductVersion"],
+                        "ProductCode": item["BundleCode"],
+                        "UpgradeCode": item["BundleUpgradeCode"],
+                        "InstallerType": "burn",
+                    },
                     {
                         "DisplayName": item["ProductName"],
                         "Publisher": item["Manufacturer"],
@@ -54,14 +68,14 @@ def render(version, metadata, output):
                         "ProductCode": item["ProductCode"],
                         "UpgradeCode": item["UpgradeCode"],
                         "InstallerType": "msi",
-                    }
+                    },
                 ],
             }
         )
     common = {"PackageIdentifier": PACKAGE, "PackageVersion": version}
     manifests = {
         "installer": {
-            "InstallerType": "wix",
+            "InstallerType": "burn",
             "Scope": "machine",
             "ElevationRequirement": "elevatesSelf",
             "UpgradeBehavior": "install",
