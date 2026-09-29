@@ -50,6 +50,16 @@ state:
   jobApi:
     enabled: true
 
+# [shows: resource pools] The NAS's two disks, as a pool: disk-heavy work
+# (smart-selftest and library-refresh's checksum tasks) waits here for a free
+# slot instead of piling onto the same spindles. The dashboard's Resource
+# pools card and the app's pools screen show who holds a slot and who is
+# queued, in priority order.
+pools:
+  nas-disks:
+    slots: 2
+    maxQueued: 20
+
 web:
   # Plaintext on the local port; TLS is the tunnel's job.
   listen:
@@ -227,6 +237,23 @@ jobs:
     sla:
       maxTimeSinceSuccessSeconds: 1800
       maxRuntimeSeconds: 300
+
+  # [shows: a two-slot pool claim + queue priority] A short SMART self-test on
+  # both NAS disks. It claims both nas-disks slots at a higher priority, so
+  # when it fires alongside library-refresh, the workflow's three checksum
+  # tasks queue behind it on the pools card, then run two at a time. Private,
+  # like cert-check: visitors can watch it but not start it, so only the
+  # schedule adds work to the queue.
+  - name: smart-selftest
+    schedule: "3-53/10 * * * *"
+    pool: nas-disks
+    poolSlots: 2
+    queuePriority: 5
+    queueTimeout: 240
+    command: |
+      echo "[demo] SMART short self-test on both NAS disks (simulated)"
+      sleep 20
+      echo "hdd1, hdd2: self-test passed"
 
   # [shows: retry with exponential backoff] Fails about a third of the time,
   # and retries usually rescue it: catch the Retrying state and the attempt
@@ -623,7 +650,7 @@ jobs:
       PY
 
 # =====================================================================
-#  Orchestration: three DAGs, one per pattern
+#  Orchestration: four DAGs, one per pattern
 # =====================================================================
 dags:
   # [shows: dynamic fan-out via XCom expand + fan-in + artifacts] The flagship
@@ -755,3 +782,63 @@ dags:
           - apply
         triggerRule: all_done
         command: 'echo "rollout report filed (all_done: written whether the gate approved, rejected, or apply failed)"'
+
+  # [shows: a static diamond + pooled tasks + an edge that skips layers]
+  # Every 5 minutes: snapshot the media dataset, verify three libraries'
+  # checksums in parallel on the nas-disks pool (two slots, so one task waits
+  # its turn, and all three wait whenever smart-selftest holds the disks),
+  # rebuild the search index, then publish. publish also depends on snapshot
+  # directly, because it reads the snapshot name, so the graph has an edge
+  # that skips two layers.
+  - name: library-refresh
+    schedule: "3-58/5 * * * *"
+    onMissed: skip
+    retainRuns: 48
+    tasks:
+      - id: snapshot
+        command: |
+          set -eu
+          s="media@$(date -u +%Y%m%d-%H%M)"
+          echo "$s" | cronstable xcom push --key snapshot
+          echo "took snapshot $s (simulated)"
+      - id: verify-movies
+        dependsOn:
+          - snapshot
+        pool: nas-disks
+        queueTimeout: 240
+        command: |
+          echo "[demo] checking movie checksums against the snapshot"
+          sleep 8
+          echo "movies: 1,204 files verified"
+      - id: verify-music
+        dependsOn:
+          - snapshot
+        pool: nas-disks
+        queueTimeout: 240
+        command: |
+          echo "[demo] checking music checksums against the snapshot"
+          sleep 8
+          echo "music: 18,930 files verified"
+      - id: verify-photos
+        dependsOn:
+          - snapshot
+        pool: nas-disks
+        queueTimeout: 240
+        command: |
+          echo "[demo] checking photo checksums against the snapshot"
+          sleep 8
+          echo "photos: 41,283 files verified"
+      - id: reindex
+        dependsOn:
+          - verify-movies
+          - verify-music
+          - verify-photos
+        command: 'echo "search index rebuilt for movies, music, and photos"'
+      - id: publish
+        dependsOn:
+          - reindex
+          - snapshot
+        command: |
+          set -eu
+          s=$(cronstable xcom pull --task snapshot --key snapshot)
+          echo "library catalog for $s published"

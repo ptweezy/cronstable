@@ -505,7 +505,11 @@ def test_example_is_standard_daemon_config_with_separate_bounded_policy():
     assert "restore-drill" in policy["jobs"]
     assert "demo-operator" not in policy["jobs"]
     assert "cert-check" not in policy["jobs"]
+    # The two-slot pool claim stays private, so visitors cannot fill the
+    # queue that library-refresh's pooled tasks wait in.
+    assert "smart-selftest" not in policy["jobs"]
     assert "firmware-rollout" in policy["dags"]
+    assert "library-refresh" in policy["dags"]
     assert unchanged()
 
 
