@@ -18,34 +18,35 @@ def digest(value):
     ).hexdigest()
 
 
+_LAUNCH_KEYS = (
+    "command",
+    "shell",
+    "workingDirectory",
+    "user",
+    "group",
+    "executionTimeout",
+    "killTimeout",
+    "failsWhen",
+    "verify",
+    "pool",
+    "poolSlots",
+    "queueTimeout",
+    "queuePriority",
+)
+
+
 def configuration_revision(config):
+    """Digest a DAG's launch configuration.
+
+    View readers see the digest, so environment contributes variable names
+    only, as in the job-set ID.
+    """
     tasks = []
     for task in config.tasks:
         job = task.job_template
-        tasks.append(
-            {
-                "spec": asdict(task.spec),
-                "launch": {
-                    key: getattr(job, key)
-                    for key in (
-                        "command",
-                        "shell",
-                        "environment",
-                        "workingDirectory",
-                        "user",
-                        "group",
-                        "executionTimeout",
-                        "killTimeout",
-                        "failsWhen",
-                        "verify",
-                        "pool",
-                        "poolSlots",
-                        "queueTimeout",
-                        "queuePriority",
-                    )
-                },
-            }
-        )
+        launch = {key: getattr(job, key) for key in _LAUNCH_KEYS}
+        launch["environment"] = sorted(e["key"] for e in job.environment)
+        tasks.append({"spec": asdict(task.spec), "launch": launch})
     return digest(sorted(tasks, key=lambda task: task["spec"]["id"]))
 
 

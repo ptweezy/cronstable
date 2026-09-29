@@ -3258,7 +3258,7 @@ async def test_lifecycle_web_app_wildcard_acao_and_socket_mode(
     monkeypatch.setattr(
         cronstable.cron,
         "web_site_from_url",
-        lambda runner, url, ssl_context=None: _LifecycleFakeSite(url),
+        lambda runner, url, ssl_context=None, **_: _LifecycleFakeSite(url),
     )
     cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     with caplog.at_level(logging.WARNING, logger="cronstable"):
@@ -3288,7 +3288,7 @@ async def test_lifecycle_web_app_specific_acao_folded_into_allowlist(
     monkeypatch.setattr(
         cronstable.cron,
         "web_site_from_url",
-        lambda runner, url, ssl_context=None: _LifecycleFakeSite(url),
+        lambda runner, url, ssl_context=None, **_: _LifecycleFakeSite(url),
     )
     cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     await start_web_app(
@@ -3313,7 +3313,7 @@ async def test_lifecycle_web_app_mounts_mcp_endpoint(
     monkeypatch.setattr(
         cronstable.cron,
         "web_site_from_url",
-        lambda runner, url, ssl_context=None: _LifecycleFakeSite(url),
+        lambda runner, url, ssl_context=None, **_: _LifecycleFakeSite(url),
     )
     cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     mcp_config = _build_mcp_config({"enabled": True})

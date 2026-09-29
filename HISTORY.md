@@ -49,6 +49,22 @@
   `allow_config_change`.
 - Every `401` from the web API carries
   `WWW-Authenticate: Bearer realm="cronstable"`.
+- A reload that restarts the web API keeps each `http://` listener's socket
+  open and passes new connections to the replacement server. Another local
+  account therefore cannot bind the port during the restart and collect the
+  bearer token that the dashboard, `cronstable tui`, and `cronstable mcp`
+  send. The running server stops only after its replacement is built, so a
+  replacement that fails to build leaves it serving. `https://` and
+  `unix://` listeners close and bind again.
+- Saving or clearing the dashboard token rewrites both calendar feed links
+  and empties the token field and the pairing sheet, so a shared tab keeps
+  no copy of the previous token.
+- A DAG run's `configurationRevision` covers the names of task environment
+  variables and leaves out their values, so a `view` reader cannot test
+  guesses for a secret against it. Recovering a run after an environment
+  value changes does not require `allowConfigChange`. Runs whose recorded
+  revision includes environment values report a configuration change when
+  recovered.
 
 ## 1.2.58
 

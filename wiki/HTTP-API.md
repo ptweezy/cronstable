@@ -1243,6 +1243,15 @@ the request; a client certificate authenticates it at the handshake.
 confines the listener to the machine, not to your user, so set a token
 anywhere other local users matter.
 
+A client sends its token to whatever process answers the configured address,
+and over plaintext `http://` it cannot tell the daemon from another process.
+The daemon keeps its `http://` ports bound while it runs, including through
+config reloads. While the daemon is stopped, for example during an upgrade,
+another local account can bind the port and collect the token from an open
+dashboard, `cronstable tui`, or `cronstable mcp`. On a host with untrusted
+local accounts, serve the API over an `https://` listener whose certificate
+the clients verify. See [listener TLS](Listener-TLS).
+
 `authToken` resolves the token from exactly one source, in this precedence order
 (`_resolve_web_token`):
 
@@ -1567,12 +1576,20 @@ writable volume. See [production and container deployment](Production-Deployment
 The control API lifecycle is driven by `start_stop_web_app`, called on each config
 reload from the scheduler loop:
 
-- If a server is running and the new `web` config is absent or differs from the
-  running one, the running server is stopped (`web_runner.cleanup()`) before any new
-  one is started. A change to any `web` field (including `headers`, `authToken`, or
-  `socketMode`) thus triggers a restart of the server on reload.
-- The server is (re)started only when `web` is present, `listen` is nonempty, and no
-  server is currently running.
+- If a server is running and the new `web` config differs from the running one,
+  the server restarts on reload. A change to any `web` field (including
+  `headers`, `authToken`, or `socketMode`) triggers a restart. The daemon builds
+  the replacement first and stops the running server (`web_runner.cleanup()`)
+  after that, so a replacement that fails to build leaves the running server in
+  place.
+- An `http://` listener keeps its socket through a restart, and the replacement
+  accepts new connections on it, so no other process can bind the port in
+  between. An `https://` or `unix://` listener closes with the running server
+  and binds again for the replacement.
+- If the new `web` config is absent or its `listen` list is empty, the running
+  server stops and every listener closes.
+- The server starts when `web` is present, `listen` is nonempty, and no server
+  is running.
 - A reload also restarts the server when the `web.tls` files changed on disk
   under unchanged config (an in-place certificate rotation), because the
   `SSLContext` is built once per start. Open connections, including SSE log
@@ -1593,8 +1610,9 @@ reload from the scheduler loop:
 A `ConfigError` raised while resolving `authToken` (empty token or unreadable
 `fromFile`) propagates out of `start_stop_web_app` and is caught by the reload
 loop's dedicated web-app handler, which logs `Error in the web configuration, so
-not starting the web API` and leaves the web API down until a later reload fixes
-it.
+not starting the web API`. The web API stays as it was until a later reload
+fixes the error: a running server keeps its previous configuration, and a
+stopped one stays down.
 
 The daemon still applies the rest of the new configuration (jobs, cluster,
 logging): the web app starts under its own error handling, after the cluster

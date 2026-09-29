@@ -35,8 +35,11 @@ The response includes `planToken`. Submit the same selection with
 inventory, or configuration invalidates the preview. When the current
 configuration differs from the source's recorded revision, execution also
 requires `allowConfigChange: true`. Runs without a recorded revision require
-this acknowledgement. Adding or removing task IDs, or changing whether a
-task is mapped, requires a full run.
+this acknowledgement. The revision covers each task's launch settings and the
+names of its environment variables. It leaves out environment values, so the
+revision shown to view readers reveals no secret. Changing a value, such as
+rotating a password, does not require the acknowledgement. Adding or removing
+task IDs, or changing whether a task is mapped, requires a full run.
 
 Identical accepted plans use the same recovery run key. Retrying a request
 therefore returns that run while it remains retained. Missing retained

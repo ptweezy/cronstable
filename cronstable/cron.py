@@ -7,6 +7,7 @@ import asyncio
 import asyncio.subprocess
 import copy
 import datetime
+import errno
 import gc
 import hashlib
 import heapq
@@ -1827,6 +1828,8 @@ def schedule_slot(
 
 #: Built once, on the first web start (see :func:`_access_log_class`).
 _ACCESS_LOG_CLASS: Optional[type] = None
+#: Built once, on the first held listener (see :func:`_held_site_class`).
+_HELD_SITE_CLASS: Optional[type] = None
 
 
 def _redact_query_token(path_qs: str) -> str:
@@ -1899,10 +1902,110 @@ def _access_log_class() -> type:
     return _ACCESS_LOG_CLASS
 
 
+class _RefusingProtocol(asyncio.Protocol):
+    """Closes a connection that arrives while no web runner is up."""
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        transport.close()
+
+
+class _HeldListeners:
+    """Plaintext TCP listeners that stay bound across web app restarts.
+
+    Each one hands new connections to the current runner, so a restart
+    never frees the port for another local account to bind and receive
+    the clients' bearer tokens.
+    """
+
+    def __init__(self, protocol_factory: Callable[[], Any]) -> None:
+        self._protocol_factory = protocol_factory
+        self._servers: dict[tuple[str, int], asyncio.AbstractServer] = {}
+        self._claimed: set[tuple[str, int]] = set()
+
+    async def acquire(
+        self, host: str, port: int, backlog: int
+    ) -> asyncio.AbstractServer:
+        """The listener for ``host:port``, bound on first use."""
+        key = (host, port)
+        if key in self._claimed:
+            raise OSError(errno.EADDRINUSE, "listen address repeated")
+        server = self._servers.get(key)
+        if server is None:
+            server = await asyncio.get_running_loop().create_server(
+                self._protocol_factory, host, port, backlog=backlog
+            )
+            self._servers[key] = server
+        self._claimed.add(key)
+        return server
+
+    def retain(self, keys: Iterable[tuple[str, int]]) -> None:
+        """Close every listener outside ``keys`` and start a new claim set."""
+        keep = set(keys)
+        for key in [k for k in self._servers if k not in keep]:
+            self._servers.pop(key).close()
+        self._claimed = set()
+
+
+def _held_site_class() -> type:
+    """An aiohttp site over a :class:`_HeldListeners` listener.
+
+    ``stop`` leaves the listener open for the next runner. Built lazily for
+    the reason :func:`_access_log_class` gives.
+    """
+    global _HELD_SITE_CLASS
+    if _HELD_SITE_CLASS is None:
+
+        class _HeldSite(web.BaseSite):  # type: ignore[misc]
+            def __init__(
+                self,
+                runner: web.AppRunner,
+                listeners: _HeldListeners,
+                host: str,
+                port: int,
+            ) -> None:
+                super().__init__(runner)
+                self._listeners = listeners
+                self._host = host
+                self._port = port
+
+            @property
+            def name(self) -> str:
+                host = "[%s]" % self._host if ":" in self._host else self._host
+                return "http://%s:%d" % (host, self._port)
+
+            async def start(self) -> None:
+                await super().start()
+                self._server = await self._listeners.acquire(
+                    self._host, self._port, self._backlog
+                )
+
+            async def stop(self) -> None:
+                self._server = None
+                await super().stop()
+
+        _HELD_SITE_CLASS = _HeldSite
+    return _HELD_SITE_CLASS
+
+
+def _held_listen_keys(listen: Iterable[str]) -> set[tuple[str, int]]:
+    """The ``(host, port)`` of each ``http://`` entry in ``listen``."""
+    keys = set()
+    for url in listen:
+        parsed = urlparse(url)
+        try:
+            port = parsed.port
+        except ValueError:
+            continue
+        if parsed.scheme == "http" and parsed.hostname and port is not None:
+            keys.add((parsed.hostname, port))
+    return keys
+
+
 def web_site_from_url(
     runner: web.AppRunner,
     url: str,
     ssl_context: Optional[ssl.SSLContext] = None,
+    held: Optional[_HeldListeners] = None,
 ) -> web.BaseSite:
     """One listener for ``url``, TLS-wrapped when the url says ``https``.
 
@@ -1912,6 +2015,7 @@ def web_site_from_url(
     one port and over TLS on another. ``unix://`` listeners are always
     plaintext: they are already confined to the host's filesystem, where the
     socket's own permissions (``web.socketMode``) are the access control.
+    With ``held``, an ``http://`` entry serves from that registry's listener.
     """
     parsed = urlparse(url)
     if parsed.scheme in ("http", "https"):
@@ -1939,6 +2043,11 @@ def web_site_from_url(
                 url,
             )
             raise ValueError(url)
+        if parsed.scheme == "http" and held is not None:
+            site: web.BaseSite = _held_site_class()(
+                runner, held, parsed.hostname, parsed.port
+            )
+            return site
         return web.TCPSite(
             runner,
             parsed.hostname,
@@ -2219,6 +2328,8 @@ class Cron:
         self.retry_state: dict[str, JobRetryState] = {}
         self.web_runner: web.AppRunner | None = None
         self.web_config: WebConfig | None = None
+        # http:// listeners outlive the runner; see _HeldListeners.
+        self._web_held = _HeldListeners(self._web_protocol)
         # (scheme, socket name) per bound TCP listener of the RUNNING web
         # app, in listen order: the Bonjour advert needs a port, scheme and
         # address from ONE listener, unreconstructable after the fact
@@ -2236,12 +2347,11 @@ class Cron:
         # start_stop_web_app so they track reloads.
         self.mcp_config: MCPConfig | None = None
         self._mcp: Any | None = None
-        # live SSE log tails, ended (via the sentinel) BEFORE aiohttp's
-        # shutdown wait: a tail never finishes on its own and would freeze
-        # teardown for the full 60s timeout. _web_draining refuses tails
-        # arriving mid-teardown.
-        self._web_sse_queues: "set[asyncio.Queue]" = set()
-        self._web_draining = False
+        # live SSE log tails per app generation, ended (via the sentinel)
+        # BEFORE aiohttp's shutdown wait: a tail never finishes on its own
+        # and would freeze teardown for the full 60s timeout. None marks an
+        # app whose teardown has begun, which refuses new tails.
+        self._web_sse_queues: dict[Any, Optional[set[asyncio.Queue]]] = {}
         # the leadership backend, when a cluster section is configured
         self.cluster_manager: Optional[LeadershipBackend] = None
         # optional election-inert second gossip manager so non-gossip
@@ -2608,6 +2718,7 @@ class Cron:
         await self._bonjour.stop()
         if self.web_runner is not None:
             logger.info("Stopping http server")
+            self._web_held.retain(())
             await self.web_runner.cleanup()
         # close the pooled statsd UDP endpoints (otherwise reclaimed only
         # at loop GC, with a ResourceWarning). Safe to call twice.
@@ -6631,17 +6742,30 @@ class Cron:
                 return running.output
         return None
 
+    def _web_protocol(self) -> asyncio.BaseProtocol:
+        """The current runner's protocol for a held listener's connection."""
+        runner = self.web_runner
+        server = runner.server if runner is not None else None
+        if server is None:
+            return _RefusingProtocol()
+        return server()
+
     async def _web_on_shutdown(self, app: web.Application) -> None:
         """End every live SSE tail so the web app can tear down promptly.
 
         Runs inside ``web_runner.cleanup()`` BEFORE aiohttp waits its 60s
         shutdown timeout: a tail handler never returns on its own, so an
         open tail would stall scheduling for the full timeout. The queue
-        sentinel reuses the end-of-output path.
+        sentinel reuses the end-of-output path. Tails of a newer app
+        generation keep running.
         """
-        self._web_draining = True
-        for queue in list(self._web_sse_queues):
+        queues = self._web_sse_queues.get(app) or ()
+        self._web_sse_queues[app] = None
+        for queue in queues:
             queue.put_nowait(None)
+
+    async def _web_on_cleanup(self, app: web.Application) -> None:
+        self._web_sse_queues.pop(app, None)
 
     def _sse_headers(self) -> dict[str, str]:
         # Like /metrics, the stream framing is this endpoint's contract: an
@@ -6661,7 +6785,10 @@ class Cron:
         return headers
 
     async def _pump_output(
-        self, resp: web.StreamResponse, output: JobOutputStream
+        self,
+        request: web.Request,
+        resp: web.StreamResponse,
+        output: JobOutputStream,
     ) -> None:
         """Replay the retained buffer then live-tail an output stream over SSE.
 
@@ -6676,11 +6803,12 @@ class Cron:
         # Registered (no await since the drain check) so a teardown can end
         # this tail; a tail arriving after the broadcast must not enter a
         # loop nothing would ever wake again (see _web_on_shutdown).
-        if self._web_draining:
+        tails = self._web_sse_queues.setdefault(request.app, set())
+        if tails is None:
             output.unsubscribe(queue)
             await resp.write(b"event: end\ndata: {}\n\n")
             return
-        self._web_sse_queues.add(queue)
+        tails.add(queue)
         try:
             # One write for the whole retained buffer, not one per line: a tab
             # opening on a chatty job replays up to LIVE_LOG_LIMIT lines, and
@@ -6726,7 +6854,7 @@ class Cron:
             # client navigated away / closed the tab: nothing to do
             pass
         finally:
-            self._web_sse_queues.discard(queue)
+            tails.discard(queue)
             output.unsubscribe(queue)
 
     @staticmethod
@@ -6822,7 +6950,7 @@ class Cron:
         if output is None:
             await resp.write(b'event: end\ndata: {"reason": "no-output"}\n\n')
             return resp
-        await self._pump_output(resp, output)
+        await self._pump_output(request, resp, output)
         return resp
 
     async def _web_dag_task_logs(
@@ -6850,7 +6978,7 @@ class Cron:
         if output is None:
             await resp.write(b'event: end\ndata: {"reason": "no-output"}\n\n')
             return resp
-        await self._pump_output(resp, output)
+        await self._pump_output(request, resp, output)
         return resp
 
     def _web_restart_reason(
@@ -6887,10 +7015,10 @@ class Cron:
         if web_config is not None and not tlsutil.listener_tls_loadable(
             web_config.get("tls")
         ):
-            # Make-before-break is infeasible (the new runner binds the
-            # same port the old one holds), so only proceed once the NEW
-            # material loads: a half-written rotation would otherwise tear
-            # down a working listener and fail to rebuild.
+            # An https:// listener closes before its replacement binds the
+            # same port, so only proceed once the NEW material loads: a
+            # half-written rotation would otherwise tear down a working
+            # listener and fail to rebuild.
             logger.warning(
                 "web: new TLS material is not yet loadable (a "
                 "partial/half-written rotation, or a config edit racing "
@@ -6947,20 +7075,40 @@ class Cron:
             return None, None, True
         return context, signature, False
 
+    async def _web_retiring_runner(
+        self,
+        web_config: Optional[WebConfig],
+        mcp_config: Optional[MCPConfig],
+    ) -> Optional[web.AppRunner]:
+        """The running runner a due restart replaces, or None.
+
+        A restart retires the runner only after its replacement is built,
+        so a failed build keeps it serving. When ``web_config`` no longer
+        listens, this stops the runner instead.
+        """
+        if self.web_runner is None:
+            return None
+        reason = self._web_restart_reason(web_config, mcp_config)
+        if reason is None:
+            return None
+        if web_config is not None and web_config["listen"]:
+            logger.info("web: %s, restarting http server", reason)
+            return self.web_runner
+        logger.info("web: %s, stopping http server", reason)
+        self._web_held.retain(())
+        await self.web_runner.cleanup()
+        self.web_runner = None
+        self._web_tcp_bound = []
+        self._web_tls_signature = None
+        self._web_token_files_signature = None
+        return None
+
     async def start_stop_web_app(
         self,
         web_config: Optional[WebConfig],
         mcp_config: Optional[MCPConfig] = None,
     ):
-        if self.web_runner is not None:
-            reason = self._web_restart_reason(web_config, mcp_config)
-            if reason is not None:
-                logger.info("web: %s, stopping http server", reason)
-                await self.web_runner.cleanup()
-                self.web_runner = None
-                self._web_tcp_bound = []
-                self._web_tls_signature = None
-                self._web_token_files_signature = None
+        retiring = await self._web_retiring_runner(web_config, mcp_config)
 
         # Build the listener's TLS context ONCE per (re)start, before anything
         # is bound, so a context failure never leaves a half-built runner.
@@ -6970,7 +7118,7 @@ class Cron:
         start_wanted = bool(
             web_config is not None
             and web_config["listen"]
-            and self.web_runner is None
+            and (self.web_runner is None or retiring is not None)
         )
         web_tls = web_config.get("tls") if web_config is not None else None
         # listener_tls_configured, not a bare truthiness test on the dict: a
@@ -7066,11 +7214,11 @@ class Cron:
                     )
                 )
             app = web.Application(middlewares=middlewares)
-            # New app generation: tails may subscribe again, and the
-            # on_shutdown hook is what ends them at the NEXT teardown (see
-            # _web_on_shutdown for why cleanup would otherwise stall).
-            self._web_draining = False
+            # The on_shutdown hook ends this generation's tails at its
+            # teardown (see _web_on_shutdown for why cleanup would
+            # otherwise stall), and on_cleanup forgets the generation.
             app.on_shutdown.append(self._web_on_shutdown)
+            app.on_cleanup.append(self._web_on_cleanup)
             # The MCP server (POST /mcp) rides these same listeners and the
             # auth middleware above: /mcp is NEVER added to `public`, so it
             # inherits the bearer-token gate. Built here (not in __init__) so a
@@ -7106,20 +7254,26 @@ class Cron:
                     handler = getattr(self, handler_name)
                 routes.append(web.route(method, path, handler))
             app.add_routes(routes)
-            self.web_runner = web.AppRunner(
-                app, access_log_class=_access_log_class()
-            )
-            await self.web_runner.setup()
+            runner = web.AppRunner(app, access_log_class=_access_log_class())
+            await runner.setup()
+            # The held listeners pass new connections to this runner from
+            # here on; the retiring one drains only its own.
+            self.web_runner = runner
+            if retiring is not None:
+                await retiring.cleanup()
+            # https:// and unix:// sites bind afresh below, so a held
+            # listener the new config drops must release its port first.
+            self._web_held.retain(_held_listen_keys(web_config["listen"]))
             socket_mode = web_config.get("socketMode")
             self._web_tcp_bound = []
             bound_any = False
             for addr in web_config["listen"]:
                 # everything `addresses` gains from start() below belongs
                 # to this entry (see _record_bound_listeners)
-                bound_before = len(self.web_runner.addresses)
+                bound_before = len(runner.addresses)
                 try:
                     site = web_site_from_url(
-                        self.web_runner, addr, tls_context
+                        runner, addr, tls_context, held=self._web_held
                     )
                     await site.start()
                 except (ValueError, OSError) as ex:
@@ -7147,10 +7301,13 @@ class Cron:
                     "web: no listen address could be bound, so the web API "
                     "is not up; retrying on the next housekeeping pass"
                 )
-                await self.web_runner.cleanup()
+                self._web_held.retain(())
+                await runner.cleanup()
                 self.web_runner = None
                 self._mcp = None
                 self._web_tcp_bound = []
+                self._web_tls_signature = None
+                self._web_token_files_signature = None
             else:
                 self.web_config = web_config
                 self.mcp_config = mcp_config

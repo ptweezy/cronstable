@@ -1,6 +1,8 @@
 import asyncio
 import datetime
 import inspect
+import os
+import socket
 import threading
 from pathlib import Path
 
@@ -2253,7 +2255,7 @@ async def test_web_app_restarts_on_config_change(monkeypatch):
     monkeypatch.setattr(
         cronstable.cron,
         "web_site_from_url",
-        lambda runner, url, ssl_context=None: FakeSite(url),
+        lambda runner, url, ssl_context=None, **_: FakeSite(url),
     )
 
     cron = cronstable.cron.Cron(None)
@@ -2271,6 +2273,80 @@ async def test_web_app_restarts_on_config_change(monkeypatch):
     # clearing the config stops the server
     await cron.start_stop_web_app(None)
     assert cron.web_runner is None
+
+
+def _port_taken(port):
+    """Whether a squatter's bind of 127.0.0.1:port fails."""
+    probe = socket.socket()
+    if os.name == "posix":
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError:
+        return True
+    finally:
+        probe.close()
+    return False
+
+
+@pytest.mark.asyncio
+async def test_web_restart_keeps_the_http_port_bound(
+    start_web_app, monkeypatch
+):
+    # A token rotation restarts the app. The port must stay bound while the
+    # old runner tears down, or another local account could bind it and
+    # collect the bearer tokens clients keep sending.
+    import aiohttp
+    from aiohttp import web
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    config = {
+        "listen": ["http://127.0.0.1:0"],
+        "authToken": {"value": "old"},
+        "ui": False,
+    }
+    await start_web_app(cron, config)
+    retiring = cron.web_runner
+    port = retiring.addresses[0][1]
+    seen = []
+    cleanup = web.AppRunner.cleanup
+
+    async def checked_cleanup(runner):
+        if runner is retiring:
+            seen.append(_port_taken(port))
+        await cleanup(runner)
+        if runner is retiring:
+            seen.append(_port_taken(port))
+
+    monkeypatch.setattr(web.AppRunner, "cleanup", checked_cleanup)
+    await cron.start_stop_web_app(dict(config, authToken={"value": "new"}))
+    assert cron.web_runner is not retiring
+    assert seen == [True, True]
+    assert cron.web_runner.addresses[0][1] == port
+    base = "http://127.0.0.1:{}/jobs".format(port)
+    async with aiohttp.ClientSession() as session:
+        for token, status in (("old", 401), ("new", 200)):
+            headers = {"Authorization": "Bearer " + token}
+            async with session.get(base, headers=headers) as resp:
+                assert resp.status == status
+    await cron.start_stop_web_app(None)
+    assert not _port_taken(port)
+
+
+@pytest.mark.asyncio
+async def test_web_teardown_ends_only_its_own_generations_tails():
+    from aiohttp import web
+
+    cron = cronstable.cron.Cron(None)
+    old, new = web.Application(), web.Application()
+    old_tail, new_tail = asyncio.Queue(), asyncio.Queue()
+    cron._web_sse_queues = {old: {old_tail}, new: {new_tail}}
+    await cron._web_on_shutdown(old)
+    assert old_tail.get_nowait() is None
+    assert new_tail.empty()
+    assert cron._web_sse_queues == {old: None, new: {new_tail}}
+    await cron._web_on_cleanup(old)
+    assert cron._web_sse_queues == {new: {new_tail}}
 
 
 # ---------------------------------------------------------------------------
@@ -2780,6 +2856,8 @@ def test_webloop_tail_payload_with_cursor():
 
 @pytest.mark.asyncio
 async def test_webloop_pump_output_handles_disconnect():
+    from types import SimpleNamespace
+
     cron = _cron(TWO_JOBS)
     out = JobOutputStream()
     out.publish("stdout", "x\n")
@@ -2790,7 +2868,7 @@ async def test_webloop_pump_output_handles_disconnect():
             raise ConnectionResetError()
 
     # a client that vanishes mid-write is swallowed; nothing escapes.
-    await cron._pump_output(FakeResp(), out)
+    await cron._pump_output(SimpleNamespace(app=None), FakeResp(), out)
 
 
 @pytest.mark.asyncio
