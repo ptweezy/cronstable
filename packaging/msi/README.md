@@ -58,11 +58,15 @@ The `sign-windows` job runs `.github/scripts/prepare_winget.ps1` on the signed
 amd64 and arm64 MSIs and setup bundles while the other platform builds run. The
 script verifies hashes and signatures, reads product metadata, and scans each
 installer and its extracted payload with current Microsoft Defender signatures.
-It checks that the embedded MSI matches the standalone MSI and that the detached
-engine has a timestamped signature. `render_winget.py` generates manifests from
-that metadata, and `winget validate` checks them before publication. The renderer
-sets the installer type to `burn` and the scope to `machine`. It includes the
-bundle and MSI identities so WinGet can match either installed package type.
+It checks that the embedded MSI matches the standalone MSI. The script also
+verifies timestamped signatures and scans the signed engines supplied to
+`wix burn reattach`, using the retained files in `EngineDirectory`. This follows
+the [WiX bundle signing flow](https://docs.firegiant.com/wix/tools/signing/).
+`render_winget.py` generates manifests from that metadata, and `winget validate`
+checks them before publication.
+The renderer sets the installer type to `burn` and the scope to `machine`. It
+includes the bundle and MSI identities so WinGet can match either installed
+package type.
 
 The `winget` job uses `verify_winget_release.py` to compare the published installers
 and `SHA256SUMS` with the scanned hashes before submitting the saved manifests.

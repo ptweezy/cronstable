@@ -1,12 +1,14 @@
 # Read and scan the release installers. Run on an elevated Windows runner.
 param(
     [Parameter(Mandatory)][string]$AssetDirectory,
+    [Parameter(Mandatory)][string]$EngineDirectory,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [string]$WixCommand = 'wix'
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $assets = (Resolve-Path $AssetDirectory).Path
+$engines = (Resolve-Path $EngineDirectory).Path
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $output = (Resolve-Path $OutputDirectory).Path
 Start-Transcript -Path (Join-Path $output 'defender.log')
@@ -146,13 +148,17 @@ try {
         if ((Get-FileHash $embeddedMsi -Algorithm SHA256).Hash -ne $hash) {
             throw "$bundleName embeds a different MSI"
         }
-        $enginePath = Join-Path $bundleTarget 'engine.exe'
-        & $WixCommand burn detach $bundlePath -engine $enginePath
-        if ($LASTEXITCODE -ne 0) { throw "Bundle engine extraction failed: $bundleName" }
+        # Verify the signed engine supplied to `wix burn reattach`.
+        # Detaching a finished bundle preserves its outer signature headers.
+        $enginePath = Join-Path $engines $bundleName
+        if (-not (Test-Path $enginePath -PathType Leaf)) {
+            throw "$bundleName missing signed setup engine: $enginePath"
+        }
         $engineSignature = Get-AuthenticodeSignature $enginePath
         if ($engineSignature.Status -ne 'Valid' -or -not $engineSignature.TimeStamperCertificate) {
-            throw "$bundleName has an unsigned or invalid setup engine"
+            throw "$bundleName has an unsigned or invalid setup engine: $($engineSignature.Status)"
         }
+        Scan-Path $enginePath
         [xml]$bundle = Get-Content (Join-Path $bundleUx 'manifest.xml') -Raw
         $registration = $bundle.BurnManifest.Registration
         $packages = @($bundle.BurnManifest.Chain.MsiPackage)

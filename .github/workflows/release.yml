@@ -4581,7 +4581,7 @@ jobs:
         if: steps.decide.outputs.signed == 'true'
         timeout-minutes: 20
         shell: pwsh
-        run: ./.github/scripts/prepare_winget.ps1 -AssetDirectory out -OutputDirectory winget-validation -WixCommand "$env:USERPROFILE/.dotnet/tools/wix.exe"
+        run: ./.github/scripts/prepare_winget.ps1 -AssetDirectory out -EngineDirectory engines -OutputDirectory winget-validation -WixCommand "$env:USERPROFILE/.dotnet/tools/wix.exe"
       - name: Generate winget manifests
         if: steps.decide.outputs.signed == 'true'
         env:

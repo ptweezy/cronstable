@@ -308,6 +308,7 @@ def test_submission_requires_signed_scanned_validated_msis():
         assert not early[name].get("continue-on-error", False)
     scan = early["Verify and Defender-scan winget installers"]["run"]
     assert "-AssetDirectory out" in scan
+    assert "-EngineDirectory engines" in scan
     assert ".dotnet/tools/wix.exe" in scan
     assert "cd out" in early["Prepare winget checksums"]["run"]
     assert "sha256sum" in early["Prepare winget checksums"]["run"]
