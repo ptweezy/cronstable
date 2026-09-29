@@ -3067,11 +3067,12 @@ jobs:
           # base is the package manager here, with PKG_PATH already set.
           prepare: |
             set -eu
+            . .github/scripts/retry.sh
             # Keep libraries already installed as dependencies. The repository
             # can offer a newer version that conflicts with the installed one.
             for package in python313 libsodium py313-psutil py313-multidict py313-yarl py313-propcache py313-aiohappyeyeballs py313-jinja2 py313-uvloop py313-orjson rust openssl gmake pkgconf libffi sqlite3 xz bzip2; do
               if ! /usr/sbin/pkg_info -qe "$package"; then
-                /usr/sbin/pkg_add "$package"
+                retry 5 /usr/sbin/pkg_add "$package"
               fi
             done
           run: |
