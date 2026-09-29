@@ -665,6 +665,12 @@ def _leader(app):
     return app.request("/cluster").get("leader")
 
 
+def _leading(app):
+    """Return the ``/cluster`` view once ``app`` holds the fence, else None."""
+    view = app.request("/cluster")
+    return view if view["is_leader"] else None
+
+
 def test_second_daemon_defers_then_takes_over_a_killed_leader(tmp_path):
     store = tmp_path / "shared"
     nodes = []
@@ -707,9 +713,11 @@ def test_second_daemon_defers_then_takes_over_a_killed_leader(tmp_path):
         # lease and then takes over with a higher fence.
         alpha.kill()
         assert _leader(beta) == "alpha"
-        beta.wait("beta taking over", lambda: _leader(beta) == "beta")
-        view = beta.request("/cluster")
-        assert view["is_leader"] is True
+        # beta can name itself holder a round before it holds the fence: a
+        # takeover acquire that outlasts its op timeout still lands, and
+        # only the next locked renew grants the fence.
+        view = beta.wait("beta taking over", lambda: _leading(beta))
+        assert view["leader"] == "beta"
         assert view["lease"]["fence"] > fence
         beta.wait("beta running the job", lambda: beta.job_pids("led"))
 
