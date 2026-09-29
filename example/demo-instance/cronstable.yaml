@@ -39,6 +39,7 @@ defaults:
   concurrencyPolicy: Forbid
   executionTimeout: 30
   killTimeout: 2
+  monitorResources: true
 
 # Durable run history: job detail and run screens stay populated across daemon
 # restarts, jobs get the loopback state API (cursor/idempotent/lock/artifact/
@@ -188,7 +189,6 @@ jobs:
   - name: cam-timelapse
     schedule: "2-57/5 * * * *"
     concurrencyPolicy: Replace
-    monitorResources: true
     command: |
       segs=$((RANDOM % 3 + 6))
       echo "stitching driveway-cam stills ($segs segments planned)"
@@ -445,7 +445,6 @@ jobs:
     schedule: "0 2 * * sun#1"
     priority: idle
     archiveOutput: true
-    monitorResources: true
     command: |
       echo "monthly scrub of the storage pool (idle priority)"
       for disk in ssd0 hdd1 hdd2; do

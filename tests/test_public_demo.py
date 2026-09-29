@@ -11,7 +11,11 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from yarl import URL
 
-from cronstable.config import ConfigError, parse_config_string
+from cronstable.config import (
+    ConfigError,
+    parse_config_file,
+    parse_config_string,
+)
 from cronstable.cron import WEB_ROUTES, Cron, _error_envelope_middleware
 from tests._configs import DISABLED_JOB
 
@@ -511,6 +515,19 @@ def test_example_is_standard_daemon_config_with_separate_bounded_policy():
     assert "firmware-rollout" in policy["dags"]
     assert "library-refresh" in policy["dags"]
     assert unchanged()
+
+
+def test_example_monitors_resources_by_default():
+    # The defaults block turns monitoring on for every job and workflow task
+    # in the YAML file, so each Resources tab has data. Imported crontab
+    # lines carry no per-job options and stay unmonitored.
+    config = parse_config_file(str(DEMO / "cronstable.yaml"))
+    unmonitored = [j.name for j in config.jobs if not j.monitorResources]
+    assert unmonitored
+    assert all(n.startswith("legacy.crontab:") for n in unmonitored)
+    assert all(
+        t.job_template.monitorResources for d in config.dags for t in d.tasks
+    )
 
 
 def test_policy_edit_invalidates_gateway(tmp_path):
