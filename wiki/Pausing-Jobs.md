@@ -73,7 +73,7 @@ Scheduling never reads the store. Fire-time checks are memory-only. If the store
 | [Web dashboard](Web-Dashboard) | A **Paused** status with a `⏸` chip showing the expiry and note, a paused summary pill and wallboard tile, and one-click pause/resume (row button, drawer button, palette, the `p` key). |
 | [Terminal dashboard](Terminal-Dashboard) | The same status, `⏸ til HH:MM` in the next-fire column, and the same `p` toggle. |
 | [Prometheus](Metrics-with-Prometheus#per-job) | `cronstable_job_paused{job_name}` is `1` while the job is paused. `cronstable_job_runs_total` counts the skipped slots under `status="skipped"`. |
-| [MCP](MCP) | The observe tools report the same `paused` object. `cron_pause_job` and `cron_resume_job` act on it. |
+| [MCP](MCP) | The observe tools report the same `paused` object. `cron_pause_job` and `cron_resume_job` act on it and record the presented token's label as `by`. |
 
 ## See also
 

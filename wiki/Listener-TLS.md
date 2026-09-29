@@ -35,8 +35,11 @@ captured output the API returns, on the wire in the clear.
 
 You might not need listener TLS in these deployments:
 
-* **A loopback-only dashboard.** Traffic to `http://127.0.0.1:8080` stays on
-  the host.
+* **A loopback-only dashboard on a single-user host.** Traffic to
+  `http://127.0.0.1:8080` stays on the host. On a host with other local
+  accounts, one of them can bind the port while the daemon is stopped, and a
+  plaintext client then sends it the token. See
+  [authentication](HTTP-API#authentication).
 * **A `unix://` listener.** The socket lives in the host filesystem and
   [`web.socketMode`](HTTP-API#unix-socket-permissions) is its access control.
   `unix://` entries stay plaintext even when `web.tls` is set.
@@ -371,12 +374,13 @@ Two properties are worth planning around:
   listener stays up, the daemon logs a warning, and the check runs again on the
   next reload. A half-written rotation therefore costs a log line, not an
   outage.
-* **The restart briefly drops open connections.** Make-before-break is not
-  possible here: the new runner binds the port the old one still holds, so the
-  old listener must stop first. Requests in progress are dropped, and so are the
-  long-lived **SSE log streams** the dashboard and the TUI hold open. Those
-  streams reconnect on their own, and the visible effect is a tailing log view
-  that blips and resumes. Time noisy rotations accordingly.
+* **The restart briefly drops open connections.** An `https://` listener
+  closes before its replacement binds the same port. Requests in progress are
+  dropped, and so are the long-lived **SSE log streams** the dashboard and the
+  TUI hold open. Those streams reconnect on their own, and the visible effect
+  is a tailing log view that blips and resumes. Time noisy rotations
+  accordingly. `http://` listeners in the same `listen` list keep their
+  sockets through the restart.
 
 **The `state.jobApi` listener does not hot-reload.** It builds its context once
 when it starts and has no rotation check, so renewing its certificate in place

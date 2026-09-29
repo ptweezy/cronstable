@@ -229,8 +229,9 @@ winget install ptweezy.cronstable
 Upgrade later with `brew upgrade cronstable` or
 `winget upgrade ptweezy.cronstable`.
 
-winget installs a signed, per-machine MSI. Approve the administrator prompt,
-and then open a new shell so that `cronstable` is on your `PATH`. The installer
+WinGet runs a signed setup executable that installs the per-machine MSI.
+The administrator prompt displays cronstable's full wordmark. Approve the
+prompt, then open a new shell so that `cronstable` is on your `PATH`. The installer
 registers the Windows service without starting it. It also creates the
 configuration directory, which only SYSTEM and Administrators can write. The
 service starts at the next boot and runs no jobs until you add configuration.

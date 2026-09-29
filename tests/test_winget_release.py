@@ -1,4 +1,4 @@
-"""Verify the link between scanned MSIs and published release assets."""
+"""Verify that published MSIs and setup bundles match the scanned files."""
 
 import hashlib
 import importlib.util
@@ -39,12 +39,17 @@ def published(tmp_path):
     metadata = {}
     sums = []
     for arch in ("amd64", "arm64"):
-        name = f"cronstable-windows-{arch}.msi"
-        content = f"signed MSI for {arch}".encode()
-        (tmp_path / name).write_bytes(content)
-        digest = hashlib.sha256(content).hexdigest()
-        metadata[arch] = {"ProductVersion": "1.2.50", "Sha256": digest.upper()}
-        sums.append(f"{digest}  {name}\n")
+        metadata[arch] = {"ProductVersion": "1.2.50"}
+        for suffix, field in (
+            (".msi", "Sha256"),
+            ("-setup.exe", "BundleSha256"),
+        ):
+            name = f"cronstable-windows-{arch}{suffix}"
+            content = f"signed {name}".encode()
+            (tmp_path / name).write_bytes(content)
+            digest = hashlib.sha256(content).hexdigest()
+            metadata[arch][field] = digest.upper()
+            sums.append(f"{digest}  {name}\n")
     (tmp_path / "SHA256SUMS").write_text("".join(sums), encoding="utf-8")
     return metadata, tmp_path
 
@@ -55,17 +60,20 @@ def test_published_files_match_scan(published):
 
 
 @pytest.mark.parametrize("arch", ["amd64", "arm64"])
+@pytest.mark.parametrize(
+    "suffix,field", [(".msi", "Sha256"), ("-setup.exe", "BundleSha256")]
+)
 def test_replaced_asset_blocks_submission_even_with_updated_sums(
-    published, arch
+    published, arch, suffix, field
 ):
     metadata, assets = published
-    name = f"cronstable-windows-{arch}.msi"
-    content = b"rebuilt MSI with a different signature"
+    name = f"cronstable-windows-{arch}{suffix}"
+    content = b"rebuilt installer with a different signature"
     (assets / name).write_bytes(content)
     sums = assets / "SHA256SUMS"
     sums.write_text(
         sums.read_text("utf-8").replace(
-            metadata[arch]["Sha256"].lower(),
+            metadata[arch][field].lower(),
             hashlib.sha256(content).hexdigest(),
         ),
         encoding="utf-8",
@@ -83,9 +91,10 @@ def test_published_sums_must_match_scan(published):
         verifier.verify("1.2.50", metadata, assets)
 
 
-def test_missing_asset_blocks_submission(published):
+@pytest.mark.parametrize("suffix", [".msi", "-setup.exe"])
+def test_missing_asset_blocks_submission(published, suffix):
     metadata, assets = published
-    (assets / "cronstable-windows-arm64.msi").unlink()
+    (assets / f"cronstable-windows-arm64{suffix}").unlink()
     with pytest.raises(FileNotFoundError):
         verifier.verify("1.2.50", metadata, assets)
 

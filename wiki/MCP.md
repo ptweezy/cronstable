@@ -11,27 +11,35 @@ backfill, or approve a DAG).
 It is served two ways from the same code:
 
 - **`POST /mcp`** on the existing [`web.listen`](HTTP-API) addresses, a
-  stateless [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+  stateless [Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http)
   JSON-RPC endpoint that inherits the web API's `authToken` / unix-socket auth.
 - **`cronstable mcp`**, a small **stdio bridge** that desktop clients launch as
   a subprocess. It forwards frames to a running daemon's `/mcp`.
 
 It is hand-written in pure Python with **no new dependencies** (the same
-minimal-dependency stance as the rest of cronstable), targets MCP revision
-`2025-11-25`, and exposes **tools**, **resources**, and **prompts**.
+minimal-dependency stance as the rest of cronstable), and exposes **tools**,
+**resources**, **prompts**, and argument **completion**.
+
+## Protocol revisions
+
+The endpoint serves both eras of the protocol, so clients that speak either
+one connect without configuration:
+
+- **`2026-07-28`**, the stateless revision. A request whose `_meta` carries
+  `io.modelcontextprotocol/protocolVersion` is served on its own:
+  `server/discover` reports the supported versions, capabilities, and server
+  identity, and every result carries `resultType`. The list results and
+  `resources/read` carry the cache hints `ttlMs` and `cacheScope: "private"`.
+  Over HTTP, the server checks that the `MCP-Protocol-Version`, `Mcp-Method`,
+  and `Mcp-Name` headers match the request body, and answers a mismatch with
+  error `-32020` and an unsupported version with `-32022`.
+- **`2025-11-25`**, **`2025-06-18`**, and **`2025-03-26`**, the revisions a
+  client negotiates with `initialize`.
+
+Neither era keeps sessions: the server issues no `Mcp-Session-Id` and opens no
+`GET` stream.
 
 ## Enabling it
-
-`cron_list_pools` inspects shared capacity and waiting work.
-`cron_cancel_queued` cancels a waiting entry using its `pool` and `id`.
-`cron_preview_recovery` previews selected tasks or failed dates;
-`cron_recover_dag` executes that preview with its `plan_token`. Cancellation
-and recovery execution require `confirm: true` and a writable MCP setup.
-Recovery also requires `allow_config_change: true` when the preview reports
-a configuration change. See [resource pools](Resource-Pools) and
-[workflow recovery](Workflow-Recovery) for behavior and limits.
-
-### Server configuration
 
 The server is **off by default**. Add an [`mcp`](Configuration-Reference#mcp)
 section (it uses the [`web`](HTTP-API) listeners, so a `web` section is
@@ -74,25 +82,47 @@ default) strips every mutating tool regardless of toolset.
 
 | Toolset | Tools |
 | --- | --- |
-| `observe` (read) | `cron_get_status`, `cron_list_jobs`, `cron_get_job`, `cron_list_runs`, `cron_get_job_trends`, `cron_get_job_resources`, `cron_get_cluster`, `cron_get_fleet`, `cron_get_node`, `cron_query_metrics`, `cron_get_version`, `cron_tail_job_logs`, `cron_schedule_pressure`, `cron_schedule_duplicates`, `cron_suggest_slot`, `cron_validate_schedule`, `cron_explain_schedule`, `cron_why_no_run` |
-| `dags` (read) | `cron_list_dags`, `cron_list_dag_runs`, `cron_get_dag_run`, `cron_get_dag_xcom`, `cron_tail_dag_task_logs` |
+| `observe` (read) | `cron_get_status`, `cron_list_jobs`, `cron_get_job`, `cron_list_runs`, `cron_get_job_trends`, `cron_get_job_resources`, `cron_get_cluster`, `cron_get_fleet`, `cron_get_node`, `cron_query_metrics`, `cron_get_version`, `cron_tail_job_logs`, `cron_schedule_pressure`, `cron_schedule_duplicates`, `cron_suggest_slot`, `cron_validate_schedule`, `cron_explain_schedule`, `cron_why_no_run`, `cron_list_pools` |
+| `dags` (read) | `cron_list_dags`, `cron_list_dag_runs`, `cron_get_dag_run`, `cron_get_dag_xcom`, `cron_tail_dag_task_logs`, `cron_preview_recovery` |
 | `state` (read) | `cron_inspect_state` (store overview / a namespace's documents / a stream's records; KV values and secrets redacted) |
-| `act` (**mutating**) | `cron_run_job`, `cron_cancel_job`, `cron_pause_job`, `cron_resume_job` |
-| `dags` (**mutating**) | `cron_trigger_dag`, `cron_backfill_dag`, `cron_decide_gate` |
+| `act` (**mutating**) | `cron_run_job`, `cron_cancel_job`, `cron_pause_job`, `cron_resume_job`, `cron_cancel_queued` |
+| `dags` (**mutating**) | `cron_trigger_dag`, `cron_backfill_dag`, `cron_recover_dag`, `cron_decide_gate` |
 
-Mutating tools require an explicit `confirm: true` argument, carry honest
-`destructiveHint` annotations, and re-check the same authorization as the REST
-API. `cron_backfill_dag` defaults to `dry_run: true`. It previews the range and
-executes only on `dry_run: false` **and** `confirm: true`.
+A tool result has two text blocks, a one-line summary followed by the result
+as JSON, plus the same object in `structuredContent`. Clients that pass only
+the text to the model still see the data. `cron_get_status`,
+`cron_list_jobs`, and the three schedule-authoring tools declare an
+`outputSchema` for their structured results. A call with an argument the tool
+does not accept returns an error result that names the argument and lists the
+accepted ones, so the model can correct the call.
+
+Mutating tools require an explicit `confirm: true` argument and re-check the
+same authorization as the REST API. The tools that launch configured commands
+(`cron_run_job`, `cron_trigger_dag`, `cron_backfill_dag`, and
+`cron_recover_dag`) and `cron_decide_gate`, which releases the tasks waiting
+on a gate, report `destructiveHint: true` and `openWorldHint: true`, so a
+client that asks before risky calls asks before these. `cron_backfill_dag`
+defaults to `dry_run: true`. It previews the range and executes only on
+`dry_run: false` **and** `confirm: true`.
 
 `cron_pause_job` takes `name` plus an optional `durationSeconds` and `note`,
 and holds the job's scheduled fires for the window (one hour when
 `durationSeconds` is omitted). `cron_resume_job` takes `name` and ends the
-pause. Both call the daemon's own pause path with the acting channel recorded
-as `mcp`, so a pause taken by an agent reads as such in the audit fields. The
+pause. Both call the daemon's own pause path. The audit field `by` records the
+label of the presented token (`mcp` on a listener without tokens), and the
+channel records `mcp`, so a pause taken by an agent reads as such. The
 observe tools report the resulting `paused` and `sla` state on every job
 payload. Semantics: [pausing jobs](Pausing-Jobs) and
 [late-run detection](Late-Run-Detection).
+
+`cron_list_pools` inspects shared capacity and waiting work.
+`cron_cancel_queued` cancels a waiting entry using its `pool` and `id`.
+`cron_preview_recovery` previews selected tasks or failed dates;
+`cron_recover_dag` executes that preview with its `plan_token`. Cancellation
+and recovery execution require `confirm: true` and a writable MCP setup.
+Recovery also requires `allow_config_change: true` when the preview reports
+a configuration change. See [resource pools](Resource-Pools) and
+[workflow recovery](Workflow-Recovery) for behavior and limits.
 
 The three schedule-authoring tools make an agent a competent schedule
 **author**, not only a reader, with the daemon's own engine as the authority:
@@ -116,24 +146,45 @@ can attach as context, scoped by the same toolsets:
 - Fixed: `cronstable://status`, `cronstable://cluster`, `cronstable://fleet`, `cronstable://version`
 - Templates: `cronstable://jobs/{name}`, `cronstable://jobs/{name}/runs`, `cronstable://dags/{name}`, `cronstable://dags/{name}/runs/{run_key}`, `cronstable://state/{ns}`
 
+Template values are percent-encoded, as RFC 6570 expands them: a job named
+`nightly backup` is `cronstable://jobs/nightly%20backup`.
+
 Every critical read is *also* a tool, because client support for resources is
 uneven. Resources are an optimization, never the only path.
 
 ### Prompts (canned triage playbooks)
 
-Enabled by default (`prompts: true`), and scoped by the same toolsets as
-resources. Slash-command workflows that chain the read tools:
+Enabled by default (`prompts: true`). Slash-command workflows that chain the
+read tools. A prompt is served only when every tool it calls is available to
+the caller:
 
 - `triage_job_failure(job)`: root-cause a failing job
 - `why_did_dag_run_fail(dag, run_key)`: walk a failed DAG run (needs the
   `dags` toolset)
-- `blast_radius(target)`: scope what else is at risk
+- `blast_radius(target)`: scope what else is at risk, adding the workflow and
+  shared-state checks when the `dags` and `state` toolsets are on
 - `fleet_health_summary()`: a wallboard-style summary
 - `backfill_plan(dag, from, to)`: reason about a backfill before running it
-  (needs the `dags` toolset)
+  (needs the `dags` toolset, `readOnly: false`, and a token that can call
+  `cron_backfill_dag`)
 
 With the default `toolsets: [observe]`, only the three `observe` prompts are
-served.
+served. Every prompt argument is required, and `prompts/get` without one
+returns an invalid-params error.
+
+### Argument completion
+
+Clients that support completion suggest values while you fill in a prompt
+argument or a resource template variable:
+
+- `job` and a job template's `{name}`: job names
+- `target`: job and workflow names
+- `dag` and a workflow template's `{name}`: workflow names
+- `run_key`: the recent runs of the workflow already chosen for `dag` or
+  `{name}`
+
+Matching is a case-insensitive prefix, and a reply lists at most 100 values
+with the total number of matches.
 
 ## Wiring a client to it
 
@@ -174,24 +225,37 @@ earlier.
 ### The stdio bridge
 
 `cronstable mcp` reads newline-delimited JSON-RPC on stdin and forwards each
-frame to `<url>/mcp`, writing replies to stdout (only frames go to stdout; logs
-go to stderr). It needs a **reachable running daemon**, the right design for an
-operations tool. Flags:
+frame to `<url>/mcp`, writing the reply to stdout (only frames go to stdout;
+logs go to stderr). It needs a **reachable running daemon**, the right design
+for an operations tool.
+
+For a frame whose `_meta` names a protocol version, the bridge copies that
+version, the method, and the tool, prompt, or resource name into the
+`MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name` headers, and
+Base64-encodes a name that is not plain ASCII. Other frames carry the version
+`initialize` negotiated. The daemon's JSON-RPC errors reach the client as the
+daemon sent them, so a client can pick a version from a `-32022` error. When
+the bridge cannot reach the daemon, it replies with its own error, code
+`-31000`. The bridge drops JSON-RPC responses a client writes, because the
+daemon sends no requests. Flags:
 
 - `--url` (default `http://127.0.0.1:8080`): the daemon's web base URL
 - `--token` / `--token-env`: the bearer token (defaults to the
   `CRONSTABLE_WEB_TOKEN` env var if set)
-- `--protocol-version`: pin the `MCP-Protocol-Version` header the bridge sends
-  before `initialize` completes (default `2025-11-25`); after `initialize`
-  returns, the bridge adopts the server's negotiated version
+- `--protocol-version`: pin the `MCP-Protocol-Version` header of the frames
+  sent before `initialize` completes (default `2025-11-25`); after
+  `initialize` returns, the bridge adopts the server's negotiated version
 - `--timeout` (default `30.0`): per-request deadline, in seconds, for each
   forwarded frame
-- `--check`: handshake the endpoint (`initialize` + `tools/list`) and exit, a
-  quick wiring check
+- `--check`: probe the endpoint with `server/discover` (or `initialize`,
+  for a daemon that does not answer it), count its tools, print the protocol
+  and era, and exit
+
+With the default configuration:
 
 ```shell
 $ cronstable mcp --url http://127.0.0.1:8080 --token-env CRONSTABLE_WEB_TOKEN --check
-mcp check: ok - protocol 2025-11-25, 29 tool(s) at http://127.0.0.1:8080/mcp
+mcp check: ok - protocol 2026-07-28 (modern; the daemon serves 2026-07-28, 2025-11-25, 2025-06-18, 2025-03-26), 19 tool(s) at http://127.0.0.1:8080/mcp
 ```
 
 ## Security
@@ -217,16 +281,27 @@ The MCP surface matches cronstable's hardening and is safe by default:
   A plain `https://` listener does not lift the gate: encryption is not caller
   authentication.
 
+- **Per-tool scopes.** With [scoped tokens](HTTP-API#scoped-tokens-webauthtokens), `/mcp`
+  accepts any token with the `view` scope, so a `view` token opens a read-only
+  session and cannot reach the REST control routes. Each tool then requires
+  the scope of its REST route: `control` for the mutating tools and
+  `cron_preview_recovery`, `approve` for `cron_decide_gate`, and `view` for
+  the rest. `tools/list` shows only the tools the presented token can call,
+  and the prompts follow. Anonymous access (`web.anonymousScopes`) never
+  reaches `/mcp`.
+
 - **Origin + body defenses.** A present, non-allow-listed `Origin` is refused
   `403` (a DNS-rebinding defense; browser clients go on `mcp.allowedOrigins`).
   An oversized request body is refused `413`.
 
 - **Human-in-the-loop for writes.** Mutating tools require `confirm: true`.
-  Backfills default to a dry-run preview. Every action re-checks the REST
-  authorization, including scope promotions: `cron_decide_gate` requires the
-  presented token to hold the `approve` scope, exactly like the REST decision
-  route. Tool annotations are honest hints. The real guards are the read-only
-  default, the confirm gate, and server-side authorization.
+  Backfills default to a dry-run preview. Tool annotations are hints for the
+  client. The real guards are the read-only default, the confirm gate, and
+  server-side authorization.
+
+- **Attribution.** An action records the presented token's label as `by`.
+  `cron_decide_gate` appends its optional `by` argument, up to 100
+  characters, to the label as display text.
 
 - **Redaction.** `cron_inspect_state` mirrors the dashboard's metadata-only
   stance: KV values become a size/type summary and secret **names** are shown
@@ -251,6 +326,6 @@ CRONSTABLE_WEB_TOKEN=dev-token \
   `POST /mcp` entry.
 - [MCP Server Design](MCP-Server-Design): the design document this server was
   built from, with notes on where the implementation diverged.
-- The [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25)
+- The [MCP specification](https://modelcontextprotocol.io/specification/2026-07-28)
   and the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector)
   for debugging a server.

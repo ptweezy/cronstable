@@ -198,6 +198,9 @@ dev = [
     "mypy-extensions",
     # validates docs/openapi.yaml (.github/scripts/check_openapi.py, tox -e openapi).
     "openapi-spec-validator",
+    # validates MCP tool results against their declared outputSchema
+    # (tests/test_mcp_tools.py).
+    "jsonschema",
     # Compare the saved cron test cases with the original library in
     # tests/test_cronexpr.py on each CI runner.
     "crontab>=1.0.5,<2",

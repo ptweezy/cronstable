@@ -758,7 +758,9 @@ carries no data and no secrets. The first data request returns `401`, and the
 dashboard then prompts you for the token, stores it **only in that browser tab**
 (`sessionStorage`), and attaches it as `Authorization: Bearer …` on every
 subsequent request. You can update or clear the stored token from the header's
-token button at any time.
+token button at any time. Saving or clearing a token rewrites the calendar
+feed links from the new token and empties the pairing sheet, so no link or
+payload in the tab keeps the previous token.
 
 ### Scope-aware chrome
 

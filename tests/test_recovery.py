@@ -186,3 +186,30 @@ async def test_retention_preserves_source_during_recovery_preparation(dag_cron, 
     assert not repeated["created"]
     with pytest.raises(recovery.RecoveryError, match="selection differs"):
         await cron._dag.recover("flow", key, mode="from", tasks=["extract"], plan_token=preview["planToken"])
+
+
+def test_configuration_revision_hashes_environment_names_only(tmp_path, monkeypatch):
+    from cronstable.config import parse_config_string
+
+    env_file = tmp_path / "task.env"
+
+    def revision(secret, extra=""):
+        monkeypatch.setenv("DB_PASSWORD", secret)
+        env_file.write_text(f"TOKEN={secret}\n")
+        text = CONFIG.replace(
+            "      - id: extract\n        command: ignored\n",
+            "      - id: extract\n        command: ignored\n"
+            f"        env_file: {env_file.as_posix()}\n"
+            "        environment:\n"
+            "          - key: DB_PASSWORD\n"
+            "            value: ${DB_PASSWORD}\n" + extra,
+        )
+        config = parse_config_string(text, "")
+        env = config.dags[0].task_templates["extract"].environment
+        values = {e["key"]: e["value"] for e in env}
+        assert values["DB_PASSWORD"] == values["TOKEN"] == secret
+        return recovery.configuration_revision(config.dags[0])
+
+    assert revision("orange77") == revision("correct-horse")
+    added = "          - key: MODE\n            value: full\n"
+    assert revision("orange77", added) != revision("orange77")

@@ -42,7 +42,7 @@ def test_every_shipped_amd64_format_has_a_v3_counterpart():
     assets = set(files.split())
     baseline = {p for p in assets if re.search(r"-amd64(?:$|[.-])", p)}
     assert (
-        len(baseline) == 14
+        len(baseline) == 15
     )  # Both Linux libcs, native binaries and packages.
     assert {p.replace("-amd64", "-amd64v3") for p in baseline} <= assets
     assert not any("macos26" in p for p in assets)

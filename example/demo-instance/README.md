@@ -27,13 +27,16 @@ No registration or token entry is required in the dashboard or iOS demo:
 4. Trigger **firmware-rollout**, open its newest run, and **Approve** or
    **Reject** the gate. If a run is already active, open that one. Private
    housekeeping resolves abandoned gates after at least five minutes.
-5. Pause/resume a sample job. Visitor pauses expire after **one minute**.
+5. Trigger **library-refresh**, then open **Resource pools**: its three
+   checksum tasks share the two `nas-disks` slots, so one waits its turn.
+6. Pause/resume a sample job. Visitor pauses expire after **one minute**.
 
 Everyone shares this board: starts have a ten-second cooldown, and all
 mutations have a one-second cooldown. Busy requests return 429 with
-`Retry-After`. The gateway's allowlist names 25 jobs and all three workflows.
-The operator, secret-handling example (`cert-check`), disabled legacy job and
-imported crontab entries remain read-only for visitors.
+`Retry-After`. The gateway's allowlist names 25 jobs and all four workflows.
+The operator, secret-handling example (`cert-check`), pool self-test
+(`smart-selftest`), disabled legacy job and imported crontab entries remain
+read-only for visitors.
 
 The demo has no real push pairing or APNs delivery; the iOS alert cards are
 local samples. Real notifications need a separate configured server.

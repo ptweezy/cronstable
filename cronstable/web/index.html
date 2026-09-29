@@ -9661,6 +9661,17 @@ var qrcode = function() {
     focusLater($("modalWrap"), $("tokenInput"), 40);
   }
   function closeModal() { closeOverlay("modalWrap"); }
+  // Rebuild or blank everything minted from the previous token.
+  function tokenChanged() {
+    $("tokenInput").value = "";
+    updateIcsLink();
+    if (state.drawerJob && state.tab === "schedule") renderSchedule(state.drawerJob);
+    else $("schedulePane").innerHTML = "";
+    pairSeq++;
+    $("pairPayload").textContent = "";
+    $("pairQr").textContent = "";
+    updateAuthBtn(); closeModal(); loadWhoami(); loadJobs();
+  }
 
   function toast(kind, msg) {
     const e = el("div", "toast " + kind);
@@ -11293,9 +11304,9 @@ var qrcode = function() {
     $("tokenSave").addEventListener("click", () => {
       const v = $("tokenInput").value.trim();
       if (v) sessionStorage.setItem(TOKEN_KEY, v); else sessionStorage.removeItem(TOKEN_KEY);
-      updateAuthBtn(); closeModal(); loadWhoami(); loadJobs();
+      tokenChanged();
     });
-    $("tokenClear").addEventListener("click", () => { sessionStorage.removeItem(TOKEN_KEY); updateAuthBtn(); closeModal(); loadWhoami(); loadJobs(); });
+    $("tokenClear").addEventListener("click", () => { sessionStorage.removeItem(TOKEN_KEY); tokenChanged(); });
     $("tokenCancel").addEventListener("click", closeModal);
     $("modalWrap").addEventListener("click", (e) => { if (e.target === $("modalWrap")) closeModal(); });
     $("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("tokenSave").click(); });

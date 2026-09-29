@@ -515,6 +515,48 @@ def test_anonymous_viewer_with_a_wrong_token_gets_the_modal(browser, tmp_path):
             assert page.inner_text("#authLabel") == "view only"
 
 
+@pytest.mark.parametrize("replacement", [None, e2e.VIEW_TOKEN])
+def test_changing_the_token_leaves_no_copy_in_the_page(
+    browser, tmp_path, replacement
+):
+    """Clear and Save rebuild or blank every value derived from the token."""
+    with e2e.Daemon(tmp_path, auth="public") as daemon:
+        with e2e.open_page(
+            browser, daemon.url, token=e2e.FULL_TOKEN, prefs={"week": True}
+        ) as page:
+            page.wait_for_function(
+                "(t) => document.getElementById('icsLink')"
+                ".getAttribute('href').endsWith(t)",
+                arg=e2e.FULL_TOKEN,
+            )
+            _click(page, "#settingsBtn")
+            _click(page, "#openPair")
+            _open(page, "pairWrap")
+            assert e2e.FULL_TOKEN in page.text_content("#pairPayload")
+            _click(page, "#pairClose")
+            _closed(page, "pairWrap")
+            _click(page, '#rows [data-logs="alpha-ok"]')
+            _click(page, '#dTabs button[data-tab="schedule"]')
+            page.wait_for_selector("#schedulePane .icslink")
+            _click(page, "#authBtn")
+            _open(page, "modalWrap")
+            if replacement is None:
+                page.click("#tokenClear")
+            else:
+                page.fill("#tokenInput", replacement)
+                page.click("#tokenSave")
+            _closed(page, "modalWrap")
+            assert _stored_token(page) == replacement
+            assert e2e.FULL_TOKEN not in page.content()
+            assert page.input_value("#tokenInput") == ""
+            expected = "/calendar.ics" + (
+                "?token=" + replacement if replacement else ""
+            )
+            assert page.get_attribute("#icsLink", "href") == expected
+            feed = page.get_attribute("#schedulePane .icslink", "href")
+            assert feed == "/jobs/alpha-ok" + expected
+
+
 # --------------------------------------------------------------------------
 # refusals and probe failures
 # --------------------------------------------------------------------------

@@ -257,6 +257,10 @@ exe_kwargs = dict(
     console=True,
     version=version_resource,
 )
+if sys.platform == "win32":
+    exe_kwargs["icon"] = os.path.join(
+        SPECPATH, "..", "packaging", "windows", "cronstable.ico"
+    )
 if BUNDLE in ("onedir", "both"):
     # dist/cronstable/cronstable.exe plus _internal/. The exe keeps the
     # version resource so Properties > Details works on the shipped file.

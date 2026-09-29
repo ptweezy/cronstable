@@ -17,11 +17,11 @@ One small set of files is excluded from the MIT grant: the rendered brand
 artwork. These files are in directories that are otherwise MIT-licensed; for
 example, they share `docs/img/` with dozens of ordinary screenshots. A
 directory-level `LICENSE` file would claim too much, so the files are listed by
-name instead, in three places. You can reach all three from any one of them:
+name. These documents describe the license and artwork:
 
 - [LICENSE](LICENSE) names the exclusion, so the grant itself states its scope.
 - This section has the authoritative list.
-- [docs/img/README.md](docs/img/README.md) repeats the list next to the files.
+- [docs/img/README.md](docs/img/README.md) lists the artwork in `docs/img/`.
 
 The following files are excluded:
 
@@ -30,6 +30,7 @@ The following files are excluded:
 | `docs/**/logo-balance.gif`, `docs/**/logo-balance.webp` | the animated wordmark, dark |
 | `docs/**/logo-balance-light.gif`, `docs/**/logo-balance-light.webp` | the animated wordmark, light |
 | `docs/**/ios-icon.png` | the iOS app icon |
+| `packaging/windows/cronstable.ico`, `packaging/windows/cronstable-logo.png` | the Windows app and installer wordmark |
 
 These files are the finished logo artwork, not source code. You may reproduce
 them **unmodified** when you refer to cronstable itself. This is the same

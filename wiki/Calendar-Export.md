@@ -61,7 +61,7 @@ The `◫ week` toolbar button opens a seven-day grid of scheduled runs, starting
 - Runs follow each job's time zone and **appear in your browser's local time**. The dashed line marks the current time.
 - Each chip represents a scheduled run, colored by job. Chips sharing a quarter-hour split the column. Past times today appear dimmed. Clicking a chip opens the job's **Schedule** tab.
 - **High-frequency jobs** (more than about eight runs a day) appear in the **background hum** summary strip below the grid. Clicking a strip chip opens the same job drawer.
-- The card header links to the fleet `.ics` feed; each job's **Schedule** tab links to its feed. Both links include the token when authentication is enabled.
+- The card header links to the fleet `.ics` feed; each job's **Schedule** tab links to its feed. Both links include the tab's current token when authentication is enabled, and saving or clearing the token rewrites them.
 
 The view is a persisted preference like the other dashboard panels, and appears in the command palette as "Toggle week calendar". The [terminal dashboard](Terminal-Dashboard) carries the same panel under the same palette command: a day-by-hour fire grid, the agenda, and the hum strip, rendered in UTC.
 

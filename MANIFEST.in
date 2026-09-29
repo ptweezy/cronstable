@@ -25,13 +25,9 @@ recursive-exclude * __pycache__
 recursive-exclude * *.py[co]
 recursive-exclude env *
 
-# docs/ is the website tree. setuptools_scm's git file finder seeds the sdist
-# with every tracked file before this file is even read, so the ~116 MB of
-# screenshots and diagrams under docs/ rode along and pushed the 1.2.31 sdist
-# past PyPI's 100 MiB per-file limit. Deny the tree and add back only the
-# files the shipped tests/ tree reads, so future website assets cannot leak
-# in again. tests/test_packaging.py fences this list: it scans tests/ for
-# repo-relative docs/ reads and fails if one is missing here.
+# Exclude website screenshots and animations from source distributions.
+# Include the fixtures used by the shipped tests.
+# tests/test_packaging.py checks that the fixture paths stay in this list.
 prune docs
 include docs/openapi.yaml
 include docs/demo/index.html

@@ -1314,14 +1314,16 @@ paths:
       `mcp.enabled` is set. The JSON-RPC 2.0 protocol it speaks (Streamable
       HTTP transport, message set, toolsets) is documented on the MCP wiki
       page, not re-typed here; this entry pins the surface and its auth. Every
-      method requires the `control` scope from a scoped token: /mcp is an
-      action-capable surface, whatever its own `mcp.readOnly`/toolset config
-      then narrows. It also enforces its own `Origin` allow-list.
+      method requires the `view` scope from a scoped token, and each tool
+      then requires the scope of the REST route it mirrors (`control` for
+      the mutating tools, `approve` for the gate decision). Anonymous access
+      (`web.anonymousScopes`) never reaches it. It also enforces its own
+      `Origin` allow-list.
     post:
       tags: [mcp]
       summary: MCP JSON-RPC message
       operationId: postMcp
-      x-required-scope: control
+      x-required-scope: view
       requestBody:
         required: true
         content:
@@ -1334,19 +1336,35 @@ paths:
             application/json:
               schema: { type: object, additionalProperties: true }
         "202":
-          description: A notification or client response; no reply body.
+          description: A notification; no reply body.
         "400":
-          description: Empty body, malformed JSON, or a JSON-RPC batch.
+          description: >-
+            An empty body, malformed JSON, a JSON-RPC batch, a JSON-RPC
+            response (this server sends no requests), or an unsupported
+            `MCP-Protocol-Version`, each as the `Error` envelope. A
+            2026-07-28 request whose `_meta` or mirrored headers fail
+            validation, or whose version is unsupported, gets a JSON-RPC
+            error instead (`McpError`: -32602, -32020 or -32022).
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/McpError"
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: >-
+            A 2026-07-28 request naming a method this server does not
+            implement (-32601).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/McpError" }
     get:
       tags: [mcp]
       summary: Not supported (stateless transport)
       operationId: getMcp
-      x-required-scope: control
+      x-required-scope: view
       responses:
         "405":
           description: >-
@@ -1361,7 +1379,7 @@ paths:
       tags: [mcp]
       summary: CORS preflight
       operationId: optionsMcp
-      x-required-scope: control
+      x-required-scope: view
       responses:
         "204":
           description: Preflight approved for an allow-listed `Origin`.
@@ -1525,12 +1543,12 @@ components:
         `web.authTokens` is set. Compared in constant time; a missing or wrong
         token is 401. Tokens may be *scoped*: the scalar `web.authToken` grants
         all scopes, while each `web.authTokens` entry lists some of `view`
-        (every read-only GET), `control` (the mutating POSTs and every /mcp
-        method, GET and OPTIONS included) and `approve` (the DAG decision
-        route); `control` and `approve` each imply `view`. A recognised token
+        (every read-only GET, and every /mcp method), `control` (the
+        mutating POSTs) and `approve` (the DAG decision route); `control` and
+        `approve` each imply `view`. A recognised token
         that lacks the scope an operation requires is 403, not 401. The
         required scope defaults to `view` for GET/HEAD and `control` for other
-        methods; operations that need more carry an `x-required-scope`
+        methods; operations that need another carry an `x-required-scope`
         extension. A daemon may also grant scopes to callers presenting no
         credential at all (`web.anonymousScopes`, `view` only), in which case
         the same scope table decides the request and an uncovered operation
@@ -1636,7 +1654,8 @@ components:
       description: >-
         The uniform error envelope. Every 4xx/5xx body this API's application
         serves is this object, the auth middleware's 401 included, so clients
-        parse failures one way across every endpoint. A request that fails
+        parse failures one way across every endpoint. The one exception is
+        /mcp's 2026-07-28 path, whose protocol errors are `McpError`. A request that fails
         before it reaches the application (a malformed request line, an
         unparseable method token, oversized request headers, an unrecognised
         `Expect:`) is answered by the HTTP server itself as text/plain and is
@@ -1648,6 +1667,28 @@ components:
           type: string
           description: Human-readable reason.
       required: [error]
+    McpError:
+      type: object
+      description: >-
+        A JSON-RPC 2.0 error response, the one exception to the `Error`
+        envelope. /mcp answers a 2026-07-28 request that fails validation
+        with one, as the MCP specification requires, so a client can tell a
+        modern server's rejection from a legacy one's.
+      properties:
+        jsonrpc: { type: string, enum: ["2.0"] }
+        id:
+          description: The request's id, or null when it could not be read.
+          nullable: true
+        error:
+          type: object
+          properties:
+            code: { type: integer }
+            message: { type: string }
+            data:
+              description: >-
+                For -32022, the `supported` versions and the `requested` one.
+          required: [code, message]
+      required: [jsonrpc, id, error]
 
     WhoAmI:
       type: object

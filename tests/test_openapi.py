@@ -85,21 +85,33 @@ def test_scope_overrides_name_registered_routes():
 
 
 _ERROR_SCHEMA_REF = "#/components/schemas/Error"
+_MCP_ERROR_REF = "#/components/schemas/McpError"
 
 
-def _is_error_schema(schema):
+def _is_error_schema(schema, path=None):
     """The schema IS the Error envelope, or composes it in via ``allOf``.
 
     The composed form is for the one error body that carries extra keys
     alongside `error` (the push `test` 502's `device`/`status`), which is
-    still an envelope a generic client can read.
+    still an envelope a generic client can read. ``/mcp`` alone may also
+    answer with ``McpError``, the JSON-RPC error MCP 2026-07-28 requires,
+    by itself or as a ``oneOf`` alternative to the envelope.
     """
     if schema.get("$ref") == _ERROR_SCHEMA_REF:
         return True
-    return any(
+    if any(
         part.get("$ref") == _ERROR_SCHEMA_REF
         for part in schema.get("allOf") or ()
+    ):
+        return True
+    if path != "/mcp":
+        return False
+    refs = (
+        [schema.get("$ref")]
+        if "$ref" in schema
+        else [part.get("$ref") for part in schema.get("oneOf") or ()]
     )
+    return bool(refs) and set(refs) <= {_ERROR_SCHEMA_REF, _MCP_ERROR_REF}
 
 
 def test_every_error_response_declares_the_json_envelope():
@@ -136,7 +148,7 @@ def test_every_error_response_declares_the_json_envelope():
                     )
                     continue
                 body = resp.get("content", {}).get("application/json", {})
-                assert _is_error_schema(body.get("schema") or {}), (
+                assert _is_error_schema(body.get("schema") or {}, path), (
                     "{} {} {} declares no application/json Error body; add "
                     "a content block or use a #/components/responses "
                     "ref".format(method.upper(), path, status)

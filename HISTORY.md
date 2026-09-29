@@ -1,5 +1,71 @@
 # History
 
+## 1.2.59
+
+- WinGet installs and upgrades use signed setup executables that display
+  the full cronstable logo in User Account Control (UAC) prompts. Windows
+  executables and installed application entries use the same logo. The setup
+  installers support upgrades from existing MSI installations. Standalone
+  MSI packages are also available.
+- MCP tool results carry their data as JSON in a second text block after
+  the one-line summary, so clients that pass only `content` to the model,
+  such as Claude Desktop, can answer from it. `cron_get_status`,
+  `cron_list_jobs`, and the three schedule-authoring tools declare an
+  `outputSchema`.
+- The MCP server serves protocol revision `2026-07-28` beside `2025-11-25`
+  and its predecessors on the same endpoint. A request that carries its
+  version in `_meta` is served statelessly, with `server/discover`,
+  `resultType`, cache hints, and checks that the `MCP-Protocol-Version`,
+  `Mcp-Method`, and `Mcp-Name` headers match the body. The `cronstable mcp`
+  bridge sets those headers for such frames and passes the daemon's JSON-RPC
+  errors through; its own transport errors use code `-31000`.
+  `cronstable mcp --check` reports which era the daemon speaks.
+- A `view` token opens a read-only MCP session. `/mcp` requires `view`, each
+  tool requires the scope of its REST route, and `tools/list` and the
+  prompts show only what the presented token can call. Anonymous access
+  (`web.anonymousScopes`) does not reach `/mcp`.
+- MCP pauses, resumes, and gate decisions record the presented token's label
+  as `by`. A `by` argument to `cron_decide_gate` must be a string of at most
+  100 characters, and the server appends it to the label.
+- `cron_run_job`, `cron_trigger_dag`, `cron_backfill_dag`,
+  `cron_recover_dag`, and `cron_decide_gate` report `destructiveHint: true`
+  and `openWorldHint: true`, so clients that confirm risky calls confirm
+  these.
+- MCP resource templates decode percent-encoded values, so
+  `cronstable://jobs/nightly%20backup` reads the job `nightly backup`.
+- An MCP prompt is served only when every tool it calls is visible to the
+  caller: `backfill_plan` needs `readOnly: false`, and `blast_radius` leaves
+  out its workflow and state steps when those toolsets are off.
+  `prompts/get` rejects a missing, empty, or non-string argument with
+  `-32602`.
+- The MCP server completes prompt arguments and resource template variables
+  from job names, workflow names, and recent run keys, and identifies itself
+  with a description, a website, and the dashboard's icon.
+- The MCP server rejects tool arguments a tool does not accept, request IDs
+  that are not strings or integers, and JSON-RPC responses posted by a
+  client, and its responses echo the negotiated `MCP-Protocol-Version`.
+  `cron_pause_job` refuses a Boolean `durationSeconds`, and the recovery
+  tools apply the REST checks to `mode`, `plan_token`, and
+  `allow_config_change`.
+- Every `401` from the web API carries
+  `WWW-Authenticate: Bearer realm="cronstable"`.
+- A reload that restarts the web API keeps each `http://` listener's socket
+  open and passes new connections to the replacement server. Another local
+  account therefore cannot bind the port during the restart and collect the
+  bearer token that the dashboard, `cronstable tui`, and `cronstable mcp`
+  send. The running server stops only after its replacement is built, so a
+  replacement that fails to build leaves it serving. `https://` and
+  `unix://` listeners close and bind again.
+- Saving or clearing the dashboard token rewrites both calendar feed links
+  and empties the token field and the pairing sheet, so a shared tab keeps
+  no copy of the previous token.
+- A DAG run's `configurationRevision` covers the names of task environment
+  variables and leaves out their values, so a `view` reader cannot test
+  guesses for a secret against it. Recovering a run after an environment
+  value changes does not require `allowConfigChange`. Runs whose recorded
+  revision includes environment values report a configuration change when
+  recovered.
+
 ## 1.2.58
 
 - The Windows service refuses to load a configuration that any account

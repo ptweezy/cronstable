@@ -29,6 +29,7 @@
   "dags": [
     "nightly-archive",
     "photo-pipeline",
-    "firmware-rollout"
+    "firmware-rollout",
+    "library-refresh"
   ]
 }

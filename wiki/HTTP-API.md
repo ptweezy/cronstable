@@ -132,7 +132,10 @@ envelope: `{"error": "<reason>"}` (`Content-Type: application/json`), across
 the job, DAG (directed acyclic graph), schedule, state, and push routes alike.
 That includes the `401` from the auth middleware and the router's own responses
 (`405` on a wrong method, `404` on an unmatched path). `docs/openapi.yaml`
-declares the same envelope as the `Error` schema.
+declares the same envelope as the `Error` schema. The one exception is
+`POST /mcp` under MCP `2026-07-28`, where a `400` or `404` carries the
+JSON-RPC error object that revision requires (see
+[protocol revisions](MCP#protocol-revisions)).
 
 A `404` for a named subject says what was not found, for example
 `{"error": "job 'nightly' not found"}` or, on the routes that also accept a
@@ -1184,13 +1187,17 @@ opt-in [Model Context Protocol](https://modelcontextprotocol.io) server is
 served at `POST /mcp` on the same listeners, letting an AI agent observe (and,
 when `readOnly: false`, control) jobs, DAGs, the cluster/fleet, metrics and the
 durable state store. It is a **stateless Streamable-HTTP** JSON-RPC 2.0
-endpoint (no `Mcp-Session-Id`; `GET /mcp` returns `405`), pinned to MCP
-revision `2025-11-25`.
+endpoint (no `Mcp-Session-Id`; `GET /mcp` returns `405`) that serves MCP
+revision `2026-07-28` and the `initialize`-based revisions `2025-03-26`
+through `2025-11-25` (see [protocol revisions](MCP#protocol-revisions)).
 
 It inherits `web.authToken` exactly like the data routes (it is **never** in
 the public set, so it always requires the bearer token when one is
-configured), and additionally validates the `Origin` header (`403` on a
-present, non-allow-listed origin) and caps the request body (`413`). If
+configured). A scoped token needs `view` to reach it, and each tool then
+requires the scope of the REST route it mirrors (see
+[scopes](#scoped-tokens-webauthtokens)). The endpoint additionally validates
+the `Origin` header (`403` on a present, non-allow-listed origin) and caps
+the request body (`413`). If
 `mcp.enabled` is set with no `web.authToken` on a routable listener,
 cronstable **fails closed** at config load (raises a `ConfigError`) unless
 `mcp.allowUnauthenticated: true`.
@@ -1236,6 +1243,15 @@ the request; a client certificate authenticates it at the handshake.
 confines the listener to the machine, not to your user, so set a token
 anywhere other local users matter.
 
+A client sends its token to whatever process answers the configured address,
+and over plaintext `http://` it cannot tell the daemon from another process.
+The daemon keeps its `http://` ports bound while it runs, including through
+config reloads. While the daemon is stopped, for example during an upgrade,
+another local account can bind the port and collect the token from an open
+dashboard, `cronstable tui`, or `cronstable mcp`. On a host with untrusted
+local accounts, serve the API over an `https://` listener whose certificate
+the clients verify. See [listener TLS](Listener-TLS).
+
 `authToken` resolves the token from exactly one source, in this precedence order
 (`_resolve_web_token`):
 
@@ -1253,7 +1269,9 @@ When `authToken` is set, an aiohttp middleware (`_make_auth_middleware`) require
 - The presented token is compared against the configured token in constant
   time with `hmac.compare_digest`.
 - A missing/malformed `Authorization` header, a wrong scheme, or a non-matching
-  token returns `401 Unauthorized`.
+  token returns `401 Unauthorized` with the challenge
+  `WWW-Authenticate: Bearer realm="cronstable"`. Browsers show no sign-in
+  dialog for the `Bearer` scheme.
 
 Two settings relax that. `web.metrics.public: true` exempts `/metrics` (and
 only `/metrics`) from the bearer token, for scrapers that cannot send
@@ -1325,8 +1343,8 @@ There are three scopes:
 
 | Scope | Grants |
 | --- | --- |
-| `view` | Every read-only `GET`: jobs, runs, DAGs, cluster/fleet, schedule intelligence, the state inspector, the SSE log tail, the calendar feeds, and `/metrics`. |
-| `control` | The mutating actions: `POST` start / cancel / pause / resume, DAG trigger / backfill, and the MCP endpoint (`POST /mcp`). |
+| `view` | Every read-only `GET`: jobs, runs, DAGs, cluster/fleet, schedule intelligence, the state inspector, the SSE log tail, the calendar feeds, and `/metrics`. Also the MCP endpoint (`POST /mcp`) and its read tools. |
+| `control` | The mutating actions: `POST` start / cancel / pause / resume, DAG trigger / backfill, and the MCP tools that take them. |
 | `approve` | Only the DAG approval-gate decision (`POST …/decision`). |
 
 `control` and `approve` each **imply** `view` (an action UI has to read state
@@ -1335,16 +1353,17 @@ first), so a `[control]` token can also call every `GET`. `approve` does
 
 The required scope for a route is the safe-method default
 (`GET`/`HEAD`/`OPTIONS` → `view`, everything else → `control`) with two
-promotions: the approval decision needs `approve`, and `/mcp` needs `control`.
-A newly added `POST` route therefore requires `control` automatically rather
-than slipping through unguarded. The promotion follows the action across
-transports: the MCP `cron_decide_gate` tool also requires the presented
-token to hold `approve`, so a `[control]` token cannot take the decision
-through `/mcp` that this table denies it over REST.
+overrides: the approval decision needs `approve`, and `/mcp` needs only
+`view`. A newly added `POST` route therefore requires `control`
+automatically rather than slipping through unguarded. Each MCP tool then
+requires the scope of the REST route it mirrors, so a `[view]` token opens a
+read-only MCP session, the mutating tools need `control`, and
+`cron_decide_gate` needs `approve`. No token takes through `/mcp` an action
+this table denies it over REST.
 
 The two failure modes are distinct:
 
-- A missing/unrecognized token is **`401 Unauthorized`** (as before).
+- A missing/unrecognized token is **`401 Unauthorized`**.
 - A recognized token that lacks the scope a route needs is **`403 Forbidden`**,
   with a body naming the token label and the missing scope.
 
@@ -1392,7 +1411,7 @@ calendar feeds to anyone, while start/cancel/pause, DAG trigger and backfill,
 approval decisions, device pairing, `/shutdown`, and `/mcp` all still require
 the operator token.
 
-Four limits are fixed in the code, and no setting relaxes them:
+Five limits are fixed in the code, and no setting relaxes them:
 
 - Only **`view`** may be granted. The config schema rejects `control` and
   `approve` at parse time, so a daemon cannot be configured into anonymous
@@ -1403,6 +1422,9 @@ Four limits are fixed in the code, and no setting relaxes them:
   nothing. That combination is a config error that names the fix.
 - **`GET /push/devices`** is excluded. The registry names paired devices, so
   it answers `403` to a credential-less caller even though it is a `GET`.
+- **`/mcp`** is excluded. It serves agents, which carry a token, so it
+  answers `403` to a credential-less caller although its read tools need only
+  `view`.
 - A presented credential is judged the same way it is on any other daemon. A
   wrong or revoked token still gets `401`, so on such a daemon `401` narrows
   to "credentials were presented and are invalid", while a caller carrying
@@ -1554,12 +1576,20 @@ writable volume. See [production and container deployment](Production-Deployment
 The control API lifecycle is driven by `start_stop_web_app`, called on each config
 reload from the scheduler loop:
 
-- If a server is running and the new `web` config is absent or differs from the
-  running one, the running server is stopped (`web_runner.cleanup()`) before any new
-  one is started. A change to any `web` field (including `headers`, `authToken`, or
-  `socketMode`) thus triggers a restart of the server on reload.
-- The server is (re)started only when `web` is present, `listen` is nonempty, and no
-  server is currently running.
+- If a server is running and the new `web` config differs from the running one,
+  the server restarts on reload. A change to any `web` field (including
+  `headers`, `authToken`, or `socketMode`) triggers a restart. The daemon builds
+  the replacement first and stops the running server (`web_runner.cleanup()`)
+  after that, so a replacement that fails to build leaves the running server in
+  place.
+- An `http://` listener keeps its socket through a restart, and the replacement
+  accepts new connections on it, so no other process can bind the port in
+  between. An `https://` or `unix://` listener closes with the running server
+  and binds again for the replacement.
+- If the new `web` config is absent or its `listen` list is empty, the running
+  server stops and every listener closes.
+- The server starts when `web` is present, `listen` is nonempty, and no server
+  is running.
 - A reload also restarts the server when the `web.tls` files changed on disk
   under unchanged config (an in-place certificate rotation), because the
   `SSLContext` is built once per start. Open connections, including SSE log
@@ -1580,8 +1610,9 @@ reload from the scheduler loop:
 A `ConfigError` raised while resolving `authToken` (empty token or unreadable
 `fromFile`) propagates out of `start_stop_web_app` and is caught by the reload
 loop's dedicated web-app handler, which logs `Error in the web configuration, so
-not starting the web API` and leaves the web API down until a later reload fixes
-it.
+not starting the web API`. The web API stays as it was until a later reload
+fixes the error: a running server keeps its previous configuration, and a
+stopped one stays down.
 
 The daemon still applies the rest of the new configuration (jobs, cluster,
 logging): the web app starts under its own error handling, after the cluster

@@ -69,6 +69,63 @@ def test_binary_crypto_policy_accepts_the_security_floor():
 
 
 @pytest.mark.parametrize(
+    "installed,failures",
+    [(True, 5), (False, 0), (False, 2), (False, 5)],
+)
+def test_netbsd_package_download_retries_preserve_failures(
+    installed, failures
+):
+    shell = shutil.which("bash")
+    if os.name == "nt":
+        shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+    if shell is None or not Path(shell).is_file():
+        pytest.skip("Bash required for the NetBSD package setup harness")
+    step = next(
+        s
+        for s in workflow()["jobs"]["binaries-netbsd"]["steps"]
+        if s.get("uses", "").startswith("vmactions/netbsd-vm@")
+    )
+    prepare = step["with"]["prepare"].replace("/usr/sbin/pkg_", "pkg_")
+    prelude = """
+attempts=0
+pkg_info() {
+    if [ "$2" = rust ]; then
+        [ "$RUST_INSTALLED" = 1 ]
+    else
+        return 0
+    fi
+}
+pkg_add() {
+    [ "$1" = rust ] || return 2
+    attempts=$((attempts + 1))
+    echo "INSTALL:$1:$attempts"
+    [ "$attempts" -gt "$FAILURES" ]
+}
+sleep() { echo "DELAY:$1"; }
+"""
+    result = subprocess.run(
+        [shell, "-c", prelude + prepare],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "RUST_INSTALLED": str(int(installed)),
+            "FAILURES": str(failures),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert (result.returncode == 0) == (installed or failures < 5), (
+        result.stdout + result.stderr
+    )
+    expected_attempts = 0 if installed else min(failures + 1, 5)
+    assert result.stdout.count("INSTALL:rust:") == expected_attempts
+    assert result.stdout.count("DELAY:") == max(expected_attempts - 1, 0)
+    if result.returncode:
+        assert "still failing after 5 attempts" in result.stderr
+
+
+@pytest.mark.parametrize(
     "name,job,field",
     [
         ("release", "binaries-container", "platform"),
@@ -184,7 +241,8 @@ def test_macos_signing_retries_but_never_bypasses_verification(
     if os.name == "nt" or shutil.which("bash") is None:
         pytest.skip("POSIX shell harness for the CI bash steps")
     step = next(
-        s for s in workflow()["jobs"]["binaries-macos"]["steps"]
+        s
+        for s in workflow()["jobs"]["binaries-macos"]["steps"]
         if s.get("name") == "Sign and notarize"
     )
     prelude = """

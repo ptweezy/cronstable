@@ -1,12 +1,14 @@
-# Read and scan the exact release MSIs. Run on an elevated Windows runner.
+# Read and scan the release installers. Run on an elevated Windows runner.
 param(
     [Parameter(Mandatory)][string]$AssetDirectory,
+    [Parameter(Mandatory)][string]$EngineDirectory,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [string]$WixCommand = 'wix'
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $assets = (Resolve-Path $AssetDirectory).Path
+$engines = (Resolve-Path $EngineDirectory).Path
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $output = (Resolve-Path $OutputDirectory).Path
 Start-Transcript -Path (Join-Path $output 'defender.log')
@@ -124,6 +126,59 @@ try {
         Scan-Path $target
         if ((Get-FileHash $path -Algorithm SHA256).Hash -ne $hash) {
             throw "$name changed during validation"
+        }
+
+        $bundleName = "cronstable-windows-$arch-setup.exe"
+        $bundlePath = Join-Path $assets $bundleName
+        $bundleHash = (Get-FileHash $bundlePath -Algorithm SHA256).Hash
+        if (-not $sums.ContainsKey($bundleName) -or $sums[$bundleName] -ne $bundleHash) {
+            throw "SHA256SUMS mismatch: $bundleName"
+        }
+        $bundleSignature = Get-AuthenticodeSignature $bundlePath
+        if ($bundleSignature.Status -ne 'Valid' -or -not $bundleSignature.TimeStamperCertificate) {
+            throw "Missing valid timestamped Authenticode signature: $bundleName"
+        }
+        Scan-Path $bundlePath
+        $bundleTarget = Join-Path $output "$arch-setup"
+        $bundleUx = Join-Path $bundleTarget 'ux'
+        $bundlePayloads = Join-Path $bundleTarget 'payloads'
+        & $WixCommand burn extract $bundlePath -o $bundlePayloads -oba $bundleUx
+        if ($LASTEXITCODE -ne 0) { throw "Bundle extraction failed: $bundleName" }
+        $embeddedMsi = Join-Path $bundlePayloads "WixAttachedContainer/$name"
+        if ((Get-FileHash $embeddedMsi -Algorithm SHA256).Hash -ne $hash) {
+            throw "$bundleName embeds a different MSI"
+        }
+        # Verify the signed engine supplied to `wix burn reattach`.
+        # Detaching a finished bundle preserves its outer signature headers.
+        $enginePath = Join-Path $engines $bundleName
+        if (-not (Test-Path $enginePath -PathType Leaf)) {
+            throw "$bundleName missing signed setup engine: $enginePath"
+        }
+        $engineSignature = Get-AuthenticodeSignature $enginePath
+        if ($engineSignature.Status -ne 'Valid' -or -not $engineSignature.TimeStamperCertificate) {
+            throw "$bundleName has an unsigned or invalid setup engine: $($engineSignature.Status)"
+        }
+        Scan-Path $enginePath
+        [xml]$bundle = Get-Content (Join-Path $bundleUx 'manifest.xml') -Raw
+        $registration = $bundle.BurnManifest.Registration
+        $packages = @($bundle.BurnManifest.Chain.MsiPackage)
+        $related = @($bundle.BurnManifest.RelatedBundle | Where-Object Action -eq 'Upgrade')
+        if ($registration.PerMachine -ne 'yes' -or
+            $registration.Version -ne $properties.ProductVersion -or
+            $registration.Arp.DisplayVersion -ne $properties.ProductVersion -or
+            $registration.Arp.DisplayName -ne $properties.ProductName -or
+            $registration.Arp.Publisher -ne $properties.Manufacturer -or
+            $packages.Count -ne 1 -or $related.Count -ne 1 -or
+            $packages[0].ProductCode -ne $properties.ProductCode -or
+            $packages[0].UpgradeCode -ne $properties.UpgradeCode) {
+            throw "$bundleName metadata differs from its MSI"
+        }
+        $properties.BundleCode = $registration.Code
+        $properties.BundleUpgradeCode = $related[0].Code
+        $properties.BundleSha256 = $bundleHash
+        Scan-Path $bundleTarget
+        if ((Get-FileHash $bundlePath -Algorithm SHA256).Hash -ne $bundleHash) {
+            throw "$bundleName changed during validation"
         }
     }
     $metadata | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $output 'metadata.json') -Encoding utf8
