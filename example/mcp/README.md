@@ -27,7 +27,7 @@ From a checkout (the `cronstable` CLI includes the stdio bridge):
 ```shell
 CRONSTABLE_WEB_TOKEN=dev-token \
   cronstable mcp --url http://127.0.0.1:8080 --check
-# -> mcp check: ok - protocol 2025-11-25, 23 tool(s) at http://127.0.0.1:8080/mcp
+# -> mcp check: ok - protocol 2026-07-28 (modern; the daemon serves 2026-07-28, 2025-11-25, 2025-06-18, 2025-03-26), 35 tool(s) at http://127.0.0.1:8080/mcp
 ```
 
 ## Wire up a client

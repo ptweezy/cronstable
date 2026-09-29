@@ -14,14 +14,17 @@ import json
 import sys
 import types
 
+import jsonschema
+import pytest
+
 from cronstable import mcp as mcp_mod
 from cronstable.config import _build_mcp_config, parse_config_string
 from cronstable.cron import (
+    PAUSE_BY_MAX,
     PAUSE_DEFAULT_SECONDS,
     WEB_ROUTES,
     Cron,
     JobRunInfo,
-    _effective_web_scopes,
     _required_web_scope,
 )
 from cronstable.job import JobOutputStream
@@ -87,7 +90,24 @@ async def _call(handler, name, arguments=None):
         handler, "tools/call", {"name": name, "arguments": arguments or {}}
     )
     assert "error" not in resp, resp
+    _check_result(handler, name, resp["result"])
     return resp["result"]
+
+
+def _check_result(handler, name, result):
+    """What every tool result keeps: an error is one readable block; a
+    success is its summary, then structuredContent as JSON text, and
+    conforms to the tool's declared outputSchema."""
+    if result.get("isError"):
+        assert len(result["content"]) == 1, result
+        return
+    _summary, data = result["content"]
+    assert json.loads(data["text"]) == result["structuredContent"]
+    schema = handler._tool_by_name[name]["listing"].get("outputSchema")
+    if schema is not None:
+        jsonschema.Draft202012Validator(schema).validate(
+            result["structuredContent"]
+        )
 
 
 def _run_info(outcome, *, dur=1.0, exit_code=0):
@@ -869,13 +889,12 @@ async def test_prompt_renderers_fill_arguments():
     assert "backfill of dag 'etl' from a to b" in text
 
 
-async def test_prompts_get_tolerates_non_object_arguments():
+async def test_prompts_get_rejects_non_object_arguments():
     h = _handler()
     got = await _req(
         h, "prompts/get", {"name": "blast_radius", "arguments": [1]}
     )
-    # falls back to the placeholder when arguments are unusable
-    assert "<target>" in got["result"]["messages"][0]["content"]["text"]
+    assert got["error"]["code"] == mcp_mod.INVALID_PARAMS
 
 
 # ---------------------------------------------------------------------------
@@ -1375,16 +1394,20 @@ async def test_numeric_arguments_survive_non_finite_json_numbers():
         assert "structuredContent" in result, (args, result)
     # _call itself asserts no JSON-RPC error envelope: reaching a normal
     # tool result (even an isError one) is the fix for the tail/cursor pair
-    await _call(h, "cron_tail_job_logs", {"job": "hello", "tail": inf})
+    await _call(h, "cron_tail_job_logs", {"name": "hello", "tail": inf})
+
+
+def _as_caller(scopes, label="agent"):
+    """Run the body as a token with ``scopes``, the way handle_http files
+    the matched token; None models auth off."""
+    caller = None if scopes is None else mcp_mod._Caller(label, scopes)
+    return mcp_mod._caller.set(caller)
 
 
 async def test_decide_gate_enforces_the_approve_scope():
     # The REST decision route is gated behind `approve`
     # (cron._WEB_SCOPE_OVERRIDES); the same action via tools/call must not
-    # be reachable with the bare `control` scope the /mcp middleware floor
-    # demands. handle_http files the presented token's scopes into
-    # _caller_scopes; None (auth off, direct handle_message) stays
-    # unrestricted, matching REST.
+    # be reachable with `control` alone.
     h = _handler()
     args = {
         "dag": "nope",
@@ -1394,43 +1417,108 @@ async def test_decide_gate_enforces_the_approve_scope():
         "confirm": True,
     }
     # a control-scoped caller is refused before the handler runs
-    token = mcp_mod._caller_scopes.set(frozenset({"view", "control"}))
+    token = _as_caller(frozenset({"view", "control"}))
     try:
         result = await _call(h, "cron_decide_gate", args)
     finally:
-        mcp_mod._caller_scopes.reset(token)
+        mcp_mod._caller.reset(token)
     assert result["isError"] is True
     assert "approve" in result["content"][0]["text"]
     # an approve-holder proceeds to the handler (and fails on the unknown
     # dag, which is a different, post-authorization error)
-    token = mcp_mod._caller_scopes.set(
-        frozenset({"view", "control", "approve"})
-    )
+    token = _as_caller(frozenset({"view", "approve"}))
     try:
         result = await _call(h, "cron_decide_gate", args)
     finally:
-        mcp_mod._caller_scopes.reset(token)
+        mcp_mod._caller.reset(token)
     assert result["isError"] is True
-    text = result["content"][0]["text"]
-    assert "scope" not in text
+    assert "scope" not in result["content"][0]["text"]
     # no token context (auth off) is unrestricted, exactly like REST
     result = await _call(h, "cron_decide_gate", args)
     assert "scope" not in result["content"][0]["text"]
 
 
+@pytest.mark.parametrize(
+    ("scopes", "visible", "hidden"),
+    [
+        pytest.param(
+            frozenset({"view"}),
+            {"cron_get_status", "cron_list_dags", "cron_inspect_state"},
+            {
+                "cron_run_job",
+                "cron_trigger_dag",
+                "cron_decide_gate",
+                "cron_preview_recovery",
+            },
+            id="view",
+        ),
+        pytest.param(
+            frozenset({"view", "control"}),
+            {"cron_run_job", "cron_trigger_dag", "cron_preview_recovery"},
+            {"cron_decide_gate"},
+            id="control",
+        ),
+        pytest.param(
+            frozenset({"view", "approve"}),
+            {"cron_decide_gate", "cron_get_status"},
+            {"cron_run_job", "cron_preview_recovery"},
+            id="approve",
+        ),
+    ],
+)
+async def test_tools_list_shows_only_what_the_token_can_call(
+    scopes, visible, hidden
+):
+    h = _handler()
+    token = _as_caller(scopes)
+    try:
+        listed = {
+            t["name"] for t in (await _req(h, "tools/list"))["result"]["tools"]
+        }
+        assert visible <= listed
+        assert not hidden & listed
+        # a hidden tool refuses with the scope it needs, not "unknown tool"
+        for name in hidden:
+            result = await _call(h, name, {})
+            assert result["isError"] is True
+            assert "scope" in result["content"][0]["text"], name
+    finally:
+        mcp_mod._caller.reset(token)
+
+
+async def test_view_token_prompts_skip_tools_it_cannot_call():
+    h = _handler()
+    token = _as_caller(frozenset({"view"}))
+    try:
+        names = {
+            p["name"]
+            for p in (await _req(h, "prompts/list"))["result"]["prompts"]
+        }
+    finally:
+        mcp_mod._caller.reset(token)
+    # backfill_plan needs cron_backfill_dag, which needs control
+    assert "backfill_plan" not in names
+    assert "why_did_dag_run_fail" in names
+
+
 #: The REST route (or routes) each MCP tool is the twin of: same action,
 #: same in-process payload builder, so the same token scope should reach
 #: both. Hand-maintained because the two authorization tables cannot be
-#: joined automatically: mcp._TOOL_SCOPE_OVERRIDES keys on a tool name and
+#: joined automatically: a tool's scope keys on a tool name and
 #: cron._WEB_SCOPE_OVERRIDES on a matched aiohttp resource path, with no
-#: shared identifier between them. A tool with no REST counterpart maps to
-#: None; the guard below fails on an unclassified tool, so a new one cannot
-#: land without someone deciding which it is.
+#: shared identifier between them. The guard below fails on an
+#: unclassified tool, so a new one cannot land without someone deciding.
 _TOOL_REST_TWINS = {
     "cron_list_pools": (("GET", "/pools"),),
     "cron_cancel_queued": (("POST", "/pools/{name}/queue/{key}/cancel"),),
-    "cron_preview_recovery": (("POST", "/dags/{name}/runs/{run_key}/recover"), ("POST", "/dags/{name}/recover")),
-    "cron_recover_dag": (("POST", "/dags/{name}/runs/{run_key}/recover"), ("POST", "/dags/{name}/recover")),
+    "cron_preview_recovery": (
+        ("POST", "/dags/{name}/runs/{run_key}/recover"),
+        ("POST", "/dags/{name}/recover"),
+    ),
+    "cron_recover_dag": (
+        ("POST", "/dags/{name}/runs/{run_key}/recover"),
+        ("POST", "/dags/{name}/recover"),
+    ),
     "cron_get_status": (("GET", "/status"),),
     "cron_list_jobs": (("GET", "/jobs"),),
     "cron_get_job": (("GET", "/jobs/{name}"),),
@@ -1495,68 +1583,427 @@ def _scope_for_route(method, path):
     )
 
 
-def test_tool_scope_overrides_track_the_rest_scope_table():
-    """MCP tool authorization cannot drift below its REST twin's.
+def test_tool_scopes_track_the_rest_scope_table():
+    """Every MCP tool demands exactly the scope of its REST twin.
 
-    ``POST /mcp`` is gated at `control`, so every tool is reachable by any
-    control-scoped token unless ``mcp._TOOL_SCOPE_OVERRIDES`` promotes it.
-    That makes the table a security-relevant twin of
-    ``cron._WEB_SCOPE_OVERRIDES``: promote a REST route to a scope beyond
-    `control` (as the DAG decision route is promoted to `approve`) and
-    forget the tool, and a token the operator deliberately withheld that
-    scope from takes exactly the withheld action through tools/call. This
-    guard fails on that omission, on an override left behind after REST
-    relaxed, and on an override naming a tool that no longer exists.
+    ``/mcp`` opens to `view`, and tools/call then requires each tool's own
+    scope (`control` for a mutating tool, `view` otherwise, or its
+    ``mcp._TOOL_SCOPE_OVERRIDES`` entry). Promote a REST route and forget
+    the tool, and a token the operator deliberately withheld that scope
+    from takes exactly the withheld action through tools/call; relax one
+    and the tool is gated for nothing. This guard fails on either drift,
+    and on an override naming a tool that no longer exists.
 
     Residual gap, deliberately: the tool -> route correspondence above is
     hand-written (the tables share no identifier), so a WRONG mapping is
-    invisible here, and a tool mapped to None gets no cross-check. What the
-    machine does check: every registered tool is classified, every route
-    named is really registered, and the scopes agree wherever a mapping
-    exists.
+    invisible here. What the machine does check: every registered tool is
+    classified, every route named is really registered, and the scopes
+    agree wherever a mapping exists.
     """
     h = _handler()
     tools = set(h._tool_by_name)
     assert tools == set(_TOOL_REST_TWINS), (
         "a tool was added or renamed without recording its REST "
-        "twin: {}".format(
-            sorted(tools.symmetric_difference(_TOOL_REST_TWINS))
-        )
+        "twin: {}".format(sorted(tools.symmetric_difference(_TOOL_REST_TWINS)))
     )
     unknown = set(mcp_mod._TOOL_SCOPE_OVERRIDES) - tools
     assert not unknown, (
         "_TOOL_SCOPE_OVERRIDES gates tools that do not exist, so the "
-        "promotion binds nothing: {}".format(sorted(unknown))
+        "override binds nothing: {}".format(sorted(unknown))
     )
+    # the /mcp floor must not sit above any tool, or its token could not
+    # reach the tool at all
+    floor = _scope_for_route("POST", "/mcp")
+    assert floor == "view"
     served = {(method, path) for method, path, _h, _g in WEB_ROUTES}
-    # the floor every tool already sits behind: what POST /mcp demands,
-    # expanded the way a real token's scopes are (control implies view)
-    floor = _effective_web_scopes({_scope_for_route("POST", "/mcp")})
-
     for tool, twins in sorted(_TOOL_REST_TWINS.items()):
-        override = mcp_mod._TOOL_SCOPE_OVERRIDES.get(tool)
-        if twins is None:
-            continue
-        beyond = set()
+        rest = set()
         for method, path in twins:
             assert (method, path) in served, (
                 "{} is mapped to {} {}, which is not a registered "
                 "route".format(tool, method, path)
             )
-            scope = _scope_for_route(method, path)
-            if scope not in floor:
-                beyond.add(scope)
-        assert len(beyond) <= 1, (
-            "{} mirrors routes demanding several scopes beyond the /mcp "
-            "floor ({}), which one override string cannot express: split "
-            "the tool or make _TOOL_SCOPE_OVERRIDES hold a set".format(
-                tool, sorted(beyond)
+            rest.add(_scope_for_route(method, path))
+        assert len(rest) == 1, (
+            "{} mirrors routes demanding different scopes ({}), which one "
+            "tool scope cannot express: split the tool".format(
+                tool, sorted(rest)
             )
         )
-        expected = beyond.pop() if beyond else None
-        assert override == expected, (
+        mcp_scope = h._tool_by_name[tool]["scope"]
+        assert {mcp_scope} == rest, (
             "{} requires {!r} over MCP but its REST twin {} requires {!r}: "
             "a scope promoted on one surface and not the other lets a "
             "token take through tools/call exactly the action REST "
-            "withholds".format(tool, override, list(twins), expected)
+            "withholds".format(tool, mcp_scope, list(twins), rest.pop())
         )
+
+
+# ---------------------------------------------------------------------------
+# audit attribution: the token label, with a model-supplied `by` after it
+# ---------------------------------------------------------------------------
+
+
+async def test_actions_are_attributed_to_the_token_label(monkeypatch):
+    h = _handler()
+    decided = []
+    resumed = []
+
+    async def fake_approve(dag, run_key, taskkey, *, approved, by):
+        decided.append(by)
+        return {"ok": True}
+
+    real_resume = h._cron.resume_job_by_name
+
+    async def spy_resume(name, *, by, channel):
+        resumed.append((by, channel))
+        await real_resume(name, by=by, channel=channel)
+
+    monkeypatch.setattr(h._cron._dag, "approve", fake_approve)
+    monkeypatch.setattr(h._cron, "resume_job_by_name", spy_resume)
+    gate = {
+        "dag": "d",
+        "run_key": "r",
+        "taskkey": "t",
+        "decision": "approve",
+        "confirm": True,
+    }
+    token = _as_caller(frozenset({"view", "control", "approve"}), "ci-agent")
+    try:
+        await _call(h, "cron_pause_job", {"name": "hello", "confirm": True})
+        info = h._cron._paused["hello"]
+        assert (info.by, info.channel) == ("ci-agent", "mcp")
+        await _call(h, "cron_resume_job", {"name": "hello", "confirm": True})
+        await _call(h, "cron_decide_gate", gate)
+        # the model's `by` is display text after the label, never instead
+        await _call(h, "cron_decide_gate", {**gate, "by": "alice"})
+    finally:
+        mcp_mod._caller.reset(token)
+    assert resumed == [("ci-agent", "mcp")]
+    assert decided == ["ci-agent", "ci-agent (alice)"]
+    # auth off: the label is `mcp`
+    await _call(h, "cron_decide_gate", {**gate, "by": "bob"})
+    assert decided[-1] == "mcp (bob)"
+
+
+async def test_decide_gate_refuses_a_bad_by(monkeypatch):
+    h = _handler()
+
+    async def fail(*args, **kwargs):
+        raise AssertionError("a rejected `by` reached the gate")
+
+    monkeypatch.setattr(h._cron._dag, "approve", fail)
+    gate = {
+        "dag": "d",
+        "run_key": "r",
+        "taskkey": "t",
+        "decision": "reject",
+        "confirm": True,
+    }
+    result = await _call(h, "cron_decide_gate", {**gate, "by": ["alice"]})
+    assert result["isError"] is True
+    assert "by must be a string" in result["content"][0]["text"]
+    too_long = "x" * (PAUSE_BY_MAX + 1)
+    result = await _call(h, "cron_decide_gate", {**gate, "by": too_long})
+    assert result["isError"] is True
+    assert (
+        "longer than {}".format(PAUSE_BY_MAX) in (result["content"][0]["text"])
+    )
+
+
+# ---------------------------------------------------------------------------
+# input checks match the REST routes
+# ---------------------------------------------------------------------------
+
+
+def test_opt_int_treats_booleans_as_unusable():
+    assert mcp_mod._opt_int(True) is None
+    assert mcp_mod._opt_int(False) is None
+    assert mcp_mod._opt_int(0) == 0
+
+
+async def test_pause_refuses_a_boolean_duration():
+    # bool is an int subclass: `true` used to read as a one-second pause.
+    h = _handler()
+    result = await _call(
+        h,
+        "cron_pause_job",
+        {"name": "hello", "durationSeconds": True, "confirm": True},
+    )
+    assert result["isError"] is True
+    assert "integer" in result["content"][0]["text"]
+    assert "hello" not in h._cron._paused
+
+
+async def test_boolean_limit_falls_back_like_any_unusable_value():
+    h = _handler()
+    result = await _call(h, "cron_get_status", {"limit": True})
+    assert result["structuredContent"]["page"]["limit"] == 200
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments", "reason"),
+    [
+        pytest.param(
+            "cron_preview_recovery",
+            {"dag": "d", "run_key": "r", "mode": 5},
+            "mode must be a string",
+            id="mode-not-string",
+        ),
+        pytest.param(
+            "cron_recover_dag",
+            {"dag": "d", "run_key": "r", "plan_token": "x", "confirm": True},
+            "64-character",
+            id="short-plan-token",
+        ),
+        pytest.param(
+            "cron_recover_dag",
+            {
+                "dag": "d",
+                "run_key": "r",
+                "plan_token": "a" * 64,
+                "allow_config_change": "yes",
+                "confirm": True,
+            },
+            "allow_config_change must be a boolean",
+            id="allow-change-not-boolean",
+        ),
+    ],
+)
+async def test_recovery_tools_apply_the_rest_checks(
+    tool, arguments, reason, monkeypatch
+):
+    h = _handler()
+
+    async def fail(*args, **kwargs):
+        raise AssertionError("an invalid recovery request reached the DAG")
+
+    monkeypatch.setattr(h._cron._dag, "recover", fail)
+    monkeypatch.setattr(h._cron._dag, "recover_range", fail)
+    result = await _call(h, tool, arguments)
+    assert result["isError"] is True
+    assert reason in result["content"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# argument completion
+# ---------------------------------------------------------------------------
+
+_DAG_YAML = (
+    _YAML
+    + "dags:\n  - name: etl\n    tasks:\n      - id: a\n        command: x\n"
+    "  - name: hello\n    tasks:\n      - id: a\n        command: x\n"
+)
+
+
+async def _complete(handler, ref, name, value, known=None):
+    params = {"ref": ref, "argument": {"name": name, "value": value}}
+    if known is not None:
+        params["context"] = {"arguments": known}
+    resp = await _req(handler, "completion/complete", params)
+    return resp.get("result", {}).get("completion"), resp.get("error")
+
+
+def _prompt(name):
+    return {"type": "ref/prompt", "name": name}
+
+
+def _template(uri):
+    return {"type": "ref/resource", "uri": uri}
+
+
+async def test_completions_capability_follows_prompts_and_resources():
+    caps = (await _req(_handler(), "initialize", {}))["result"]["capabilities"]
+    assert caps["completions"] == {}
+    cfg = _build_mcp_config({"enabled": True})
+    cfg["resources"] = cfg["prompts"] = False
+    h = MCPHandler(_handler()._cron, cfg)
+    caps = (await _req(h, "initialize", {}))["result"]["capabilities"]
+    assert "completions" not in caps
+    resp = await _req(h, "completion/complete", {})
+    assert resp["error"]["code"] == mcp_mod.METHOD_NOT_FOUND
+
+
+async def test_complete_prompt_job_by_case_insensitive_prefix():
+    h = _handler()
+    got, _ = await _complete(h, _prompt("triage_job_failure"), "job", "HE")
+    assert got == {"values": ["hello", "heavy"], "total": 2, "hasMore": False}
+    got, _ = await _complete(h, _prompt("triage_job_failure"), "job", "")
+    assert got["values"] == ["hello", "nightly", "heavy"]
+
+
+async def test_complete_targets_add_dag_names_once():
+    h = _handler(yaml=_DAG_YAML)
+    got, _ = await _complete(h, _prompt("blast_radius"), "target", "")
+    # `hello` names both a job and a DAG, and is offered once
+    assert got["values"] == ["hello", "nightly", "heavy", "etl"]
+    got, _ = await _complete(h, _prompt("why_did_dag_run_fail"), "dag", "e")
+    assert got["values"] == ["etl"]
+
+
+async def test_complete_template_variables():
+    h = _handler(yaml=_DAG_YAML)
+    got, _ = await _complete(
+        h, _template("cronstable://jobs/{name}/runs"), "name", "n"
+    )
+    assert got["values"] == ["nightly"]
+    got, _ = await _complete(
+        h, _template("cronstable://dags/{name}"), "name", ""
+    )
+    assert got["values"] == ["etl", "hello"]
+    # no source for this variable: nothing offered, not an error
+    got, error = await _complete(
+        h, _template("cronstable://state/{ns}"), "ns", "kv/"
+    )
+    assert error is None
+    assert got["values"] == []
+
+
+async def test_complete_offers_nothing_for_a_hidden_reference():
+    h = _handler({"toolsets": ["observe"]}, yaml=_DAG_YAML)
+    for ref, name in (
+        (_prompt("why_did_dag_run_fail"), "dag"),
+        (_template("cronstable://dags/{name}"), "name"),
+    ):
+        got, error = await _complete(h, ref, name, "")
+        assert error is None
+        assert got == {"values": [], "total": 0, "hasMore": False}
+
+
+async def test_complete_caps_values_at_one_hundred():
+    entry = "  - name: job{:03d}\n    command: x\n    schedule: '* * * * *'\n"
+    yaml = "jobs:\n" + "".join(entry.format(i) for i in range(120))
+    h = _handler(yaml=yaml)
+    got, _ = await _complete(h, _prompt("triage_job_failure"), "job", "JOB")
+    assert len(got["values"]) == mcp_mod.COMPLETION_MAX
+    assert got["total"] == 120
+    assert got["hasMore"] is True
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        pytest.param({}, id="empty"),
+        pytest.param(
+            {"ref": _prompt("nope"), "argument": {"name": "x", "value": ""}},
+            id="unknown-prompt",
+        ),
+        pytest.param(
+            {
+                "ref": _template("cronstable://nope/{x}"),
+                "argument": {"name": "x", "value": ""},
+            },
+            id="unknown-template",
+        ),
+        pytest.param(
+            {
+                "ref": {"type": "ref/tool", "name": "x"},
+                "argument": {"name": "x", "value": ""},
+            },
+            id="bad-ref-type",
+        ),
+        pytest.param(
+            {
+                "ref": _prompt("triage_job_failure"),
+                "argument": {"name": "job", "value": 5},
+            },
+            id="value-not-string",
+        ),
+    ],
+)
+async def test_complete_rejects_malformed_requests(params):
+    resp = await _req(_handler(), "completion/complete", params)
+    assert resp["error"]["code"] == mcp_mod.INVALID_PARAMS
+
+
+async def test_complete_run_keys_from_recent_runs(tmp_path):
+    h, cron = await _state_handler(tmp_path)
+    try:
+        run_key = (
+            await _call(h, "cron_trigger_dag", {"dag": "ap", "confirm": True})
+        )["structuredContent"]["runKey"]
+        got, _ = await _complete(
+            h,
+            _prompt("why_did_dag_run_fail"),
+            "run_key",
+            "",
+            known={"dag": "ap"},
+        )
+        assert got["values"] == [run_key]
+        got, _ = await _complete(
+            h,
+            _template("cronstable://dags/{name}/runs/{run_key}"),
+            "run_key",
+            run_key[:3].upper(),
+            known={"name": "ap"},
+        )
+        assert got["values"] == [run_key]
+        # without the DAG in context, or for an unknown one: nothing
+        got, _ = await _complete(
+            h, _prompt("why_did_dag_run_fail"), "run_key", ""
+        )
+        assert got["values"] == []
+        got, _ = await _complete(
+            h,
+            _prompt("why_did_dag_run_fail"),
+            "run_key",
+            "",
+            known={"dag": "ghost"},
+        )
+        assert got["values"] == []
+    finally:
+        await _teardown(cron)
+
+
+# ---------------------------------------------------------------------------
+# declared output schemas
+# ---------------------------------------------------------------------------
+
+_OUTPUT_SCHEMA_TOOLS = {
+    "cron_get_status",
+    "cron_list_jobs",
+    "cron_validate_schedule",
+    "cron_explain_schedule",
+    "cron_why_no_run",
+}
+
+
+async def test_core_tools_declare_valid_output_schemas():
+    h = _handler()
+    listed = {
+        t["name"]: t for t in (await _req(h, "tools/list"))["result"]["tools"]
+    }
+    declared = {n for n, t in listed.items() if "outputSchema" in t}
+    assert declared == _OUTPUT_SCHEMA_TOOLS
+    for name in declared:
+        jsonschema.Draft202012Validator.check_schema(
+            listed[name]["outputSchema"]
+        )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"expression": "*/7 * * * *"},
+        {"expression": "0 9 * * mon-fry"},
+        {"expression": "@reboot"},
+        {"expression": "H 3 * * *", "seed": "job"},
+        {"expression": "0 0 30 2 *", "tz": "Europe/Berlin"},
+    ],
+)
+async def test_schedule_sandbox_results_conform(arguments):
+    # _call validates each result against the declared schema
+    h = _handler()
+    for tool in ("cron_validate_schedule", "cron_explain_schedule"):
+        await _call(h, tool, arguments)
+
+
+async def test_why_no_run_and_listing_results_conform():
+    yaml = _YAML + "  - name: boot\n    command: x\n    schedule: '@reboot'\n"
+    h = _handler(yaml=yaml)
+    for name in ("hello", "nightly", "boot"):
+        await _call(h, "cron_why_no_run", {"name": name, "at": "2026-07-14"})
+    h._cron.run_history["hello"].append(_run_info("failure"))
+    await _call(h, "cron_pause_job", {"name": "hello", "confirm": True})
+    await _call(h, "cron_list_jobs")
+    await _call(h, "cron_get_status", {"limit": 1})

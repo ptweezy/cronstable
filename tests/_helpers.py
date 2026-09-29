@@ -601,17 +601,18 @@ def _write_tls(dirpath, cn="web-ca", *, suffix="leaf", ip_sans=True):
 # cronstable/cron.py (tests/test_cron_web.py) and cronstable/jobapi.py
 # (tests/test_state_job_api.py).
 
-# The ONE class an ARGUMENTLESS raise may name.  An auth failure deliberately
+# The ONE class a REASONLESS raise may name.  An auth failure deliberately
 # carries no reason, and the rationale is written at all seven raise sites
 # (four in cron.auth_middleware, three in JobStateAPI._run): a 401 that
 # distinguished a missing header from a wrong scheme from an unknown token
 # would confirm to an unauthenticated caller which half of a guess was right.
-# The exemption is for a no-argument raise BECAUSE that is what makes the body
-# reasonless: `raise web.HTTPUnauthorized(text="unknown token")` puts the
-# oracle back and is flagged like any other bare error.  Both modules'
-# outermost error middleware still gives the reasonless body the JSON
-# envelope, so only the reason is withheld.  The allowlist covers raises only:
-# a RETURNED 401 is rescued by nothing and is always a defect.
+# The exemption is for a raise whose only argument is `headers=` (the 401's
+# WWW-Authenticate challenge) BECAUSE that is what keeps the body reasonless:
+# `raise web.HTTPUnauthorized(text="unknown token")` puts the oracle back and
+# is flagged like any other bare error.  Both modules' outermost error
+# middleware still gives the reasonless body the JSON envelope, so only the
+# reason is withheld.  The allowlist covers raises only: a RETURNED 401 is
+# rescued by nothing and is always a defect.
 BARE_HTTP_RAISE_ALLOWED = frozenset({"HTTPUnauthorized"})
 
 # How an error response is built instead, per scanned module.  Load-bearing:
@@ -634,11 +635,12 @@ def bare_http_raises(path):
 
     Returns a list of ``(filename, lineno, enclosing function)`` triples,
     which is empty on a conforming file.  Three shapes are reported: a
-    ``raise`` naming a ``web.HTTP*`` class with any argument, an argumentless
-    ``raise`` of a class outside ``BARE_HTTP_RAISE_ALLOWED``, and a ``return``
-    of a ``web.HTTP*`` instance (never allowlisted, since no middleware
-    rescues one).  Both the attribute spelling (``web.HTTPNotFound``) and the
-    direct-import spelling (``from aiohttp.web import HTTPNotFound``) count.
+    ``raise`` naming a ``web.HTTP*`` class with any argument but ``headers``,
+    a reasonless ``raise`` of a class outside ``BARE_HTTP_RAISE_ALLOWED``,
+    and a ``return`` of a ``web.HTTP*`` instance (never allowlisted, since no
+    middleware rescues one).  Both the attribute spelling
+    (``web.HTTPNotFound``) and the direct-import spelling
+    (``from aiohttp.web import HTTPNotFound``) count.
     The module's entry in ``ERROR_ENVELOPE_HELPERS`` is checked too: a helper
     the file no longer binds is reported at line 0.
 
@@ -649,7 +651,7 @@ def bare_http_raises(path):
     """
 
     def http_class(expr):
-        """``(class name, takes no arguments)`` for an aiohttp error expr.
+        """``(class name, carries no reason)`` for an aiohttp error expr.
 
         Covers ``web.HTTPNotFound()``, the class-only ``web.HTTPNotFound``
         and the direct-import ``HTTPNotFound()`` alike.  ``(None, False)``
@@ -659,7 +661,9 @@ def bare_http_raises(path):
         """
         bare = True
         if isinstance(expr, ast.Call):
-            bare = not expr.args and not expr.keywords
+            bare = not expr.args and all(
+                kw.arg == "headers" for kw in expr.keywords
+            )
             expr = expr.func
         if isinstance(expr, ast.Attribute) and expr.attr.startswith("HTTP"):
             return expr.attr, bare

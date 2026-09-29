@@ -153,7 +153,8 @@ def test_required_scope_get_is_view():
             "approve",
             id="decision-post-is-approve",
         ),
-        pytest.param("/mcp", "/mcp", "control", id="mcp-post-is-control"),
+        # /mcp opens to view; each tool then demands its own scope
+        pytest.param("/mcp", "/mcp", "view", id="mcp-post-is-view"),
     ],
 )
 def test_required_scope_post_routes(path, canonical, expected):
@@ -220,14 +221,6 @@ async def test_control_token_allowed_on_get_via_implied_view():
             "/jobs/{name}/start",
             id="approve-token-on-control-post",
         ),
-        pytest.param(
-            "viewtok",
-            ["view"],
-            "phone",
-            "/mcp",
-            "/mcp",
-            id="view-token-on-mcp",
-        ),
     ],
 )
 async def test_insufficient_scope_post_is_403(
@@ -262,6 +255,12 @@ async def test_insufficient_scope_post_is_403(
         ),
         pytest.param(
             "ctl", ["control"], "ci", "/mcp", "/mcp", id="control-token-on-mcp"
+        ),
+        pytest.param(
+            "viewtok", ["view"], "phone", "/mcp", "/mcp", id="view-token-on-mcp"
+        ),
+        pytest.param(
+            "apr", ["approve"], "oncall", "/mcp", "/mcp", id="approve-token-on-mcp"
         ),
     ],
 )
@@ -465,8 +464,9 @@ async def test_anonymous_view_serves_a_credential_less_get():
             "approve",
             id="decision-needs-approve",
         ),
-        pytest.param("/mcp", "/mcp", "POST", "control", id="mcp-post"),
-        pytest.param("/mcp", "/mcp", "GET", "control", id="mcp-get"),
+        # /mcp needs only view, but anonymous callers are excluded from it
+        pytest.param("/mcp", "/mcp", "POST", "view", id="mcp-post"),
+        pytest.param("/mcp", "/mcp", "GET", "view", id="mcp-get"),
     ],
 )
 async def test_anonymous_view_refuses_mutating_routes(
@@ -621,16 +621,14 @@ async def test_scoped_tokens_end_to_end():
             ) as resp:
                 assert resp.status == 200
             # the /mcp override binds on the real registered route, on every
-            # method: view is refused, control reaches the handler (whose GET
-            # answer is 405: the stateless transport has no SSE stream).
-            async with session.get(
-                base + "/mcp", headers=_bearer("viewtok")
-            ) as resp:
-                assert resp.status == 403
-            async with session.get(
-                base + "/mcp", headers=_bearer("ctltok")
-            ) as resp:
-                assert resp.status == 405
+            # method: view reaches the handler (whose GET answer is 405: the
+            # stateless transport has no SSE stream), and each tool then
+            # demands its own scope (test_mcp_over_http_gates_each_tool).
+            for tok in ("viewtok", "ctltok"):
+                async with session.get(
+                    base + "/mcp", headers=_bearer(tok)
+                ) as resp:
+                    assert resp.status == 405, tok
             # the decision route's `approve` override, on the real route:
             # approve passes the scope gate and reaches the handler (409, no
             # such run); control and view are 403 despite outranking approve
@@ -956,3 +954,160 @@ async def test_bare_options_without_preflight_header_is_401():
     mw = Cron._make_auth_middleware(_table(("ctl", ["control"], "ctl")))
     with pytest.raises(web.HTTPUnauthorized):
         await _run(mw, _ScopedReq("/mcp", method="OPTIONS"))
+
+
+# --------------------------------------------------------------------------
+# /mcp opens to view tokens; each tool demands its REST twin's scope, and
+# anonymous callers stay out
+# --------------------------------------------------------------------------
+
+
+async def test_anonymous_view_excludes_mcp():
+    # without the exclusion, web.anonymousScopes: [view] would open /mcp to
+    # unauthenticated callers now that it needs only view
+    for method in ("POST", "GET"):
+        with pytest.raises(web.HTTPForbidden) as exc:
+            await _run(
+                _anon_mw(), _ScopedReq("/mcp", method=method, canonical="/mcp")
+            )
+        assert "MCP access requires a bearer token" in str(exc.value.text)
+
+
+@pytest.mark.asyncio
+async def test_mcp_over_http_gates_each_tool():
+    import aiohttp
+
+    from cronstable.config import _build_mcp_config
+
+    cron = cronstable.cron.Cron(None, config_yaml=_DISABLED_JOB)
+    web_config = {
+        "listen": ["http://127.0.0.1:0"],
+        "authTokens": [
+            {"value": "viewtok", "scopes": ["view"], "label": "phone"},
+            {"value": "ctltok", "scopes": ["control"], "label": "ci"},
+            {"value": "apprtok", "scopes": ["approve"], "label": "lead"},
+        ],
+        "anonymousScopes": ["view"],
+    }
+    mcp_config = _build_mcp_config(
+        {"enabled": True, "readOnly": False, "toolsets": ["observe", "act", "dags"]}
+    )
+    await cron.start_stop_web_app(web_config, mcp_config)
+    try:
+        port = cron.web_runner.addresses[0][1]
+        url = "http://127.0.0.1:{}/mcp".format(port)
+
+        async def rpc(session, token, method, params=None):
+            headers = _bearer(token) if token else {}
+            body = {"jsonrpc": "2.0", "id": 1, "method": method}
+            if params is not None:
+                body["params"] = params
+            async with session.post(url, json=body, headers=headers) as resp:
+                return resp.status, await resp.json()
+
+        async def tools(session, token):
+            _status, body = await rpc(session, token, "tools/list")
+            return {t["name"] for t in body["result"]["tools"]}
+
+        async def call(session, token, name, arguments):
+            _status, body = await rpc(
+                session,
+                token,
+                "tools/call",
+                {"name": name, "arguments": arguments},
+            )
+            return body["result"]
+
+        async with aiohttp.ClientSession() as session:
+            # a view token opens a read-only session...
+            status, body = await rpc(
+                session, "viewtok", "initialize", {"protocolVersion": "2025-11-25"}
+            )
+            assert status == 200
+            listed = await tools(session, "viewtok")
+            assert "cron_get_status" in listed
+            assert not listed & {"cron_run_job", "cron_trigger_dag"}
+            result = await call(session, "viewtok", "cron_get_status", {})
+            assert "isError" not in result
+            # ...and cannot act, whatever it asks for by name
+            result = await call(
+                session, "viewtok", "cron_run_job", {"name": "test", "confirm": True}
+            )
+            assert result["isError"] is True
+            assert "'control'" in result["content"][0]["text"]
+            # a control token acts (the job is disabled, so the action itself
+            # refuses: past the scope gate)
+            assert "cron_run_job" in await tools(session, "ctltok")
+            result = await call(
+                session, "ctltok", "cron_run_job", {"name": "test", "confirm": True}
+            )
+            assert "disabled" in result["content"][0]["text"]
+            # the gate decision still needs approve, exactly like REST
+            gate = {
+                "dag": "d",
+                "run_key": "r",
+                "taskkey": "t",
+                "decision": "approve",
+                "confirm": True,
+            }
+            result = await call(session, "ctltok", "cron_decide_gate", gate)
+            assert "'approve'" in result["content"][0]["text"]
+            result = await call(session, "apprtok", "cron_decide_gate", gate)
+            assert "scope" not in result["content"][0]["text"]
+            # an anonymous caller is refused before the MCP handler
+            status, _body = await rpc(session, None, "tools/list")
+            assert status == 403
+    finally:
+        await cron.start_stop_web_app(None)
+        await asyncio.sleep(0.25)
+
+
+# --------------------------------------------------------------------------
+# every 401 carries a WWW-Authenticate challenge (RFC 9110)
+# --------------------------------------------------------------------------
+
+_CHALLENGE = 'Bearer realm="cronstable"'
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param({}, id="no-header"),
+        pytest.param({"Authorization": "Basic Zm9vOmJhcg=="}, id="wrong-scheme"),
+        pytest.param({"Authorization": "Bearer "}, id="empty-token"),
+        pytest.param({"Authorization": "Bearer caf\udce9"}, id="unencodable"),
+        pytest.param({"Authorization": "Bearer nope"}, id="unknown-token"),
+    ],
+)
+async def test_every_401_carries_the_bearer_challenge(headers):
+    mw = Cron._make_auth_middleware(_table(("viewtok", ["view"], "phone")))
+    with pytest.raises(web.HTTPUnauthorized) as exc:
+        await _run(mw, _ScopedReq("/status", headers=headers))
+    assert exc.value.headers["WWW-Authenticate"] == _CHALLENGE
+    # still reasonless: the challenge names the scheme, never the failure
+    assert exc.value.text == "401: Unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_the_envelope_keeps_the_challenge():
+    import aiohttp
+
+    cron = cronstable.cron.Cron(None, config_yaml=_DISABLED_JOB)
+    web_config = {
+        "listen": ["http://127.0.0.1:0"],
+        "authTokens": [{"value": "viewtok", "scopes": ["view"], "label": "p"}],
+    }
+    await cron.start_stop_web_app(web_config)
+    try:
+        port = cron.web_runner.addresses[0][1]
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "http://127.0.0.1:{}/status".format(port)
+            ) as resp:
+                assert resp.status == 401
+                assert resp.headers["WWW-Authenticate"] == _CHALLENGE
+                assert resp.content_type == "application/json"
+                assert "error" in await resp.json()
+    finally:
+        await cron.start_stop_web_app(None)
+        await asyncio.sleep(0.25)

@@ -316,7 +316,14 @@ class _PostRecorder:
         self.calls = []
 
     def __call__(
-        self, url, frame, token, protocol_version, timeout, opener=None
+        self,
+        url,
+        frame,
+        token,
+        protocol_version,
+        timeout,
+        opener=None,
+        headers=None,
     ):
         self.calls.append(
             {
@@ -326,6 +333,7 @@ class _PostRecorder:
                 "pv": protocol_version,
                 "timeout": timeout,
                 "opener": opener,
+                "headers": headers,
             }
         )
         outcome = self._outcomes.pop(0)
@@ -445,7 +453,7 @@ def test_bridge_transport_error_on_request_emits_error_frame(
     captured = capsys.readouterr()
     frames = _frames(captured.out)
     assert frames[0]["id"] == 5
-    assert frames[0]["error"]["code"] == -32001
+    assert frames[0]["error"]["code"] == mcpcli._TRANSPORT_ERROR
     assert "cannot reach" in frames[0]["error"]["message"]
 
 
@@ -471,7 +479,7 @@ def test_bridge_http_error_becomes_error_frame(monkeypatch, capsys):
     )
     assert code == 0
     frames = _frames(capsys.readouterr().out)
-    assert frames[0]["error"]["code"] == -32001
+    assert frames[0]["error"]["code"] == mcpcli._TRANSPORT_ERROR
     assert "HTTP 401" in frames[0]["error"]["message"]
     assert "authentication required" in frames[0]["error"]["message"]
 
@@ -510,7 +518,7 @@ def test_bridge_empty_200_body_becomes_error_frame(monkeypatch, capsys):
     )
     assert code == 0
     frames = _frames(capsys.readouterr().out)
-    assert frames[0]["error"]["code"] == -32001
+    assert frames[0]["error"]["code"] == mcpcli._TRANSPORT_ERROR
     assert "HTTP 200" in frames[0]["error"]["message"]
 
 
@@ -611,7 +619,35 @@ def _check(monkeypatch, outcomes, **arg_overrides):
     return code, recorder
 
 
-def test_check_happy_path(monkeypatch, capsys):
+# how a legacy-only daemon answers the modern probe's version header
+_LEGACY_PROBE = (400, b'{"error": "unsupported MCP-Protocol-Version"}')
+
+
+def test_check_probes_discover_and_stays_modern(monkeypatch, capsys):
+    discover = json.dumps(
+        {"result": {"supportedVersions": ["2026-07-28", "2025-11-25"]}}
+    ).encode()
+    tools = json.dumps({"result": {"tools": [{"name": "a"}]}}).encode()
+    code, recorder = _check(monkeypatch, [(200, discover), (200, tools)])
+    assert code == 0
+    err = capsys.readouterr().err
+    assert (
+        "ok - protocol 2026-07-28 (modern; the daemon serves 2026-07-28, "
+        "2025-11-25), 1 tool(s)"
+    ) in err
+    probe, listing = (json.loads(c["frame"]) for c in recorder.calls)
+    assert probe["method"] == "server/discover"
+    assert listing["method"] == "tools/list"
+    # both requests carry the modern _meta and its mirrored headers
+    for call, frame in zip(recorder.calls, (probe, listing)):
+        assert frame["params"]["_meta"][mcpcli._META_PROTOCOL_VERSION] == (
+            "2026-07-28"
+        )
+        assert call["headers"]["MCP-Protocol-Version"] == "2026-07-28"
+        assert call["headers"]["Mcp-Method"] == frame["method"]
+
+
+def test_check_falls_back_to_initialize(monkeypatch, capsys):
     init_reply = json.dumps(
         {"result": {"protocolVersion": "2025-06-18"}}
     ).encode()
@@ -619,24 +655,43 @@ def test_check_happy_path(monkeypatch, capsys):
         {"result": {"tools": [{"name": "cron_get_status"}]}}
     ).encode()
     code, recorder = _check(
-        monkeypatch, [(200, init_reply), (200, tools_reply)]
+        monkeypatch, [_LEGACY_PROBE, (200, init_reply), (200, tools_reply)]
     )
     assert code == 0
     err = capsys.readouterr().err
-    assert "ok - protocol 2025-06-18, 1 tool(s)" in err
-    # the second request must carry the negotiated version, and the first the
-    # pre-initialize default.
-    assert recorder.calls[0]["pv"] == mcpcli.DEFAULT_PROTOCOL_VERSION
-    assert recorder.calls[1]["pv"] == "2025-06-18"
-    assert json.loads(recorder.calls[1]["frame"])["method"] == "tools/list"
+    assert "ok - protocol 2025-06-18 (legacy), 1 tool(s)" in err
+    # initialize carries the pre-initialize default, tools/list the
+    # negotiated version, and neither has modern headers
+    assert recorder.calls[1]["pv"] == mcpcli.DEFAULT_PROTOCOL_VERSION
+    assert recorder.calls[2]["pv"] == "2025-06-18"
+    assert recorder.calls[1]["headers"] is recorder.calls[2]["headers"] is None
+    assert json.loads(recorder.calls[2]["frame"])["method"] == "tools/list"
+
+
+def test_check_falls_back_when_discover_omits_our_version(
+    monkeypatch, capsys
+):
+    discover = json.dumps({"result": {"supportedVersions": ["2099-01-01"]}})
+    code, recorder = _check(
+        monkeypatch,
+        [
+            (200, discover.encode()),
+            (200, b'{"result": {"protocolVersion": "2025-11-25"}}'),
+            (200, b'{"result": {"tools": []}}'),
+        ],
+    )
+    assert code == 0
+    assert "(legacy)" in capsys.readouterr().err
+    assert json.loads(recorder.calls[1]["frame"])["method"] == "initialize"
 
 
 def test_check_threads_the_default_opener_into_post(monkeypatch, capsys):
     code, recorder = _check(
-        monkeypatch, [(200, b'{"result": {}}'), (200, b'{"result": {}}')]
+        monkeypatch,
+        [_LEGACY_PROBE, (200, b'{"result": {}}'), (200, b'{"result": {}}')],
     )
     assert code == 0
-    assert [c["opener"] for c in recorder.calls] == [mcpcli._OPENER] * 2
+    assert [c["opener"] for c in recorder.calls] == [mcpcli._OPENER] * 3
 
 
 def test_check_bad_tls_material_fails_before_any_request(
@@ -655,7 +710,9 @@ def test_check_unreachable_daemon(monkeypatch, capsys):
 
 
 def test_check_initialize_http_failure(monkeypatch, capsys):
-    code, _ = _check(monkeypatch, [(401, b'{"error": "auth"}')])
+    code, _ = _check(
+        monkeypatch, [(401, b'{"error": "auth"}'), (401, b'{"error": "auth"}')]
+    )
     assert code == 1
     err = capsys.readouterr().err
     assert "initialize failed" in err
@@ -667,6 +724,7 @@ def test_check_tools_list_failure_still_ok(monkeypatch, capsys):
     code, _ = _check(
         monkeypatch,
         [
+            _LEGACY_PROBE,
             (200, b'{"result": {"protocolVersion": "2025-11-25"}}'),
             mcpcli._BridgeError("flaky"),
         ],
@@ -678,13 +736,203 @@ def test_check_tools_list_failure_still_ok(monkeypatch, capsys):
 def test_check_tools_list_bad_json_still_ok(monkeypatch, capsys):
     code, _ = _check(
         monkeypatch,
-        [(200, b'{"result": {}}'), (200, b"not json")],
+        [_LEGACY_PROBE, (200, b'{"result": {}}'), (200, b"not json")],
     )
     assert code == 0
     err = capsys.readouterr().err
     # sniff fell back to the pre-initialize default version.
     assert mcpcli.DEFAULT_PROTOCOL_VERSION in err
     assert "0 tool(s)" in err
+
+
+# ---------------------------------------------------------------------------
+# era-aware forwarding: modern headers, forwarded errors, dropped replies
+# ---------------------------------------------------------------------------
+
+_PV_KEY = mcpcli._META_PROTOCOL_VERSION
+
+
+def _modern_frame(method, mid=1, **params):
+    params["_meta"] = {
+        _PV_KEY: "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }
+    return {"jsonrpc": "2.0", "id": mid, "method": method, "params": params}
+
+
+@pytest.mark.parametrize(
+    ("frame", "expected"),
+    [
+        pytest.param(
+            _modern_frame("tools/list"),
+            {"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/list"},
+            id="no-name",
+        ),
+        pytest.param(
+            _modern_frame("tools/call", name="cron_get_status"),
+            {
+                "MCP-Protocol-Version": "2026-07-28",
+                "Mcp-Method": "tools/call",
+                "Mcp-Name": "cron_get_status",
+            },
+            id="tool-name",
+        ),
+        pytest.param(
+            _modern_frame("resources/read", uri="cronstable://status"),
+            {
+                "MCP-Protocol-Version": "2026-07-28",
+                "Mcp-Method": "resources/read",
+                "Mcp-Name": "cronstable://status",
+            },
+            id="resource-uri",
+        ),
+        pytest.param(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            None,
+            id="legacy",
+        ),
+        pytest.param(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {"_meta": {"progressToken": 1}},
+            },
+            None,
+            id="legacy-with-other-meta",
+        ),
+    ],
+)
+def test_modern_headers_mirror_the_body(frame, expected):
+    assert mcpcli._modern_headers(frame) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "encoded"),
+    [
+        pytest.param("us-west1", "us-west1", id="plain"),
+        pytest.param(
+            "Hello, 世界", "=?base64?SGVsbG8sIOS4lueVjA==?=", id="non-ascii"
+        ),
+        pytest.param(" padded ", "=?base64?IHBhZGRlZCA=?=", id="whitespace"),
+        pytest.param(
+            "line1\nline2", "=?base64?bGluZTEKbGluZTI=?=", id="control"
+        ),
+        pytest.param(
+            "=?base64?literal?=",
+            "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=",
+            id="sentinel-lookalike",
+        ),
+    ],
+)
+def test_header_values_use_the_base64_sentinel_when_needed(value, encoded):
+    # the spec's own encoding examples
+    assert mcpcli._encode_header_value(value) == encoded
+
+
+def test_modern_headers_leave_out_what_cannot_be_a_header():
+    frame = _modern_frame("tools/list\n")
+    frame["params"]["_meta"][_PV_KEY] = 20260728
+    # the daemon then names the missing header in its HeaderMismatch error
+    assert mcpcli._modern_headers(frame) == {}
+
+
+def test_post_modern_headers_replace_the_pinned_version(monkeypatch):
+    opener = _FakeOpener(_FakeResponse(200, b"{}"))
+    monkeypatch.setattr(mcpcli, "_OPENER", opener)
+    mcpcli._post(
+        "http://127.0.0.1:9",
+        b"{}",
+        None,
+        "2025-11-25",
+        1.0,
+        headers={"Mcp-Method": "tools/list"},
+    )
+    req = opener.request
+    assert req.get_header("Mcp-method") == "tools/list"
+    assert req.get_header("Mcp-protocol-version") is None
+
+
+def test_bridge_sends_modern_frames_with_their_headers(monkeypatch, capsys):
+    frame = _modern_frame("tools/call", name="cron_get_status")
+    reply = b'{"jsonrpc": "2.0", "id": 1, "result": {}}'
+    _code, recorder = _run(monkeypatch, json.dumps(frame) + "\n", [(200, reply)])
+    assert recorder.calls[0]["headers"] == {
+        "MCP-Protocol-Version": "2026-07-28",
+        "Mcp-Method": "tools/call",
+        "Mcp-Name": "cron_get_status",
+    }
+    assert len(_frames(capsys.readouterr().out)) == 1
+
+
+def test_bridge_forwards_the_daemons_jsonrpc_errors(monkeypatch, capsys):
+    # a stdio client needs the real -32022 to pick a version, and a body
+    # without an id gets the frame's
+    unsupported = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "error": {
+                "code": -32022,
+                "message": "Unsupported protocol version",
+                "data": {"supported": ["2026-07-28"], "requested": "x"},
+            },
+        }
+    ).encode()
+    missing = b'{"jsonrpc": "2.0", "error": {"code": -32601, "message": "m"}}'
+    stdin_text = (
+        json.dumps(_modern_frame("tools/list", mid=4))
+        + "\n"
+        + json.dumps(_modern_frame("nope", mid=5))
+        + "\n"
+    )
+    _run(monkeypatch, stdin_text, [(400, unsupported), (404, missing)])
+    first, second = _frames(capsys.readouterr().out)
+    assert first == json.loads(unsupported)
+    assert second["id"] == 5
+    assert second["error"]["code"] == -32601
+
+
+def test_bridge_legacy_daemon_error_stays_a_bridge_error(monkeypatch, capsys):
+    # an older, legacy-only daemon answers the modern version header with a
+    # plain 400; the bridge reports that as a non-modern error, so a
+    # dual-era client falls back to initialize.
+    _run(
+        monkeypatch,
+        json.dumps(_modern_frame("server/discover")) + "\n",
+        [_LEGACY_PROBE],
+    )
+    (frame,) = _frames(capsys.readouterr().out)
+    assert frame["error"]["code"] == mcpcli._TRANSPORT_ERROR
+    assert not -32768 <= mcpcli._TRANSPORT_ERROR <= -32000
+    assert "unsupported MCP-Protocol-Version" in frame["error"]["message"]
+
+
+def test_bridge_drops_responses_from_the_client(monkeypatch, capsys):
+    # the daemon sends no requests, so a reply answers nothing: it is
+    # neither forwarded nor answered
+    stdin_text = (
+        '{"jsonrpc": "2.0", "id": 1, "result": {}}\n'
+        '{"jsonrpc": "2.0", "id": 2, "error": {"code": 1, "message": "x"}}\n'
+    )
+    code, recorder = _run(monkeypatch, stdin_text, [])
+    assert code == 0
+    assert recorder.calls == []
+    assert capsys.readouterr().out == ""
+
+
+def test_bridge_does_not_sniff_a_modern_initialize(monkeypatch, capsys):
+    # the negotiated version is a legacy concept; a modern frame's reply
+    # must not repin the legacy header
+    frame = _modern_frame("initialize")
+    reply = b'{"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "x"}}'
+    ping = '{"jsonrpc": "2.0", "id": 2, "method": "ping"}\n'
+    _code, recorder = _run(
+        monkeypatch,
+        json.dumps(frame) + "\n" + ping,
+        [(200, reply), (200, b'{"id": 2}')],
+    )
+    assert recorder.calls[1]["pv"] == mcpcli.DEFAULT_PROTOCOL_VERSION
 
 
 # ---------------------------------------------------------------------------

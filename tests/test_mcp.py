@@ -7,12 +7,19 @@ is exercised with a minimal fake request; the fail-closed config check and the
 bridge's import isolation are checked at the module level.
 """
 
+import base64
+import itertools
 import json
+import pathlib
+import re
 import subprocess
 import sys
+import urllib.parse
 
 import pytest
+from multidict import CIMultiDict
 
+from cronstable import mcp as mcp_mod
 from cronstable.config import (
     ConfigError,
     _build_mcp_config,
@@ -60,7 +67,8 @@ class FakeReq:
 
     def __init__(self, method="POST", headers=None, body=b""):
         self.method = method
-        self.headers = headers or {}
+        # case-insensitive, like aiohttp's request headers
+        self.headers = CIMultiDict(headers or {})
         self._body = body
         self.content_length = len(body) if body else None
         # the mapping surface the auth middleware files the matched token
@@ -268,43 +276,44 @@ async def test_read_tools_annotations():
 
 
 async def test_mutating_tool_annotations_are_declared_correctly():
-    # destructiveHint/idempotentHint used to be spelled per tool; _tool()
-    # now DERIVES them from its keywords (idempotent defaults to `not
-    # mutating`), and nothing asserted either one, so a tool declared with
-    # the wrong keyword would advertise the wrong safety hint to an agent
-    # that uses these to decide what it may retry or must confirm. Pin the
-    # whole triple per tool, the way the TUI DAG-state map is pinned.
+    # _tool() derives the hints from its keywords (idempotent defaults to
+    # `not mutating`), so a tool declared with the wrong keyword would
+    # advertise the wrong safety hint to a client that uses these to decide
+    # what it may retry or must confirm with the user. Pin all four hints
+    # per tool.
     h = _handler({"readOnly": False, "toolsets": ["observe", "act", "dags"]})
     tools = {
         t["name"]: t["annotations"]
         for t in (await _req(h, "tools/list"))["result"]["tools"]
     }
     expected = {
-        # (readOnlyHint, destructiveHint, idempotentHint)
-        # launching is not destructive but is not repeatable either: two
-        # calls are two runs
-        "cron_run_job": (False, False, False),
-        # cancelling terminates a run (destructive) but re-cancelling a
-        # stopped job changes nothing
-        "cron_cancel_job": (False, True, True),
-        "cron_pause_job": (False, False, True),
-        "cron_resume_job": (False, False, True),
-        "cron_trigger_dag": (False, False, False),
-        # a backfill and a gate decision both overwrite run state
-        "cron_backfill_dag": (False, True, False),
-        "cron_decide_gate": (False, True, False),
-        "cron_recover_dag": (False, False, True),
-        "cron_cancel_queued": (False, True, True),
+        # (readOnlyHint, destructiveHint, idempotentHint, openWorldHint)
+        # launching runs whatever command the job or task configures, so
+        # its effects are open-ended, and two calls are two runs
+        "cron_run_job": (False, True, False, True),
+        "cron_trigger_dag": (False, True, False, True),
+        "cron_backfill_dag": (False, True, False, True),
+        # a recovery plan token executes once; a repeat changes nothing
+        "cron_recover_dag": (False, True, True, True),
+        # approving releases the downstream tasks
+        "cron_decide_gate": (False, True, False, True),
+        # stopping work is destructive but closed: nothing new runs, and a
+        # repeat changes nothing
+        "cron_cancel_job": (False, True, True, False),
+        "cron_cancel_queued": (False, True, True, False),
+        "cron_pause_job": (False, False, True, False),
+        "cron_resume_job": (False, False, True, False),
     }
-    for name, triple in expected.items():
+    for name, hints in expected.items():
         assert name in tools, "{} is gone; update this table".format(name)
         ann = tools[name]
         got = (
             ann["readOnlyHint"],
             ann["destructiveHint"],
             ann["idempotentHint"],
+            ann["openWorldHint"],
         )
-        assert got == triple, (name, got, triple)
+        assert got == hints, (name, got, hints)
     # every OTHER tool in this fully-enabled handler is read-only, so the
     # table above is the complete mutating set and a new mutating tool
     # cannot slip in unannotated
@@ -961,3 +970,477 @@ async def test_why_no_run_unknown_job_and_bad_timestamp():
     assert "ISO 8601" in result["content"][0]["text"]
     result = await _call(h, "cron_why_no_run", {"name": "weekday-report"})
     assert result["isError"] is True
+
+
+# ---------------------------------------------------------------------------
+# tool results carry the data in `content` too
+# ---------------------------------------------------------------------------
+
+_EVERYTHING = {
+    "readOnly": False,
+    "toolsets": ["observe", "act", "dags", "state"],
+}
+
+#: One call per registered tool. Against the stateless _YAML handler the
+#: DAG, pool-mutating and unconfirmed calls end in isError; the success
+#: paths of those tools run through test_mcp_tools.py's _call, which checks
+#: the same invariant on every result.
+_ONE_CALL_EACH = {
+    "cron_get_status": {},
+    "cron_list_jobs": {},
+    "cron_get_job": {"name": "hello"},
+    "cron_list_runs": {"name": "hello"},
+    "cron_get_job_trends": {"name": "hello"},
+    "cron_get_job_resources": {"name": "hello"},
+    "cron_get_cluster": {},
+    "cron_get_fleet": {},
+    "cron_get_node": {},
+    "cron_query_metrics": {"limit": 3},
+    "cron_get_version": {},
+    "cron_tail_job_logs": {"name": "hello"},
+    "cron_schedule_pressure": {},
+    "cron_schedule_duplicates": {},
+    "cron_suggest_slot": {},
+    "cron_validate_schedule": {"expression": "*/5 * * * *"},
+    "cron_explain_schedule": {"expression": "*/5 * * * *"},
+    "cron_why_no_run": {"name": "hello", "at": "2026-07-14T09:00:00"},
+    "cron_list_pools": {},
+    "cron_list_dags": {},
+    "cron_list_dag_runs": {"dag": "ghost"},
+    "cron_get_dag_run": {"dag": "ghost", "run_key": "r"},
+    "cron_get_dag_xcom": {"dag": "ghost", "run_key": "r"},
+    "cron_tail_dag_task_logs": {
+        "dag": "ghost",
+        "run_key": "r",
+        "taskkey": "t",
+    },
+    "cron_preview_recovery": {"dag": "ghost", "run_key": "r"},
+    "cron_inspect_state": {},
+    "cron_cancel_queued": {"pool": "p", "id": "i"},
+    "cron_run_job": {"name": "hello"},
+    "cron_cancel_job": {"name": "hello", "confirm": True},
+    "cron_pause_job": {"name": "hello", "confirm": True},
+    "cron_resume_job": {"name": "hello", "confirm": True},
+    "cron_trigger_dag": {"dag": "ghost", "confirm": True},
+    "cron_backfill_dag": {"dag": "ghost", "from": "a", "to": "b"},
+    "cron_recover_dag": {"dag": "ghost", "plan_token": "x"},
+    "cron_decide_gate": {
+        "dag": "ghost",
+        "run_key": "r",
+        "taskkey": "t",
+        "decision": "approve",
+    },
+}
+
+
+async def test_every_tool_result_carries_its_json_in_content():
+    # A client that passes only `content` to the model (Claude Desktop) must
+    # still see the data, so a success adds structuredContent as JSON text
+    # after the summary; an error stays a single readable block.
+    h = _handler(_EVERYTHING)
+    assert set(_ONE_CALL_EACH) == set(await _tool_names(h))
+    successes = 0
+    for name, arguments in _ONE_CALL_EACH.items():
+        result = await _call(h, name, arguments)
+        if result.get("isError"):
+            assert len(result["content"]) == 1, name
+            assert "structuredContent" not in result, name
+            continue
+        successes += 1
+        summary, data = result["content"]
+        assert summary["type"] == data["type"] == "text"
+        assert json.loads(data["text"]) == result["structuredContent"], name
+    assert successes >= 20
+
+
+# ---------------------------------------------------------------------------
+# resource template URIs are percent-decoded
+# ---------------------------------------------------------------------------
+
+_ODD_NAMES = ["nightly backup", "a/b", "c#d", "50%", "café ✓"]
+
+
+def _uri(template, **values):
+    for key, value in values.items():
+        template = template.replace(
+            "{" + key + "}", urllib.parse.quote(value, safe="")
+        )
+    return template
+
+
+async def test_job_templates_round_trip_encoded_names():
+    yaml = "jobs:\n" + "".join(
+        "  - name: {}\n    command: echo\n    schedule: '* * * * *'\n".format(
+            json.dumps(name)
+        )
+        for name in _ODD_NAMES
+    )
+    h = _handler(yaml=yaml)
+    for name in _ODD_NAMES:
+        job = await _req(
+            h,
+            "resources/read",
+            {"uri": _uri("cronstable://jobs/{name}", name=name)},
+        )
+        assert json.loads(job["result"]["contents"][0]["text"])["name"] == name
+        runs = await _req(
+            h,
+            "resources/read",
+            {"uri": _uri("cronstable://jobs/{name}/runs", name=name)},
+        )
+        assert "result" in runs, (name, runs)
+
+
+async def test_dag_and_state_templates_decode_every_captured_value(
+    monkeypatch,
+):
+    # the loaders are bound when the handler is built, so record what each
+    # template hands them.
+    cron = Cron(None, config_yaml=_YAML)
+    cron.web_config = {}
+    seen = []
+
+    async def record(*args):
+        seen.append(args)
+        return {"ok": True}
+
+    async def dags():
+        return [{"name": name} for name in _ODD_NAMES]
+
+    monkeypatch.setattr(cron._dag, "get_run", record)
+    monkeypatch.setattr(cron, "state_documents_payload", record)
+    monkeypatch.setattr(cron, "dags_payload", dags)
+    h = MCPHandler(
+        cron,
+        _build_mcp_config(
+            {"enabled": True, "toolsets": ["observe", "dags", "state"]}
+        ),
+    )
+    for name in _ODD_NAMES:
+        detail = await _req(
+            h,
+            "resources/read",
+            {"uri": _uri("cronstable://dags/{name}", name=name)},
+        )
+        body = json.loads(detail["result"]["contents"][0]["text"])
+        assert body == {"name": name}
+        run_key = name + " run"
+        await _req(
+            h,
+            "resources/read",
+            {
+                "uri": _uri(
+                    "cronstable://dags/{name}/runs/{run_key}",
+                    name=name,
+                    run_key=run_key,
+                )
+            },
+        )
+        await _req(
+            h,
+            "resources/read",
+            {"uri": "cronstable://state/kv/" + urllib.parse.quote(name)},
+        )
+        assert seen[-2:] == [(name, run_key), ("kv/" + name,)]
+
+
+# ---------------------------------------------------------------------------
+# prompts name only tools the client can see
+# ---------------------------------------------------------------------------
+
+_TOOLSETS = ("observe", "act", "dags", "state")
+
+
+def _toolset_combos():
+    for size in range(1, len(_TOOLSETS) + 1):
+        yield from itertools.combinations(_TOOLSETS, size)
+
+
+@pytest.mark.parametrize("read_only", [True, False])
+@pytest.mark.parametrize("scopes", [None, frozenset({"view"})])
+async def test_every_served_prompt_names_only_served_tools(read_only, scopes):
+    # A prompt that tells the model to call a tool it cannot see wastes the
+    # turn, so for every configuration a rendered prompt may name only
+    # tools that tools/list returns to the same caller.
+    caller = None if scopes is None else mcp_mod._Caller("t", scopes)
+    token = mcp_mod._caller.set(caller)
+    try:
+        for combo in _toolset_combos():
+            h = _handler({"readOnly": read_only, "toolsets": list(combo)})
+            tools = set(await _tool_names(h))
+            listed = (await _req(h, "prompts/list"))["result"]["prompts"]
+            for prompt in listed:
+                args = {a["name"]: "x" for a in prompt["arguments"]}
+                got = await _req(
+                    h,
+                    "prompts/get",
+                    {"name": prompt["name"], "arguments": args},
+                )
+                text = got["result"]["messages"][0]["content"]["text"]
+                named = set(re.findall(r"cron_\w+", text))
+                assert named, prompt["name"]
+                assert named <= tools, (combo, prompt["name"], named - tools)
+    finally:
+        mcp_mod._caller.reset(token)
+
+
+async def test_prompt_gating_under_the_default_and_read_only_configs():
+    # default observe-only: blast_radius is served without its DAG and
+    # state steps
+    h = _handler()
+    got = await _req(
+        h,
+        "prompts/get",
+        {"name": "blast_radius", "arguments": {"target": "j"}},
+    )
+    text = got["result"]["messages"][0]["content"]["text"]
+    assert "cron_get_fleet" in text
+    assert "cron_list_dags" not in text
+    assert "cron_inspect_state" not in text
+    # readOnly removes cron_backfill_dag, so backfill_plan goes with it
+    h = _handler({"toolsets": ["observe", "dags"]})
+    names = {
+        p["name"] for p in (await _req(h, "prompts/list"))["result"]["prompts"]
+    }
+    assert "why_did_dag_run_fail" in names
+    assert "backfill_plan" not in names
+    resp = await _req(
+        h,
+        "prompts/get",
+        {
+            "name": "backfill_plan",
+            "arguments": {"dag": "d", "from": "a", "to": "b"},
+        },
+    )
+    assert resp["error"]["code"] == -32602
+    h = _handler({"readOnly": False, "toolsets": ["observe", "dags"]})
+    names = {
+        p["name"] for p in (await _req(h, "prompts/list"))["result"]["prompts"]
+    }
+    assert "backfill_plan" in names
+
+
+# ---------------------------------------------------------------------------
+# prompts/get validates its arguments
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        pytest.param({"name": ["triage_job_failure"]}, id="name-not-string"),
+        pytest.param({"name": "triage_job_failure"}, id="required-missing"),
+        pytest.param(
+            {"name": "triage_job_failure", "arguments": {"job": ""}},
+            id="required-empty",
+        ),
+        pytest.param(
+            {"name": "triage_job_failure", "arguments": {"job": ["hello"]}},
+            id="value-not-string",
+        ),
+        pytest.param(
+            {"name": "triage_job_failure", "arguments": [1]},
+            id="arguments-not-object",
+        ),
+    ],
+)
+async def test_prompts_get_rejects_bad_arguments(params, caplog):
+    h = _handler()
+    resp = await _req(h, "prompts/get", params)
+    assert resp["error"]["code"] == -32602
+    # a validation failure, not an internal error with a traceback
+    assert "internal error" not in caplog.text
+
+
+async def test_prompts_get_argumentless_prompt_needs_no_arguments():
+    h = _handler()
+    got = await _req(h, "prompts/get", {"name": "fleet_health_summary"})
+    assert "cron_get_fleet" in got["result"]["messages"][0]["content"]["text"]
+
+
+# ---------------------------------------------------------------------------
+# 2025-11-25 wire conformance: responses, request ids, the version header,
+# and unknown tool arguments
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param({"jsonrpc": "2.0", "id": 1, "result": {}}, id="result"),
+        pytest.param(
+            {"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": "x"}},
+            id="error",
+        ),
+    ],
+)
+async def test_posted_response_is_refused(response):
+    # the server sends no requests, so a response can only be a client bug:
+    # the transport allows 202 or an HTTP error, never a 200 reply.
+    h = _handler()
+    resp = await h.handle_http(_post_req(response))
+    assert resp.status == 400
+    assert "responses are not accepted" in json.loads(resp.body)["error"]
+    # and nothing answers a reply, whatever the transport
+    assert await h.handle_message(response) is None
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        pytest.param(None, id="null"),
+        pytest.param(True, id="boolean"),
+        pytest.param(1.5, id="float"),
+        pytest.param({}, id="object"),
+        pytest.param([], id="array"),
+    ],
+)
+async def test_request_id_must_be_a_string_or_integer(bad_id):
+    h = _handler()
+    resp = await h.handle_message(
+        {"jsonrpc": "2.0", "id": bad_id, "method": "ping"}
+    )
+    assert resp == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {
+            "code": -32600,
+            "message": "request id must be a string or an integer",
+        },
+    }
+
+
+@pytest.mark.parametrize("good_id", ["abc", 7, 0, -3])
+async def test_string_and_integer_ids_work(good_id):
+    h = _handler()
+    resp = await h.handle_message(
+        {"jsonrpc": "2.0", "id": good_id, "method": "ping"}
+    )
+    assert resp == {"jsonrpc": "2.0", "id": good_id, "result": {}}
+
+
+@pytest.mark.parametrize(
+    ("sent", "echoed"),
+    [
+        pytest.param(None, "2025-11-25", id="missing"),
+        pytest.param("2025-06-18", "2025-06-18", id="negotiated-older"),
+        pytest.param("2025-03-26", "2025-03-26", id="oldest"),
+    ],
+)
+async def test_response_echoes_the_negotiated_version(sent, echoed):
+    h = _handler()
+    headers = {"MCP-Protocol-Version": sent} if sent else {}
+    resp = await h.handle_http(
+        _post_req({"jsonrpc": "2.0", "id": 1, "method": "ping"}, headers)
+    )
+    assert resp.status == 200
+    assert resp.headers["MCP-Protocol-Version"] == echoed
+
+
+async def test_initialize_reply_names_the_version_it_negotiated():
+    # the first request carries no version header; the reply's header must
+    # still name the revision the rest of the session uses
+    h = _handler()
+    resp = await h.handle_http(
+        _post_req(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18"},
+            }
+        )
+    )
+    assert resp.headers["MCP-Protocol-Version"] == "2025-06-18"
+
+
+async def test_initialize_ignores_an_unhashable_version():
+    h = _handler()
+    resp = await _req(h, "initialize", {"protocolVersion": ["2025-06-18"]})
+    assert resp["result"]["protocolVersion"] == "2025-11-25"
+
+
+async def test_unknown_tool_arguments_are_named_with_the_allowed_ones():
+    # every input schema declares additionalProperties: false; a model that
+    # passes `job` instead of `name` must be told so, not handed a
+    # confusing missing-argument error or a silently dropped filter.
+    h = _handler()
+    result = await _call(h, "cron_get_job", {"job": "hello"})
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "'job'" in text and "accepts name" in text
+    result = await _call(h, "cron_list_jobs", {"filter": "hel", "stat": "x"})
+    assert result["isError"] is True
+    assert "filter, state, offset, limit" in result["content"][0]["text"]
+    result = await _call(h, "cron_get_version", {"verbose": True})
+    assert "accepts no arguments" in result["content"][0]["text"]
+    # known keys behave as before
+    result = await _call(h, "cron_get_job", {"name": "hello"})
+    assert result["structuredContent"]["name"] == "hello"
+
+
+# ---------------------------------------------------------------------------
+# server identity: description, website and the dashboard's icon
+# ---------------------------------------------------------------------------
+
+
+async def test_initialize_server_info_carries_identity_and_icon():
+    h = _handler()
+    info = (await _req(h, "initialize", {"protocolVersion": "2025-11-25"}))[
+        "result"
+    ]["serverInfo"]
+    assert info["name"] == "cronstable"
+    assert info["websiteUrl"] == "https://github.com/ptweezy/cronstable"
+    assert info["description"]
+    (icon,) = info["icons"]
+    assert icon["mimeType"] == "image/png"
+    assert icon["sizes"] == ["32x32"]
+    prefix = "data:image/png;base64,"
+    assert icon["src"].startswith(prefix)
+    png = base64.b64decode(icon["src"][len(prefix) :], validate=True)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    # the IHDR chunk's width and height
+    assert int.from_bytes(png[16:20], "big") == 32
+    assert int.from_bytes(png[20:24], "big") == 32
+
+
+async def test_server_info_omits_icons_when_the_page_has_none(monkeypatch):
+    monkeypatch.setattr(mcp_mod, "_load_index_bytes", lambda: b"<html></html>")
+    mcp_mod._server_icons.cache_clear()
+    try:
+        info = (await _req(_handler(), "initialize", {}))["result"][
+            "serverInfo"
+        ]
+    finally:
+        mcp_mod._server_icons.cache_clear()
+    assert "icons" not in info
+    assert info["websiteUrl"]
+
+
+# ---------------------------------------------------------------------------
+# the documented tool counts match what the configs serve
+# ---------------------------------------------------------------------------
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+_CHECK_LINE = re.compile(r"mcp check: ok - protocol .*?, (\d+) tool\(s\)")
+
+
+def _documented_counts(path):
+    return [int(n) for n in _CHECK_LINE.findall(path.read_text("utf-8"))]
+
+
+async def test_documented_tool_counts_match_the_configs(monkeypatch):
+    # wiki/MCP.md shows a --check against the default config, and the demo
+    # README one against the demo config
+    assert _documented_counts(_ROOT / "wiki" / "MCP.md") == [
+        len(await _tool_names(_handler()))
+    ]
+    monkeypatch.setenv("CRONSTABLE_WEB_TOKEN", "dev-token")
+    example = _ROOT / "example" / "mcp"
+    cfg = parse_config_string(
+        (example / "cronstable.yaml").read_text("utf-8"), "cronstable.yaml"
+    )
+    demo = MCPHandler(Cron(None, config_yaml=_YAML), cfg.mcp_config)
+    assert _documented_counts(example / "README.md") == [
+        len(await _tool_names(demo))
+    ]

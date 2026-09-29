@@ -341,15 +341,24 @@ _WEB_ALL_SCOPES = frozenset(WEB_TOKEN_SCOPES)
 _WEB_SCOPE_OVERRIDES = {
     # the DAG approval-gate decision is the one action gated by `approve`.
     "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision": "approve",
-    # /mcp is action-capable; a scoped token needs `control` to drive it.
-    "/mcp": "control",
+    # /mcp opens to `view`; each tool then demands its REST twin's scope
+    # (mcp.MCPHandler._m_tools_call).
+    "/mcp": "view",
 }
 
+# The challenge every 401 carries (RFC 9110). Browsers open no sign-in
+# dialog for the Bearer scheme.
+_WWW_AUTHENTICATE = {"WWW-Authenticate": 'Bearer realm="cronstable"'}
+
 # Routes a view-scoped anonymous grant (web.anonymousScopes) deliberately
-# does not cover, keyed by canonical path like _WEB_SCOPE_OVERRIDES. The
-# device registry names every paired phone (name, platform, createdBy): a
-# token-holding viewer may see it, an anonymous stranger may not.
-_WEB_ANONYMOUS_EXCLUDED = frozenset({"/push/devices"})
+# does not cover, keyed by canonical path like _WEB_SCOPE_OVERRIDES, each
+# with what its refusal names. The device registry names every paired phone
+# (name, platform, createdBy): a token-holding viewer may see it, an
+# anonymous stranger may not. /mcp serves agents, which carry a token.
+_WEB_ANONYMOUS_EXCLUDED = {
+    "/push/devices": "device access",
+    "/mcp": "MCP access",
+}
 
 # Fallback base for the dashboard's pairing deep link while no push section
 # is applied. With one, /whoami derives the base from push.relay.url's
@@ -434,7 +443,7 @@ WEB_ROUTES: "tuple[tuple[str, str, str, Optional[str]], ...]" = (
     # local listener never hands every local process a stop switch.
     ("POST", "/shutdown", "_web_shutdown", None),
     # /mcp is NEVER in WEB_PUBLIC_PATHS: it inherits the bearer-token gate
-    # (and the `control` scope override above) on every method.
+    # (and the `view` scope override above) on every method.
     ("POST", "/mcp", "handle_http", "mcp"),
     ("GET", "/mcp", "handle_http_get", "mcp"),
     ("OPTIONS", "/mcp", "handle_options", "mcp"),
@@ -8468,10 +8477,10 @@ class Cron:
                 if canonical in _WEB_ANONYMOUS_EXCLUDED:
                     raise _api_error(
                         web.HTTPForbidden,
-                        (
-                            "device access requires a bearer token with"
-                            " the {!r} permission"
-                        ).format(required),
+                        "{} requires a bearer token with the {!r} "
+                        "permission".format(
+                            _WEB_ANONYMOUS_EXCLUDED[canonical], required
+                        ),
                     )
                 raise _api_error(
                     web.HTTPForbidden,
@@ -8511,10 +8520,10 @@ class Cron:
                     # failure like every other one; only the reason is
                     # withheld. The same rule holds at the three sites in
                     # JobStateAPI._run (jobapi.py).
-                    raise web.HTTPUnauthorized()
+                    raise web.HTTPUnauthorized(headers=_WWW_AUTHENTICATE)
             if not presented:
                 # reasonless by design: see the 401 note above.
-                raise web.HTTPUnauthorized()
+                raise web.HTTPUnauthorized(headers=_WWW_AUTHENTICATE)
             try:
                 # compare as bytes: compare_digest raises TypeError on any
                 # non-ASCII str (turning a garbage token into a 500, not a
@@ -8523,7 +8532,7 @@ class Cron:
                 presented_bytes = presented.encode("utf-8")
             except UnicodeEncodeError:
                 # reasonless by design: see the 401 note above.
-                raise web.HTTPUnauthorized() from None
+                raise web.HTTPUnauthorized(headers=_WWW_AUTHENTICATE) from None
             # Match against every configured token in constant time, with no
             # early return, so timing does not reveal which token (if any)
             # matched. A 401 means no token matched; authorization (scope)
@@ -8534,7 +8543,7 @@ class Cron:
                     matched = entry
             if matched is None:
                 # reasonless by design: see the 401 note above.
-                raise web.HTTPUnauthorized()
+                raise web.HTTPUnauthorized(headers=_WWW_AUTHENTICATE)
             # Full-scope tokens skip the per-route scope lookup. A scoped
             # token lacking the route's required scope is 403, distinct
             # from the 401 for an unrecognised token.

@@ -8,6 +8,7 @@ bandit[toml]
 mypy
 mypy-extensions
 openapi-spec-validator
+jsonschema
 crontab>=1.0.5,<2
 hypothesis>=6.168.1
 pytest

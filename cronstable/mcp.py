@@ -22,31 +22,43 @@ start_stop_web_app`).  The tools call the same in-process payload builders the
 clients reach the server through the featherweight ``cronstable mcp`` stdio
 bridge (:mod:`cronstable.mcpcli`), which forwards frames here over urllib.
 
-Design profile: STATELESS (no ``Mcp-Session-Id``, no GET SSE stream), tools
-only (no resources/prompts yet), pinned to protocol revision
-``2025-11-25``.  Statelessness keeps a future migration to the session-less
-2026 revision a near-no-op.
+The server offers tools, resources, prompts and argument completion, and
+keeps no sessions (no ``Mcp-Session-Id``, no GET SSE stream). It serves both
+protocol eras on one endpoint. A request whose ``_meta`` names a protocol
+version, or whose MCP-Protocol-Version header names a modern revision, is
+served statelessly under ``2026-07-28``: ``server/discover``, header
+validation, ``resultType`` and cache hints. Every other request takes the
+legacy path, where ``initialize`` negotiates ``2025-11-25`` or an earlier
+revision.
 """
 
+import base64
+import binascii
 import json as _stdlib_json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Any,
+    NamedTuple,
     Optional,
     cast,
 )
+from urllib.parse import unquote
 
 from aiohttp import web
 
 from cronstable import _json
 from cronstable import version as _version
 from cronstable.cron import (
+    PAUSE_BY_MAX,
+    WEB_ANON_REQUEST_KEY,
     WEB_TOKEN_REQUEST_KEY,
     ApiActionError,
+    _load_index_bytes,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no import cost / no cycle
@@ -54,25 +66,98 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no import cost / no cycle
 
 logger = logging.getLogger("cronstable.mcp")
 
-# The MCP revision this server implements. Every response advertises it; a
-# request carrying an unsupported MCP-Protocol-Version header is rejected.
+# Legacy revisions, negotiated by initialize. PROTOCOL_VERSION is the newest,
+# offered to a client that asks for one this server cannot speak.
 PROTOCOL_VERSION = "2025-11-25"
-# Revisions we can speak on the wire (all share the Streamable-HTTP framing).
-# A client that negotiates one of these at initialize gets it echoed back.
 SUPPORTED_PROTOCOL_VERSIONS = frozenset(
     {"2025-11-25", "2025-06-18", "2025-03-26"}
 )
+# Modern revisions: stateless, with the version in every request's _meta.
+MODERN_PROTOCOL_VERSIONS = frozenset({"2026-07-28"})
+# Every revision served, newest first (server/discover and -32022 data).
+ALL_PROTOCOL_VERSIONS = tuple(
+    sorted(
+        MODERN_PROTOCOL_VERSIONS | SUPPORTED_PROTOCOL_VERSIONS, reverse=True
+    )
+)
 
 # JSON-RPC 2.0 error codes (protocol-level faults). Tool *execution* and
-# input-validation failures do NOT use these -- they return a normal result
+# input-validation failures do NOT use these: they return a normal result
 # with isError:true so the model can read and self-correct (MCP SEP-1303).
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
-# MCP-specific: a resources/read for a URI that does not resolve.
+# Legacy only: a resources/read for a URI that does not resolve. The modern
+# path reports INVALID_PARAMS instead.
 RESOURCE_NOT_FOUND = -32002
+# Modern only. A client reads these as proof of a modern server and stops
+# falling back to initialize, so no legacy reply may carry them.
+HEADER_MISMATCH = -32020
+UNSUPPORTED_PROTOCOL_VERSION = -32022
+
+# Per-request and per-result _meta keys of the modern revisions.
+META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
+META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+
+# Modern cache hints. The lists depend on the config and the caller's token,
+# and resources carry operator data, so nothing is public. Lists change only
+# on a config reload; resources/read returns live data.
+CACHE_SCOPE = "private"
+LIST_TTL_MS = 60000
+READ_TTL_MS = 0
+_CACHE_TTL_MS = {
+    "server/discover": LIST_TTL_MS,
+    "tools/list": LIST_TTL_MS,
+    "resources/list": LIST_TTL_MS,
+    "resources/templates/list": LIST_TTL_MS,
+    "prompts/list": LIST_TTL_MS,
+    "resources/read": READ_TTL_MS,
+}
+
+# Methods that exist in only one era: 2026-07-28 removed the handshake and
+# ping, and added server/discover.
+_LEGACY_ONLY_METHODS = frozenset(
+    {"initialize", "notifications/initialized", "ping"}
+)
+_MODERN_ONLY_METHODS = frozenset({"server/discover"})
+
+# The request field each method mirrors into the Mcp-Name header.
+_MCP_NAME_SOURCE = {
+    "tools/call": "name",
+    "prompts/get": "name",
+    "resources/read": "uri",
+}
+# The Base64 sentinel form of a header value that is not plain ASCII.
+_B64_PREFIX = "=?base64?"
+_B64_SUFFIX = "?="
+
+# completion/complete returns at most this many values.
+COMPLETION_MAX = 100
+
+SERVER_NAME = "cronstable"
+SERVER_DESCRIPTION = (
+    "A cron replacement with retries, alerts, saved run history, "
+    "workflows, and dashboards."
+)
+SERVER_WEBSITE = "https://github.com/ptweezy/cronstable"
+
+_DEFAULT_INSTRUCTIONS = (
+    "cronstable's MCP server. Read-only 'observe' tools describe "
+    "jobs, workflows, cluster health, metrics and saved state. "
+    "Mutating tools (run/cancel/pause/resume a job, "
+    "run/backfill/approve a workflow) require confirm=true and "
+    "appear only when the operator disabled readOnly and the "
+    "presented token allows them. Start with "
+    "cron_get_status or cron_list_jobs. When authoring a schedule, "
+    "verify it with cron_validate_schedule / cron_explain_schedule "
+    "(the server's scheduling engine) before proposing it; "
+    "cron_why_no_run "
+    "explains why a job's schedule did or did not match a given "
+    "timestamp."
+)
 
 RESOURCE_MIME = "application/json"
 
@@ -80,34 +165,55 @@ ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 _MethodHandler = Callable[
     [dict[str, Any]], Awaitable[Optional[dict[str, Any]]]
 ]
+# completion candidates, given the arguments already resolved
+_CompletionSource = Callable[[dict[str, Any]], Awaitable[list[str]]]
 
-# Tools whose REST counterpart is gated behind a scope BEYOND the `control`
-# the auth middleware already demands for POST /mcp (cron._WEB_SCOPE_OVERRIDES
-# promotes the DAG decision route to `approve`). Without this table a
-# control-scoped token could take, via tools/call, exactly the action the
-# operator withheld from it over REST. Enforced in _m_tools_call against the
-# scopes of the presented token.
+# Tools whose REST twin demands a scope other than this server's default
+# (`control` for a mutating tool, `view` for the rest): the gate decision
+# route is promoted to `approve`, and the recovery preview is a POST. A
+# token can therefore take through tools/call only what REST grants it.
 _TOOL_SCOPE_OVERRIDES = {
     "cron_decide_gate": "approve",
+    "cron_preview_recovery": "control",
 }
 
-#: Scopes granted to the caller of the current request, set by handle_http
-#: from the token the web auth middleware matched; None when auth is off
-#: (where REST grants every action too) and in direct handle_message use
-#: (tests, which model the unauthenticated daemon). A ContextVar, not an
-#: attribute: one handler instance serves concurrent requests.
-_caller_scopes: "ContextVar[Optional[frozenset]]" = ContextVar(
-    "cronstable_mcp_caller_scopes", default=None
+
+class _Caller(NamedTuple):
+    """Who sent the current request: a token's label and granted scopes."""
+
+    label: str
+    scopes: "frozenset[str]"
+
+
+#: The current request's caller, set by handle_http from what the web auth
+#: middleware matched. None when no token auth applies (auth off, an
+#: mTLS-only listener, or direct handle_message use), where REST grants every
+#: action too. A ContextVar: one handler serves concurrent requests.
+_caller: "ContextVar[Optional[_Caller]]" = ContextVar(
+    "cronstable_mcp_caller", default=None
 )
 
 
 class MCPError(Exception):
-    """A JSON-RPC protocol-level fault (mapped to an ``error`` response)."""
+    """A JSON-RPC protocol-level fault (mapped to an ``error`` response).
 
-    def __init__(self, code: int, message: str) -> None:
+    ``http_status`` applies on the modern path only; a legacy error always
+    rides a 200.
+    """
+
+    def __init__(
+        self,
+        code: int,
+        message: str,
+        *,
+        data: Any = None,
+        http_status: int = 200,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.data = data
+        self.http_status = http_status
 
 
 class _ToolInputError(Exception):
@@ -208,12 +314,30 @@ class MCPHandler:
         self._allowed_origins = set(config["allowedOrigins"])
         self._resources_enabled: bool = config.get("resources", True)
         self._prompts_enabled: bool = config.get("prompts", True)
-        self._instructions: Optional[str] = config.get("instructions")
+        self._instructions: str = (
+            config.get("instructions") or _DEFAULT_INSTRUCTIONS
+        )
+        # the lean identity every modern result carries, and the full one
+        # initialize and server/discover return
+        self._identity = {
+            "name": SERVER_NAME,
+            "title": SERVER_NAME,
+            "version": _version.version,
+        }
+        self._server_info: dict[str, Any] = {
+            **self._identity,
+            "description": SERVER_DESCRIPTION,
+            "websiteUrl": SERVER_WEBSITE,
+        }
+        icons = _server_icons()
+        if icons:
+            self._server_info["icons"] = [dict(icon) for icon in icons]
         self._methods: dict[str, _MethodHandler] = {
             "initialize": self._m_initialize,
             "notifications/initialized": self._m_noop,
             "notifications/cancelled": self._m_noop,
             "ping": self._m_ping,
+            "server/discover": self._m_discover,
             "tools/list": self._m_tools_list,
             "tools/call": self._m_tools_call,
         }
@@ -221,6 +345,7 @@ class MCPHandler:
         self._tool_by_name = {t["name"]: t for t in self._tools}
         self._resources, self._templates = self._build_resources()
         self._resource_by_uri = {r["uri"]: r for r in self._resources}
+        self._template_by_uri = {t["uriTemplate"]: t for t in self._templates}
         self._prompts = self._build_prompts()
         self._prompt_by_name = {p["name"]: p for p in self._prompts}
         if self._resources_enabled:
@@ -232,16 +357,18 @@ class MCPHandler:
         if self._prompts_enabled:
             self._methods["prompts/list"] = self._m_prompts_list
             self._methods["prompts/get"] = self._m_prompts_get
+        if self._resources_enabled or self._prompts_enabled:
+            self._methods["completion/complete"] = self._m_complete
 
     # -- capabilities / visibility ----------------------------------------
 
     def _capabilities(self) -> dict[str, Any]:
-        """Advertise ONLY what is actually registered.
+        """Advertise ONLY what the current caller can use.
 
         A server MUST NOT advertise a capability it does not implement (a
         conformant client would then call the method and get -32601). Tools
         are always present; resources/prompts appear only when enabled AND
-        something is registered under the active toolsets.
+        something is visible, and completions whenever either appears.
         """
         caps: dict[str, Any] = {"tools": {"listChanged": False}}
         if self._resources_enabled and (
@@ -253,16 +380,19 @@ class MCPHandler:
             self._prompt_visible(p) for p in self._prompts
         ):
             caps["prompts"] = {"listChanged": False}
+        if "resources" in caps or "prompts" in caps:
+            caps["completions"] = {}
         return caps
 
     def _resource_visible(self, entry: dict[str, Any]) -> bool:
         return entry["toolset"] in self._toolsets
 
     def _prompt_visible(self, entry: dict[str, Any]) -> bool:
-        return entry["toolset"] in self._toolsets
+        """A prompt is served only when every tool it requires is."""
+        return all(self._tool_visible(name) for name in entry["requires"])
 
-    def _is_visible(self, tool: dict[str, Any]) -> bool:
-        """Whether ``tool`` is exposed under the current config.
+    def _configured(self, tool: dict[str, Any]) -> bool:
+        """Whether the config serves ``tool``.
 
         Its toolset must be enabled, and a mutating tool is stripped entirely
         while ``readOnly`` is on (readOnly wins over toolsets, GitHub-style).
@@ -273,6 +403,20 @@ class MCPHandler:
             return False
         return True
 
+    @staticmethod
+    def _permitted(tool: dict[str, Any]) -> bool:
+        """Whether the current caller's token grants ``tool``'s scope."""
+        caller = _caller.get()
+        return caller is None or tool["scope"] in caller.scopes
+
+    def _tool_visible(self, name: str) -> bool:
+        tool = self._tool_by_name.get(name)
+        return (
+            tool is not None
+            and self._configured(tool)
+            and self._permitted(tool)
+        )
+
     # -- JSON-RPC method handlers -----------------------------------------
 
     async def _m_initialize(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -280,33 +424,24 @@ class MCPHandler:
         # echo the client's version when we can speak it, else offer ours.
         negotiated = (
             requested
-            if requested in SUPPORTED_PROTOCOL_VERSIONS
+            if isinstance(requested, str)
+            and requested in SUPPORTED_PROTOCOL_VERSIONS
             else PROTOCOL_VERSION
         )
-        result: dict[str, Any] = {
+        return {
             "protocolVersion": negotiated,
             "capabilities": self._capabilities(),
-            "serverInfo": {
-                "name": "cronstable",
-                "title": "cronstable",
-                "version": _version.version,
-            },
+            "serverInfo": self._server_info,
+            "instructions": self._instructions,
         }
-        instructions = self._instructions or (
-            "cronstable's MCP server. Read-only 'observe' tools describe "
-            "jobs, workflows, cluster health, metrics and saved state. "
-            "Mutating tools (run/cancel/pause/resume a job, "
-            "run/backfill/approve a workflow) require confirm=true and "
-            "appear only when the operator disabled readOnly. Start with "
-            "cron_get_status or cron_list_jobs. When authoring a schedule, "
-            "verify it with cron_validate_schedule / cron_explain_schedule "
-            "(the server's scheduling engine) before proposing it; "
-            "cron_why_no_run "
-            "explains why a job's schedule did or did not match a given "
-            "timestamp."
-        )
-        result["instructions"] = instructions
-        return result
+
+    async def _m_discover(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "supportedVersions": list(ALL_PROTOCOL_VERSIONS),
+            "capabilities": self._capabilities(),
+            "instructions": self._instructions,
+            "_meta": {META_SERVER_INFO: self._server_info},
+        }
 
     async def _m_noop(
         self, params: dict[str, Any]
@@ -318,15 +453,9 @@ class MCPHandler:
 
     async def _m_tools_list(self, params: dict[str, Any]) -> dict[str, Any]:
         tools = [
-            {
-                "name": t["name"],
-                "title": t["title"],
-                "description": t["description"],
-                "inputSchema": t["inputSchema"],
-                "annotations": t["annotations"],
-            }
+            t["listing"]
             for t in self._tools
-            if self._is_visible(t)
+            if self._configured(t) and self._permitted(t)
         ]
         return {"tools": tools}
 
@@ -335,20 +464,27 @@ class MCPHandler:
         if not isinstance(name, str):
             raise MCPError(INVALID_PARAMS, "tools/call requires a 'name'")
         tool = self._tool_by_name.get(name)
-        if tool is None or not self._is_visible(tool):
+        if tool is None or not self._configured(tool):
             raise MCPError(INVALID_PARAMS, "unknown tool: {}".format(name))
         arguments = params.get("arguments", {})
         if not isinstance(arguments, dict):
             raise MCPError(INVALID_PARAMS, "'arguments' must be an object")
-        required_scope = _TOOL_SCOPE_OVERRIDES.get(name)
-        if required_scope is not None:
-            granted = _caller_scopes.get()
-            if granted is not None and required_scope not in granted:
-                return _tool_error(
-                    "the presented web token lacks the {!r} scope this tool "
-                    "requires (the REST route for the same action is gated "
-                    "identically)".format(required_scope)
+        if not self._permitted(tool):
+            return _tool_error(
+                "the presented web token lacks the {!r} scope this tool "
+                "requires (the REST route for the same action is gated "
+                "identically)".format(tool["scope"])
+            )
+        allowed = tool["inputSchema"]["properties"]
+        unknown = [key for key in arguments if key not in allowed]
+        if unknown:
+            return _tool_error(
+                "unknown argument(s) {}; {} accepts {}".format(
+                    ", ".join(map(repr, unknown)),
+                    name,
+                    ", ".join(allowed) or "no arguments",
                 )
+            )
         handler = cast(ToolHandler, tool["handler"])
         try:
             return await handler(arguments)
@@ -366,99 +502,194 @@ class MCPHandler:
         """Dispatch one JSON-RPC message.
 
         Returns the response object for a request, or ``None`` for a
-        notification (the caller then emits a 202).  The single seam tests
-        drive directly.
+        notification or a stray response (the caller then emits a 202).
+        The single seam tests drive directly.
+        """
+        return (await self._dispatch(msg))[0]
+
+    async def _dispatch(
+        self, msg: Any
+    ) -> tuple[Optional[dict[str, Any]], int]:
+        """:meth:`handle_message`, plus the HTTP status for its reply.
+
+        The status differs from 200 only on the modern path, where a missing
+        ``_meta`` field or an unsupported version is 400 and an unknown
+        method is 404.
         """
         if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
-            return _error_envelope(
-                _id_of(msg), INVALID_REQUEST, "invalid JSON-RPC 2.0 message"
+            return (
+                _error_envelope(
+                    _id_of(msg),
+                    INVALID_REQUEST,
+                    "invalid JSON-RPC 2.0 message",
+                ),
+                200,
             )
+        if _is_response(msg):
+            # this server sends no requests, and nothing answers a reply.
+            return None, 202
         is_notification = "id" not in msg
         msg_id = msg.get("id")
-        method = msg.get("method")
-        if not isinstance(method, str):
-            if is_notification:
-                return None
-            return _error_envelope(msg_id, INVALID_REQUEST, "missing method")
-        handler = self._methods.get(method)
-        if handler is None:
-            if is_notification:
-                return None  # unknown notifications are ignored, per spec
-            return _error_envelope(
-                msg_id, METHOD_NOT_FOUND, "unknown method: {}".format(method)
+        if not is_notification and not _valid_id(msg_id):
+            return (
+                _error_envelope(
+                    None,
+                    INVALID_REQUEST,
+                    "request id must be a string or an integer",
+                ),
+                200,
             )
-        params = msg.get("params") or {}
-        if not isinstance(params, dict):
-            if is_notification:
-                return None
-            return _error_envelope(msg_id, INVALID_PARAMS, "invalid params")
+        method = msg.get("method")
+        modern = _declares_modern(msg)
         try:
+            if not isinstance(method, str):
+                raise MCPError(INVALID_REQUEST, "missing method")
+            params = msg.get("params") or {}
+            if not isinstance(params, dict):
+                raise MCPError(INVALID_PARAMS, "invalid params")
+            if modern:
+                problem = _meta_error(msg) or _version_error(msg)
+                if problem is not None:
+                    raise problem
+            excluded = _LEGACY_ONLY_METHODS if modern else _MODERN_ONLY_METHODS
+            handler = None if method in excluded else self._methods.get(method)
+            if handler is None:
+                raise MCPError(
+                    METHOD_NOT_FOUND,
+                    "unknown method: {}".format(method),
+                    http_status=404,
+                )
             result = await handler(params)
         except MCPError as ex:
             if is_notification:
-                return None
-            return _error_envelope(msg_id, ex.code, ex.message)
+                return None, 202
+            code = ex.code
+            if modern and code == RESOURCE_NOT_FOUND:
+                code = INVALID_PARAMS
+            envelope = _error_envelope(msg_id, code, ex.message, ex.data)
+            return envelope, ex.http_status if modern else 200
         except Exception:  # noqa: BLE001 - never leak a traceback to a client
             logger.exception("mcp: internal error handling %s", method)
             if is_notification:
-                return None
-            return _error_envelope(msg_id, INTERNAL_ERROR, "internal error")
+                return None, 202
+            envelope = _error_envelope(
+                msg_id, INTERNAL_ERROR, "internal error"
+            )
+            return envelope, 200
         if is_notification:
-            return None
-        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+            return None, 202
+        if modern:
+            result = self._modern_result(cast(str, method), result or {})
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}, 200
+
+    def _modern_result(
+        self, method: str, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Add the fields every modern result carries."""
+        out = dict(result)
+        out["resultType"] = "complete"
+        meta = dict(out.get("_meta") or {})
+        meta.setdefault(META_SERVER_INFO, self._identity)
+        out["_meta"] = meta
+        ttl = _CACHE_TTL_MS.get(method)
+        if ttl is not None:
+            out["ttlMs"] = ttl
+            out["cacheScope"] = CACHE_SCOPE
+        return out
 
     # -- HTTP (Streamable HTTP, stateless profile) ------------------------
 
     async def handle_http(self, request: web.Request) -> web.StreamResponse:
-        origin = request.headers.get("Origin")
+        headers = request.headers
+        origin = headers.get("Origin")
+        pv = headers.get("MCP-Protocol-Version")
+        version = _echo_version(pv)
         # DNS-rebinding defense: a present Origin must be allow-listed. With
         # an empty allowedOrigins (non-browser clients only) any Origin is
-        # refused -- a real MCP client over stdio/CLI sends none.
+        # refused: a real MCP client over stdio/CLI sends none.
         if origin is not None and origin not in self._allowed_origins:
-            return self._http_error(403, "Origin not allowed", origin)
-        pv = request.headers.get("MCP-Protocol-Version")
-        if pv is not None and pv not in SUPPORTED_PROTOCOL_VERSIONS:
-            return self._http_error(
-                400, "unsupported MCP-Protocol-Version", origin
-            )
-        accept = request.headers.get("Accept")
+            return self._http_error(403, "Origin not allowed", origin, version)
+        accept = headers.get("Accept")
         # stateless mode only ever emits application/json; be lenient on a
         # missing Accept, but honor a present, incompatible one.
         if accept and "application/json" not in accept and "*/*" not in accept:
-            return self._http_error(406, "Accept application/json", origin)
+            return self._http_error(
+                406, "Accept application/json", origin, version
+            )
         if (
             request.content_length is not None
             and request.content_length > self._max_body
         ):
-            return self._http_error(413, "request body too large", origin)
-        # File the caller's granted scopes where tools/call can consult them
-        # (per-request task context, so concurrent requests cannot bleed).
-        token = request.get(WEB_TOKEN_REQUEST_KEY)
-        _caller_scopes.set(token.scopes if token is not None else None)
+            return self._http_error(
+                413, "request body too large", origin, version
+            )
+        # File the caller where tools/call can consult it (per-request task
+        # context, so concurrent requests cannot bleed).
+        _caller.set(_caller_of(request))
         raw = await request.read()
         if len(raw) > self._max_body:
-            return self._http_error(413, "request body too large", origin)
+            return self._http_error(
+                413, "request body too large", origin, version
+            )
         if not raw:
-            return self._http_error(400, "empty request body", origin)
+            return self._http_error(400, "empty request body", origin, version)
         try:
             msg = _json.loads(raw)
         except Exception:  # noqa: BLE001 - malformed JSON -> 400
-            return self._http_error(400, "malformed JSON", origin)
+            return self._http_error(400, "malformed JSON", origin, version)
         if isinstance(msg, list):
             # JSON-RPC batching was removed in MCP 2025-06-18.
-            return self._http_error(400, "batching unsupported", origin)
-        response = await self.handle_message(msg)
+            return self._http_error(
+                400, "batching unsupported", origin, version
+            )
+        if isinstance(msg, dict):
+            if _is_response(msg):
+                return self._http_error(
+                    400,
+                    "JSON-RPC responses are not accepted: this server "
+                    "sends no requests",
+                    origin,
+                    version,
+                )
+        modern = isinstance(msg, dict) and (
+            pv in MODERN_PROTOCOL_VERSIONS or _declares_modern(msg)
+        )
+        if modern and "id" in msg:
+            # notifications have no header rules in 2026-07-28
+            problem = _meta_error(msg) or _header_error(msg, headers)
+            if problem is not None:
+                envelope = _error_envelope(
+                    _id_of(msg), problem.code, problem.message
+                )
+                return self._json_response(
+                    envelope, origin=origin, status=400, version=version
+                )
+        elif not modern and (
+            pv is not None and pv not in SUPPORTED_PROTOCOL_VERSIONS
+        ):
+            return self._http_error(
+                400, "unsupported MCP-Protocol-Version", origin, version
+            )
+        response, status = await self._dispatch(msg)
         if response is None:
-            # a notification/response carries no reply.
-            return self._plain(202, origin)
-        return self._json_response(response, origin=origin)
+            # a notification carries no reply.
+            return self._plain(202, origin, version)
+        if isinstance(msg, dict) and msg.get("method") == "initialize":
+            # the reply names the revision the rest of the session uses.
+            version = (response.get("result") or {}).get(
+                "protocolVersion", version
+            )
+        return self._json_response(
+            response, origin=origin, status=status, version=version
+        )
 
     async def handle_http_get(
         self, request: web.Request
     ) -> web.StreamResponse:
         # stateless: no server->client SSE stream to open.
         origin = request.headers.get("Origin")
-        resp = self._http_error(405, "method not allowed", origin)
+        version = _echo_version(request.headers.get("MCP-Protocol-Version"))
+        resp = self._http_error(405, "method not allowed", origin, version)
         resp.headers["Allow"] = "POST, OPTIONS"
         return resp
 
@@ -478,7 +709,8 @@ class MCPHandler:
             return {
                 "Access-Control-Allow-Origin": origin,
                 "Access-Control-Allow-Headers": (
-                    "Authorization, Content-Type, MCP-Protocol-Version"
+                    "Authorization, Content-Type, MCP-Protocol-Version, "
+                    "Mcp-Method, Mcp-Name"
                 ),
                 "Access-Control-Expose-Headers": "MCP-Protocol-Version",
                 "Vary": "Origin",
@@ -486,48 +718,46 @@ class MCPHandler:
         return {}
 
     def _json_response(
-        self, obj: dict[str, Any], *, origin: Optional[str]
+        self,
+        obj: dict[str, Any],
+        *,
+        origin: Optional[str],
+        status: int = 200,
+        version: str = PROTOCOL_VERSION,
     ) -> web.Response:
-        headers = {"MCP-Protocol-Version": PROTOCOL_VERSION}
+        headers = {"MCP-Protocol-Version": version}
         headers.update(self._cors_headers(origin))
         return web.Response(
             body=_dumps(obj),
-            status=200,
-            content_type="application/json",
-            charset="utf-8",
-            headers=headers,
-        )
-
-    def _plain(self, status: int, origin: Optional[str]) -> web.Response:
-        headers = {"MCP-Protocol-Version": PROTOCOL_VERSION}
-        headers.update(self._cors_headers(origin))
-        return web.Response(status=status, headers=headers)
-
-    def _http_error(
-        self, status: int, message: str, origin: Optional[str]
-    ) -> web.Response:
-        headers = {"MCP-Protocol-Version": PROTOCOL_VERSION}
-        headers.update(self._cors_headers(origin))
-        return web.Response(
-            body=_dumps({"error": message}),
             status=status,
             content_type="application/json",
             charset="utf-8",
             headers=headers,
         )
 
+    def _plain(
+        self, status: int, origin: Optional[str], version: str
+    ) -> web.Response:
+        headers = {"MCP-Protocol-Version": version}
+        headers.update(self._cors_headers(origin))
+        return web.Response(status=status, headers=headers)
+
+    def _http_error(
+        self,
+        status: int,
+        message: str,
+        origin: Optional[str],
+        version: str = PROTOCOL_VERSION,
+    ) -> web.Response:
+        return self._json_response(
+            {"error": message}, origin=origin, status=status, version=version
+        )
+
     # -- pagination / argument helpers ------------------------------------
 
     def _clamp_limit(self, requested: Any) -> int:
-        if requested is None:
-            return self._max_rows
-        try:
-            n = int(requested)
-        # OverflowError alongside the usual two: int(float("inf")) raises
-        # it, and the stdlib JSON parser produces inf from the well-formed
-        # literal 1e999 -- without it a schema-valid argument became a
-        # -32603 protocol fault instead of the documented clamp.
-        except (TypeError, ValueError, OverflowError):
+        n = _opt_int(requested)
+        if n is None:
             return self._max_rows
         return max(1, min(n, self._max_rows))
 
@@ -535,11 +765,7 @@ class MCPHandler:
         self, items: list[Any], offset: Any, limit: Any
     ) -> tuple[list[Any], dict[str, Any]]:
         total = len(items)
-        try:
-            off = max(0, int(offset or 0))
-        # OverflowError: see _clamp_limit.
-        except (TypeError, ValueError, OverflowError):
-            off = 0
+        off = max(0, _opt_int(offset) or 0)
         lim = self._clamp_limit(limit)
         page = items[off : off + lim]
         nxt = off + len(page)
@@ -556,7 +782,7 @@ class MCPHandler:
     def _build_registry(self) -> list[dict[str, Any]]:
         obj = _obj_schema
         # every entry is a _tool(...) spec; see that factory for the defaults
-        specs = [
+        return [
             # ---- observe (read-only) ----
             _tool(
                 "observe",
@@ -565,6 +791,7 @@ class MCPHandler:
                 "Show each job's status: running, disabled, or scheduled.",
                 obj({"offset": _INT, "limit": _INT}),
                 self._t_get_status,
+                output=_STATUS_OUTPUT,
             ),
             _tool(
                 "observe",
@@ -583,6 +810,7 @@ class MCPHandler:
                     }
                 ),
                 self._t_list_jobs,
+                output=_JOBS_OUTPUT,
             ),
             _tool(
                 "observe",
@@ -734,6 +962,7 @@ class MCPHandler:
                     ["expression"],
                 ),
                 self._t_validate_schedule,
+                output=_PREVIEW_OUTPUT,
             ),
             _tool(
                 "observe",
@@ -756,6 +985,7 @@ class MCPHandler:
                     ["expression"],
                 ),
                 self._t_explain_schedule,
+                output=_PREVIEW_OUTPUT,
             ),
             _tool(
                 "observe",
@@ -771,6 +1001,15 @@ class MCPHandler:
                 "(cron_list_runs) instead.",
                 obj({"name": _STR, "at": _STR}, ["name", "at"]),
                 self._t_why_no_run,
+                output=_WHY_OUTPUT,
+            ),
+            _tool(
+                "observe",
+                "cron_list_pools",
+                "List resource pools",
+                "Show pool capacity, queued work, and recent queue outcomes.",
+                obj({}),
+                self._t_list_pools,
             ),
             # ---- dags ----
             _tool(
@@ -824,28 +1063,6 @@ class MCPHandler:
                 ),
                 self._t_tail_dag_task_logs,
             ),
-            # ---- state (read-only inspector) ----
-            _tool(
-                "state",
-                "cron_inspect_state",
-                "Inspect state store",
-                "Inspect saved state without revealing values: overview "
-                "(default), one namespace's documents (`ns` "
-                "kv/|cursor/|idem/) or a stream's newest records (`stream`). "
-                "KV values and "
-                "secrets are redacted.",
-                obj({"ns": _STR, "stream": _STR, "limit": _INT}),
-                self._t_inspect_state,
-            ),
-            # ---- act (mutating job control; readOnly:false to expose) ----
-            _tool(
-                "observe",
-                "cron_list_pools",
-                "List resource pools",
-                "Show pool capacity, queued work, and recent queue outcomes.",
-                obj({}),
-                self._t_list_pools,
-            ),
             _tool(
                 "dags",
                 "cron_preview_recovery",
@@ -865,30 +1082,20 @@ class MCPHandler:
                 ),
                 self._t_preview_recovery,
             ),
+            # ---- state (read-only inspector) ----
             _tool(
-                "dags",
-                "cron_recover_dag",
-                "Recover workflow tasks",
-                "Execute a reviewed recovery plan. Requires plan_token and "
-                "confirm=true. Creates a new run preserving successful work.",
-                obj(
-                    {
-                        "dag": _STR,
-                        "run_key": _STR,
-                        "from": _STR,
-                        "to": _STR,
-                        "mode": _STR,
-                        "tasks": {"type": "array", "items": _STR},
-                        "plan_token": _STR,
-                        "allow_config_change": _BOOL,
-                        "confirm": _BOOL,
-                    },
-                    ["dag", "plan_token"],
-                ),
-                self._t_recover_dag,
-                mutating=True,
-                idempotent=True,
+                "state",
+                "cron_inspect_state",
+                "Inspect state store",
+                "Inspect saved state without revealing values: overview "
+                "(default), one namespace's documents (`ns` "
+                "kv/|cursor/|idem/) or a stream's newest records (`stream`). "
+                "KV values and "
+                "secrets are redacted.",
+                obj({"ns": _STR, "stream": _STR, "limit": _INT}),
+                self._t_inspect_state,
             ),
+            # ---- act (mutating job control; readOnly:false to expose) ----
             _tool(
                 "act",
                 "cron_cancel_queued",
@@ -912,6 +1119,8 @@ class MCPHandler:
                 obj({"name": _STR, "confirm": _BOOL}, ["name"]),
                 self._t_run_job,
                 mutating=True,
+                destructive=True,
+                open_world=True,
             ),
             _tool(
                 "act",
@@ -965,6 +1174,8 @@ class MCPHandler:
                 obj({"dag": _STR, "confirm": _BOOL}, ["dag"]),
                 self._t_trigger_dag,
                 mutating=True,
+                destructive=True,
+                open_world=True,
             ),
             _tool(
                 "dags",
@@ -986,6 +1197,33 @@ class MCPHandler:
                 self._t_backfill_dag,
                 mutating=True,
                 destructive=True,
+                open_world=True,
+            ),
+            _tool(
+                "dags",
+                "cron_recover_dag",
+                "Recover workflow tasks",
+                "Execute a reviewed recovery plan. Requires plan_token and "
+                "confirm=true. Creates a new run preserving successful work.",
+                obj(
+                    {
+                        "dag": _STR,
+                        "run_key": _STR,
+                        "from": _STR,
+                        "to": _STR,
+                        "mode": _STR,
+                        "tasks": {"type": "array", "items": _STR},
+                        "plan_token": _STR,
+                        "allow_config_change": _BOOL,
+                        "confirm": _BOOL,
+                    },
+                    ["dag", "plan_token"],
+                ),
+                self._t_recover_dag,
+                mutating=True,
+                destructive=True,
+                idempotent=True,
+                open_world=True,
             ),
             _tool(
                 "dags",
@@ -1007,42 +1245,11 @@ class MCPHandler:
                 ),
                 self._t_decide_gate,
                 mutating=True,
+                # approving releases the downstream tasks
                 destructive=True,
+                open_world=True,
             ),
         ]
-        registry: list[dict[str, Any]] = []
-        for (
-            toolset,
-            mutating,
-            name,
-            title,
-            desc,
-            schema,
-            handler,
-            destructive,
-            idempotent,
-        ) in specs:
-            registry.append(
-                {
-                    "toolset": toolset,
-                    "mutating": mutating,
-                    "name": name,
-                    "title": title,
-                    "description": desc,
-                    "inputSchema": schema,
-                    "handler": handler,
-                    "annotations": {
-                        "title": title,
-                        "readOnlyHint": not mutating,
-                        "destructiveHint": destructive,
-                        "idempotentHint": idempotent,
-                        # every tool acts on cronstable's own closed domain,
-                        # never an unpredictable external system.
-                        "openWorldHint": False,
-                    },
-                }
-            )
-        return registry
 
     # -- observe tool handlers --------------------------------------------
 
@@ -1464,7 +1671,11 @@ class MCPHandler:
         if note is not None and not isinstance(note, str):
             raise _ToolInputError("note must be a string")
         record = await self._cron.pause_job_by_name(
-            name, duration=duration, note=note or "", by="mcp", channel="mcp"
+            name,
+            duration=duration,
+            note=note or "",
+            by=_attribution(None),
+            channel="mcp",
         )
         return _result(
             {"paused": name, "until": record["until"]},
@@ -1474,7 +1685,9 @@ class MCPHandler:
     async def _t_resume_job(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         _require_confirm(args, "resuming")
-        await self._cron.resume_job_by_name(name, by="mcp", channel="mcp")
+        await self._cron.resume_job_by_name(
+            name, by=_attribution(None), channel="mcp"
+        )
         return _result({"resumed": name}, "resumed job {!r}".format(name))
 
     async def _t_list_pools(self, args):
@@ -1508,7 +1721,21 @@ class MCPHandler:
         from cronstable.recovery import RecoveryError
 
         name = _req_str(args, "dag")
-        token = _req_str(args, "plan_token") if execute else None
+        # the checks POST .../recover applies (Cron._web_dag_recover)
+        token = None
+        if execute:
+            token = _req_str(args, "plan_token")
+            if len(token) != 64:
+                raise _ToolInputError(
+                    "plan_token must be the 64-character token "
+                    "cron_preview_recovery returned"
+                )
+        mode = args.get("mode", "failed")
+        if not isinstance(mode, str):
+            raise _ToolInputError("mode must be a string")
+        allow_change = args.get("allow_config_change", False)
+        if not isinstance(allow_change, bool):
+            raise _ToolInputError("allow_config_change must be a boolean")
         tasks = args.get("tasks", [])
         if (
             not isinstance(tasks, list)
@@ -1523,14 +1750,13 @@ class MCPHandler:
                 data = await self._cron._dag.recover(
                     name,
                     _req_str(args, "run_key"),
-                    mode=args.get("mode", "failed"),
+                    mode=mode,
                     tasks=tasks,
                     plan_token=token,
-                    allow_config_change=args.get("allow_config_change")
-                    is True,
+                    allow_config_change=allow_change,
                 )
             else:
-                if tasks or args.get("mode", "failed") != "failed":
+                if tasks or mode != "failed":
                     raise _ToolInputError(
                         "date ranges recover failed tasks; "
                         "select run_key for mode 'from'"
@@ -1540,8 +1766,7 @@ class MCPHandler:
                     _req_str(args, "from"),
                     _req_str(args, "to"),
                     plan_token=token,
-                    allow_config_change=args.get("allow_config_change")
-                    is True,
+                    allow_config_change=allow_change,
                 )
         except RecoveryError as ex:
             return _tool_error(str(ex))
@@ -1602,7 +1827,7 @@ class MCPHandler:
         if decision not in ("approve", "reject"):
             raise _ToolInputError("decision must be 'approve' or 'reject'")
         _require_confirm(args, "deciding an approval gate")
-        by = str(args.get("by") or "mcp")
+        by = _attribution(args.get("by"))
         result = await self._cron._dag.approve(
             dag, run_key, taskkey, approved=(decision == "approve"), by=by
         )
@@ -1678,7 +1903,12 @@ class MCPHandler:
     def _match_resource(
         self, uri: str
     ) -> tuple[Optional[Callable[..., Any]], tuple[str, ...]]:
-        """Resolve a URI to a loader + captured args, or ``(None, ())``."""
+        """Resolve a URI to a loader + captured args, or ``(None, ())``.
+
+        Clients expand the templates under RFC 6570, which percent-encodes
+        a name's reserved and non-ASCII characters, so each captured value
+        is decoded; an encoded ``/`` (``%2F``) still matches ``[^/]+``.
+        """
         fixed = self._resource_by_uri.get(uri)
         if fixed is not None and self._resource_visible(fixed):
             return fixed["loader"], ()
@@ -1687,7 +1917,7 @@ class MCPHandler:
                 continue
             m = tmpl["regex"].match(uri)
             if m is not None:
-                return tmpl["loader"], m.groups()
+                return tmpl["loader"], tuple(unquote(g) for g in m.groups())
         return None, ()
 
     def _build_resources(
@@ -1758,7 +1988,7 @@ class MCPHandler:
             for uri, name, title, desc, toolset, loader in fixed
         ]
         # resource templates: (uriTemplate, regex, name, title, desc, toolset,
-        #  loader(*groups))
+        #  loader(*groups), completion source per variable)
         templates_spec = [
             (
                 "cronstable://jobs/{name}",
@@ -1768,6 +1998,7 @@ class MCPHandler:
                 "Full detail for one job.",
                 "observe",
                 _async1(cron.job_detail_payload),
+                {"name": self._complete_jobs},
             ),
             (
                 "cronstable://jobs/{name}/runs",
@@ -1777,6 +2008,7 @@ class MCPHandler:
                 "Retained run history + stats for one job.",
                 "observe",
                 _async1(cron.job_runs_payload),
+                {"name": self._complete_jobs},
             ),
             (
                 "cronstable://dags/{name}",
@@ -1786,6 +2018,7 @@ class MCPHandler:
                 "A workflow's tasks and dependencies.",
                 "dags",
                 dag_detail,
+                {"name": self._complete_dags},
             ),
             (
                 "cronstable://dags/{name}/runs/{run_key}",
@@ -1795,6 +2028,10 @@ class MCPHandler:
                 "One workflow run's full document.",
                 "dags",
                 cron._dag.get_run,
+                {
+                    "name": self._complete_dags,
+                    "run_key": self._complete_runs("name"),
+                },
             ),
             (
                 "cronstable://state/{ns}",
@@ -1804,6 +2041,7 @@ class MCPHandler:
                 "Redacted documents of a kv/|cursor/|idem/ namespace.",
                 "state",
                 cron.state_documents_payload,
+                {},
             ),
         ]
         templates = [
@@ -1815,8 +2053,18 @@ class MCPHandler:
                 "description": desc,
                 "toolset": toolset,
                 "loader": loader,
+                "complete": complete,
             }
-            for tmpl, rx, name, title, desc, toolset, loader in templates_spec
+            for (
+                tmpl,
+                rx,
+                name,
+                title,
+                desc,
+                toolset,
+                loader,
+                complete,
+            ) in templates_spec
         ]
         return resources, templates
 
@@ -1837,29 +2085,63 @@ class MCPHandler:
 
     async def _m_prompts_get(self, params: dict[str, Any]) -> dict[str, Any]:
         name = params.get("name")
-        prompt = self._prompt_by_name.get(name) if name else None
+        if not isinstance(name, str):
+            raise MCPError(INVALID_PARAMS, "prompts/get requires a 'name'")
+        prompt = self._prompt_by_name.get(name)
         if prompt is None or not self._prompt_visible(prompt):
             raise MCPError(INVALID_PARAMS, "unknown prompt: {}".format(name))
-        args = params.get("arguments") or {}
-        if not isinstance(args, dict):
+        args = params.get("arguments")
+        if args is None:
             args = {}
-        text = prompt["render"](args)
+        if not isinstance(args, dict):
+            raise MCPError(INVALID_PARAMS, "'arguments' must be an object")
+        for key, value in args.items():
+            if not isinstance(value, str):
+                raise MCPError(
+                    INVALID_PARAMS,
+                    "prompt argument {!r} must be a string".format(key),
+                )
+        missing = [
+            a["name"]
+            for a in prompt["arguments"]
+            if a["required"] and not args.get(a["name"])
+        ]
+        if missing:
+            raise MCPError(
+                INVALID_PARAMS,
+                "missing required prompt argument(s): {}".format(
+                    ", ".join(missing)
+                ),
+            )
+        present = frozenset(
+            t for t in prompt["optional"] if self._tool_visible(t)
+        )
         return {
             "description": prompt["description"],
             "messages": [
                 {
                     "role": "user",
-                    "content": {"type": "text", "text": text},
+                    "content": {
+                        "type": "text",
+                        "text": prompt["render"](args, present),
+                    },
                 }
             ],
         }
 
     def _build_prompts(self) -> list[dict[str, Any]]:
+        """The prompt catalog.
+
+        Each prompt names the tools its text calls: ``requires`` gates the
+        prompt itself, and an ``optional`` tool's step is rendered only when
+        that tool is served, so a prompt never tells the model to call a
+        tool it cannot see.
+        """
+
         def arg(name: str, desc: str, required: bool = True) -> dict[str, Any]:
             return {"name": name, "description": desc, "required": required}
 
-        def triage(a: dict[str, Any]) -> str:
-            job = a.get("job", "<job>")
+        def triage(a: dict[str, str], present: frozenset) -> str:
             return (
                 "Investigate why the cronstable job '{0}' is failing. Steps:\n"
                 "1. cron_get_job(name='{0}') and cron_list_runs(name='{0}') "
@@ -1872,9 +2154,9 @@ class MCPHandler:
                 "Then give a root-cause hypothesis, the blast radius, and the "
                 "safest next action (do NOT run or cancel anything without "
                 "asking)."
-            ).format(job)
+            ).format(a["job"])
 
-        def dag_fail(a: dict[str, Any]) -> str:
+        def dag_fail(a: dict[str, str], present: frozenset) -> str:
             return (
                 "Diagnose the failed workflow run '{1}' of dag '{0}'. Use "
                 "cron_get_dag_run(dag='{0}', run_key='{1}') to find the "
@@ -1882,19 +2164,28 @@ class MCPHandler:
                 "output, and cron_get_dag_xcom(dag='{0}', run_key='{1}') for "
                 "the data they passed. Explain which task failed, why, and "
                 "what downstream tasks were blocked."
-            ).format(a.get("dag", "<dag>"), a.get("run_key", "<run_key>"))
+            ).format(a["dag"], a["run_key"])
 
-        def blast(a: dict[str, Any]) -> str:
+        def blast(a: dict[str, str], present: frozenset) -> str:
+            steps = [
+                "cron_get_status and cron_get_fleet to find other affected "
+                "jobs"
+            ]
+            if "cron_list_dags" in present:
+                steps.append(
+                    "cron_list_dags to see which workflows depend on it"
+                )
+            if "cron_inspect_state" in present:
+                steps.append(
+                    "cron_inspect_state to check for shared locks/cursors it "
+                    "holds"
+                )
             return (
                 "Assess the blast radius of an incident involving '{0}'. Use "
-                "cron_get_status and cron_get_fleet to find other affected "
-                "jobs, cron_list_dags to see which workflows depend on "
-                "it, and "
-                "cron_inspect_state to check for shared locks/cursors it "
-                "holds. Summarize what else is at risk if it stays broken."
-            ).format(a.get("target", "<target>"))
+                "{1}. Summarize what else is at risk if it stays broken."
+            ).format(a["target"], _join(steps))
 
-        def fleet(a: dict[str, Any]) -> str:
+        def fleet(a: dict[str, str], present: frozenset) -> str:
             return (
                 "Summarize overall cronstable health for a status update. Use "
                 "cron_get_fleet, cron_get_cluster and cron_get_status to "
@@ -1904,7 +2195,7 @@ class MCPHandler:
                 "important thing."
             )
 
-        def backfill_plan(a: dict[str, Any]) -> str:
+        def backfill_plan(a: dict[str, str], present: frozenset) -> str:
             return (
                 "Plan a backfill of dag '{0}' from {1} to {2}. First run "
                 "cron_backfill_dag(dag='{0}', from='{1}', to='{2}') with its "
@@ -1913,11 +2204,7 @@ class MCPHandler:
                 "and review the date range, then explain what a real backfill "
                 "would do. Only propose the real run (dry_run=false, "
                 "confirm=true) after the operator agrees."
-            ).format(
-                a.get("dag", "<dag>"),
-                a.get("from", "<from>"),
-                a.get("to", "<to>"),
-            )
+            ).format(a["dag"], a["from"], a["to"])
 
         return [
             {
@@ -1926,7 +2213,16 @@ class MCPHandler:
                 "description": "Find why a job failed using its runs, "
                 "trends, logs, and host health.",
                 "arguments": [arg("job", "the failing job's name")],
-                "toolset": "observe",
+                "requires": (
+                    "cron_get_job",
+                    "cron_list_runs",
+                    "cron_get_job_trends",
+                    "cron_tail_job_logs",
+                    "cron_get_node",
+                    "cron_get_cluster",
+                ),
+                "optional": (),
+                "complete": {"job": self._complete_jobs},
                 "render": triage,
             },
             {
@@ -1935,7 +2231,9 @@ class MCPHandler:
                 "description": "Identify jobs and workflows affected by a "
                 "failing job or workflow.",
                 "arguments": [arg("target", "a job or workflow name")],
-                "toolset": "observe",
+                "requires": ("cron_get_status", "cron_get_fleet"),
+                "optional": ("cron_list_dags", "cron_inspect_state"),
+                "complete": {"target": self._complete_targets},
                 "render": blast,
             },
             {
@@ -1943,7 +2241,14 @@ class MCPHandler:
                 "title": "Fleet health summary",
                 "description": "A summary of cluster, node, and job health.",
                 "arguments": [],
-                "toolset": "observe",
+                "requires": (
+                    "cron_get_fleet",
+                    "cron_get_cluster",
+                    "cron_get_status",
+                    "cron_get_node",
+                ),
+                "optional": (),
+                "complete": {},
                 "render": fleet,
             },
             {
@@ -1955,7 +2260,16 @@ class MCPHandler:
                     arg("dag", "the workflow name"),
                     arg("run_key", "the failed run key"),
                 ],
-                "toolset": "dags",
+                "requires": (
+                    "cron_get_dag_run",
+                    "cron_tail_dag_task_logs",
+                    "cron_get_dag_xcom",
+                ),
+                "optional": (),
+                "complete": {
+                    "dag": self._complete_dags,
+                    "run_key": self._complete_runs("dag"),
+                },
                 "render": dag_fail,
             },
             {
@@ -1968,10 +2282,123 @@ class MCPHandler:
                     arg("from", "ISO start date"),
                     arg("to", "ISO end date"),
                 ],
-                "toolset": "dags",
+                "requires": ("cron_backfill_dag",),
+                "optional": (),
+                "complete": {"dag": self._complete_dags},
                 "render": backfill_plan,
             },
         ]
+
+    # -- argument completion ----------------------------------------------
+
+    async def _m_complete(self, params: dict[str, Any]) -> dict[str, Any]:
+        ref = params.get("ref")
+        argument = params.get("argument")
+        if not isinstance(ref, dict) or not isinstance(argument, dict):
+            raise MCPError(
+                INVALID_PARAMS,
+                "completion/complete requires 'ref' and 'argument' objects",
+            )
+        name = argument.get("name")
+        value = argument.get("value", "")
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise MCPError(
+                INVALID_PARAMS,
+                "'argument' requires a string 'name' and 'value'",
+            )
+        context = params.get("context")
+        known = context.get("arguments") if isinstance(context, dict) else None
+        source = self._completion_source(ref, name)
+        candidates = (
+            await source(known if isinstance(known, dict) else {})
+            if source is not None
+            else []
+        )
+        prefix = value.lower()
+        matches = [c for c in candidates if c.lower().startswith(prefix)]
+        return {
+            "completion": {
+                "values": matches[:COMPLETION_MAX],
+                "total": len(matches),
+                "hasMore": len(matches) > COMPLETION_MAX,
+            }
+        }
+
+    def _completion_source(
+        self, ref: dict[str, Any], argument: str
+    ) -> Optional[_CompletionSource]:
+        """The candidates for ``argument`` of ``ref``; None offers nothing.
+
+        A reference the current config or caller cannot see offers nothing,
+        exactly as an argument without a source does.
+        """
+        kind = ref.get("type")
+        if kind == "ref/prompt":
+            name = ref.get("name")
+            prompt = (
+                self._prompt_by_name.get(name)
+                if isinstance(name, str)
+                else None
+            )
+            if prompt is None:
+                raise MCPError(
+                    INVALID_PARAMS, "unknown prompt: {}".format(name)
+                )
+            if not self._prompts_enabled or not self._prompt_visible(prompt):
+                return None
+            return cast(
+                Optional[_CompletionSource], prompt["complete"].get(argument)
+            )
+        if kind == "ref/resource":
+            uri = ref.get("uri")
+            template = (
+                self._template_by_uri.get(uri)
+                if isinstance(uri, str)
+                else None
+            )
+            if template is None:
+                raise MCPError(
+                    INVALID_PARAMS,
+                    "unknown resource template: {}".format(uri),
+                )
+            if not self._resources_enabled or not self._resource_visible(
+                template
+            ):
+                return None
+            return cast(
+                Optional[_CompletionSource],
+                template["complete"].get(argument),
+            )
+        raise MCPError(
+            INVALID_PARAMS, "'ref.type' must be 'ref/prompt' or 'ref/resource'"
+        )
+
+    async def _complete_jobs(self, known: dict[str, Any]) -> list[str]:
+        return list(self._cron.cron_jobs)
+
+    async def _complete_dags(self, known: dict[str, Any]) -> list[str]:
+        return list(self._cron.cron_dags)
+
+    async def _complete_targets(self, known: dict[str, Any]) -> list[str]:
+        jobs = list(self._cron.cron_jobs)
+        return jobs + [d for d in self._cron.cron_dags if d not in jobs]
+
+    def _complete_runs(self, dag_argument: str) -> _CompletionSource:
+        """Recent run keys of the DAG named by the ``dag_argument`` value."""
+
+        async def complete(known: dict[str, Any]) -> list[str]:
+            dag = known.get(dag_argument)
+            if not isinstance(dag, str):
+                return []
+            try:
+                runs = await self._cron._dag.list_runs(
+                    dag, limit=self._max_rows
+                )
+            except ApiActionError:
+                return []
+            return [r["runKey"] for r in runs or () if "runKey" in r]
+
+        return complete
 
 
 # -- module-level helpers -------------------------------------------------
@@ -1999,6 +2426,7 @@ def _async1(fn: Callable[[str], Any]) -> Callable[[str], Awaitable[Any]]:
 _STR = {"type": "string"}
 _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
+_OBJ = {"type": "object"}
 
 
 def _enum(values: list[str]) -> dict[str, Any]:
@@ -2018,6 +2446,125 @@ def _obj_schema(
     return schema
 
 
+def _nullable(schema: dict[str, Any]) -> dict[str, Any]:
+    # anyOf rather than a type list: clients that map tool schemas onto a
+    # single-type dialect reject the list form
+    return {"anyOf": [schema, {"type": "null"}]}
+
+
+# outputSchema fragments. Each declares only what its payload always
+# carries (optional fields are typed but not required) and leaves
+# additionalProperties open, so the payloads can grow.
+_PAGE_OUTPUT = {
+    "type": "object",
+    "properties": {
+        "offset": _INT,
+        "limit": _INT,
+        "total": _INT,
+        "returned": _INT,
+        "nextOffset": _nullable(_INT),
+    },
+    "required": ["offset", "limit", "total", "returned", "nextOffset"],
+}
+_STATUS_OUTPUT = {
+    "type": "object",
+    "properties": {
+        "status": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "job": _STR,
+                    "status": _enum(["running", "disabled", "scheduled"]),
+                    "never_fires": _BOOL,
+                },
+                "required": ["job", "status"],
+            },
+        },
+        "page": _PAGE_OUTPUT,
+    },
+    "required": ["status", "page"],
+}
+_JOBS_OUTPUT = {
+    "type": "object",
+    "properties": {
+        "jobs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": _STR,
+                    "enabled": _BOOL,
+                    "schedule": _STR,
+                    "command": _STR,
+                    "running": _BOOL,
+                    "timezone": _nullable(_STR),
+                    "last_run": _nullable(_OBJ),
+                    "paused": _nullable(_OBJ),
+                },
+                "required": ["name", "enabled", "running", "paused"],
+            },
+        },
+        "page": _PAGE_OUTPUT,
+    },
+    "required": ["jobs", "page"],
+}
+_FINDINGS = {"type": "array", "items": _OBJ}
+_PREVIEW_OUTPUT = {
+    "type": "object",
+    "properties": {
+        "expression": _STR,
+        "timezone": _STR,
+        "valid": _BOOL,
+        "error": _STR,
+        "reboot": _BOOL,
+        "normalized": _STR,
+        "resolved": _STR,
+        "seed": _STR,
+        "description": _STR,
+        "fires": {"type": "array", "items": _STR},
+        "never_fires": _BOOL,
+        "lint": _FINDINGS,
+    },
+    "required": ["expression", "timezone", "valid"],
+}
+_WHY_OUTPUT = {
+    "type": "object",
+    "properties": {
+        "job": _STR,
+        "enabled": _BOOL,
+        "timezone": _STR,
+        "at": _STR,
+        "at_in_zone": _STR,
+        "expression": _STR,
+        "resolved": _STR,
+        "reboot": _BOOL,
+        "description": _STR,
+        "matches": _BOOL,
+        "checks": _FINDINGS,
+        "failed": {"type": "array", "items": _STR},
+        "notes": _FINDINGS,
+        "previous_fire": _nullable(_STR),
+        "next_fire": _nullable(_STR),
+    },
+    "required": [
+        "job",
+        "enabled",
+        "timezone",
+        "at",
+        "expression",
+        "reboot",
+        "description",
+        "matches",
+        "checks",
+        "failed",
+        "notes",
+        "previous_fire",
+        "next_fire",
+    ],
+}
+
+
 def _tool(
     toolset: str,
     name: str,
@@ -2029,36 +2576,57 @@ def _tool(
     mutating: bool = False,
     destructive: bool = False,
     idempotent: Optional[bool] = None,
-) -> tuple[Any, ...]:
-    """One registry spec, defaults tuned to the common case.
+    open_world: bool = False,
+    output: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """One registry entry, defaults tuned to the common case.
 
     Read-only tools take every default; mutating tools default to
     non-idempotent (a re-run acts again) unless declared otherwise, e.g.
-    pause/resume, whose repeat is a no-op.
+    pause/resume, whose repeat is a no-op. ``open_world`` marks a tool that
+    runs whatever command a job or task configures.
     """
     if idempotent is None:
         idempotent = not mutating
-    return (
-        toolset,
-        mutating,
-        name,
-        title,
-        description,
-        schema,
-        handler,
-        destructive,
-        idempotent,
-    )
+    listing: dict[str, Any] = {
+        "name": name,
+        "title": title,
+        "description": description,
+        "inputSchema": schema,
+        "annotations": {
+            "title": title,
+            "readOnlyHint": not mutating,
+            "destructiveHint": destructive,
+            "idempotentHint": idempotent,
+            "openWorldHint": open_world,
+        },
+    }
+    if output is not None:
+        listing["outputSchema"] = output
+    return {
+        "toolset": toolset,
+        "mutating": mutating,
+        "name": name,
+        "scope": _TOOL_SCOPE_OVERRIDES.get(
+            name, "control" if mutating else "view"
+        ),
+        "inputSchema": schema,
+        "handler": handler,
+        "listing": listing,
+    }
 
 
 def _result(structured: dict[str, Any], summary: str) -> dict[str, Any]:
-    """A successful tool result: a text summary plus the structured object.
+    """A successful tool result: a one-line summary, then the same data.
 
-    The ``text`` block mirrors ``structuredContent`` for clients that do not
-    read structured output; modern clients parse the object.
+    The second text block is ``structuredContent`` as JSON, for clients
+    that pass only ``content`` to the model.
     """
     return {
-        "content": [{"type": "text", "text": summary}],
+        "content": [
+            {"type": "text", "text": summary},
+            {"type": "text", "text": _dumps(structured).decode("utf-8")},
+        ],
         "structuredContent": structured,
     }
 
@@ -2143,12 +2711,13 @@ def _req_str(args: dict[str, Any], key: str) -> str:
 
 
 def _opt_int(value: Any) -> Optional[int]:
-    if value is None:
+    # bool is an int subclass; `true` must not read as 1.
+    if value is None or isinstance(value, bool):
         return None
     try:
         return int(value)
     # OverflowError: int(float("inf")) raises it, and stdlib json parses
-    # the legal literal 1e999 to inf -- fall back to the default like any
+    # the legal literal 1e999 to inf. Fall back to the default like any
     # other unusable value instead of surfacing a -32603 internal error.
     except (TypeError, ValueError, OverflowError):
         return None
@@ -2163,13 +2732,194 @@ def _require_confirm(args: dict[str, Any], gerund: str) -> None:
         )
 
 
+def _attribution(supplied: Any) -> str:
+    """The audit ``by`` of an action: the caller's token label, or ``mcp``
+    without one, with a model-supplied ``by`` appended as display text."""
+    caller = _caller.get()
+    label = caller.label if caller is not None else "mcp"
+    if supplied is None or supplied == "":
+        return label
+    if not isinstance(supplied, str):
+        raise _ToolInputError("by must be a string")
+    if len(supplied) > PAUSE_BY_MAX:
+        raise _ToolInputError(
+            "by is longer than {} characters".format(PAUSE_BY_MAX)
+        )
+    return "{} ({})".format(label, supplied)
+
+
+def _join(parts: list[str]) -> str:
+    """``a``, ``a and b``, ``a, b, and c``."""
+    if len(parts) < 3:
+        return " and ".join(parts)
+    return ", ".join(parts[:-1]) + ", and " + parts[-1]
+
+
+def _valid_id(value: Any) -> bool:
+    """MCP request IDs are strings or integers, never null."""
+    return isinstance(value, str) or (
+        isinstance(value, int) and not isinstance(value, bool)
+    )
+
+
 def _id_of(msg: Any) -> Any:
-    return msg.get("id") if isinstance(msg, dict) else None
+    msg_id = msg.get("id") if isinstance(msg, dict) else None
+    return msg_id if _valid_id(msg_id) else None
 
 
-def _error_envelope(msg_id: Any, code: int, message: str) -> dict[str, Any]:
-    return {
-        "jsonrpc": "2.0",
-        "id": msg_id,
-        "error": {"code": code, "message": message},
-    }
+def _is_response(msg: dict[str, Any]) -> bool:
+    """A JSON-RPC response: a reply with no method."""
+    return "method" not in msg and ("result" in msg or "error" in msg)
+
+
+def _request_meta(msg: dict[str, Any]) -> Optional[dict[str, Any]]:
+    params = msg.get("params")
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    return meta if isinstance(meta, dict) else None
+
+
+def _declares_modern(msg: dict[str, Any]) -> bool:
+    """Whether the body names a protocol version, as only modern clients do."""
+    meta = _request_meta(msg)
+    return meta is not None and META_PROTOCOL_VERSION in meta
+
+
+def _meta_error(msg: dict[str, Any]) -> Optional[MCPError]:
+    """A modern request's missing or malformed required ``_meta`` fields."""
+    meta = _request_meta(msg) or {}
+    if isinstance(meta.get(META_PROTOCOL_VERSION), str) and isinstance(
+        meta.get(META_CLIENT_CAPABILITIES), dict
+    ):
+        return None
+    return MCPError(
+        INVALID_PARAMS,
+        "params._meta requires a string {!r} and an object {!r}".format(
+            META_PROTOCOL_VERSION, META_CLIENT_CAPABILITIES
+        ),
+        http_status=400,
+    )
+
+
+def _version_error(msg: dict[str, Any]) -> Optional[MCPError]:
+    requested = (_request_meta(msg) or {}).get(META_PROTOCOL_VERSION)
+    if requested in MODERN_PROTOCOL_VERSIONS:
+        return None
+    return MCPError(
+        UNSUPPORTED_PROTOCOL_VERSION,
+        "Unsupported protocol version",
+        data={
+            "supported": list(ALL_PROTOCOL_VERSIONS),
+            "requested": requested,
+        },
+        http_status=400,
+    )
+
+
+def _header_error(msg: dict[str, Any], headers: Any) -> Optional[MCPError]:
+    """A modern request whose mirrored headers disagree with its body.
+
+    Called after :func:`_meta_error`, so the body's version is a string.
+    """
+    method = msg.get("method")
+    expected = [
+        (
+            "MCP-Protocol-Version",
+            cast(dict, _request_meta(msg))[META_PROTOCOL_VERSION],
+        ),
+        ("Mcp-Method", method),
+    ]
+    source = _MCP_NAME_SOURCE.get(method) if isinstance(method, str) else None
+    if source is not None:
+        params = cast(dict, msg["params"])
+        expected.append(("Mcp-Name", params.get(source)))
+    for header, body_value in expected:
+        value = headers.get(header)
+        if value is None:
+            return _mismatch("missing {} header".format(header))
+        if header == "Mcp-Name":
+            try:
+                value = _decode_header_value(value)
+            except ValueError:
+                return _mismatch("Mcp-Name header is malformed Base64")
+        if value != body_value:
+            return _mismatch(
+                "{} header value {!r} does not match body value {!r}".format(
+                    header, value, body_value
+                )
+            )
+    return None
+
+
+def _mismatch(detail: str) -> MCPError:
+    return MCPError(
+        HEADER_MISMATCH, "Header mismatch: " + detail, http_status=400
+    )
+
+
+def _decode_header_value(value: str) -> str:
+    """Undo the ``=?base64?...?=`` form; plain values pass through."""
+    if not (
+        len(value) >= len(_B64_PREFIX) + len(_B64_SUFFIX)
+        and value.startswith(_B64_PREFIX)
+        and value.endswith(_B64_SUFFIX)
+    ):
+        return value
+    encoded = value[len(_B64_PREFIX) : -len(_B64_SUFFIX)]
+    try:
+        return base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError) as ex:
+        raise ValueError("malformed Base64 header value") from ex
+
+
+def _echo_version(requested: Optional[str]) -> str:
+    """The MCP-Protocol-Version a response carries: the request's, when this
+    server speaks it, else PROTOCOL_VERSION."""
+    if requested in SUPPORTED_PROTOCOL_VERSIONS or (
+        requested in MODERN_PROTOCOL_VERSIONS
+    ):
+        return cast(str, requested)
+    return PROTOCOL_VERSION
+
+
+def _caller_of(request: Any) -> Optional[_Caller]:
+    token = request.get(WEB_TOKEN_REQUEST_KEY)
+    if token is not None:
+        return _Caller(token.label, token.scopes)
+    anonymous = request.get(WEB_ANON_REQUEST_KEY)
+    if anonymous is not None:
+        return _Caller("anonymous", frozenset(anonymous))
+    return None
+
+
+# The dashboard's favicon link: the one source of the server icon.
+_FAVICON_RE = re.compile(
+    rb'<link rel="icon" sizes="32x32" href="(data:image/png;base64,'
+    rb'[A-Za-z0-9+/]+=*)"'
+)
+
+
+@lru_cache(maxsize=1)
+def _server_icons() -> "tuple[dict[str, Any], ...]":
+    """The dashboard's 32x32 PNG favicon as MCP icons, or none if absent."""
+    try:
+        match = _FAVICON_RE.search(_load_index_bytes())
+    except OSError:
+        return ()
+    if match is None:
+        return ()
+    return (
+        {
+            "src": match.group(1).decode("ascii"),
+            "mimeType": "image/png",
+            "sizes": ["32x32"],
+        },
+    )
+
+
+def _error_envelope(
+    msg_id: Any, code: int, message: str, data: Any = None
+) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": msg_id, "error": error}

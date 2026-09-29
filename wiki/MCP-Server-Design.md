@@ -1,6 +1,6 @@
 # Design document: a Model Context Protocol (MCP) server for cronstable
 
-**Status:** Implemented · **Author:** Principal Engineering · **Date:** 2026-07-08 · **Target spec:** MCP `2025-11-25`
+**Status:** Implemented · **Author:** Principal Engineering · **Date:** 2026-07-08 · **Target spec:** MCP `2025-11-25` (the server also serves `2026-07-28`)
 
 This page summarizes the MCP server's original design and how the
 implementation differs. The server is in `cronstable/mcp.py`; its stdio
@@ -63,6 +63,15 @@ history.
 - Resources and prompts are toolset-scoped (§5.3/§5.4): the `dags` resource
   templates and the `why_did_dag_run_fail` / `backfill_plan` prompts
   require the `dags` toolset.
+- Both protocol eras (§4.3): the design's method set targets `2025-11-25`.
+  The server also serves the stateless `2026-07-28` revision on the same
+  endpoint, with `server/discover`, per-request `_meta`, header validation,
+  `resultType`, and cache hints, and the stdio bridge copies a modern
+  frame's `_meta` into the headers that revision requires. See
+  [protocol revisions](MCP#protocol-revisions).
+- Argument completion (§4.3): the server adds `completion/complete`, which
+  completes prompt arguments and resource template variables from job
+  names, workflow names, and recent run keys.
 - TLS is served by the daemon, not only by a reverse proxy (§6): where the
   design text says to terminate TLS/mTLS in a reverse proxy and cites the
   [HTTP control API](HTTP-API) page for it, `web.listen` now accepts

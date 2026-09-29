@@ -81,7 +81,6 @@ target/
 # token here; anyone holding it can publish through the tunnel).
 .env
 
-/CLAUDE.md
 /.claude/*
 !/.claude/settings.json
 

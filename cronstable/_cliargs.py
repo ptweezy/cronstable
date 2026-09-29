@@ -361,8 +361,8 @@ def add_mcp_command(sub: Any) -> None:
         "--protocol-version",
         default=None,
         metavar="REV",
-        help="pin the MCP-Protocol-Version sent before initialize "
-        "(default: {})".format(MCP_DEFAULT_PROTOCOL_VERSION),
+        help="pin the MCP-Protocol-Version of legacy frames sent before "
+        "initialize (default: {})".format(MCP_DEFAULT_PROTOCOL_VERSION),
     )
     parser.add_argument(
         "--timeout",
@@ -376,7 +376,8 @@ def add_mcp_command(sub: Any) -> None:
         dest="mcp_check",
         default=False,
         action="store_true",
-        help="check the connection with initialize and tools/list, then exit",
+        help="check the connection with server/discover (or initialize) "
+        "and tools/list, then exit",
     )
 
 
