@@ -959,9 +959,9 @@ jobs:
                 RUST_SETUP="$RUST_SETUP_CMD"
               fi
               RUST_SETUP="$RUST_SETUP" sh pyinstaller/install_orjson.sh
-              # Bundle isal (the `speedups` extra's SIMD gzip) from a wheel on
-              # amd64/arm64, never a source build (it needs nasm). Without it,
-              # the binary gzips with the stdlib zlib in cronstable/_gzip.
+              # Bundle isal (SIMD gzip, from the `speedups` extra) from a wheel
+              # on amd64/arm64, never a source build (it needs nasm). Without
+              # it, the binary gzips with the stdlib zlib in cronstable/_gzip.
               sh pyinstaller/install_extra.sh isal "@" wheel "using stdlib zlib"
               # Bundle pynacl (the `push` extra): hard where a wheel exists,
               # soft where it source-builds. A build that fails the sealed-box
