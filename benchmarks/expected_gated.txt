@@ -110,6 +110,7 @@ tui.drawer_paint_5k
 tui.log_restyle_5k
 tui.log_search_20k
 webapi.auth_scope_20k
+webapi.gzip_body_500
 webapi.jobs_bytes_500
 webapi.jobs_gzip_500
 webapi.jobs_payload_500

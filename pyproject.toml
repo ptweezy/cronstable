@@ -103,6 +103,13 @@ speedups = [
     # targets (riscv64, armv6, musl ppc64le/s390x) have no wheel; Windows
     # does, so no marker.
     "orjson>=3.11.6",
+    # isal (ISA-L) gzips web and cluster responses with SIMD deflate
+    # (cronstable._gzip falls back to stdlib zlib). The marker lists only
+    # targets with a wheel, so pip never tries the sdist, which builds ISA-L
+    # and needs nasm on x86. There is no cp315 wheel yet. Linux stops at
+    # x86_64 and aarch64, with the same 32-bit userland caveat as the push
+    # extra's cryptography line.
+    "isal>=1.8.0; python_version < '3.15' and ((sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64'))",
 ]
 # End-to-end encrypted push alerts (the `push` reporter; see cronstable.push).
 # PyNaCl seals `x25519` and fails closed: a config with a `push:` section
@@ -139,6 +146,9 @@ dev = [
     # Rust source build. py314t uses a generated list without it, because no
     # marker can detect the free-threaded ABI that orjson rejects.
     "orjson>=3.11.6; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+    # isal reuses the speedups marker; tests/test_gzip.py covers both
+    # backends wherever it installs.
+    "isal>=1.8.0; python_version < '3.15' and ((sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64'))",
     "pynacl>=1.6.2",
     "zeroconf>=0.151.3",
     # Browser-backed tests require a separate `playwright install chromium`
@@ -238,6 +248,8 @@ strict_optional = true
 module = [
     "orjson",
     "uvloop",
+    "isal",
+    "isal.*",
     "nacl",
     "nacl.*",
     "cryptography",

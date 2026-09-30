@@ -919,6 +919,8 @@ def _import_door_probe():
         print("AIOHTTP-AFTER-IMPORT", loaded("aiohttp"))
         print("ZEROCONF-AFTER-IMPORT", loaded("zeroconf"))
         print("ZEROCONF-INSTALLED", int(_zeroconf_installed()))
+        print("ISAL-AFTER-IMPORT", loaded("isal"))
+        print("ISAL-INSTALLED", int(_isal_installed()))
         cron.web.Response  # first touch: this is what opens the door
         print("AIOHTTP-AFTER-TOUCH", loaded("aiohttp"))
         # the NAME, not type(...).__name__: both globals rebind to modules, so
@@ -937,6 +939,9 @@ def _import_door_probe():
 
         def _zeroconf_installed():
             return importlib.util.find_spec("zeroconf") is not None
+
+        def _isal_installed():
+            return importlib.util.find_spec("isal") is not None
         """
     )
     done = subprocess.run(
@@ -959,6 +964,8 @@ def _import_door_probe():
         "AIOHTTP-AFTER-IMPORT",
         "ZEROCONF-AFTER-IMPORT",
         "ZEROCONF-INSTALLED",
+        "ISAL-AFTER-IMPORT",
+        "ISAL-INSTALLED",
         "AIOHTTP-AFTER-TOUCH",
         "WEB-NAME-AFTER-TOUCH",
         "AIOHTTP-NAME-AFTER-TOUCH",
@@ -1028,4 +1035,17 @@ def test_importing_the_daemon_loads_no_zeroconf():
         "importing cronstable.cron pulled in zeroconf: discovery.py's "
         "_probe_zeroconf deferral was defeated, costing ~24 ms and ~3.6 MB "
         "of RSS on every start that never advertises."
+    )
+
+
+def test_importing_the_daemon_loads_no_isal():
+    # cronstable._gzip resolves its backend on first use: isal imports the
+    # stdlib gzip module, and a daemon with no web or cluster listener
+    # never compresses anything.
+    probe = _import_door_probe()
+    if not probe["ISAL-INSTALLED"]:
+        pytest.skip("isal has no wheel for this platform")
+    assert probe["ISAL-AFTER-IMPORT"] == 0, (
+        "importing cronstable.cron pulled in isal: cronstable._gzip's "
+        "deferred backend was defeated, costing ~5 ms on every start."
     )

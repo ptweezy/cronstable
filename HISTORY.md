@@ -1,5 +1,19 @@
 # History
 
+## 1.2.61
+
+- Gzip web and cluster responses with ISA-L when the `speedups` extra
+  installs `isal`. On Linux it compresses a 500-job `/jobs` response 3.5
+  times as fast as stock zlib, and aiohttp uses it for the gzip exchange
+  between cluster peers. Without `isal`, the daemon uses the standard
+  library's `zlib`. `isal` installs only from a wheel, so the amd64 and
+  arm64 Docker images include it, as do the `amd64`, `amd64v3`, and `arm64`
+  binaries for Linux, macOS, and Windows. The `webapi.gzip_body_500`
+  benchmark times the compressor.
+- The amd64 and arm64 Docker images include uvloop, the `speedups` extra's
+  event loop, as the POSIX binaries do. The other image architectures have
+  no uvloop wheel and run on stock asyncio.
+
 ## 1.2.60
 
 - A job's verification record redacts every line of a PEM private key that

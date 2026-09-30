@@ -4962,6 +4962,43 @@ def bench_webapi_jobs_gzip():
     return asyncio.run(run())
 
 
+@bench(
+    "webapi.gzip_body_500",
+    "webapi",
+    detail="the daemon's response gzip x1000 on the 500-job /jobs body",
+    repeats=(3, 2, 1),
+)
+def bench_webapi_gzip_body():
+    """The CPU the daemon spends gzipping a poll response.
+
+    Every memoized /jobs, /fleet and /metrics build pays this once per memo
+    window, on the loop or its executor hop.  webapi.jobs_payload_500 folds
+    it into a larger total; this one isolates the compressor, which is the
+    number a gzip backend change (cronstable._gzip) moves.
+    """
+    import asyncio
+
+    import cronstable.cron
+
+    gzip_body = getattr(cronstable.cron, "_gzip_body", None)
+    if gzip_body is None:
+        raise Skip("cron._gzip_body not present")
+    cron = fixture(
+        "webapi_cron_500",
+        lambda: _seeded_web_cron(_n(500), history_every=5),
+    )
+    if not hasattr(cron, "_web_list_jobs"):
+        raise Skip("Cron._web_list_jobs not present")
+    resp = asyncio.run(cron._web_list_jobs(_mocked_get("/jobs")))
+    body = bytes(resp.body)
+    reps = _n(1000)
+    gzip_body(body)  # resolve the backend outside the timed region
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        gzip_body(body)
+    return time.perf_counter() - t0
+
+
 class _NullStreamResponse:
     """A StreamResponse that swallows what is written to it.
 

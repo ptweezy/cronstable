@@ -10,7 +10,8 @@ files next to it:
   extras, so the images and pyproject.toml can never drift and a renamed
   extra fails the build loudly (KeyError) instead of silently shipping
   without it.  push carries both sealing libraries, PyNaCl for `x25519`
-  and cryptography for post-quantum `xwing`.
+  and cryptography for post-quantum `xwing`.  From the speedups extra it
+  takes uvloop and isal; orjson has its own install step.
 - build-requires.txt: build-system.requires, for the throwaway buildenv
   the project install builds its wheel with.
 
@@ -35,6 +36,11 @@ where a wheel really exists and drops it otherwise.  An image that loses it
 still has PyNaCl, so the daemon advertises `x25519` and refuses `xwing`
 pairings, which is the designed fail-closed degradation.
 
+uvloop and isal have the same marker blind spot, and get the same wheel
+check against their own table.  Their lines keep their markers where they
+stay.  An image that drops them runs on stock asyncio and gzips with the
+stdlib zlib.
+
 Both lists are echoed to stdout so the build log shows what was resolved.
 Runs on the venv interpreter, which is Python 3.11+ (tomllib) in every
 image.
@@ -50,6 +56,22 @@ import sys
 import tomllib
 
 EXTRAS = ("push", "discovery")
+
+#: The requirements this script takes from the speedups extra.
+SPEEDUPS = ("uvloop", "isal")
+
+#: The (machine, libc) pairs both SPEEDUPS packages publish a Linux wheel
+#: for, keyed like CRYPTOGRAPHY_WHEELS.  Elsewhere they would build from
+#: source under emulation, and isal's build needs nasm on x86, which no
+#: image carries.
+SPEEDUPS_WHEELS = frozenset(
+    {
+        ("x86_64", "glibc"),
+        ("x86_64", "musl"),
+        ("aarch64", "glibc"),
+        ("aarch64", "musl"),
+    }
+)
 
 #: The (machine, libc) pairs cryptography publishes a Linux wheel for, keyed
 #: on the machine name pip resolves wheels UNDER rather than the one uname
@@ -92,6 +114,18 @@ def cryptography_has_wheel(machine, pointer_size, libc):
     which keeps this a table lookup the tests can walk case by case.
     """
     return (wheel_machine(machine, pointer_size), libc) in CRYPTOGRAPHY_WHEELS
+
+
+def speedups_have_wheels(target):
+    """Whether the SPEEDUPS packages have wheels for ``target``.
+
+    ``target`` is what detect_target returns.  ``None`` (not Linux)
+    answers True: pip and the markers decide there.
+    """
+    if target is None:
+        return True
+    machine, pointer_size, libc = target
+    return (wheel_machine(machine, pointer_size), libc) in SPEEDUPS_WHEELS
 
 
 def detect_libc():
@@ -222,9 +256,21 @@ def main(pyproject_path, wheelhouse=None):
     requirements = list(project["dependencies"])
     for extra in EXTRAS:
         requirements += project["optional-dependencies"][extra]
+    requirements += [
+        line
+        for line in project["optional-dependencies"]["speedups"]
+        if requirement_name(line) in SPEEDUPS
+    ]
     target = detect_target()
     resolved = []
     for line in requirements:
+        name = requirement_name(line)
+        if name in SPEEDUPS and not speedups_have_wheels(target):
+            sys.stdout.write(
+                "%s: no wheel for this image (%r); not installed\n"
+                % (name, target)
+            )
+            continue
         if requirement_name(line) == "zeroconf" and os.environ.get(
             "ZEROCONF_VERSION"
         ):

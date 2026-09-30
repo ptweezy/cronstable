@@ -319,6 +319,12 @@ def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
     with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fobj:
         data = tomllib.load(fobj)
     project = data["project"]
+    speedups = [
+        line
+        for line in project["optional-dependencies"]["speedups"]
+        if module.requirement_name(line) in module.SPEEDUPS
+    ]
+    assert len(speedups) == len(module.SPEEDUPS)
     declared = (
         project["dependencies"]
         + project["optional-dependencies"]["push"]
@@ -329,18 +335,29 @@ def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
         .read_text(encoding="utf-8")
         .splitlines()
     )
-    # Every requirement but cryptography rides through verbatim, marker and
-    # all, in pyproject's own order.
+    resolved = ("cryptography", *module.SPEEDUPS)
+    # Every requirement but the resolved ones rides through verbatim, marker
+    # and all, in pyproject's own order.
     others = [
         line
         for line in declared
-        if module.requirement_name(line) != "cryptography"
+        if module.requirement_name(line) not in resolved
     ]
     assert [
         line
         for line in written
-        if module.requirement_name(line) != "cryptography"
+        if module.requirement_name(line) not in resolved
     ] == others
+    # The speedups come verbatim, wherever this host has their wheels.
+    assert [
+        line
+        for line in written
+        if module.requirement_name(line) in module.SPEEDUPS
+    ] == (
+        speedups
+        if module.speedups_have_wheels(module.detect_target())
+        else []
+    )
     build_requires = tmp_path / "build-requires.txt"
     assert (
         build_requires.read_text(encoding="utf-8").splitlines()
@@ -388,6 +405,54 @@ def test_extract_deps_writes_the_file_the_target_can_install(
     # source build everywhere, so push keeps sealing x25519 on the rows that
     # lose the post-quantum suite.
     assert any(module.requirement_name(line) == "pynacl" for line in written)
+
+
+def _speedups_line(name):
+    """pyproject's speedups requirement for ``name``, marker included."""
+    tomllib = pytest.importorskip("tomllib")
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fobj:
+        speedups = tomllib.load(fobj)["project"]["optional-dependencies"][
+            "speedups"
+        ]
+    (line,) = [line for line in speedups if line.startswith(name)]
+    return line
+
+
+@pytest.mark.parametrize("name", ["uvloop", "isal"])
+@pytest.mark.parametrize(
+    "target,keeps",
+    [
+        (("x86_64", 8, "glibc"), True),  # linux/amd64
+        (("aarch64", 8, "musl"), True),  # the Alpine linux/arm64 row
+        (("x86_64", 4, "glibc"), False),  # linux/386 on an amd64 host
+        (("aarch64", 4, "glibc"), False),  # linux/arm/v7 on an arm64 host
+        (("ppc64le", 8, "glibc"), False),  # no wheel at any tag
+        (None, True),  # off Linux the marker decides
+    ],
+)
+def test_extract_deps_keeps_speedups_only_where_a_wheel_exists(
+    tmp_path, monkeypatch, target, keeps, name
+):
+    # Without a wheel, uvloop and isal build from source under emulation
+    # (isal's build needs nasm on x86, which no image carries), and their
+    # markers have the same kernel-not-userland blind spot as
+    # cryptography's. An image without a wheel must get no line for them,
+    # and one with a wheel gets pyproject's line unchanged.
+    module = _extract_deps_module()
+    monkeypatch.setattr(module, "detect_target", lambda: target)
+    shutil.copy(
+        os.path.join(ROOT, "pyproject.toml"), tmp_path / "pyproject.toml"
+    )
+    module.main(str(tmp_path / "pyproject.toml"))
+    written = (
+        (tmp_path / "requirements.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    kept = [
+        line for line in written if module.requirement_name(line) == name
+    ]
+    assert kept == ([_speedups_line(name)] if keeps else [])
 
 
 def test_cryptography_line_keeps_its_floor_and_loses_its_marker():

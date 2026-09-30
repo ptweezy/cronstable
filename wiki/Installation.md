@@ -103,6 +103,11 @@ hardened Kubernetes/Docker setup (read-only root filesystem, dropped
 capabilities, `fsGroup`), see
 [production and container deployment](Production-Deployment).
 
+The `amd64`, `amd64v3`, and `arm64` images also include uvloop and isal from
+the `speedups` extra. The other architectures have no wheels for them, so
+those images run on stock asyncio and gzip responses with the standard
+library's `zlib`.
+
 ### Distro variants
 
 The default `latest` (and `<version>`) image is built on **Debian** (slim). The
@@ -607,6 +612,11 @@ probe fails, the binary keeps `x25519` push. Existing `xwing` devices need
 to pair again under `x25519` if the upgraded daemon loses that suite.
 See [Push notifications](Push-Notifications) for what the source builds
 promise and how to check a binary.
+
+`isal`, the SIMD gzip library in the `speedups` extra, is bundled only from a
+wheel. The `amd64`, `amd64v3`, and `arm64` builds for Linux (both libcs),
+macOS, and Windows include it. The other builds gzip web and cluster responses with
+the standard library's `zlib`, which produces the same format more slowly.
 
 The `mips64le` build covers 64-bit little-endian MIPS on glibc hosts. It is
 built in an emulated Debian bookworm container, the last Debian suite that

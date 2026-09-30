@@ -60,6 +60,15 @@ try:
     hiddenimports.append("orjson")
 except ImportError:
     pass
+# isal (the `speedups` extra's SIMD gzip; cronstable/_gzip falls back to
+# zlib) is imported inside a function. Its isal_zlib extension imports
+# gzip and isal.igzip_lib from C, where the analysis cannot see them.
+try:
+    import isal.isal_zlib  # noqa: F401
+
+    hiddenimports.extend(["isal.isal_zlib", "isal.igzip_lib", "gzip"])
+except ImportError:
+    pass
 # pynacl (the `push` extra): cronstable/push guards `from nacl.public
 # import ...` in a try/except, the pattern the analysis is most likely
 # to drop. Name the exact module we import, AND cffi's `_cffi_backend`

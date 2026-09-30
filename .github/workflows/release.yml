@@ -959,6 +959,10 @@ jobs:
                 RUST_SETUP="$RUST_SETUP_CMD"
               fi
               RUST_SETUP="$RUST_SETUP" sh pyinstaller/install_orjson.sh
+              # Bundle isal (the `speedups` extra's SIMD gzip) from a wheel on
+              # amd64/arm64, never a source build (it needs nasm). Without it,
+              # the binary gzips with the stdlib zlib in cronstable/_gzip.
+              sh pyinstaller/install_extra.sh isal "@" wheel "using stdlib zlib"
               # Bundle pynacl (the `push` extra): hard where a wheel exists,
               # soft where it source-builds. A build that fails the sealed-box
               # round trip is uninstalled, so push fails closed.
@@ -1228,6 +1232,8 @@ jobs:
               # Bundle orjson: see binaries. RUST_SETUP is the per-libc matrix
               # rust_setup, shaped like the binaries RUST_SETUP_CMD.
               RUST_SETUP="${{ matrix.rust_setup }}" sh pyinstaller/install_orjson.sh
+              # Bundle isal: see binaries.
+              sh pyinstaller/install_extra.sh isal "@" wheel "using stdlib zlib"
               # Bundle pynacl: see binaries. soft on every row here, and the
               # nacl_tools install is best-effort.
               ${{ matrix.nacl_tools }}
@@ -1853,11 +1859,14 @@ jobs:
           uv venv --python "${{ steps.runtime.outputs.python-path || '3.14' }}"
           uv pip install -r pyinstaller/build-requirements.txt
           uv pip install .                     # bakes the pinned version into cronstable/version.py
-          # Bundle uvloop and orjson (see binaries): wheels on both arches.
+          # Bundle uvloop, orjson and isal (see binaries): wheels on both
+          # arches.
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_extra.sh uvloop "@" soft "using asyncio"
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh isal "@" wheel "using stdlib zlib"
           # Bundle pynacl, HARD: universal2 wheels exist, so a failure is a
           # broken build, and a soft-fail would ship push disabled.
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
@@ -2568,6 +2577,9 @@ jobs:
           # Bundle orjson (the `speedups` extra); see binaries.
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
+          # Bundle isal (see binaries): a wheel on x64 only.
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh isal "@" wheel "using stdlib zlib"
           # Bundle pynacl (the `push` extra), hard: every Windows arch has a
           # wheel, so a failure means a broken build.
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
@@ -3135,10 +3147,11 @@ jobs:
           uv venv --python 3.14 .venv-new
           SETUPTOOLS_SCM_PRETEND_VERSION="$NEW_VERSION" \
             uv pip install --python .venv-new/bin/python .
-          # orjson on BOTH sides, as production ships it; not the full
-          # speedups extra, since uvloop would dominate every async delta.
-          # Hard: compare.py refuses a pairing whose sides differ in orjson.
-          uv pip install --python .venv-new/bin/python orjson
+          # orjson and isal on BOTH sides, as production ships them; not the
+          # full speedups extra, since uvloop would dominate every async
+          # delta. Hard: compare.py refuses a pairing whose sides differ in
+          # orjson.
+          uv pip install --python .venv-new/bin/python orjson isal
           # pynacl on BOTH sides, hard: push.seal_500 skips without it.
           uv pip install --python .venv-new/bin/python pynacl
           # Playwright for webui.* on BOTH sides: a metric that skips on one
@@ -3159,7 +3172,7 @@ jobs:
             SETUPTOOLS_SCM_PRETEND_VERSION="$prev" \
               uv pip install --python .venv-old/bin/python /tmp/perf-baseline
             # Hard, like the current-side installs above.
-            uv pip install --python .venv-old/bin/python orjson pynacl
+            uv pip install --python .venv-old/bin/python orjson isal pynacl
             # The Chromium download above is shared, so this adds only the
             # Python package.
             uv pip install --python .venv-old/bin/python playwright || true

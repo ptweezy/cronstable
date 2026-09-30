@@ -43,7 +43,16 @@ if TYPE_CHECKING:  # the loopback job-state API is imported lazily at runtime
     from cronstable.jobapi import JobStateAPI
 
 import cronstable.version
-from cronstable import _json, discovery, platform, push, statsd, tlsutil
+from cronstable import (
+    _gzip,
+    _json,
+    discovery,
+    platform,
+    push,
+    statsd,
+    tlsutil,
+)
+from cronstable._gzip import gzip_body as _gzip_body
 from cronstable.config import (
     WEB_TOKEN_SCOPES,
     ClusterConfig,
@@ -1544,17 +1553,6 @@ def _accepts_gzip(header: str | None) -> bool:
 #: Body size at or above which a gzip-capable client gets a compressed
 #: response.  Below it the framing overhead is most of the payload.
 _GZIP_MIN_BYTES = 1024
-
-
-def _gzip_body(body: bytes) -> bytes:
-    """``body`` as a gzip stream, level 1.
-
-    Level 1 on purpose: the payloads are highly repetitive JSON, and
-    higher levels cost multiples of the CPU for little gain. ``wbits=31``
-    wraps the deflate stream in a gzip container, so zlib suffices.
-    """
-    packer = zlib.compressobj(1, zlib.DEFLATED, 31)
-    return packer.compress(body) + packer.flush()
 
 
 def _jobs_response_product(
@@ -7220,6 +7218,7 @@ class Cron:
                         anonymous_scopes=anonymous_scopes,
                     )
                 )
+            _gzip.use_for_aiohttp()
             app = web.Application(middlewares=middlewares)
             # The on_shutdown hook ends this generation's tails at its
             # teardown (see _web_on_shutdown for why cleanup would

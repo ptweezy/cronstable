@@ -143,7 +143,7 @@ def installer(tmp_path, monkeypatch):
     requirements = tmp_path / "requirements"
     requirements.mkdir()
     # A distinctive floor proves the shell reads the supplied file.
-    for name in ("cryptography", "orjson"):
+    for name in ("cryptography", "orjson", "isal"):
         (requirements / f"{name}.txt").write_text(f"{name}>=42.0\n")
     log = tmp_path / "calls.jsonl"
     stub = (
@@ -209,6 +209,29 @@ def test_generated_floor_preserves_installer_policy(
     )
     assert result.returncode == exit_code, result.stderr
     assert calls[0] == ["pip-stub", "install", "cryptography>=42.0,<49"]
+    assert any(call[1] == "uninstall" for call in calls) == uninstall
+
+
+@pytest.mark.parametrize(
+    "install_status,probe_status,uninstall",
+    [(0, 0, False), (1, 0, False), (0, 1, True)],
+)
+def test_wheel_policy_is_soft_and_never_builds_the_sdist(
+    installer, monkeypatch, install_status, probe_status, uninstall
+):
+    # isal's sdist needs nasm on x86, so the lanes install it from a wheel
+    # or not at all, with soft's failure handling either way.
+    monkeypatch.setenv("INSTALL_STATUS", str(install_status))
+    monkeypatch.setenv("PROBE_STATUS", str(probe_status))
+    result, calls = installer("install_extra.sh", "isal", "@", "wheel")
+    assert result.returncode == 0, result.stderr
+    assert calls[0] == [
+        "pip-stub",
+        "install",
+        "--only-binary",
+        "isal",
+        "isal>=42.0",
+    ]
     assert any(call[1] == "uninstall" for call in calls) == uninstall
 
 

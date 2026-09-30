@@ -10,7 +10,7 @@
 # cryptography also gate the frozen artifact on `cronstable
 # --sealable-suites`, which no build-env probe can stand in for.
 #
-# Usage: install_extra.sh NAME SPEC hard|soft [FALLBACK]
+# Usage: install_extra.sh NAME SPEC hard|soft|wheel [FALLBACK]
 #   NAME      verify_extra.py probe name, also the pip name to uninstall
 #   SPEC      @ uses the floor generated from pyproject.toml; @,<51 adds a
 #             lane-specific cap. A full requirement also works (e.g. the
@@ -23,6 +23,8 @@
 #             installs but fails verify_extra.py (a source build, notably
 #             under QEMU, can import yet be miscompiled) is uninstalled so a
 #             broken extra is never frozen in. Always exits 0.
+#   wheel     soft, from a prebuilt wheel only (--only-binary NAME), for
+#             an extra whose source build yields nothing worth bundling.
 #   FALLBACK  what the binary uses instead, for the soft-path log lines
 #             (default: "not bundled").
 #
@@ -40,7 +42,7 @@ PY="${PY:-python}"
 PIPUNINST="${PIPUNINST:-$PIP uninstall -y}"
 here=$(dirname "$0")
 
-usage="usage: install_extra.sh NAME SPEC hard|soft [FALLBACK]"
+usage="usage: install_extra.sh NAME SPEC hard|soft|wheel [FALLBACK]"
 name="${1:?$usage}"
 spec="${2:?$usage}"
 policy="${3:?$usage}"
@@ -55,7 +57,7 @@ case "$spec" in
 esac
 
 case "$policy" in
-    hard|soft) ;;
+    hard|soft|wheel) ;;
     *) echo "install_extra.sh: unknown policy \"$policy\" ($usage)" >&2; exit 2 ;;
 esac
 
@@ -66,8 +68,14 @@ if [ "$policy" = "hard" ]; then
 fi
 
 # soft: install wherever a wheel exists or a source build succeeds; a failed
-# install is not an error, the binary uses the fallback.
-if $PIP install "$spec"; then
+# install is not an error, the binary uses the fallback. wheel: the same,
+# minus the source build.
+only_binary=""
+if [ "$policy" = "wheel" ]; then
+    only_binary="--only-binary $name"
+fi
+# $only_binary is unquoted on purpose: empty, it must add no argument.
+if $PIP install $only_binary "$spec"; then
     :
 else
     echo "$name unavailable; $note"

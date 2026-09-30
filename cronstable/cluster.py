@@ -42,7 +42,7 @@ from typing import (
 import aiohttp
 from aiohttp import web
 
-from cronstable import _json, tlsutil
+from cronstable import _gzip, _json, tlsutil
 from cronstable.config import ClusterConfig
 from cronstable.fingerprint import SCHEME_VERSION
 from cronstable.leadership import LeadershipBackend
@@ -1564,6 +1564,8 @@ class ClusterManager(LeadershipBackend):
         return web.Response(status=204)
 
     async def start(self) -> None:
+        # aiohttp gzips this node's /peer replies and inflates its peers'
+        _gzip.use_for_aiohttp()
         app = web.Application()
         app.add_routes(
             [

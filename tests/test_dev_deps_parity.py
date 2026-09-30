@@ -66,6 +66,32 @@ def _has_cryptography_wheel():
     return False
 
 
+def _has_isal_wheel():
+    # mirrors the marker on the isal lines of the speedups and dev extras
+    if sys.version_info >= (3, 15):
+        return False
+    machine = platform.machine()
+    if sys.platform == "linux":
+        return machine in ("x86_64", "aarch64")
+    if sys.platform == "darwin":
+        return True
+    if sys.platform == "win32":
+        return machine == "AMD64"
+    return False
+
+
+def test_isal_is_installed_where_a_wheel_exists():
+    # tests/test_gzip.py skips its isal half without it, so a marker that
+    # stops matching would leave the SIMD gzip backend untested.
+    if not _has_isal_wheel():
+        pytest.skip("no isal wheel for this platform")
+    assert importlib.util.find_spec("isal") is not None, (
+        "isal is missing from this environment, so the isal half of "
+        "tests/test_gzip.py silently skips. Check the isal line in "
+        "pyproject.toml's dev extra (then regenerate build files)."
+    )
+
+
 def test_cryptography_is_installed_where_a_wheel_exists():
     # The mTLS, certificate-rotation and X-Wing tests skip without
     # cryptography (about 70 call sites). The dev extra installs it behind

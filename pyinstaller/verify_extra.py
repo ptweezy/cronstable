@@ -11,6 +11,10 @@ cronstable prefers each of these packages whenever it is merely importable:
 - orjson: every durable-state and cluster-gossip read/write routes through
   it when importable (cronstable._json); a broken build would corrupt the
   state store instead of falling back to the stdlib json.
+- isal: every gzipped web and cluster response, and every compressed
+  reply aiohttp reads, goes through it when importable (cronstable._gzip);
+  a broken build would send streams no client can decode instead of
+  falling back to the stdlib zlib.
 - pynacl: a broken bundled libsodium corrupts or crashes every push alert;
   with it absent, the daemon's fail-closed config check reports push as
   unavailable instead of sealing garbage.
@@ -40,7 +44,7 @@ arch had no wheel and the optional source build was skipped or failed;
 that artifact simply ships without the extra.
 
 Usage: python pyinstaller/verify_extra.py
-       {uvloop|orjson|pynacl|cryptography|zeroconf}
+       {uvloop|orjson|isal|pynacl|cryptography|zeroconf}
 """
 
 import importlib.util
@@ -77,6 +81,27 @@ def _verify_orjson():
     if not isinstance(blob, bytes) or orjson.loads(blob) != sample:
         raise AssertionError("round-trip mismatch (miscompiled?)")
     return "imports and round-trips"
+
+
+def _verify_isal():
+    import gzip
+
+    from isal import isal_zlib
+
+    from cronstable import _gzip
+
+    # The daemon's own compressor, read back by the stdlib, and the inflate
+    # aiohttp runs on compressed replies. A miscompiled ISA-L can import yet
+    # emit or accept a corrupt stream.
+    if _gzip.backend() is not isal_zlib:
+        raise AssertionError("cronstable._gzip did not select isal")
+    sample = b'{"name":"backup","status":"ok"}' * 512 + "café ☃".encode()
+    if gzip.decompress(_gzip.gzip_body(sample)) != sample:
+        raise AssertionError("gzip round-trip mismatch (miscompiled?)")
+    inflater = isal_zlib.decompressobj(wbits=31)
+    if inflater.decompress(gzip.compress(sample)) != sample:
+        raise AssertionError("gunzip mismatch (miscompiled?)")
+    return "gzips and gunzips round-trip"
 
 
 def _verify_pynacl():
@@ -116,6 +141,7 @@ def _verify_zeroconf():
 _PROBES = {
     "uvloop": ("uvloop", _verify_uvloop),
     "orjson": ("orjson", _verify_orjson),
+    "isal": ("isal", _verify_isal),
     "pynacl": ("nacl", _verify_pynacl),
     # `cryptography`, not its HPKE submodule: a cryptography too old for the
     # module is installed-but-useless, which the probe must fail (so the
