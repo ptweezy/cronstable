@@ -1806,20 +1806,23 @@ and [Troubleshooting](https://github.com/ptweezy/cronstable/wiki/Troubleshooting
 ## Contributing and license
 
 Bug reports, feature ideas, and pull requests are welcome, including ones
-written with AI help. The project uses AI openly: it's the realistic future of
-software development, and it helps make cronstable the best it can be. Because
-AI agents make thorough review and testing cheap, every change gets more
-scrutiny and the project's standards are higher. Putting others down for using
-AI isn't tolerated here (see
-[AI use](https://github.com/ptweezy/cronstable/blob/main/CONTRIBUTING.md#ai-use)).
-For the development setup and how to sign off your commits under the Developer
-Certificate of Origin (DCO), see
+written with AI help. For the development setup and how to sign off your
+commits under the Developer Certificate of Origin (DCO), see
 [CONTRIBUTING.md](https://github.com/ptweezy/cronstable/blob/main/CONTRIBUTING.md).
 For how releases work, see
 [Contributing and Releasing](https://github.com/ptweezy/cronstable/wiki/Contributing-and-Releasing).
 The [performance benchmarks](https://github.com/ptweezy/cronstable/wiki/Performance-Benchmarks)
 compare speed and memory use against the latest release on every commit to
 catch regressions before release.
+
+The project uses AI openly: it's the realistic future of software development,
+and it helps make cronstable the best it can be. cronstable is maintained to be
+production ready for every kind of user and for jobs of any type or importance.
+Opinions on AI vary, but for a product at that level, AI review and input are
+expected. Because AI agents make thorough review and testing cheap, every change
+gets more scrutiny and the project's standards are higher. Putting others down
+for using AI isn't tolerated here (see
+[AI use](https://github.com/ptweezy/cronstable/blob/main/CONTRIBUTING.md#ai-use)).
 
 Report security vulnerabilities privately, not in a public issue.
 [SECURITY.md](https://github.com/ptweezy/cronstable/blob/main/SECURITY.md)

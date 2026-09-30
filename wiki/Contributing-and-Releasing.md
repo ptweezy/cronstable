@@ -6,6 +6,8 @@ This page covers the cronstable developer workflow (environment, tests, linters,
 
 cronstable uses AI tools openly in its development. AI-assisted development is the realistic future of software, and the project uses it to make cronstable the best it can be.
 
+The project is maintained to be production ready for every kind of user and for jobs of any type or importance. Opinions on AI vary, but for a product at that level, AI review and input are expected.
+
 AI agents raise the project's standards. They make thorough review and testing cheap, so every change gets more scrutiny than it would without them. Contributions written with AI help are welcome and held to the same standards as any other change.
 
 The project doesn't tolerate putting others down for using AI. Judge a contribution by the work itself, whatever tools produced it.
