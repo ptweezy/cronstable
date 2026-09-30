@@ -11,7 +11,7 @@ WORKDIR /src
 ARG DEPS_REFRESH=""
 RUN set -eux; \
     : "deps-refresh=${DEPS_REFRESH}"; \
-    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*30)); done; }; \
 @@toolchain@@
 
 # Record the distro interpreter or install the opt-in amd64v3 runtime.
@@ -25,7 +25,7 @@ COPY pyproject.toml /tmp/deps/pyproject.toml
 COPY docker/extract_deps.py /tmp/deps/extract_deps.py
 COPY docker/wheelhouse/@@wheel_libc@@/ /tmp/deps/pqwheels/
 RUN set -eux; \
-    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*30)); done; }; \
 @@sodium@@
     "$(cat /opt/python-runtime/python-path)" -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \

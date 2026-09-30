@@ -9,7 +9,7 @@ WORKDIR /src
 ARG DEPS_REFRESH=""
 RUN set -eux; \
     : "deps-refresh=${DEPS_REFRESH}"; \
-    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*30)); done; }; \
     retry apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update; \
     retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev git; \
     rm -rf /var/lib/apt/lists/*
@@ -25,7 +25,7 @@ COPY pyproject.toml /tmp/deps/pyproject.toml
 COPY docker/extract_deps.py /tmp/deps/extract_deps.py
 COPY docker/wheelhouse/glibc/ /tmp/deps/pqwheels/
 RUN set -eux; \
-    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*30)); done; }; \
     "$(cat /opt/python-runtime/python-path)" -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
     /opt/venv/bin/python /tmp/deps/extract_deps.py /tmp/deps/pyproject.toml /tmp/deps/pqwheels; \

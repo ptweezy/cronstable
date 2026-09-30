@@ -52,7 +52,7 @@ toolchain = '''
 python = "python3.11"
 runtime_install = '''
 RUN set -eux; \
-    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*30)); done; }; \
     retry dnf --setopt=retries=10 install -y python3.11; \
     dnf clean all
 '''
@@ -85,7 +85,7 @@ toolchain = '''
 sodium = "    export SODIUM_INSTALL=system; \\"
 runtime_install = '''
 RUN set -eux; \
-    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*30)); done; }; \
     retry dnf --setopt=retries=10 install -y python3 libsodium; \
     dnf clean all
 '''
@@ -110,7 +110,7 @@ python = "python3.13"
 sodium = "    export SODIUM_INSTALL=system; \\"
 runtime_install = '''
 RUN set -eux; \
-    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*30)); done; }; \
     retry zypper --non-interactive refresh; \
     retry zypper --non-interactive install python313 libsodium26; \
     zypper clean --all
@@ -136,7 +136,7 @@ toolchain = '''
 runtime = "registry.access.redhat.com/ubi${UBI_VERSION}/ubi-minimal"
 runtime_install = '''
 RUN set -eux; \
-    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*30)); done; }; \
     retry microdnf install -y python3; \
     microdnf clean all
 '''
@@ -158,7 +158,7 @@ toolchain = '''
 '''
 runtime_install = '''
 RUN set -eux; \
-    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*30)); done; }; \
     retry apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update; \
     retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends python3 ca-certificates; \
     rm -rf /var/lib/apt/lists/*

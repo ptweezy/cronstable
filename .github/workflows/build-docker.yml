@@ -82,8 +82,11 @@ jobs:
         if: matrix.qemu
       - uses: docker/setup-buildx-action@v4.4.1
       - name: Build the platform once
+        id: build
+        # A refresh gets one more attempt below. Release builds fail at once.
+        continue-on-error: ${{ inputs.refresh }}
         uses: docker/build-push-action@v7.4.0
-        with:
+        with: &build
           context: .
           file: ${{ inputs.refresh && format('{0}/Dockerfile.refresh', runner.temp) || matrix.dockerfile }}
           platforms: ${{ matrix.platforms }}
@@ -107,6 +110,14 @@ jobs:
           # Cache loss affects build speed only. Publishing uses the OCI artifact.
           cache-from: type=gha,scope=${{ matrix.distro }}-${{ matrix.platform_id }}
           cache-to: ${{ !inputs.refresh && github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope={0}-{1},ignore-error=true', matrix.distro, matrix.platform_id) || '' }}
+      # Package mirrors and registries can fail for minutes at a time.
+      - name: Wait before rebuilding the platform
+        if: inputs.refresh && steps.build.outcome == 'failure'
+        run: sleep 300
+      - name: Rebuild the platform after a failure
+        if: inputs.refresh && steps.build.outcome == 'failure'
+        uses: docker/build-push-action@v7.4.0
+        with: *build
       - name: Test the refreshed runtime
         if: inputs.refresh
         env:
@@ -116,8 +127,9 @@ jobs:
           ZEROCONF_VERSION: ${{ inputs.zeroconf }}
         run: |
           set -euo pipefail
-          sudo apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update
-          sudo apt-get -o Acquire::Retries=5 install -y skopeo
+          . .github/scripts/retry.sh
+          retry 5 sudo apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update
+          retry 5 sudo apt-get -o Acquire::Retries=5 install -y skopeo
           IFS=/ read -r image_os image_arch image_variant <<< "$PLATFORM"
           platform_args=(--override-os "$image_os" --override-arch "$image_arch")
           if [ -n "$image_variant" ]; then
@@ -176,22 +188,32 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           list-all-pkgs: true
-          exit-code: '1'
+          # The next step decides which findings block publication.
+          exit-code: '0'
           timeout: 15m
-      - name: Show vulnerability findings
-        if: ${{ always() && inputs.refresh }}
+          cache-dir: ${{ github.workspace }}/.cache/trivy
+      - name: Block vulnerabilities that the published image lacks
+        if: inputs.refresh
+        env:
+          PLATFORM: ${{ matrix.platforms }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          SUFFIX: ${{ matrix.suffix }}
         run: |
-          if [ -f "$RUNNER_TEMP/vulnerabilities.json" ]; then
-            jq -r '.Results[]? | .Target as $target | .Vulnerabilities[]? |
-              [$target, .PkgName, .InstalledVersion, .FixedVersion, .Severity, .VulnerabilityID] | @tsv' \
-              "$RUNNER_TEMP/vulnerabilities.json"
-          fi
-      - name: Upload vulnerability report
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/release-inputs/refresh-tools/scan_gate.py" \
+            --report "$RUNNER_TEMP/vulnerabilities.json" \
+            --baseline "$RUNNER_TEMP/vulnerabilities-published.json" \
+            --published "ghcr.io/${REPO,,}:$VERSION$SUFFIX" \
+            --platform "$PLATFORM" --cache-dir "$GITHUB_WORKSPACE/.cache/trivy"
+      - name: Upload vulnerability reports
         if: ${{ always() && inputs.refresh }}
         uses: actions/upload-artifact@v7.0.1
         with:
           name: vulnerabilities-${{ matrix.distro }}-${{ matrix.platform_id }}
-          path: ${{ runner.temp }}/vulnerabilities.json
+          path: |
+            ${{ runner.temp }}/vulnerabilities.json
+            ${{ runner.temp }}/vulnerabilities-published.json
           if-no-files-found: warn
           retention-days: 30
       - uses: actions/upload-artifact@v7.0.1

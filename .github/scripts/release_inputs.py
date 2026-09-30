@@ -16,14 +16,14 @@ from packaging.version import Version
 
 
 def fetch(url):
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             with urllib.request.urlopen(url, timeout=60) as response:
                 return response.read()
-        except (urllib.error.URLError, TimeoutError):
-            if attempt == 2:
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if attempt == 4:
                 raise
-            time.sleep(2**attempt)
+            time.sleep(5 * 2**attempt)
 
 
 def select_source(data, specifier, python):

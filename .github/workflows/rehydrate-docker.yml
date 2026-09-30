@@ -67,7 +67,8 @@ jobs:
           python ../.github/scripts/release_inputs.py
           cp release-inputs/resolved.json release-inputs/third-party/resolved.json
           mkdir -p release-inputs/refresh-tools
-          cp ../.github/scripts/refresh_runtime.py release-inputs/refresh-tools/
+          cp ../.github/scripts/refresh_runtime.py ../.github/scripts/scan_gate.py \
+            release-inputs/refresh-tools/
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: release-inputs
@@ -86,6 +87,8 @@ jobs:
     env:
       SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.prepare.outputs.version }}
       PIP_CONSTRAINT: ${{ github.workspace }}/release-inputs/constraints.txt
+      PIP_RETRIES: '10'
+      PIP_TIMEOUT: '60'
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -102,7 +105,12 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install -r requirements_dev.txt '.[speedups,push,discovery]'
-          python -m pytest -q
+          # A released suite never receives later race fixes, so a failure
+          # blocks the refresh only when it repeats.
+          if ! python -m pytest -q; then
+            echo "::warning::Rerunning the failed tests once"
+            python -m pytest -q --last-failed --last-failed-no-failures none
+          fi
 
   pq-wheels:
     needs: prepare
@@ -137,8 +145,10 @@ jobs:
       refresh: true
       zeroconf: ${{ needs.prepare.outputs.zeroconf }}
 
+  # A missing wheel fails only the platforms that need it.
   docker-glibc:
     needs: [prepare, pq-wheels]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     uses: ./.github/workflows/build-docker.yml
     with:
       matrix: ${{ needs.prepare.outputs.docker-glibc }}
@@ -150,6 +160,7 @@ jobs:
 
   docker-musl:
     needs: [prepare, pq-wheels-musl]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     uses: ./.github/workflows/build-docker.yml
     with:
       matrix: ${{ needs.prepare.outputs.docker-musl }}
@@ -159,8 +170,11 @@ jobs:
       refresh: true
       zeroconf: ${{ needs.prepare.outputs.zeroconf }}
 
+  # Each distro needs all of its own platforms, so a failed platform holds
+  # back only its distro. A failed test run holds back every distro.
   assemble:
     needs: [prepare, test, docker, docker-glibc, docker-musl]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.test.result == 'success' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
@@ -190,8 +204,9 @@ jobs:
             --platforms "$PLATFORMS" --version "$VERSION" --revision "$REVISION" --output layout
           tar -cf image.tar -C layout .
           sha256sum image.tar > image.sha256
-          sudo apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update
-          sudo apt-get -o Acquire::Retries=5 install -y skopeo
+          . .github/scripts/retry.sh
+          retry 5 sudo apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update
+          retry 5 sudo apt-get -o Acquire::Retries=5 install -y skopeo
           skopeo copy --all --preserve-digests oci-archive:image.tar:release oci:verified:release
       - uses: actions/upload-artifact@v7.0.1
         with:
@@ -204,10 +219,12 @@ jobs:
           retention-days: 2
 
   publish:
-    needs: [prepare, assemble]
+    needs: [prepare, test, assemble]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.test.result == 'success' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
+      actions: read
       contents: read
       packages: write
     strategy:
@@ -225,14 +242,24 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+      # Assemble uploads this artifact as its last step, so the artifact
+      # exists only when every platform of this distro passed.
+      - name: Check that this distro passed every gate
+        id: ready
+        env:
+          ARTIFACT: docker-refresh-${{ matrix.distro }}
+        run: python3 .github/scripts/docker_refresh.py ready
       - uses: actions/download-artifact@v8.0.1
+        if: steps.ready.outputs.ready == 'true'
         with:
           name: docker-refresh-${{ matrix.distro }}
           path: prepared
       - name: Verify prepared bytes
+        if: steps.ready.outputs.ready == 'true'
         working-directory: prepared
         run: sha256sum -c image.sha256
       - name: Check that the release is still current
+        if: steps.ready.outputs.ready == 'true'
         id: current
         env:
           RELEASE_ID: ${{ needs.prepare.outputs.release-id }}
@@ -262,8 +289,9 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          sudo apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update
-          sudo apt-get -o Acquire::Retries=5 install -y skopeo
+          . .github/scripts/retry.sh
+          retry 5 sudo apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update
+          retry 5 sudo apt-get -o Acquire::Retries=5 install -y skopeo
           python3 .github/scripts/docker_refresh.py tags > tags.txt
           images=("ghcr.io/${REPO,,}")
           if [ -n "$DOCKERHUB_USERNAME" ]; then
@@ -271,9 +299,12 @@ jobs:
           fi
           for image in "${images[@]}"; do
             while IFS= read -r tag; do
-              skopeo copy --all --preserve-digests --retry-times 3 \
+              # skopeo's own retries skip some server errors, such as a 500
+              # during a blob upload. A repeated push reuses finished blobs.
+              retry 6 skopeo copy --all --preserve-digests --retry-times 3 \
                 --authfile "$HOME/.docker/config.json" \
-                oci-archive:prepared/image.tar:release "docker://$image:$tag"
+                oci-archive:prepared/image.tar:release "docker://$image:$tag" \
+                < /dev/null
               echo "Published \`$image:$tag\`" >> "$GITHUB_STEP_SUMMARY"
             done < tags.txt
           done

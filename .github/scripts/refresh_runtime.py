@@ -94,7 +94,8 @@ def run(command):
             return
         if attempt == 4:
             raise subprocess.CalledProcessError(result.returncode, args)
-        time.sleep(5 * (attempt + 1))
+        # Waits 15s, 30s, 60s, then 120s; mirror outages can last minutes.
+        time.sleep(15 * 2**attempt)
 
 
 def build_tools(root):

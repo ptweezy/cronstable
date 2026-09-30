@@ -156,10 +156,15 @@ cryptography wheel. Dependency versions follow the release's constraints.
 Updating exact pins, including the custom Python runtime, requires a new release.
 
 Publication requires passing tests on Python 3.11 through 3.14 and runtime checks
-on every image platform. The workflow verifies each image manifest. Trivy blocks
-publication for high or critical vulnerabilities with an available fix.
-Scan reports remain in the workflow artifacts for 30 days. A newer release
-or a moved release tag cancels publication of the older rebuild.
+on every image platform. Each distro publishes once all of its own platforms pass,
+so a failed platform delays only its distro. The workflow verifies each image
+manifest. Trivy scans each refreshed image for high or critical vulnerabilities
+with an available fix, and a finding blocks publication only when the currently
+published image does not have it. Findings that the published image shares still
+need a fix from the base image or distribution, so the refresh publishes and lists
+them in the run summary. Scan reports for both images remain in the workflow
+artifacts for 30 days. A newer release or a moved release tag cancels publication
+of the older rebuild.
 
 Successful refreshes update `latest` and the current release's version tags,
 including their distro and CPU suffixes, on GHCR and the configured Docker Hub

@@ -5,18 +5,28 @@ import json
 import os
 import re
 import subprocess
+import sys
+import time
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+ATTEMPTS = 4
+
 
 def api(path):
-    result = subprocess.run(
-        ["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/{path}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return json.loads(result.stdout)
+    command = ["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/{path}"]
+    for attempt in range(ATTEMPTS):
+        result = subprocess.run(
+            command, check=False, capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+        sys.stderr.write(result.stderr)
+        if attempt + 1 == ATTEMPTS:
+            raise subprocess.CalledProcessError(
+                result.returncode, command, result.stdout, result.stderr
+            )
+        time.sleep(10 * 2**attempt)
 
 
 def release_version(release):
@@ -85,6 +95,15 @@ def tags(version, build, distro, suffix):
     return result
 
 
+def ready(name, run_id):
+    """Whether this run holds the named, unexpired artifact."""
+    found = api(f"actions/runs/{run_id}/artifacts?name={quote(name)}")
+    return any(
+        item["name"] == name and not item["expired"]
+        for item in found.get("artifacts", [])
+    )
+
+
 def write_outputs(values):
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         for key, value in values.items():
@@ -94,9 +113,19 @@ def write_outputs(values):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "command", choices=("select", "check", "tags", "validate-ref")
+        "command", choices=("select", "check", "tags", "validate-ref", "ready")
     )
     args = parser.parse_args()
+    if args.command == "ready":
+        name = os.environ["ARTIFACT"]
+        found = ready(name, os.environ["GITHUB_RUN_ID"])
+        write_outputs({"ready": str(found).lower()})
+        if not found:
+            print(
+                f"::notice::{name} did not pass every gate; "
+                "publication is skipped."
+            )
+        return
     if args.command == "validate-ref":
         if (
             os.environ.get("REFRESH") != "true"

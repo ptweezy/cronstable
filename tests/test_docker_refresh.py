@@ -191,6 +191,63 @@ def test_publication_check_emits_a_machine_readable_decision(
     assert output.read_text() == f"current={str(current).lower()}\n"
 
 
+@pytest.mark.parametrize(
+    "artifacts,ready",
+    [
+        ([{"name": "docker-refresh-alpine", "expired": False}], True),
+        ([{"name": "docker-refresh-alpine", "expired": True}], False),
+        ([{"name": "docker-refresh-alpine-amd64v3", "expired": False}], False),
+        ([], False),
+    ],
+)
+def test_publication_waits_for_its_distro_to_pass_every_gate(
+    tmp_path, monkeypatch, artifacts, ready
+):
+    refresh = load("docker_refresh")
+    output = tmp_path / "outputs"
+    for key, value in {
+        "GITHUB_OUTPUT": str(output),
+        "GITHUB_RUN_ID": "100",
+        "ARTIFACT": "docker-refresh-alpine",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(sys, "argv", ["docker_refresh.py", "ready"])
+    calls = []
+
+    def listing(path):
+        calls.append(path)
+        return {"total_count": len(artifacts), "artifacts": artifacts}
+
+    monkeypatch.setattr(refresh, "api", listing)
+    refresh.main()
+    assert calls == ["actions/runs/100/artifacts?name=docker-refresh-alpine"]
+    assert output.read_text() == f"ready={str(ready).lower()}\n"
+
+
+@pytest.mark.parametrize("failures", [0, 2, 4])
+def test_github_api_calls_retry_transient_failures(monkeypatch, failures):
+    refresh = load("docker_refresh")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    results = [subprocess.CompletedProcess([], 1, "", "HTTP 502\n")] * failures
+    results.append(subprocess.CompletedProcess([], 0, '{"id": 42}', ""))
+    commands, sleeps = [], []
+
+    def gh(command, **kwargs):
+        commands.append(command)
+        return results[len(commands) - 1]
+
+    monkeypatch.setattr(refresh.subprocess, "run", gh)
+    monkeypatch.setattr(refresh.time, "sleep", sleeps.append)
+    if failures < refresh.ATTEMPTS:
+        assert refresh.api("releases/latest") == {"id": 42}
+    else:
+        with pytest.raises(subprocess.CalledProcessError):
+            refresh.api("releases/latest")
+    assert commands[0] == ["gh", "api", "repos/o/r/releases/latest"]
+    assert len(commands) == min(failures + 1, refresh.ATTEMPTS)
+    assert sleeps == [10, 20, 40][: len(commands) - 1]
+
+
 def test_every_image_gets_unique_build_and_existing_release_aliases():
     refresh = load("docker_refresh")
     matrix = load("docker_matrix")
@@ -261,7 +318,7 @@ def test_matrix_uses_released_recipes_and_covers_required_wheels(tmp_path):
     assert {r["wheel"] for r in rows if r["wheel"]} <= wheel_names
 
 
-def test_scheduled_refresh_gates_all_images_before_any_publication():
+def test_scheduled_refresh_gates_each_distro_before_its_publication():
     refresh = workflow("rehydrate-docker")
     assert refresh["on"]["schedule"] == [{"cron": "23 6 * * *"}]
     assert "workflow_dispatch" in refresh["on"]
@@ -289,19 +346,79 @@ def test_scheduled_refresh_gates_all_images_before_any_publication():
             jobs[name]["with"]["ref"]
             == "${{ needs.prepare.outputs.revision }}"
         )
+    # A failed platform holds back only its distro, never the release
+    # tests or the source selection that every distro depends on.
+    for name in ("docker-glibc", "docker-musl"):
+        assert "!cancelled()" in jobs[name]["if"]
+        assert "needs.prepare.result == 'success'" in jobs[name]["if"]
+    for name in ("assemble", "publish"):
+        assert "test" in jobs[name]["needs"]
+        for gate in (
+            "!cancelled()",
+            "needs.prepare.result == 'success'",
+            "needs.test.result == 'success'",
+        ):
+            assert gate in jobs[name]["if"]
     publish = jobs["publish"]
     assert (
         publish["concurrency"]
         == workflow("release")["jobs"]["docker-push"]["concurrency"]
     )
+    steps = publish["steps"]
+    ready = next(s for s in steps if s.get("id") == "ready")
+    assert ready["run"].endswith("docker_refresh.py ready")
+    assert (
+        ready["env"]["ARTIFACT"] == "docker-refresh-${{ matrix.distro }}"
+    )
+    assert publish["permissions"]["actions"] == "read"
+    download = next(
+        s
+        for s in steps
+        if s.get("uses", "").startswith("actions/download-artifact")
+    )
+    assert download["with"]["name"] == ready["env"]["ARTIFACT"]
+    current = next(s for s in steps if s.get("id") == "current")
+    for step in (download, current):
+        assert steps.index(ready) < steps.index(step)
+        assert step["if"] == "steps.ready.outputs.ready == 'true'"
     step = next(
         s
-        for s in publish["steps"]
+        for s in steps
         if s.get("name") == "Publish the validated images"
     )
     assert step["if"] == "steps.current.outputs.current == 'true'"
-    assert "skopeo copy --all --preserve-digests" in step["run"]
+    assert "retry 6 skopeo copy --all --preserve-digests" in step["run"]
     assert "docker/build-push-action" not in str(publish)
+
+
+def test_refresh_retries_transient_failures_before_failing():
+    jobs = workflow("rehydrate-docker")["jobs"]
+    tests = next(
+        s
+        for s in jobs["test"]["steps"]
+        if s.get("name") == "Test the release with fresh dependencies"
+    )
+    assert "python -m pytest -q --last-failed" in tests["run"]
+    assert "--last-failed-no-failures none" in tests["run"]
+    for name in ("assemble", "publish"):
+        run = str(jobs[name]["steps"])
+        assert run.count("sudo apt-get") == 2
+        assert run.count("retry 5 sudo apt-get") == 2
+    steps = workflow("build-docker")["jobs"]["build"]["steps"]
+    first, again = (
+        s
+        for s in steps
+        if s.get("uses", "").startswith("docker/build-push-action")
+    )
+    assert first["id"] == "build"
+    # Release builds fail at once; only a refresh spends a second attempt.
+    assert first["continue-on-error"] == "${{ inputs.refresh }}"
+    retried = "inputs.refresh && steps.build.outcome == 'failure'"
+    assert again["if"] == retried
+    assert again["with"] == first["with"]
+    wait = steps[steps.index(again) - 1]
+    assert wait["if"] == retried
+    assert wait["run"].startswith("sleep ")
 
 
 def test_refresh_bypasses_all_image_and_compiler_caches_and_checks_bytes():
@@ -320,8 +437,6 @@ def test_refresh_bypasses_all_image_and_compiler_caches_and_checks_bytes():
         s for s in steps if s.get("name") == "Scan the refreshed image"
     )
     assert scan["with"]["input"] == "${{ runner.temp }}/scan-image"
-    assert scan["with"]["exit-code"] == "1"
-    assert scan["with"]["ignore-unfixed"] is True
     assert scan["env"]["TRIVY_PLATFORM"] == "${{ matrix.platforms }}"
     assert not scan.get("continue-on-error")
     names = [s.get("name") for s in steps]
@@ -346,13 +461,169 @@ def test_refresh_bypasses_all_image_and_compiler_caches_and_checks_bytes():
             assert "!inputs.refresh" in step["if"]
 
 
+def test_only_findings_new_to_the_refresh_block_publication():
+    steps = workflow("build-docker")["jobs"]["build"]["steps"]
+    scan = next(
+        s for s in steps if s.get("name") == "Scan the refreshed image"
+    )
+    # The published image is scanned with the same filters and database.
+    assert scan["with"]["exit-code"] == "0"
+    assert scan["with"]["severity"] == load("scan_gate").SEVERITY
+    assert scan["with"]["ignore-unfixed"] is True
+    assert scan["with"]["cache-dir"] == "${{ github.workspace }}/.cache/trivy"
+    gate = next(s for s in steps if "scan_gate.py" in s.get("run", ""))
+    assert gate["if"] == "inputs.refresh"
+    assert not gate.get("continue-on-error")
+    for fragment in (
+        '"$RUNNER_TEMP/release-inputs/refresh-tools/scan_gate.py"',
+        '--cache-dir "$GITHUB_WORKSPACE/.cache/trivy"',
+        '--published "ghcr.io/${REPO,,}:$VERSION$SUFFIX"',
+        '--platform "$PLATFORM"',
+    ):
+        assert fragment in gate["run"]
+    upload = next(
+        s
+        for s in steps
+        if s.get("with", {}).get("name", "").startswith("image-")
+    )
+    assert "if" not in upload
+    assert steps.index(scan) < steps.index(gate) < steps.index(upload)
+
+
+OPENSSL = ("debian", "libssl3t64", "CVE-2026-75804")
+MSGPACK = ("python-pkg", "msgpack", "GHSA-6v7p-g79w-8964")
+
+
+def trivy_report(*findings):
+    return {
+        "Results": [
+            {
+                "Type": kind,
+                "Vulnerabilities": [
+                    {
+                        "PkgName": package,
+                        "InstalledVersion": "1",
+                        "FixedVersion": "2",
+                        "Severity": "HIGH",
+                        "VulnerabilityID": vulnerability,
+                    }
+                ],
+            }
+            for kind, package, vulnerability in findings
+        ]
+    }
+
+
+def run_gate(tmp_path, monkeypatch, refreshed, published):
+    """Run the gate; published holds each attempt's findings or None."""
+    gate = load("scan_gate")
+    report = tmp_path / "vulnerabilities.json"
+    report.write_text(json.dumps(trivy_report(*refreshed)))
+    baseline = tmp_path / "published.json"
+    commands, sleeps = [], []
+
+    def trivy(command, check):
+        commands.append(command)
+        findings = published[len(commands) - 1]
+        if findings is None:
+            return subprocess.CompletedProcess(command, 1)
+        baseline.write_text(json.dumps(trivy_report(*findings)))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(gate.subprocess, "run", trivy)
+    monkeypatch.setattr(gate.time, "sleep", sleeps.append)
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    code = gate.main(
+        [
+            "--report",
+            str(report),
+            "--baseline",
+            str(baseline),
+            "--published",
+            "ghcr.io/o/r:1.2.3-distroless",
+            "--platform",
+            "linux/arm64",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ]
+    )
+    text = summary.read_text() if summary.exists() else ""
+    return code, commands, sleeps, text
+
+
+def test_scan_gate_skips_the_published_scan_for_a_clean_image(
+    tmp_path, monkeypatch
+):
+    code, commands, _, summary = run_gate(tmp_path, monkeypatch, (), [])
+    assert (code, commands, summary) == (0, [], "")
+
+
+def test_scan_gate_publishes_findings_the_published_image_shares(
+    tmp_path, monkeypatch, capsys
+):
+    code, commands, sleeps, summary = run_gate(
+        tmp_path, monkeypatch, [OPENSSL], [[OPENSSL, MSGPACK]]
+    )
+    assert (code, sleeps) == (0, [])
+    (command,) = commands
+    for option in (
+        ["--image-src", "remote"],
+        ["--platform", "linux/arm64"],
+        ["--cache-dir", str(tmp_path / "cache")],
+        ["--severity", "HIGH,CRITICAL"],
+    ):
+        start = command.index(option[0])
+        assert command[start : start + 2] == option
+    for flag in ("--skip-db-update", "--ignore-unfixed"):
+        assert flag in command
+    assert command[-1] == "ghcr.io/o/r:1.2.3-distroless"
+    assert "| also published | libssl3t64 |" in summary
+    out = capsys.readouterr().out
+    assert "::warning title=Waiting on upstream fixes::1 finding(s)" in out
+    assert "::error" not in out
+
+
+def test_scan_gate_blocks_findings_new_to_the_refresh(
+    tmp_path, monkeypatch, capsys
+):
+    code, _, _, summary = run_gate(
+        tmp_path, monkeypatch, [OPENSSL, MSGPACK], [[OPENSSL]]
+    )
+    assert code == 1
+    assert "| new | msgpack |" in summary
+    assert "| also published | libssl3t64 |" in summary
+    out = capsys.readouterr().out
+    assert (
+        "::error title=New vulnerabilities::1 finding(s) absent from "
+        "ghcr.io/o/r:1.2.3-distroless: msgpack GHSA-6v7p-g79w-8964" in out
+    )
+
+
+@pytest.mark.parametrize(
+    "published,code,sleeps",
+    [
+        ([None, [OPENSSL]], 0, [15]),
+        ([None, None, None, None], 1, [15, 30, 60]),
+    ],
+)
+def test_scan_gate_retries_the_published_scan_then_blocks_everything(
+    tmp_path, monkeypatch, published, code, sleeps
+):
+    result = run_gate(tmp_path, monkeypatch, [OPENSSL], published)
+    assert result[0] == code
+    assert len(result[1]) == len(published)
+    assert result[2] == sleeps
+
+
 def test_runtime_refresh_uses_tools_from_the_workflow_checkout():
     prepare = workflow("rehydrate-docker")["jobs"]["prepare"]["steps"]
     inputs = next(s for s in prepare if s.get("id") == "inputs")
     assert inputs["working-directory"] == "source"
     assert (
         "cp ../.github/scripts/refresh_runtime.py "
-        "release-inputs/refresh-tools/" in inputs["run"]
+        "../.github/scripts/scan_gate.py \\\n"
+        "  release-inputs/refresh-tools/" in inputs["run"]
     )
     steps = workflow("build-docker")["jobs"]["build"]["steps"]
     render = next(s for s in steps if " recipe " in s.get("run", ""))
