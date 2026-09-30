@@ -574,7 +574,6 @@ async def test_no_anonymous_scopes_keeps_todays_401():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_scoped_tokens_end_to_end():
     import aiohttp
 
@@ -658,7 +657,6 @@ async def test_scoped_tokens_end_to_end():
         await asyncio.sleep(0.25)
 
 
-@pytest.mark.asyncio
 async def test_fromfile_token_rotation_rebuilds_the_app(tmp_path):
     # The config holds only the token file's PATH, so the web_config
     # inequality gate never fires for a secret rewritten in place; the
@@ -703,7 +701,6 @@ async def test_fromfile_token_rotation_rebuilds_the_app(tmp_path):
         await asyncio.sleep(0.25)
 
 
-@pytest.mark.asyncio
 async def test_half_written_token_rotation_keeps_the_app(tmp_path, caplog):
     # A truncate-then-write rotation can be observed half-written; tearing
     # the app down for a token table that cannot resolve would leave
@@ -731,7 +728,6 @@ async def test_half_written_token_rotation_keeps_the_app(tmp_path, caplog):
         await asyncio.sleep(0.25)
 
 
-@pytest.mark.asyncio
 async def test_anonymous_view_end_to_end(caplog):
     """A public-view instance over real HTTP: strangers read, only tokens
     mutate, and the startup log says so."""
@@ -884,7 +880,6 @@ def test_web_access_log_redacts_calendar_token(caplog):
     assert "GET /status HTTP/1.1" in caplog.text
 
 
-@pytest.mark.asyncio
 async def test_web_access_log_redaction_is_installed_on_the_runner(caplog):
     # Pins the one line that installs _access_log_class on the runner
     # (Cron.start_stop_web_app).  The unit test above proves the class
@@ -973,7 +968,6 @@ async def test_anonymous_view_excludes_mcp():
         assert "MCP access requires a bearer token" in str(exc.value.text)
 
 
-@pytest.mark.asyncio
 async def test_mcp_over_http_gates_each_tool():
     import aiohttp
 
@@ -1088,7 +1082,6 @@ async def test_every_401_carries_the_bearer_challenge(headers):
     assert exc.value.text == "401: Unauthorized"
 
 
-@pytest.mark.asyncio
 async def test_the_envelope_keeps_the_challenge():
     import aiohttp
 

@@ -32,7 +32,7 @@ The surface is split three ways so a new lease backend stays tiny:
 import abc
 import json
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 from cronstable.config import ClusterConfig, ConfigError
 
@@ -49,7 +49,7 @@ def encode_reboot_ran(job_set_id: str, jobs: set[str]) -> str:
     )
 
 
-def decode_reboot_ran(raw: Optional[str]) -> tuple[Optional[str], set[str]]:
+def decode_reboot_ran(raw: str | None) -> tuple[str | None, set[str]]:
     """Decode a stored @reboot-ran blob to ``(job_set_id, jobs)``.
 
     Tolerant of any malformed/absent value (returns ``(None, set())``): a
@@ -120,7 +120,7 @@ class LeadershipBackend(abc.ABC):
         """Whether this node currently holds leadership (quorum-gated)."""
 
     @abc.abstractmethod
-    def leader_name(self) -> Optional[str]:
+    def leader_name(self) -> str | None:
         """The current leader as this node sees it, or ``None`` if unknown."""
 
     @abc.abstractmethod
@@ -146,7 +146,7 @@ class LeadershipBackend(abc.ABC):
         """Per-job ownership collapses to leadership for a single holder."""
         return self.is_leader()
 
-    def job_owner(self, job_name: str) -> Optional[str]:
+    def job_owner(self, job_name: str) -> str | None:
         """Per-job owner collapses to the single leader."""
         return self.leader_name()
 
@@ -179,7 +179,8 @@ class LeadershipBackend(abc.ABC):
         """No-op: there is no peer set to gossip the run to."""
 
     def tls_files_changed(self) -> bool:
-        """Lease backends are not restarted on an mTLS cert rotation."""
+        """Whether tracked on-disk TLS files changed since the backend loaded
+        them. ``False`` here: this base tracks none."""
         return False
 
     def view_settled(self) -> bool:
@@ -205,8 +206,9 @@ class LeadershipBackend(abc.ABC):
         :meth:`cronstable.cron.Cron.start_stop_cluster` BEFORE it tears the
         manager down for a cert rotation, so a half-written cert cannot
         leave the node with no manager (wedging ``Leader`` /
-        ``PreferLeader`` jobs closed for up to one reload).  Lease backends
-        have no per-node mTLS material: default ``True``; gossip overrides.
+        ``PreferLeader`` jobs closed for up to one reload).  ``True`` here,
+        with nothing on disk to load; every backend that tracks TLS files
+        overrides it.
         """
         return True
 
@@ -224,7 +226,7 @@ class LeadershipBackend(abc.ABC):
 
     def set_node_stats_provider(  # noqa: B027
         self,
-        provider: Callable[[], Optional[dict[str, Any]]],
+        provider: Callable[[], dict[str, Any] | None],
         share: bool = True,
     ) -> None:
         """Install the scheduler's whole-node CPU/memory snapshot callable.
@@ -237,7 +239,7 @@ class LeadershipBackend(abc.ABC):
         shares node load via ``cluster.observability`` instead).
         """
 
-    def fleet_view(self) -> Optional[dict[str, Any]]:
+    def fleet_view(self) -> dict[str, Any] | None:
         """The merged per-node job-summary view for ``GET /fleet``.
 
         ``None`` means unavailable (a lease backend knows only the holder);
@@ -372,11 +374,11 @@ class LeaseBackend(LeadershipBackend):
         # gates on it so a reload that changes the job-set id WITHOUT
         # rebuilding this backend cannot let a stale store-read suppress
         # the genuinely-new one-shot.  None until the first observe.
-        self._reboot_ran_job_set_id: Optional[str] = None
+        self._reboot_ran_job_set_id: str | None = None
         self._reboot_ran_local: set[str] = set()
         # job-set id the ``_reboot_ran_local`` marks were recorded under
         # (see _reconcile_local_reboot_ran).  None until the first use.
-        self._reboot_ran_local_job_set_id: Optional[str] = None
+        self._reboot_ran_local_job_set_id: str | None = None
 
     def _reconcile_local_reboot_ran(self, current: str) -> None:
         """Drop our own @reboot-ran marks when the job set changed.
@@ -436,7 +438,7 @@ class LeaseBackend(LeadershipBackend):
         """
 
     def _observe_reboot_ran(
-        self, stored_job_set_id: Optional[str], stored: set[str]
+        self, stored_job_set_id: str | None, stored: set[str]
     ) -> None:
         """Fold a store-read @reboot-ran set into the cache, job-set-scoped.
 
@@ -454,8 +456,8 @@ class LeaseBackend(LeadershipBackend):
         self._reboot_ran_job_set_id = current
 
     def reboot_ran_annotation(
-        self, existing: Optional[dict[str, str]] = None
-    ) -> Optional[dict[str, str]]:
+        self, existing: dict[str, str] | None = None
+    ) -> dict[str, str] | None:
         """The annotations to write back: carry ``existing`` forward, set ours.
 
         Returns ``None`` when there is nothing to write and nothing to

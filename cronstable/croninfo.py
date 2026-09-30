@@ -40,7 +40,6 @@ from collections.abc import Iterable, Iterator, Sequence
 from typing import (
     Any,
     NamedTuple,
-    Optional,
 )
 
 from cronstable.cronexpr import (
@@ -246,7 +245,7 @@ def _split_special_dow(spec: str) -> tuple[str, list[str]]:
 _HASH_HINT = re.compile(r"(?i)(?:^|[\s,])h(?:[\s,/(]|$)")
 
 
-def _engine_accepts(expr: str, hash_key: Optional[str]) -> bool:
+def _engine_accepts(expr: str, hash_key: str | None) -> bool:
     """True when the scheduling engine parses ``expr`` as-is.
 
     The tolerant parsers the describers lean on (the splitters below and
@@ -282,7 +281,7 @@ _STAR_STEP = re.compile(r"^\*/(\d+)$")
 
 
 def describe_cron(
-    expr: str, hash_key: Optional[str] = None, tab: Optional[CronTab] = None
+    expr: str, hash_key: str | None = None, tab: CronTab | None = None
 ) -> str:
     """Plain-English schedule text, a port of the web ``describeCron``.
 
@@ -414,8 +413,8 @@ def describe_cron(
 def _describe_time(
     mi: str,
     hr: str,
-    minutes: Optional[list[int]],
-    hours: Optional[list[int]],
+    minutes: list[int] | None,
+    hours: list[int] | None,
 ) -> str:
     """The leading time-of-day phrase of :func:`describe_cron`."""
     step_m = _STAR_STEP.match(mi)
@@ -459,7 +458,7 @@ def _describe_time(
 
 def _describe_seconds(
     sec_spec: str,
-    seconds: Optional[list[int]],
+    seconds: list[int] | None,
     base: str,
     top_free: bool,
 ) -> str:
@@ -496,10 +495,10 @@ def _describe_seconds(
 def next_fires(
     schedule: str,
     count: int,
-    tz: Optional[datetime.tzinfo] = None,
-    start: Optional[datetime.datetime] = None,
-    hash_key: Optional[str] = None,
-    tab: Optional[CronTab] = None,
+    tz: datetime.tzinfo | None = None,
+    start: datetime.datetime | None = None,
+    hash_key: str | None = None,
+    tab: CronTab | None = None,
 ) -> list[datetime.datetime]:
     """The next ``count`` fire times of a schedule, straight from the
     daemon's own engine (:meth:`CronTab.occurrences`), so the preview
@@ -573,11 +572,11 @@ _MONTH_MAX = {
 
 
 def lint_schedule(
-    expression: Optional[str] = None,
-    timezone: Optional[datetime.tzinfo] = None,
-    now: Optional[datetime.datetime] = None,
-    hash_key: Optional[str] = None,
-    tab: Optional[CronTab] = None,
+    expression: str | None = None,
+    timezone: datetime.tzinfo | None = None,
+    now: datetime.datetime | None = None,
+    hash_key: str | None = None,
+    tab: CronTab | None = None,
 ) -> list[Finding]:
     """Advisory findings for a schedule the engine accepts.
 
@@ -887,7 +886,7 @@ def _lint_dst(
 
 def _offset_at(
     timezone: datetime.tzinfo, day: datetime.date
-) -> Optional[datetime.timedelta]:
+) -> datetime.timedelta | None:
     return (
         datetime.datetime.combine(day, datetime.time(0))
         .replace(tzinfo=timezone)
@@ -1037,7 +1036,7 @@ def _affected_hours(key: _MemoZone, ordinal: int) -> frozenset[int]:
 
 def _dst_finding(
     tab: CronTab, timezone: datetime.tzinfo, first_day: datetime.date
-) -> Optional[Finding]:
+) -> Finding | None:
     """The first scheduled wall time a transition around ``first_day``
     skips or repeats, as a Finding, or ``None`` when the schedule misses
     the anomalous window (or the day fields exclude the date)."""
@@ -1089,7 +1088,7 @@ def _dst_finding(
 
 def _classify(
     timezone: datetime.tzinfo, civil: datetime.datetime
-) -> Optional[str]:
+) -> str | None:
     """``"gap"`` (nonexistent), ``"fold"`` (ambiguous) or ``None``."""
     off0 = civil.replace(tzinfo=timezone, fold=0).utcoffset()
     off1 = civil.replace(tzinfo=timezone, fold=1).utcoffset()
@@ -1106,7 +1105,7 @@ def _classify(
 #  the no-run explainer
 # ===================================================================
 def _value_runs(
-    values: Iterable[int], names: Optional[Sequence[str]] = None
+    values: Iterable[int], names: Sequence[str] | None = None
 ) -> list[str]:
     """Sorted values with consecutive runs collapsed to ``a-b`` ranges.
 
@@ -1135,7 +1134,7 @@ def _value_runs(
 
 
 def _compact_values(
-    values: Iterable[int], names: Optional[Sequence[str]] = None
+    values: Iterable[int], names: Sequence[str] | None = None
 ) -> str:
     """:func:`_value_runs` as prose: "0, 15, 30 and 45", "1-3 and 7"."""
     return _list_join(_value_runs(values, names))
@@ -1183,7 +1182,7 @@ def _allowed_dow(tab: CronTab) -> str:
 def why_no_run(
     tab: CronTab,
     when: datetime.datetime,
-    timezone: Optional[datetime.tzinfo] = None,
+    timezone: datetime.tzinfo | None = None,
 ) -> dict[str, Any]:
     """Field-by-field verdict on whether ``tab`` selects the instant
     ``when``, decomposing exactly what :meth:`CronTab.test` computes.
@@ -1373,7 +1372,7 @@ class ScheduleEntry(NamedTuple):
 
     name: str
     tab: CronTab
-    timezone: Optional[datetime.tzinfo] = None
+    timezone: datetime.tzinfo | None = None
 
 
 #: job names carried per grid cell and per duplicate group before the
@@ -1598,9 +1597,9 @@ def _fill_cell_jobs(
 
 def schedule_pressure(
     entries: Sequence[ScheduleEntry],
-    start: Optional[datetime.datetime] = None,
+    start: datetime.datetime | None = None,
     hours: int = 24,
-    tz: Optional[datetime.tzinfo] = None,
+    tz: datetime.tzinfo | None = None,
 ) -> dict[str, Any]:
     """The fleet's collision heatmap: every fire over the next 24 hours.
 
@@ -1663,7 +1662,7 @@ def schedule_pressure(
     }
 
 
-def _tz_label(timezone: Optional[datetime.tzinfo]) -> str:
+def _tz_label(timezone: datetime.tzinfo | None) -> str:
     return str(timezone) if timezone is not None else "local"
 
 
@@ -1745,9 +1744,9 @@ def _circular_distance(a: int, b: int, span: int) -> int:
 def suggest_slot(
     entries: Sequence[ScheduleEntry],
     period: str = "hourly",
-    start: Optional[datetime.datetime] = None,
-    tz: Optional[datetime.tzinfo] = None,
-    grid: Optional[list[list[int]]] = None,
+    start: datetime.datetime | None = None,
+    tz: datetime.tzinfo | None = None,
+    grid: list[list[int]] | None = None,
 ) -> dict[str, Any]:
     """The least-loaded slot for a new job, from the fleet's real fires.
 

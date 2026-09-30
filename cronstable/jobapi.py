@@ -27,7 +27,7 @@ import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 from aiohttp import web
@@ -154,7 +154,7 @@ class RunContext:
     run_id: str
     job_name: str
     attempt: int
-    scheduled_at: Optional[str]
+    scheduled_at: str | None
     host: str
     default_scope: str
     allowed_scopes: set[str] = field(default_factory=set)
@@ -181,12 +181,12 @@ class _LockHold:
     # schedule -- renewing a short lease on the default cadence would let it
     # lapse before its first renewal and be stolen.
     ttl: float = 0.0
-    renewer: Optional[asyncio.Task] = None
+    renewer: asyncio.Task | None = None
     lost: bool = False
 
 
 def run_environment(
-    ctx: RunContext, base_url: str, cacert: Optional[str] = None
+    ctx: RunContext, base_url: str, cacert: str | None = None
 ) -> dict[str, str]:
     """The ``CRONSTABLE_*`` env the daemon injects for one run.
 
@@ -281,7 +281,7 @@ class JobLockManager:
 
     def __init__(
         self,
-        backend_getter: Callable[[], Optional[StateBackend]],
+        backend_getter: Callable[[], StateBackend | None],
         base_holder: str,
         ttl: float,
         is_run_live: Callable[[str], bool],
@@ -311,7 +311,7 @@ class JobLockManager:
         name: str,
         *,
         permits: int = 1,
-        ttl: Optional[float] = None,
+        ttl: float | None = None,
         wait: bool = False,
         block_seconds: float = 0.0,
     ) -> dict[str, Any]:
@@ -391,8 +391,6 @@ class JobLockManager:
             await asyncio.wait_for(
                 backend.release_lease(lease), timeout=STATE_OP_TIMEOUT
             )
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - the TTL frees it regardless
             pass
 
@@ -447,8 +445,6 @@ class JobLockManager:
                 )
             except asyncio.TimeoutError:
                 continue  # unknown: try again next period
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - renewal is best-effort
                 continue
             if renewed is not None:
@@ -490,8 +486,6 @@ class JobLockManager:
                 await asyncio.wait_for(
                     backend.release_lease(hold.lease), timeout=STATE_OP_TIMEOUT
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - the TTL frees it regardless
                 pass
         return True
@@ -518,7 +512,7 @@ class JobStateAPI:
 
     def __init__(
         self,
-        backend_getter: Callable[[], Optional[StateBackend]],
+        backend_getter: Callable[[], StateBackend | None],
         *,
         base_holder: str,
         config: dict[str, Any],
@@ -526,8 +520,8 @@ class JobStateAPI:
         self._backend_getter = backend_getter
         self._config = config
         self._runs: dict[str, RunContext] = {}
-        self._runner: Optional[web.AppRunner] = None
-        self._base_url: Optional[str] = None
+        self._runner: web.AppRunner | None = None
+        self._base_url: str | None = None
         self._max_value_bytes = int(config.get("maxValueBytes") or 0)
         self._max_artifact_bytes = int(config.get("maxArtifactBytes") or 0)
         self.locks = JobLockManager(
@@ -540,11 +534,11 @@ class JobStateAPI:
     # --- lifecycle -------------------------------------------------------
 
     @property
-    def base_url(self) -> Optional[str]:
+    def base_url(self) -> str | None:
         return self._base_url
 
     @property
-    def cacert(self) -> Optional[str]:
+    def cacert(self) -> str | None:
         """The CA path a job needs to verify this endpoint, if any."""
         return (self._config.get("tls") or {}).get("ca") or None
 
@@ -641,7 +635,7 @@ class JobStateAPI:
     def register_run(self, ctx: RunContext) -> None:
         self._runs[ctx.token] = ctx
 
-    async def finish_run(self, token: Optional[str]) -> None:
+    async def finish_run(self, token: str | None) -> None:
         """Drop a finished run's token/secrets and release its locks."""
         if not token:
             return
@@ -834,7 +828,7 @@ class JobStateAPI:
         return body
 
     @staticmethod
-    def _scope(ctx: RunContext, given: Optional[str]) -> str:
+    def _scope(ctx: RunContext, given: str | None) -> str:
         """The scope a call may act in, authorising any explicitly-named one.
 
         A run always reaches its own ``default_scope`` and the conventional

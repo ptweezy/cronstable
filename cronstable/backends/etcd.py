@@ -33,7 +33,7 @@ import datetime
 import logging
 import ssl
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 import aiohttp
 
@@ -161,7 +161,7 @@ def build_reboot_ran_cas_txn(
 
 def holder_from_txn_response(
     resp: dict[str, Any], identity: str
-) -> Optional[str]:
+) -> str | None:
     """The current holder implied by a campaign transaction's response.
 
     A succeeded transaction means *we* created the key, so the holder is us; a
@@ -203,13 +203,13 @@ def campaign_won(resp: dict[str, Any], my_lease_id: str) -> bool:
     return False
 
 
-def lease_id_from_grant(resp: dict[str, Any]) -> Optional[str]:
+def lease_id_from_grant(resp: dict[str, Any]) -> str | None:
     """The lease id from a ``/v3/lease/grant`` response (stringified int64)."""
     lease_id = resp.get("ID")
     return str(lease_id) if lease_id is not None else None
 
 
-def _ttl_or_none(ttl: Any) -> Optional[int]:
+def _ttl_or_none(ttl: Any) -> int | None:
     """A wire TTL as an int, or ``None`` when absent or unparseable."""
     if ttl is None:
         return None
@@ -219,7 +219,7 @@ def _ttl_or_none(ttl: Any) -> Optional[int]:
         return None
 
 
-def lease_ttl_from_grant(resp: dict[str, Any]) -> Optional[int]:
+def lease_ttl_from_grant(resp: dict[str, Any]) -> int | None:
     """The *server-chosen* TTL from a ``/v3/lease/grant`` response, if any.
 
     etcd may grant a TTL lower than requested; the local lease deadline must
@@ -230,7 +230,7 @@ def lease_ttl_from_grant(resp: dict[str, Any]) -> Optional[int]:
     return _ttl_or_none(resp.get("TTL"))
 
 
-def lease_ttl_from_keepalive(resp: dict[str, Any]) -> Optional[int]:
+def lease_ttl_from_keepalive(resp: dict[str, Any]) -> int | None:
     """Remaining TTL from a ``/v3/lease/keepalive`` response.
 
     ``0`` (or a missing/odd value) means the lease is gone -- the holder must
@@ -268,16 +268,16 @@ class EtcdBackend(StoreLeaseBackend):
         # whether the effective ttl is below _MIN_USABLE_TTL, so the warning/
         # recovery in _narrow_effective_ttl logs once per transition.
         self._ttl_collapsed: bool = False
-        self.username: Optional[str] = etcd["username"]
-        self.password: Optional[str] = etcd.get("resolved_password")
-        self._tls: dict[str, Optional[str]] = etcd["tls"]
+        self.username: str | None = etcd["username"]
+        self.password: str | None = etcd.get("resolved_password")
+        self._tls: dict[str, str | None] = etcd["tls"]
         # on-disk client-TLS files (ca / cert / key) the SSLContext is built
         # from, snapshotted in start() so tls_files_changed() detects an
         # in-place cert/CA rotation and start_stop_cluster rebuilds the
         # backend: the context is never reloaded, so a rotated cert would
         # otherwise silently lose leadership fleet-wide once the old one
         # expires. Empty (-> tls_files_changed False) for plain-http.
-        self._tls_signature: dict[str, Optional[tuple[int, int]]] = {}
+        self._tls_signature: dict[str, tuple[int, int] | None] = {}
         self.connect_timeout: int = config["connectTimeout"]
         # renew_period / round_deadline / request_timeout are derived from the
         # *effective* ttl (properties below), so they tighten automatically if
@@ -322,23 +322,23 @@ class EtcdBackend(StoreLeaseBackend):
         # key must be raced for atomically. Cleared once a transaction has
         # run and the key exists.
         self._campaign_must_create = True
-        self._holder: Optional[str] = None
-        self._lease_id: Optional[str] = None
+        self._holder: str | None = None
+        self._lease_id: str | None = None
         # wall-clock expiry, for the dashboard/lease_detail display ONLY
-        self._lease_deadline: Optional[datetime.datetime] = None
+        self._lease_deadline: datetime.datetime | None = None
         # monotonic deadlines: the load-bearing fence/freshness gates (immune
         # wall-clock steps; see _monotonic)
-        self._lease_deadline_mono: Optional[float] = None
+        self._lease_deadline_mono: float | None = None
         # quorum freshness deadline, FIXED at each successful round's contact
         # instant (contact + the effective ttl at THAT contact; see
         # _apply_round), so the not-quorate cadence widening in _renew_once
         # cannot retroactively resurrect is_quorate() with zero store contact.
-        self._quorum_deadline_mono: Optional[float] = None
+        self._quorum_deadline_mono: float | None = None
 
-        self._auth_token: Optional[str] = None
-        self._ssl: Optional[ssl.SSLContext] = None
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._task: Optional[asyncio.Task] = None
+        self._auth_token: str | None = None
+        self._ssl: ssl.SSLContext | None = None
+        self._session: aiohttp.ClientSession | None = None
+        self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
     # --- derived renew cadence (all track the *effective* lease ttl) ------
@@ -471,11 +471,11 @@ class EtcdBackend(StoreLeaseBackend):
 
     def _apply_round(
         self,
-        holder: Optional[str],
+        holder: str | None,
         is_leader: bool,
         now: datetime.datetime,
-        mono: Optional[float] = None,
-        lease_mono: Optional[float] = None,
+        mono: float | None = None,
+        lease_mono: float | None = None,
     ) -> None:
         """Update live leader state from a round's outcome (pure, tested).
 
@@ -589,7 +589,7 @@ class EtcdBackend(StoreLeaseBackend):
             self._session = None
             raise
 
-    def _build_ssl(self) -> Optional[ssl.SSLContext]:
+    def _build_ssl(self) -> ssl.SSLContext | None:
         if not any(self.endpoint_is_https(e) for e in self.endpoints):
             return None
         ctx = ssl.create_default_context(cafile=self._tls.get("ca") or None)
@@ -630,7 +630,7 @@ class EtcdBackend(StoreLeaseBackend):
             return False
         return True
 
-    async def _authenticate(self) -> Optional[str]:
+    async def _authenticate(self) -> str | None:
         resp = await self._post(
             "/v3/auth/authenticate",
             {"name": self.username, "password": self.password},
@@ -673,7 +673,7 @@ class EtcdBackend(StoreLeaseBackend):
         # the round's sequential POSTs fail over fast and still fit the round
         # deadline when one endpoint is half-open; see request_timeout.
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
-        last_error: Optional[Exception] = None
+        last_error: Exception | None = None
         last_endpoint = None
         stale_token = False
         for endpoint in endpoints:
@@ -744,7 +744,7 @@ class EtcdBackend(StoreLeaseBackend):
 
     async def _grant_lease(
         self,
-    ) -> "tuple[Optional[str], Optional[int]]":
+    ) -> "tuple[str | None, int | None]":
         """Grant a lease; return ``(lease_id, server_granted_ttl)``.
 
         The granted TTL may be lower than requested, so the caller narrows the
@@ -753,11 +753,11 @@ class EtcdBackend(StoreLeaseBackend):
         resp = await self._post("/v3/lease/grant", {"TTL": str(self.ttl)})
         return lease_id_from_grant(resp), lease_ttl_from_grant(resp)
 
-    async def _keepalive(self, lease_id: str) -> Optional[int]:
+    async def _keepalive(self, lease_id: str) -> int | None:
         resp = await self._post("/v3/lease/keepalive", {"ID": str(lease_id)})
         return lease_ttl_from_keepalive(resp)
 
-    async def _campaign(self, lease_id: str) -> "tuple[Optional[str], bool]":
+    async def _campaign(self, lease_id: str) -> "tuple[str | None, bool]":
         """Campaign for the election key; return ``(holder, won)``.
 
         ``holder`` is the display name stored at the key; ``won`` is whether
@@ -812,8 +812,6 @@ class EtcdBackend(StoreLeaseBackend):
                 # inside the lease window, so a slow-but-quorate endpoint
                 # cannot make the holder self-demote every cycle.
                 await asyncio.wait_for(self._renew_once(), self.round_deadline)
-            except asyncio.CancelledError:
-                raise
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
                 # could not reach etcd this round: leave the monotonic contact
                 # deadline alone so is_quorate goes stale (Leader closed,
@@ -850,7 +848,7 @@ class EtcdBackend(StoreLeaseBackend):
         # expired quorum without a real contact.
         if not self.is_quorate() and self._effective_ttl < self.ttl:
             self._effective_ttl = self.ttl
-        lease_mono: Optional[float] = None
+        lease_mono: float | None = None
         if self._lease_id is not None:
             lease_mono = _monotonic()
             ttl = await self._keepalive(self._lease_id)
@@ -909,9 +907,7 @@ class EtcdBackend(StoreLeaseBackend):
 
     # --- @reboot-ran persistence (H2: no peer set, so persist to the store) --
 
-    async def _sync_reboot_ran(
-        self, *, leaderish: Optional[bool] = None
-    ) -> None:
+    async def _sync_reboot_ran(self, *, leaderish: bool | None = None) -> None:
         """Best-effort: read the @reboot-ran key, fold it in, re-persist marks.
 
         A read/write failure never fails the leadership round (the local set
@@ -1008,7 +1004,7 @@ class EtcdBackend(StoreLeaseBackend):
             )
             kvs = resp.get("kvs") or []
             if kvs and kvs[0].get("value") is not None:
-                raw: Optional[str] = _b64decode(kvs[0]["value"])
+                raw: str | None = _b64decode(kvs[0]["value"])
                 # accept BOTH wire spellings: the gRPC-gateway JSON can
                 # marshal KV fields as snake_case OR camelCase (as with
                 # response_range/responseRange). Reading only mod_revision

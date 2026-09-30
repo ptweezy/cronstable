@@ -171,7 +171,6 @@ def test_resolve_web_token_file_tolerates_a_bom(tmp_path):
     )
 
 
-@pytest.mark.asyncio
 async def test_auth_middleware():
     from aiohttp import web
 
@@ -239,7 +238,6 @@ def test_origin_matches_host():
     assert not m("http://localhost:8021", "localhost:notaport")
 
 
-@pytest.mark.asyncio
 async def test_origin_middleware_blocks_cross_site_mutations():
     from aiohttp import web
 
@@ -297,7 +295,6 @@ async def test_origin_middleware_blocks_cross_site_mutations():
     assert resp.text == "ok"
 
 
-@pytest.mark.asyncio
 async def test_web_app_origin_gate_end_to_end(start_web_app):
     # the gate is wired into the real app even with NO authToken configured
     # (the default posture the CSRF gate exists for): a cross-site POST is
@@ -335,7 +332,6 @@ def test_web_site_from_url_malformed_http():
         cronstable.cron.web_site_from_url(None, "http://")
 
 
-@pytest.mark.asyncio
 async def test_start_web_app_ignores_bad_listen_urls(start_web_app):
     # an unusable listen url is skipped, not surfaced as an exception
     cron = cronstable.cron.Cron(None)
@@ -343,7 +339,6 @@ async def test_start_web_app_ignores_bad_listen_urls(start_web_app):
     await start_web_app(cron, bad_config)  # must not raise
 
 
-@pytest.mark.asyncio
 async def test_web_start_disabled_job_refused():
     from aiohttp import web
 
@@ -354,7 +349,6 @@ async def test_web_start_disabled_job_refused():
     assert not cron.running_jobs
 
 
-@pytest.mark.asyncio
 async def test_web_status_reports_disabled():
     import json
 
@@ -366,7 +360,6 @@ async def test_web_status_reports_disabled():
     assert data[0]["status"] == "disabled"
 
 
-@pytest.mark.asyncio
 async def test_web_status_and_job_set_id_accept_negotiation():
     # A generated client sends compound Accept headers ("application/json,
     # */*", ";q=" parameters); any explicit application/json range selects
@@ -397,7 +390,6 @@ async def test_web_status_and_job_set_id_accept_negotiation():
     assert tresp.content_type == "text/plain"
 
 
-@pytest.mark.asyncio
 async def test_web_list_jobs():
     import json
 
@@ -422,7 +414,6 @@ async def test_web_list_jobs():
     assert beta["scheduled_in"] is None  # disabled -> no next run
 
 
-@pytest.mark.asyncio
 async def test_web_list_jobs_etag_304_and_invalidation():
     """GET /jobs serves a content ETag, 304s a matching conditional poll,
     keeps the tag stable while only the countdown moves, and moves it when
@@ -465,7 +456,6 @@ async def test_web_list_jobs_etag_304_and_invalidation():
     assert changed.headers["ETag"] != etag
 
 
-@pytest.mark.asyncio
 async def test_web_list_jobs_memo_shares_one_build(monkeypatch):
     # N pollers inside the memo TTL must share ONE payload build (the
     # whole point: a wallboard plus tabs used to cost N identical builds
@@ -500,7 +490,6 @@ async def test_web_list_jobs_memo_shares_one_build(monkeypatch):
     assert fresh.headers["ETag"] != first.headers["ETag"]
 
 
-@pytest.mark.asyncio
 async def test_web_list_jobs_single_flight_shares_one_build(monkeypatch):
     # Concurrent pollers must JOIN one build while it is in flight;
     # sharing a product that already landed in the memo proves nothing.
@@ -568,7 +557,6 @@ async def test_web_list_jobs_single_flight_shares_one_build(monkeypatch):
                 t.cancel()
 
 
-@pytest.mark.asyncio
 async def test_web_list_jobs_bust_mid_build_is_not_stored(monkeypatch):
     # A bust landing while the build is on the executor must not be undone
     # by that pre-bust product being stored on the way out: the leader
@@ -625,7 +613,6 @@ def _hdr_req(inm=None, ae=None):
     return Req(headers=headers)
 
 
-@pytest.mark.asyncio
 async def test_web_list_dags_etag_304_and_gzip():
     """GET /dags is the third leg of the dashboard's per-poll fan-out: it
     must serve a content ETag, 304 an unchanged conditional poll instead of
@@ -664,7 +651,6 @@ async def test_web_list_dags_etag_304_and_gzip():
     assert changed.headers["ETag"] != etag
 
 
-@pytest.mark.asyncio
 async def test_single_caller_response_builds_only_what_it_serves(monkeypatch):
     """The unmemoized path serves ONE caller, so gzipping a body that
     caller will not take is pure waste on the event loop. A 304 carries no
@@ -708,7 +694,6 @@ async def test_single_caller_response_builds_only_what_it_serves(monkeypatch):
     assert hashed == []  # use_etag=False: the digest was never taken
 
 
-@pytest.mark.asyncio
 async def test_web_get_cluster_negotiates_gzip_but_never_etags():
     """GET /cluster embeds freshly sampled node gauges, so a content tag
     would churn per poll and never match: the handler must not emit one.
@@ -725,7 +710,6 @@ async def test_web_get_cluster_negotiates_gzip_but_never_etags():
     assert json.loads(resp.text) == {"enabled": False, "peers": []}
 
 
-@pytest.mark.asyncio
 async def test_web_job_set_id():
     import json
 
@@ -758,7 +742,6 @@ def test_job_set_id_logged_only_on_change(caplog):
     assert cron.job_set_id() in logged[0]
 
 
-@pytest.mark.asyncio
 async def test_web_list_jobs_includes_last_run():
     import json
 
@@ -1033,7 +1016,6 @@ class _GatedAppendBackend:
         self.appends.append((stream, record))
 
 
-@pytest.mark.asyncio
 async def test_archive_snapshots_lines_at_record_time():
     # The archive must write the lines the run had when it was RECORDED,
     # not whatever the ring holds when the persist task finally runs: a
@@ -1085,7 +1067,6 @@ def test_fleet_backend_prefers_observability_mesh():
     assert cron._fleet_backend() is mesh
 
 
-@pytest.mark.asyncio
 async def test_start_stop_observability_builds_mesh_and_installs_providers(
     monkeypatch,
 ):
@@ -1113,7 +1094,6 @@ async def test_start_stop_observability_builds_mesh_and_installs_providers(
     assert built[0].stopped is True
 
 
-@pytest.mark.asyncio
 async def test_start_stop_observability_respects_share_opt_out(monkeypatch):
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     made = []
@@ -1133,7 +1113,6 @@ async def test_start_stop_observability_respects_share_opt_out(monkeypatch):
     assert made[0].node_stats_share is False
 
 
-@pytest.mark.asyncio
 async def test_start_stop_observability_reconciles_share_on_kept_mesh(
     monkeypatch,
 ):
@@ -1170,7 +1149,6 @@ async def test_start_stop_observability_reconciles_share_on_kept_mesh(
     assert made[0].node_stats_share is True
 
 
-@pytest.mark.asyncio
 async def test_start_stop_observability_none_is_noop():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     await cron.start_stop_observability(None)
@@ -1179,7 +1157,6 @@ async def test_start_stop_observability_none_is_noop():
     assert cron.observability_mesh is None
 
 
-@pytest.mark.asyncio
 async def test_web_get_cluster_injects_local_node_stats():
     import json
 
@@ -1197,7 +1174,6 @@ async def test_web_get_cluster_injects_local_node_stats():
     assert "cpu_percent" in data["node_stats"]
 
 
-@pytest.mark.asyncio
 async def test_web_get_node_returns_resources():
     import json
 
@@ -1211,7 +1187,6 @@ async def test_web_get_node_returns_resources():
     assert "mem_percent" in data["resources"]
 
 
-@pytest.mark.asyncio
 async def test_job_to_dict_includes_live_running_resources():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     job = cron.cron_jobs["alpha"]
@@ -1233,7 +1208,6 @@ async def test_job_to_dict_includes_live_running_resources():
     }
 
 
-@pytest.mark.asyncio
 async def test_job_to_dict_omits_running_resources_when_unmonitored():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     job = cron.cron_jobs["alpha"]
@@ -1249,7 +1223,6 @@ async def test_job_to_dict_omits_running_resources_when_unmonitored():
     assert "running_resources" not in d
 
 
-@pytest.mark.asyncio
 async def test_web_list_jobs_includes_history_and_timezone():
     import json
 
@@ -1273,7 +1246,6 @@ async def test_web_list_jobs_includes_history_and_timezone():
     assert data[1]["history"] == []
 
 
-@pytest.mark.asyncio
 async def test_web_job_runs_endpoint_returns_runs_and_stats():
     import json
 
@@ -1313,7 +1285,6 @@ async def test_web_job_runs_endpoint_returns_runs_and_stats():
     assert cron.last_run["alpha"].outcome == "success"
 
 
-@pytest.mark.asyncio
 async def test_web_job_runs_unknown_job_404():
     from aiohttp import web
 
@@ -1322,7 +1293,6 @@ async def test_web_job_runs_unknown_job_404():
         await cron._web_job_runs(Req(match={"name": "nope"}))
 
 
-@pytest.mark.asyncio
 async def test_web_job_runs_empty_history():
     import json
 
@@ -1336,7 +1306,6 @@ async def test_web_job_runs_empty_history():
     assert body["stats"]["avg_duration"] is None
 
 
-@pytest.mark.asyncio
 async def test_web_job_runs_honours_limit_param():
     # the one run-listing surface without a cap gained the same clamped
     # `limit` its DAG and MCP twins always had; the default serves the
@@ -1389,7 +1358,6 @@ def test_strip_headers_drops_names_in_any_spelling():
     assert cronstable.cron._strip_content_type({"CONTENT-type": "x"}) == {}
 
 
-@pytest.mark.asyncio
 async def test_handler_errors_carry_the_json_envelope():
     # every 4xx body on this origin is the ONE envelope {"error": msg}
     # (matching jobapi and /mcp) instead of per-handler text/plain. The
@@ -1443,7 +1411,6 @@ async def test_handler_errors_carry_the_json_envelope():
     }
 
 
-@pytest.mark.asyncio
 async def test_web_cancel_unknown_job_404():
     from aiohttp import web
 
@@ -1452,7 +1419,6 @@ async def test_web_cancel_unknown_job_404():
         await cron._web_cancel_job(Req(match={"name": "nope"}))
 
 
-@pytest.mark.asyncio
 async def test_web_cancel_not_running_409():
     from aiohttp import web
 
@@ -1461,7 +1427,6 @@ async def test_web_cancel_not_running_409():
         await cron._web_cancel_job(Req(match={"name": "alpha"}))
 
 
-@pytest.mark.asyncio
 async def test_handle_finished_job_records_cancelled(monkeypatch):
     # a run cancelled by the user is recorded as "cancelled" but, like a
     # replacement, must not be reported as success/failure or retried.
@@ -1500,7 +1465,6 @@ async def test_handle_finished_job_records_cancelled(monkeypatch):
     assert [r.outcome for r in cron.run_history["test"]] == ["cancelled"]
 
 
-@pytest.mark.asyncio
 async def test_web_cancel_running_job_terminates_and_records():
     # end-to-end: launch a real long-running job, cancel it via the endpoint,
     # and confirm it is actually terminated and recorded as "cancelled".
@@ -1532,7 +1496,6 @@ async def test_web_cancel_running_job_terminates_and_records():
     assert [r.outcome for r in cron.run_history["test"]] == ["cancelled"]
 
 
-@pytest.mark.asyncio
 async def test_web_index_served():
     cron = _cron(TWO_JOBS)
     # a real web.Request always carries headers; _web_index reads
@@ -1543,7 +1506,6 @@ async def test_web_index_served():
     assert "<html" in resp.text.lower()
 
 
-@pytest.mark.asyncio
 async def test_web_index_sets_security_headers():
     cron = _cron(TWO_JOBS)
     resp = await cron._web_index(Req())
@@ -1558,7 +1520,6 @@ async def test_web_index_sets_security_headers():
     assert resp.headers["Referrer-Policy"] == "no-referrer"
 
 
-@pytest.mark.asyncio
 async def test_web_index_security_headers_overridable():
     # an operator-configured web.headers value wins over the secure default,
     # while defaults the operator didn't set are still applied.
@@ -1569,7 +1530,6 @@ async def test_web_index_security_headers_overridable():
     assert resp.headers["X-Content-Type-Options"] == "nosniff"  # default kept
 
 
-@pytest.mark.asyncio
 async def test_web_index_revalidates_with_304():
     # the dashboard is static package data, so a client that echoes the ETag
     # gets an empty 304 instead of another ~573 KB body.
@@ -1587,7 +1547,6 @@ async def test_web_index_revalidates_with_304():
     assert full.body
 
 
-@pytest.mark.asyncio
 async def test_web_index_serves_gzip_when_accepted():
     # precompressed once for the life of the process; the compressed body must
     # decode back to exactly the identity body.
@@ -1613,7 +1572,6 @@ async def test_web_index_serves_gzip_when_accepted():
     assert plain.body == raw
 
 
-@pytest.mark.asyncio
 async def test_auth_middleware_public_path():
     from aiohttp import web
 
@@ -1638,7 +1596,6 @@ async def test_auth_middleware_public_path():
         await middleware(FakeRequest("/jobs"), handler)
 
 
-@pytest.mark.asyncio
 async def test_web_job_logs_streams_last_run():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
@@ -1670,7 +1627,6 @@ async def test_web_job_logs_streams_last_run():
     assert "event: end" in body
 
 
-@pytest.mark.asyncio
 async def test_web_job_logs_batches_live_bursts(monkeypatch):
     """A burst of published lines must reach the SSE client in a handful of
     transport writes, not one write (plus one fresh wait_for timer task) per
@@ -1724,7 +1680,6 @@ async def test_web_job_logs_batches_live_bursts(monkeypatch):
     assert sum(w.count(b"event: line") for w in burst_writes) == 60
 
 
-@pytest.mark.asyncio
 async def test_web_job_logs_no_output():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
@@ -1739,7 +1694,6 @@ async def test_web_job_logs_no_output():
     assert "no-output" in body
 
 
-@pytest.mark.asyncio
 async def test_web_job_logs_unknown_job():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
@@ -1770,7 +1724,6 @@ async def test_web_job_logs_unknown_job():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_web_app_enforces_auth_when_token_configured(start_web_app):
     import aiohttp
 
@@ -1806,7 +1759,6 @@ async def test_web_app_enforces_auth_when_token_configured(start_web_app):
     assert cron.web_runner is None
 
 
-@pytest.mark.asyncio
 async def test_shutdown_route_is_gated_by_the_real_app(start_web_app):
     """POST /shutdown through the real router and middleware stack.
 
@@ -1867,7 +1819,6 @@ async def test_shutdown_route_is_gated_by_the_real_app(start_web_app):
     assert cron._stop_event.is_set()
 
 
-@pytest.mark.asyncio
 async def test_shutdown_route_refuses_on_a_listener_with_no_tokens():
     """The open-listener case, end to end.
 
@@ -1896,7 +1847,6 @@ async def test_shutdown_route_refuses_on_a_listener_with_no_tokens():
         await asyncio.sleep(0.25)
 
 
-@pytest.mark.asyncio
 async def test_web_app_ui_path_public_but_data_paths_require_auth(
     start_web_app,
 ):
@@ -1923,7 +1873,6 @@ async def test_web_app_ui_path_public_but_data_paths_require_auth(
             assert resp.status == 401
 
 
-@pytest.mark.asyncio
 async def test_web_json_endpoints_tolerate_operator_content_type(
     start_web_app,
 ):
@@ -1989,7 +1938,6 @@ def test_error_envelope_middleware_carries_the_new_style_marker():
     )
 
 
-@pytest.mark.asyncio
 async def test_web_errors_carry_the_json_envelope(start_web_app):
     # every error body is one JSON envelope, including the three families
     # that used to escape as aiohttp's text/plain defaults: the auth
@@ -2028,7 +1976,6 @@ async def test_web_errors_carry_the_json_envelope(start_web_app):
             assert "GET" in resp.headers.get("Allow", "")
 
 
-@pytest.mark.asyncio
 async def test_chunked_oversized_mcp_body_413s_with_the_envelope(
     start_web_app,
 ):
@@ -2109,7 +2056,6 @@ _CONVERTED_404_ROUTES = [
 ]
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("path,reason", _CONVERTED_404_ROUTES)
 async def test_converted_404s_name_what_was_not_found(
     start_web_app, path, reason
@@ -2131,7 +2077,6 @@ async def test_converted_404s_name_what_was_not_found(
             assert await resp.json() == {"error": reason}
 
 
-@pytest.mark.asyncio
 async def test_dag_run_404_splits_unknown_dag_from_no_state_store():
     # DagRunStore answers a plain None for two different causes (dagrun.py:
     # `backend is None or dag_name not in self._dags()`), so the old single
@@ -2183,7 +2128,6 @@ def test_no_web_handler_raises_a_bare_http_error():
     assert bare_http_raises(path) == []
 
 
-@pytest.mark.asyncio
 async def test_web_500_and_504_carry_the_json_envelope(
     start_web_app, monkeypatch, caplog
 ):
@@ -2238,7 +2182,6 @@ async def test_web_500_and_504_carry_the_json_envelope(
     assert "/status" in logged[0].getMessage()
 
 
-@pytest.mark.asyncio
 async def test_web_app_restarts_on_config_change(monkeypatch):
     # changing the web config replaces the running server with a new one;
     # clearing it stops the server entirely. web_site_from_url is faked so no
@@ -2289,7 +2232,6 @@ def _port_taken(port):
     return False
 
 
-@pytest.mark.asyncio
 async def test_web_restart_keeps_the_http_port_bound(
     start_web_app, monkeypatch
 ):
@@ -2333,7 +2275,6 @@ async def test_web_restart_keeps_the_http_port_bound(
     assert not _port_taken(port)
 
 
-@pytest.mark.asyncio
 async def test_web_teardown_ends_only_its_own_generations_tails():
     from aiohttp import web
 
@@ -2492,7 +2433,6 @@ def test_webloop_update_config_no_source_returns_empty():
     assert cfg.web_config is None
 
 
-@pytest.mark.asyncio
 async def test_webloop_run_skips_subminute_housekeeping(
     monkeypatch, run_cron
 ):
@@ -2512,7 +2452,6 @@ async def test_webloop_run_skips_subminute_housekeeping(
     assert not task.done()
 
 
-@pytest.mark.asyncio
 async def test_webloop_run_shutdown_teardown(tmp_path, monkeypatch, run_cron):
     # drive run()'s graceful-shutdown teardown across the observability overlay,
     # the slot renewers / catch-up / slot-pursuit task pools, the state-backend
@@ -2594,7 +2533,6 @@ logging:
 """
 
 
-@pytest.mark.asyncio
 async def test_webloop_run_applies_logging_config(
     tmp_path, monkeypatch, run_cron
 ):
@@ -2614,7 +2552,6 @@ async def test_webloop_run_applies_logging_config(
     assert applied[0] == {"version": 1}
 
 
-@pytest.mark.asyncio
 async def test_webloop_run_survives_logging_config_error(
     tmp_path, monkeypatch, run_cron
 ):
@@ -2637,7 +2574,6 @@ async def test_webloop_run_survives_logging_config_error(
     assert not task.done()
 
 
-@pytest.mark.asyncio
 async def test_webloop_web_get_version():
     import cronstable.version
 
@@ -2646,7 +2582,6 @@ async def test_webloop_web_get_version():
     assert resp.text == cronstable.version.version
 
 
-@pytest.mark.asyncio
 async def test_webloop_web_status_text_running_and_disabled():
     from types import SimpleNamespace
 
@@ -2661,7 +2596,6 @@ async def test_webloop_web_status_text_running_and_disabled():
     assert "beta: disabled" in resp.text
 
 
-@pytest.mark.asyncio
 async def test_webloop_schedule_why_reboot_with_pause(monkeypatch):
     from types import SimpleNamespace
 
@@ -2683,7 +2617,6 @@ jobs:
     assert any(n["code"] == "paused" for n in payload["notes"])
 
 
-@pytest.mark.asyncio
 async def test_webloop_schedule_why_no_previous_fire():
     yaml = """
 jobs:
@@ -2699,7 +2632,6 @@ jobs:
     assert payload["next_fire"] is not None
 
 
-@pytest.mark.asyncio
 async def test_webloop_schedule_why_previous_fire():
     yaml = """
 jobs:
@@ -2735,7 +2667,6 @@ dags:
     assert "dag:nosched" not in names
 
 
-@pytest.mark.asyncio
 async def test_webloop_web_dag_run_and_xcom(monkeypatch):
     import json as _json
 
@@ -2773,7 +2704,6 @@ async def test_webloop_web_dag_run_and_xcom(monkeypatch):
     assert _json.loads(resp.text)["a"] == 1
 
 
-@pytest.mark.asyncio
 async def test_webloop_web_dag_backfill_errors(monkeypatch):
     import json as _json
 
@@ -2812,7 +2742,6 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
     assert _json.loads(resp.text)["runs"] == 2
 
 
-@pytest.mark.asyncio
 async def test_webloop_state_payloads_propagate_cancel():
     cron = cronstable.cron.Cron(None)
 
@@ -2854,7 +2783,6 @@ def test_webloop_tail_payload_with_cursor():
     assert len(payload["lines"]) == 3
 
 
-@pytest.mark.asyncio
 async def test_webloop_pump_output_handles_disconnect():
     from types import SimpleNamespace
 
@@ -2871,7 +2799,6 @@ async def test_webloop_pump_output_handles_disconnect():
     await cron._pump_output(SimpleNamespace(app=None), FakeResp(), out)
 
 
-@pytest.mark.asyncio
 async def test_webloop_web_job_logs_live_running():
     from types import SimpleNamespace
 
@@ -2907,7 +2834,6 @@ dags:
 """
 
 
-@pytest.mark.asyncio
 async def test_webloop_web_dag_task_logs_unknown_dag():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
@@ -2927,7 +2853,6 @@ async def test_webloop_web_dag_task_logs_unknown_dag():
         assert (await resp.json())["error"] == "workflow 'nope' not found"
 
 
-@pytest.mark.asyncio
 async def test_webloop_web_dag_task_logs_no_output():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
@@ -2946,7 +2871,6 @@ async def test_webloop_web_dag_task_logs_no_output():
     assert "no-output" in body
 
 
-@pytest.mark.asyncio
 async def test_webloop_web_dag_task_logs_live_running():
     from types import SimpleNamespace
 
@@ -2991,7 +2915,6 @@ async def test_webloop_web_dag_task_logs_live_running():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_web_app_retries_bind_after_all_listens_fail(start_web_app):
     # A predecessor (here: a plain socket) still holds the only listen port,
     # so every bind fails. web_config must NOT latch: the unchanged latch is
@@ -3017,7 +2940,6 @@ async def test_web_app_retries_bind_after_all_listens_fail(start_web_app):
         blocker.close()
 
 
-@pytest.mark.asyncio
 async def test_web_teardown_ends_open_sse_tails_promptly(
     monkeypatch, start_web_app
 ):
@@ -3053,7 +2975,6 @@ async def test_web_teardown_ends_open_sse_tails_promptly(
         assert b"event: end" in rest
 
 
-@pytest.mark.asyncio
 async def test_cors_preflight_reaches_mcp_options_through_auth(start_web_app):
     # A browser preflight carries no Authorization by the Fetch standard, so
     # the bearer gate must pass it through to the /mcp OPTIONS route, which
@@ -3196,7 +3117,6 @@ def test_payload_mutations_funnel_through_memo_busting_helpers():
     assert offenders == []
 
 
-@pytest.mark.asyncio
 async def test_pause_set_and_resume_bust_via_funnel():
     # both halves of the pause lifecycle render immediately (each op busts
     # at least once), while a resume of a not-paused job changes no
@@ -3223,7 +3143,6 @@ async def test_pause_set_and_resume_bust_via_funnel():
     assert len(busts) == after_resume
 
 
-@pytest.mark.asyncio
 async def test_bounded_boot_scan_partitions_and_tallies():
     # the pool contract: worker count is min(pool bound, items), the
     # shared iterator hands each item to exactly one worker, and the tally
@@ -3257,7 +3176,6 @@ async def test_bounded_boot_scan_partitions_and_tallies():
     assert counted == 10  # the even indices
 
 
-@pytest.mark.asyncio
 async def test_bounded_boot_scan_timeout_warns_once_and_aborts(caplog):
     import logging
 
@@ -3286,7 +3204,6 @@ async def test_bounded_boot_scan_timeout_warns_once_and_aborts(caplog):
     assert counted == 0
 
 
-@pytest.mark.asyncio
 async def test_bounded_boot_scan_skips_a_job_whose_step_raises(caplog):
     # asyncio.gather without return_exceptions hands the FIRST exception
     # to the awaiter and leaves the siblings running, so an unexpected

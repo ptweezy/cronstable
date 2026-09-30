@@ -255,7 +255,6 @@ def test_next_sleep_interval_modes(monkeypatch):
     assert cronstable.cron.next_sleep_interval(True) == pytest.approx(0.5)
 
 
-@pytest.mark.asyncio
 async def test_spawn_jobs_subminute_dedup(monkeypatch):
     # A minute-level job fires exactly once per minute and a second-level job
     # exactly once per matching second, even when the loop wakes more than once
@@ -291,7 +290,6 @@ async def test_spawn_jobs_subminute_dedup(monkeypatch):
     assert min_fires == [(1, 0)]  # once, despite the ticks through the minute
 
 
-@pytest.mark.asyncio
 async def test_service_slots_catches_up_overrun_seconds(monkeypatch):
     # A pass that overruns by a couple of seconds (the clock jumps forward
     # between passes) must not silently drop the seconds it skipped: the next
@@ -309,7 +307,6 @@ async def test_service_slots_catches_up_overrun_seconds(monkeypatch):
     assert [s for (n, s) in launched if n == "tick"] == [1, 2, 3]
 
 
-@pytest.mark.asyncio
 async def test_service_slots_bounds_catchup_after_long_gap(monkeypatch):
     # A gap larger than CATCHUP_LIMIT is a stall/suspend, not tick overhead:
     # resume at the current second instead of replaying a burst.
@@ -325,7 +322,6 @@ async def test_service_slots_bounds_catchup_after_long_gap(monkeypatch):
     assert [s for (n, s) in launched if n == "tick"] == [gap]
 
 
-@pytest.mark.asyncio
 async def test_startup_seeding_skips_in_progress_minute(monkeypatch):
     # Restarting partway through a minute must not fire a minute-level job for
     # the minute already under way, even though a second-level job is present
@@ -345,7 +341,6 @@ async def test_startup_seeding_skips_in_progress_minute(monkeypatch):
     assert ("min", 0) in launched  # now it fires, once, at the fresh boundary
 
 
-@pytest.mark.asyncio
 async def test_single_slot_job_fires_once_across_boundary(monkeypatch):
     # A single-slot job (noon) serviced tick-by-tick across the minute boundary
     # fires exactly once. Regression for the two-clock-read TOCTOU: the due
@@ -370,7 +365,6 @@ async def test_single_slot_job_fires_once_across_boundary(monkeypatch):
 # =====================================================================
 
 
-@pytest.mark.asyncio
 async def test_spawn_jobs_launches_concurrently(monkeypatch):
     # Jobs due in the same slot are launched concurrently, not one at a time:
     # all three enter their (blocking) launch before any of them completes, so
@@ -402,7 +396,6 @@ async def test_spawn_jobs_launches_concurrently(monkeypatch):
         await asyncio.wait_for(task, timeout=2)
 
 
-@pytest.mark.asyncio
 async def test_single_due_job_still_launches(monkeypatch):
     # The len == 1 fast path (await directly, no gather) still launches the one
     # due job, so the optimisation does not regress the common single-job slot.
@@ -422,7 +415,6 @@ async def test_single_due_job_still_launches(monkeypatch):
     assert launched == ["alpha"]
 
 
-@pytest.mark.asyncio
 async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
     # The once-a-minute reparse is offloaded to a worker thread so a slow disk
     # read + parse cannot freeze the event loop (and stall the scheduling
@@ -501,7 +493,6 @@ cluster:
 """
 
 
-@pytest.mark.asyncio
 async def test_startup_gates_reboot_before_servicing(tmp_path, monkeypatch):
     # Housekeeping (which sets the cluster gate _elect_leader_configured via
     # start_stop_cluster) must run BEFORE the first spawn_jobs, so a Leader
@@ -630,7 +621,6 @@ def test_sleep_interval_no_jobs_uses_housekeeping(monkeypatch):
     assert cron._sleep_interval() == pytest.approx(45.0, abs=0.05)
 
 
-@pytest.mark.asyncio
 async def test_backward_clock_step_does_not_refire(monkeypatch):
     # The heart of the clock-step immunity: next-fire advances forward-only, so
     # an NTP/clock step BACKWARD defers the next fire rather than re-firing an
@@ -659,7 +649,6 @@ async def test_backward_clock_step_does_not_refire(monkeypatch):
 _EVERY_15MIN = job_yaml("j15", schedule="*/15 * * * *")
 
 
-@pytest.mark.asyncio
 async def test_long_gap_sparse_job_fires_only_if_current_slot_matches(
     monkeypatch,
 ):
@@ -683,7 +672,6 @@ async def test_long_gap_sparse_job_fires_only_if_current_slot_matches(
     assert [n for (n, s) in launched] == ["j15"]
 
 
-@pytest.mark.asyncio
 async def test_long_gap_resumes_at_matching_current_slot(monkeypatch):
     # The mirror of the above: when the resume instant DOES land on a matching
     # slot, the job fires once there (the frequently-scheduled / on-boundary
@@ -696,7 +684,6 @@ async def test_long_gap_resumes_at_matching_current_slot(monkeypatch):
     assert [(n, s) for (n, s) in launched] == [("j15", 0)]  # once, at 00:45
 
 
-@pytest.mark.asyncio
 async def test_large_forward_jump_does_not_enumerate_window(monkeypatch):
     # A large forward clock jump / long suspend must NOT walk the missed window
     # occurrence-by-occurrence: for a per-second job an 8h gap is ~28,800
@@ -722,7 +709,6 @@ async def test_large_forward_jump_does_not_enumerate_window(monkeypatch):
 _LOCAL_MINUTE_JOB = job_yaml("loc", extra="    utc: false\n")
 
 
-@pytest.mark.asyncio
 async def test_last_run_slot_is_aware_utc_in_both_advance_branches(
     monkeypatch,
 ):
@@ -773,7 +759,6 @@ def test_reload_utc_to_timezone_utc_preserves_next_fire(tmp_path, monkeypatch):
     assert cron._next_fire["m"] == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
 
 
-@pytest.mark.asyncio
 async def test_minute_job_missed_minutes_fires_once(monkeypatch):
     # A minute-level job whose scheduler froze across several minutes fires
     # ONCE on resume (no backdated storm), matching cron's outage semantics --
@@ -904,7 +889,6 @@ def _count_crontab_calls(monkeypatch):
     return counts
 
 
-@pytest.mark.asyncio
 async def test_perf_wake_is_o_due_not_o_all(monkeypatch, capsys):
     # PERFORMANCE DEMONSTRATION. The next-fire index turns a wake from
     # O(all jobs) into O(due jobs): over a large fleet, a wake where nothing is
@@ -991,7 +975,6 @@ def _launch_recorder(monkeypatch, cron):
     return launched
 
 
-@pytest.mark.asyncio
 async def test_pause_gate_skips_fire_and_writes_skipped_row(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
     _set_now(monkeypatch, holder)
@@ -1016,7 +999,6 @@ async def test_pause_gate_skips_fire_and_writes_skipped_row(monkeypatch):
     assert restored.skip_reason == "paused"
 
 
-@pytest.mark.asyncio
 async def test_pause_expiry_resumes_firing(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
     _set_now(monkeypatch, holder)
@@ -1051,7 +1033,6 @@ def test_pause_periodic_sweeps_expired_entries(monkeypatch, caplog):
     assert any("pause expired" in r.getMessage() for r in caplog.records)
 
 
-@pytest.mark.asyncio
 async def test_manual_start_allowed_while_paused(monkeypatch):
     cron = cronstable.cron.Cron(None, config_yaml=_PAUSABLE_JOB)
     launched = _launch_recorder(monkeypatch, cron)
@@ -1062,7 +1043,6 @@ async def test_manual_start_allowed_while_paused(monkeypatch):
     assert launched == ["p"]
 
 
-@pytest.mark.asyncio
 async def test_retry_defers_across_pause_and_fires_after_resume(monkeypatch):
     monkeypatch.setattr(cronstable.cron, "RETRY_GATE_RECHECK_FLOOR", 0.02)
     cron = cronstable.cron.Cron(None, config_yaml=_PAUSABLE_JOB)
@@ -1108,7 +1088,6 @@ def test_reload_keeps_pause_and_prunes_removed_jobs(tmp_path, monkeypatch):
     assert "drop" not in cron._paused
 
 
-@pytest.mark.asyncio
 async def test_catch_up_defers_a_paused_job_instead_of_latching_it(
     monkeypatch,
 ):
@@ -1136,7 +1115,6 @@ async def test_catch_up_defers_a_paused_job_instead_of_latching_it(
     assert "p" in cron._catchup_done
 
 
-@pytest.mark.asyncio
 async def test_origin_middleware_covers_pause_and_resume_routes():
     from aiohttp import web
 
@@ -1187,7 +1165,6 @@ jobs:
 """
 
 
-@pytest.mark.asyncio
 async def test_pause_and_sla_pass_survives_a_broken_config(monkeypatch):
     # The pause sweep and the SLA monitor must NOT share run()'s reload
     # try/except: a broken config file on disk raises out of reload_config,
@@ -1213,7 +1190,6 @@ async def test_pause_and_sla_pass_survives_a_broken_config(monkeypatch):
     assert cron.metrics._job("s").sla_late == {STALE: 1}
 
 
-@pytest.mark.asyncio
 async def test_sla_stale_check_breaches_and_clears(monkeypatch, caplog):
     import logging
 
@@ -1263,7 +1239,6 @@ async def test_sla_stale_check_breaches_and_clears(monkeypatch, caplog):
     assert len(reports) == 1
 
 
-@pytest.mark.asyncio
 async def test_sla_late_after_check_breaches_and_clears(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
     _set_now(monkeypatch, holder)
@@ -1287,7 +1262,6 @@ async def test_sla_late_after_check_breaches_and_clears(monkeypatch):
     await cron._drain_completions()
 
 
-@pytest.mark.asyncio
 async def test_sla_late_after_within_grace_is_not_breached(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 12, 1, 0)}
     _set_now(monkeypatch, holder)
@@ -1299,7 +1273,6 @@ async def test_sla_late_after_within_grace_is_not_breached(monkeypatch):
     assert ("s", LATE) not in cron._sla_state
 
 
-@pytest.mark.asyncio
 async def test_sla_max_runtime_check_breaches_and_clears(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
     _set_now(monkeypatch, holder)
@@ -1329,7 +1302,6 @@ async def test_sla_max_runtime_check_breaches_and_clears(monkeypatch):
     assert len(reports) == 1  # the clear reports nothing
 
 
-@pytest.mark.asyncio
 async def test_sla_latch_fires_onlate_exactly_once(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
     _set_now(monkeypatch, holder)
@@ -1354,7 +1326,6 @@ async def test_sla_latch_fires_onlate_exactly_once(monkeypatch):
     assert cron.metrics._job("s").sla_breaches == {STALE: 1}
 
 
-@pytest.mark.asyncio
 async def test_sla_paused_and_disabled_jobs_are_exempt(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
     _set_now(monkeypatch, holder)
@@ -1385,7 +1356,6 @@ async def test_sla_paused_and_disabled_jobs_are_exempt(monkeypatch):
     assert len(reports) == 1
 
 
-@pytest.mark.asyncio
 async def test_sla_cluster_gate_is_per_job(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 13, 0, 0)}
     _set_now(monkeypatch, holder)
@@ -1403,7 +1373,6 @@ async def test_sla_cluster_gate_is_per_job(monkeypatch):
     await cron._drain_completions()
 
 
-@pytest.mark.asyncio
 async def test_sla_restart_baseline_without_a_store(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
     _set_now(monkeypatch, holder)
@@ -1427,7 +1396,6 @@ async def test_sla_restart_baseline_without_a_store(monkeypatch):
     await cron._drain_completions()
 
 
-@pytest.mark.asyncio
 async def test_sla_warmed_last_success_drives_the_check(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
     _set_now(monkeypatch, holder)
@@ -1445,7 +1413,6 @@ async def test_sla_warmed_last_success_drives_the_check(monkeypatch):
     assert ctx.last_success_at == "2020-01-01T09:00:00+00:00"
 
 
-@pytest.mark.asyncio
 async def test_sla_due_slot_excused_while_paused(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
     _set_now(monkeypatch, holder)
@@ -1471,7 +1438,6 @@ async def test_sla_due_slot_excused_while_paused(monkeypatch):
     assert cron._sla_due["s"] == slot2
 
 
-@pytest.mark.asyncio
 async def test_sla_last_start_set_on_actual_launch(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
     _set_now(monkeypatch, holder)
@@ -1537,7 +1503,6 @@ def test_sla_payload_shape(monkeypatch):
     ]
 
 
-@pytest.mark.asyncio
 async def test_sla_dropped_check_latch_is_cleared(monkeypatch):
     # a reload can drop one check while keeping the sla block; its stale
     # latch must clear instead of showing late forever
@@ -1552,7 +1517,6 @@ async def test_sla_dropped_check_latch_is_cleared(monkeypatch):
     await cron._drain_completions()
 
 
-@pytest.mark.asyncio
 async def test_sla_dropped_block_latch_is_cleared(tmp_path, monkeypatch):
     # a reload can drop the whole sla block of a latched job; the walk
     # visits SLA jobs only, so the pre-scan over the latch map is what
@@ -1625,7 +1589,6 @@ _SLA_FORBID_LATE_JOB = job_yaml(
 )
 
 
-@pytest.mark.asyncio
 async def test_sla_pause_clears_a_latch_taken_before_the_pause(monkeypatch):
     # regression (#17/#33/#38): a job that latched a breach and is THEN
     # paused was skipped whole by the monitor, so cronstable_job_late, the
@@ -1657,7 +1620,6 @@ async def test_sla_pause_clears_a_latch_taken_before_the_pause(monkeypatch):
     await cron._drain_completions()
 
 
-@pytest.mark.asyncio
 async def test_sla_latch_clears_when_disabled_or_not_owned(monkeypatch):
     # regression (#17): the same freeze through the other two exemptions.
     # Disabling a job, or losing it to another node under election, must
@@ -1692,7 +1654,6 @@ async def test_sla_latch_clears_when_disabled_or_not_owned(monkeypatch):
     await cron._drain_completions()
 
 
-@pytest.mark.asyncio
 async def test_sla_due_is_only_recorded_by_the_owning_node(monkeypatch):
     # regression (#18): _launch_plan recorded the due slot BEFORE the
     # ownership gate, so a follower accumulated due slots it never launched
@@ -1731,7 +1692,6 @@ async def test_sla_due_is_only_recorded_by_the_owning_node(monkeypatch):
     assert reports == []
 
 
-@pytest.mark.asyncio
 async def test_sla_due_excused_when_a_peer_holds_the_cluster_slot(monkeypatch):
     # regression (#16): a node that records the slot as due and is then
     # denied the cluster concurrency slot by a LIVE peer never launches, so
@@ -1772,7 +1732,6 @@ async def test_sla_due_excused_when_a_peer_holds_the_cluster_slot(monkeypatch):
     assert reports == []
 
 
-@pytest.mark.asyncio
 async def test_sla_late_after_excused_while_an_instance_runs(monkeypatch):
     # regression (#23): a slot Forbid dropped because the previous instance is
     # STILL RUNNING is not a late slot, so one healthy long run must not page
@@ -1809,7 +1768,6 @@ async def test_sla_late_after_excused_while_an_instance_runs(monkeypatch):
     assert reports == []
 
 
-@pytest.mark.asyncio
 async def test_sla_late_after_forbid_drop_survives_the_run_ending(monkeypatch):
     # regression (#23 residual): the running_jobs guard only excused the
     # dropped slot WHILE the instance was alive; once the run ended and the
@@ -1855,7 +1813,6 @@ async def test_sla_late_after_forbid_drop_survives_the_run_ending(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_sla_first_seen_baselines_a_reload_added_job(
     tmp_path, monkeypatch
 ):
@@ -1936,7 +1893,6 @@ _SLA_DISABLED_STALE_JOB = job_yaml(
 )
 
 
-@pytest.mark.asyncio
 async def test_sla_reenabled_after_a_disabled_span_gets_a_fresh_baseline(
     tmp_path, monkeypatch
 ):
@@ -1986,7 +1942,6 @@ async def test_sla_reenabled_after_a_disabled_span_gets_a_fresh_baseline(
     assert len(reports) == 1
 
 
-@pytest.mark.asyncio
 async def test_sla_reenabled_after_a_disabled_span_credits_a_prior_success(
     tmp_path, monkeypatch
 ):
@@ -2098,7 +2053,6 @@ def test_sla_bank_pause_coalesces_out_of_order_overlapping_windows():
     ]
 
 
-@pytest.mark.asyncio
 async def test_sla_pause_time_is_credited_against_staleness(monkeypatch):
     # regression (#22): the staleness clock ran at full rate across a pause,
     # so an unattended job paged the first pass after the window expired,
@@ -2128,7 +2082,6 @@ async def test_sla_pause_time_is_credited_against_staleness(monkeypatch):
     await cron._drain_completions()
 
 
-@pytest.mark.asyncio
 async def test_sla_pause_credit_never_counts_a_window_twice(monkeypatch):
     # regression (#22): repeated and OVERLAPPING pauses must each be
     # credited once. Re-pausing a paused job replaces the window, so the
@@ -2181,7 +2134,6 @@ async def test_sla_pause_credit_never_counts_a_window_twice(monkeypatch):
     await cron._drain_completions()
 
 
-@pytest.mark.asyncio
 async def test_sla_pause_credit_covers_a_window_spanning_a_restart(
     monkeypatch,
 ):
@@ -2258,7 +2210,6 @@ async def _warm_ledger(cron, records):
     return backend
 
 
-@pytest.mark.asyncio
 async def test_sla_warm_takes_the_newest_success_by_finished_at(monkeypatch):
     # regression (#21): the warm walked the ledger by APPEND position, but
     # record files are named on write time and run-record writes are
@@ -2278,7 +2229,6 @@ async def test_sla_warm_takes_the_newest_success_by_finished_at(monkeypatch):
     assert cron._sla_last_success["s"] == DT(2020, 1, 1, 10, 5, 0, tzinfo=UTC)
 
 
-@pytest.mark.asyncio
 async def test_sla_warm_widens_past_a_success_free_window(monkeypatch):
     # regression (#20): a job failing more often than the warm window is
     # wide has no success among the newest RUN_HISTORY_LIMIT records, and
@@ -2310,7 +2260,6 @@ async def test_sla_warm_widens_past_a_success_free_window(monkeypatch):
     await cron._drain_completions()
 
 
-@pytest.mark.asyncio
 async def test_sla_warm_floors_on_the_oldest_record_without_a_success(
     monkeypatch,
 ):
@@ -2345,7 +2294,6 @@ def _mem_run(outcome, finished_at):
     )
 
 
-@pytest.mark.asyncio
 async def test_job_trends_payload_caches_within_ttl_and_busts_on_run():
     cron = cronstable.cron.Cron(None, config_yaml=_ONLY_IF_LAST_JOB)  # job "s"
     backend = _RecordBackend(
@@ -2399,7 +2347,6 @@ def test_apply_reload_prunes_trends_cache_for_removed_jobs():
     assert "gone" not in cron._trends_cache
 
 
-@pytest.mark.asyncio
 async def test_sla_warm_seeds_reference_past_the_in_memory_history_guard(
     monkeypatch,
 ):
@@ -2433,7 +2380,6 @@ async def test_sla_warm_seeds_reference_past_the_in_memory_history_guard(
     await cron._drain_completions()
 
 
-@pytest.mark.asyncio
 async def test_sla_warm_seeds_reference_when_a_run_lands_during_the_read(
     monkeypatch,
 ):
@@ -2489,7 +2435,6 @@ _ONLY_IF_LAST_JOB = job_yaml(
 )
 
 
-@pytest.mark.asyncio
 async def test_sla_warm_last_real_outcome_is_newest_by_finished_at(monkeypatch):
     # regression (#21 residual): the onlyIfLastSucceeded memo (_last_real_outcome)
     # was seeded by a positional walk of the warmed ring (the last-APPENDED
@@ -2516,7 +2461,6 @@ async def test_sla_warm_last_real_outcome_is_newest_by_finished_at(monkeypatch):
     )
 
 
-@pytest.mark.asyncio
 async def test_depends_on_past_folds_all_ledger_records_by_finished_at(
     monkeypatch,
 ):
@@ -2553,7 +2497,6 @@ async def test_depends_on_past_folds_all_ledger_records_by_finished_at(
     assert await cron._depends_on_past_ok(cron.cron_jobs["s"]) is False
 
 
-@pytest.mark.asyncio
 async def test_depends_on_past_picks_newest_in_memory_run_by_finished_at(
     monkeypatch,
 ):
@@ -2583,7 +2526,6 @@ async def test_depends_on_past_picks_newest_in_memory_run_by_finished_at(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_sla_report_never_blocks_a_run_completion(monkeypatch):
     # regression (#4): the onLate report installed itself as the job's
     # _completion_tail, which _queue_job_completion blocks on, so a slow
@@ -3431,7 +3373,6 @@ _LOCAL_DST_TWINS = "jobs:\n" + "".join(
 )
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("day", [DT(2027, 3, 14), DT(2027, 11, 7)])
 async def test_local_clock_job_fires_once_at_nine_across_dst(monkeypatch, day):
     # A utc: false job follows the host's DST rules: driven hourly across

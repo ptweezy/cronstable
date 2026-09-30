@@ -155,7 +155,6 @@ def test_shell_spawn_leaves_cmd_alone_on_posix(shell):
     assert kwargs == {}
 
 
-@pytest.mark.asyncio
 async def test_string_command_with_cmd_shell_spawns_through_the_shell(
     monkeypatch,
 ):
@@ -251,7 +250,6 @@ def test_emit_writes_the_streams_own_encoding():
     )
 
 
-@pytest.mark.asyncio
 async def test_stream_reader_join_timeout_keeps_partial_output():
     # The read loop only ends at EOF, i.e. once EVERY write-end of the pipe is
     # closed -- including one a descendant of the job inherited and never
@@ -290,7 +288,6 @@ async def test_stream_reader_join_timeout_keeps_partial_output():
         (0, b"", "", False),
     ],
 )
-@pytest.mark.asyncio
 async def test_stream_reader(
     save_limit, input_lines, output, expected_failure
 ):
@@ -315,7 +312,6 @@ async def test_stream_reader(
     assert (out, job.failed) == (output, expected_failure)
 
 
-@pytest.mark.asyncio
 async def test_stream_reader_long_line():
     fake_stream = asyncio.StreamReader()
     reader = cronstable.job.StreamReader(
@@ -340,7 +336,6 @@ async def test_stream_reader_long_line():
     assert out == "one line\nanother line\n"
 
 
-@pytest.mark.asyncio
 async def test_stream_reader_reassembles_a_run_spanning_many_reads(
     monkeypatch,
 ):
@@ -364,7 +359,6 @@ async def test_stream_reader_reassembles_a_run_spanning_many_reads(
     assert discarded == 0
 
 
-@pytest.mark.asyncio
 async def test_stream_reader_decodes_utf8_split_across_reads(monkeypatch):
     # only complete lines are decoded and a multi-byte code point straddling a
     # read boundary rides in the carried tail, so it must still decode intact
@@ -378,7 +372,6 @@ async def test_stream_reader_decodes_utf8_split_across_reads(monkeypatch):
     assert output == "start☃end\n"
 
 
-@pytest.mark.asyncio
 async def test_stream_reader_drops_an_unterminated_over_cap_run(monkeypatch):
     # An unterminated run past the cap is dropped as it accumulates (the cap
     # is now measured on the running length, so the pieces are never joined
@@ -398,7 +391,6 @@ async def test_stream_reader_drops_an_unterminated_over_cap_run(monkeypatch):
     assert "x" * 101 not in output
 
 
-@pytest.mark.asyncio
 async def test_stream_reader_unterminated_run_is_not_quadratic():
     # A job emitting a long unterminated line (a progress bar, a binary blob,
     # a stuck writer) is read on the EVENT LOOP thread, so the accumulation
@@ -426,7 +418,6 @@ async def test_stream_reader_unterminated_run_is_not_quadratic():
     assert elapsed < 2.0, "unterminated tail took {:.2f}s".format(elapsed)
 
 
-@pytest.mark.asyncio
 async def test_job_output_stream_subscribe_then_publish():
     out = cronstable.job.JobOutputStream()
     queue = out.subscribe()
@@ -438,7 +429,6 @@ async def test_job_output_stream_subscribe_then_publish():
     assert list(out.lines) == [("stdout", "hello\n"), ("stderr", "oops\n")]
 
 
-@pytest.mark.asyncio
 async def test_job_output_stream_close_delivers_sentinel():
     out = cronstable.job.JobOutputStream()
     queue = out.subscribe()
@@ -448,7 +438,6 @@ async def test_job_output_stream_close_delivers_sentinel():
     assert queue.get_nowait() is None  # end-of-stream sentinel
 
 
-@pytest.mark.asyncio
 async def test_job_output_stream_late_subscriber_gets_sentinel():
     # subscribing after the run finished must not block forever: the new
     # subscriber receives the end sentinel immediately, after the buffer.
@@ -460,7 +449,6 @@ async def test_job_output_stream_late_subscriber_gets_sentinel():
     assert list(out.lines) == [("stdout", "done\n")]
 
 
-@pytest.mark.asyncio
 async def test_job_output_stream_ring_buffer_bounds():
     out = cronstable.job.JobOutputStream(limit=3)
     for i in range(5):
@@ -523,7 +511,6 @@ async def test_job_output_stream_zero_limit_still_broadcasts():
         cronstable.job.JobOutputStream(limit=-1)
 
 
-@pytest.mark.asyncio
 async def test_job_output_stream_subscriber_queue_drops_oldest_when_full(
     monkeypatch,
 ):
@@ -543,7 +530,6 @@ async def test_job_output_stream_subscriber_queue_drops_oldest_when_full(
     assert queue.get_nowait() == ("stdout", "line 4\n")
 
 
-@pytest.mark.asyncio
 async def test_job_output_stream_sentinel_delivered_to_saturated_queue(
     monkeypatch,
 ):
@@ -561,7 +547,6 @@ async def test_job_output_stream_sentinel_delivered_to_saturated_queue(
     assert drained[-1] is None  # sentinel present despite the earlier overflow
 
 
-@pytest.mark.asyncio
 async def test_stream_reader_publishes_to_output():
     # the on_line hook wires StreamReader output into a JobOutputStream so the
     # web UI can tail lines live as the job produces them.
@@ -643,7 +628,6 @@ jobs:
         (False, "out", None, "Cron job 'test' failed", "out\n"),
     ],
 )
-@pytest.mark.asyncio
 async def test_report_mail(success, stdout, stderr, subject, body):
     conf = cronstable.config.parse_config_string(A_JOB, "")
     job_config = conf.jobs[0]
@@ -773,7 +757,6 @@ async def test_report_mail(success, stdout, stderr, subject, body):
         ),
     ],
 )
-@pytest.mark.asyncio
 async def test_report_sentry(  # noqa: C901
     success,
     dsn_from,
@@ -920,7 +903,6 @@ async def test_report_sentry(  # noqa: C901
         ),
     ],
 )
-@pytest.mark.asyncio
 async def test_report_shell(command, expected_output):
     stdout, stderr = None, None
     with tempfile.TemporaryDirectory() as tmp:
@@ -1067,7 +1049,6 @@ class _WebhookServer:
         (True, "Cron job 'test' completed"),
     ],
 )
-@pytest.mark.asyncio
 async def test_report_webhook(success, expected_subject):
     import json
 
@@ -1098,7 +1079,6 @@ async def test_report_webhook(success, expected_subject):
 
 
 @pytest.mark.parametrize("url_source", ["fromFile", "fromEnvVar"])
-@pytest.mark.asyncio
 async def test_report_webhook_url_sources(url_source, monkeypatch, tmp_path):
     server = _WebhookServer()
     async with server as url:
@@ -1118,7 +1098,6 @@ async def test_report_webhook_url_sources(url_source, monkeypatch, tmp_path):
     assert len(server.requests) == 1
 
 
-@pytest.mark.asyncio
 async def test_report_webhook_bad_url_keeps_the_secret_out_of_the_log(caplog):
     # webhook.url is a secret in this model (config.py documents it as one:
     # a Slack/Discord URL embeds its token) and the schema does not check
@@ -1161,7 +1140,6 @@ def test_scrub_url_in():
     assert scrub("invalid_payload", url) == "invalid_payload"
 
 
-@pytest.mark.asyncio
 async def test_report_webhook_error_body_cannot_echo_the_secret_url(caplog):
     # The response body is third-party text and the reporter logs it, so a
     # receiver that quotes the request target back (Express answers an
@@ -1202,7 +1180,6 @@ async def test_report_webhook_error_body_cannot_echo_the_secret_url(caplog):
     assert "<redacted>" in caplog.text
 
 
-@pytest.mark.asyncio
 async def test_report_webhook_undecodable_error_body_keeps_the_status(caplog):
     # A receiver whose error page does not match its own declared charset
     # (a latin-1 gateway page labelled utf-8) made aiohttp's strict
@@ -1248,7 +1225,6 @@ async def test_report_webhook_undecodable_error_body_keeps_the_status(caplog):
     assert "<redacted>" in caplog.text
 
 
-@pytest.mark.asyncio
 async def test_report_webhook_unencodable_body_is_not_a_request_failure(
     caplog, monkeypatch
 ):
@@ -1277,7 +1253,6 @@ async def test_report_webhook_unencodable_body_is_not_a_request_failure(
     assert "s3cr3tTOKEN" not in caplog.text
 
 
-@pytest.mark.asyncio
 async def test_report_webhook_idna_host_is_contained(caplog):
     # A host yarl accepts but idna rejects at connect time (a doubled dot)
     # raises UnicodeError out of getaddrinfo, which is NOT a ClientError,
@@ -1296,7 +1271,6 @@ async def test_report_webhook_idna_host_is_contained(caplog):
     assert "site-packages" not in caplog.text
 
 
-@pytest.mark.asyncio
 async def test_report_webhook_disabled():
     # with no url source configured (the default), the reporter must return
     # early without opening any HTTP session
@@ -1321,7 +1295,6 @@ jobs:
         )
 
 
-@pytest.mark.asyncio
 async def test_report_webhook_env_var_not_set(monkeypatch, caplog):
     monkeypatch.delenv("TEST_WEBHOOK_URL", raising=False)
     job_config, job = _webhook_setup(
@@ -1344,7 +1317,6 @@ async def test_report_webhook_env_var_not_set(monkeypatch, caplog):
     )
 
 
-@pytest.mark.asyncio
 async def test_report_webhook_from_file_unreadable_skips_cleanly(
     tmp_path, caplog
 ):
@@ -1369,7 +1341,6 @@ async def test_report_webhook_from_file_unreadable_skips_cleanly(
     )
 
 
-@pytest.mark.asyncio
 async def test_report_webhook_http_error(caplog):
     # a non-2xx response is logged at ERROR (with the response text) but must
     # not raise out of the reporter
@@ -1390,7 +1361,6 @@ async def test_report_webhook_http_error(caplog):
     )
 
 
-@pytest.mark.asyncio
 async def test_report_webhook_custom_method_and_body():
     server = _WebhookServer()
     async with server as url:
@@ -1413,7 +1383,6 @@ async def test_report_webhook_custom_method_and_body():
     assert request["body"] == "job test: rc=123"
 
 
-@pytest.mark.asyncio
 async def test_webhook_reports_share_one_pooled_connection():
     # Every report used to build its own ClientSession and pay a fresh TCP
     # connect (and, over https, a fresh TLS handshake) on the reaper, the one
@@ -1462,7 +1431,6 @@ def test_a_dead_loops_webhook_pool_is_swept_on_the_next_report():
         live_loop.close()
 
 
-@pytest.mark.asyncio
 async def test_webhook_pool_does_not_cap_reports_in_flight():
     # aiohttp's TCPConnector defaults to limit=100 connections. That default
     # was harmless while every report built its own connector (a cap of one,
@@ -1486,7 +1454,6 @@ async def test_webhook_pool_does_not_cap_reports_in_flight():
         await cronstable.job.close_webhook_pool()
 
 
-@pytest.mark.asyncio
 async def test_close_webhook_pool_releases_the_connections():
     # The pool outlives a report, so something has to close it at daemon
     # shutdown or aiohttp logs "Unclosed connector" on teardown (the same
@@ -1565,7 +1532,6 @@ def test_template_vars_key_sets_stay_in_step():
         ("bash", 'echo "hello"', "exec", _argv("bash", "-c", 'echo "hello"')),
     ],
 )
-@pytest.mark.asyncio
 async def test_job_run(
     monkeypatch, shell, command, expected_type, expected_args
 ):
@@ -1643,7 +1609,6 @@ jobs:
     assert args == expected_args
 
 
-@pytest.mark.asyncio
 async def test_capture_pipes_do_not_buffer_a_whole_maxlinelength():
     # The pipe's `limit` is asyncio's flow-control watermark, not a line cap:
     # asyncio pauses the child once twice that much output sits unread. It
@@ -1674,7 +1639,6 @@ async def test_capture_pipes_do_not_buffer_a_whole_maxlinelength():
     assert job.stdout == "hi\n"
 
 
-@pytest.mark.asyncio
 async def test_monitor_resources_populates_usage():
     # a monitored job records CPU time + peak RSS on the RunningJob, which the
     # reaper then folds into the run record / metrics.
@@ -1699,7 +1663,6 @@ async def test_monitor_resources_populates_usage():
     )
 
 
-@pytest.mark.asyncio
 async def test_monitor_resources_off_by_default():
     job = _running_job(
         "jobs:\n  - name: test\n"
@@ -1713,7 +1676,6 @@ async def test_monitor_resources_off_by_default():
     assert job.template_vars["cpu_seconds"] is None
 
 
-@pytest.mark.asyncio
 async def test_template_vars_carry_run_context(monkeypatch):
     # a report payload should identify the run: host, schedule, start instant,
     # and the durable-ledger run id (all new alongside the run's outcome).
@@ -1742,7 +1704,6 @@ async def test_template_vars_carry_run_context(monkeypatch):
     assert started == job.started_at.isoformat()
 
 
-@pytest.mark.asyncio
 async def test_template_vars_schedule_renders_object_form():
     # schedule_unparsed is Union[str, dict]; an object schedule must render to
     # its crontab line here just as it does for the shell reporter's
@@ -1757,7 +1718,6 @@ async def test_template_vars_schedule_renders_object_form():
     assert job.template_vars["schedule"] == "*/5 * * * *"
 
 
-@pytest.mark.asyncio
 async def test_execution_timeout():
     job = _running_job(
         "jobs:\n  - name: test\n"
@@ -1803,7 +1763,6 @@ async def _await_reaped(pid, timeout=10.0):
 @pytest.mark.skipif(
     IS_WINDOWS, reason="process groups (and killpg) are POSIX-only"
 )
-@pytest.mark.asyncio
 async def test_execution_timeout_kills_the_whole_process_group():
     # A job that leaves a helper behind (`sh -c 'helper & main'`) hits its
     # executionTimeout. Terminating only the process we spawned kills the
@@ -1826,7 +1785,6 @@ async def test_execution_timeout_kills_the_whole_process_group():
     )
 
 
-@pytest.mark.asyncio
 async def test_killed_job_with_an_escaped_descendant_still_finishes(
     monkeypatch,
 ):
@@ -1854,7 +1812,6 @@ async def test_killed_job_with_an_escaped_descendant_still_finishes(
     os.kill(helper_pid, signal.SIGKILL if not IS_WINDOWS else signal.SIGTERM)
 
 
-@pytest.mark.asyncio
 async def test_untouched_job_drain_is_not_bounded(monkeypatch):
     # The bound is only for a run we killed: a job left to exit on its own owns
     # its lifetime, and its output is not ours to cut short. Assert the gate,
@@ -1878,7 +1835,6 @@ async def test_untouched_job_drain_is_not_bounded(monkeypatch):
     assert joined and all(t is None for t in joined)
 
 
-@pytest.mark.asyncio
 async def test_error1():
     job = _running_job(
         "jobs:\n  - name: test\n"
@@ -1896,7 +1852,6 @@ async def test_error1():
         await job.wait()
 
 
-@pytest.mark.asyncio
 async def test_error2():
     job = _running_job(
         "jobs:\n  - name: test\n"
@@ -1908,7 +1863,6 @@ async def test_error2():
         await job.wait()
 
 
-@pytest.mark.asyncio
 async def test_error3():
     # cancel() with no process is a NO-OP, not a RuntimeError: callers cancel
     # whatever running_jobs holds (a failed spawn registers with proc=None),
@@ -1945,7 +1899,6 @@ def _statsd_job(port=9999, command=None, extra=""):
 @pytest.mark.parametrize(
     "command", [cmd_print(out="hello"), cmd_print(code=1)]
 )
-@pytest.mark.asyncio
 async def test_statsd(command):
     loop = asyncio.get_event_loop()
     received = []
@@ -1991,7 +1944,6 @@ async def test_statsd(command):
     assert any("the.prefix.duration" in r for r in received[1:])
 
 
-@pytest.mark.asyncio
 async def test_statsd_resource_metrics():
     # with monitorResources on, job_stopped also ships cpu + max_rss gauges.
     loop = asyncio.get_event_loop()
@@ -2027,7 +1979,6 @@ async def test_statsd_resource_metrics():
     assert any("the.prefix.max_rss:" in r for r in received)
 
 
-@pytest.mark.asyncio
 async def test_start_failure_reported_not_raised():
     # A command that cannot be launched (e.g. it does not exist) must be
     # treated as a normal job failure with exit code 127, not raise
@@ -2052,7 +2003,6 @@ jobs:
     assert job.failed
 
 
-@pytest.mark.asyncio
 async def test_start_failure_bare_oserror_reported_not_raised(monkeypatch):
     # REBOOT-LAUNCH-OSERROR: a bare OSError from create_subprocess_exec (fd /
     # process exhaustion -- EMFILE/ENFILE/ENOMEM/EAGAIN -- or EPERM/EACCES) is
@@ -2083,7 +2033,6 @@ jobs:
     assert job.failed
 
 
-@pytest.mark.asyncio
 async def test_start_failure_log_does_not_leak_the_child_environment(
     monkeypatch, caplog
 ):
@@ -2142,7 +2091,6 @@ def test_loggable_spawn_kwargs_leaves_other_keys_alone():
     assert kwargs["env"] == {"A": "secret-a", "B": "secret-b"}
 
 
-@pytest.mark.asyncio
 async def test_statsd_failure_does_not_crash(monkeypatch):
     # statsd is best-effort: a send error (e.g. an unresolvable host) must be
     # swallowed and not propagate out of start()/wait() to crash the scheduler.
@@ -2158,7 +2106,6 @@ async def test_statsd_failure_does_not_crash(monkeypatch):
     assert job.retcode == 0
 
 
-@pytest.mark.asyncio
 async def test_stalled_statsd_does_not_block_job_launch(monkeypatch):
     # Launches run under the daemon-wide 16-permit spawn gate; a statsd
     # host stalled in endpoint resolution (dead DNS, black-holed route)
@@ -2185,7 +2132,6 @@ async def test_stalled_statsd_does_not_block_job_launch(monkeypatch):
     assert sends  # the telemetry did go out once the host recovered
 
 
-@pytest.mark.asyncio
 async def test_finished_telemetry_task_exception_is_retrieved(
     monkeypatch, caplog
 ):
@@ -2237,7 +2183,6 @@ async def test_finished_telemetry_task_exception_is_retrieved(
         loop.set_exception_handler(old_handler)
 
 
-@pytest.mark.asyncio
 async def test_stop_telemetry_runtime_error_does_not_propagate(
     monkeypatch, caplog
 ):
@@ -2263,7 +2208,6 @@ async def test_stop_telemetry_runtime_error_does_not_propagate(
     assert "failed to send statsd job_stopped metric" in caplog.text
 
 
-@pytest.mark.asyncio
 async def test_report_mail_closes_connection_on_error():
     # if sending fails, the SMTP connection must still be closed (no leak).
     conf = cronstable.config.parse_config_string(A_JOB, "")
@@ -2408,7 +2352,6 @@ def test_demote_wraps_oserror(monkeypatch, failing_call, prefix):
 
 
 @pytest.mark.skipif(IS_WINDOWS, reason="preexec_fn is POSIX-only")
-@pytest.mark.asyncio
 async def test_start_wires_preexec_fn_only_when_demoting(monkeypatch):
     captured = []
 
@@ -2488,7 +2431,6 @@ _WD_COMMAND_FORMS = [
 ]
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("command_config, spawns", _WD_COMMAND_FORMS)
 async def test_start_passes_working_directory_as_cwd(
     monkeypatch, tmp_path, command_config, spawns
@@ -2533,7 +2475,6 @@ async def test_start_passes_working_directory_as_cwd(
     assert "cwd" not in captured[-1][1]
 
 
-@pytest.mark.asyncio
 async def test_bad_working_directory_is_a_start_failure_naming_cwd(
     caplog, tmp_path
 ):
@@ -2596,7 +2537,6 @@ def _priority_job_yaml(extra=""):
     )
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "extra, expected",
     [
@@ -2663,7 +2603,6 @@ async def test_start_carries_the_priority_to_both_platform_halves(
         assert captured[-1]["start_new_session"] is True
 
 
-@pytest.mark.asyncio
 async def test_refused_priority_neither_fails_nor_re_logs_the_run(
     monkeypatch, caplog
 ):
@@ -2808,7 +2747,6 @@ async def _capture_shell_reporter_env(
     return captured["env"]
 
 
-@pytest.mark.asyncio
 async def test_report_shell_full_env_contract(monkeypatch):
     # sentinel host: pins that CRONSTABLE_HOST is sourced from the daemon's
     # HOSTNAME rather than restating report_hostname()'s own expression.
@@ -2849,7 +2787,6 @@ async def test_report_shell_full_env_contract(monkeypatch):
     assert env["CRONSTABLE_LAST_SUCCESS_AT"] == ""
 
 
-@pytest.mark.asyncio
 async def test_report_shell_env_when_succeeded(monkeypatch):
     # FAILED tracks job.failed; a success exports "0" and an empty FAIL_REASON
     # (job.fail_reason is None -> ""), and None stdout/stderr collapse to "".
@@ -2868,7 +2805,6 @@ async def test_report_shell_env_when_succeeded(monkeypatch):
     assert env["CRONSTABLE_STDERR"] == ""
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "out_len, err_len, exp_out_trunc, exp_err_trunc, exp_out_len, exp_err_len",
     [
@@ -2901,7 +2837,6 @@ async def test_report_shell_truncates_large_output(
 # --- cancel() on a run that never spawned -----------------------------------
 
 
-@pytest.mark.asyncio
 async def test_cancel_with_no_process_is_noop():
     # A job whose command fails to spawn registers with proc=None and
     # start_failed (see start()). The Replace branch of maybe_launch_job and
@@ -2947,7 +2882,6 @@ jobs:
 )
 
 
-@pytest.mark.asyncio
 async def test_report_shell_hanging_reporter_is_killed():
     # report() runs INLINE on the reaper -- the daemon's only job-completion
     # loop -- so a reporter command that never exits used to freeze completion
@@ -2985,7 +2919,6 @@ def test_report_shell_timeout_defaults_to_60():
     assert report["shell"]["timeout"] == 60
 
 
-@pytest.mark.asyncio
 async def test_report_shell_combined_over_limit_is_not_truncated(monkeypatch):
     # DOCUMENTS CURRENT BEHAVIOR (and a latent gap): when stdout and stderr are
     # each under the 16 KiB per-arg limit but whose SUM exceeds it, the code
@@ -3508,8 +3441,6 @@ jobs:
 async def test_sentry_report_applies_environment_and_max_string_length(
     monkeypatch,
 ):
-    import sentry_sdk.utils
-
     conf = cronstable.config.parse_config_string(
         """
 jobs:
@@ -3583,11 +3514,11 @@ jobs:
 
     await cronstable.job.SentryReporter().report(False, job, report)
 
-    # maxStringLength was pushed into the sentry-sdk global
-    assert sentry_sdk.utils.MAX_STRING_LENGTH == 4096
-    # environment reached sentry_sdk.init -> the client options
+    # environment and maxStringLength reached sentry_sdk.init -> the client
+    # options
     assert transports
     assert transports[-1].args[0].get("environment") == "staging"
+    assert transports[-1].args[0].get("max_value_length") == 4096
     messages = [m for t in transports for m in t.messages_sent]
     assert len(messages) == 1
     msg = messages[0]
@@ -4194,7 +4125,6 @@ async def test_report_common_logs_reporter_exceptions(caplog):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_start_failure_embedded_nul_reported_not_raised():
     # create_subprocess_exec raises ValueError('embedded null byte') for a
     # NUL in an argument -- not a SubprocessError, not an OSError -- and it
@@ -4373,7 +4303,6 @@ def test_sla_breach_context_full_template_var_contract(monkeypatch):
     assert ctx.stderr_discarded == 0
 
 
-@pytest.mark.asyncio
 async def test_sla_breach_mail_report_renders_late_templates():
     # the onLate defaults swap the completed/failed wording for the overdue
     # templates; success=False means the empty-body suppression cannot bite.
@@ -4407,7 +4336,6 @@ async def test_sla_breach_mail_report_renders_late_templates():
     assert "Last success: 2020-01-01T10:00:00+00:00" in body
 
 
-@pytest.mark.asyncio
 async def test_sla_breach_mail_body_without_last_success():
     conf = cronstable.config.parse_config_string(_SLA_MAIL_JOB, "")
     job_config = conf.jobs[0]
@@ -4442,7 +4370,6 @@ async def test_sla_breach_mail_body_without_last_success():
     assert "Last success: (none recorded)" in message.get_payload()
 
 
-@pytest.mark.asyncio
 async def test_sla_breach_shell_report_exports_sla_env(monkeypatch):
     for key in [k for k in os.environ if k.startswith("CRONSTABLE_")]:
         monkeypatch.delenv(key, raising=False)
@@ -4484,7 +4411,6 @@ async def test_sla_breach_shell_report_exports_sla_env(monkeypatch):
     assert env["CRONSTABLE_CPU_SECONDS"] == ""
 
 
-@pytest.mark.asyncio
 async def test_sla_breach_webhook_report_default_late_body():
     import json
 
@@ -4538,7 +4464,6 @@ jobs:
 """
 
 
-@pytest.mark.asyncio
 async def test_sla_breach_sentry_report_uses_sla_fingerprint(monkeypatch):
     # the dsn must be declared in YAML: a parsed job's unoverridden report
     # subtrees alias DEFAULT_CONFIG, so an in-place dsn write here would
@@ -4603,7 +4528,6 @@ async def test_sla_breach_sentry_report_uses_sla_fingerprint(monkeypatch):
     assert msg["extra"]["success"] is False
 
 
-@pytest.mark.asyncio
 async def test_report_sla_breach_runs_all_four_real_reporters():
     # every real reporter accepts the context and early-returns on its null
     # default config: the whole default onLate block is a safe no-op.
@@ -4613,7 +4537,6 @@ async def test_report_sla_breach_runs_all_four_real_reporters():
     await cronstable.job.report_sla_breach(ctx, job_config.onLate["report"])
 
 
-@pytest.mark.asyncio
 async def test_report_sla_breach_gathers_and_logs_exceptions(
     monkeypatch, caplog
 ):
@@ -4785,7 +4708,6 @@ def test_pyinstaller_env_leaks_true_when_frozen(monkeypatch):
     assert cronstable.job.pyinstaller_env_leaks()
 
 
-@pytest.mark.asyncio
 async def test_spawn_scrubs_env_for_plain_jobs_on_leak(monkeypatch):
     # no environment:/extra_env, but _PYI_* in the daemon's environ: the
     # spawn must pass an explicit scrubbed env rather than let the child
@@ -4803,7 +4725,6 @@ async def test_spawn_scrubs_env_for_plain_jobs_on_leak(monkeypatch):
     assert job.env is None
 
 
-@pytest.mark.asyncio
 async def test_spawn_keeps_plain_inherit_without_leak(monkeypatch):
     # unfrozen and clean: no env kwarg at all, the child keeps inheriting
     # the daemon's environ byte for byte as it always has.
@@ -4816,7 +4737,6 @@ async def test_spawn_keeps_plain_inherit_without_leak(monkeypatch):
     assert "env" not in kwargs
 
 
-@pytest.mark.asyncio
 async def test_spawn_config_environment_wins_over_scrub(monkeypatch):
     # explicit environment: entries overlay after the strip, so a job can
     # still set a _PYI_* var deliberately; self.env keeps feeding templates.
@@ -4833,7 +4753,6 @@ async def test_spawn_config_environment_wins_over_scrub(monkeypatch):
     assert job.env is kwargs["env"]
 
 
-@pytest.mark.asyncio
 async def test_shell_reporter_env_scrubbed(monkeypatch):
     # reporter commands launch frozen binaries too; same scrub as jobs.
     captured = _spawn_recorder(monkeypatch)

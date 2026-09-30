@@ -116,7 +116,6 @@ def test_resource_usage_from_dict_defaults_samples():
 # ---- ResourceMonitor lifecycle -------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_monitor_samples_a_real_process():
     proc = await _spawn_busy(0.6)
     monitor = ResourceMonitor(proc.pid, interval=0.05)
@@ -131,7 +130,6 @@ async def test_monitor_samples_a_real_process():
     assert usage.max_rss_bytes > 0
 
 
-@pytest.mark.asyncio
 async def test_monitor_live_snapshot():
     proc = await _spawn_busy(0.6)
     monitor = ResourceMonitor(proc.pid, interval=0.05)
@@ -175,7 +173,6 @@ class _FakeProcess:
         return list(self.child_list)
 
 
-@pytest.mark.asyncio
 async def test_monitor_accumulates_sequential_children():
     # regression: an `sh -c 'a; b'` style run, where one child exits before
     # the next starts, must accumulate every child's CPU time rather than
@@ -211,7 +208,6 @@ async def test_monitor_accumulates_sequential_children():
     assert snap["cpu_seconds"] == pytest.approx(19.2)
 
 
-@pytest.mark.asyncio
 async def test_monitor_transient_read_failure_does_not_double_count():
     # regression: a member that stays in the tree but fails one read (a
     # transient AccessDenied) has not departed -- its last reading must be
@@ -295,7 +291,6 @@ def test_node_sampler_snapshot_is_memoised(monkeypatch):
     assert len(calls) == 2
 
 
-@pytest.mark.asyncio
 async def test_monitor_stop_is_idempotent():
     proc = await _spawn_busy(0.2)
     monitor = ResourceMonitor(proc.pid, interval=0.05)
@@ -307,7 +302,6 @@ async def test_monitor_stop_is_idempotent():
     assert first == second
 
 
-@pytest.mark.asyncio
 async def test_monitor_bogus_pid_is_inert():
     # a pid that is (almost certainly) not a live process: the monitor must
     # stay inert and yield no usage rather than raising.
@@ -317,7 +311,6 @@ async def test_monitor_bogus_pid_is_inert():
     assert await monitor.stop() is None
 
 
-@pytest.mark.asyncio
 async def test_monitor_without_psutil_is_noop(monkeypatch):
     # simulate a checkout without the optional import resolving.
     monkeypatch.setattr("cronstable.resources.psutil", None)
@@ -683,7 +676,6 @@ def test_resource_usage_series_parse_is_capped():
 # ---- ResourceMonitor series capture ----------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_monitor_records_chart_series():
     proc = await _spawn_busy(0.6)
     monitor = ResourceMonitor(proc.pid, interval=0.05)
@@ -702,7 +694,6 @@ async def test_monitor_records_chart_series():
     assert max(p[2] for p in usage.series) <= usage.max_rss_bytes
 
 
-@pytest.mark.asyncio
 async def test_monitor_history_zero_disables_series():
     proc = await _spawn_busy(0.4)
     monitor = ResourceMonitor(
@@ -724,7 +715,6 @@ def test_node_sampler_history_none_before_start():
     assert NodeResourceSampler().history() is None
 
 
-@pytest.mark.asyncio
 async def test_node_sampler_history_records_and_bounds():
     sampler = NodeResourceSampler()
     sampler.start_history(interval=0.05, points=10)
@@ -743,7 +733,6 @@ async def test_node_sampler_history_records_and_bounds():
         await sampler.stop_history()
 
 
-@pytest.mark.asyncio
 async def test_node_sampler_history_reconfigure_keeps_points():
     sampler = NodeResourceSampler()
     sampler.start_history(interval=0.05, points=10)
@@ -764,7 +753,6 @@ async def test_node_sampler_history_reconfigure_keeps_points():
         await sampler.stop_history()
 
 
-@pytest.mark.asyncio
 async def test_node_sampler_history_without_psutil(monkeypatch):
     monkeypatch.setattr(resources, "psutil", None)
     sampler = NodeResourceSampler()

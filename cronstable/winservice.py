@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
-from typing import Any, Optional
+from typing import Any
 
 from cronstable import platform
 
@@ -173,7 +173,7 @@ def display_name(name: str) -> str:
     return "cronstable scheduler ({})".format(name)
 
 
-def frozen_layout(executable: str, meipass: Optional[str]) -> str:
+def frozen_layout(executable: str, meipass: str | None) -> str:
     """Which packaging shape this process is: source, onedir or onefile.
 
     It decides whether ``install`` can succeed at all, so it is a three-way
@@ -209,7 +209,7 @@ def host_argv(
     *,
     config: str,
     name: str,
-    log_file: Optional[str],
+    log_file: str | None,
     no_log_file: bool,
     console: bool,
     log_level: str,
@@ -377,10 +377,10 @@ def failure_actions_plan(
 
 def bootstrap_log_path(
     config: str,
-    log_file: Optional[str],
+    log_file: str | None,
     *,
     config_is_dir: bool,
-    program_data: Optional[str],
+    program_data: str | None,
 ) -> str:
     """Where ``service run`` writes before the configuration is parsed.
 
@@ -408,7 +408,7 @@ def bootstrap_log_path(
 _LOG_NAME = "cronstable-service.log"
 
 
-def config_is_user_scoped(config: str, user_profile: Optional[str]) -> bool:
+def config_is_user_scoped(config: str, user_profile: str | None) -> bool:
     """Whether ``config`` lives under the installing user's own profile.
 
     A service runs as LocalSystem, whose profile is not this one, so a
@@ -1146,8 +1146,8 @@ class ServiceHost:
         self._cron: Any = None
         self._loop: Any = None
         self._checkpoint = 0
-        self._pump_stop: Optional[threading.Event] = None
-        self._pump: Optional[threading.Thread] = None
+        self._pump_stop: threading.Event | None = None
+        self._pump: threading.Thread | None = None
         self._exit_code = 0
         self._specific_exit = 0
 
@@ -1726,7 +1726,7 @@ def dispatch(
     *,
     run_daemon: Callable[..., None],
     new_event_loop: Callable[[], Any],
-    api: Optional[WinApi] = None,
+    api: WinApi | None = None,
 ) -> int:
     """Route ``cronstable service <action>``.
 

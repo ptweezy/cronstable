@@ -30,7 +30,7 @@ than re-deriving it from a possibly-changed upstream output.
 import re
 from collections.abc import Collection
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from cronstable import _json
 
@@ -160,7 +160,7 @@ class TaskSpec:
     trigger_rule: str = ALL_SUCCESS
     max_attempts: int = 1
     retry_delay: float = 0.0
-    expand: Optional[ExpandSpec] = None
+    expand: ExpandSpec | None = None
     # sensor poke schedule (bounded, jittered, durable)
     poke_interval: float = 30.0
     poke_timeout: float = 3600.0
@@ -365,7 +365,7 @@ def xcom_name(taskkey: str, key: str) -> str:
     return "{}/{}".format(taskkey, key)
 
 
-def task_display_key(task_id: str, map_index: Optional[int]) -> str:
+def task_display_key(task_id: str, map_index: int | None) -> str:
     """The per-instance key: ``id`` or ``id#<map_index>`` for a mapped run."""
     if map_index is None:
         return task_id
@@ -385,7 +385,7 @@ def new_run_body(
     dag: str,
     run_key: str,
     run_id: str,
-    logical_date: Optional[str],
+    logical_date: str | None,
     kind: str,
     now: float,
     spec: DagSpec,
@@ -464,7 +464,7 @@ class LaunchIntent:
 
     task_id: str
     taskkey: str
-    map_index: Optional[int]
+    map_index: int | None
     map_item: Any
     attempt: int
     is_sensor: bool
@@ -499,7 +499,7 @@ class ReconcileAdvanceResult:
     # upstream XCom lists and run :func:`plan_and_claim` as a second RMW.
     expansions_needed: bool = False
     # the claim half's result when it ran inside this same RMW.
-    advance: Optional[AdvanceResult] = None
+    advance: AdvanceResult | None = None
 
 
 # --------------------------------------------------------------------------
@@ -745,7 +745,7 @@ def plan_and_claim(
     now: float,
     proc: str,
     host: str,
-    expansions: dict[str, Optional[list[Any]]],
+    expansions: dict[str, list[Any] | None],
 ):
     """Build the ``mutate_document`` transform that advances one run.
 
@@ -770,7 +770,7 @@ def plan_and_claim(
     """
 
     def transform(
-        body: Optional[dict[str, Any]],
+        body: dict[str, Any] | None,
     ) -> tuple[Any, AdvanceResult]:
         result = AdvanceResult()
         if body is None or is_terminal_run(body):
@@ -817,7 +817,7 @@ def is_keep(value: Any) -> bool:
 def _apply_expansions(
     spec: DagSpec,
     body: dict[str, Any],
-    expansions: dict[str, Optional[list[Any]]],
+    expansions: dict[str, list[Any] | None],
     now: float,
     result: AdvanceResult,
 ) -> None:
@@ -881,7 +881,7 @@ def _apply_expansions(
 
 def _instances_of(
     spec: DagSpec, body: dict[str, Any], task: TaskSpec
-) -> list[tuple[str, Optional[int], Any]]:
+) -> list[tuple[str, int | None, Any]]:
     """The concrete (taskkey, map_index, item) instances of ``task``.
 
     A plain task is one instance keyed by its id; a mapped task is its
@@ -947,7 +947,7 @@ def _propagate_and_claim(
                 # deliberately skipped: a task a reload added after the run
                 # was created, which the terminaliser skips as well
                 continue
-            verdict: Optional[str] = None
+            verdict: str | None = None
             if entry.get("state") == PENDING:
                 if (
                     result.deferred
@@ -1446,7 +1446,7 @@ def _is_quiescent(
     body: dict[str, Any],
     now: float,
     proc: str,
-    expansions: Optional[dict[str, Optional[list[Any]]]],
+    expansions: dict[str, list[Any] | None] | None,
 ) -> bool:
     """Whether an advance pass over ``body`` provably cannot change it.
 
@@ -1648,10 +1648,10 @@ def _q_blocked(
 def set_task_pid(
     taskkey: str,
     proc: str,
-    pid: Optional[int],
+    pid: int | None,
     now: float,
     *,
-    attempt: Optional[int] = None,
+    attempt: int | None = None,
 ):
     """Transform recording the OS pid of a just-launched task instance.
 
@@ -1689,7 +1689,7 @@ def set_task_pid(
 
 
 def set_task_pids(
-    entries: list[tuple[str, str, Optional[int], Optional[int]]],
+    entries: list[tuple[str, str, int | None, int | None]],
     now: float,
 ):
     """Transform recording a whole launch batch's OS pids in ONE RMW.
@@ -1806,15 +1806,15 @@ def mark_task_finished(
     taskkey: str,
     *,
     success: bool,
-    exit_code: Optional[int],
-    fail_reason: Optional[str],
+    exit_code: int | None,
+    fail_reason: str | None,
     now: float,
     task: TaskSpec,
     jitter: float = 0.0,
-    expected_proc: Optional[str] = None,
-    expected_attempt: Optional[int] = None,
-    expected_poke: Optional[int] = None,
-    resources: Optional[dict[str, Any]] = None,
+    expected_proc: str | None = None,
+    expected_attempt: int | None = None,
+    expected_poke: int | None = None,
+    resources: dict[str, Any] | None = None,
 ):
     """Transform moving a finished instance to its terminal (or retry) state.
 
@@ -2163,7 +2163,7 @@ def reconcile_and_plan(
     """
 
     def transform(
-        body: Optional[dict[str, Any]],
+        body: dict[str, Any] | None,
     ) -> tuple[Any, ReconcileAdvanceResult]:
         advance = AdvanceResult()
         result = ReconcileAdvanceResult(advance=advance)

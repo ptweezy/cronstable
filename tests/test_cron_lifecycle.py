@@ -144,7 +144,6 @@ JOB_THAT_FAILS = (
         ),
     ],
 )
-@pytest.mark.asyncio
 async def test_simple(tracing_running_job, config_yaml, expected_events):
     cron = cronstable.cron.Cron(None, config_yaml=config_yaml)
 
@@ -183,7 +182,6 @@ RETRYING_JOB_THAT_FAILS = (
 )
 
 
-@pytest.mark.asyncio
 async def test_fail_retry(tracing_running_job):
     cron = cronstable.cron.Cron(None, config_yaml=RETRYING_JOB_THAT_FAILS)
 
@@ -246,7 +244,6 @@ JOB_THAT_HANGS = (
 )
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("spawn_delay", [0, 0.3])
 async def test_execution_timeout(tracing_running_job, monkeypatch, spawn_delay):
     cron = cronstable.cron.Cron(None, config_yaml=JOB_THAT_HANGS)
@@ -306,7 +303,6 @@ async def test_execution_timeout(tracing_running_job, monkeypatch, spawn_delay):
 
 
 @pytest.mark.parametrize("policy", ["Allow", "Forbid", "Replace"])
-@pytest.mark.asyncio
 async def test_concurrency_policy(policy):
     # Launch the same long-running job twice and assert the second launch is
     # handled per the policy. Driven directly (no wall-clock dependence) so it
@@ -350,7 +346,6 @@ async def test_concurrency_policy(policy):
             await rj.wait()
 
 
-@pytest.mark.asyncio
 async def test_concurrent_launches_cannot_double_start_a_forbid_job(
     monkeypatch,
 ):
@@ -406,7 +401,6 @@ FAILED_SPAWN_REPLACE_JOB = (
 )
 
 
-@pytest.mark.asyncio
 async def test_replace_policy_survives_failed_spawn():
     # A spawn failure registers the instance with proc=None (start_failed);
     # the next fire's Replace branch then cancels whatever running_jobs holds.
@@ -431,7 +425,6 @@ async def test_replace_policy_survives_failed_spawn():
     assert first.retcode == 127
 
 
-@pytest.mark.asyncio
 async def test_handle_finished_job_skips_replaced(monkeypatch):
     # a job cancelled to make way for a replacement must not be reported as a
     # success or failure (and must not trigger retries).
@@ -469,7 +462,6 @@ async def test_handle_finished_job_skips_replaced(monkeypatch):
     assert "test" not in cron.run_history  # nor added to history
 
 
-@pytest.mark.asyncio
 async def test_handle_finished_job_replaced_busts_memos(monkeypatch):
     # a replaced instance records no run row, but its removal still flips
     # the payload's running flag: the memo bust must fire before the
@@ -500,7 +492,6 @@ async def test_handle_finished_job_replaced_busts_memos(monkeypatch):
     assert "test" not in cron.running_jobs
 
 
-@pytest.mark.asyncio
 async def test_handle_finished_job_reports_normal_failure(monkeypatch):
     from types import SimpleNamespace
 
@@ -541,7 +532,6 @@ async def test_handle_finished_job_reports_normal_failure(monkeypatch):
     assert [r.outcome for r in cron.run_history["test"]] == ["failure"]
 
 
-@pytest.mark.asyncio
 async def test_reaper_finishes_whole_batch_when_one_job_raises(
     monkeypatch, caplog
 ):
@@ -640,7 +630,6 @@ async def test_reaper_finishes_whole_batch_when_one_job_raises(
     assert not any("bug (3)" in m for m in messages)
 
 
-@pytest.mark.asyncio
 async def test_reaper_flushes_completions_even_when_the_batch_unwinds(
     monkeypatch,
 ):
@@ -717,7 +706,6 @@ class _EventRunningJob:
         asyncio.current_task().add_done_callback(lambda _t: self.filed.set())
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("count", [100, 200])
 async def test_reaper_registration_work_is_linear(monkeypatch, count):
     cron = Cron(None)
@@ -763,7 +751,6 @@ async def test_reaper_registration_work_is_linear(monkeypatch, count):
     )
 
 
-@pytest.mark.asyncio
 async def test_reaper_registers_launches_while_idle_and_busy(monkeypatch):
     cron = Cron(None)
     parked = asyncio.Event()
@@ -802,7 +789,6 @@ async def test_reaper_registers_launches_while_idle_and_busy(monkeypatch):
     assert not cron._reaper_pending
 
 
-@pytest.mark.asyncio
 async def test_reaper_drains_launch_during_completion_handler(monkeypatch):
     cron = Cron(None)
     first, second = (
@@ -841,7 +827,6 @@ async def test_reaper_drains_launch_during_completion_handler(monkeypatch):
     assert not cron._reaper_pending
 
 
-@pytest.mark.asyncio
 async def test_reaper_releases_removed_pending_instance_and_parks(monkeypatch):
     import gc
     import weakref
@@ -873,7 +858,6 @@ async def test_reaper_releases_removed_pending_instance_and_parks(monkeypatch):
         await asyncio.wait_for(reaper, timeout=2)
 
 
-@pytest.mark.asyncio
 async def test_reaper_retries_handler_failure_before_instance_removal(
     monkeypatch, caplog
 ):
@@ -899,7 +883,6 @@ async def test_reaper_retries_handler_failure_before_instance_removal(
     assert "bug (6)" in caplog.text
 
 
-@pytest.mark.asyncio
 async def test_reaper_parks_between_batches(monkeypatch):
     # The reaper clears `completed` at the start of every batch. Without
     # the clear, the standing completion wait resolves at once on every
@@ -934,7 +917,6 @@ async def test_reaper_parks_between_batches(monkeypatch):
     assert flushes <= 3
 
 
-@pytest.mark.asyncio
 async def test_reaper_handles_a_completion_filed_mid_batch_without_parking(
     monkeypatch,
 ):
@@ -1003,7 +985,6 @@ RETRYING_JOB_THAT_FAILS2 = (
 )
 
 
-@pytest.mark.asyncio
 async def test_concurrency_and_backoff(monkeypatch, tracing_running_job):  # noqa: C901
     # This test runs against the REAL wall clock (get_now maps perf_counter
     # 1:1 onto simulated time from START_TIME), spawning two real subprocesses:
@@ -1115,7 +1096,6 @@ def test_naturaltime(value_in, out):
     assert got_out == out
 
 
-@pytest.mark.asyncio
 async def test_schedule_retry_job_disappeared():
     # a job removed from config while a retry is pending must not raise
     # UnboundLocalError; the retry is simply skipped.
@@ -1124,7 +1104,6 @@ async def test_schedule_retry_job_disappeared():
     assert "nonexistent" not in cron.retry_state
 
 
-@pytest.mark.asyncio
 async def test_schedule_retry_job_abandoned_when_no_longer_owner():
     # H1 regression: a retry can outlive the leadership it started under (a
     # partition / quorum loss moved ownership while it slept). It must re-check
@@ -1157,7 +1136,6 @@ async def test_schedule_retry_job_abandoned_when_no_longer_owner():
     assert state.cancelled is True
 
 
-@pytest.mark.asyncio
 async def test_schedule_retry_job_survives_transient_gate_blip(monkeypatch):
     # A retry waking during a TRANSIENT fail-closed condition (lost quorum, a
     # nodeName/size/policy conflict, a backend read error) must NOT abandon
@@ -1201,7 +1179,6 @@ async def test_schedule_retry_job_survives_transient_gate_blip(monkeypatch):
     assert launched == ["j"]  # the kept retry relaunched the job
 
 
-@pytest.mark.asyncio
 async def test_schedule_retry_job_defers_during_unsettled_view(
     monkeypatch, caplog
 ):
@@ -1263,7 +1240,6 @@ async def test_schedule_retry_job_defers_during_unsettled_view(
     # covered by test_schedule_retry_job_abandoned_when_no_longer_owner)
 
 
-@pytest.mark.asyncio
 async def test_retry_abandonment_cancels_state_and_records(caplog):
     # The ownership-move abandonment must (a) set state.cancelled BEFORE
     # dropping the state: a RunningJob launched while the retry sat pending
@@ -1367,7 +1343,6 @@ def test_cluster_allows_fails_closed_on_backend_error():
     assert cron._cluster_allows(every) is True
 
 
-@pytest.mark.asyncio
 async def test_run_survives_config_error(tmp_path, monkeypatch, run_cron):
     # If the reparse raises (e.g. the config became invalid on reload), run()
     # must log it and keep running the previously-loaded jobs, not crash with
@@ -1404,7 +1379,6 @@ async def test_run_survives_config_error(tmp_path, monkeypatch, run_cron):
     assert cron.metrics._last_reload_ok is False
 
 
-@pytest.mark.asyncio
 async def test_config_guard_runs_before_every_parse(
     tmp_path, monkeypatch, run_cron
 ):
@@ -2113,7 +2087,6 @@ def _pend_reboot(cron, job=None, *, present=True):
         ),
     ],
 )
-@pytest.mark.asyncio
 async def test_deferred_reboot_gate(
     reboot_cron,
     election,
@@ -2134,7 +2107,6 @@ async def test_deferred_reboot_gate(
         assert mgr.reboot_ran("boot") is expect_ran
 
 
-@pytest.mark.asyncio
 async def test_deferred_reboot_paused_owner_keeps_it_pending(reboot_cron):
     # A pause defers a deferred @reboot one-shot's boot run instead of
     # forfeiting it: the cluster's once-per-boot token must not be spent on
@@ -2162,7 +2134,6 @@ async def test_deferred_reboot_paused_owner_keeps_it_pending(reboot_cron):
     assert mgr.reboot_ran("boot") is True
 
 
-@pytest.mark.asyncio
 async def test_deferred_reboot_records_before_launch(reboot_cron, monkeypatch):
     # At-most-once crash safety: the deferred-@reboot owner MUST record
     # intent-to-run (mark_reboot_ran, which eagerly gossips/persists) BEFORE
@@ -2193,7 +2164,6 @@ async def test_deferred_reboot_records_before_launch(reboot_cron, monkeypatch):
     assert events == ["record", "launch"]
 
 
-@pytest.mark.asyncio
 async def test_deferred_reboot_leader_runs_when_identity_differs(reboot_cron):
     # H3 regression: a lease backend reports leader_name() as the holder's
     # display *identity* (e.g. cluster.kubernetes.identity), which may
@@ -2230,7 +2200,6 @@ async def test_deferred_reboot_leader_runs_when_identity_differs(reboot_cron):
     assert "boot" not in cron._pending_reboot_jobs
 
 
-@pytest.mark.asyncio
 async def test_deferred_reboot_leader_runs_after_owner_lands_here(reboot_cron):
     # #8 (continued from the kept_when_other_owns row): because we kept
     # waiting instead of dropping, the one-shot still runs when leadership
@@ -2246,7 +2215,6 @@ async def test_deferred_reboot_leader_runs_after_owner_lands_here(reboot_cron):
     assert launched == ["boot"] and "boot" not in cron._pending_reboot_jobs
 
 
-@pytest.mark.asyncio
 async def test_deferred_reboot_kept_when_absent_election_disabled(reboot_cron):
     # #4 (election-disabled path): the same never-lose rule holds when election
     # was turned off on a reload -- a momentarily-absent name is kept pending,
@@ -2265,7 +2233,6 @@ async def test_deferred_reboot_kept_when_absent_election_disabled(reboot_cron):
     assert not cron._pending_reboot_jobs
 
 
-@pytest.mark.asyncio
 async def test_deferred_reboot_election_disabled_skips_non_reboot_reuse(
     reboot_cron,
 ):
@@ -2287,7 +2254,6 @@ async def test_deferred_reboot_election_disabled_skips_non_reboot_reuse(
     assert "boot" not in cron._pending_reboot_jobs  # stale entry retired
 
 
-@pytest.mark.asyncio
 async def test_deferred_reboot_kept_on_transient_absence(reboot_cron):
     # #4: @reboot only defers at startup, so if a name momentarily vanishes
     # from cron_jobs mid-reload (templating glitch, transient remove-then-
@@ -2308,7 +2274,6 @@ async def test_deferred_reboot_kept_on_transient_absence(reboot_cron):
     assert "boot" not in cron._pending_reboot_jobs
 
 
-@pytest.mark.asyncio
 async def test_deferred_reboot_absent_job_never_runs(reboot_cron):
     # a deliberately-removed @reboot job that never returns must never run,
     # even though we keep it pending: the launch is gated on presence.
@@ -2320,7 +2285,6 @@ async def test_deferred_reboot_absent_job_never_runs(reboot_cron):
     assert launched == []  # removed-and-gone -> never runs
 
 
-@pytest.mark.asyncio
 async def test_deferred_reboot_runs_current_config_on_name_reuse(reboot_cron):
     # #4 name-reuse edge: if a name is removed and later re-added for a
     # DIFFERENT @reboot job, the owner runs the CURRENT cron_jobs[name], never
@@ -2337,7 +2301,6 @@ async def test_deferred_reboot_runs_current_config_on_name_reuse(reboot_cron):
     assert "boot" not in cron._pending_reboot_jobs
 
 
-@pytest.mark.asyncio
 async def test_deferred_reboot_retired_when_name_reused_non_deferrable(
     reboot_cron,
 ):
@@ -2359,7 +2322,6 @@ async def test_deferred_reboot_retired_when_name_reused_non_deferrable(
     assert "boot" not in cron._pending_reboot_jobs  # stale entry retired
 
 
-@pytest.mark.asyncio
 async def test_spawn_jobs_defers_reboot_leader_at_startup(reboot_cron):
     config = parse_config_string(
         "jobs:\n  - name: boot\n    command: echo hi\n"
@@ -2403,7 +2365,6 @@ async def test_spawn_jobs_defers_reboot_leader_at_startup(reboot_cron):
     assert "boot" in cron._pending_reboot_jobs
 
 
-@pytest.mark.asyncio
 async def test_web_start_deferred_reboot_retires_pending_and_marks_ran(
     reboot_cron,
 ):
@@ -2432,7 +2393,6 @@ async def test_web_start_deferred_reboot_retires_pending_and_marks_ran(
     assert launched == ["boot"]
 
 
-@pytest.mark.asyncio
 async def test_web_start_deferred_reboot_without_manager(reboot_cron):
     # the same manual start with no manager running (backend failed to start)
     # must still retire the pending entry -- the local re-run protection --
@@ -2451,7 +2411,6 @@ async def test_web_start_deferred_reboot_without_manager(reboot_cron):
     assert "boot" not in cron._pending_reboot_jobs
 
 
-@pytest.mark.asyncio
 async def test_web_start_deferred_reboot_concurrent_requests(reboot_cron):
     # Reviewer race: two concurrent POST /jobs/{name}/start for the SAME
     # still-pending @reboot name can both pass the pending check before the
@@ -2483,7 +2442,6 @@ async def test_web_start_deferred_reboot_concurrent_requests(reboot_cron):
     assert mgr.reboot_ran("boot") is True  # ...and recorded cluster-wide
 
 
-@pytest.mark.asyncio
 async def test_cluster_start_survives_bad_cert_files(caplog):
     # #6: a missing/unreadable cert file is an operational misconfiguration --
     # start_stop_cluster must log it and keep running (no manager), NOT let the
@@ -2501,7 +2459,6 @@ async def test_cluster_start_survives_bad_cert_files(caplog):
     assert any("failed to start" in r.message for r in caplog.records)
 
 
-@pytest.mark.asyncio
 async def test_cluster_restarts_on_in_place_cert_rotation(caplog):
     # an in-place cert rotation leaves the config bytes identical, so the
     # restart-on-config-change check alone never fires; the manager must also
@@ -2543,7 +2500,6 @@ async def test_cluster_restarts_on_in_place_cert_rotation(caplog):
     assert cron.cluster_manager is None
 
 
-@pytest.mark.asyncio
 async def test_cluster_cert_rotation_keeps_manager_when_unloadable(caplog):
     # #6: a half-written / briefly-absent cert observed mid-rotation must NOT
     # tear the manager down. The rotation signal fires (tls_files_changed) but
@@ -2612,7 +2568,6 @@ class _ConfigChangeFakeMgr:
         self.stopped = True
 
 
-@pytest.mark.asyncio
 async def test_cluster_config_change_keeps_manager_when_new_tls_unloadable(
     caplog,
 ):
@@ -2636,7 +2591,6 @@ async def test_cluster_config_change_keeps_manager_when_new_tls_unloadable(
     assert any("not yet loadable" in r.message for r in caplog.records)
 
 
-@pytest.mark.asyncio
 async def test_cluster_config_change_tears_down_when_new_tls_loadable(
     monkeypatch,
 ):
@@ -2666,7 +2620,6 @@ def _observability_toggle_yamls():
     )
 
 
-@pytest.mark.asyncio
 async def test_cluster_observability_only_change_keeps_manager_reconciles():
     # An observability-only edit (shareNodeStats toggled; the election
     # section untouched) must NOT restart the election manager -- on a lease
@@ -2725,7 +2678,6 @@ jobs:
 """
 
 
-@pytest.mark.asyncio
 async def test_run_reloads_changed_config(tmp_path, monkeypatch, run_cron):
     # tiny sleep so the reload loop iterates quickly instead of waiting out the
     # real ~60s to the next minute boundary.
@@ -2752,7 +2704,6 @@ async def test_run_reloads_changed_config(tmp_path, monkeypatch, run_cron):
     assert cron.job_set_id() != id1
 
 
-@pytest.mark.asyncio
 async def test_signal_reload_wakes_the_loop_and_forces_reparse(
     tmp_path, monkeypatch, run_cron
 ):
@@ -2798,7 +2749,6 @@ jobs:
 """
 
 
-@pytest.mark.asyncio
 async def test_signal_reload_is_immediate_in_subminute_mode(
     tmp_path, monkeypatch, run_cron
 ):
@@ -2844,7 +2794,6 @@ _RETRY_DRAIN_JOB = (
 )
 
 
-@pytest.mark.asyncio
 async def test_run_drains_pending_retry_on_shutdown(run_cron):
     # the @reboot job fails at once and schedules a retry with a long delay,
     # so a pending (sleeping) retry task sits in retry_state when we shut down.
@@ -2928,7 +2877,6 @@ cluster:
 """
 
 
-@pytest.mark.asyncio
 async def test_web_config_error_does_not_disengage_cluster_gate(
     tmp_path, monkeypatch, caplog, run_cron
 ):
@@ -2963,7 +2911,6 @@ async def test_web_config_error_does_not_disengage_cluster_gate(
     assert cron._cluster_allows(cron.cron_jobs["gated"]) is False
 
 
-@pytest.mark.asyncio
 async def test_shutdown_stops_cluster_manager_before_job_drain():
     # Shutdown cancels retries and releases leadership before waiting for
     # running jobs, so a slow local job does not delay failover.
@@ -3017,7 +2964,6 @@ async def test_shutdown_stops_cluster_manager_before_job_drain():
     assert not cron.running_jobs  # ...and the drain then completed
 
 
-@pytest.mark.asyncio
 async def test_shutdown_closes_the_pooled_webhook_connections():
     # WebhookReporter keeps one connection pool per loop so reports stop
     # paying a connect and a TLS handshake each. Nothing reclaims that pool
@@ -3099,7 +3045,6 @@ class _ShutdownReq:
         return self._store.get(key, default)
 
 
-@pytest.mark.asyncio
 async def test_web_shutdown_refused_without_authentication():
     # POST /shutdown is fail-closed: with no auth middleware there is no
     # matched token, and an unauthenticated listener must not hand every
@@ -3118,7 +3063,6 @@ async def test_web_shutdown_refused_without_authentication():
     assert not cron._stop_event.is_set()
 
 
-@pytest.mark.asyncio
 async def test_web_shutdown_with_a_token_signals_the_drain():
     # an authenticated caller gets the same graceful drain Ctrl-C/SIGTERM
     # trigger; this is the stop path for service wrappers and supervisors
@@ -3136,7 +3080,6 @@ async def test_web_shutdown_with_a_token_signals_the_drain():
     assert cron._stop_event.is_set()
 
 
-@pytest.mark.asyncio
 async def test_fleet_job_summaries_snapshot():
     # the compact per-job snapshot gossiped to peers for the fleet view:
     # lean fixed-shape entries only -- notably no fail_reason (arbitrary

@@ -48,7 +48,6 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import (
     Any,
-    Optional,
     TypeVar,
     cast,
 )
@@ -92,7 +91,7 @@ SCHEME_VERSION = SCHEMA_VERSION
 # leaving it to be quarantined on read).  Empty while v1 is the only
 # shipped scheme.
 RECORD_MIGRATIONS: dict[
-    str, Callable[[dict[str, Any]], Optional[dict[str, Any]]]
+    str, Callable[[dict[str, Any]], dict[str, Any] | None]
 ] = {}
 
 # Streams never garbage collected regardless of manifests: the store's
@@ -312,7 +311,7 @@ def _fs_safe_fragment(fragment: str) -> str:
     )
 
 
-def _decode_fs_token(token: str) -> Optional[str]:
+def _decode_fs_token(token: str) -> str | None:
     """The logical name a non-truncated ``_fs_safe`` token encodes, or None.
 
     Inverts :func:`_fs_safe` exactly: unquote to BYTES, then decode with
@@ -388,7 +387,7 @@ def _record_epoch(name: str) -> float:
     return epoch
 
 
-def _record_name_epoch_str(stem: str) -> Optional[str]:
+def _record_name_epoch_str(stem: str) -> str | None:
     """The canonical zero-padded epoch head of a record filename stem.
 
     ``None`` for anything not shaped like the ``{:020.6f}`` head every name
@@ -446,7 +445,7 @@ def _unescape_mount(field: str) -> str:
     return "".join(out)
 
 
-def _mount_entry(path: str) -> Optional[tuple[str, str]]:
+def _mount_entry(path: str) -> tuple[str, str] | None:
     """The ``(fstype, options)`` of the mount ``path`` lives on, or ``None``.
 
     Parses ``/proc/mounts``; longest matching mountpoint wins.  Linux-only;
@@ -462,7 +461,7 @@ def _mount_entry(path: str) -> Optional[tuple[str, str]]:
         return None
     real = os.path.realpath(path)
     best_mount = ""
-    best: Optional[tuple[str, str]] = None
+    best: tuple[str, str] | None = None
     for line in lines:
         parts = line.split(" ")
         if len(parts) < 4:
@@ -479,13 +478,13 @@ def _mount_entry(path: str) -> Optional[tuple[str, str]]:
     return best
 
 
-def _mount_fstype(path: str) -> Optional[str]:
+def _mount_fstype(path: str) -> str | None:
     """The filesystem type of the mount ``path`` lives on, or ``None``."""
     entry = _mount_entry(path)
     return entry[0] if entry is not None else None
 
 
-def _local_lock_reason(path: str) -> Optional[str]:
+def _local_lock_reason(path: str) -> str | None:
     """A human reason the mount's locks are host-local, or ``None`` (fine).
 
     ``nolock`` and ``local_lock=flock``/``all`` NFS options satisfy flock
@@ -531,7 +530,7 @@ def _entry_is_dir(entry: "os.DirEntry[str]") -> bool:
         return False
 
 
-def detect_topology(path: str) -> Optional[str]:
+def detect_topology(path: str) -> str | None:
     """Probe: ``"shared"`` | ``"single-node"`` | ``None`` (cannot tell).
 
     ``None`` means the probe could not decide (no ``/proc``, or Windows), and
@@ -609,7 +608,7 @@ class _TokenBucket:
         self.rate = rate
         self.burst = max(1.0, rate)
         self._tokens = self.burst
-        self._last: Optional[float] = None
+        self._last: float | None = None
 
     async def throttle(self) -> float:
         """Take one token, sleeping until one is available.
@@ -666,8 +665,8 @@ class StateBackend(abc.ABC):
         stream: str,
         data: dict[str, Any],
         *,
-        prune_keep: Optional[int] = None,
-        prune_latest_by: Optional[str] = None,
+        prune_keep: int | None = None,
+        prune_latest_by: str | None = None,
     ) -> str:
         """Append one immutable record to ``stream``; return its record id.
 
@@ -691,11 +690,11 @@ class StateBackend(abc.ABC):
         self,
         stream: str,
         *,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         newest_first: bool = False,
         strict: bool = False,
-        predicate: Optional[Callable[[dict[str, Any]], bool]] = None,
-        max_matches: Optional[int] = None,
+        predicate: Callable[[dict[str, Any]], bool] | None = None,
+        max_matches: int | None = None,
     ) -> list[dict[str, Any]]:
         """Read back a stream's records (corrupt ones quarantined).
 
@@ -736,7 +735,7 @@ class StateBackend(abc.ABC):
         return [], False
 
     @abc.abstractmethod
-    async def derive_max(self, stream: str, field: str) -> Optional[Any]:
+    async def derive_max(self, stream: str, field: str) -> Any | None:
         """The max value of ``field`` over a stream's records (the cursor).
 
         Order-independent, so on a shared mount where several nodes append to
@@ -758,7 +757,7 @@ class StateBackend(abc.ABC):
     @abc.abstractmethod
     async def read_document(
         self, namespace: str, key: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """The current body of document ``key`` in ``namespace``, or ``None``.
 
         An unlocked, best-effort read: absent, unreadable and corrupt all
@@ -771,8 +770,8 @@ class StateBackend(abc.ABC):
         self,
         namespace: str,
         key: str,
-        transform: "Callable[[Optional[dict[str, Any]]], tuple[Any, _T]]",
-    ) -> "tuple[Optional[dict[str, Any]], _T]":
+        transform: "Callable[[dict[str, Any] | None], tuple[Any, _T]]",
+    ) -> "tuple[dict[str, Any] | None, _T]":
         """Atomically read-modify-write document ``key``.
 
         Runs ``transform(current_body)`` under an advisory ``flock`` over
@@ -794,7 +793,7 @@ class StateBackend(abc.ABC):
     async def list_documents(self, namespace: str) -> list[dict[str, Any]]:
         """Every readable document body in ``namespace``, order-independent."""
 
-    async def list_document_keys(self, namespace: str) -> Optional[list[str]]:
+    async def list_document_keys(self, namespace: str) -> list[str] | None:
         """The keys of ``namespace``'s documents WITHOUT reading any body.
 
         ``None`` means keys cannot be enumerated cheaply and faithfully
@@ -826,7 +825,7 @@ class StateBackend(abc.ABC):
         """Store ``data`` (deduplicated by content); return its SHA-256 hex."""
 
     @abc.abstractmethod
-    async def get_blob(self, digest: str) -> Optional[bytes]:
+    async def get_blob(self, digest: str) -> bytes | None:
         """Read the blob with SHA-256 ``digest``, or ``None`` if absent."""
 
     # --- advisory-lock TTL lease -----------------------------------------
@@ -838,7 +837,7 @@ class StateBackend(abc.ABC):
     @abc.abstractmethod
     async def acquire_lease(
         self, name: str, holder: str, ttl: float
-    ) -> Optional[Lease]:
+    ) -> Lease | None:
         """Take (or renew) lease ``name`` for ``ttl``s, else ``None``.
 
         A caller that bounds this with a timeout must treat a timeout as
@@ -848,7 +847,7 @@ class StateBackend(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def renew_lease(self, lease: Lease, ttl: float) -> Optional[Lease]:
+    async def renew_lease(self, lease: Lease, ttl: float) -> Lease | None:
         """Extend a still-held lease; ``None`` if it was taken over."""
 
     @abc.abstractmethod
@@ -856,7 +855,7 @@ class StateBackend(abc.ABC):
         """Release a lease we hold (a no-op if we no longer hold it)."""
 
     @abc.abstractmethod
-    async def read_lease(self, name: str) -> Optional[Lease]:
+    async def read_lease(self, name: str) -> Lease | None:
         """Observe a lease without taking it (best-effort, unlocked read)."""
 
     # --- maintenance -------------------------------------------------------
@@ -903,7 +902,7 @@ class StateBackend(abc.ABC):
         """Whether a lease here excludes across hosts (HA-capable)."""
         return self.topology == "shared"
 
-    async def verify_locking(self) -> Optional[str]:
+    async def verify_locking(self) -> str | None:
         """Why the store's locks must not be trusted for coordination, or
         ``None`` (they behave, or the backend has no way to tell).  See the
         filesystem backend for the real probe."""
@@ -1072,8 +1071,8 @@ class FilesystemStateBackend(StateBackend):
         # construction needs no running event loop.  The LEASE lane is
         # deliberately SEPARATE (see BULK_CALL_SLOTS / LEASE_CALL_SLOTS)
         # so bulk traffic can never starve a lease renew below its TTL.
-        self._call_slots: Optional[asyncio.Semaphore] = None
-        self._lease_slots: Optional[asyncio.Semaphore] = None
+        self._call_slots: asyncio.Semaphore | None = None
+        self._lease_slots: asyncio.Semaphore | None = None
         # Optional request-rate control (state.maxOpsPerSecond): every op
         # takes a token before its worker thread is spawned, so a billing-
         # sensitive mount sees a bounded request rate. 0/absent -> off.
@@ -1248,7 +1247,7 @@ class FilesystemStateBackend(StateBackend):
         self._enter_inflight(is_lease)
         future: asyncio.Future = loop.create_future()
 
-        def _resolve(result: Any, exc: Optional[BaseException]) -> None:
+        def _resolve(result: Any, exc: BaseException | None) -> None:
             slots.release()
             self._exit_inflight(is_lease)
             if future.cancelled():
@@ -1260,7 +1259,7 @@ class FilesystemStateBackend(StateBackend):
 
         def _runner() -> None:
             result: Any = None
-            exc: Optional[BaseException] = None
+            exc: BaseException | None = None
             began = time.perf_counter()
             try:
                 result = fn(*args)
@@ -1564,8 +1563,8 @@ class FilesystemStateBackend(StateBackend):
         stream: str,
         data: dict[str, Any],
         *,
-        prune_keep: Optional[int] = None,
-        prune_latest_by: Optional[str] = None,
+        prune_keep: int | None = None,
+        prune_latest_by: str | None = None,
     ) -> str:
         return await self._call(
             "append",
@@ -1580,8 +1579,8 @@ class FilesystemStateBackend(StateBackend):
         self,
         stream: str,
         data: dict[str, Any],
-        prune_keep: Optional[int] = None,
-        prune_latest_by: Optional[str] = None,
+        prune_keep: int | None = None,
+        prune_latest_by: str | None = None,
     ) -> str:
         token = _fs_safe(stream)
         # _stream_dir(stream), spelled out to keep the token in hand
@@ -1759,7 +1758,7 @@ class FilesystemStateBackend(StateBackend):
             # never let cleanup of a poison record raise into a read.
             pass
 
-    def _record_cache_get(self, path: str) -> Optional[bytes]:
+    def _record_cache_get(self, path: str) -> bytes | None:
         with self._record_cache_lock:
             raw = self._record_cache.get(path)
             if raw is not None:
@@ -1785,7 +1784,7 @@ class FilesystemStateBackend(StateBackend):
 
     def _read_record(
         self, stream_dir: str, name: str, *, strict: bool = False
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """One record's ``data`` body, or ``None`` if it is not readable.
 
         Best-effort reads (``strict=False``) are served from an in-memory
@@ -1903,11 +1902,11 @@ class FilesystemStateBackend(StateBackend):
         self,
         stream: str,
         *,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         newest_first: bool = False,
         strict: bool = False,
-        predicate: Optional[Callable[[dict[str, Any]], bool]] = None,
-        max_matches: Optional[int] = None,
+        predicate: Callable[[dict[str, Any]], bool] | None = None,
+        max_matches: int | None = None,
     ) -> list[dict[str, Any]]:
         return await self._call(
             "list",
@@ -1934,7 +1933,7 @@ class FilesystemStateBackend(StateBackend):
 
     def _read_stream_name_sidecar(
         self, stream_dir: str, token: str
-    ) -> Optional[str]:
+    ) -> str | None:
         """The logical stream name recorded inside a truncated stream dir.
 
         ``None`` when the sidecar is absent, unreadable, or fails the
@@ -2027,11 +2026,11 @@ class FilesystemStateBackend(StateBackend):
     def _list_sync(
         self,
         stream: str,
-        limit: Optional[int],
+        limit: int | None,
         newest_first: bool,
         strict: bool = False,
-        predicate: Optional[Callable[[dict[str, Any]], bool]] = None,
-        max_matches: Optional[int] = None,
+        predicate: Callable[[dict[str, Any]], bool] | None = None,
+        max_matches: int | None = None,
     ) -> list[dict[str, Any]]:
         stream_dir = self._stream_dir(stream)
         try:
@@ -2062,7 +2061,7 @@ class FilesystemStateBackend(StateBackend):
                 break
         return out
 
-    async def derive_max(self, stream: str, field: str) -> Optional[Any]:
+    async def derive_max(self, stream: str, field: str) -> Any | None:
         return await self._call(
             "derive-max", self._derive_max_sync, stream, field
         )
@@ -2084,7 +2083,7 @@ class FilesystemStateBackend(StateBackend):
             for key in [k for k in self._derive_memo if k[0] == token]:
                 del self._derive_memo[key]
 
-    def _derive_max_sync(self, stream: str, field: str) -> Optional[Any]:
+    def _derive_max_sync(self, stream: str, field: str) -> Any | None:
         token = _fs_safe(stream)
         stream_dir = os.path.join(self._records_root, token)  # _stream_dir
         memo_key = (token, field)
@@ -2107,7 +2106,7 @@ class FilesystemStateBackend(StateBackend):
         with self._derive_memo_lock:
             gen = self._derive_wipe_gen.get(token, 0)
             cached = self._derive_memo.get(memo_key)
-        best: Optional[Any] = None
+        best: Any | None = None
         to_scan = listing
         # The fold's anchor and the one comparison the warm path needs:
         # the watermark survives or something newer exists exactly when
@@ -2334,7 +2333,7 @@ class FilesystemStateBackend(StateBackend):
 
     def _read_lease_file(
         self, lease_path: str, *, strict: bool = False
-    ) -> Optional[Lease]:
+    ) -> Lease | None:
         """Read a lease file; ``None`` means *positively absent*.
 
         With ``strict`` (the locked RMW paths), anything short of plain
@@ -2389,14 +2388,14 @@ class FilesystemStateBackend(StateBackend):
 
     async def acquire_lease(
         self, name: str, holder: str, ttl: float
-    ) -> Optional[Lease]:
+    ) -> Lease | None:
         return await self._call(
             "lease-acquire", self._acquire_sync, name, holder, ttl
         )
 
     def _acquire_sync(
         self, name: str, holder: str, ttl: float
-    ) -> Optional[Lease]:
+    ) -> Lease | None:
         lock_path, lease_path = self._lease_paths(name)
         with self._locked(lock_path):
             try:
@@ -2456,10 +2455,10 @@ class FilesystemStateBackend(StateBackend):
                 return None
             return lease
 
-    async def renew_lease(self, lease: Lease, ttl: float) -> Optional[Lease]:
+    async def renew_lease(self, lease: Lease, ttl: float) -> Lease | None:
         return await self._call("lease-renew", self._renew_sync, lease, ttl)
 
-    def _renew_sync(self, lease: Lease, ttl: float) -> Optional[Lease]:
+    def _renew_sync(self, lease: Lease, ttl: float) -> Lease | None:
         lock_path, lease_path = self._lease_paths(lease.name)
         with self._locked(lock_path):
             try:
@@ -2540,7 +2539,7 @@ class FilesystemStateBackend(StateBackend):
                         durable=False,
                     )
 
-    async def read_lease(self, name: str) -> Optional[Lease]:
+    async def read_lease(self, name: str) -> Lease | None:
         _lock_path, lease_path = self._lease_paths(name)
         lease = await self._call(
             "lease-read", self._read_lease_file, lease_path
@@ -2554,7 +2553,7 @@ class FilesystemStateBackend(StateBackend):
 
     def _read_doc_file(
         self, doc_path: str, *, strict: bool = False
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Read a document body; ``None`` means *positively absent*.
 
         Mirrors :meth:`_read_lease_file`.  With ``strict`` (the locked
@@ -2589,14 +2588,14 @@ class FilesystemStateBackend(StateBackend):
 
     async def read_document(
         self, namespace: str, key: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         return await self._call(
             "doc-read", self._read_document_sync, namespace, key
         )
 
     def _read_document_sync(
         self, namespace: str, key: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         _lock_path, doc_path = self._doc_paths(namespace, key)
         return self._read_doc_file(doc_path)
 
@@ -2604,8 +2603,8 @@ class FilesystemStateBackend(StateBackend):
         self,
         namespace: str,
         key: str,
-        transform: Callable[[Optional[dict[str, Any]]], tuple[Any, _T]],
-    ) -> tuple[Optional[dict[str, Any]], _T]:
+        transform: Callable[[dict[str, Any] | None], tuple[Any, _T]],
+    ) -> tuple[dict[str, Any] | None, _T]:
         return await self._call(
             "doc-mutate", self._mutate_document_sync, namespace, key, transform
         )
@@ -2614,8 +2613,8 @@ class FilesystemStateBackend(StateBackend):
         self,
         namespace: str,
         key: str,
-        transform: Callable[[Optional[dict[str, Any]]], tuple[Any, _T]],
-    ) -> tuple[Optional[dict[str, Any]], _T]:
+        transform: Callable[[dict[str, Any] | None], tuple[Any, _T]],
+    ) -> tuple[dict[str, Any] | None, _T]:
         lock_path, doc_path = self._doc_paths(namespace, key)
         # _locked creates the namespace dir before opening the lock file,
         # so the very first write to a fresh namespace has somewhere to
@@ -2652,7 +2651,7 @@ class FilesystemStateBackend(StateBackend):
             return new_body, result
 
     async def delete_document(self, namespace: str, key: str) -> bool:
-        def _delete(current: Optional[dict[str, Any]]) -> tuple[Any, bool]:
+        def _delete(current: dict[str, Any] | None) -> tuple[Any, bool]:
             return DOC_DELETE, current is not None
 
         _stored, existed = await self.mutate_document(namespace, key, _delete)
@@ -2663,12 +2662,12 @@ class FilesystemStateBackend(StateBackend):
             "doc-list", self._list_documents_sync, namespace
         )
 
-    async def list_document_keys(self, namespace: str) -> Optional[list[str]]:
+    async def list_document_keys(self, namespace: str) -> list[str] | None:
         return await self._call(
             "doc-list", self._list_document_keys_sync, namespace
         )
 
-    def _list_document_keys_sync(self, namespace: str) -> Optional[list[str]]:
+    def _list_document_keys_sync(self, namespace: str) -> list[str] | None:
         ns_dir = self._doc_dir(namespace)
         try:
             names = os.listdir(ns_dir)
@@ -2779,7 +2778,7 @@ class FilesystemStateBackend(StateBackend):
         self._atomic_write(path, data)
         return digest
 
-    async def get_blob(self, digest: str) -> Optional[bytes]:
+    async def get_blob(self, digest: str) -> bytes | None:
         return await self._call("blob-get", self._get_blob_sync, digest)
 
     async def blob_exists(self, digest: str, size: int) -> bool:
@@ -2791,7 +2790,7 @@ class FilesystemStateBackend(StateBackend):
 
         return await self._call("blob-stat", check)
 
-    def _get_blob_sync(self, digest: str) -> Optional[bytes]:
+    def _get_blob_sync(self, digest: str) -> bytes | None:
         try:
             with open(self._blob_path(digest), "rb", buffering=0) as fobj:
                 return fobj.read()
@@ -2805,7 +2804,7 @@ class FilesystemStateBackend(StateBackend):
 
     # --- lock-fidelity probe -------------------------------------------------
 
-    async def verify_locking(self) -> Optional[str]:
+    async def verify_locking(self) -> str | None:
         """Probe whether the store's advisory locks actually exclude.
 
         ``None`` when the locks behave, else a human-readable reason they
@@ -2830,7 +2829,7 @@ class FilesystemStateBackend(StateBackend):
         """
         return await self._call("lock-probe", self._verify_locking_sync)
 
-    def _verify_locking_sync(self) -> Optional[str]:
+    def _verify_locking_sync(self) -> str | None:
         reason = _local_lock_reason(self.root)
         if reason is not None:
             return (
@@ -3106,9 +3105,7 @@ class FilesystemStateBackend(StateBackend):
         return removed
 
     @staticmethod
-    def _idem_doc_expired(
-        body: Optional[dict[str, Any]], cutoff: float
-    ) -> bool:
+    def _idem_doc_expired(body: dict[str, Any] | None, cutoff: float) -> bool:
         """Whether an idempotency doc's TTL lapsed before ``cutoff``.
 
         ``None`` (absent or unreadable) and a missing/non-numeric

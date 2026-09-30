@@ -411,7 +411,6 @@ def test_creationflags_has_exactly_one_writer():
     assert sorted({name for name, _ in writers}) == ["platform.py"], writers
 
 
-@pytest.mark.asyncio
 async def test_kill_process_group_windows_break_first_taskkill_on_force(
     monkeypatch,
 ):
@@ -442,7 +441,6 @@ async def test_kill_process_group_windows_break_first_taskkill_on_force(
     assert taskkills == [4242]
 
 
-@pytest.mark.asyncio
 async def test_kill_process_group_windows_break_failure_tree_kills(
     monkeypatch,
 ):
@@ -555,7 +553,6 @@ def _windows_terminate(pid):
 @pytest.mark.skipif(
     not platform.IS_WINDOWS, reason="Windows kill sequence is Windows-only"
 )
-@pytest.mark.asyncio
 async def test_kill_process_group_windows_reaches_the_grandchild(tmp_path):
     # end to end on a real tree, spawned exactly as the daemon spawns a
     # string-form `command:` job (cmd.exe /c in its own process group, so
@@ -627,7 +624,6 @@ async def test_kill_process_group_windows_reaches_the_grandchild(tmp_path):
 @pytest.mark.skipif(
     platform.IS_WINDOWS, reason="killpg / process groups are POSIX-only"
 )
-@pytest.mark.asyncio
 async def test_kill_process_group_signals_the_group_then_reports_it_gone():
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -838,7 +834,6 @@ def test_fsync_directory_swallows_missing_path(tmp_path):
 @pytest.mark.skipif(
     platform.IS_WINDOWS, reason="killpg is POSIX-only"
 )
-@pytest.mark.asyncio
 async def test_kill_process_group_falls_back_when_killpg_errors(monkeypatch):
     # A killpg that fails with a generic OSError (not ProcessLookupError) is
     # logged and reported as "not signalled" so the caller falls back to

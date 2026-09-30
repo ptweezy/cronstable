@@ -34,7 +34,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 # jobstate at module scope: it imports only state and _json, both on this
 # module's graph anyway, so a deferred import buys no laziness.
@@ -199,7 +199,7 @@ def _jitter(max_jitter: float) -> float:
     """A random poke jitter in ``[0, max_jitter]`` (0 when disabled)."""
     if max_jitter <= 0:
         return 0.0
-    return random.uniform(0.0, max_jitter)  # noqa: S311 - not cryptographic
+    return random.uniform(0.0, max_jitter)  # not cryptographic
 
 
 @dataclass(slots=True)
@@ -224,7 +224,7 @@ class _DagRef:
     # plain task).  Extends the completion fence to pokes: a re-poke re-stamps
     # the SAME proc token and never bumps attempt, so only the poke number
     # distinguishes a stale queued completion from the live in-flight poke.
-    poke: Optional[int] = None
+    poke: int | None = None
 
 
 class DagScheduler:
@@ -288,7 +288,7 @@ class DagScheduler:
         # Each caller shields the task from its own cancellation.
         self._summaries_inflight: dict[
             tuple[StateBackend, str, int],
-            asyncio.Task[Optional[list[dict[str, Any]]]],
+            asyncio.Task[list[dict[str, Any]] | None],
         ] = {}
         # Bumped whenever the memo above is popped or cleared. The pop alone
         # cannot uphold the pop-on-local-write contract: an uncached rebuild
@@ -338,15 +338,15 @@ class DagScheduler:
         # gate on every pass while it is parked, so this dedups to one alert
         # per gate; a run's entries drop when it reaches a terminal state.
         self._approval_notified: set[tuple[str, str, str]] = set()
-        self._service_task: Optional[asyncio.Task] = None
+        self._service_task: asyncio.Task | None = None
         self._next_sched_check = 0.0
         self._next_adopt = 0.0
         self._next_gc = 0.0
 
     # --- accessors -------------------------------------------------------
 
-    def _backend(self) -> Optional[StateBackend]:
-        backend: Optional[StateBackend] = self._cron.state_backend
+    def _backend(self) -> StateBackend | None:
+        backend: StateBackend | None = self._cron.state_backend
         return backend
 
     def _dags(self) -> dict[str, Any]:
@@ -383,7 +383,7 @@ class DagScheduler:
 
     async def _mutate(
         self, dag_name: str, key: str, transform
-    ) -> "tuple[Optional[dict[str, Any]], Any]":
+    ) -> "tuple[dict[str, Any] | None, Any]":
         backend = self._backend()
         if backend is None:
             return None, None
@@ -407,7 +407,7 @@ class DagScheduler:
             self._summaries_gen += 1
         return result
 
-    async def _read(self, dag_name: str, key: str) -> Optional[dict[str, Any]]:
+    async def _read(self, dag_name: str, key: str) -> dict[str, Any] | None:
         backend = self._backend()
         if backend is None:
             return None
@@ -473,12 +473,10 @@ class DagScheduler:
             if now >= self._next_gc:
                 self._next_gc = now + GC_INTERVAL
                 await self._gc_runs()
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - a bad pass must not kill the loop
             logger.exception("dag: unexpected error in the service pass")
 
-    def next_wake_delay(self) -> Optional[float]:
+    def next_wake_delay(self) -> float | None:
         """Seconds until the scheduler next wants to run, or ``None``.
 
         Caps the main loop's sleep so a due sensor poke, task retry, or the
@@ -584,8 +582,6 @@ class DagScheduler:
                 continue
             try:
                 await self._seed_dag(dagcfg, now_dt)
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - isolate the poisoned dag
                 # one dag's bad seed must not starve every other dag's
                 # fire/adopt/advance; logged once per schedule signature.
@@ -598,7 +594,7 @@ class DagScheduler:
 
     def _next_fire(
         self, sched: Any, after: datetime.datetime
-    ) -> Optional[datetime.datetime]:
+    ) -> datetime.datetime | None:
         """``Cron._compute_next_fire``, guarded for a non-crontab schedule.
 
         A schedule string the parser passes through verbatim (the documented
@@ -609,7 +605,7 @@ class DagScheduler:
         """
         if not isinstance(sched.schedule, CronTab):
             return None
-        nxt: Optional[datetime.datetime] = self._cron._compute_next_fire(
+        nxt: datetime.datetime | None = self._cron._compute_next_fire(
             sched, after
         )
         return nxt
@@ -623,8 +619,6 @@ class DagScheduler:
         if sched.onMissed != "skip":
             try:
                 await self._catch_up(dagcfg, now_dt)
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001
                 logger.exception("dag %s: catch-up seed failed", dagcfg.name)
 
@@ -640,8 +634,6 @@ class DagScheduler:
                 continue
             try:
                 await self._fire_forward(dagcfg, now_dt)
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - isolate per-dag failures
                 logger.exception(
                     "dag %s: firing its scheduled runs failed", name
@@ -712,7 +704,7 @@ class DagScheduler:
         # expects.
         from cronstable.cron import schedule_slot
 
-        fired_now: Optional[datetime.datetime] = None
+        fired_now: datetime.datetime | None = None
         if isinstance(sched.schedule, CronTab):
             now_slot = schedule_slot(sched, now_dt)
             if sched.schedule.test(now_slot):
@@ -905,8 +897,6 @@ class DagScheduler:
                     return
                 await self._create_run(current, when, "catchup")
             await self._checkpoint_catchup(dagcfg.name, "close", watermark)
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - per-dag isolation, like the seed
             logger.exception(
                 "dag %s: deferred catch-up replay failed", dagcfg.name
@@ -914,7 +904,7 @@ class DagScheduler:
 
     async def _durable_watermark(
         self, dagcfg: Any
-    ) -> Optional[datetime.datetime]:
+    ) -> datetime.datetime | None:
         backend = self._backend()
         if backend is None:
             return None
@@ -922,7 +912,7 @@ class DagScheduler:
             backend.list_documents(self._ns(dagcfg.name)),
             timeout=STATE_OP_TIMEOUT,
         )
-        latest: Optional[datetime.datetime] = None
+        latest: datetime.datetime | None = None
         for body in docs:
             iso = body.get("logicalDate")
             when = _parse_iso(iso) if isinstance(iso, str) else None
@@ -935,7 +925,7 @@ class DagScheduler:
         """The durable checkpoint stream for a dag's catch-up cycles."""
         return DAG_CATCHUP_STREAM_PREFIX + dag_name
 
-    async def _pending_catchup_watermark(self, dag_name: str) -> Optional[str]:
+    async def _pending_catchup_watermark(self, dag_name: str) -> str | None:
         """The watermark of an unfinished backfill cycle, if one is open.
 
         The dag twin of ``Cron._pending_catchup_watermark``: an ``open``
@@ -999,7 +989,7 @@ class DagScheduler:
 
     async def _create_run(
         self, dagcfg: Any, logical_dt: datetime.datetime, kind: str
-    ) -> Optional[RunRef]:
+    ) -> RunRef | None:
         # Canonicalise the instant to UTC before it becomes the run key. The
         # scheduled/catch-up paths already hand in UTC-aware instants, but
         # backfill preserves whatever offset the operator's ISO range carried,
@@ -1022,7 +1012,7 @@ class DagScheduler:
         return ref
 
     async def _create_doc(
-        self, dagcfg: Any, run_key: str, logical_iso: Optional[str], kind: str
+        self, dagcfg: Any, run_key: str, logical_iso: str | None, kind: str
     ) -> bool:
         run_id = os.urandom(16).hex()
         now = _now()
@@ -1117,8 +1107,6 @@ class DagScheduler:
                 )
             except asyncio.TimeoutError:
                 continue  # unknown: retry next period
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - renewal is best-effort
                 continue
             if renewed is not None:
@@ -1153,8 +1141,6 @@ class DagScheduler:
                 await asyncio.wait_for(
                     backend.release_lease(lease), timeout=STATE_OP_TIMEOUT
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - the TTL frees it regardless
                 pass
 
@@ -1170,8 +1156,6 @@ class DagScheduler:
         for name, dagcfg in list(self._dags().items()):
             try:
                 await self._adopt_one_dag(backend, name, dagcfg, full=full)
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - isolate per-dag failures
                 logger.exception("dag %s: orphan adoption failed", name)
 
@@ -1347,8 +1331,6 @@ class DagScheduler:
             return
         try:
             await self._do_advance(dagcfg, ref)
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - never kill the loop
             logger.exception("dag run %s/%s: advance failed", ref[0], ref[1])
             if ref in self._owned:
@@ -1379,8 +1361,6 @@ class DagScheduler:
                 backend.read_lease(self._lease_name(ref)),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - unverifiable: fail closed
             return False
         if observed is not None and (
@@ -1460,12 +1440,10 @@ class DagScheduler:
         # failed explicitly (exit 127) per task.  Each launch is independent:
         # one failing must not skip the rest of the batch (which would
         # strand them claimed-but-unlaunched).
-        pid_stamps: list[tuple[str, str, Optional[int], Optional[int]]] = []
+        pid_stamps: list[tuple[str, str, int | None, int | None]] = []
         for intent in result.launches:
             try:
                 stamp = await self._launch_task(dagcfg, ref, run_id, intent)
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - fail just this task, keep going
                 logger.exception(
                     "dag run %s/%s: launching task %s failed",
@@ -1502,8 +1480,6 @@ class DagScheduler:
             # already-running tasks.
             try:
                 await self._set_pids(ref, pid_stamps)
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - the pids are an optimisation
                 logger.warning(
                     "dag run %s/%s: could not record pids for %d launched "
@@ -1548,8 +1524,8 @@ class DagScheduler:
         self,
         ref: RunRef,
         taskkey: Any,
-        attempt: Optional[int],
-        poke: Optional[int],
+        attempt: int | None,
+        poke: int | None,
     ) -> None:
         """Drop one launch's registry key once its completion is settled."""
         keys = self._launched.get(ref)
@@ -1563,8 +1539,8 @@ class DagScheduler:
         self,
         ref: RunRef,
         taskkey: Any,
-        attempt: Optional[int],
-        poke: Optional[int],
+        attempt: int | None,
+        poke: int | None,
     ) -> None:
         """Retire a completion that is applied, fenced out or dropped: its
         queued retry, if any, and the launch key it settles go together."""
@@ -1617,8 +1593,6 @@ class DagScheduler:
         transform = self._wrap(dag.release_lost_claims(spec, lost, _now()))
         try:
             _, released = await self._mutate(ref[0], ref[1], transform)
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - retried on the next advance
             logger.warning(
                 "dag run %s/%s: releasing lost claim(s) %s failed; retried "
@@ -1641,8 +1615,8 @@ class DagScheduler:
 
     async def _read_expansions(
         self, dagcfg: Any, run_id: str, body: dict[str, Any]
-    ) -> dict[str, Optional[list[Any]]]:
-        expansions: dict[str, Optional[list[Any]]] = {}
+    ) -> dict[str, list[Any] | None]:
+        expansions: dict[str, list[Any] | None] = {}
         for tid, from_task, key in dag.tasks_awaiting_expansion(
             dagcfg.spec, body
         ):
@@ -1653,7 +1627,7 @@ class DagScheduler:
 
     async def _read_xcom_list(
         self, run_id: str, dag_name: str, taskkey: str, key: str
-    ) -> Optional[list[Any]]:
+    ) -> list[Any] | None:
         """The JSON list an upstream published, for a mapped task to fan out.
 
         Only ever read after the upstream has *succeeded*, so its output is
@@ -1908,7 +1882,7 @@ class DagScheduler:
 
     async def _launch_task(
         self, dagcfg: Any, ref: RunRef, run_id: str, intent
-    ) -> Optional[tuple[str, str, Optional[int], Optional[int]]]:
+    ) -> tuple[str, str, int | None, int | None] | None:
         template = dagcfg.task_templates[intent.task_id]
         taskkey = intent.taskkey
         pool_ticket = None
@@ -2059,7 +2033,7 @@ class DagScheduler:
 
     async def _prepare_task_run(
         self, dagcfg: Any, run_id: str, run_key: str, intent, template
-    ) -> tuple[Optional[str], dict[str, str]]:
+    ) -> tuple[str | None, dict[str, str]]:
         """Register the task run with the loopback API; return its env.
 
         Mirrors ``Cron._prepare_job_api_run`` but scopes the run's default
@@ -2116,7 +2090,7 @@ class DagScheduler:
     async def _set_pids(
         self,
         ref: RunRef,
-        stamps: list[tuple[str, str, Optional[int], Optional[int]]],
+        stamps: list[tuple[str, str, int | None, int | None]],
     ) -> None:
         """Record a whole launch loop's pids in one batched RMW.
 
@@ -2205,8 +2179,6 @@ class DagScheduler:
         for ref, entries in buffered.items():
             try:
                 await self._flush_run_completions(ref, entries)
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - never lose a completion
                 # An unrecorded completion leaves its entry RUNNING forever
                 # (trusted by reconciliation while this daemon lives); queue
@@ -2271,8 +2243,6 @@ class DagScheduler:
         transform = self._wrap(dag.mark_tasks_finished(marks, _now()))
         try:
             _, applied = await self._mutate(ref[0], ref[1], transform)
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - one failed RMW must not wedge the run
             # Unlike a pid write, a lost completion is NOT best-effort:
             # unrecorded, the entry stays RUNNING under our proc token, which
@@ -2308,12 +2278,12 @@ class DagScheduler:
         task_id: str,
         *,
         success: bool,
-        exit_code: Optional[int],
-        fail_reason: Optional[str],
-        proc: Optional[str] = None,
-        attempt: Optional[int] = None,
-        poke: Optional[int] = None,
-        resources: Optional[dict[str, Any]] = None,
+        exit_code: int | None,
+        fail_reason: str | None,
+        proc: str | None = None,
+        attempt: int | None = None,
+        poke: int | None = None,
+        resources: dict[str, Any] | None = None,
     ) -> None:
         task = dagcfg.spec.by_id.get(task_id)
         if task is None:
@@ -2340,8 +2310,6 @@ class DagScheduler:
         )
         try:
             _, applied = await self._mutate(ref[0], ref[1], transform)
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - one failed RMW must not wedge
             # the run: unrecorded, the entry stays RUNNING under our proc
             # token, which reconciliation trusts forever while this daemon
@@ -2401,12 +2369,12 @@ class DagScheduler:
         task_id: str,
         *,
         success: bool,
-        exit_code: Optional[int],
-        fail_reason: Optional[str],
-        proc: Optional[str],
-        attempt: Optional[int],
-        poke: Optional[int],
-        resources: Optional[dict[str, Any]] = None,
+        exit_code: int | None,
+        fail_reason: str | None,
+        proc: str | None,
+        attempt: int | None,
+        poke: int | None,
+        resources: dict[str, Any] | None = None,
     ) -> None:
         key = (ref, taskkey)
         prior = self._pending_completions.get(key)
@@ -2502,7 +2470,7 @@ class DagScheduler:
                     "dag %s: boot reconciliation timed out reading runs", name
                 )
                 continue
-            except Exception as ex:
+            except Exception as ex:  # noqa: BLE001 - degrade, never crash
                 logger.warning(
                     "dag %s: boot reconciliation could not read runs "
                     "(continuing with the remaining dags): %s",
@@ -2518,7 +2486,7 @@ class DagScheduler:
                     continue
                 try:
                     await self._try_own(dagcfg, (name, run_key))
-                except Exception as ex:
+                except Exception as ex:  # noqa: BLE001 - degrade, never crash
                     # One stalled or strict-unreadable run document must not
                     # abort boot reconciliation: this loop runs inside the
                     # state-rehydration tail, and an escaping raise skipped
@@ -2537,7 +2505,7 @@ class DagScheduler:
 
     async def _reconcile_run(
         self, dagcfg: Any, ref: RunRef
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Fail tasks a crash left running; return the observed document.
 
         The RMW already read the run document under its lock (and
@@ -2932,8 +2900,8 @@ class DagScheduler:
         await self._mutate(ref[0], ref[1], prepared)
 
     async def trigger_run(
-        self, dag_name: str, *, logical_date: Optional[str] = None
-    ) -> Optional[str]:
+        self, dag_name: str, *, logical_date: str | None = None
+    ) -> str | None:
         """Create a manual run of ``dag_name`` now; return its run key.
 
         ``None`` for an unknown dag; raises when the run document could not
@@ -3093,7 +3061,7 @@ class DagScheduler:
 
     async def _bulk_summaries(
         self, backend: StateBackend, ns: str, name: str
-    ) -> Optional[list[dict[str, Any]]]:
+    ) -> list[dict[str, Any]] | None:
         """One list_documents sweep: rebuild the cache from every body. Used
         for the cold cache / large-delta case and when the backend cannot list
         keys only. Returns None on a hiccup, matching the old degrade
@@ -3103,8 +3071,6 @@ class DagScheduler:
             docs = await asyncio.wait_for(
                 backend.list_documents(ns), timeout=STATE_OP_TIMEOUT
             )
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - degrade, never fail /dags
             return None
         cache = {}
@@ -3120,7 +3086,7 @@ class DagScheduler:
 
     async def _bulk_rollup(
         self, backend: StateBackend, ns: str, name: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """The full-sweep rollup: :meth:`_bulk_summaries`, rolled up."""
         summaries = await self._bulk_summaries(backend, ns, name)
         if summaries is None:
@@ -3129,7 +3095,7 @@ class DagScheduler:
 
     async def _run_summaries(
         self, backend: StateBackend, name: str
-    ) -> Optional[list[dict[str, Any]]]:
+    ) -> list[dict[str, Any]] | None:
         """Every retained run's summary, memoized for DAG_SUMMARY_LIST_TTL.
 
         Concurrent requests share a refresh for the same store, DAG and
@@ -3167,7 +3133,7 @@ class DagScheduler:
 
     async def _refresh_run_summaries(
         self, backend: StateBackend, name: str, gen: int
-    ) -> Optional[list[dict[str, Any]]]:
+    ) -> list[dict[str, Any]] | None:
         """Cache a shared result while its generation is current."""
         summaries = await self._run_summaries_uncached(backend, name)
         if (
@@ -3180,7 +3146,7 @@ class DagScheduler:
 
     async def _run_summaries_uncached(
         self, backend: StateBackend, name: str
-    ) -> Optional[list[dict[str, Any]]]:
+    ) -> list[dict[str, Any]] | None:
         """Every retained run's summary, caching immutable terminal runs.
 
         Lists keys only, drops cache entries for GC'd runs, and re-reads just
@@ -3200,8 +3166,6 @@ class DagScheduler:
             keys = await asyncio.wait_for(
                 backend.list_document_keys(ns), timeout=STATE_OP_TIMEOUT
             )
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - degrade, never fail /dags
             return None
         if keys is None:
@@ -3220,8 +3184,6 @@ class DagScheduler:
                 body = await asyncio.wait_for(
                     backend.read_document(ns, key), timeout=STATE_OP_TIMEOUT
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - degrade, never fail /dags
                 return None
             if body is None:
@@ -3234,7 +3196,7 @@ class DagScheduler:
 
     async def _dag_run_rollup(
         self, backend: StateBackend, name: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Per-dag run rollup for list_dags, over the cached summaries."""
         summaries = await self._run_summaries(backend, name)
         if summaries is None:
@@ -3243,7 +3205,7 @@ class DagScheduler:
 
     async def get_run(
         self, dag_name: str, run_key: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         if dag_name not in self._dags():
             return None
         return await self._read(dag_name, run_key)
@@ -3255,7 +3217,7 @@ class DagScheduler:
         *,
         max_value_bytes: int = 65536,
         max_entries: int = 500,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Every XCom value published by this run's tasks, for the dashboard.
 
         XCom lives in the artifact store under ``dagxcom/<dag>/<run_id>`` with
@@ -3287,8 +3249,6 @@ class DagScheduler:
                 jobstate.artifact_list(backend, scope),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - degrade, never 500 the tab
             return result
         result["truncated"] = len(records) > max_entries
@@ -3318,8 +3278,6 @@ class DagScheduler:
                             backend.get_blob(str(digest)),
                             timeout=STATE_OP_TIMEOUT,
                         )
-                    except asyncio.CancelledError:
-                        raise
                     except Exception:  # noqa: BLE001 - unreadable; skip it
                         data = None
                 if data is not None:
@@ -3334,7 +3292,7 @@ class DagScheduler:
 
     async def list_runs(
         self, dag_name: str, *, limit: int = 50
-    ) -> Optional[list[dict[str, Any]]]:
+    ) -> list[dict[str, Any]] | None:
         """The newest ``limit`` runs of ``dag_name``, newest first.
 
         Served from the same per-key summary cache list_dags' rollup fills, so
@@ -3375,8 +3333,6 @@ class DagScheduler:
         for name, dagcfg in list(self._dags().items()):
             try:
                 await self._gc_one_dag(backend, name, dagcfg)
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001
                 logger.exception("dag %s: run GC failed", name)
 
@@ -3567,8 +3523,6 @@ class DagScheduler:
                     await self._delete_run(
                         backend, name, run_key, body.get("runId")
                     )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - one dag must not stop the pass
                 logger.exception("dag %s: removed-dag run GC failed", name)
 
@@ -3668,7 +3622,7 @@ class DagScheduler:
 # --------------------------------------------------------------------------
 
 
-def _parse_iso(value: Optional[str]) -> Optional[datetime.datetime]:
+def _parse_iso(value: str | None) -> datetime.datetime | None:
     if not value:
         return None
     try:

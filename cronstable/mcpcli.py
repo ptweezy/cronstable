@@ -34,7 +34,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from cronstable import _cliargs
 
@@ -85,7 +85,7 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _build_opener(
-    ctx: Optional["ssl.SSLContext"],
+    ctx: "ssl.SSLContext | None",
 ) -> urllib.request.OpenerDirector:
     """The opener this invocation posts through: the shared one, or a TLS one.
 
@@ -110,7 +110,7 @@ class _BridgeError(Exception):
     """A transport failure reaching the daemon's ``/mcp`` endpoint."""
 
 
-def _resolve_token(args: argparse.Namespace) -> Optional[str]:
+def _resolve_token(args: argparse.Namespace) -> str | None:
     if args.token:
         return str(args.token)
     env_name = args.token_env or ENV_TOKEN
@@ -118,7 +118,7 @@ def _resolve_token(args: argparse.Namespace) -> Optional[str]:
     return value or None
 
 
-def _resolve_tls(args: argparse.Namespace) -> Optional["ssl.SSLContext"]:
+def _resolve_tls(args: argparse.Namespace) -> "ssl.SSLContext | None":
     """The client TLS posture for this invocation, or ``None`` for the default.
 
     Flag then env, the same precedence as :func:`_resolve_token`, so a shell
@@ -182,11 +182,11 @@ def _resolve_tls(args: argparse.Namespace) -> Optional["ssl.SSLContext"]:
 def _post(
     url: str,
     frame: bytes,
-    token: Optional[str],
+    token: str | None,
     protocol_version: str,
     timeout: float,
     opener: Any = None,
-    headers: Optional[dict[str, str]] = None,
+    headers: dict[str, str] | None = None,
 ) -> tuple[int, bytes]:
     """POST one JSON-RPC frame to ``<url>/mcp``; return ``(status, body)``.
 
@@ -214,7 +214,7 @@ def _post(
     )
     via = opener or _OPENER
     try:
-        with via.open(req, timeout=timeout) as resp:  # noqa: S310
+        with via.open(req, timeout=timeout) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as ex:
         # HTTPError holds the response. Close it to release the connection.
@@ -452,7 +452,7 @@ def _encode_header_value(value: str) -> str:
     return _B64_PREFIX + encoded + _B64_SUFFIX
 
 
-def _modern_headers(msg: Any) -> Optional[dict[str, str]]:
+def _modern_headers(msg: Any) -> dict[str, str] | None:
     """The headers a modern frame's POST carries, or None for a legacy frame.
 
     A value that cannot travel as a header is left out, and the daemon then
@@ -480,7 +480,7 @@ def _modern_headers(msg: Any) -> Optional[dict[str, str]]:
     return headers
 
 
-def _jsonrpc_error(body: bytes, msg_id: Any) -> Optional[dict[str, Any]]:
+def _jsonrpc_error(body: bytes, msg_id: Any) -> dict[str, Any] | None:
     """A daemon error body that is a JSON-RPC error, given the frame's id."""
     try:
         parsed = json.loads(body)
@@ -497,7 +497,7 @@ def _jsonrpc_error(body: bytes, msg_id: Any) -> Optional[dict[str, Any]]:
     return parsed
 
 
-def _sniff_protocol_version(body: bytes) -> Optional[str]:
+def _sniff_protocol_version(body: bytes) -> str | None:
     try:
         parsed = json.loads(body)
     except ValueError:
@@ -610,7 +610,7 @@ def _check(args: argparse.Namespace) -> int:
     return 0
 
 
-def _discovered_versions(body: bytes) -> Optional[list[str]]:
+def _discovered_versions(body: bytes) -> list[str] | None:
     """The versions a ``server/discover`` reply lists, when it lists ours."""
     try:
         parsed = json.loads(body)

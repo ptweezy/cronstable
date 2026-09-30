@@ -28,7 +28,7 @@ propagate as backend exceptions.
 """
 
 import time
-from typing import Any, Optional
+from typing import Any
 
 from cronstable import _json
 from cronstable.state import DOC_KEEP, StateBackend
@@ -167,7 +167,7 @@ def _check_size(kind: str, value: Any, max_bytes: int) -> None:
 
 async def kv_get(
     backend: StateBackend, scope: str, key: str
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     """The stored body of ``key`` (``{key, value, updatedAt}``), or ``None``.
 
     ``None`` means the key is absent; a present key whose value is ``null`` is
@@ -191,7 +191,7 @@ async def kv_set(
     _check_size("value", value, max_bytes)
     body = {"key": key, "value": value, "updatedAt": _now()}
 
-    def _put(_current: Optional[dict[str, Any]]) -> tuple[Any, None]:
+    def _put(_current: dict[str, Any] | None) -> tuple[Any, None]:
         return body, None
 
     await backend.mutate_document(
@@ -220,7 +220,7 @@ async def kv_list(backend: StateBackend, scope: str) -> list[dict[str, Any]]:
 
 async def cursor_get(
     backend: StateBackend, scope: str, name: str
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     """The cursor body (``{name, value, updatedAt}``), or ``None`` if unset."""
     return await backend.read_document(
         CURSOR_NS_PREFIX + _require_scope(scope), name
@@ -254,7 +254,7 @@ async def cursor_advance(
     now = _now()
 
     def _advance(
-        current: Optional[dict[str, Any]],
+        current: dict[str, Any] | None,
     ) -> tuple[Any, dict[str, Any]]:
         cur = current.get("value") if current else None
         if force or cur is None:
@@ -316,7 +316,7 @@ async def idempotency_claim(
     now = _now()
 
     def _claim(
-        current: Optional[dict[str, Any]],
+        current: dict[str, Any] | None,
     ) -> tuple[Any, dict[str, Any]]:
         if current is not None:
             expires = current.get("expiresAt")
@@ -358,7 +358,7 @@ async def artifact_put(
     data: bytes,
     *,
     max_bytes: int = 0,
-    meta: Optional[dict[str, Any]] = None,
+    meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Publish ``data`` under ``name``; return the artifact record.
 
@@ -397,7 +397,7 @@ async def artifact_put(
 
 async def artifact_get_record(
     backend: StateBackend, scope: str, name: str, *, strict: bool = False
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     """The newest artifact record published under ``name``, or ``None``.
 
     The scan is best-effort by default: a record that cannot be read *right
@@ -448,8 +448,8 @@ async def artifact_get(
     name: str,
     *,
     strict: bool = False,
-    max_bytes: Optional[int] = None,
-) -> Optional[tuple[dict[str, Any], bytes]]:
+    max_bytes: int | None = None,
+) -> tuple[dict[str, Any], bytes] | None:
     """The newest ``(record, payload)`` published under ``name``, or ``None``.
 
     ``None`` if the name was never published.  A record whose blob has since

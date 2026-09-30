@@ -1021,7 +1021,6 @@ def test_reboot_ran_follower_answers_false_while_unsynced():
     assert b.reboot_ran("boot-job") is False
 
 
-@pytest.mark.asyncio
 async def test_completed_read_back_opens_reboot_gate(monkeypatch):
     b = _backend()
     b._is_leader = True
@@ -1036,7 +1035,6 @@ async def test_completed_read_back_opens_reboot_gate(monkeypatch):
     assert b.reboot_ran("boot-job") is False  # now safe to answer
 
 
-@pytest.mark.asyncio
 async def test_failed_read_back_keeps_reboot_gate_closed(monkeypatch):
     from cronstable.leadership import RebootRanUnknownError
 
@@ -1053,7 +1051,6 @@ async def test_failed_read_back_keeps_reboot_gate_closed(monkeypatch):
         b.reboot_ran("boot-job")
 
 
-@pytest.mark.asyncio
 async def test_mark_reboot_ran_eager_persist_opens_gate(monkeypatch):
     # the eager mark-persist path reads the key back too (CAS read-modify-
     # write), so a leader that just recorded its own one-shot is synced.
@@ -1071,7 +1068,6 @@ async def test_mark_reboot_ran_eager_persist_opens_gate(monkeypatch):
     assert b.reboot_ran("mine") is True
 
 
-@pytest.mark.asyncio
 async def test_renew_gain_syncs_before_leadership_applies(monkeypatch):
     # on a takeover the forced read-back runs BEFORE _apply_round, so a
     # healthy gain never exposes is_leader()==True next to a stale set (and
@@ -1103,7 +1099,6 @@ async def test_renew_gain_syncs_before_leadership_applies(monkeypatch):
         b.reboot_ran("boot-job")
 
 
-@pytest.mark.asyncio
 async def test_renew_steady_state_syncs_after_apply(monkeypatch):
     # an established leader (no gain) keeps the old order: apply, then the
     # best-effort sync; an open gate stays open across the round.
@@ -1132,7 +1127,6 @@ async def test_renew_steady_state_syncs_after_apply(monkeypatch):
     assert b.reboot_ran("boot-job") is False
 
 
-@pytest.mark.asyncio
 async def test_known_lease_loss_closes_reboot_gate(monkeypatch):
     # a lost lease can be re-won within a single round with _is_leader never
     # observed False -- another node may have led, run and marked a one-shot

@@ -504,7 +504,6 @@ def _mgr(peers=(), node="node-a", job_set="v1:mine", **over):
     return ClusterManager(cfg, get_id)
 
 
-@pytest.mark.asyncio
 async def test_tls_files_changed_detects_in_place_rotation(tmp_path):
     # the SSL contexts load the cert+key once at construction, so an in-place
     # rotation (cert-manager / Vault / a k8s secret refresh -- same paths, new
@@ -526,7 +525,6 @@ async def test_tls_files_changed_detects_in_place_rotation(tmp_path):
     assert mgr.tls_files_changed() is True
 
 
-@pytest.mark.asyncio
 async def test_tls_files_loadable_true_then_false_on_corruption(tmp_path):
     # the gossip override dry-runs build_*_ssl_context against the live files,
     # which is exactly what fails on a missing / half-written cert. This lets
@@ -558,7 +556,6 @@ async def test_tls_files_loadable_true_then_false_on_corruption(tmp_path):
         pytest.fail("tls_files_loadable must swallow load errors, not raise")
 
 
-@pytest.mark.asyncio
 async def test_mtls_round_trip_agreed(tmp_path):
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()
@@ -588,7 +585,6 @@ async def test_mtls_round_trip_agreed(tmp_path):
         await b.stop()
 
 
-@pytest.mark.asyncio
 async def test_mtls_round_trip_drift(tmp_path):
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()
@@ -616,7 +612,6 @@ async def test_mtls_round_trip_drift(tmp_path):
         await b.stop()
 
 
-@pytest.mark.asyncio
 async def test_mtls_untrusted_peer(tmp_path):
     # peer presents a cert from a DIFFERENT CA than we trust -> untrusted
     mine = _write_tls(tmp_path, cn="mine")
@@ -695,7 +690,6 @@ async def test_server_mtls_rejects_wrong_ca_client_cert(tmp_path):
         await a.stop()
 
 
-@pytest.mark.asyncio
 async def test_peer_client_disables_redirects(tmp_path):
     # H2: the peer HTTP client must NOT follow redirects. aiohttp defaults
     # allow_redirects=True, so a CA-vouched-but-hostile peer could answer /peer
@@ -740,7 +734,6 @@ class _Req:
     headers: dict = {}
 
 
-@pytest.mark.asyncio
 async def test_web_cluster_endpoint_disabled():
     import json
 
@@ -752,7 +745,6 @@ async def test_web_cluster_endpoint_disabled():
     assert json.loads(resp.text) == {"enabled": False, "peers": []}
 
 
-@pytest.mark.asyncio
 async def test_web_cluster_endpoint_enabled():
     import json
 
@@ -776,7 +768,6 @@ async def test_web_cluster_endpoint_enabled():
     assert data["peers"][0]["status"] == "agreed"
 
 
-@pytest.mark.asyncio
 async def test_web_cluster_lease_payload_carries_fleet_hint():
     # a lease backend's /cluster payload tells the dashboard whether /fleet
     # has data behind it: true exactly while the observability overlay mesh
@@ -800,7 +791,6 @@ async def test_web_cluster_lease_payload_carries_fleet_hint():
     assert json.loads(resp.text)["fleet"] is True
 
 
-@pytest.mark.asyncio
 async def test_web_cluster_gossip_payload_has_no_fleet_hint():
     # gossip serves the fleet view natively; its payload stays unchanged and
     # the dashboard's gossip branch shows the fleet button unconditionally.
@@ -819,7 +809,6 @@ async def test_web_cluster_gossip_payload_has_no_fleet_hint():
     assert "fleet" not in json.loads(resp.text)
 
 
-@pytest.mark.asyncio
 async def test_web_fleet_endpoint_disabled_without_cluster():
     import json
 
@@ -831,7 +820,6 @@ async def test_web_fleet_endpoint_disabled_without_cluster():
     assert json.loads(resp.text) == {"enabled": False, "nodes": []}
 
 
-@pytest.mark.asyncio
 async def test_web_fleet_endpoint_disabled_for_lease_backends():
     # a lease backend inherits the seam default fleet_view() -> None (it knows
     # only the lease holder, not what any node runs), and the endpoint then
@@ -851,7 +839,6 @@ async def test_web_fleet_endpoint_disabled_for_lease_backends():
     assert json.loads(resp.text) == {"enabled": False, "nodes": []}
 
 
-@pytest.mark.asyncio
 async def test_web_fleet_endpoint_passes_through_gossip_view():
     import json
 
@@ -875,7 +862,6 @@ async def test_web_fleet_endpoint_passes_through_gossip_view():
     assert data["nodes"][0]["self"] is True
 
 
-@pytest.mark.asyncio
 async def test_web_fleet_endpoint_is_conditional_gzipped_and_memoized(
     monkeypatch,
 ):
@@ -982,7 +968,6 @@ def _fat_fleet_view(builds=None):
     }
 
 
-@pytest.mark.asyncio
 async def test_web_fleet_single_flight_shares_one_build(monkeypatch):
     # Concurrent pollers must JOIN one merge+serialize while it is in
     # flight; sharing a product that already landed in the memo proves
@@ -1012,7 +997,6 @@ async def test_web_fleet_single_flight_shares_one_build(monkeypatch):
     assert cron._fleet_response_memo.inflight is None
 
 
-@pytest.mark.asyncio
 async def test_web_fleet_offloads_only_a_large_serialize(monkeypatch):
     # the merge reads live gossip state so it stays on the loop; the
     # serialize/hash/gzip over the merged dict offloads only at
@@ -1054,7 +1038,6 @@ async def test_web_fleet_offloads_only_a_large_serialize(monkeypatch):
     assert idents[-1] == threading.get_ident()
 
 
-@pytest.mark.asyncio
 async def test_web_fleet_bust_mid_build_is_not_stored(monkeypatch):
     # A bust landing while the build is on the executor must not be undone
     # by that pre-bust product being stored on the way out: the leader
@@ -1237,7 +1220,6 @@ def test_hrw_owner_bytes_matches_hrw_owner():
             )
 
 
-@pytest.mark.asyncio
 async def test_mtls_round_trip_elects_single_leader(tmp_path):
     # two agreeing nodes (cluster_size 2, quorum 2): once each has polled the
     # other, exactly one of them (the lowest name) is leader.
@@ -1277,7 +1259,6 @@ async def test_mtls_round_trip_elects_single_leader(tmp_path):
         await b.stop()
 
 
-@pytest.mark.asyncio
 async def test_is_leader_false_without_quorum(tmp_path):
     # node-a in a 3-node cluster whose two peers are unreachable: it sees only
     # itself (1 < quorum 2) and must not lead.
@@ -1459,7 +1440,6 @@ def test_available_job_owner_matches_quorate_owner_when_all_agree():
         assert gated == ungated
 
 
-@pytest.mark.asyncio
 async def test_mtls_spread_assigns_distinct_owners(tmp_path):
     # two agreeing nodes in spread mode: each job is owned by exactly one of
     # them, and both compute the same owner for the same job.
@@ -1502,7 +1482,6 @@ async def test_mtls_spread_assigns_distinct_owners(tmp_path):
         await b.stop()
 
 
-@pytest.mark.asyncio
 async def test_mtls_reboot_ran_push_propagates(tmp_path):
     # the eager push: node-a runs a deferred @reboot job and pushes the fact to
     # node-b over real mTLS, so node-b learns it ran without waiting to poll.
@@ -1532,7 +1511,6 @@ async def test_mtls_reboot_ran_push_propagates(tmp_path):
         await b.stop()
 
 
-@pytest.mark.asyncio
 async def test_mtls_cold_boot_runs_deferred_reboot_exactly_once(tmp_path):
     # BLANK-VIEW @reboot regression, scenario (a): a 3-node cluster cold-boots
     # with a PreferLeader @reboot one-shot. Pre-fix, every node's gates were
@@ -1595,7 +1573,6 @@ async def test_mtls_cold_boot_runs_deferred_reboot_exactly_once(tmp_path):
             await mgr.stop()
 
 
-@pytest.mark.asyncio
 async def test_mtls_restarted_node_reads_reboot_gossip_in_start(tmp_path):
     # BLANK-VIEW @reboot regression, scenario (b): a node (re)starts into a
     # converged cluster that already ran the @reboot one-shot. Pre-fix its
@@ -1690,7 +1667,6 @@ def test_split_host_port_rejects_bad_input():
         _split_host_port("[::1]")  # bracketed, no port
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_payload(no_tls):
     import json
 
@@ -2916,7 +2892,6 @@ def test_declared_fields_gate_both_agreement_and_conflict(no_tls):
         assert not any(named.values()), field
 
 
-@pytest.mark.asyncio
 async def test_mtls_cluster_size_divergence_detected(tmp_path):
     # end-to-end repro of the headline trace over real mTLS: mid 3->5 resize,
     # node a still declares N=3 while node c declares N=5. They share the job
@@ -2954,7 +2929,6 @@ async def test_mtls_cluster_size_divergence_detected(tmp_path):
         await c.stop()
 
 
-@pytest.mark.asyncio
 async def test_mtls_duplicate_nodename_detected(tmp_path):
     # two nodes accidentally share a nodeName: each sees the other announce
     # that name from a different instance id -> conflict on both sides.
@@ -3201,7 +3175,6 @@ _POLL_PEER_FAILURE_CASES += [
 ]
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("observation", "want_status", "err_substr", "election_still_works"),
     _POLL_PEER_FAILURE_CASES,
@@ -3389,7 +3362,6 @@ _POLL_PEER_ABSORB_CASES = [
 ]
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("peers", "over", "host", "make_body", "check"),
     _POLL_PEER_ABSORB_CASES,
@@ -3403,14 +3375,12 @@ async def test_poll_peer_absorbs_declared_field(
     check(mgr, mgr.view.peers[host], session)
 
 
-@pytest.mark.asyncio
 async def test_poll_all_with_no_peers_is_noop(no_tls):
     # exercises _poll_all's session setup + empty gather with no network
     mgr = _mgr([])
     await mgr._poll_all()  # must not raise
 
 
-@pytest.mark.asyncio
 async def test_start_stop_lifecycle_plaintext(no_tls):
     # no peers -> the poll loop's _poll_all is a no-op (no peer sockets), so
     # this drives start()/_poll_loop/stop() over a plaintext listener with no
@@ -3424,7 +3394,6 @@ async def test_start_stop_lifecycle_plaintext(no_tls):
     await mgr.stop()  # idempotent: nothing running
 
 
-@pytest.mark.asyncio
 async def test_start_completes_one_poll_round_inline(no_tls):
     # BLANK-VIEW @reboot regression: start() must complete one full poll
     # round before returning -- mirroring the lease backends' inline store
@@ -3815,7 +3784,6 @@ def test_multihomed_peer_outage_does_not_inflate_quorum(no_tls):
     assert a.conflicting_sizes() == [] and b.conflicting_sizes() == []
 
 
-@pytest.mark.asyncio
 async def test_poll_peer_records_peer_members(no_tls):
     # a successful poll stores the peer's reported members, and an attesting
     # peer is counted toward quorum (the mutual-agreement happy path).
@@ -3840,7 +3808,6 @@ async def test_poll_peer_records_peer_members(no_tls):
     assert mgr._agreeing_peer_names() == ["node-b"]
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_includes_members(no_tls):
     mgr = _mgr(["b:1"])
     _seed_agree(mgr, "b:1", "node-b")
@@ -3852,7 +3819,6 @@ async def test_handle_peer_includes_members(no_tls):
     assert me["agreed"] is True and me["instance_id"] == mgr.instance_id
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_includes_mutual_agreeing(no_tls):
     # the /peer response must publish our mutual_agreeing set (the confirmed
     # two-way agreers) so pollers can drive bridge confirmation off it.
@@ -3864,7 +3830,6 @@ async def test_handle_peer_includes_mutual_agreeing(no_tls):
     assert payload["mutual_agreeing"] == ["node-b", "node-c"]
 
 
-@pytest.mark.asyncio
 async def test_poll_peer_round_trips_mutual_agreeing(no_tls):
     # end to end: a polled mutual_agreeing is parsed, stored, and drives a
     # bridge decision. node-a polls node-b (N=4, quorum 3); b reports it
@@ -3900,7 +3865,6 @@ def test_poll_failure_resets_mutual_agreeing(no_tls):
     assert mgr.view.peers["b:1"].mutual_agreeing is None
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_includes_quorate_vouched(no_tls):
     # the /peer response must publish our quorate_vouched set (our
     # _eligible_candidates -- the nodes we confirm quorate) so a poller folds
@@ -3916,7 +3880,6 @@ async def test_handle_peer_includes_quorate_vouched(no_tls):
     assert payload["quorate_vouched"] == sorted(mgr._eligible_candidates())
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_caps_quorate_vouched(no_tls):
     # quorate_vouched is the one re-advertised set built entirely from ABSORBED
     # peer data (_bridge_candidates folds a peer's mutual_agreeing), so without
@@ -3950,7 +3913,6 @@ async def test_handle_peer_caps_quorate_vouched(no_tls):
     assert len(resp.body) <= MAX_PEER_RESPONSE_BYTES // 2 + 8192
 
 
-@pytest.mark.asyncio
 async def test_candidate_truncation_is_reported_not_silent(no_tls, caplog):
     # Unlike the summaries cap, whose residual is a degraded VIEW, dropping a
     # candidate from the tail costs a `spread` co-owner and double-runs its
@@ -3979,7 +3941,6 @@ async def test_candidate_truncation_is_reported_not_silent(no_tls, caplog):
     assert view["conflict"] is False
 
 
-@pytest.mark.asyncio
 async def test_candidate_truncation_warning_does_not_flood(no_tls, caplog):
     # The bridge derive and the advert build report DIFFERENT counts (the
     # advert is the direct + bridge union, strictly larger whenever any
@@ -4009,7 +3970,6 @@ async def test_candidate_truncation_warning_does_not_flood(no_tls, caplog):
     assert len(warned) == 2
 
 
-@pytest.mark.asyncio
 async def test_candidate_truncation_warning_survives_membership_churn(
     no_tls, caplog
 ):
@@ -4053,7 +4013,6 @@ async def test_candidate_truncation_warning_survives_membership_churn(
     assert len(again) == 2, [r.getMessage() for r in again]
 
 
-@pytest.mark.asyncio
 async def test_cluster_read_does_not_blank_advert_truncation(no_tls):
     # The /cluster view flag rode the same scalar the bridge derive zeroes
     # when ITS half fits, and view_dict cascades into that derive, so the
@@ -4081,7 +4040,6 @@ async def test_cluster_read_does_not_blank_advert_truncation(no_tls):
     assert mgr.view_dict()["candidates_truncated"] == over
 
 
-@pytest.mark.asyncio
 async def test_candidates_truncated_is_zero_for_an_ordinary_fleet(no_tls):
     mgr = _mgr(["b:1"])
     _seed_agree(mgr, "b:1", "node-b", mutual={"node-a", "node-c"})
@@ -4090,7 +4048,6 @@ async def test_candidates_truncated_is_zero_for_an_ordinary_fleet(no_tls):
     assert mgr.view_dict()["candidates_truncated"] == 0
 
 
-@pytest.mark.asyncio
 async def test_candidates_truncated_clears_when_the_fleet_shrinks(no_tls):
     # The advert cell is rewritten only when a /peer poll rebuilds the
     # response body, so a node whose pollers were all decommissioned kept
@@ -4124,7 +4081,6 @@ async def test_candidates_truncated_clears_when_the_fleet_shrinks(no_tls):
     assert mgr._candidates_truncated == 0
 
 
-@pytest.mark.asyncio
 async def test_candidates_truncated_reports_growth_before_any_peer_poll(
     no_tls,
 ):
@@ -4152,7 +4108,6 @@ async def test_candidates_truncated_reports_growth_before_any_peer_poll(
     assert mgr.view_dict()["candidates_truncated"] == union
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_drops_summaries_rather_than_ship_oversized(
     no_tls, monkeypatch
 ):
@@ -4197,7 +4152,6 @@ async def test_handle_peer_drops_summaries_rather_than_ship_oversized(
     assert (await mgr._handle_peer(req)).status == 304
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_says_so_when_shedding_cannot_fit_the_body(
     no_tls, monkeypatch, caplog
 ):
@@ -4229,7 +4183,6 @@ async def test_handle_peer_says_so_when_shedding_cannot_fit_the_body(
     assert "dropped job_summaries" not in records[0].getMessage()
 
 
-@pytest.mark.asyncio
 async def test_poll_peer_round_trips_quorate_vouched(no_tls):
     # end to end: a polled quorate_vouched is parsed, stored, and drives the
     # spread Leader owner fold. node-a (spread) polls node-c, which vouches a
@@ -4263,7 +4216,6 @@ def test_poll_failure_resets_quorate_vouched(no_tls):
     assert mgr.view.peers["b:1"].quorate_vouched is None
 
 
-@pytest.mark.asyncio
 async def test_poll_peer_rejects_deeply_nested_json(no_tls, monkeypatch):
     # a deeply-nested body makes json.loads raise RecursionError, NOT
     # ValueError. It must still be classified as a failed observation: were it
@@ -4296,7 +4248,6 @@ async def test_poll_peer_rejects_deeply_nested_json(no_tls, monkeypatch):
     assert "invalid JSON" in (peer.last_error or "")
 
 
-@pytest.mark.asyncio
 async def test_start_cleans_up_runner_on_bind_failure(no_tls):
     # #7: a bind failure (port already in use) after AppRunner.setup() must not
     # leak the runner; start() cleans up after itself and leaves the manager
@@ -4347,7 +4298,6 @@ def test_reboot_ran_transitive_from_agreed_peer_only(no_tls):
     assert mgr.reboot_ran("other") is False
 
 
-@pytest.mark.asyncio
 async def test_handle_reboot_ran_absorbs_only_matching_job_set(no_tls):
     mgr = _mgr(["b:1"])
     # a push for a DIFFERENT job set is ignored (stale config)
@@ -4363,7 +4313,6 @@ async def test_handle_reboot_ran_absorbs_only_matching_job_set(no_tls):
     assert mgr.reboot_ran("boot") is True  # the int entry is dropped
 
 
-@pytest.mark.asyncio
 async def test_push_reboot_ran_fans_out_to_peers(no_tls, monkeypatch):
     mgr = _mgr(["b:1", "c:1"])
     mgr._ran_reboot_jobs.add("boot")
@@ -4385,7 +4334,6 @@ async def test_push_reboot_ran_fans_out_to_peers(no_tls, monkeypatch):
     )
 
 
-@pytest.mark.asyncio
 async def test_ran_jobs_cleared_on_job_set_change(no_tls):
     # a config reload (job_set_id change) forgets prior runs: a still-deferred
     # job may then re-run (safe), never silently skip a job whose def changed.
@@ -4405,7 +4353,6 @@ async def test_ran_jobs_cleared_on_job_set_change(no_tls):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_peer_status_change_logs_untrusted_with_error(no_tls, caplog):
     # C2: a TLS/cert failure is the highest-value transition -> WARNING with
     # the host and the underlying error (botched rotations must stay visible).
@@ -4422,7 +4369,6 @@ async def test_peer_status_change_logs_untrusted_with_error(no_tls, caplog):
     )
 
 
-@pytest.mark.asyncio
 async def test_peer_status_change_unreachable_quiet_at_startup(no_tls, caplog):
     # C2: a first contact (unknown -> unreachable) is NOT warned, so a cluster
     # coming up does not emit a burst while peers are still binding.
@@ -4436,7 +4382,6 @@ async def test_peer_status_change_unreachable_quiet_at_startup(no_tls, caplog):
     assert not [r for r in caplog.records if "unreachable" in r.message]
 
 
-@pytest.mark.asyncio
 async def test_peer_status_change_warns_only_on_real_drop(no_tls, caplog):
     # C2: one "now agreed" on first contact, nothing on a repeat poll, and a
     # WARNING (with the error) only when a *previously reached* peer drops.
@@ -4463,7 +4408,6 @@ def _self_poll_session(mgr):
     )
 
 
-@pytest.mark.asyncio
 async def test_self_poll_warns_on_degenerate_two_node_election(no_tls, caplog):
     # SELF-BY-IP regression: a self entry listed by a routable IP under a
     # wildcard listen is invisible to config-time detection, so a real 2-node
@@ -4507,7 +4451,6 @@ async def test_self_poll_warns_on_degenerate_two_node_election(no_tls, caplog):
     )
 
 
-@pytest.mark.asyncio
 async def test_self_poll_benign_self_listing_logs_info_only(no_tls, caplog):
     # the same self-listing in a genuinely 3+-node cluster (effective size 3)
     # is benign: identified once at INFO, no degenerate-quorum warning.
@@ -4532,7 +4475,6 @@ async def test_self_poll_benign_self_listing_logs_info_only(no_tls, caplog):
     assert len(infos) == 1 and "10.0.0.1:8443" in infos[0]
 
 
-@pytest.mark.asyncio
 async def test_degenerate_self_warning_survives_multihomed_dedup_lag(
     no_tls, caplog
 ):
@@ -4606,7 +4548,6 @@ async def test_degenerate_self_warning_survives_multihomed_dedup_lag(
         )
 
 
-@pytest.mark.asyncio
 async def test_handle_reboot_ran_times_out_on_slow_body(no_tls):
     # A5: a hung body read is bounded by connectTimeout -> 408, rather than
     # pinning a handler coroutine indefinitely.
@@ -4625,7 +4566,6 @@ async def test_handle_reboot_ran_times_out_on_slow_body(no_tls):
     assert resp.status == 408
 
 
-@pytest.mark.asyncio
 async def test_handle_reboot_ran_rejects_oversized_body(no_tls):
     # A5/DoS: an over-cap body is refused (413) before any JSON parse.
     from cronstable.cluster import MAX_PEER_RESPONSE_BYTES
@@ -4639,7 +4579,6 @@ async def test_handle_reboot_ran_rejects_oversized_body(no_tls):
     assert resp.status == 413
 
 
-@pytest.mark.asyncio
 async def test_handle_reboot_ran_rejects_deeply_nested_json(
     no_tls, monkeypatch
 ):
@@ -4667,7 +4606,6 @@ async def test_handle_reboot_ran_rejects_deeply_nested_json(
     assert resp.status == 400
 
 
-@pytest.mark.asyncio
 async def test_mark_reboot_ran_survives_concurrent_reload_clear(no_tls):
     # A2: mark_reboot_ran reconciles to the live id BEFORE adding, so a poll
     # under the (now-current) id does not discard the just-recorded run.
@@ -4682,7 +4620,6 @@ async def test_mark_reboot_ran_survives_concurrent_reload_clear(no_tls):
     assert mgr.reboot_ran("boot") is True
 
 
-@pytest.mark.asyncio
 async def test_handle_reboot_ran_survives_lagged_job_set_id(no_tls):
     # A3: a push arriving after a reload changed the live id (but before the
     # poll loop advanced _ran_jobs_job_set_id) is recorded under the live id
@@ -4773,7 +4710,6 @@ def test_bridge_candidates_reject_an_empty_name(no_tls):
     assert mgr.is_leader()
 
 
-@pytest.mark.asyncio
 async def test_poll_peer_empty_name_never_stands_the_cluster_down(no_tls):
     # end to end: a peer gossiping "" in mutual_agreeing must not elect '' as
     # leader (no node matches it, so every Leader job stops firing while
@@ -5014,7 +4950,6 @@ def test_node_stats_header_drops_integers_outside_float_range(field, value):
     assert _parse_node_stats_header(header) == {"mem_percent": 12.5}
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("telemetry", ["outcome-list", "outcome-map", "stats"])
 async def test_malformed_telemetry_cannot_preserve_stale_quorum(
     no_tls, telemetry
@@ -5102,7 +5037,6 @@ def test_parse_job_summaries_caps_cardinality():
     assert len(parsed) == MAX_ADVERTISED_JOB_SUMMARIES
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_advertises_job_summaries(no_tls):
     mgr = _mgr([])
     # no provider installed yet (the scheduler installs it before start()):
@@ -5132,7 +5066,6 @@ async def test_handle_peer_advertises_job_summaries(no_tls):
     assert payload["job_summaries_truncated"] is False
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_advertises_node_stats_header_only_when_shared(
     no_tls,
 ):
@@ -5188,7 +5121,6 @@ def test_view_dict_carries_peer_node_stats_and_local_readout(no_tls):
     }
 
 
-@pytest.mark.asyncio
 async def test_poll_peer_absorbs_node_stats_header(no_tls):
     # the reading arrives via the response HEADER (never the body -- see
     # _handle_peer), hardened through _parse_node_stats like any peer input
@@ -5216,7 +5148,6 @@ async def test_poll_peer_absorbs_node_stats_header(no_tls):
     assert mgr.view.peers["b:1"].node_stats_at is not None
 
 
-@pytest.mark.asyncio
 async def test_poll_peer_ignores_malformed_node_stats_header(no_tls):
     # the header is CA-vouched-but-untrusted input: bad JSON, a non-dict, or
     # an oversized value must read as "no reading this round" -- the poll
@@ -5455,7 +5386,6 @@ def test_fleet_view_skips_self_listing_and_dedupes_instances(no_tls):
     assert len(fleet["nodes"]) == 2
 
 
-@pytest.mark.asyncio
 async def test_mtls_round_trip_job_summaries(tmp_path):
     # end-to-end over the real mTLS channel: b advertises its scheduler
     # snapshot, a absorbs it and can serve a merged fleet view naming b's
@@ -5506,7 +5436,6 @@ async def test_mtls_round_trip_job_summaries(tmp_path):
         await b.stop()
 
 
-@pytest.mark.asyncio
 async def test_mtls_round_trip_node_stats(tmp_path):
     # end-to-end over the real mTLS channel: b advertises its whole-node
     # CPU/memory, a absorbs it and serves it in the merged fleet view -- the
@@ -5590,7 +5519,6 @@ _PEER_B_BODY = {
 }
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_carries_etag_and_answers_304(no_tls):
     mgr = _mgr(["b:1"], job_set="v1:x")
     resp = await mgr._handle_peer(_Req())
@@ -5618,7 +5546,6 @@ async def test_handle_peer_carries_etag_and_answers_304(no_tls):
     assert resp4.headers["ETag"] != etag
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_304_survives_live_countdown_ticks(no_tls):
     # Pins the handler's CLOCK PLUMBING, which the etag unit test (it passes
     # now_epoch explicitly) cannot: the tag hashes each live scheduled_in as
@@ -5721,7 +5648,6 @@ def test_stable_job_summaries_rewrites_only_scheduled_in():
     assert stable["soon"] is not raw["soon"]
 
 
-@pytest.mark.asyncio
 async def test_observe_peer_conditional_replay_on_304(no_tls):
     mgr = _mgr(["b:1"])
     session = _FakeSeqSession(
@@ -5752,7 +5678,6 @@ async def test_observe_peer_conditional_replay_on_304(no_tls):
     assert peer.job_summaries_at == taken_at
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_etag_stable_while_node_stats_change(no_tls):
     # THE point of the header sidecar: live load values never touch the
     # body's ETag, so a sharing cluster keeps the idle-304 optimisation --
@@ -5777,7 +5702,6 @@ async def test_handle_peer_etag_stable_while_node_stats_change(no_tls):
     assert json.loads(resp2.headers[NODE_STATS_HEADER])["cpu_percent"] == 90.0
 
 
-@pytest.mark.asyncio
 async def test_observe_peer_absorbs_fresh_node_stats_on_304(no_tls):
     # the poller half of the sidecar: a conditional 304 round replays the
     # cached body observation but absorbs THIS response's header reading --
@@ -5823,7 +5747,6 @@ async def test_observe_peer_absorbs_fresh_node_stats_on_304(no_tls):
     assert peer.node_stats_at == stamped_at
 
 
-@pytest.mark.asyncio
 async def test_observe_peer_unsolicited_304_is_failure(no_tls):
     # a 304 answers a conditional request; with nothing cached we sent none,
     # so a peer volunteering one is buggy or hostile -> a failed observation,
@@ -5836,7 +5759,6 @@ async def test_observe_peer_unsolicited_304_is_failure(no_tls):
     assert "304" in (peer.last_error or "")
 
 
-@pytest.mark.asyncio
 async def test_observe_peer_replay_recomputes_against_live_id(no_tls):
     # a 304 proves the PEER'S payload is unchanged; OUR job set may have
     # reloaded meanwhile, so the replay must re-derive agreement against the
@@ -5854,7 +5776,6 @@ async def test_observe_peer_replay_recomputes_against_live_id(no_tls):
     assert peer.mismatch_streak == 1
 
 
-@pytest.mark.asyncio
 async def test_observe_peer_bounds_and_drops_unusable_etags(no_tls):
     # the tag is stored and echoed as a request header every round, so a
     # hostile peer must not be able to park an oversized or control-character
@@ -5991,7 +5912,6 @@ def test_fleet_view_ages_peer_countdowns(no_tls):
     assert jobs["soon"]["scheduled_in"] == 100.0
 
 
-@pytest.mark.asyncio
 async def test_mtls_conditional_304_and_gzip(tmp_path):
     # end-to-end over real sockets: the second poll round rides a bodyless
     # 304, and a full body large enough to clear the floor goes out gzipped.
@@ -6152,7 +6072,6 @@ def test_derived_sets_memoized_match_fresh_computation(no_tls):
     assert_memo_matches_fresh()
 
 
-@pytest.mark.asyncio
 async def test_handle_peer_serves_cached_pair_until_view_mutates(no_tls):
     # /peer serves the same (payload, etag) pair from its short-TTL cache
     # (the payload cascade and the hash run once, not per request), but a

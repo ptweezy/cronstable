@@ -10,7 +10,11 @@ from tests.test_web_scopes import _ScopedReq, _bearer, _run, _table
 from cronstable.cron import Cron
 from cronstable.config import _build_mcp_config
 from cronstable.mcp import MCPHandler
-from tests.test_mcp_tools import _req
+from tests.test_mcp_tools import _call, _req
+
+
+async def _store_offline(*args, **kwargs):
+    raise OSError("store offline")
 
 
 async def test_manual_queue_api_acknowledges_and_cancels(dag_cron, monkeypatch):
@@ -27,6 +31,15 @@ async def test_manual_queue_api_acknowledges_and_cancels(dag_cron, monkeypatch):
     assert (await cron._web_pool_cancel(cancel)).status == 200
     await cron._pools.tick()
     assert not cron.running_jobs
+
+
+async def test_manual_queue_answers_503_while_pool_state_is_unavailable(dag_cron, monkeypatch):
+    cron = await make(dag_cron, monkeypatch)
+    cron.web_config = {}
+    monkeypatch.setattr(cron._pools, "enqueue_job", _store_offline)
+    with pytest.raises(web.HTTPServiceUnavailable) as ei:
+        await cron._web_start_job(Req(match={"name": "one"}))
+    assert json.loads(ei.value.text) == {"error": "pool state is unavailable"}
 
 
 @pytest.mark.parametrize("payload", [{"dryRun": False}, {"tasks": "x"}, {"dryRun": "false"}, {"allowConfigChange": 1}])
@@ -64,6 +77,24 @@ async def test_mcp_queue_uses_structured_content_and_requires_confirmation(dag_c
     assert (await cron._pools.snapshot())[0]["queued"] == 1
     accepted = await _req(handler, "tools/call", {"name": "cron_cancel_queued", "arguments": {**args, "confirm": True}})
     assert accepted["result"]["structuredContent"]["state"] == "cancelled"
+
+
+@pytest.mark.parametrize(
+    "tool, arguments, target, message",
+    [
+        ("cron_list_pools", {}, "snapshot", "pool state is unavailable"),
+        ("cron_cancel_queued", {"pool": "database", "id": "x", "confirm": True}, "cancel", "pool state is unavailable"),
+        ("cron_preview_recovery", {"dag": "flow", "run_key": "r"}, "recover", "recovery state is unavailable"),
+    ],
+)
+async def test_mcp_store_failures_are_tool_errors(dag_cron, monkeypatch, tool, arguments, target, message):
+    cron = await make(dag_cron, monkeypatch)
+    owner = cron._dag if target == "recover" else cron._pools
+    monkeypatch.setattr(owner, target, _store_offline)
+    handler = MCPHandler(cron, _build_mcp_config({"enabled": True, "readOnly": False, "toolsets": ["observe", "act", "dags"]}))
+    result = await _call(handler, tool, arguments)
+    assert result["isError"]
+    assert result["content"][0]["text"] == message
 
 
 async def test_mcp_recovery_uses_reviewed_plan(dag_cron, tmp_path):

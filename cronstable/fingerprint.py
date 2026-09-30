@@ -48,7 +48,6 @@ from operator import attrgetter
 from typing import (
     Any,
     NamedTuple,
-    Optional,
 )
 
 from cronstable.config import (
@@ -119,7 +118,7 @@ _HOOK_PREFIXES = {
 _Hook = dict[str, Any]
 _RedactTable = dict[int, tuple[_Hook, _Hook]]
 _NormalizeTable = dict[int, tuple[Any, Any]]
-_FragmentTable = dict[int, tuple[Any, Optional[bytes]]]
+_FragmentTable = dict[int, tuple[Any, bytes | None]]
 
 
 class SharedNodeMemo(NamedTuple):
@@ -293,7 +292,7 @@ def _omit_default_report_fields(report: dict[str, Any]) -> dict[str, Any]:
 
 
 def _redact_action(
-    action: dict[str, Any], memo: Optional[SharedNodeMemo] = None
+    action: dict[str, Any], memo: SharedNodeMemo | None = None
 ) -> dict[str, Any]:
     """Copy an on{Failure,PermanentFailure,Success} block, redacting secrets.
 
@@ -320,7 +319,7 @@ def _redact_action(
 
 
 def canonical_job(
-    job: JobConfig, memo: Optional[SharedNodeMemo] = None
+    job: JobConfig, memo: SharedNodeMemo | None = None
 ) -> dict[str, Any]:
     """Build the canonical, host-independent identity dict for one job.
 
@@ -396,9 +395,7 @@ def canonical_job(
     return out
 
 
-def _normalize_numbers(
-    obj: Any, memo: Optional[_NormalizeTable] = None
-) -> Any:
+def _normalize_numbers(obj: Any, memo: _NormalizeTable | None = None) -> Any:
     """Collapse the int/float distinction by value, recursively.
 
     A whole-number float (``30.0``) canonicalizes to the same int (``30``) it
@@ -517,7 +514,7 @@ def _spliced_bytes(doc: dict[str, Any], memo: SharedNodeMemo) -> bytes:
     return b"{" + b",".join(parts) + b"}"
 
 
-def _canonical_bytes(obj: Any, memo: Optional[SharedNodeMemo] = None) -> bytes:
+def _canonical_bytes(obj: Any, memo: SharedNodeMemo | None = None) -> bytes:
     # _normalize_numbers so int and float spellings of the same value cannot
     # diverge; _canonical_json (see above) for the settings that make the
     # serialization the single canonical one.
@@ -531,7 +528,7 @@ def _canonical_bytes(obj: Any, memo: Optional[SharedNodeMemo] = None) -> bytes:
     return _spliced_bytes(_normalize_numbers(obj, memo.normalized), memo)
 
 
-def job_digest(job: JobConfig, memo: Optional[SharedNodeMemo] = None) -> str:
+def job_digest(job: JobConfig, memo: SharedNodeMemo | None = None) -> str:
     """Hex SHA-256 of a single job's canonical identity.
 
     ``memo``, when given, is a per-call :class:`SharedNodeMemo` shared with

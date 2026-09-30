@@ -34,7 +34,7 @@ import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple
 
 #: The schema every ``<Task>`` element lives in.
 TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
@@ -318,7 +318,7 @@ def parse_boundary(text: str, where: str) -> Boundary:
     return Boundary(when, match.group("zone") or "")
 
 
-def _text(parent: Optional[ET.Element], tag: str) -> Optional[str]:
+def _text(parent: ET.Element | None, tag: str) -> str | None:
     if parent is None:
         return None
     found = parent.find(_NS + tag)
@@ -327,7 +327,7 @@ def _text(parent: Optional[ET.Element], tag: str) -> Optional[str]:
     return found.text.strip()
 
 
-def _flag(parent: Optional[ET.Element], tag: str) -> Optional[bool]:
+def _flag(parent: ET.Element | None, tag: str) -> bool | None:
     value = _text(parent, tag)
     if value is None:
         return None
@@ -343,7 +343,7 @@ _NAME_REPLACED = re.compile(r"[/#?%\x00-\x1f\x7f-\x9f]")
 _NAME_SPACES = re.compile(r"\s+")
 
 
-def job_name(uri: Optional[str], fallback: str) -> str:
+def job_name(uri: str | None, fallback: str) -> str:
     """A job name derived from a task's ``RegistrationInfo/URI``.
 
     ``\\`` becomes ``.`` so a Task Scheduler folder reads as a namespace,
@@ -416,8 +416,8 @@ _MONTHS = (
 
 
 def repetition_fields(
-    start: datetime.datetime, interval_s: float, duration_s: Optional[float]
-) -> Optional[tuple[str, str]]:
+    start: datetime.datetime, interval_s: float, duration_s: float | None
+) -> tuple[str, str] | None:
     """The (minute, hour) cron fields a repetition tiles a day with.
 
     ``None`` when it cannot be expressed as one cron expression, which is
@@ -463,7 +463,7 @@ def repetition_fields(
 
 def _repetition(
     trigger: ET.Element, where: str
-) -> tuple[Optional[float], Optional[float]]:
+) -> tuple[float | None, float | None]:
     block = trigger.find(_NS + "Repetition")
     if block is None:
         return None, None
@@ -477,7 +477,7 @@ def _repetition(
 
 def _lower_time_trigger(
     trigger: ET.Element, where: str, task: str
-) -> tuple[Optional[str], list[Note]]:
+) -> tuple[str | None, list[Note]]:
     notes: list[Note] = []
     boundary_text = _text(trigger, "StartBoundary")
     if not boundary_text:
@@ -566,7 +566,7 @@ def _weekday_list(parent: ET.Element) -> list[str]:
     return names
 
 
-def _month_list(parent: Optional[ET.Element]) -> str:
+def _month_list(parent: ET.Element | None) -> str:
     if parent is None:
         return "*"
     numbers = [
@@ -579,7 +579,7 @@ def _month_list(parent: Optional[ET.Element]) -> str:
 
 def _lower_schedule_by_day(
     block: ET.Element, boundary: Boundary, task: str
-) -> tuple[Optional[str], list[Note]]:
+) -> tuple[str | None, list[Note]]:
     interval = int(_text(block, "DaysInterval") or "1")
     minute, hour = boundary.when.minute, boundary.when.hour
     if interval <= 1:
@@ -607,7 +607,7 @@ def _lower_schedule_by_day(
 
 def _lower_schedule_by_week(
     block: ET.Element, boundary: Boundary, task: str
-) -> tuple[Optional[str], list[Note]]:
+) -> tuple[str | None, list[Note]]:
     interval = int(_text(block, "WeeksInterval") or "1")
     days = block.find(_NS + "DaysOfWeek")
     names = _weekday_list(days) if days is not None else []
@@ -642,7 +642,7 @@ def _lower_schedule_by_week(
 
 def _lower_schedule_by_month(
     block: ET.Element, boundary: Boundary, task: str
-) -> tuple[Optional[str], list[Note]]:
+) -> tuple[str | None, list[Note]]:
     days_element = block.find(_NS + "DaysOfMonth")
     days: list[str] = []
     if days_element is not None:
@@ -674,7 +674,7 @@ def _lower_schedule_by_month(
 
 def _lower_schedule_by_month_dow(
     block: ET.Element, boundary: Boundary, task: str
-) -> tuple[Optional[str], list[Note]]:
+) -> tuple[str | None, list[Note]]:
     weeks_element = block.find(_NS + "Weeks")
     days_element = block.find(_NS + "DaysOfWeek")
     weeks: list[str] = []
@@ -716,7 +716,7 @@ def _lower_schedule_by_month_dow(
 
 def _lower_calendar_trigger(
     trigger: ET.Element, where: str, task: str
-) -> tuple[Optional[str], list[Note]]:
+) -> tuple[str | None, list[Note]]:
     boundary_text = _text(trigger, "StartBoundary")
     if not boundary_text:
         return None, [
@@ -778,7 +778,7 @@ def _lower_calendar_trigger(
 
 def _lower_boot_trigger(
     trigger: ET.Element, where: str, task: str
-) -> tuple[Optional[str], list[Note]]:
+) -> tuple[str | None, list[Note]]:
     notes = []
     if _text(trigger, "Delay"):
         notes.append(
@@ -815,7 +815,7 @@ def _lower_boot_trigger(
 
 def lower_trigger(
     trigger: ET.Element, where: str, task: str
-) -> tuple[Optional[str], list[Note]]:
+) -> tuple[str | None, list[Note]]:
     """One trigger element as a cron schedule, or ``None`` plus the reason."""
     kind = _local(trigger.tag)
     if kind == "TimeTrigger":
@@ -913,7 +913,7 @@ _PERCENT_VAR = re.compile(r"%[^%\s]+%")
 
 def lower_exec(
     action: ET.Element, task: str
-) -> tuple[Optional[list[str] | str], Optional[str], list[Note]]:
+) -> tuple[list[str] | str | None, str | None, list[Note]]:
     """One ``Exec`` action as a command plus a working directory.
 
     Usually an argv list.  A command line carrying ``%VAR%`` comes back as
@@ -1042,7 +1042,7 @@ _PRIORITY = {
 
 
 def lower_settings(
-    settings: Optional[ET.Element], where: str, task: str
+    settings: ET.Element | None, where: str, task: str
 ) -> tuple[dict[str, Any], list[Note]]:
     """The ``Settings`` block as job keys, plus what could not be carried."""
     keys: dict[str, Any] = {}
@@ -1186,7 +1186,7 @@ def convert_task(
     source: str,
     fallback: str,
     *,
-    timezone: Optional[str] = None,
+    timezone: str | None = None,
 ) -> ConvertedTask:
     """Lower one ``<Task>`` into jobs plus everything that did not carry."""
     registration = task_element.find(_NS + "RegistrationInfo")
@@ -1305,7 +1305,7 @@ def convert_task(
 
 
 def _timezone_keys(
-    triggers: list[ET.Element], task: str, timezone: Optional[str]
+    triggers: list[ET.Element], task: str, timezone: str | None
 ) -> tuple[dict[str, Any], list[Note]]:
     """How a converted job should read its schedule's clock.
 
@@ -1508,7 +1508,7 @@ def render_report(tasks: list[ConvertedTask]) -> str:
 
 # --- The command -----------------------------------------------------------
 def convert_source(
-    path: str, *, timezone: Optional[str], strict: bool
+    path: str, *, timezone: str | None, strict: bool
 ) -> tuple[list[ConvertedTask], list[Note]]:
     """Every task in one file (or standard input).
 

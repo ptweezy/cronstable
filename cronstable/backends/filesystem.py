@@ -76,7 +76,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 # The skew margin and unknown-holder sentinel are cross-backend contracts
 # shared via _common.  Here the margin is applied TWICE (the module
@@ -142,7 +142,7 @@ def _wallclock() -> float:
     return time.time()
 
 
-def display_name(holder: Optional[str]) -> Optional[str]:
+def display_name(holder: str | None) -> str | None:
     """The human identity in a ``<nodeName>#<token>`` holder string.
 
     ``None`` passes through (no holder).  An empty display part maps to
@@ -206,14 +206,14 @@ class FilesystemBackend(ElectionReadsBase):
         # of leadership state) once a round re-establishes the picture.
         self._lease_lost = False
         # the lease we hold (None when not holding); carries the fence.
-        self._lease: Optional[Lease] = None
-        self._holder: Optional[str] = None
+        self._lease: Lease | None = None
+        self._holder: str | None = None
         # wall-clock expiry, for the dashboard/lease_detail display ONLY
-        self._lease_deadline: Optional[datetime.datetime] = None
+        self._lease_deadline: datetime.datetime | None = None
         # monotonic deadlines: the load-bearing fence/freshness gates
-        self._lease_deadline_mono: Optional[float] = None
-        self._quorum_deadline_mono: Optional[float] = None
-        self._observed_fence: Optional[int] = None
+        self._lease_deadline_mono: float | None = None
+        self._quorum_deadline_mono: float | None = None
+        self._observed_fence: int | None = None
 
         # reboot-ran refresh bookkeeping (see _refresh_reboot_ran)
         self._reboot_refresh_next = 0.0
@@ -232,9 +232,9 @@ class FilesystemBackend(ElectionReadsBase):
         # in between) where leadership is gained in _renew_once.
         self._reboot_ran_synced = False
         self._reboot_persisted: set[str] = set()
-        self._reboot_persisted_job_set_id: Optional[str] = None
+        self._reboot_persisted_job_set_id: str | None = None
 
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
     # --- derived renew cadence --------------------------------------------
@@ -309,12 +309,12 @@ class FilesystemBackend(ElectionReadsBase):
 
     def _apply_round(
         self,
-        holder: Optional[str],
+        holder: str | None,
         is_leader: bool,
-        expires_at: Optional[float],
-        fence: Optional[int],
-        mono: Optional[float] = None,
-        lease_mono: Optional[float] = None,
+        expires_at: float | None,
+        fence: int | None,
+        mono: float | None = None,
+        lease_mono: float | None = None,
     ) -> None:
         """Update live leader state from a round's POSITIVE outcome.
 
@@ -463,8 +463,6 @@ class FilesystemBackend(ElectionReadsBase):
                 await asyncio.wait_for(
                     self._renew_once(), timeout=self.round_deadline
                 )
-            except asyncio.CancelledError:
-                raise
             except (OSError, asyncio.TimeoutError) as ex:
                 # transient store trouble: nothing to change -- the fixed
                 # quorum deadline simply lapses (Leader closes, PreferLeader

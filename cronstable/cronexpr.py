@@ -61,9 +61,6 @@ import re
 import time
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Iterator, Mapping
-from typing import (
-    Optional,
-)
 
 __all__ = ["LOCAL_ZONE", "CronTab", "LocalZone", "expand_field"]
 
@@ -179,7 +176,7 @@ _ITEM_H = re.compile(r"(?:^|[\s,])h")
 _HASH_DOM_END = 28
 
 
-def _quartz_hint(fields: tuple[str, ...]) -> Optional[str]:
+def _quartz_hint(fields: tuple[str, ...]) -> str | None:
     """Extra text for a parse error that smells like Quartz syntax.
 
     ``#`` and ``W`` are part of this dialect but each is valid in exactly
@@ -232,7 +229,7 @@ _MONTH = ("month", 1, 12, 12, _MONTH_NAMES)
 _DOW = ("day-of-week", 0, 7, 6, _DOW_NAMES)
 _YEAR = ("year", 1970, _YEAR_HORIZON, _YEAR_HORIZON, None)
 
-_FieldSpec = tuple[str, int, int, int, Optional[Mapping[str, int]]]
+_FieldSpec = tuple[str, int, int, int, Mapping[str, int] | None]
 
 #: field layouts by column count, mirroring ``CronTab.__init__``'s slicing
 _LAYOUTS: Mapping[int, tuple[_FieldSpec, ...]] = {
@@ -257,7 +254,7 @@ def _hash_value(hash_key: str, label: str) -> int:
 
 
 def _expand_hash_item(
-    item: str, low: str, spec: _FieldSpec, hash_key: Optional[str]
+    item: str, low: str, spec: _FieldSpec, hash_key: str | None
 ) -> str:
     """One ``H`` item, expanded to the explicit values it hashes to.
 
@@ -320,7 +317,7 @@ def _expand_hash_item(
 
 
 def _expand_hash_field(
-    text: str, spec: _FieldSpec, hash_key: Optional[str]
+    text: str, spec: _FieldSpec, hash_key: str | None
 ) -> str:
     """Replace every ``H`` item of one field with its hashed values.
 
@@ -838,7 +835,7 @@ class _Frame:
         self,
         lo: datetime.datetime,
         hi: datetime.datetime,
-        fixed: Optional[datetime.timezone],
+        fixed: datetime.timezone | None,
         open: bool,
     ) -> None:
         self.lo = lo
@@ -848,7 +845,7 @@ class _Frame:
         self.built = time.monotonic()
 
 
-def _host_offset(utc: datetime.datetime) -> Optional[datetime.timedelta]:
+def _host_offset(utc: datetime.datetime) -> datetime.timedelta | None:
     """The host offset at the aware instant ``utc``: one library reading."""
     return _local_civil(utc).utcoffset()
 
@@ -856,8 +853,8 @@ def _host_offset(utc: datetime.datetime) -> Optional[datetime.timedelta]:
 def _first_change(
     start: datetime.datetime,
     stop: datetime.datetime,
-    offset: Optional[datetime.timedelta],
-) -> Optional[datetime.datetime]:
+    offset: datetime.timedelta | None,
+) -> datetime.datetime | None:
     """The first hourly sample after ``start``, reaching ``stop``, whose
     host offset is not ``offset``; None when every sample agrees."""
     at = start
@@ -869,7 +866,7 @@ def _first_change(
 
 
 def _build_frame(
-    at: datetime.datetime, until: Optional[datetime.datetime]
+    at: datetime.datetime, until: datetime.datetime | None
 ) -> _Frame:
     origin = at - _GAP_PROBE
     first = _local_civil(origin)
@@ -926,8 +923,8 @@ class LocalZone(datetime.tzinfo):
     def fixed_frame(
         self,
         at: datetime.datetime,
-        until: Optional[datetime.datetime] = None,
-    ) -> tuple[Optional[datetime.timezone], datetime.datetime]:
+        until: datetime.datetime | None = None,
+    ) -> tuple[datetime.timezone | None, datetime.datetime]:
         """The host clock as a fixed offset around the aware instant ``at``.
 
         Returns ``(fixed, good_to)``.  ``fixed`` is a
@@ -959,19 +956,17 @@ class LocalZone(datetime.tzinfo):
         return frame.fixed, frame.hi
 
     def utcoffset(
-        self, dt: Optional[datetime.datetime]
-    ) -> Optional[datetime.timedelta]:
+        self, dt: datetime.datetime | None
+    ) -> datetime.timedelta | None:
         if dt is None:
             return None
         civil = dt.replace(tzinfo=None)
         return civil - _local_instant(civil).replace(tzinfo=None)
 
-    def dst(
-        self, dt: Optional[datetime.datetime]
-    ) -> Optional[datetime.timedelta]:
+    def dst(self, dt: datetime.datetime | None) -> datetime.timedelta | None:
         return None
 
-    def tzname(self, dt: Optional[datetime.datetime]) -> Optional[str]:
+    def tzname(self, dt: datetime.datetime | None) -> str | None:
         if dt is None:
             return "local"
         # the name in force at the instant the label resolves to
@@ -1035,7 +1030,7 @@ class CronTab:
         "_resolved_differs",
     )
 
-    def __init__(self, crontab: str, hash_key: Optional[str] = None) -> None:
+    def __init__(self, crontab: str, hash_key: str | None = None) -> None:
         self._source = " ".join(crontab.split())
         self._resolved = self._source
         lowered = crontab.lower()
@@ -1045,9 +1040,7 @@ class CronTab:
         # resolve).  Substring test first, the regex only when it hits
         # (``thu``).
         has_hash = "h" in lowered and _ITEM_H.search(lowered) is not None
-        display: Optional[list[str]] = (
-            self._source.split() if has_hash else None
-        )
+        display: list[str] | None = self._source.split() if has_hash else None
         if len(fields) == 1 and fields[0] in _MACROS:
             self._source = fields[0]
             self._resolved = fields[0]
@@ -1088,7 +1081,7 @@ class CronTab:
         else:
             second_text = "0"
         if len(fields) == 6:
-            year_text: Optional[str] = fields[5]
+            year_text: str | None = fields[5]
             if year_text == "*":
                 year_text = None  # matches like an absent column
         else:
@@ -1111,7 +1104,7 @@ class CronTab:
             ) = _parse_dom(dom_text)
             self._months = _parse_plain(fields[3], _MONTH)
             self._dow, self._dow_last, self._dow_nth = _parse_dow(dow_text)
-            self._years: Optional[frozenset[int]] = (
+            self._years: frozenset[int] | None = (
                 _parse_plain(year_text, _YEAR)
                 if year_text is not None
                 else None
@@ -1137,8 +1130,8 @@ class CronTab:
         # _first_time/_last_time's answers for tod=None, built on first
         # use: eager tuples here cost ~140 bytes per parsed CronTab,
         # enough to trip mem.crontab_10k's gate.
-        self._first_hms: Optional[_HMS] = None
-        self._last_hms: Optional[_HMS] = None
+        self._first_hms: _HMS | None = None
+        self._last_hms: _HMS | None = None
         # Whether the day-of-week column constrains anything.  All seven
         # values makes the second half of the plain-day test a tautology,
         # letting _next_civil bisect straight through the day-of-month
@@ -1285,7 +1278,7 @@ class CronTab:
         return self._dow_nth
 
     @property
-    def years(self) -> Optional[frozenset[int]]:
+    def years(self) -> frozenset[int] | None:
         """Explicit years, or ``None`` when the column is ``*`` or absent."""
         return self._years
 
@@ -1414,9 +1407,9 @@ class CronTab:
 
     def next(
         self,
-        now: Optional[datetime.datetime] = None,
+        now: datetime.datetime | None = None,
         default_utc: bool = False,
-    ) -> Optional[float]:
+    ) -> float | None:
         """Seconds until the next occurrence STRICTLY after ``now``.
 
         ``None`` when the schedule never occurs again (the search stops at
@@ -1459,7 +1452,7 @@ class CronTab:
 
     def _next_instant(
         self, now: datetime.datetime, now_utc: datetime.datetime
-    ) -> Optional[datetime.datetime]:
+    ) -> datetime.datetime | None:
         """Return the first scheduled UTC instant after the aware ``now``.
 
         This implements the scheduling policy shared by :meth:`next` and
@@ -1522,7 +1515,7 @@ class CronTab:
             return rival.replace(tzinfo=tz).astimezone(_UTC)
         return resolved_utc
 
-    def next_local(self, now_utc: datetime.datetime) -> Optional[float]:
+    def next_local(self, now_utc: datetime.datetime) -> float | None:
         """Seconds until the next occurrence STRICTLY after the aware
         instant ``now_utc`` on the host clock: what :meth:`next` answers
         for ``now_utc.astimezone(LOCAL_ZONE)``, taken on the fixed-offset
@@ -1546,7 +1539,7 @@ class CronTab:
 
     def _next_civil(
         self, civil: datetime.datetime
-    ) -> Optional[datetime.datetime]:
+    ) -> datetime.datetime | None:
         """Smallest whole-second civil instant strictly after ``civil``."""
         # a whole-second seed (every occurrences() cursor) skips the copy
         base = (
@@ -1555,7 +1548,7 @@ class CronTab:
         year, month, day = base.year, base.month, base.day
         # the seed itself is the floor: the time walks read only
         # hour/minute/second
-        tod: Optional[_TimeOfDay] = base
+        tod: _TimeOfDay | None = base
         years = self._years
         years_sorted = self._years_sorted
         months = self._months
@@ -1616,8 +1609,8 @@ class CronTab:
         month: int,
         day: int,
         month_end: int,
-        tod: Optional[_TimeOfDay],
-    ) -> Optional[datetime.datetime]:
+        tod: _TimeOfDay | None,
+    ) -> datetime.datetime | None:
         """Forward day scan for a tab whose day columns are plain sets.
 
         ``None`` when this month holds no matching day at or after ``day``
@@ -1677,8 +1670,8 @@ class CronTab:
         year: int,
         month: int,
         day: int,
-        tod: Optional[_TimeOfDay],
-    ) -> Optional[datetime.datetime]:
+        tod: _TimeOfDay | None,
+    ) -> datetime.datetime | None:
         """``(year, month, day)`` at its earliest matching time, if any.
 
         ``None`` when no matching time of day sits at or after ``tod``
@@ -1696,8 +1689,8 @@ class CronTab:
         year: int,
         month: int,
         day: int,
-        tod: Optional[_TimeOfDay],
-    ) -> Optional[datetime.datetime]:
+        tod: _TimeOfDay | None,
+    ) -> datetime.datetime | None:
         """The backward mirror of :meth:`_at_first_time`, for
         :meth:`_prev_civil`."""
         hms = self._last_time(tod)
@@ -1706,12 +1699,12 @@ class CronTab:
         return datetime.datetime(year, month, day, hms[0], hms[1], hms[2])
 
     @staticmethod
-    def _next_in(ordered: tuple[int, ...], current: int) -> Optional[int]:
+    def _next_in(ordered: tuple[int, ...], current: int) -> int | None:
         """First element of ``ordered`` greater than ``current``."""
         index = bisect_right(ordered, current)
         return ordered[index] if index < len(ordered) else None
 
-    def _first_time(self, at_or_after: Optional[_TimeOfDay]) -> Optional[_HMS]:
+    def _first_time(self, at_or_after: _TimeOfDay | None) -> _HMS | None:
         """Earliest matching time of day, at/after ``at_or_after`` if set.
 
         Each column is bisected, not scanned.  The fall-throughs preserve
@@ -1757,9 +1750,9 @@ class CronTab:
     # ------------------------------------------------------------------
     def prev(
         self,
-        now: Optional[datetime.datetime] = None,
+        now: datetime.datetime | None = None,
         default_utc: bool = False,
-    ) -> Optional[float]:
+    ) -> float | None:
         """Seconds since the most recent occurrence STRICTLY before ``now``.
 
         The mirror of :meth:`next`: ``None`` when the schedule has no
@@ -1796,7 +1789,7 @@ class CronTab:
         while anchor is not None:
             resolved = anchor.replace(tzinfo=tz).astimezone(utc).astimezone(tz)
             if resolved.replace(tzinfo=None) == anchor:
-                last: Optional[datetime.datetime] = None
+                last: datetime.datetime | None = None
                 start = (anchor - _ONE_SECOND).replace(tzinfo=tz)
                 for instant in self.occurrences(start):
                     instant_utc = instant.astimezone(utc)
@@ -1810,14 +1803,14 @@ class CronTab:
 
     def _prev_civil(
         self, civil: datetime.datetime
-    ) -> Optional[datetime.datetime]:
+    ) -> datetime.datetime | None:
         """Largest whole-second civil instant strictly before ``civil``."""
         if civil.microsecond:
             base = civil.replace(microsecond=0)
         else:
             base = civil - _ONE_SECOND
         year, month, day = base.year, base.month, base.day
-        tod: Optional[_TimeOfDay] = base  # the ceiling; see _next_civil
+        tod: _TimeOfDay | None = base  # the ceiling; see _next_civil
         years = self._years
         years_sorted = self._years_sorted
         months = self._months
@@ -1877,8 +1870,8 @@ class CronTab:
         year: int,
         month: int,
         day: int,
-        tod: Optional[_TimeOfDay],
-    ) -> Optional[datetime.datetime]:
+        tod: _TimeOfDay | None,
+    ) -> datetime.datetime | None:
         """The backward mirror of :meth:`_next_plain_day`.
 
         ``day`` is already clamped into the month by the caller, so no
@@ -1919,12 +1912,12 @@ class CronTab:
         return None
 
     @staticmethod
-    def _prev_in(ordered: tuple[int, ...], current: int) -> Optional[int]:
+    def _prev_in(ordered: tuple[int, ...], current: int) -> int | None:
         """Last element of ``ordered`` less than ``current``."""
         index = bisect_left(ordered, current) - 1
         return ordered[index] if index >= 0 else None
 
-    def _last_time(self, at_or_before: Optional[_TimeOfDay]) -> Optional[_HMS]:
+    def _last_time(self, at_or_before: _TimeOfDay | None) -> _HMS | None:
         """Latest matching time of day, at/before ``at_or_before`` if set.
 
         The backward mirror of :meth:`_first_time`, with the order of
@@ -1967,7 +1960,7 @@ class CronTab:
     # ------------------------------------------------------------------
     def occurrences(
         self,
-        start: Optional[datetime.datetime] = None,
+        start: datetime.datetime | None = None,
         default_utc: bool = False,
     ) -> Iterator[datetime.datetime]:
         """Yield successive fire instants strictly after ``start``.

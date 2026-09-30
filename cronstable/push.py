@@ -50,7 +50,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
@@ -193,7 +193,7 @@ SUITES: dict[str, _Suite] = {
 }
 
 
-def suite_or_error(name: Optional[str]) -> _Suite:
+def suite_or_error(name: str | None) -> _Suite:
     """The named suite, or a :class:`PushError` naming the known ones.
 
     ``None`` means "unspecified" and resolves to :data:`DEFAULT_SUITE`.
@@ -483,7 +483,7 @@ def _xwing_sealer() -> Callable[[bytes, bytes], bytes]:
         )
 
         suite = Suite(KEM.MLKEM768_X25519, KDF.HKDF_SHA256, AEAD.AES_256_GCM)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - a library failure
         # Broad on purpose: no key material is in scope yet, so anything
         # this block raises is a library failure, never a device's fault.
         raise _xwing_library_failure(exc) from None
@@ -507,7 +507,7 @@ def _xwing_sealer() -> Callable[[bytes, bytes], bytes]:
 #: :func:`_xwing_probe`'s cached verdict: None until the first call, then
 #: whether one real probe seal succeeded.  Process-lifetime on purpose: a
 #: broken install does not heal without a reinstall and a restart.
-_XWING_PROBE: Optional[bool] = None
+_XWING_PROBE: bool | None = None
 
 
 def _xwing_probe() -> bool:
@@ -549,7 +549,7 @@ def _xwing_probe() -> bool:
             _XWING_PROBE = True
         except PushError:
             _XWING_PROBE = False  # the sealer already logged the reason
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a library failure
             # No device key is in play, so this too is the library's.
             _xwing_library_failure(exc)
             _XWING_PROBE = False
@@ -611,7 +611,7 @@ def validate_public_key(value: Any, suite: str = DEFAULT_SUITE) -> str:
             _sealed_box(raw).encrypt(b"probe")
         except PushError:
             raise  # a broken PyNaCl, not a broken key: keep its wording
-        except Exception:
+        except Exception:  # noqa: BLE001 - an unusable key
             raise PushError(
                 "publicKey is not a usable X25519 public key"
             ) from None
@@ -625,7 +625,7 @@ def validate_public_key(value: Any, suite: str = DEFAULT_SUITE) -> str:
         except PushError:
             # a broken cryptography, not a broken key: keep its wording
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - an unusable key
             # The 400 stays generic (the caller sent the key and has it),
             # but the operator log keeps the library's reason: "is not
             # usable" alone is undebuggable from the daemon side.
@@ -715,7 +715,7 @@ def seal_to_device(
             sealed = _sealed_box(raw).encrypt(plaintext)
     except PushError:
         raise  # a broken library, not a broken key: keep its wording
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - an unusable key
         raise PushError(
             "device public key is unusable: {}".format(exc)
         ) from None
@@ -834,7 +834,7 @@ def _trim_log_tail(
         return _encode(payload)
 
     lo, hi = 1, total  # 0 is the caller's already-measured non-fit
-    fitted: Optional[bytes] = None
+    fitted: bytes | None = None
     applied = 0
     while lo <= hi:
         mid = (lo + hi) // 2
@@ -856,7 +856,7 @@ def _trim_log_tail(
     return fitted
 
 
-def fit_payload(payload: dict[str, Any], limit: Optional[int] = None) -> bytes:
+def fit_payload(payload: dict[str, Any], limit: int | None = None) -> bytes:
     """Shrink ``payload`` in place until it seals under the APNs cap.
 
     Trim order: oldest log-tail lines first (the newest lines carry the
@@ -928,7 +928,7 @@ def collapse_id(payload: dict[str, Any], salt: str) -> str:
     return hashlib.sha256(keyed).hexdigest()[:32]
 
 
-def key_fingerprint(public_key_b64: Optional[str]) -> Optional[str]:
+def key_fingerprint(public_key_b64: str | None) -> str | None:
     """A short, human-comparable fingerprint of a device public key.
 
     Pairing happens over whatever transport the operator exposed the
@@ -1007,7 +1007,7 @@ async def _call_on_daemon_thread(fn: Callable[[], Any], name: str) -> Any:
     loop = asyncio.get_running_loop()
     future: asyncio.Future = loop.create_future()
 
-    def _resolve(result: Any, exc: Optional[BaseException]) -> None:
+    def _resolve(result: Any, exc: BaseException | None) -> None:
         if future.cancelled():
             return  # the awaiter timed out and moved on; nobody to tell
         if exc is not None:
@@ -1017,7 +1017,7 @@ async def _call_on_daemon_thread(fn: Callable[[], Any], name: str) -> Any:
 
     def _runner() -> None:
         result: Any = None
-        exc: Optional[BaseException] = None
+        exc: BaseException | None = None
         try:
             result = fn()
         except BaseException as ex:  # noqa: BLE001 - relayed to the awaiter
@@ -1079,8 +1079,8 @@ class FileDeviceStore:
         # object, so the fence survives the rebuild a config reload does
         # (see :data:`_FILE_LOCKS`).
         self._file_lock = _file_lock_for(path)
-        self._corrupt: Optional[str] = None
-        self._salt: Optional[str] = None
+        self._corrupt: str | None = None
+        self._salt: str | None = None
 
     def describe(self) -> str:
         return "file:{}".format(self.path)
@@ -1122,7 +1122,7 @@ class FileDeviceStore:
             ) from None
         except PushError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - normalized to PushError
             # Same normalization as StateDeviceStore._bounded: every
             # caller up to send_report and the pairing handlers expects
             # PushError and nothing else, and an escapee here would take
@@ -1303,7 +1303,7 @@ class StateDeviceStore:
 
     kind = "state"
 
-    def __init__(self, get_backend: Callable[[], Optional[Any]]) -> None:
+    def __init__(self, get_backend: Callable[[], Any | None]) -> None:
         self._get_backend = get_backend
 
     def describe(self) -> str:
@@ -1347,7 +1347,7 @@ class StateDeviceStore:
             ) from None
         except PushError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - normalized to PushError
             # The type name is part of the message: a backend's internal
             # exception often stringifies to a bare token (an unreadable
             # document says only "unknown-schema-or-not-a-document"),
@@ -1369,7 +1369,7 @@ class StateDeviceStore:
     async def upsert(self, device: dict[str, Any]) -> None:
         backend = self._backend()
 
-        def _put(_current: Optional[dict[str, Any]]) -> tuple[Any, None]:
+        def _put(_current: dict[str, Any] | None) -> tuple[Any, None]:
             # Pure and idempotent: mutate_document may retry it on a
             # torn read, and it runs on the store's worker thread.
             return dict(device), None
@@ -1403,7 +1403,7 @@ class StateDeviceStore:
         backend = self._backend()
         candidate = secrets.token_hex(16)
 
-        def _ensure(current: Optional[dict[str, Any]]) -> tuple[Any, str]:
+        def _ensure(current: dict[str, Any] | None) -> tuple[Any, str]:
             existing = (current or {}).get("salt")
             if isinstance(existing, str) and existing:
                 return DOC_KEEP, existing
@@ -1444,14 +1444,14 @@ class PushService:
         # Why the last read failed, or None while the mirror is trusted.
         # The freshness deadline alone cannot say that: inside the retry
         # window it reads exactly like a successful load (see refresh).
-        self._registry_error: Optional[str] = None
+        self._registry_error: str | None = None
         self._refresh_lock = asyncio.Lock()
         # The persistent coalescing salt (see collapse_id), fetched with
         # the first successful refresh. Until the store yields one, the
         # process-local fallback keeps ids unpredictable to the relay at
         # the cost of cross-node/restart coalescing -- the safe side of
         # that trade.
-        self._collapse_salt: Optional[str] = None
+        self._collapse_salt: str | None = None
         self._local_salt = secrets.token_hex(16)
         # Set once the relay has answered 400 to a ciphertext over
         # CIPHERTEXT_B64_FLOOR, so the "relay is behind" warning is one
@@ -1651,11 +1651,11 @@ class PushService:
         )
         return [public_device(d) for d in devices]
 
-    def get_device(self, device_id: str) -> Optional[dict[str, Any]]:
+    def get_device(self, device_id: str) -> dict[str, Any] | None:
         return self._devices.get(device_id)
 
     async def pair(
-        self, fields: dict[str, str], created_by: Optional[str]
+        self, fields: dict[str, str], created_by: str | None
     ) -> tuple[dict[str, Any], bool]:
         """Register (or re-register) a device; returns (record, created).
 
@@ -1778,8 +1778,8 @@ class PushService:
         payload: dict[str, Any],
         *,
         priority: str,
-        only: Optional[dict[str, Any]] = None,
-        collapse: Optional[str] = None,
+        only: dict[str, Any] | None = None,
+        collapse: str | None = None,
     ) -> list[dict[str, Any]]:
         # Before any fitting, not after.  fit_payload's last resort drops
         # `run_id`, which collapse_id hashes as an identity field, so
@@ -1986,14 +1986,14 @@ def _relay_caps_below_ours(
     )
 
 
-_service: Optional[PushService] = None
+_service: PushService | None = None
 
 
-def get_service() -> Optional[PushService]:
+def get_service() -> PushService | None:
     """The running daemon's push service, or None when unconfigured."""
     return _service
 
 
-def set_service(service: Optional[PushService]) -> None:
+def set_service(service: PushService | None) -> None:
     global _service
     _service = service

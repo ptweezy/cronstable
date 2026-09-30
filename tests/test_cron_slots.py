@@ -162,7 +162,6 @@ def test_slotlease_log_cluster_role_swallows_backend_error(caplog):
 # --- _prepare_job_api_run: stage secrets, skip an unresolvable one ----------
 
 
-@pytest.mark.asyncio
 async def test_slotlease_prepare_job_api_run_skips_unresolvable_secret(
     monkeypatch, caplog
 ):
@@ -199,7 +198,6 @@ async def test_slotlease_prepare_job_api_run_skips_unresolvable_secret(
     assert "CRONSTABLE_STATE_URL" in env or env  # env was built
 
 
-@pytest.mark.asyncio
 async def test_prepare_job_api_run_stages_fromfile_secrets_off_loop(
     tmp_path, monkeypatch
 ):
@@ -261,7 +259,6 @@ async def test_prepare_job_api_run_stages_fromfile_secrets_off_loop(
     assert staged_on_loop_thread[-1] is True  # no hop for memory-only specs
 
 
-@pytest.mark.asyncio
 async def test_same_slot_spawn_burst_is_gated(monkeypatch):
     # A slot that launches many jobs at once must not execute every spawn's
     # synchronous fork/exec setup in one contiguous ready-queue burst; the
@@ -291,14 +288,12 @@ async def test_same_slot_spawn_burst_is_gated(monkeypatch):
 # --- _slot_fidelity_reason -------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_fidelity_reason_no_backend():
     cron = cronstable.cron.Cron(None)
     cron.state_backend = None
     assert await cron._slot_fidelity_reason() is None
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_fidelity_reason_probe_error_is_inconclusive():
     cron = cronstable.cron.Cron(None)
 
@@ -312,7 +307,6 @@ async def test_slotlease_slot_fidelity_reason_probe_error_is_inconclusive():
     assert cron._slot_fidelity is None  # nothing latched; retried next claim
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_fidelity_reason_cancelled_propagates():
     cron = cronstable.cron.Cron(None)
 
@@ -326,7 +320,6 @@ async def test_slotlease_slot_fidelity_reason_cancelled_propagates():
         await cron._slot_fidelity_reason()
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_fidelity_reason_latches_and_logs(caplog):
     import logging
 
@@ -349,7 +342,6 @@ async def test_slotlease_slot_fidelity_reason_latches_and_logs(caplog):
 # --- _acquire_slot_lease: map timeout/error to None, re-raise cancel --------
 
 
-@pytest.mark.asyncio
 async def test_slotlease_acquire_slot_lease_maps_failures_to_none():
     cron = cronstable.cron.Cron(None)
     timed_out = _SlotleaseBackend(acquire_exc=asyncio.TimeoutError())
@@ -358,7 +350,6 @@ async def test_slotlease_acquire_slot_lease_maps_failures_to_none():
     assert await cron._acquire_slot_lease(errored, "slots/s") is None
 
 
-@pytest.mark.asyncio
 async def test_slotlease_acquire_slot_lease_cancel_propagates():
     cron = cronstable.cron.Cron(None)
     cancelling = _SlotleaseBackend(acquire_exc=asyncio.CancelledError())
@@ -384,14 +375,12 @@ def _slotlease_cluster_cron(policy_yaml=_SLOTLEASE_CLUSTER_FORBID, monkeypatch=N
     return cron
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_returns_true_when_state_not_configured():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     cron._state_configured = False
     assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_degrades_when_backend_is_none():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     cron._state_configured = True
@@ -401,7 +390,6 @@ async def test_slotlease_claim_degrades_when_backend_is_none():
     assert cron._slot_refs["s"] == 1  # node-local enforcement refcount
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_fails_closed_when_backend_is_none():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     cron._state_configured = True
@@ -411,7 +399,6 @@ async def test_slotlease_claim_fails_closed_when_backend_is_none():
     assert "s" not in cron._slot_refs
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_degrades_when_locks_cannot_fence(monkeypatch):
     cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
     cron.state_backend = _SlotleaseBackend()
@@ -424,7 +411,6 @@ async def test_slotlease_claim_degrades_when_locks_cannot_fence(monkeypatch):
     assert cron._slot_refs["s"] == 1
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_adopts_live_local_lease(
     monkeypatch, slotlease_reaper
 ):
@@ -439,7 +425,6 @@ async def test_slotlease_claim_adopts_live_local_lease(
     assert cron._slot_refs["s"] == 2  # adopted the live lease
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_forbid_when_peer_holds_slot(monkeypatch):
     cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
     cron.state_backend = _SlotleaseBackend(acquire=None, read=_slotlease_lease())
@@ -449,7 +434,6 @@ async def test_slotlease_claim_forbid_when_peer_holds_slot(monkeypatch):
     assert seen == ["s"]
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_replace_spawns_pursuit(monkeypatch):
     cron = _slotlease_cluster_cron(_SLOTLEASE_CLUSTER_REPLACE, monkeypatch=monkeypatch)
     cron.state_backend = _SlotleaseBackend(acquire=None, read=_slotlease_lease())
@@ -467,7 +451,6 @@ async def test_slotlease_claim_replace_spawns_pursuit(monkeypatch):
     assert spawned and spawned[0][0] == "s"
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_adopts_own_late_acquire(
     monkeypatch, slotlease_reaper
 ):
@@ -483,7 +466,6 @@ async def test_slotlease_claim_adopts_own_late_acquire(
     assert cron._slot_refs["s"] == 1
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_expired_unreclaimed_falls_to_policy(
     monkeypatch,
 ):
@@ -498,7 +480,6 @@ async def test_slotlease_claim_expired_unreclaimed_falls_to_policy(
     assert cron._slot_refs["s"] == 1
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_read_timeout_is_unanswered(monkeypatch):
     cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
     cron.state_backend = _SlotleaseBackend(
@@ -508,7 +489,6 @@ async def test_slotlease_claim_read_timeout_is_unanswered(monkeypatch):
     assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_read_error_is_unanswered(monkeypatch):
     cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
     cron.state_backend = _SlotleaseBackend(
@@ -518,7 +498,6 @@ async def test_slotlease_claim_read_error_is_unanswered(monkeypatch):
     assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_success_cancels_stale_renewer(
     monkeypatch, slotlease_reaper
 ):
@@ -540,7 +519,6 @@ async def test_slotlease_claim_success_cancels_stale_renewer(
 # --- _spawn_slot_pursuit: single-flight ------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_slotlease_spawn_slot_pursuit_is_single_flight(
     slotlease_reaper,
 ):
@@ -556,14 +534,12 @@ async def test_slotlease_spawn_slot_pursuit_is_single_flight(
 # --- _pursue_replace_slot --------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_slotlease_pursue_replace_no_backend_returns():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
     cron.state_backend = None
     await cron._pursue_replace_slot(cron.cron_jobs["s"], _slotlease_lease())
 
 
-@pytest.mark.asyncio
 async def test_slotlease_pursue_replace_append_failure_gives_up(caplog):
     import logging
 
@@ -577,7 +553,6 @@ async def test_slotlease_pursue_replace_append_failure_gives_up(caplog):
     )
 
 
-@pytest.mark.asyncio
 async def test_slotlease_pursue_replace_stops_on_shutdown():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
     backend = _SlotleaseBackend(read=_slotlease_lease())
@@ -587,7 +562,6 @@ async def test_slotlease_pursue_replace_stops_on_shutdown():
     assert backend.appended  # the cancel request was recorded before stopping
 
 
-@pytest.mark.asyncio
 async def test_slotlease_pursue_replace_relaunches_when_slot_frees(
     monkeypatch,
 ):
@@ -606,7 +580,6 @@ async def test_slotlease_pursue_replace_relaunches_when_slot_frees(
     assert relaunched == ["s"]
 
 
-@pytest.mark.asyncio
 async def test_slotlease_pursue_replace_read_error_is_ignored(monkeypatch, caplog):
     import logging
 
@@ -621,7 +594,6 @@ async def test_slotlease_pursue_replace_read_error_is_ignored(monkeypatch, caplo
     assert any("did not yield" in r.message for r in caplog.records)
 
 
-@pytest.mark.asyncio
 async def test_slotlease_pursue_replace_read_cancel_propagates(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
@@ -633,7 +605,6 @@ async def test_slotlease_pursue_replace_read_cancel_propagates(monkeypatch):
 # --- _slot_renewer ---------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_renewer_returns_when_lease_gone(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
@@ -642,7 +613,6 @@ async def test_slotlease_slot_renewer_returns_when_lease_gone(monkeypatch):
     await asyncio.wait_for(cron._slot_renewer("s"), timeout=5)
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_renewer_retires_when_superseded(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
@@ -684,7 +654,6 @@ class _SlotleaseRenewBackend:
         return item
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_renewer_list_error_then_taken_over(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
@@ -709,7 +678,6 @@ async def test_slotlease_slot_renewer_list_error_then_taken_over(monkeypatch):
     assert "s" not in cron._slot_leases  # dropped on the takeover
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_renewer_renew_timeout_then_error_then_taken_over(
     monkeypatch,
 ):
@@ -732,7 +700,6 @@ async def test_slotlease_slot_renewer_renew_timeout_then_error_then_taken_over(
     assert "s" not in cron._slot_leases
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_renewer_replace_request_cancels_instance(
     monkeypatch,
 ):
@@ -773,7 +740,6 @@ async def test_slotlease_slot_renewer_replace_request_cancels_instance(
     assert run.replaced is True and run.cancelled is True
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_renewer_replace_cancel_runs_in_background(
     monkeypatch, caplog
 ):
@@ -844,7 +810,6 @@ async def test_slotlease_slot_renewer_replace_cancel_runs_in_background(
     assert "cancelling the replaced instance failed" in caplog.text
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_renewer_period_follows_slot_ttl(monkeypatch):
     # a state-section reload lowers slotTtlSeconds under a kept renewer:
     # the next period is a third of the new TTL.
@@ -873,7 +838,6 @@ async def test_slotlease_slot_renewer_period_follows_slot_ttl(monkeypatch):
     assert delays == [10.0, 2.0]
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_renewer_waits_out_backend_gap(monkeypatch):
     # between the old backend's stop() and the replacement's start() the
     # renewer sees no backend; with the lease still held it idles that
@@ -906,7 +870,6 @@ async def test_slotlease_slot_renewer_waits_out_backend_gap(monkeypatch):
     assert "s" not in cron._slot_leases
 
 
-@pytest.mark.asyncio
 async def test_slotlease_store_teardown_drops_idle_lease_quietly(
     stateful_cron, caplog
 ):
@@ -922,7 +885,6 @@ async def test_slotlease_store_teardown_drops_idle_lease_quietly(
     assert "stays in the previous state store" not in caplog.text
 
 
-@pytest.mark.asyncio
 async def test_slotlease_respelled_same_store_keeps_slots(
     stateful_cron, slotlease_reaper, tmp_path, caplog
 ):
@@ -958,7 +920,6 @@ async def test_slotlease_respelled_same_store_keeps_slots(
     await cron._stop_job_api()
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("removed", [False, True])
 async def test_slotlease_store_change_while_down_drops_slots(
     stateful_cron, slotlease_reaper, tmp_path, monkeypatch, caplog, removed
@@ -1007,7 +968,6 @@ async def test_slotlease_store_change_while_down_drops_slots(
 # --- release paths ---------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_cluster_slot_decrements_refcount():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     cron._slot_refs["s"] = 2
@@ -1015,7 +975,6 @@ async def test_slotlease_release_cluster_slot_decrements_refcount():
     assert cron._slot_refs["s"] == 1  # still one user; lease kept
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_cluster_slot_kept_while_instance_runs():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     cron._slot_refs["s"] = 1
@@ -1026,7 +985,6 @@ async def test_slotlease_release_cluster_slot_kept_while_instance_runs():
     assert "s" not in cron._slot_refs
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_cluster_slot_releases_lease():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     lease = _slotlease_lease(holder=cron._slot_holder())
@@ -1043,7 +1001,6 @@ async def test_slotlease_release_cluster_slot_releases_lease():
     assert backend.released == [lease]
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_cluster_slot_phantom_cleanup():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     backend = _SlotleaseBackend(read=None)  # no lease on disk -> nothing to free
@@ -1055,14 +1012,12 @@ async def test_slotlease_release_cluster_slot_phantom_cleanup():
     assert backend.released == []
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_slot_lease_no_backend():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     cron.state_backend = None
     await cron._release_slot_lease("s", _slotlease_lease())  # returns, no error
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_slot_lease_skips_when_reclaimed():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     backend = _SlotleaseBackend()
@@ -1072,7 +1027,6 @@ async def test_slotlease_release_slot_lease_skips_when_reclaimed():
     assert backend.released == []  # a fresh claim adopted the on-disk lease
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_slot_lease_warns_on_error(caplog):
     import logging
 
@@ -1086,14 +1040,12 @@ async def test_slotlease_release_slot_lease_warns_on_error(caplog):
     )
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_phantom_slot_no_backend():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     cron.state_backend = None
     await cron._release_phantom_slot("s")  # returns, no error
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_phantom_slot_releases_own_lease():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     mine = _slotlease_lease(holder=cron._slot_holder())
@@ -1103,7 +1055,6 @@ async def test_slotlease_release_phantom_slot_releases_own_lease():
     assert backend.released == [mine]
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_phantom_slot_swallows_error():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     cron.state_backend = _SlotleaseBackend(read_exc=RuntimeError("EIO"))
@@ -1113,7 +1064,6 @@ async def test_slotlease_release_phantom_slot_swallows_error():
 # --- maybe_launch_job: cluster start-failure hands the slot back -----------
 
 
-@pytest.mark.asyncio
 async def test_slotlease_maybe_launch_job_releases_slot_on_start_failure(
     monkeypatch,
 ):
@@ -1157,7 +1107,6 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_start_failure(
     assert finished == ["tok123"]
 
 
-@pytest.mark.asyncio
 async def test_slotlease_maybe_launch_job_releases_slot_on_prepare_cancel(
     monkeypatch,
 ):
@@ -1208,7 +1157,6 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_prepare_cancel(
 # --- cancellation propagates through every store call (never swallowed) -----
 
 
-@pytest.mark.asyncio
 async def test_slotlease_claim_read_lease_cancel_propagates(monkeypatch):
     cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
     cron.state_backend = _SlotleaseBackend(
@@ -1218,7 +1166,6 @@ async def test_slotlease_claim_read_lease_cancel_propagates(monkeypatch):
         await cron._claim_cluster_slot(cron.cron_jobs["s"])
 
 
-@pytest.mark.asyncio
 async def test_slotlease_pursue_replace_append_cancel_propagates():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
     cron.state_backend = _SlotleaseBackend(append_exc=asyncio.CancelledError())
@@ -1226,7 +1173,6 @@ async def test_slotlease_pursue_replace_append_cancel_propagates():
         await cron._pursue_replace_slot(cron.cron_jobs["s"], _slotlease_lease())
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_renewer_list_cancel_propagates(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
@@ -1241,7 +1187,6 @@ async def test_slotlease_slot_renewer_list_cancel_propagates(monkeypatch):
         await cron._slot_renewer("s")
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_renewer_renew_cancel_propagates(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
@@ -1259,7 +1204,6 @@ async def test_slotlease_slot_renewer_renew_cancel_propagates(monkeypatch):
         await cron._slot_renewer("s")
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_renewer_readback_error_then_takeover(
     monkeypatch,
 ):
@@ -1284,7 +1228,6 @@ async def test_slotlease_slot_renewer_readback_error_then_takeover(
     assert "s" not in cron._slot_leases
 
 
-@pytest.mark.asyncio
 async def test_slotlease_slot_renewer_readback_cancel_propagates(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
@@ -1307,7 +1250,6 @@ async def test_slotlease_slot_renewer_readback_cancel_propagates(monkeypatch):
         await asyncio.wait_for(task, timeout=5)
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_slot_lease_cancel_propagates():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     cron.state_backend = _SlotleaseBackend(release_exc=asyncio.CancelledError())
@@ -1315,7 +1257,6 @@ async def test_slotlease_release_slot_lease_cancel_propagates():
         await cron._release_slot_lease("s", _slotlease_lease())
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_phantom_slot_skips_when_claim_present():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     backend = _SlotleaseBackend(read=_slotlease_lease(holder=cron._slot_holder()))
@@ -1325,7 +1266,6 @@ async def test_slotlease_release_phantom_slot_skips_when_claim_present():
     assert backend.released == []  # a live claim owns the slot; not a phantom
 
 
-@pytest.mark.asyncio
 async def test_slotlease_release_phantom_slot_cancel_propagates():
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     cron.state_backend = _SlotleaseBackend(read_exc=asyncio.CancelledError())
@@ -1338,7 +1278,6 @@ async def test_slotlease_release_phantom_slot_cancel_propagates():
 _SLOTLEASE_NODE_JOB = job_yaml("s", "echo hi")
 
 
-@pytest.mark.asyncio
 async def test_slotlease_maybe_launch_node_scope_start_failure_finishes_run(
     monkeypatch,
 ):
@@ -1377,7 +1316,6 @@ async def test_slotlease_maybe_launch_node_scope_start_failure_finishes_run(
     assert finished == ["tokN"]  # but the job-API run registration is dropped
 
 
-@pytest.mark.asyncio
 async def test_slotlease_maybe_launch_start_failure_without_job_api(
     monkeypatch,
 ):
@@ -1402,7 +1340,6 @@ async def test_slotlease_maybe_launch_start_failure_without_job_api(
         await cron.maybe_launch_job(job)
 
 
-@pytest.mark.asyncio
 async def test_slotlease_pursue_replace_polls_until_slot_frees(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)

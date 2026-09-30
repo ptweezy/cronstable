@@ -37,7 +37,6 @@ from collections.abc import Callable, Iterator, Mapping
 from typing import (
     TYPE_CHECKING,
     Any,
-    Optional,
 )
 
 # asyncio is imported lazily (inside _taskkill_tree, the one function that
@@ -302,7 +301,7 @@ _refuse_drifted_priority_tables(
 )
 
 
-def posix_nice_for(priority: str) -> Optional[int]:
+def posix_nice_for(priority: str) -> int | None:
     """The absolute POSIX nice value ``priority`` maps to, or ``None``.
 
     ``None`` for :data:`DEFAULT_PRIORITY`, the one level that is never
@@ -314,7 +313,7 @@ def posix_nice_for(priority: str) -> Optional[int]:
 
 
 def new_process_group_kwargs(
-    priority: str = DEFAULT_PRIORITY, *, windows: Optional[bool] = None
+    priority: str = DEFAULT_PRIORITY, *, windows: bool | None = None
 ) -> dict[str, Any]:
     """Subprocess kwargs that isolate a job in its own process group.
 
@@ -379,7 +378,7 @@ def new_process_group_kwargs(
 
 
 def apply_priority(
-    pid: int, priority: str, *, windows: Optional[bool] = None
+    pid: int, priority: str, *, windows: bool | None = None
 ) -> bool:
     """Give an already-spawned job's process group its priority, on POSIX.
 
@@ -803,7 +802,7 @@ def _install_windows_console_handler(  # pragma: no cover (windows)
 
 
 # --- OS boot identity ------------------------------------------------------
-def os_boot_id() -> Optional[str]:
+def os_boot_id() -> str | None:
     """A stable, unique identifier of the current OS boot, or ``None``.
 
     Linux publishes a fresh UUID per boot; where the file is unavailable
@@ -820,7 +819,7 @@ def os_boot_id() -> Optional[str]:
     return value or None
 
 
-def os_boot_time() -> Optional[float]:
+def os_boot_time() -> float | None:
     """Wall-clock epoch seconds the OS booted at, or ``None`` (cannot tell).
 
     Derived as ``now - uptime``: on Windows from ``GetTickCount64`` (a 64-bit
@@ -867,7 +866,7 @@ def os_boot_time() -> Optional[float]:
 
 
 # --- Process liveness -------------------------------------------------------
-def pid_alive(pid: int) -> Optional[bool]:
+def pid_alive(pid: int) -> bool | None:
     """Return whether ``pid`` is running, or ``None`` if its status is unknown.
 
     In-flight run reconciliation (:mod:`cronstable.cron`) uses this check
@@ -941,7 +940,7 @@ def _is_zombie(pid: int) -> bool:
         return False
 
 
-def process_start_time(pid: int) -> Optional[float]:
+def process_start_time(pid: int) -> float | None:
     """Wall-clock epoch seconds ``pid`` started at, or ``None`` (cannot tell).
 
     The pid-reuse disambiguator for :func:`pid_alive` consumers that must
@@ -1286,7 +1285,7 @@ _WRITE_TOKENS = {"FA", "FW", "GA", "GW", "KA", "KW", "DC", "LC"}
 _WRITE_MASK = 0x00000002 | 0x00000004 | 0x40000000 | 0x10000000
 
 
-def _sddl_write_grantee(sddl: str) -> Optional[str]:
+def _sddl_write_grantee(sddl: str) -> str | None:
     """The first any-user principal an SDDL string lets create files.
 
     Parses the ACE list rather than walking ACEs through ``GetAce``: the
@@ -1319,7 +1318,7 @@ def _sddl_write_grantee(sddl: str) -> Optional[str]:
     return None
 
 
-def _sddl_rights(rights: str) -> tuple[Optional[int], set[str]]:
+def _sddl_rights(rights: str) -> tuple[int | None, set[str]]:
     """One ACE's rights field decoded: ``(mask, tokens)``.
 
     A hexadecimal field yields the mask and no tokens; a token string
@@ -1360,13 +1359,13 @@ _LINK_REPARSE_TAGS = frozenset(
 )
 
 
-def _sddl_owner(sddl: str) -> Optional[str]:
+def _sddl_owner(sddl: str) -> str | None:
     """The ``O:`` principal of an SDDL string, alias or SID, or None."""
     match = re.match(r"O:(.+?)(?=[GDS]:|$)", sddl)
     return match.group(1) if match else None
 
 
-def _sddl_untrusted_owner(sddl: str) -> Optional[str]:
+def _sddl_untrusted_owner(sddl: str) -> str | None:
     """The owner ``sddl`` names when a machine-wide path may not have it."""
     owner = _sddl_owner(sddl)
     return None if owner is None or owner in _TRUSTED_OWNERS else owner
@@ -1396,8 +1395,8 @@ def _sddl_owner_neutralized(sddl: str) -> bool:
 
 
 def _security_finding(
-    sddl: Optional[str], *, machine_wide: bool, reparse: bool
-) -> Optional[str]:
+    sddl: str | None, *, machine_wide: bool, reparse: bool
+) -> str | None:
     """The first way ``sddl`` lets a non-administrator write, or None.
 
     On a machine-wide path a reparse point and an untrusted owner come
@@ -1418,7 +1417,7 @@ def _security_finding(
     return _sddl_write_grantee(sddl)
 
 
-def path_is_user_scoped(path: str, user_profile: Optional[str]) -> bool:
+def path_is_user_scoped(path: str, user_profile: str | None) -> bool:
     """Whether ``path`` lies under ``user_profile``, compared as Windows paths.
 
     ntpath on every OS: a Windows path compared with os.path on a POSIX box
@@ -1474,7 +1473,7 @@ def _under_shared_profile(path: str, root: str) -> bool:
     )
 
 
-def _own_profile() -> Optional[str]:
+def _own_profile() -> str | None:
     """The caller's profile directory, from the environment.
 
     ``USERPROFILE`` is the rule; a launcher that scrubs it (``runas``
@@ -1505,7 +1504,7 @@ def is_reparse_point(path: str) -> bool:
     return getattr(st, "st_reparse_tag", 0) in _LINK_REPARSE_TAGS
 
 
-def any_user_write_grantee(path: str) -> Optional[str]:
+def any_user_write_grantee(path: str) -> str | None:
     """Who, other than an administrator, may write to ``path``.
 
     Returns the principal's familiar name, or ``None`` when nobody can and
@@ -1539,7 +1538,7 @@ def any_user_write_grantee(path: str) -> Optional[str]:
     )
 
 
-def service_write_grantee(path: str) -> Optional[str]:
+def service_write_grantee(path: str) -> str | None:
     """:func:`any_user_write_grantee` as a LocalSystem service sees ``path``.
 
     LocalSystem's profile is under ``system32``, outside normal user
@@ -1557,7 +1556,7 @@ def service_write_grantee(path: str) -> Optional[str]:
     )
 
 
-def untrusted_owner(path: str) -> Optional[str]:
+def untrusted_owner(path: str) -> str | None:
     """The owner of a machine-wide ``path`` when it is not a trusted one.
 
     Answers who holds the directory, which is what init has to change,
@@ -1572,7 +1571,7 @@ def untrusted_owner(path: str) -> Optional[str]:
     )
 
 
-def _read_security_sddl(path: str) -> Optional[str]:
+def _read_security_sddl(path: str) -> str | None:
     """One object's owner and DACL as SDDL text, or ``None`` if unreadable.
 
     The text starts ``O:`` with the owner and carries the DACL after
@@ -1940,7 +1939,7 @@ def _event_log_api() -> Any:  # pragma: no cover (windows) - Windows-only
     return advapi32
 
 
-def open_event_log(source: str) -> Optional[int]:
+def open_event_log(source: str) -> int | None:
     """Register ``source`` with the Event Log and return its handle.
 
     ``None`` where there is no Event Log to open, or the service refused.
@@ -1962,7 +1961,7 @@ def open_event_log(source: str) -> Optional[int]:
     if IS_WINDOWS:  # pragma: no cover (windows) - Windows-only path
         try:
             advapi32 = _event_log_api()
-            handle: Optional[int] = advapi32.RegisterEventSourceW(None, source)
+            handle: int | None = advapi32.RegisterEventSourceW(None, source)
         except Exception:  # noqa: BLE001 - any ctypes failure -> no log
             return None
         return int(handle) if handle else None

@@ -32,6 +32,7 @@ legacy path, where ``initialize`` negotiates ``2025-11-25`` or an earlier
 revision.
 """
 
+import asyncio
 import base64
 import binascii
 import json as _stdlib_json
@@ -44,7 +45,6 @@ from typing import (
     TYPE_CHECKING,
     Any,
     NamedTuple,
-    Optional,
     cast,
 )
 from urllib.parse import unquote
@@ -162,9 +162,7 @@ _DEFAULT_INSTRUCTIONS = (
 RESOURCE_MIME = "application/json"
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
-_MethodHandler = Callable[
-    [dict[str, Any]], Awaitable[Optional[dict[str, Any]]]
-]
+_MethodHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]]
 # completion candidates, given the arguments already resolved
 _CompletionSource = Callable[[dict[str, Any]], Awaitable[list[str]]]
 
@@ -189,7 +187,7 @@ class _Caller(NamedTuple):
 #: middleware matched. None when no token auth applies (auth off, an
 #: mTLS-only listener, or direct handle_message use), where REST grants every
 #: action too. A ContextVar: one handler serves concurrent requests.
-_caller: "ContextVar[Optional[_Caller]]" = ContextVar(
+_caller: "ContextVar[_Caller | None]" = ContextVar(
     "cronstable_mcp_caller", default=None
 )
 
@@ -239,7 +237,7 @@ _METRIC_LINE_RE = re.compile(r"^([A-Za-z_:][\w:]*)(\{[^}]*\})?\s+(\S+)")
 
 
 def _parse_prometheus(
-    text: str, match: Optional[str], limit: int
+    text: str, match: str | None, limit: int
 ) -> tuple[list[dict[str, Any]], int]:
     """Reduce a Prometheus exposition to a compact, filtered sample list.
 
@@ -274,7 +272,7 @@ def _parse_prometheus(
 
 def _filter_metric_samples(
     samples: Iterator[tuple[str, str, str]],
-    match: Optional[str],
+    match: str | None,
     limit: int,
 ) -> tuple[list[dict[str, Any]], int]:
     """Filter structured ``(name, label_block, value)`` samples by a
@@ -443,9 +441,7 @@ class MCPHandler:
             "_meta": {META_SERVER_INFO: self._server_info},
         }
 
-    async def _m_noop(
-        self, params: dict[str, Any]
-    ) -> Optional[dict[str, Any]]:
+    async def _m_noop(self, params: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     async def _m_ping(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -498,7 +494,7 @@ class MCPHandler:
 
     # -- top-level dispatch (transport-independent, unit-testable) --------
 
-    async def handle_message(self, msg: Any) -> Optional[dict[str, Any]]:
+    async def handle_message(self, msg: Any) -> dict[str, Any] | None:
         """Dispatch one JSON-RPC message.
 
         Returns the response object for a request, or ``None`` for a
@@ -507,9 +503,7 @@ class MCPHandler:
         """
         return (await self._dispatch(msg))[0]
 
-    async def _dispatch(
-        self, msg: Any
-    ) -> tuple[Optional[dict[str, Any]], int]:
+    async def _dispatch(self, msg: Any) -> tuple[dict[str, Any] | None, int]:
         """:meth:`handle_message`, plus the HTTP status for its reply.
 
         The status differs from 200 only on the modern path, where a missing
@@ -703,7 +697,7 @@ class MCPHandler:
 
     # -- HTTP response helpers --------------------------------------------
 
-    def _cors_headers(self, origin: Optional[str]) -> dict[str, str]:
+    def _cors_headers(self, origin: str | None) -> dict[str, str]:
         if origin and origin in self._allowed_origins:
             # credentialed CORS may not use a wildcard; echo the exact origin.
             return {
@@ -721,7 +715,7 @@ class MCPHandler:
         self,
         obj: dict[str, Any],
         *,
-        origin: Optional[str],
+        origin: str | None,
         status: int = 200,
         version: str = PROTOCOL_VERSION,
     ) -> web.Response:
@@ -736,7 +730,7 @@ class MCPHandler:
         )
 
     def _plain(
-        self, status: int, origin: Optional[str], version: str
+        self, status: int, origin: str | None, version: str
     ) -> web.Response:
         headers = {"MCP-Protocol-Version": version}
         headers.update(self._cors_headers(origin))
@@ -746,7 +740,7 @@ class MCPHandler:
         self,
         status: int,
         message: str,
-        origin: Optional[str],
+        origin: str | None,
         version: str = PROTOCOL_VERSION,
     ) -> web.Response:
         return self._json_response(
@@ -1466,7 +1460,7 @@ class MCPHandler:
     @staticmethod
     def _preview_args(
         args: dict[str, Any],
-    ) -> tuple[Optional[str], Optional[str]]:
+    ) -> tuple[str | None, str | None]:
         """The shared `tz`/`seed` arguments of the schedule sandboxes."""
         tz = args.get("tz")
         if tz is not None and not isinstance(tz, str):
@@ -1662,7 +1656,7 @@ class MCPHandler:
     async def _t_pause_job(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         _require_confirm(args, "pausing")
-        duration: Optional[int] = None
+        duration: int | None = None
         if args.get("durationSeconds") is not None:
             duration = _opt_int(args["durationSeconds"])
             if duration is None:
@@ -1691,9 +1685,15 @@ class MCPHandler:
         return _result({"resumed": name}, "resumed job {!r}".format(name))
 
     async def _t_list_pools(self, args):
-        return _result(
-            {"pools": await self._cron._pools.snapshot()}, "resource pools"
-        )
+        from cronstable.pools import PoolError
+
+        try:
+            pools = await self._cron._pools.snapshot()
+        except PoolError as ex:
+            return _tool_error(str(ex))
+        except (OSError, asyncio.TimeoutError):
+            return _tool_error("pool state is unavailable")
+        return _result({"pools": pools}, "resource pools")
 
     async def _t_cancel_queued(self, args):
         from cronstable.pools import PoolError
@@ -1705,6 +1705,8 @@ class MCPHandler:
             )
         except PoolError as ex:
             return _tool_error(str(ex))
+        except (OSError, asyncio.TimeoutError):
+            return _tool_error("pool state is unavailable")
         return _result(
             {"id": entry["id"], "state": entry["state"]},
             "queued work cancelled",
@@ -1770,6 +1772,8 @@ class MCPHandler:
                 )
         except RecoveryError as ex:
             return _tool_error(str(ex))
+        except (OSError, asyncio.TimeoutError):
+            return _tool_error("recovery state is unavailable")
         return _result(
             data, "recovery started" if execute else "recovery preview"
         )
@@ -1902,7 +1906,7 @@ class MCPHandler:
 
     def _match_resource(
         self, uri: str
-    ) -> tuple[Optional[Callable[..., Any]], tuple[str, ...]]:
+    ) -> tuple[Callable[..., Any] | None, tuple[str, ...]]:
         """Resolve a URI to a loader + captured args, or ``(None, ())``.
 
         Clients expand the templates under RFC 6570, which percent-encodes
@@ -1935,7 +1939,7 @@ class MCPHandler:
         async def status_data() -> dict[str, Any]:
             return {"status": cron.status_payload()}
 
-        async def dag_detail(name: str) -> Optional[dict[str, Any]]:
+        async def dag_detail(name: str) -> dict[str, Any] | None:
             for entry in await cron.dags_payload():
                 if entry.get("name") == name:
                     return entry
@@ -2326,7 +2330,7 @@ class MCPHandler:
 
     def _completion_source(
         self, ref: dict[str, Any], argument: str
-    ) -> Optional[_CompletionSource]:
+    ) -> _CompletionSource | None:
         """The candidates for ``argument`` of ``ref``; None offers nothing.
 
         A reference the current config or caller cannot see offers nothing,
@@ -2347,7 +2351,7 @@ class MCPHandler:
             if not self._prompts_enabled or not self._prompt_visible(prompt):
                 return None
             return cast(
-                Optional[_CompletionSource], prompt["complete"].get(argument)
+                _CompletionSource | None, prompt["complete"].get(argument)
             )
         if kind == "ref/resource":
             uri = ref.get("uri")
@@ -2366,7 +2370,7 @@ class MCPHandler:
             ):
                 return None
             return cast(
-                Optional[_CompletionSource],
+                _CompletionSource | None,
                 template["complete"].get(argument),
             )
         raise MCPError(
@@ -2434,7 +2438,7 @@ def _enum(values: list[str]) -> dict[str, Any]:
 
 
 def _obj_schema(
-    properties: dict[str, Any], required: Optional[list[str]] = None
+    properties: dict[str, Any], required: list[str] | None = None
 ) -> dict[str, Any]:
     schema: dict[str, Any] = {
         "type": "object",
@@ -2575,9 +2579,9 @@ def _tool(
     *,
     mutating: bool = False,
     destructive: bool = False,
-    idempotent: Optional[bool] = None,
+    idempotent: bool | None = None,
     open_world: bool = False,
-    output: Optional[dict[str, Any]] = None,
+    output: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One registry entry, defaults tuned to the common case.
 
@@ -2710,7 +2714,7 @@ def _req_str(args: dict[str, Any], key: str) -> str:
     return value
 
 
-def _opt_int(value: Any) -> Optional[int]:
+def _opt_int(value: Any) -> int | None:
     # bool is an int subclass; `true` must not read as 1.
     if value is None or isinstance(value, bool):
         return None
@@ -2772,7 +2776,7 @@ def _is_response(msg: dict[str, Any]) -> bool:
     return "method" not in msg and ("result" in msg or "error" in msg)
 
 
-def _request_meta(msg: dict[str, Any]) -> Optional[dict[str, Any]]:
+def _request_meta(msg: dict[str, Any]) -> dict[str, Any] | None:
     params = msg.get("params")
     meta = params.get("_meta") if isinstance(params, dict) else None
     return meta if isinstance(meta, dict) else None
@@ -2784,7 +2788,7 @@ def _declares_modern(msg: dict[str, Any]) -> bool:
     return meta is not None and META_PROTOCOL_VERSION in meta
 
 
-def _meta_error(msg: dict[str, Any]) -> Optional[MCPError]:
+def _meta_error(msg: dict[str, Any]) -> MCPError | None:
     """A modern request's missing or malformed required ``_meta`` fields."""
     meta = _request_meta(msg) or {}
     if isinstance(meta.get(META_PROTOCOL_VERSION), str) and isinstance(
@@ -2800,7 +2804,7 @@ def _meta_error(msg: dict[str, Any]) -> Optional[MCPError]:
     )
 
 
-def _version_error(msg: dict[str, Any]) -> Optional[MCPError]:
+def _version_error(msg: dict[str, Any]) -> MCPError | None:
     requested = (_request_meta(msg) or {}).get(META_PROTOCOL_VERSION)
     if requested in MODERN_PROTOCOL_VERSIONS:
         return None
@@ -2815,7 +2819,7 @@ def _version_error(msg: dict[str, Any]) -> Optional[MCPError]:
     )
 
 
-def _header_error(msg: dict[str, Any], headers: Any) -> Optional[MCPError]:
+def _header_error(msg: dict[str, Any], headers: Any) -> MCPError | None:
     """A modern request whose mirrored headers disagree with its body.
 
     Called after :func:`_meta_error`, so the body's version is a string.
@@ -2871,7 +2875,7 @@ def _decode_header_value(value: str) -> str:
         raise ValueError("malformed Base64 header value") from ex
 
 
-def _echo_version(requested: Optional[str]) -> str:
+def _echo_version(requested: str | None) -> str:
     """The MCP-Protocol-Version a response carries: the request's, when this
     server speaks it, else PROTOCOL_VERSION."""
     if requested in SUPPORTED_PROTOCOL_VERSIONS or (
@@ -2881,7 +2885,7 @@ def _echo_version(requested: Optional[str]) -> str:
     return PROTOCOL_VERSION
 
 
-def _caller_of(request: Any) -> Optional[_Caller]:
+def _caller_of(request: Any) -> _Caller | None:
     token = request.get(WEB_TOKEN_REQUEST_KEY)
     if token is not None:
         return _Caller(token.label, token.scopes)

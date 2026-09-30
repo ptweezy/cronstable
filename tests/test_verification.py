@@ -136,6 +136,20 @@ async def test_verification_output_is_bounded():
     assert run.verification["output_truncated"]
 
 
+async def test_verification_output_redacts_a_whole_private_key():
+    run = job(
+        "pass",
+        'print("rows: 3\\n-----BEGIN PRIVATE KEY-----\\n'
+        'MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\\n-----END PRIVATE KEY-----")',
+    )
+    await run.start()
+    await run.wait()
+    stdout = run.verification["stdout"]
+    assert "rows: 3" in stdout
+    assert "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" not in stdout
+    assert "END PRIVATE KEY" not in stdout
+
+
 async def test_verification_deadline_includes_output_drain(monkeypatch):
     original = RunningJob.wait
     async def wait(run):
