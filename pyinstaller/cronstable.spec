@@ -9,9 +9,10 @@ from PyInstaller.utils.hooks import collect_data_files
 block_cipher = None
 
 # CRONSTABLE_BUNDLE selects the output layout: "onefile" (the default),
-# "onedir", or "both". The default must stay one-file because six knob-less
-# consumers read the single dist/cronstable(.exe): four release.yml lanes
-# plus pyinstaller/Dockerfile and pyinstaller/Makefile. The one-dir layout
+# "onedir", or "both". The default must stay one-file because every
+# knob-less consumer reads the single dist/cronstable(.exe): each release.yml
+# binary lane except the Windows one, plus pyinstaller/Dockerfile and
+# pyinstaller/Makefile. The one-dir layout
 # exists because a one-file build cannot host a Windows service: its
 # bootloader unpacks itself and runs the program in a child process the
 # Service Control Manager never sees (see cronstable/winservice.py). "both" emits the two

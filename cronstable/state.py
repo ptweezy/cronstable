@@ -1810,10 +1810,8 @@ class FilesystemStateBackend(StateBackend):
         cached = raw is not None
         if raw is None:
             try:
-                # unbuffered: a whole-file read gains nothing from a buffer,
-                # and skipping it saves an object, an lseek and (before
-                # 3.14) an isatty ioctl per read. The other whole-file
-                # readers below do the same.
+                # unbuffered, like the other whole-file readers below: a
+                # whole-file read gains nothing from a buffer
                 with open(path, "rb", buffering=0) as fobj:
                     raw = fobj.read()
             except FileNotFoundError:

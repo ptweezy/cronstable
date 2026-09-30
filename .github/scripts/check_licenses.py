@@ -29,8 +29,8 @@ long, unambiguous license-name phrases, for the rare package that ships no
 classifier or SPDX expression.
 
 Usage:
-    python scripts/check_licenses.py            # scan the current environment
-    python scripts/check_licenses.py --strict   # also fail on weak copyleft
+    python .github/scripts/check_licenses.py           # scan the current environment
+    python .github/scripts/check_licenses.py --strict  # also fail on weak copyleft
 """
 
 from __future__ import annotations

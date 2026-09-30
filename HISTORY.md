@@ -34,6 +34,12 @@
   cache in constant time. Pool reads copy the stored document once. The
   terminal UI copies styled text runs as slices when it cuts a row to
   width.
+- Pin PyInstaller once, in `pyinstaller/build-requirements.txt`, where
+  Dependabot tracks it, and run one shared extras smoke test
+  (`pyinstaller/smoke_frozen.sh`) across the POSIX binary builds. Raise the
+  test coverage floors to 95% on POSIX and 94% on Windows. Key the
+  manylinux wheel cache on its build image. The local PyInstaller image
+  builds on CPython 3.14.7, like the release binaries.
 
 ## 1.2.59
 

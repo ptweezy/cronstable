@@ -50,13 +50,9 @@ dependencies = [
     # zoneinfo's tz database, so timezones resolve on minimal/slim images
     # that don't ship the system tzdata.
     "tzdata>=2026.4",
-    # per-run CPU/memory accounting (opt-in `monitorResources`; see
-    # cronstable.resources). psutil gives a portable, process-tree-aware read of
-    # a job's CPU time and resident memory on Linux, macOS and Windows alike --
-    # asyncio's own subprocess reaping only surfaces the exit code. The feature
-    # is off by default, but the import is unconditional so `cronstable --help`
-    # and the type checker resolve it everywhere; it ships wheels for the
-    # mainstream targets and builds from source elsewhere.
+    # Per-run CPU/memory accounting (opt-in `monitorResources`; see
+    # cronstable.resources). The feature is off by default, but the import is
+    # unconditional so `cronstable --help` and mypy resolve it everywhere.
     "psutil>=7.2.2",
 ]
 classifiers = [
@@ -93,78 +89,38 @@ Container = "https://github.com/ptweezy/cronstable/pkgs/container/cronstable"
 cronstable = "cronstable.__main__:main"
 
 [project.optional-dependencies]
-# Optional: use the official Kubernetes client for the `kubernetes` leadership
-# backend. Entirely optional -- without it (or on an architecture where its
-# grpc/protobuf wheels are unavailable) the backend auto-falls back to its
-# hand-rolled apiserver REST transport over the core aiohttp dependency, so the
-# core install stays zero-new-dep and architecture-portable. The etcd backend
-# needs no extra: it always uses etcd's v3 gRPC-gateway JSON/HTTP API directly.
+# Official Kubernetes client for the `kubernetes` leadership backend. Without
+# it (or where its grpc/protobuf wheels are missing) the backend falls back to
+# its own apiserver REST transport over aiohttp. The etcd backend needs none.
 kubernetes = ["kubernetes>=27"]
-# Optional: swap asyncio's event loop for uvloop's faster libuv-based one
-# (cluster HTTP, web dashboard, Prometheus scrape). Best-effort at runtime --
-# cronstable falls back to stock asyncio when it is absent -- so it stays off the
-# core install to keep the zero-new-dep, architecture-portable baseline intact.
-# Gated off Windows, which has no uvloop build (and needs the Proactor loop for
-# subprocesses anyway); pip skips it there rather than failing to resolve.
+# uvloop's faster event loop; cronstable falls back to stock asyncio without
+# it. Windows has no uvloop build (and needs the Proactor loop for
+# subprocesses), so the marker skips it there.
 speedups = [
     "uvloop>=0.19; sys_platform != 'win32'",
-    # orjson accelerates the durable-state persistence and cluster-gossip JSON
-    # paths (see cronstable._json, which falls back to the stdlib json when it is
-    # absent). Like uvloop it is best-effort: it ships no wheels for some of
-    # the leaner architectures we target (riscv64, armv6, musl ppc64le/s390x),
-    # so it stays optional and the zero-new-dep, architecture-portable core
-    # install runs on stock json without it. It does have Windows wheels, so
-    # (unlike uvloop) it needs no platform marker.
+    # orjson speeds the state-persistence and cluster-gossip JSON paths
+    # (cronstable._json falls back to stdlib json). Optional because some
+    # targets (riscv64, armv6, musl ppc64le/s390x) have no wheel; Windows
+    # does, so no marker.
     "orjson>=3.11.6",
 ]
 # End-to-end encrypted push alerts (the `push` reporter; see cronstable.push).
-# Two libraries, one extra. PyNaCl seals the `x25519` suite: it bundles
-# libsodium (pure C, no Rust), ships abi3 wheels for every mainstream target
-# incl. win-arm64, and source-builds with a plain C toolchain on the leaner
-# arches. Optional so the zero-new-dep, architecture-portable core install
-# holds; UNLIKE the speedups extras there is no silent runtime fallback: a
-# config with a `push:` section refuses to start when PyNaCl is absent (an
-# alerting channel must fail closed, not self-disable). See
-# config._validate_push_config.
-#
-# cryptography seals the post-quantum `xwing` suite (X-Wing, ML-KEM-768 +
-# X25519, through its HPKE module) and rides the same extra, so post-quantum
-# sealing is what a plain `pip install "cronstable[push]"` gets wherever it
-# can, with nothing further to ask for. It cannot be the start-refusing gate
-# PyNaCl is: cryptography is Rust plus OpenSSL and publishes wheels for a
-# subset of the targets PyNaCl reaches, so the marker lists those that have
-# one and the extra always resolves. Off the list it installs PyNaCl alone;
-# the daemon then seals `x25519`, refuses `xwing` pairings (fail-closed),
-# and says so at startup. Unmarked, pip would take the newest cryptography and
-# fail building its sdist for want of Rust and OpenSSL headers. Linux stops
-# at x86_64 and aarch64, the arches with a wheel under BOTH libcs:
-# cryptography publishes ppc64le and armv7l for manylinux but not musllinux,
-# and a marker cannot see the libc. Every other platform gets xwing from the
-# builds that DO know their libc and can compile: the release binaries (the
-# `pq` and `pq_src` matrix keys in .github/workflows/release.yml, the latter
-# building cryptography from source with an OpenSSL 3.5) and the container
-# images, whose docker/extract_deps.py resolves this line from inside the
-# target image and reads the wheelhouse the workflow's pq-wheels job fills
-# for the platforms PyPI has no wheel for.
-#
-# Require the patched cryptography release, including its updated OpenSSL
-# wheels (GHSA-537c-gmf6-5ccf, GHSA-g6cj-pr64-35w5,
-# GHSA-m2h6-j472-rp4c, GHSA-jwv3-5hgf-82ww). Intel macOS and 32-bit
-# Windows lost upstream support in 49.0.0; install PyNaCl alone there
-# instead of retaining a vulnerable cryptography 48.x cap. Those targets
-# keep x25519 push. Binary CI attempts patched source builds for X-Wing.
-#
-# One residual rides along, because no PEP 508 marker can express it:
-# `platform_machine` is the raw `uname -m`, which reports the KERNEL.  A
-# 32-bit userland on a 64-bit kernel therefore passes the marker, pip
-# correctly looks for the i686 (or armv7l) wheel, finds none, and fails
-# building the sdist for want of Rust.  Install under `linux32` there
-# (`linux32 pip install "cronstable[push]"`), which makes uname report
-# the 32-bit machine so the marker excludes cryptography and the install
-# lands PyNaCl alone.  Windows has the same shape with no `linux32`: a
-# 32-bit Python on 64-bit Windows reports `AMD64`, takes the uncapped
-# line, and finds no supported win32 wheel. Install cronstable plus
-# `pynacl` by hand there, or use a 64-bit Python installation.
+# PyNaCl seals `x25519` and fails closed: a config with a `push:` section
+# refuses to start without it (config._validate_push_config).
+# cryptography seals the post-quantum `xwing` suite. Its marker lists only
+# targets with a wheel, so pip never tries the sdist (which needs Rust and
+# OpenSSL headers); elsewhere the daemon seals `x25519`, refuses `xwing`
+# pairings and says so at startup. Linux stops at x86_64 and aarch64, the
+# only arches with wheels under both libcs (a marker cannot see the libc).
+# The release binaries (`pq`/`pq_src` in release.yml) and container images
+# (docker/extract_deps.py) build xwing for more targets.
+# The floor is the patched release (GHSA-537c-gmf6-5ccf, GHSA-g6cj-pr64-35w5,
+# GHSA-m2h6-j472-rp4c, GHSA-jwv3-5hgf-82ww). 49.0.0 dropped Intel macOS and
+# 32-bit Windows; they keep x25519 only. Do not cap at a vulnerable 48.x.
+# `platform_machine` reports the kernel: on a 32-bit userland with a 64-bit
+# kernel, install with `linux32 pip install "cronstable[push]"`. A 32-bit
+# Python on 64-bit Windows reports `AMD64`; install `pynacl` by hand there or
+# use a 64-bit Python.
 push = [
     "pynacl>=1.6.2",
     "cryptography>=50.0.1,<51; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
@@ -176,16 +132,12 @@ discovery = ["zeroconf>=0.151.3"]
 dev = [
     # Canonical dev list: scripts/generate_build_files.py emits
     # requirements_dev.txt for tox and pip. Edit dependencies here.
-    # The mTLS and X-Wing tests need cryptography; use the push extra's
-    # wheel markers and skip those tests where no wheel is available.
-    # On a 32-bit Linux userland with a 64-bit kernel, install under
-    # linux32 so the marker sees the userland architecture (see push).
+    # cryptography (mTLS and X-Wing tests) reuses the push marker and its
+    # linux32 caveat; those tests skip where it is absent.
     "cryptography>=50.0.1,<51; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
-    # Exercise the real accelerated JSON, push-sealing and mDNS paths.
-    # orjson is wheel-only in dev: omit platforms/interpreters that would
-    # need a Rust source build. PyNaCl and zeroconf cover every CI runner.
-    # The py314t tox env uses a generated variant without orjson, whose
-    # build rejects the free-threaded ABI (not expressible in these markers).
+    # orjson is wheel-only here: the marker skips targets that would need a
+    # Rust source build. py314t uses a generated list without it, because no
+    # marker can detect the free-threaded ABI that orjson rejects.
     "orjson>=3.11.6; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
     "pynacl>=1.6.2",
     "zeroconf>=0.151.3",
@@ -195,7 +147,6 @@ dev = [
     # security linter; bandit[toml] reads [tool.bandit] from pyproject.toml.
     "bandit[toml]",
     "mypy",
-    "mypy-extensions",
     # validates docs/openapi.yaml (.github/scripts/check_openapi.py, tox -e openapi).
     "openapi-spec-validator",
     # validates MCP tool results against their declared outputSchema
@@ -210,9 +161,8 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
-    # Randomize test order to detect dependencies between tests. Use the
-    # seed printed in the header with `-p randomly --randomly-seed=N`
-    # to reproduce a failing order.
+    # Randomize test order to find dependencies between tests; reproduce an
+    # order with the header seed: `-p randomly --randomly-seed=N`.
     "pytest-randomly",
     # Report timed-out tests and their thread stacks before the
     # faulthandler_timeout limit terminates the session.
@@ -224,18 +174,13 @@ dev = [
 ]
 
 [tool.setuptools]
-# The kubernetes/etcd leadership backends talk to their store over plain HTTP
-# via the core aiohttp dependency (no kubernetes/etcd3 client, no grpc), so
-# they add no runtime dependency and need no optional extra -- which also keeps
-# cronstable's wide architecture coverage intact.
 packages = ["cronstable", "cronstable.web", "cronstable.backends"]
 
 [tool.setuptools.package-data]
 "cronstable.web" = ["*.html"]
-# Third-party license notices ride inside every artifact (wheel, Docker,
-# and the frozen binaries via the spec's collect_data_files), so the
-# LGPL notice for the bundled python-zeroconf is never separated from
-# the code it covers. Printed by `cronstable --third-party-licenses`.
+# License notices ship in every artifact (wheel, Docker, frozen binaries)
+# so the LGPL notice for bundled python-zeroconf stays with its code.
+# `cronstable --third-party-licenses` prints them.
 "cronstable" = ["licenses/*.txt"]
 
 [tool.setuptools_scm]
@@ -261,9 +206,8 @@ select = [
     "F",
     # Pycodestyle warnings
     "W",
-    # pyupgrade: only the typing-modernization codes (builtin generics, PEP
-    # 604 unions and optionals, deprecated typing imports); the full UP set
-    # stays off
+    # pyupgrade, typing-modernization codes only (builtin generics, PEP 604
+    # unions and optionals, deprecated typing imports)
     "UP006",
     "UP007",
     "UP035",
@@ -276,20 +220,11 @@ max-complexity = 20
 
 [tool.mypy]
 python_version = "3.10"
-# Type-check against the POSIX API surface (grp/pwd/os.setuid/...), which is
-# where those calls actually run; the Windows-specific branches are guarded at
-# runtime (sys.platform checks / getattr). CI runs mypy on Linux, so pinning
-# this keeps local runs on any OS consistent.
-#
-# The gate that reads the Windows branches is the test suite, and until the
-# per-OS coverage profiles below existed that claim was hollow: every Windows
-# branch was pragma'd out of the measurement on the Windows rows too. It is
-# now true, because `# pragma: no cover (windows)` code is measured there. A
-# second `mypy --platform win32` pass would be the stronger check and is not
-# wired yet; `cronstable.platform.apply_priority` reaches os.setpriority
-# behind a plain bool (the `windows=` override its tests drive both arms
-# with), which no sys.platform spelling can prune, so that pass currently
-# needs a `type: ignore` the Linux pass considers unused.
+# Check the POSIX API surface (grp, pwd, os.setuid) on every OS, as Linux CI
+# does; Windows branches are runtime-guarded and the Windows test rows cover
+# them. No `--platform win32` pass: cronstable.platform.apply_priority
+# reaches os.setpriority behind a plain bool, so that pass would need a
+# `type: ignore` that the Linux pass reports as unused.
 platform = "linux"
 no_implicit_optional = true
 warn_no_return = true
@@ -297,13 +232,9 @@ warn_return_any = true
 strict_optional = true
 
 [[tool.mypy.overrides]]
-# The optional-extra deps are imported behind try/except guards (orjson in
-# cronstable._json, uvloop in cronstable.__main__, pynacl and cryptography
-# in cronstable.push, zeroconf in cronstable.discovery, kubernetes in the
-# leadership backend's official-client fast path), so a checkout without the
-# extras installed must still type-check cleanly. cryptography ships py.typed,
-# so where it IS installed (the dev env) mypy still checks it fully; this
-# entry only covers the bare tox mypy env, exactly like nacl's.
+# Optional-extra deps, imported behind try/except guards, so a checkout
+# without the extras still type-checks. Where an extra is installed and ships
+# py.typed (cryptography in the dev env), mypy still checks it fully.
 module = [
     "orjson",
     "uvloop",
@@ -319,11 +250,9 @@ module = [
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# Core runtime deps that ship no py.typed marker (and whose stub packages we
-# deliberately don't add): their surface types as Any, exactly as it always
-# has. This table is the ONLY missing-import allowance; tox -e mypy runs
-# WITHOUT a global --ignore-missing-imports, so a new unresolvable import
-# fails the gate instead of silently typing as Any.
+# Core runtime deps with no py.typed (stub packages deliberately omitted).
+# This table is the ONLY missing-import allowance, so a new unresolvable
+# import fails tox -e mypy.
 module = [
     "strictyaml",
     "strictyaml.*",
@@ -334,9 +263,8 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests", ".github/tests"]
-# A wedged await (the intermittent 3.12 test_dag_tools_full_flow hang) must
-# dump every thread's stack and fail the run, not burn the 30 min CI job
-# timeout and report "cancelled". Armed per test; no test comes near 300s.
+# A wedged await dumps every thread's stack and fails the run before the
+# 30-minute CI job timeout cancels it. Armed per test; none comes near 300s.
 faulthandler_timeout = 300
 faulthandler_exit_on_timeout = true
 # Report a test timeout and thread stacks after the asyncio task dump
@@ -361,32 +289,17 @@ omit = ["cronstable/version.py"]
 [tool.coverage.report]
 show_missing = true
 # Three pragma tokens, two profiles. A bare `# pragma: no cover` is hidden on
-# every OS (defensive branches, unreachable raises). `# pragma: no cover
-# (windows)` is hidden on POSIX and
-# MEASURED on Windows; `# pragma: no cover (posix)` is the mirror. Without
-# them the Windows cells scored the wrong file: the Windows code that runs
-# there was excluded, and the POSIX code that cannot run there was counted
-# and missed.
+# every OS; `# pragma: no cover (windows)` is hidden on POSIX and MEASURED on
+# Windows; `(posix)` is the mirror. The token may follow other text.
+# Rule 2 is the only per-profile rule: tox.ini sets CRONSTABLE_COVERAGE_SKIP
+# to the platform whose branches CANNOT run in that env, and the `windows`
+# default gives a bare `pytest --cov` or an IDE run the POSIX profile.
 #
-# Rule 2 is the only difference between the two profiles. coverage
-# substitutes the environment variable when it reads this file, and tox.ini
-# sets it from the `windows`/`posix` factor to name the platform whose
-# branches CANNOT run in that env. The default (`windows`) is the historical
-# POSIX-shaped measurement, so a bare `pytest --cov` or an IDE run reports
-# what it always did.
-#
-# exclude_lines REPLACES coverage's defaults rather than appending to them
-# (which is what `exclude_also` does, and the default catch-all pragma rule
-# would then swallow the tagged pragmas before rule 2 ever saw them). So rule
-# 1 is coverage's own DEFAULT_EXCLUDE[0] with a lookahead appended, and the
-# last two entries are the copies of DEFAULT_EXCLUDE[1] and [2] this project
-# still wants. Both OS rules accept the token anywhere after `cover`, so a
-# site can keep the trailing prose that explains it.
-# tests/test_coverage_profiles.py pins rule 1 against DEFAULT_EXCLUDE[0]
-# verbatim, because that relationship is the point of rule 1; it pins the
-# last two by what they exclude instead, since coverage rewords those two
-# between patch releases and a verbatim pin would red every cell whose
-# resolved coverage is a patch out of step with this one.
+# exclude_lines REPLACES coverage's defaults (with `exclude_also`, the default
+# pragma rule would swallow the tagged pragmas), so rule 1 is
+# DEFAULT_EXCLUDE[0] plus a lookahead and the last two copy DEFAULT_EXCLUDE[1]
+# and [2]. tests/test_coverage_profiles.py pins rule 1 verbatim and the last
+# two by behavior, because coverage rewords those in patch releases.
 exclude_lines = [
     '#\s*(pragma|PRAGMA)[:\s]?\s*(no|NO)\s*(cover|COVER)(?!.*\((windows|posix)\))',
     '#\s*(pragma|PRAGMA)[:\s]?\s*(no|NO)\s*(cover|COVER).*\(${CRONSTABLE_COVERAGE_SKIP-windows}\)',
@@ -395,10 +308,9 @@ exclude_lines = [
 ]
 
 [tool.mutmut]
-# Mutation tests run one module per nightly job. mutmut changes expressions
-# and reruns the tests that execute them. A surviving mutation can indicate
-# an assertion that is missing or insufficient. Select modules whose behavior
-# depends on their inputs to reduce timing-related failures. To run locally:
+# Nightly mutation tests, one module per job; a surviving mutant points to a
+# missing or weak assertion. List only input-driven modules, which avoids
+# timing-related failures. To run locally:
 #     pip install mutmut && mutmut run "cronstable.redact*" && mutmut results
 source_paths = [
     "cronstable/cronexpr.py",
@@ -423,9 +335,7 @@ pytest_add_cli_args = ["-p", "no:randomly", "-p", "no:cacheprovider"]
 
 [tool.bandit]
 exclude_dirs = ["tests"]
-# B104's only hits are the literal "0.0.0.0"/"::" strings in config.py's
-# wildcard-listen match-sets (_WILDCARD_LISTEN_HOSTS and friends): data used to
-# recognize a wildcard listen address, not a socket bind. The real listen host
-# is user-configured and never a literal here, so B104 yields only false
-# positives. Bandit still runs at medium+; every other check stays active.
+# B104 hits only the "0.0.0.0"/"::" literals in config.py's wildcard-listen
+# match-sets (such as _WILDCARD_LISTEN_HOSTS), which recognize a wildcard
+# address and never bind one.
 skips = ["B104"]

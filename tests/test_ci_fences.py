@@ -350,9 +350,9 @@ def test_signed_upload_name_dodges_the_broad_release_download():
 def test_release_overlays_the_signed_set_before_hashing():
     # The overlay must sit after the broad download (or the unsigned
     # set wins) and before SHA256SUMS (or the sums describe bytes that
-    # are not attached). Its gate reads the sign job's output, which
-    # requires sign-windows in needs; without that the expression is
-    # silently empty and a signed release ships unsigned.
+    # are not attached). It runs unconditionally: release-prepare needs
+    # sign-windows, so the signed set exists whenever this job runs, and
+    # any condition could only let a release ship unsigned.
     job = _workflow()["jobs"]["release-prepare"]
     assert SIGN_JOB in job["needs"]
     names = [step.get("name") for step in job["steps"]]
@@ -362,7 +362,7 @@ def test_release_overlays_the_signed_set_before_hashing():
         < names.index("Generate SHA256SUMS")
     )
     overlay = _named_steps(job)[OVERLAY_STEP]
-    assert "needs.sign-windows.outputs.signed" in str(overlay["if"])
+    assert "if" not in overlay
 
 
 def test_signed_set_covers_every_windows_release_asset():
@@ -388,14 +388,14 @@ def test_signed_set_covers_every_windows_release_asset():
 
 
 def test_decide_step_env_covers_every_signing_secret():
-    # The decide step's env block is the single enumeration of the
-    # signing secrets (its shell derives the all-or-none check from the
-    # AZURE_* env vars). A secret referenced by a later step but absent
-    # from the env block is not gated: the job claims signed=true and
-    # then fails mid-release.
+    # The check step's env block is the single enumeration of the
+    # signing secrets (its shell derives the missing-secret check from
+    # the AZURE_* env vars). A secret referenced by a later step but
+    # absent from the env block is not checked: the step passes and the
+    # job then fails mid-release.
     job = _workflow()["jobs"][SIGN_JOB]
-    decide = _named_steps(job)["Decide whether to sign"]
-    env_keys = set(decide.get("env") or {})
+    check = _named_steps(job)["Require the signing secrets"]
+    env_keys = set(check.get("env") or {})
     referenced = set()
     for step in job["steps"]:
         referenced |= set(re.findall(r"secrets\.(AZURE_\w+)", str(step)))

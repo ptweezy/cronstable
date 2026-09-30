@@ -1726,9 +1726,9 @@ def _metrics_response_product(
 
 
 # Each frame's bytes up to the encoded line, for every stream name a job
-# publishes (RunningJob's output_prefix makes the verify.* pair). Splicing
-# the line's JSON string in skips building and encoding a dict per line and
-# yields the bytes the dict encodes to, on either JSON backend.
+# publishes (RunningJob's output_prefix makes the verify.* pair). A head
+# plus the line's JSON string is the same bytes the full dict encodes to,
+# on either JSON backend.
 _SSE_LINE_HEADS = {
     name: b'event: line\ndata: {"stream":"' + name.encode() + b'","line":'
     for name in ("stdout", "stderr", "verify.stdout", "verify.stderr")
@@ -5655,8 +5655,8 @@ class Cron:
                 str(job.timezone) if job.timezone is not None else None
             ),
             "running": bool(running),
-            # most jobs are idle, so skip the comprehension for them: on
-            # 3.10/3.11 even an empty one costs a function call per job
+            # guarded: most jobs are idle, and on 3.10/3.11 even an empty
+            # comprehension is a function call
             "pids": (
                 [
                     runjob.proc.pid

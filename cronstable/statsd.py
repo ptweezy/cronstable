@@ -121,9 +121,8 @@ async def _endpoint(host, port, message):
     task = endpoints.get(key)
     if task is not None and task.done():
         if not _unusable(task, loop.time()):
-            # the pooled endpoint is open and healthy: its result is
-            # already known, so skip the shield-and-await round trip
-            # (awaiting a finished task never suspends anyway)
+            # the pooled endpoint is open and healthy; a finished task
+            # needs no shield
             return task.result()[0], False
         _discard(endpoints, key, task)
         task = None

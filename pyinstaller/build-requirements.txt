@@ -1,0 +1,4 @@
+# The PyInstaller release every frozen build uses: each binary lane in
+# .github/workflows/release.yml, pyinstaller/Dockerfile, and the local MSI
+# recipe in packaging/msi/README.md install from this file.
+pyinstaller==6.22.1

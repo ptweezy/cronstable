@@ -6,7 +6,6 @@ zeroconf>=0.151.3
 playwright; platform_machine != 'ARM64' or sys_platform != 'win32'
 bandit[toml]
 mypy
-mypy-extensions
 openapi-spec-validator
 jsonschema
 crontab>=1.0.5,<2

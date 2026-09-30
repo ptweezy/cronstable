@@ -955,9 +955,7 @@ def _propagate_and_claim(
                     and task.type != APPROVAL
                 ):
                     # quota spent: a root is always ready, so _advance_task
-                    # would return at its deferred check untouched. Skipping
-                    # both calls keeps a wide DAG's backlog of pending roots
-                    # cheap on every pass once the claims are made.
+                    # would return at its deferred check untouched
                     continue
                 verdict = _deps_verdict(spec, body, task)
             _advance_task(

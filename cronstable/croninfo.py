@@ -318,8 +318,7 @@ def describe_cron(
             return "Custom schedule: %s" % expr
         if tab.resolved_differs:
             # the engine wrote resolved_source, so this parse is also the
-            # engine gate's verdict on it: pass it on instead of parsing
-            # the resolved text again
+            # engine gate's verdict on it
             return "%s (H slots hashed from the job name)" % describe_cron(
                 tab.resolved_source, tab=tab
             )

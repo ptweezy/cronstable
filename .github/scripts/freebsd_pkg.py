@@ -4,8 +4,7 @@
 
 Runs in the `binaries-freebsd` VM right after the binary it packages is built,
 and shells out to ``pkg create``.  That is a deliberate choice over fpm, which
-the roadmap proposed because it writes ``+MANIFEST`` itself and therefore runs on
-the Linux runner: fpm maps ``aarch64`` to ``arm64`` and emits the ABI string
+writes ``+MANIFEST`` itself and so could run on the Linux runner: fpm maps ``aarch64`` to ``arm64`` and emits the ABI string
 ``FreeBSD:14:arm64``, which ``pkg`` rejects, so the arm64 package needs a
 monkey-patch to come out valid at all.  Building here instead means the ABI comes
 from the machine the package targets, no Ruby toolchain enters the pipeline, and

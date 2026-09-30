@@ -1,7 +1,6 @@
-# Keep the build context small. NOTE: .git MUST be included because
-# setuptools_scm derives the version from git tags during `pip install .`.
-# README.md and LICENSE must also stay: pyproject.toml references them at
-# build time.
+# Keep the build context small. .git, README.md and LICENSE MUST stay:
+# setuptools_scm reads the git tags, and pyproject.toml references the other
+# two at build time (tests/test_dockerfile_layering.py pins this file).
 .venv
 .venv314
 .tox
@@ -17,19 +16,13 @@ build
 __pycache__
 *.pyc
 
-# None of this is needed to build the package, so it's excluded to shrink
-# the build context.
-# pyinstaller/ is NOT excluded: its Makefile builds with the repo root as
-# the context (`docker build -f Dockerfile ..`), so this file governs that
-# build too, and the image runs `pyinstaller pyinstaller/cronstable.spec`
-# from the copied tree; excluding the directory broke that build outright.
+# Not needed to build the package. Keep pyinstaller/: its Makefile uses the
+# repo root as the build context, so this file governs that build too.
 .claude
 .github
 docker
-# except the two shared helpers every Dockerfile COPYs: the
-# requirement-extraction script (into the dependency layer beside
-# pyproject.toml) and the best-effort orjson installer (just below the
-# dependency layers). The negations must follow the exclusion they carve out.
+# except the shared helpers every Dockerfile COPYs. Each negation must
+# follow the exclusion it carves out.
 !docker/extract_deps.py
 !docker/install_orjson.sh
 !docker/python_runtime.py
@@ -45,15 +38,10 @@ acceptance-results
 .editorconfig
 .gitignore
 
-# Documentation, website assets and side trees. None of these reach the wheel
-# (`packages` in pyproject.toml lists three package directories, all under
-# cronstable/), and none of the eight Dockerfiles or the pyinstaller build
-# reads them. docs/ alone is ~45 MB of screenshots and diagrams, which every
-# `docker build` uploaded to the daemon and every layer-cache key hashed:
-# a screenshot edit invalidated the COPY layer and everything under it in all
-# 36 emulated platform builds. The two files the SHIPPED test suite reads from
-# docs/ (openapi.yaml, demo/index.html) matter to the sdist, not to any image:
-# tests/ is excluded here already, so nothing in an image build wants them.
+# Docs, website assets and side trees reach neither the wheel nor any image
+# build. docs/ alone is about 45 MB; sending it would make every screenshot
+# edit invalidate the COPY layer, and everything below it, in every platform
+# build.
 docs
 wiki
 benchmarks

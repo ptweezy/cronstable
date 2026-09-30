@@ -1,25 +1,11 @@
-# Dependabot keeps the CI/CD supply chain current: it opens PRs to bump the
-# pinned versions as new releases land, so the exact pins in .github/workflows
-# and the Dockerfiles don't silently rot back into known-vulnerable versions.
-#
-# Two mechanisms, one file:
-#   - VERSION updates (configured below) run on the weekly schedule and bump a
-#     dependency simply because a newer release exists.
-#   - SECURITY updates -- the ones that matter most here, where Dependabot raises
-#     a PR the moment a dependency has a published advisory, regardless of
-#     schedule -- are switched on in the repo UI, not here: Settings -> Code
-#     security -> enable "Dependabot alerts" AND "Dependabot security updates".
-#     They reuse the ecosystems declared below to know which manifests to patch,
-#     so keep this file in sync with what the pipeline actually uses.
-#
-# Updates are grouped per ecosystem so a quiet week brings at most one PR per
-# ecosystem to review, not one per dependency.
+# Weekly VERSION updates for the exact pins, grouped into one PR per
+# ecosystem. SECURITY updates are enabled in the repo settings (Code security:
+# "Dependabot alerts" and "Dependabot security updates") and reuse the
+# ecosystems below, so keep this list in step with what the pipeline uses.
 version: 2
 updates:
-  # The GitHub Actions pinned in .github/workflows/*.yml. They are exact-pinned
-  # (e.g. actions/checkout@v7.0.0), which is precisely what lets Dependabot see
-  # each one as outdated and open a reviewable bump -- a moving major tag (@v7)
-  # would hide minor/patch drift behind a mutable ref instead.
+  # Actions are exact-pinned (actions/checkout@v7.0.0) so Dependabot sees the
+  # minor and patch drift that a moving major tag would hide.
   - package-ecosystem: github-actions
     directories:
       - "/" # scans .github/workflows/ and root action.yml only
@@ -31,11 +17,10 @@ updates:
       github-actions:
         patterns: ["*"]
 
-  # pyproject.toml owns dependency floors. If a PR changes requirements_min.txt,
-  # apply its new pins as floors there (including matching extras), then run
-  # scripts/generate_build_files.py before merging.
-  # Keep requirements_min.txt visible to configured dependency scans:
-  # excluding it left GitHub's graph reporting obsolete vulnerable pins.
+  # pyproject.toml owns dependency floors: apply a requirements_min.txt bump
+  # there (extras too), then run scripts/generate_build_files.py. Keep
+  # requirements_min.txt scanned; excluding it leaves the dependency graph
+  # reporting obsolete vulnerable pins.
   - package-ecosystem: pip
     directory: "/"
     exclude-paths:
@@ -49,11 +34,10 @@ updates:
       python:
         patterns: ["*"]
 
-  # Base images in the Dockerfiles: the published multi-distro image matrix
-  # (/Dockerfile is the default Debian image; docker/Dockerfile.* are the
-  # variants) plus the local PyInstaller build image (pyinstaller/Dockerfile,
-  # which also carries the uv COPY --from pin). Base-image bumps can change a
-  # distro's default Python, so review these rather than automerging.
+  # scripts/generate_build_files.py writes /Dockerfile and docker/Dockerfile.*
+  # from docker/images.toml: apply a base-image bump there and rerun it. A uv
+  # bump in pyinstaller/Dockerfile also moves SETUP_UV_VERSION in release.yml.
+  # Review, do not automerge: a new base image can change the default Python.
   - package-ecosystem: docker
     directories:
       - "/"

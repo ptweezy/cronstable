@@ -4082,7 +4082,7 @@ def _validate_eventlog_config(config: "CronstableConfig") -> None:
     users = _eventlog_report_users(config)
     if not users:
         # users names every enabled block, and only enabled blocks are
-        # checked below: skip walking the whole fleet a second time
+        # checked below
         return
 
     def _blocks() -> Any:
@@ -4324,7 +4324,7 @@ def _resolve_env(
     inside the document (e.g. ``web.listen[0]``); it appears only in the
     unset-variable error so the operator can find the offending key.
     """
-    # one lookup: environ values are always str, so None means unset
+    # environ values are always str, so None means unset
     value = os.environ.get(name)
     if default is not None:
         # `:-` falls back to the default when unset OR set-but-empty.

@@ -1,10 +1,8 @@
 include LICENSE
 
-# setuptools_scm's git file finder seeds the sdist with every tracked file, so
-# a working note left at the repo root ships to PyPI: windows-roadmap.md
-# reached the 1.2.42 and 1.2.43 sdists that way. Deny root-level markdown and
-# add back only the documents this project publishes. test_packaging.py fences
-# both the deny rule and the add-backs.
+# setuptools_scm seeds the sdist with every tracked file, so a note left at
+# the repo root would ship to PyPI. Deny root-level markdown and add back the
+# published documents; tests/test_packaging.py pins both.
 exclude *.md
 include README.md
 include HISTORY.md
@@ -25,9 +23,8 @@ recursive-exclude * __pycache__
 recursive-exclude * *.py[co]
 recursive-exclude env *
 
-# Exclude website screenshots and animations from source distributions.
-# Include the fixtures used by the shipped tests.
-# tests/test_packaging.py checks that the fixture paths stay in this list.
+# Drop the website images; add back the files the shipped tests read
+# (tests/test_packaging.py checks this list).
 prune docs
 include docs/openapi.yaml
 include docs/demo/index.html
@@ -38,13 +35,9 @@ include docs/comparison.html
 include docs/palette.css
 include docs/relay-protocol.md
 
-# wiki/ and benchmarks/ deliberately stay. Together they are ~1.2 MB, and the
-# shipped test suite reads both: tests/test_tui.py asserts against
-# wiki/Web-Dashboard.md, and tests/test_benchmarks.py runs benchmarks/bench.py
-# and benchmarks/compare.py.
+# wiki/ and benchmarks/ stay (about 1.2 MB): tests/test_tui.py reads
+# wiki/Web-Dashboard.md and tests/test_benchmarks.py runs benchmarks/.
 
 # The shipped suite also reads Dockerfile, docker/, .dockerignore,
-# .github/docker-matrix.json and .github/workflows/release.yml
-# (tests/test_dockerfile_layering.py and tests/test_ci_fences.py); none of
-# those are pruned, so they ship, and any future prune must keep them
-# reachable.
+# .github/docker-matrix.json and .github/workflows/release.yml; keep them
+# unpruned (tests/test_dockerfile_layering.py, tests/test_ci_fences.py).

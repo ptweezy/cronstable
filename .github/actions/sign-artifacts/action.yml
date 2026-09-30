@@ -3,18 +3,11 @@ description: >-
   Authenticode-sign one folder, retrying the whole call when an attempt
   fails.
 
-# A composite action because a `uses:` step cannot be wrapped in a shell
-# loop, so .github/scripts/retry.sh is no help; here a step can be marked
-# non-fatal and the next one gated on its outcome.
-#
-# What flakes is the setup, not the signing service: the action installs
-# its module from the PowerShell gallery on every call, and a gallery
-# blip exits 1 before a single byte is signed. Re-signing is safe either
-# way, since signtool replaces a signature rather than stacking one.
-#
-# The digest and timestamp inputs live here because they are the same at
-# every call site and a missing timestamp dies with the leaf certificate
-# Artifact Signing rotates within days.
+# Composite because retry.sh cannot wrap a `uses:` step; here a step can be
+# non-fatal and gate the next one. The flake is the PowerShell gallery module
+# install on every call; re-signing is safe (signtool replaces a signature).
+# Keep the timestamp: without one, a signature dies with the leaf
+# certificate, which Artifact Signing rotates within days.
 
 inputs:
   label:
@@ -88,9 +81,8 @@ runs:
         echo "::warning::signing ${{ inputs.label }}: attempt 2 of 3 failed; retrying in 60s"
         sleep 60
 
-    # No continue-on-error: the last attempt owns the failure, so an
-    # exhausted ladder still fails the release rather than shipping
-    # unsigned bytes under a green check.
+    # No continue-on-error, so an exhausted ladder fails the release
+    # instead of shipping unsigned files under a green check.
     - name: Sign ${{ inputs.label }} (last attempt)
       id: sign3
       if: steps.sign2.outcome == 'failure'

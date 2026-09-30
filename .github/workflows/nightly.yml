@@ -1,17 +1,8 @@
-# Run extended checks on main without blocking commits. release.yml
-# contains the required checks.
-#
-# - deep: Run Hypothesis with the thorough profile, which generates about
-#   30 times as many examples as required CI runs. Then run the full suite
-#   three times with randomized test order; see the deep environment in tox.ini.
-# - devmode: Run the suite with PYTHONDEVMODE=1 to enable asyncio diagnostics
-#   and allocation tracebacks for ResourceWarning messages.
-# - mutation: Introduce small code changes with mutmut, one module per job,
-#   and check whether the tests detect them. Upload undetected mutations
-#   and include counts in each job summary.
-#
-# Each job installs the latest compatible dependencies. Scheduled runs can
-# therefore detect breaking dependency changes before the next push.
+# Extended checks on main that never block a commit (release.yml holds the
+# required ones): deep (tox -e deep), devmode (PYTHONDEVMODE asyncio and
+# ResourceWarning diagnostics) and mutation (mutmut, one module per job).
+# Jobs install the latest compatible dependencies, so a breaking upstream
+# release shows up here before the next push.
 
 name: nightly
 
@@ -37,8 +28,7 @@ jobs:
         with:
           python-version: '3.14'
       - run: pip install tox tox-uv
-      # Install Chromium so the browser suites run instead of skipping.
-      # Use the same installation as release.yml.
+      # Same Chromium install as release.yml, so the browser suites run.
       - name: Install Chromium
         run: |
           set -euo pipefail

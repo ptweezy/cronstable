@@ -166,7 +166,7 @@ class PoolScheduler:
         def transform(current):
             body = (
                 # current is freshly parsed JSON, so a JSON round trip is a
-                # faithful (and with orjson several times faster) deep copy
+                # faithful deep copy
                 _json.deepcopy_json(current)
                 if current is not None
                 else {

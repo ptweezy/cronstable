@@ -110,7 +110,6 @@ jobs:
     with:
       matrix: ${{ needs.prepare.outputs.pq-glibc }}
       version: ${{ needs.prepare.outputs.version }}
-      release: false
       ref: ${{ needs.prepare.outputs.revision }}
       refresh: true
       cryptography: ${{ needs.prepare.outputs.cryptography }}
@@ -122,7 +121,6 @@ jobs:
     with:
       matrix: ${{ needs.prepare.outputs.pq-musl }}
       version: ${{ needs.prepare.outputs.version }}
-      release: false
       ref: ${{ needs.prepare.outputs.revision }}
       refresh: true
       cryptography: ${{ needs.prepare.outputs.cryptography }}

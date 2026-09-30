@@ -6791,8 +6791,7 @@ var qrcode = function() {
   // next N fire times as {c: components, t: instant ms}; untilMs (optional)
   // bounds the walk itself, so a sparse schedule stops at the window's end
   // instead of hunting fires toward the year ceiling. instantsOnly returns
-  // the bare instants, sparing a component copy and a wrapper per fire for
-  // a caller (the week walk) that reads only t
+  // bare instants, for a caller (the week walk) that reads only t
   function nextRuns(parsed, n, frame, fromMs, untilMs, instantsOnly) {
     if (parsed.type !== "fields") return [];
     const start = wallParts(new Date(fromMs), frame);
@@ -7911,9 +7910,8 @@ var qrcode = function() {
     });
     items.sort((a, b) => a.t - b.t || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     frequent.sort((a, b) => (a.name < b.name ? -1 : 1));
-    // repaint only if the grid changed, compared against the last walk field
-    // by field: a joined signature string cost a number-to-string conversion
-    // per fire on every cold walk (and could collide on names holding @ or |)
+    // repaint only if the grid changed, compared with the last walk field by
+    // field
     const pi = state.week.items, pf = state.week.frequent;
     let same = state.week.bounds != null && state.week.bounds[0] === bounds[0] &&
       pi.length === items.length && pf != null && pf.length === frequent.length;

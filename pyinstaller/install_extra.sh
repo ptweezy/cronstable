@@ -12,7 +12,7 @@
 #
 # Usage: install_extra.sh NAME SPEC hard|soft [FALLBACK]
 #   NAME      verify_extra.py probe name, also the pip name to uninstall
-#   SPEC      @ uses the floor generated from pyproject.toml; @,<49 adds a
+#   SPEC      @ uses the floor generated from pyproject.toml; @,<51 adds a
 #             lane-specific cap. A full requirement also works (e.g. the
 #             zeroconf version resolved by the release source-offer job).
 #   hard      install and verify must both succeed, else exit nonzero. On
@@ -79,10 +79,10 @@ if $PY "$here/verify_extra.py" "$name"; then
     :
 else
     # exit 2 is verify_extra.py's USAGE code (NAME is not one of its probe
-    # names), not a probe failure. Folding the two together uninstalled a
-    # perfectly healthy package over a typo and still exited 0, so the
-    # binary shipped without the extra and nothing said so. A bad name is
-    # a build bug: fail loudly on both policies.
+    # names), not a probe failure. Folding the two together would
+    # uninstall a healthy package over a typo and still exit 0, shipping
+    # the binary without the extra and saying nothing. A bad name is a
+    # build bug: fail loudly on both policies.
     status=$?
     if [ "$status" -eq 2 ]; then
         echo "install_extra.sh: \"$name\" is not a verify_extra.py probe name" >&2

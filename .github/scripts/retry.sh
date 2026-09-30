@@ -64,7 +64,8 @@ retry() {
 #
 # Official `library/` images only: the mirror paths hardcode that namespace, so
 # a namespaced image (org/name) would be rewritten to a path that does not
-# exist. Both call sites pass a hardcoded python:3.14-* tag.
+# exist. The one call site, binaries-container, passes python:3.14-* images
+# from its matrix.
 pull_base() {
   _pull_image=$1
   _pull_platform=$2

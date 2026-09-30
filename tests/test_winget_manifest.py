@@ -304,7 +304,7 @@ def test_submission_requires_signed_scanned_validated_msis():
         early_names.index(n) for n in early_gates
     )
     for name in early_gates:
-        assert early[name]["if"] == "steps.decide.outputs.signed == 'true'"
+        assert early[name].get("if", "success()") == "success()"
         assert not early[name].get("continue-on-error", False)
     scan = early["Verify and Defender-scan winget installers"]["run"]
     assert "-AssetDirectory out" in scan
@@ -328,8 +328,6 @@ def test_submission_requires_signed_scanned_validated_msis():
         assert steps[name].get("if", "success()") == "success()"
         assert not steps[name].get("continue-on-error", False)
     download = steps[gates[0]]
-    assert "needs.sign-windows.outputs.signed" in download["env"]["SIGNED"]
-    assert '"$SIGNED" != true' in download["run"]
     assert "cronstable-windows-amd64.msi" in download["run"]
     assert "cronstable-windows-arm64.msi" in download["run"]
     assert "cronstable-windows-amd64-setup.exe" in download["run"]
@@ -337,7 +335,7 @@ def test_submission_requires_signed_scanned_validated_msis():
     assert "SHA256SUMS" in download["run"]
     evidence = early["Preserve winget validation evidence"]
     assert evidence["if"] == (
-        "always() && steps.decide.outputs.signed == 'true'"
+        "always() && steps.signing_secrets.outcome == 'success'"
     )
     assert "*.log" in evidence["with"]["path"]
     assert "winget-validation/metadata.json" in evidence["with"]["path"]

@@ -7589,8 +7589,7 @@ class AppDrawers(AppOverlays):
         # per-frame constants the rows share: the two stream markers (with
         # the row's leading space already on), and the attribute lookups
         # render() needs, resolved once per frame. The memo is only ever
-        # cleared or trimmed in place, so its bound get stays current, and
-        # a hit (nearly every row of a steady paint) skips the method call.
+        # cleared or trimmed in place, so its bound get stays current.
         style = paint.style
         ansi_line = self._ansi_line
         ansi_get = self._ansi_cache.get

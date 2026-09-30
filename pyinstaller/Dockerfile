@@ -4,30 +4,30 @@ RUN apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && DEBIA
 	apt-get install -y -q \
 		curl git ca-certificates build-essential zlib1g-dev \
 		libbz2-dev libssl-dev libreadline-dev libffi-dev \
-		liblzma-dev libsqlite3-dev tk-dev \
-		upx-ucl
+		liblzma-dev libsqlite3-dev tk-dev
 RUN curl https://pyenv.run | bash
 
 ENV PATH="/root/.pyenv/bin:$PATH"
 
-RUN pyenv install -l | grep 3.13
-RUN CONFIGURE_OPTS=--enable-shared pyenv install 3.13.15
-RUN pyenv global 3.13.15
+# The CPython release the CI binary lanes freeze.
+RUN CONFIGURE_OPTS=--enable-shared pyenv install 3.14.7
+RUN pyenv global 3.14.7
 
 # uv accelerates the installs below (parallel downloads + a shared cache). This
 # is an amd64-only local build, so the amd64/arm64 uv image covers it and the
 # clean `COPY --from` pattern applies -- unlike the multi-arch release
-# Dockerfile, which stays on pip for architecture portability. Pin matches the
-# CI setup-uv version.
+# Dockerfile, which stays on pip for architecture portability. Pin matches
+# SETUP_UV_VERSION in .github/workflows/release.yml.
 COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /uvx /bin/
 
-RUN /root/.pyenv/versions/3.13.15/bin/python -m venv /cronstable
+RUN /root/.pyenv/versions/3.14.7/bin/python -m venv /cronstable
 # Point uv at that venv (VIRTUAL_ENV) and never let it fetch a managed Python --
-# the pyenv-built 3.13.15 (--enable-shared, above) is what must be baked in.
+# the pyenv-built 3.14.7 (--enable-shared, above) is what must be baked in.
 ENV PATH=/cronstable/bin:$PATH \
     VIRTUAL_ENV=/cronstable \
     UV_PYTHON_DOWNLOADS=never
-RUN uv pip install setuptools pyinstaller==6.22.1
+COPY pyinstaller/build-requirements.txt /tmp/build-requirements.txt
+RUN uv pip install setuptools -r /tmp/build-requirements.txt
 
 COPY . /root/cronstable
 WORKDIR /root/cronstable

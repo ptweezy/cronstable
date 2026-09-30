@@ -64,7 +64,6 @@ target/
 
 /.mypy_cache/
 
-/pyoxidizer/venv/
 /cronstable/version.py
 
 # Local-only changelog tooling; keep the shared artifact generators.

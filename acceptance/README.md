@@ -31,9 +31,8 @@ The executable and working directories live in a fresh temporary directory,
 outside the checkout. The working path contains spaces and a non-ASCII
 character. Job PATH contains only the staged binary and system utilities,
 and Python source-path overrides are removed. This exercises the frozen
-bootloader when a scheduled job invokes the CLI by name, including the
-PyInstaller environment-inheritance regression previously covered by
-`.github/scripts/cli_job_smoke.sh`.
+bootloader when a scheduled job invokes the CLI by name, including the case
+where the job inherits PyInstaller's environment variables.
 
 Each run records the supplied executable's SHA-256, version expectation,
 platform, and layout in `acceptance-results/run-*/artifact.json`. Each test

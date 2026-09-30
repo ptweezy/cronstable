@@ -928,7 +928,8 @@ async def test_job_command_invoking_cli_writes_state(tmp_path):
     # exit status. The frozen-build failure this shape guards against exited
     # 0 while writing nothing (the CLI's bootloader died on inherited _PYI_*
     # vars before the subcommand ran); the release lanes run this same shape
-    # against the real frozen binary in .github/scripts/cli_job_smoke.sh.
+    # against the real frozen binary in acceptance/test_core.py
+    # (test_scheduled_cli_state_survives_restart).
     config = _ONE_JOB.format(path=tmp_path)
     cron = Cron(None, config_yaml=config)
     await start_state(cron, _state_cfg(config))

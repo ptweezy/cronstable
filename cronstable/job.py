@@ -700,8 +700,7 @@ class StreamReader:
         tail_len = 0
         # Output is decoded as plain strict UTF-8 until a line fails to be,
         # then per line through _decode_output_line for the rest of the
-        # stream: same text either way, minus a call per line for the
-        # common all-UTF-8 stream.
+        # stream. Both give the same text for valid UTF-8.
         strict = True
         while True:
             chunk = await stream.read(_READ_CHUNK)
