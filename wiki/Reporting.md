@@ -233,15 +233,13 @@ returns early.
 | `extra` | map of str to (str/int/bool) (Opt) | unset | Additional key/value context attached to the event. Your map is merged on top of cronstable's always-attached `job`/`exit_code`/`command`/`shell`/`success` context. |
 | `body` | str (Opt) | default subject + body template | jinja2 template for the captured message text. |
 | `environment` | str (Opt) | `None` | Sentry environment tag. |
-| `maxStringLength` | int (Opt) | `8192` | Sets `sentry_sdk.utils.MAX_STRING_LENGTH` (max length before Sentry truncates strings). |
+| `maxStringLength` | int (Opt) | `8192` | Maximum length of a string value in the event. Sentry truncates longer strings. Passed to `sentry_sdk.init` as `max_value_length`. |
 
 Notes on behavior:
 
-- The reporter initializes the Sentry client once per `(dsn, environment)` pair
-  and caches it, rebuilding only when one of those changes, not on every
-  report.
-- When set (and truthy), `maxStringLength` mutates the process-global
-  `sentry_sdk.utils.MAX_STRING_LENGTH`.
+- The reporter initializes the Sentry client once and caches it. It rebuilds
+  the client only when `dsn`, `environment`, or `maxStringLength` changes.
+- `maxStringLength: 0` sets no limit, so Sentry's own default applies.
 - In addition to any `extra` you supply, cronstable always attaches `job`,
   `exit_code`, `command`, `shell`, and `success` to the event's extra context.
   Your `extra` map is merged on top of these.

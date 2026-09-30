@@ -35,7 +35,6 @@ from itertools import islice
 from typing import (
     Any,
     ClassVar,
-    Optional,
     TypeGuard,
     TypeVar,
 )
@@ -167,8 +166,8 @@ MAX_MEMOIZED_JOB_OWNERS = 100_000
 def _parse_members(
     raw: Any,
     *,
-    max_len: Optional[int] = None,
-    max_items: Optional[int] = None,
+    max_len: int | None = None,
+    max_items: int | None = None,
 ) -> list["tuple[str, str, bool]"]:
     """Validate a peer's reported ``members`` list, dropping malformed entries.
 
@@ -212,8 +211,8 @@ def _parse_members(
 def _parse_str_list(
     raw: Any,
     *,
-    max_len: Optional[int] = None,
-    max_items: Optional[int] = None,
+    max_len: int | None = None,
+    max_items: int | None = None,
 ) -> "set[str]":
     """Validate an untrusted JSON value as a set of strings, dropping the rest.
 
@@ -245,7 +244,7 @@ def _parse_str_list(
     return out
 
 
-def _finite_number(value: Any) -> Optional[float]:
+def _finite_number(value: Any) -> float | None:
     """An untrusted JSON value as a finite float, else ``None``.
 
     Rejects bools (an int subclass) and non-finite floats: Python's json
@@ -272,7 +271,7 @@ def _finite_number(value: Any) -> Optional[float]:
     return out if math.isfinite(out) else None
 
 
-def _parse_job_summaries(raw: Any) -> Optional[dict[str, dict[str, Any]]]:
+def _parse_job_summaries(raw: Any) -> dict[str, dict[str, Any]] | None:
     """Validate a peer's gossiped ``job_summaries`` block, field by field.
 
     Every field is type-checked and rebuilt into a fresh dict (never stored
@@ -329,10 +328,10 @@ def _parse_job_summaries(raw: Any) -> Optional[dict[str, dict[str, Any]]]:
 
 
 def _aged_job_summaries(
-    jobs: Optional[dict[str, dict[str, Any]]],
-    taken_at: Optional[datetime.datetime],
+    jobs: dict[str, dict[str, Any]] | None,
+    taken_at: datetime.datetime | None,
     now: datetime.datetime,
-) -> Optional[dict[str, dict[str, Any]]]:
+) -> dict[str, dict[str, Any]] | None:
     """A peer's stored job summaries with each countdown aged to ``now``.
 
     A stored ``scheduled_in`` is the peer's countdown as of receipt of the
@@ -359,7 +358,7 @@ def _aged_job_summaries(
     return aged
 
 
-def _parse_node_stats(raw: Any) -> Optional[dict[str, Any]]:
+def _parse_node_stats(raw: Any) -> dict[str, Any] | None:
     """Validate a peer's gossiped ``node_stats`` block into a fresh dict.
 
     Every value is re-coerced through :func:`_finite_number` (rejecting
@@ -380,7 +379,7 @@ def _parse_node_stats(raw: Any) -> Optional[dict[str, Any]]:
     return out or None
 
 
-def _parse_node_stats_header(raw: Optional[str]) -> Optional[dict[str, Any]]:
+def _parse_node_stats_header(raw: str | None) -> dict[str, Any] | None:
     """A peer's :data:`NODE_STATS_HEADER` value as a validated stats dict.
 
     ``None`` for an absent header (absence is the signal, not an error) and
@@ -398,7 +397,7 @@ def _parse_node_stats_header(raw: Optional[str]) -> Optional[dict[str, Any]]:
 
 
 def _peer_sees_me_agreed(
-    peer_members: Optional[list["tuple[str, str, bool]"]],
+    peer_members: list["tuple[str, str, bool]"] | None,
     my_instance: str,
 ) -> bool:
     """Whether a peer's member list shows us (by ``instance_id``) as AGREED.
@@ -421,7 +420,7 @@ _DeclaredT = TypeVar("_DeclaredT")
 
 
 def _declares_divergent(
-    declared: Optional[_DeclaredT], ours: Any
+    declared: _DeclaredT | None, ours: Any
 ) -> TypeGuard[_DeclaredT]:
     """Whether a peer *declared* a coordination value and it is not ours.
 
@@ -467,8 +466,8 @@ def elect_leader(
     node_name: str,
     live_peer_names: Iterable[str],
     cluster_size: int,
-    candidate_names: Optional[Iterable[str]] = None,
-) -> Optional[str]:
+    candidate_names: Iterable[str] | None = None,
+) -> str | None:
     """Pure, deterministic leader election from one node's point of view.
 
     Below a quorum of ``cluster_size`` (this node plus ``live_peer_names``)
@@ -557,8 +556,8 @@ def elect_job_owner(
     node_name: str,
     live_peer_names: Iterable[str],
     cluster_size: int,
-    candidate_names: Optional[Iterable[str]] = None,
-) -> Optional[str]:
+    candidate_names: Iterable[str] | None = None,
+) -> str | None:
     """Quorum-gated per-job owner (the ``distribution: spread`` analogue of
     :func:`elect_leader`).
 
@@ -595,27 +594,27 @@ class PeerState:
 
     host: str
     status: str = STATUS_UNKNOWN
-    job_set_id: Optional[str] = None  # peer's last-reported id
-    node_name: Optional[str] = None  # peer's last-reported node name
+    job_set_id: str | None = None  # peer's last-reported id
+    node_name: str | None = None  # peer's last-reported node name
     # peer's last-reported per-process instance id, used to distinguish a
     # benign self-listing from a duplicate nodeName (see record_success).
     # Deliberately not surfaced in to_dict (it is an internal liveness token).
-    instance_id: Optional[str] = None
+    instance_id: str | None = None
     # whether a successful poll has positively identified this host as THIS
     # node. Latched so transient self-poll failures keep the entry
     # STATUS_SELF (else cluster_size would flap N<->N+1 on the poll
     # interval); re-evaluated on every successful poll. Internal; not in
     # to_dict.
     self_confirmed: bool = False
-    last_seen: Optional[datetime.datetime] = None  # last successful contact
-    last_error: Optional[str] = None
+    last_seen: datetime.datetime | None = None  # last successful contact
+    last_error: str | None = None
     # consecutive reachable-but-mismatched rounds, for the drift hysteresis
     mismatch_streak: int = 0
     # the peer's own reported observations (node_name, instance_id, agreed),
     # feeding mutual-agreement and transitive conflict detection (see
     # _agreeing_peer_names / conflict_names). None when no fresh response.
     # Internal; not in to_dict.
-    members: Optional[list["tuple[str, str, bool]"]] = None
+    members: list["tuple[str, str, bool]"] | None = None
     # whether the last /peer response carried a ``members`` list. A legacy
     # build omits it and cannot attest us back, so _agreeing_peers falls
     # back to one-directional agreement for it (else a new node stands down
@@ -626,38 +625,38 @@ class PeerState:
     # the cluster size (len(peers)+1) the peer last declared; a divergence
     # is a first-class conflict (see conflicting_sizes). None when no fresh
     # result, or a peer too old to report it. Internal; not in to_dict.
-    declared_size: Optional[int] = None
+    declared_size: int | None = None
     # the coordination policy the peer last declared (distribution +
     # electLeader): behavior-affecting yet NOT in the fingerprint, so
     # divergent nodes still see each other AGREED; a divergence is a
     # first-class conflict (see conflicting_policies). None when no fresh
     # result or a peer too old. Internal; not in to_dict.
-    declared_distribution: Optional[str] = None
-    declared_elect_leader: Optional[bool] = None
+    declared_distribution: str | None = None
+    declared_elect_leader: bool | None = None
     # the @reboot job names the peer reports as already run in the cluster
     # (its own runs plus what it learned), used to retire our matching deferred
     # one-shots without re-running them (see ClusterManager.reboot_ran). Only
     # trusted from an AGREED peer (same job-set id). None when no fresh result.
-    ran_reboot_jobs: Optional["set[str]"] = None
+    ran_reboot_jobs: set[str] | None = None
     # the names the peer reports it *mutually* agrees with (its own
     # _agreeing_peer_names). Unlike members' one-way ``agreed`` flag, this
     # two-way set is the only sound evidence that a transitively-reached
     # node is itself quorate (see _bridge_candidates). None when no fresh
     # result or an older peer (no bridge evidence: the safe direction).
-    mutual_agreeing: Optional["set[str]"] = None
+    mutual_agreeing: set[str] | None = None
     # the names the peer can itself *confirm are quorate* (its own
     # _eligible_candidates). Load-bearing for the spread Leader-path fold
     # (_unconfirmed_contenders): folding an edge-reachable but sub-quorum
     # node would make every quorate node defer to one that then stands down,
     # a silent cluster-wide zero-run. None when no fresh result or an older
     # peer (which then vouches nothing: it can only lean toward running).
-    quorate_vouched: Optional["set[str]"] = None
+    quorate_vouched: set[str] | None = None
     # the peer's advertised per-job run summaries, feeding GET /fleet.
     # Observability only, never an election input, so deliberately NOT
     # cleared on a failed poll: the fleet view shows a briefly-unreachable
     # node's last-known state aged by last_seen rather than blanking it.
     # None = never reported. Internal; not in to_dict.
-    job_summaries: Optional[dict[str, dict[str, Any]]] = None
+    job_summaries: dict[str, dict[str, Any]] | None = None
     # whether the peer said it truncated its advertised summaries at its
     # cap, so the fleet view labels that node's column partial.
     job_summaries_truncated: bool = False
@@ -666,17 +665,17 @@ class PeerState:
     # through record_success), so fleet_view ages each countdown by the
     # snapshot's true age instead of freezing it (see _aged_job_summaries).
     # Internal; not in to_dict.
-    job_summaries_at: Optional[datetime.datetime] = None
+    job_summaries_at: datetime.datetime | None = None
     # the peer's last-reported whole-node CPU/memory, for the cluster panel
     # (to_dict) and fleet view. Like job_summaries: None leaves any absorbed
     # value in place rather than blanking a briefly-unreachable node.
-    node_stats: Optional[dict[str, Any]] = None
+    node_stats: dict[str, Any] | None = None
     # when the node_stats reading was last known current: stamped on every
     # successful poll whose response carried NODE_STATS_HEADER (200 and 304
     # alike). A freshness bound, not an ageing baseline: last_seen keeps
     # advancing on header-less polls, so without this stamp the view would
     # serve an hours-old reading as current forever; see fresh_node_stats.
-    node_stats_at: Optional[datetime.datetime] = None
+    node_stats_at: datetime.datetime | None = None
 
     # Process-wide count of PeerState field writes (a ClassVar, ignored by
     # the dataclass machinery): the generation the manager's memoized
@@ -696,7 +695,7 @@ class PeerState:
 
     def fresh_node_stats(
         self, now: datetime.datetime, max_age: float
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """The last-absorbed ``node_stats``, or ``None`` once expired.
 
         ``max_age`` is the staleness window in seconds (see
@@ -711,8 +710,8 @@ class PeerState:
 
     def to_dict(
         self,
-        now: Optional[datetime.datetime] = None,
-        node_stats_max_age: Optional[float] = None,
+        now: datetime.datetime | None = None,
+        node_stats_max_age: float | None = None,
     ) -> dict[str, Any]:
         return {
             "host": self.host,
@@ -754,26 +753,26 @@ class ClusterView:
     def record_success(
         self,
         host: str,
-        peer_name: Optional[str],
-        peer_id: Optional[str],
-        peer_scheme: Optional[str],
+        peer_name: str | None,
+        peer_id: str | None,
+        peer_scheme: str | None,
         my_id: str,
         now: datetime.datetime,
         my_name: str,
-        peer_instance: Optional[str] = None,
-        my_instance: Optional[str] = None,
-        peer_members: Optional[list["tuple[str, str, bool]"]] = None,
-        peer_ran_reboot_jobs: Optional["set[str]"] = None,
-        peer_size: Optional[int] = None,
-        peer_mutual_agreeing: Optional["set[str]"] = None,
-        peer_quorate_vouched: Optional["set[str]"] = None,
-        peer_distribution: Optional[str] = None,
-        peer_elect_leader: Optional[bool] = None,
+        peer_instance: str | None = None,
+        my_instance: str | None = None,
+        peer_members: list["tuple[str, str, bool]"] | None = None,
+        peer_ran_reboot_jobs: set[str] | None = None,
+        peer_size: int | None = None,
+        peer_mutual_agreeing: set[str] | None = None,
+        peer_quorate_vouched: set[str] | None = None,
+        peer_distribution: str | None = None,
+        peer_elect_leader: bool | None = None,
         peer_reports_members: bool = True,
-        peer_job_summaries: Optional[dict[str, dict[str, Any]]] = None,
+        peer_job_summaries: dict[str, dict[str, Any]] | None = None,
         peer_job_summaries_truncated: bool = False,
-        peer_job_summaries_at: Optional[datetime.datetime] = None,
-        peer_node_stats: Optional[dict[str, Any]] = None,
+        peer_job_summaries_at: datetime.datetime | None = None,
+        peer_node_stats: dict[str, Any] | None = None,
     ) -> None:
         peer = self.peers[host]
         peer.last_seen = now
@@ -895,8 +894,8 @@ class ClusterView:
 
     def to_list(
         self,
-        now: Optional[datetime.datetime] = None,
-        node_stats_max_age: Optional[float] = None,
+        now: datetime.datetime | None = None,
+        node_stats_max_age: float | None = None,
     ) -> list[dict[str, Any]]:
         return [
             peer.to_dict(now, node_stats_max_age)
@@ -1115,12 +1114,12 @@ class ClusterManager(LeadershipBackend):
         self._tls_signature = tlsutil.tls_file_signature(
             config["tls"], _TLS_SIGNATURE_KEYS
         )
-        self._runner: Optional[web.AppRunner] = None
-        self._poll_task: Optional[asyncio.Task] = None
+        self._runner: web.AppRunner | None = None
+        self._poll_task: asyncio.Task | None = None
         # one client session for the lifetime of the manager, so peer polls and
         # reboot-ran pushes reuse connections instead of re-handshaking mTLS
         # every round; created in start(), closed in stop().
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session: aiohttp.ClientSession | None = None
         self._stop = asyncio.Event()
         # @reboot one-shots THIS node has run as the elected owner (plus any
         # learned via push), gossiped so peers retire their matching
@@ -1128,7 +1127,7 @@ class ClusterManager(LeadershipBackend):
         # current job-set: cleared when our job_set_id changes (see
         # _poll_all), so a config change cannot carry a stale "already ran".
         self._ran_reboot_jobs: set[str] = set()
-        self._ran_jobs_job_set_id: Optional[str] = None
+        self._ran_jobs_job_set_id: str | None = None
         # completed peer-poll rounds since this manager was built. A rebuilt
         # manager mints a fresh instance_id, so peers cannot attest it back
         # until they have re-polled it (~1-2 intervals); this counter bounds
@@ -1155,28 +1154,26 @@ class ClusterManager(LeadershipBackend):
         # on the /peer response for the fleet view (installed by
         # Cron.start_stop_cluster before start(); None until then, and /peer
         # then simply advertises no summaries).
-        self._job_summaries_provider: Optional[
-            Callable[[], dict[str, Any]]
-        ] = None
+        self._job_summaries_provider: Callable[[], dict[str, Any]] | None = (
+            None
+        )
         # our own whole-node CPU/memory provider. Installing it makes the
         # local /cluster + /fleet self readouts work even when not shared;
         # _share_node_stats separately gates advertising it to peers.
-        self._node_stats_provider: Optional[
-            Callable[[], Optional[dict[str, Any]]]
-        ] = None
+        self._node_stats_provider: (
+            Callable[[], dict[str, Any] | None] | None
+        ) = None
         self._share_node_stats = False
         # Memoized election-derived results (one dict for all of them,
         # function name -> value), valid only for _derived_cache_key; see
         # _memoized_derived / _derived_state_key.
         self._derived_cache: dict[str, Any] = {}
-        self._derived_cache_key: Optional["tuple"] = None
+        self._derived_cache_key: tuple | None = None
         # The last (state key, monotonic build time, etag, body bytes) built
         # by _handle_peer, re-served while the key matches and the TTL holds;
         # the encoded body is cached because the payload dict is frozen for
         # the entry's life and only the bytes are ever served.
-        self._peer_response_cache: Optional[
-            "tuple[Any, float, str, bytes]"
-        ] = None
+        self._peer_response_cache: tuple[Any, float, str, bytes] | None = None
         # Per-source oversize observations from the last derive / advert
         # build ("bridge": the transitive-confirmation derive, "advert": the
         # quorate_vouched union): the full candidate count at the last
@@ -1218,13 +1215,13 @@ class ClusterManager(LeadershipBackend):
 
     def set_node_stats_provider(
         self,
-        provider: Callable[[], Optional[dict[str, Any]]],
+        provider: Callable[[], dict[str, Any] | None],
         share: bool = True,
     ) -> None:
         self._node_stats_provider = provider
         self._share_node_stats = share
 
-    def _local_node_stats(self) -> Optional[dict[str, Any]]:
+    def _local_node_stats(self) -> dict[str, Any] | None:
         """This node's own whole-node CPU/memory, or ``None``.
 
         Trusted local input, emitted as-is (small fixed shape, no cap).
@@ -1237,7 +1234,7 @@ class ClusterManager(LeadershipBackend):
             return None
         return provider()
 
-    def _advertised_node_stats(self) -> Optional[dict[str, Any]]:
+    def _advertised_node_stats(self) -> dict[str, Any] | None:
         """Our node stats for the outgoing /peer response, or ``None``.
 
         ``None`` unless sharing is on. A reading never enters the /peer
@@ -1374,7 +1371,7 @@ class ClusterManager(LeadershipBackend):
     def _peer_etag(
         payload: dict[str, Any],
         now_epoch: float,
-        stable_summaries: Optional[dict[str, Any]] = None,
+        stable_summaries: dict[str, Any] | None = None,
     ) -> str:
         """A strong ETag for ``payload``: a hash of change-relevant content.
 
@@ -1607,8 +1604,6 @@ class ClusterManager(LeadershipBackend):
             # by connectTimeout; a failed round records peers unreachable.
             try:
                 await self._poll_all()
-            except asyncio.CancelledError:
-                raise
             except Exception:  # pragma: no cover - defensive, as _poll_loop
                 logger.exception("cluster: initial peer poll round failed")
             self._poll_task = asyncio.create_task(self._poll_loop())
@@ -1679,8 +1674,6 @@ class ClusterManager(LeadershipBackend):
         while not self._stop.is_set():
             try:
                 await self._poll_all()
-            except asyncio.CancelledError:
-                raise
             except Exception:  # pragma: no cover - defensive
                 logger.exception("cluster: unexpected error in poll loop")
             try:
@@ -1869,8 +1862,8 @@ class ClusterManager(LeadershipBackend):
         # instead of the full O(members + jobs) JSON (see _handle_peer).
         cached = self._peer_observation_cache.get(host)
         status = 0
-        response_etag: Optional[str] = None
-        raw_stats_header: Optional[str] = None
+        response_etag: str | None = None
+        raw_stats_header: str | None = None
         raw, too_large = b"", False
         try:
             # allow_redirects=False: a legitimate peer never redirects;
@@ -1974,7 +1967,7 @@ class ClusterManager(LeadershipBackend):
         # Type-validate the scalar identity fields: a non-string node_name from
         # a CA-trusted-but-misbehaving peer would otherwise flow into
         # min()/sorted()/dict keys during election and crash the scheduler.
-        fields: dict[str, Optional[str]] = {}
+        fields: dict[str, str | None] = {}
         for key in (
             "node_name",
             "job_set_id",
@@ -2119,7 +2112,7 @@ class ClusterManager(LeadershipBackend):
 
     # --- deferred @reboot "already ran" gossip ---------------------------
 
-    def advertised_ran_jobs(self, my_id: Optional[str] = None) -> set[str]:
+    def advertised_ran_jobs(self, my_id: str | None = None) -> set[str]:
         """@reboot one-shots known to have run under our *current* job set.
 
         Our own runs plus those reported by agreeing peers; re-advertising
@@ -2753,7 +2746,7 @@ class ClusterManager(LeadershipBackend):
         )
 
     @_memoized_derived
-    def leader_name(self) -> Optional[str]:
+    def leader_name(self) -> str | None:
         """Elected leader as this node sees it, or ``None`` if not quorate.
 
         The quorum gate uses our full mutual live set; the elected name is
@@ -2902,7 +2895,7 @@ class ClusterManager(LeadershipBackend):
 
     # --- per-job ownership (distribution: spread) -------------------------
 
-    def job_owner(self, job_name: str) -> Optional[str]:
+    def job_owner(self, job_name: str) -> str | None:
         """Quorum-gated owner of ``job_name`` (spread mode), else ``None``.
 
         The rendezvous winner over ourselves, the confirmed-quorate

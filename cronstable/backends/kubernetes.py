@@ -47,7 +47,7 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Optional, TypeVar
+from typing import Any, TypeVar
 from urllib.parse import quote
 
 import aiohttp
@@ -104,7 +104,7 @@ def _join_host_port(host: str, port: str) -> str:
     return "{}:{}".format(host, port)
 
 
-def display_holder(raw: Optional[str]) -> Optional[str]:
+def display_holder(raw: str | None) -> str | None:
     """The human-readable holder name from a (possibly suffixed) identity.
 
     cronstable writes ``spec.holderIdentity`` as ``<name>#<instance token>``
@@ -125,19 +125,19 @@ def display_holder(raw: Optional[str]) -> Optional[str]:
 class LeaseState:
     """The fields of an observed ``Lease`` the election cares about."""
 
-    holder: Optional[str]
-    renew_time: Optional[datetime.datetime]
-    acquire_time: Optional[datetime.datetime]
-    duration: Optional[int]
+    holder: str | None
+    renew_time: datetime.datetime | None
+    acquire_time: datetime.datetime | None
+    duration: int | None
     transitions: int
-    resource_version: Optional[str]
+    resource_version: str | None
     # the Lease's metadata.annotations, where the @reboot-ran set is persisted
     # (see cronstable.leadership.REBOOT_RAN_KEY); default {} so positional
     # LeaseState(...) constructions in the tests are unaffected.
     annotations: dict[str, str] = field(default_factory=dict)
 
 
-def parse_lease(obj: Optional[dict[str, Any]]) -> LeaseState:
+def parse_lease(obj: dict[str, Any] | None) -> LeaseState:
     """Extract a :class:`LeaseState` from a decoded ``Lease`` JSON object."""
     spec = (obj or {}).get("spec") or {}
     meta = (obj or {}).get("metadata") or {}
@@ -158,7 +158,7 @@ def parse_lease(obj: Optional[dict[str, Any]]) -> LeaseState:
 def lease_is_expired(
     state: LeaseState,
     now: Any,
-    observed_at: Optional[Any],
+    observed_at: Any | None,
 ) -> bool:
     """Whether another holder's lease has lapsed, from *our* clock's view.
 
@@ -197,7 +197,7 @@ def lease_is_expired(
 
 
 def _deadline_passed(
-    now: Any, anchor: Optional[Any], duration: Optional[int]
+    now: Any, anchor: Any | None, duration: int | None
 ) -> bool:
     """Whether ``anchor + duration`` has elapsed on whichever clock ``now`` is.
 
@@ -212,14 +212,14 @@ def _deadline_passed(
 
 
 def decide_lease_action(
-    state: Optional[LeaseState],
+    state: LeaseState | None,
     identity: str,
     now: Any,
-    observed_at: Optional[Any],
+    observed_at: Any | None,
     *,
-    last_holder: Optional[str] = None,
-    last_observed_at: Optional[Any] = None,
-    duration: Optional[int] = None,
+    last_holder: str | None = None,
+    last_observed_at: Any | None = None,
+    duration: int | None = None,
 ) -> str:
     """Choose the action for this round given the observed lease.
 
@@ -272,13 +272,13 @@ def decide_lease_action(
 
 def build_lease_body(
     name: str,
-    namespace: Optional[str],
+    namespace: str | None,
     identity: str,
     now: datetime.datetime,
     duration: int,
-    state: Optional[LeaseState],
+    state: LeaseState | None,
     action: str,
-    annotations: Optional[dict[str, str]] = None,
+    annotations: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the ``Lease`` object to POST (create) or PUT (acquire/renew).
 
@@ -325,18 +325,18 @@ def build_lease_body(
 
 
 def plan_lease_write(
-    lease_obj: Optional[dict[str, Any]],
+    lease_obj: dict[str, Any] | None,
     name: str,
-    namespace: Optional[str],
+    namespace: str | None,
     identity: str,
     now: datetime.datetime,
     duration: int,
-    observed_at: Optional[Any],
-    mono_now: Optional[float] = None,
-    annotations: Optional[dict[str, str]] = None,
-    last_holder: Optional[str] = None,
-    last_observed_at: Optional[Any] = None,
-) -> tuple[str, Optional[dict[str, Any]], Optional[LeaseState]]:
+    observed_at: Any | None,
+    mono_now: float | None = None,
+    annotations: dict[str, str] | None = None,
+    last_holder: str | None = None,
+    last_observed_at: Any | None = None,
+) -> tuple[str, dict[str, Any] | None, LeaseState | None]:
     """Pure planning step: observed Lease -> (action, body, state).
 
     ``observed_at`` is the local instant we first saw the current lease record
@@ -402,39 +402,39 @@ class KubernetesBackend(StoreLeaseBackend):
         self.lease_duration: int = k8s["leaseDurationSeconds"]
         self.renew_deadline: int = k8s["renewDeadlineSeconds"]
         self.retry_period: int = k8s["retryPeriodSeconds"]
-        self._configured_namespace: Optional[str] = k8s["leaseNamespace"]
-        self.kubeconfig: Optional[str] = k8s["kubeconfig"]
-        self.api_server_override: Optional[str] = k8s["apiServer"]
+        self._configured_namespace: str | None = k8s["leaseNamespace"]
+        self.kubeconfig: str | None = k8s["kubeconfig"]
+        self.api_server_override: str | None = k8s["apiServer"]
         self.client_library: str = k8s["clientLibrary"]
         self.connect_timeout: int = config["connectTimeout"]
 
         # resolved at start() from the in-cluster files or a kubeconfig
-        self.namespace: Optional[str] = self._configured_namespace
+        self.namespace: str | None = self._configured_namespace
 
         # live state, written by the renew loop and read by the sync methods.
         # _leader_until / _last_contact are WALL-CLOCK, for display only; the
         # load-bearing fence and freshness gates use the monotonic deadlines
         # below (immune to wall-clock steps; see _monotonic).
         self._is_leader = False
-        self._holder: Optional[str] = None
-        self._leader_until: Optional[datetime.datetime] = None
-        self._last_contact: Optional[datetime.datetime] = None
-        self._leader_until_mono: Optional[float] = None
-        self._last_contact_mono: Optional[float] = None
+        self._holder: str | None = None
+        self._leader_until: datetime.datetime | None = None
+        self._last_contact: datetime.datetime | None = None
+        self._leader_until_mono: float | None = None
+        self._last_contact_mono: float | None = None
 
         # client-go's observedTime: the (holder, renewTime) record we last saw
         # and the MONOTONIC clock when we first saw it. The steal decision is
         # anchored to _observed_at (our monotonic clock), not the holder's
         # renewTime, so it is immune both to skew between us and the holder and
         # to a discontinuous jump in our own wall clock.
-        self._observed_holder: Optional[str] = None
-        self._observed_renew: Optional[datetime.datetime] = None
-        self._observed_at: Optional[float] = None
+        self._observed_holder: str | None = None
+        self._observed_renew: datetime.datetime | None = None
+        self._observed_at: float | None = None
 
         # the chosen transport (native client or hand-rolled HTTP), bound in
         # start(); see select_transport.
-        self._transport: Optional["_K8sTransport"] = None
-        self._task: Optional[asyncio.Task] = None
+        self._transport: "_K8sTransport | None" = None
+        self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         # Serialises the renew loop's lease write with an eager reboot-ran
         # persist (see _persist_reboot_ran), so the two cannot interleave and
@@ -452,7 +452,7 @@ class KubernetesBackend(StoreLeaseBackend):
         # re-read per request; see _auth_headers). Empty until setup() records
         # them, which keeps tls_files_changed() False (nothing on disk to
         # rotate: embedded -data creds / insecure mode).
-        self._tls_signature: dict[str, Optional[tuple[int, int]]] = {}
+        self._tls_signature: dict[str, tuple[int, int] | None] = {}
 
     # --- pure local-state reads (no I/O) ---------------------------------
 
@@ -478,6 +478,32 @@ class KubernetesBackend(StoreLeaseBackend):
             return False
         return _monotonic() < self._last_contact_mono + self.lease_duration
 
+    def tls_files_loadable(self) -> bool:
+        """Dry-run-load the on-disk TLS material before a rotation rebuild.
+
+        Rotations are not atomic across the kubeconfig, CA, cert and key, so
+        a reload can observe a half-written file. Keeping the running
+        backend until the material loads avoids rebuilding into a failed
+        start, as the etcd and gossip backends do.
+        """
+        from strictyaml.ruamel.error import YAMLError, YAMLFutureWarning
+
+        if not self._tls_signature:
+            return True
+        try:
+            _build_tls_context(self.kubeconfig)
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+            YAMLError,
+            YAMLFutureWarning,
+        ):
+            return False
+        return True
+
     def lease_detail(self) -> dict[str, Any]:
         return {
             "name": self.lease_name,
@@ -493,7 +519,7 @@ class KubernetesBackend(StoreLeaseBackend):
             ),
         }
 
-    def _resolve_namespace(self, context_namespace: Optional[str]) -> str:
+    def _resolve_namespace(self, context_namespace: str | None) -> str:
         """The Lease namespace, resolved identically for *both* transports.
 
         Centralised here (not duplicated per transport) so the HTTP and native
@@ -514,8 +540,8 @@ class KubernetesBackend(StoreLeaseBackend):
     # --- the renew loop's per-round local-state update (pure) ------------
 
     def _track_observation(
-        self, state: Optional[LeaseState], mono_now: float
-    ) -> Optional[float]:
+        self, state: LeaseState | None, mono_now: float
+    ) -> float | None:
         """Record client-go's observedTime and return the steal anchor.
 
         Whenever the observed ``(holder, renewTime)`` record changes, reset the
@@ -546,9 +572,9 @@ class KubernetesBackend(StoreLeaseBackend):
         self,
         action: str,
         write_ok: bool,
-        state: Optional[LeaseState],
+        state: LeaseState | None,
         now: datetime.datetime,
-        mono: Optional[float] = None,
+        mono: float | None = None,
     ) -> None:
         """Update the live leader state from this round's outcome.
 
@@ -599,7 +625,7 @@ class KubernetesBackend(StoreLeaseBackend):
             # exactly when two replicas cold-start and the loser 409s. Mirrors
             # etcd's _UNKNOWN_HOLDER fence.
             self._is_leader = False
-            holder: Optional[str] = None
+            holder: str | None = None
             if state is not None:
                 holder = display_holder(state.holder)
             if holder is None and self._observed_holder is not None:
@@ -641,7 +667,7 @@ class KubernetesBackend(StoreLeaseBackend):
             # state -- the genuine "apiserver unreachable" case.
             try:
                 await asyncio.wait_for(self._renew_once(), self.renew_deadline)
-            except Exception as ex:
+            except Exception as ex:  # noqa: BLE001 - the renew loop retries
                 logger.warning(
                     "cluster: kubernetes initial round failed: %s", ex
                 )
@@ -685,9 +711,7 @@ class KubernetesBackend(StoreLeaseBackend):
                 # a stuck call is abandoned (and retried next round) before the
                 # lease can expire, rather than blocking the whole duration.
                 await asyncio.wait_for(self._renew_once(), self.renew_deadline)
-            except asyncio.CancelledError:
-                raise
-            except Exception as ex:
+            except Exception as ex:  # noqa: BLE001 - stale quorum fails closed
                 # could not complete the round (apiserver unreachable, a
                 # transport/library error): do NOT advance _last_contact, so
                 # is_quorate goes stale and Leader fails closed while
@@ -778,7 +802,7 @@ class KubernetesBackend(StoreLeaseBackend):
             return
         try:
             await asyncio.wait_for(self._renew_once(), self.renew_deadline)
-        except Exception as ex:
+        except Exception as ex:  # noqa: BLE001 - never fatal
             logger.debug(
                 "cluster: kubernetes reboot-ran eager persist failed: %s", ex
             )
@@ -804,7 +828,7 @@ class KubernetesBackend(StoreLeaseBackend):
                     await asyncio.wait_for(
                         self._release(), self.renew_deadline
                     )
-                except Exception as ex:
+                except Exception as ex:  # noqa: BLE001 - the TTL frees it regardless
                     logger.debug(
                         "cluster: kubernetes lease release timed out: %s", ex
                     )
@@ -812,7 +836,7 @@ class KubernetesBackend(StoreLeaseBackend):
                 await asyncio.wait_for(
                     self._transport.close(), self.connect_timeout
                 )
-            except Exception as ex:
+            except Exception as ex:  # noqa: BLE001 - never fatal
                 logger.debug(
                     "cluster: kubernetes transport close timed out: %s", ex
                 )
@@ -868,11 +892,11 @@ class KubernetesBackend(StoreLeaseBackend):
                 },
             }
             await self._transport.write(body, create=False)
-        except Exception as ex:
+        except Exception as ex:  # noqa: BLE001 - the TTL frees it regardless
             logger.debug("cluster: kubernetes lease release failed: %s", ex)
 
 
-def _incluster_namespace() -> Optional[str]:
+def _incluster_namespace() -> str | None:
     try:
         with open(os.path.join(_SA_DIR, "namespace")) as ns_file:
             return ns_file.read().strip()
@@ -881,9 +905,9 @@ def _incluster_namespace() -> Optional[str]:
 
 
 def resolve_namespace(
-    configured: Optional[str],
-    context_namespace: Optional[str],
-    incluster_namespace: Optional[str],
+    configured: str | None,
+    context_namespace: str | None,
+    incluster_namespace: str | None,
 ) -> str:
     """Resolve the Lease namespace identically for both transports.
 
@@ -927,7 +951,7 @@ def _kubeconfig_active_context(
     return ctx, cluster, user
 
 
-def _kubeconfig_file(kubeconfig: str, value: Optional[str]) -> Optional[str]:
+def _kubeconfig_file(kubeconfig: str, value: str | None) -> str | None:
     """Resolve a referenced file path relative to the kubeconfig directory.
 
     This matches kubectl and the official client for ``certificate-authority``,
@@ -941,7 +965,41 @@ def _kubeconfig_file(kubeconfig: str, value: Optional[str]) -> Optional[str]:
     return os.path.normpath(os.path.join(base, value))
 
 
-def _kubeconfig_cert_files(path: str) -> list[Optional[str]]:
+def _build_tls_context(kubeconfig: str | None) -> ssl.SSLContext:
+    """Build the client TLS context the transports load, from the files on
+    disk, with no side effects (see
+    :meth:`KubernetesBackend.tls_files_loadable`).
+
+    Embedded ``*-data`` client material is part of the kubeconfig, whose
+    parse covers a half-written rewrite.
+    """
+    if not kubeconfig:
+        return ssl.create_default_context(
+            cafile=os.path.join(_SA_DIR, "ca.crt")
+        )
+    _ctx, cluster, user = _kubeconfig_active_context(kubeconfig)
+    if cluster.get("insecure-skip-tls-verify"):
+        context = ssl.create_default_context()
+    elif cluster.get("certificate-authority-data"):
+        context = ssl.create_default_context(
+            cadata=base64.b64decode(
+                cluster["certificate-authority-data"]
+            ).decode("utf-8")
+        )
+    else:
+        context = ssl.create_default_context(
+            cafile=_kubeconfig_file(
+                kubeconfig, cluster.get("certificate-authority")
+            )
+        )
+    cert = _kubeconfig_file(kubeconfig, user.get("client-certificate"))
+    key = _kubeconfig_file(kubeconfig, user.get("client-key"))
+    if cert and key:
+        context.load_cert_chain(cert, key)
+    return context
+
+
+def _kubeconfig_cert_files(path: str) -> list[str | None]:
     """File-referenced CA / client-cert / client-key of a kubeconfig's active
     context, for TLS-rotation tracking (:meth:`KubernetesBackend.tls_files_
     changed`).
@@ -996,7 +1054,7 @@ class _K8sTransport:
 
     async def observe(
         self,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         raise NotImplementedError
 
     async def write(self, body: dict[str, Any], *, create: bool) -> bool:
@@ -1016,16 +1074,16 @@ class _K8sHttpTransport(_K8sTransport):
 
     def __init__(self, backend: "KubernetesBackend") -> None:
         self.b = backend
-        self._base_url: Optional[str] = None
-        self._auth_token: Optional[str] = None
+        self._base_url: str | None = None
+        self._auth_token: str | None = None
         # the on-disk path of a *rotating* in-cluster service-account token,
         # re-read before every request (see _auth_headers). None when the
         # token is static (a kubeconfig bearer token) or absent (client-cert
         # auth), in which case _auth_token alone is used.
-        self._token_path: Optional[str] = None
-        self._ssl: Optional[ssl.SSLContext] = None
+        self._token_path: str | None = None
+        self._ssl: ssl.SSLContext | None = None
         self._tempfiles: list[str] = []
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session: aiohttp.ClientSession | None = None
 
     async def setup(self) -> None:
         self._load_connection()
@@ -1273,9 +1331,7 @@ class _K8sHttpTransport(_K8sTransport):
                 "static token or client certificate.".format(ctx.get("user"))
             )
 
-    def _material(
-        self, path: Optional[str], data: Optional[str]
-    ) -> Optional[str]:
+    def _material(self, path: str | None, data: str | None) -> str | None:
         """Return a filesystem path for cert/key material given as a path or
         as base64 ``*-data`` (written to a tracked temp file, cleaned on stop).
         """
@@ -1323,7 +1379,7 @@ class _K8sHttpTransport(_K8sTransport):
                 headers=resp.headers,
             )
 
-    async def observe(self) -> Optional[dict[str, Any]]:
+    async def observe(self) -> dict[str, Any] | None:
         assert self._session is not None
         async with self._session.get(
             self._lease_url(),
@@ -1402,7 +1458,7 @@ class _K8sLibraryTransport(_K8sTransport):
         self.b = backend
         self._api: Any = None
         self._api_client: Any = None
-        self._pool: Optional[ThreadPoolExecutor] = None
+        self._pool: ThreadPoolExecutor | None = None
 
     async def _offload(self, fn: Callable[[], _T]) -> _T:
         """Run one blocking client call on this transport's own pool."""
@@ -1422,12 +1478,12 @@ class _K8sLibraryTransport(_K8sTransport):
         context_namespace = await self._offload(self._setup_sync)
         self.b.namespace = self.b._resolve_namespace(context_namespace)
 
-    def _setup_sync(self) -> Optional[str]:
+    def _setup_sync(self) -> str | None:
         from kubernetes import client
         from kubernetes import config as kube_config
         from kubernetes.config.config_exception import ConfigException
 
-        context_namespace: Optional[str] = None
+        context_namespace: str | None = None
         try:
             if self.b.kubeconfig:
                 kube_config.load_kube_config(config_file=self.b.kubeconfig)
@@ -1492,10 +1548,10 @@ class _K8sLibraryTransport(_K8sTransport):
             self.b._record_tls_files([os.path.join(_SA_DIR, "ca.crt")])
         return context_namespace
 
-    async def observe(self) -> Optional[dict[str, Any]]:
+    async def observe(self) -> dict[str, Any] | None:
         from kubernetes.client.exceptions import ApiException
 
-        def _read() -> Optional[dict[str, Any]]:
+        def _read() -> dict[str, Any] | None:
             try:
                 lease = self._api.read_namespaced_lease(
                     self.b.lease_name,

@@ -12,7 +12,7 @@ import types
 from collections import Counter, OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, NamedTuple, NewType, Optional
+from typing import Any, Literal, NamedTuple, NewType
 from urllib.parse import ParseResult, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -72,7 +72,7 @@ def _patch_strictyaml_seq_deepcopy() -> None:
     """
     try:
         from strictyaml.ruamel.comments import CommentedSeq
-    except Exception:  # pragma: no cover - vendored layout changed
+    except Exception:  # noqa: BLE001  # pragma: no cover - vendored layout changed
         return
 
     class _Probe(CommentedSeq):  # type: ignore[misc,valid-type]
@@ -84,7 +84,7 @@ def _patch_strictyaml_seq_deepcopy() -> None:
 
     try:
         copy.deepcopy(_Probe([0, 1, 2, 3]))
-    except Exception:  # pragma: no cover - vendored layout changed
+    except Exception:  # noqa: BLE001  # pragma: no cover - vendored layout changed
         return
     if _Probe.calls <= 1:
         return
@@ -126,12 +126,12 @@ def _patch_strictyaml_pointer_copy() -> None:
     """
     try:
         from strictyaml.yamlpointer import YAMLPointer
-    except Exception:  # pragma: no cover - vendored layout changed
+    except Exception:  # noqa: BLE001  # pragma: no cover - vendored layout changed
         return
     try:
         stock_names = YAMLPointer.val.__code__.co_names
         state = set(vars(YAMLPointer()))
-    except Exception:  # pragma: no cover - vendored layout changed
+    except Exception:  # noqa: BLE001  # pragma: no cover - vendored layout changed
         return
     if "deepcopy" not in stock_names or state != {"_indices"}:
         return
@@ -1406,7 +1406,7 @@ CONFIG_SCHEMA = EmptyDict() | Map(
 )
 
 
-_MONITOR_SAMPLING_DEFAULTS: Optional[tuple[float, int]] = None
+_MONITOR_SAMPLING_DEFAULTS: tuple[float, int] | None = None
 
 
 def _monitor_sampling_defaults() -> tuple[float, int]:
@@ -1568,8 +1568,8 @@ def schedule_object_to_crontab(spec: dict[str, Any]) -> str:
 
 
 def _schedule_field(
-    spec: dict[str, Any], key: str, default: Optional[str] = "*"
-) -> Optional[str]:
+    spec: dict[str, Any], key: str, default: str | None = "*"
+) -> str | None:
     """One validated cron column of an object-form ``schedule:``.
 
     ``default`` when the key is absent (or set to null); otherwise the
@@ -1624,7 +1624,7 @@ def schedule_has_seconds(
 #: Per-parse memo for :meth:`JobConfig._lint_schedule`, keyed by
 #: ``(source text, H-resolved text, resolved zone)``.  Created by
 #: :func:`_config_from_doc` and dropped when that parse returns.
-LintCache = dict[tuple[str, str, Optional[datetime.tzinfo]], list[Finding]]
+LintCache = dict[tuple[str, str, datetime.tzinfo | None], list[Finding]]
 
 #: Shared empty threshold mapping for every job with no SLA check (the vast
 #: majority): saves one dict per job, and the read-only proxy makes the
@@ -1714,8 +1714,8 @@ class JobConfig:
     def __init__(
         self,
         config: dict,
-        env_cache: Optional[dict[str, dict[str, str]]] = None,
-        lint_cache: Optional["LintCache"] = None,
+        env_cache: dict[str, dict[str, str]] | None = None,
+        lint_cache: LintCache | None = None,
     ) -> None:
         self.name: str = config["name"]
         self.command: str | list[str] = config["command"]
@@ -1761,7 +1761,7 @@ class JobConfig:
         self.utc = config.pop("utc")
         self.enabled: bool = config.pop("enabled")
         # depends on self.utc, so resolve after it is set
-        self.timezone: Optional[datetime.tzinfo] = self._resolve_timezone(
+        self.timezone: datetime.tzinfo | None = self._resolve_timezone(
             config.pop("timezone")
         )
         # Log schedule findings during configuration loading and retain them
@@ -1828,7 +1828,7 @@ class JobConfig:
         # is per-host, and a Windows replica running the same logical job
         # from D:\jobs must not read as drift against a Linux one on
         # /srv/jobs.
-        self.workingDirectory: Optional[str] = config.pop("workingDirectory")
+        self.workingDirectory: str | None = config.pop("workingDirectory")
         self._resolve_working_directory()
 
         self.executionTimeout = config.pop("executionTimeout")
@@ -1845,7 +1845,7 @@ class JobConfig:
         # Resolved login name of the target user, used by the child process'
         # privilege-drop (os.initgroups) so it gets the user's supplementary
         # groups instead of inheriting root's. None when unknown.
-        self.username: Optional[str] = None
+        self.username: str | None = None
         self._resolve_user_group(config)
         self._warn_if_priority_needs_privilege()
 
@@ -1855,7 +1855,7 @@ class JobConfig:
         # cronstable.fingerprint.job_digest_cached. A reload rebuilds every
         # JobConfig, so the memo cannot outlive the definition it describes
         # (tests/test_fingerprint.py pins that).
-        self._digest: Optional[str] = None
+        self._digest: str | None = None
 
         self._precompute_payload_views()
 
@@ -1887,7 +1887,7 @@ class JobConfig:
         # The plain-dialect spelling an ``H`` schedule resolved to, else None
         # (the common case; the payload builder just tests for None).
         schedule = self.schedule
-        resolved: Optional[str] = None
+        resolved: str | None = None
         if isinstance(schedule, CronTab) and schedule.resolved_differs:
             resolved = schedule.resolved_source
         self.schedule_resolved_or_none = resolved
@@ -1899,9 +1899,7 @@ class JobConfig:
             else _NO_SLA_THRESHOLDS
         )
 
-    def _lint_schedule(
-        self, lint_cache: Optional["LintCache"]
-    ) -> list[Finding]:
+    def _lint_schedule(self, lint_cache: LintCache | None) -> list[Finding]:
         """Advisory findings for this job's schedule.
 
         ``lint_cache`` is a per-parse memo: fleets repeat schedule shapes,
@@ -1926,7 +1924,7 @@ class JobConfig:
         return list(findings) if findings else _NO_FINDINGS
 
     def _parse_schedule(
-        self, schedule_unparsed, prebuilt: Optional[CronTab] = None
+        self, schedule_unparsed, prebuilt: CronTab | None = None
     ) -> CronTab | str:
         """Resolve the ``schedule:`` value to a CronTab (or ``@reboot``).
 
@@ -1960,8 +1958,8 @@ class JobConfig:
             ) from err
 
     def _resolve_timezone(
-        self, timezone: Optional[str]
-    ) -> Optional[datetime.tzinfo]:
+        self, timezone: str | None
+    ) -> datetime.tzinfo | None:
         if timezone is not None:
             try:
                 return ZoneInfo(timezone)
@@ -1983,7 +1981,7 @@ class JobConfig:
         (:data:`LOCAL_ZONE`) for a ``utc: false`` job without one."""
         return self.timezone or LOCAL_ZONE
 
-    def next_delay(self, now_utc: datetime.datetime) -> Optional[float]:
+    def next_delay(self, now_utc: datetime.datetime) -> float | None:
         """Seconds from the aware instant ``now_utc`` to the schedule's next
         occurrence in :attr:`frame`; None when it never occurs again."""
         tab = self.schedule
@@ -2012,7 +2010,7 @@ class JobConfig:
                 )
 
     def _merge_env_file(
-        self, env_cache: Optional[dict[str, dict[str, str]]] = None
+        self, env_cache: dict[str, dict[str, str]] | None = None
     ) -> None:
         # Within one parse many jobs commonly share an env_file; read+parse
         # it once and reuse the result.  The cached dict is treated as
@@ -2090,8 +2088,8 @@ class JobConfig:
         # None) for the job-set fingerprint.  The resolved uid/gid below are
         # host-specific (the same name can map to different ids on different
         # hosts), so fingerprinting must use the configured value, not them.
-        self.user: Optional[str | int] = user
-        self.group: Optional[str | int] = group
+        self.user: str | int | None = user
+        self.group: str | int | None = group
         if user is None and group is None:
             return  # nothing to switch to: nothing POSIX-only to resolve
 
@@ -2345,7 +2343,7 @@ class DagTaskConfig:
         self,
         dag_name: str,
         raw_task: dict,
-        defaults: Optional[dict[str, Any]] = None,
+        defaults: dict[str, Any] | None = None,
     ) -> None:
         # Imported at the point of use: only a config with a dags: section
         # needs the DAG state machine, and this module is on the
@@ -2458,7 +2456,7 @@ class DagConfig:
     )
 
     def __init__(
-        self, raw_dag: dict, defaults: Optional[dict[str, Any]] = None
+        self, raw_dag: dict, defaults: dict[str, Any] | None = None
     ) -> None:
         # deferred for the reason DagTaskConfig gives
         from cronstable import dag
@@ -2486,7 +2484,7 @@ class DagConfig:
         except dag.DagValidationError as ex:
             raise ConfigError("dag {!r}: {}".format(self.name, ex)) from ex
         schedule = raw.pop("schedule", None)
-        self.schedule_job: Optional[JobConfig] = (
+        self.schedule_job: JobConfig | None = (
             self._build_schedule_job(raw, schedule)
             if schedule is not None
             else None
@@ -2586,7 +2584,7 @@ _V4_WILDCARD_LISTEN_HOSTS = frozenset({"0.0.0.0", "*", ""})
 _V6_WILDCARD_LISTEN_HOSTS = frozenset({"::", "[::]", "*", ""})
 
 
-def _loopback_ip_version(host: str) -> Optional[int]:
+def _loopback_ip_version(host: str) -> int | None:
     """The IP version (4 or 6) of a literal loopback host, else ``None``.
 
     Accepts the bracketed IPv6 form peer entries use (``[::1]``).  Pure
@@ -3218,7 +3216,7 @@ def _lease_advisories(raw: dict, backend: str) -> list[str]:
     return advisories
 
 
-def _resolve_secret(spec: Optional[dict], what: str) -> Optional[str]:
+def _resolve_secret(spec: dict | None, what: str) -> str | None:
     """Resolve a value/fromFile/fromEnvVar secret block, or ``None`` if unset.
 
     Mirrors :meth:`cronstable.cron.Cron._resolve_web_token`, but tolerates "no
@@ -3853,7 +3851,7 @@ def _validate_web_config(webconf: WebConfig) -> None:
         previous = bound
 
 
-def _build_mcp_config(raw: Optional[dict]) -> MCPConfig:
+def _build_mcp_config(raw: dict | None) -> MCPConfig:
     """Fill the optional ``mcp:`` section over :data:`DEFAULT_MCP`.
 
     An absent or empty block yields the defaults (the server disabled), so a
@@ -4244,19 +4242,19 @@ def validate_pools(config: "CronstableConfig") -> None:
 @dataclass(slots=True)
 class CronstableConfig:
     jobs: list[JobConfig]
-    web_config: Optional[WebConfig]
+    web_config: WebConfig | None
     job_defaults: JobDefaults
-    logging_config: Optional[LoggingConfig]
+    logging_config: LoggingConfig | None
     # The optional sections default to None (feature off, classic behavior)
     # so existing constructors (e.g. the empty config in Cron.update_config)
     # need no change.
-    cluster_config: Optional[ClusterConfig] = None
-    state_config: Optional[StateConfig] = None
+    cluster_config: ClusterConfig | None = None
+    state_config: StateConfig | None = None
     # A mutable default needs field(default_factory), never a shared [].
     dags: list["DagConfig"] = field(default_factory=list)
-    mcp_config: Optional[MCPConfig] = None
-    notify_config: Optional[dict[str, Any]] = None
-    push_config: Optional[dict[str, Any]] = None
+    mcp_config: MCPConfig | None = None
+    notify_config: dict[str, Any] | None = None
+    push_config: dict[str, Any] | None = None
     pools: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -4313,7 +4311,7 @@ _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _resolve_env(
-    name: str, default: Optional[str], path: str, location: str
+    name: str, default: str | None, path: str, location: str
 ) -> str:
     """Resolve one ``${VAR}`` / ``${VAR:-default}`` reference to its value.
 
@@ -4477,8 +4475,8 @@ def _interpolate_env(doc: Any, path: str) -> Any:
 def parse_config_string(
     data: str,
     path: str,
-    _seen: Optional[set] = None,
-    _sources: Optional[set] = None,
+    _seen: set | None = None,
+    _sources: set | None = None,
 ) -> CronstableConfig:
     try:
         doc = strictyaml.load(data, CONFIG_SCHEMA, label=path).data
@@ -4569,8 +4567,8 @@ def _build_push_config(raw: dict) -> dict[str, Any]:
 
 
 def resolve_bonjour_config(
-    web_config: Optional[WebConfig],
-) -> Optional[dict[str, Any]]:
+    web_config: WebConfig | None,
+) -> dict[str, Any] | None:
     """Collapse ``web.bonjour``'s bool-or-map forms to one shape.
 
     Returns ``None`` when the advert is off (absent, ``false``, or the
@@ -4593,8 +4591,8 @@ def resolve_bonjour_config(
 def _config_from_doc(
     doc: dict,
     path: str,
-    _seen: Optional[set],
-    _sources: Optional[set] = None,
+    _seen: set | None,
+    _sources: set | None = None,
 ) -> CronstableConfig:
     """Build a CronstableConfig from an already-validated plain config doc.
 
@@ -4719,8 +4717,8 @@ def _is_crontab_config(path: str, data: str) -> bool:
 
 def parse_config_file(
     path: str,
-    _seen: Optional[set] = None,
-    _sources: Optional[set] = None,
+    _seen: set | None = None,
+    _sources: set | None = None,
 ) -> CronstableConfig:
     # Guard against include cycles with a clear ConfigError instead of
     # RecursionError. _seen is scoped per top-level parse, so two
@@ -4879,7 +4877,7 @@ def _validate_dags(config: CronstableConfig) -> None:
 
 
 def parse_config(
-    config_arg: str, _sources: Optional[set] = None
+    config_arg: str, _sources: set | None = None
 ) -> CronstableConfig:
     if os.path.isdir(config_arg):
         config = _parse_config_dir(config_arg, _sources)
@@ -4932,7 +4930,7 @@ class _CachedDirFile(NamedTuple):
 
     sources: frozenset[str]
     included: frozenset[str]
-    sig: tuple[tuple[str, Optional[str]], ...]
+    sig: tuple[tuple[str, str | None], ...]
     config: CronstableConfig
 
 
@@ -4947,7 +4945,7 @@ _DIR_FILE_CACHE_MAX = 1024
 
 def _dir_file_content_sig(
     sources: frozenset[str],
-) -> tuple[tuple[str, Optional[str]], ...]:
+) -> tuple[tuple[str, str | None], ...]:
     """Sorted ``(abspath, content_digest)`` fingerprint of a parse's inputs.
 
     Hashes each source's bytes rather than trusting a ``(mtime_ns, size)``
@@ -4956,11 +4954,11 @@ def _dir_file_content_sig(
     the cache skips, not the read.  A vanished or unreadable source hashes
     to ``None`` so a deletion still reads as a change.
     """
-    parts: list[tuple[str, Optional[str]]] = []
+    parts: list[tuple[str, str | None]] = []
     for src in sorted(sources):
         try:
             with open(src, "rb") as handle:
-                digest: Optional[str] = hashlib.blake2b(
+                digest: str | None = hashlib.blake2b(
                     handle.read(), digest_size=16
                 ).hexdigest()
         except OSError:
@@ -4970,7 +4968,7 @@ def _dir_file_content_sig(
 
 
 def _parse_file_cached(
-    path: str, _seen: Optional[set] = None
+    path: str, _seen: set | None = None
 ) -> tuple[CronstableConfig, frozenset[str], frozenset[str]]:
     """Parse one config file, reusing an unchanged prior parse.
 
@@ -5019,7 +5017,7 @@ def _parse_file_cached(
 
 
 def _parse_included_file(
-    path: str, _seen: Optional[set], _sources: Optional[set]
+    path: str, _seen: set | None, _sources: set | None
 ) -> CronstableConfig:
     """Parse one ``include:`` target, reusing an unchanged prior parse.
 
@@ -5036,9 +5034,9 @@ def _claim_config_dir_section(
     kind: str,
     new_value: Any,
     current: Any,
-    current_source: Optional[str],
+    current_source: str | None,
     path: str,
-) -> tuple[Any, Optional[str]]:
+) -> tuple[Any, str | None]:
     """Adopt one at-most-once section from a config-dir file.
 
     web/cluster/state/mcp/logging/notify/push may each appear in at most
@@ -5056,25 +5054,25 @@ def _claim_config_dir_section(
 
 
 def _parse_config_dir(
-    config_arg: str, _sources: Optional[set] = None
+    config_arg: str, _sources: set | None = None
 ) -> CronstableConfig:
     jobs: list[JobConfig] = []
     dags: list[DagConfig] = []
     config_errors: dict[str, str] = {}
-    web_config: Optional[WebConfig] = None
-    web_config_source_fname: Optional[str] = None
-    cluster_config: Optional[ClusterConfig] = None
-    cluster_config_source_fname: Optional[str] = None
-    state_config: Optional[StateConfig] = None
-    state_config_source_fname: Optional[str] = None
-    mcp_config: Optional[MCPConfig] = None
-    mcp_config_source_fname: Optional[str] = None
-    logging_config: Optional[LoggingConfig] = None
-    logging_config_source_fname: Optional[str] = None
-    notify_config: Optional[dict[str, Any]] = None
-    notify_config_source_fname: Optional[str] = None
-    push_config: Optional[dict[str, Any]] = None
-    push_config_source_fname: Optional[str] = None
+    web_config: WebConfig | None = None
+    web_config_source_fname: str | None = None
+    cluster_config: ClusterConfig | None = None
+    cluster_config_source_fname: str | None = None
+    state_config: StateConfig | None = None
+    state_config_source_fname: str | None = None
+    mcp_config: MCPConfig | None = None
+    mcp_config_source_fname: str | None = None
+    logging_config: LoggingConfig | None = None
+    logging_config_source_fname: str | None = None
+    notify_config: dict[str, Any] | None = None
+    notify_config_source_fname: str | None = None
+    push_config: dict[str, Any] | None = None
+    push_config_source_fname: str | None = None
     pools: dict[str, dict[str, int]] = {}
     job_defaults: JobDefaults = JobDefaults({})
     # Sort by name so job order and the "first config found" error messages

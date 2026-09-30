@@ -25,7 +25,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Optional
+from typing import Any
 
 # The env vars the daemon injects (see cronstable.jobapi); the job CLI is the
 # consumer.  Hardcoded here rather than imported so the CLI never pulls aiohttp
@@ -149,10 +149,10 @@ def _http(
     method: str,
     path: str,
     *,
-    query: Optional[dict[str, Any]] = None,
-    json_body: Optional[dict[str, Any]] = None,
-    data: Optional[bytes] = None,
-    timeout: Optional[float] = None,
+    query: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+    data: bytes | None = None,
+    timeout: float | None = None,
 ) -> tuple[int, dict[str, str], bytes]:
     """One request to the endpoint; return ``(status, headers, body)``.
 
@@ -194,7 +194,7 @@ def _http(
     if timeout is None:
         timeout = _DEFAULT_TIMEOUT
     try:
-        with _opener().open(req, timeout=timeout) as resp:  # noqa: S310
+        with _opener().open(req, timeout=timeout) as resp:
             return resp.status, dict(resp.headers), resp.read()
     except urllib.error.HTTPError as ex:
         # HTTPError holds the response. Close it to release the connection.
@@ -256,9 +256,9 @@ def _json(
     method: str,
     path: str,
     *,
-    query: Optional[dict[str, Any]] = None,
-    json_body: Optional[dict[str, Any]] = None,
-    timeout: Optional[float] = None,
+    query: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+    timeout: float | None = None,
 ) -> tuple[int, dict[str, Any]]:
     # timeout is forwarded only when explicitly set: _http applies the
     # default itself, and test fakes of the _http seam predate the kwarg.
@@ -286,7 +286,7 @@ def _ok(status: int, data: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
-def _scope_of(args: argparse.Namespace) -> Optional[str]:
+def _scope_of(args: argparse.Namespace) -> str | None:
     """The scope to send, or ``None`` to let the daemon default to the job."""
     if getattr(args, "use_global", False):
         return "global"
@@ -553,7 +553,7 @@ def _cmd_xcom(args: argparse.Namespace) -> int:
     raise _CliError("unknown xcom action {!r}".format(args.xcom_command))
 
 
-def _read_input(path: Optional[str]) -> bytes:
+def _read_input(path: str | None) -> bytes:
     if not path or path == "-":
         return sys.stdin.buffer.read()
     try:
@@ -563,7 +563,7 @@ def _read_input(path: Optional[str]) -> bytes:
         raise _CliError("cannot read {}: {}".format(path, ex)) from ex
 
 
-def _write_output(path: Optional[str], data: bytes) -> None:
+def _write_output(path: str | None, data: bytes) -> None:
     if not path or path == "-":
         sys.stdout.buffer.write(data)
         return
@@ -574,7 +574,7 @@ def _write_output(path: Optional[str], data: bytes) -> None:
         raise _CliError("cannot write {}: {}".format(path, ex)) from ex
 
 
-def _lock_acquire(args: argparse.Namespace) -> tuple[bool, Optional[str]]:
+def _lock_acquire(args: argparse.Namespace) -> tuple[bool, str | None]:
     scope = _scope_of(args)
     # a --wait long poll is server-bounded by blockSeconds: the client
     # deadline is that plus margin, so the server (not the socket) ends it.
@@ -651,7 +651,7 @@ def _cmd_lock(args: argparse.Namespace) -> int:
             print("lock not acquired: {}".format(args.name), file=sys.stderr)
             return EXIT_NOT_ACQUIRED
         try:
-            completed = subprocess.run(  # noqa: S603
+            completed = subprocess.run(
                 args.run_command, env=_spawn_environment()
             )
             return completed.returncode

@@ -9,7 +9,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from cronstable.fingerprint import job_digest_cached
 from cronstable.state import DOC_KEEP
@@ -44,7 +44,7 @@ class Ticket:
     backend: Any
     deadline: float
     running: Any = None
-    completion: Optional[tuple[str, Optional[str]]] = None
+    completion: tuple[str, str | None] | None = None
     payload: dict[str, Any] = field(default_factory=dict)
     valid: bool = True
 
@@ -53,7 +53,7 @@ class Ticket:
 class RetrySettlement:
     generation: str
     reason: str
-    previous: Optional[str] = None
+    previous: str | None = None
 
 
 def _maintain(body: dict[str, Any], now: float) -> None:
@@ -94,8 +94,8 @@ class PoolScheduler:
     def __init__(self, cron: Any) -> None:
         self.cron = cron
         self.held: dict[tuple[str, str], Ticket] = {}
-        self._task: Optional[asyncio.Task] = None
-        self._heartbeat: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
+        self._heartbeat: asyncio.Task | None = None
         self._wake = asyncio.Event()
         self._retry_settlements: dict[tuple[str, str], RetrySettlement] = {}
 
@@ -136,8 +136,6 @@ class PoolScheduler:
             self._wake.clear()
             try:
                 await self.tick()
-            except asyncio.CancelledError:
-                raise
             except Exception:
                 logger.exception("pool queue service failed; retrying")
             if self._task is not me:
@@ -402,7 +400,7 @@ class PoolScheduler:
             if self._retry_settlements.get((pool, scope)) == settlement:
                 del self._retry_settlements[(pool, scope)]
 
-    async def acquire(self, pool: str, key: str) -> Optional[Ticket]:
+    async def acquire(self, pool: str, key: str) -> Ticket | None:
         if (pool, key) in self.held:
             return None
         owner = self.cron._proc_token + ":" + uuid.uuid4().hex
@@ -462,7 +460,7 @@ class PoolScheduler:
         return ticket
 
     async def finish(
-        self, ticket: Optional[Ticket], state="finished", reason=None
+        self, ticket: Ticket | None, state="finished", reason=None
     ):
         if ticket is None:
             return
@@ -583,7 +581,7 @@ class PoolScheduler:
             renewed = await self._change(
                 ticket.pool, renew, backend=ticket.backend
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - treated as a lost lease
             renewed = False
         if renewed:
             ticket.deadline = started + LEASE_SECONDS
@@ -605,8 +603,6 @@ class PoolScheduler:
         for pool in self.cron.pool_config:
             try:
                 await self._tick_pool(pool)
-            except asyncio.CancelledError:
-                raise
             except Exception:
                 logger.exception("pool %s could not dispatch; retrying", pool)
 

@@ -14,7 +14,6 @@ default; set ``redactArchivedSecrets: false`` to disable it for a job.
 
 import re
 from collections.abc import Callable, Iterable
-from typing import Optional
 
 #: What a redacted span is replaced with.
 REDACTED = "***REDACTED***"
@@ -268,7 +267,7 @@ if any(  # pragma: no cover - dev invariant
 #: entry.  Per call this replaces a fresh ``zip(..., strict=True)`` and a
 #: nested tuple unpack, which together cost more than the gate tests they fed.
 _STEPS: tuple[
-    tuple[str, Optional[tuple[str, ...]], Callable[..., str], _Repl], ...
+    tuple[str, tuple[str, ...] | None, Callable[..., str], _Repl], ...
 ] = tuple(
     (gate, None, pattern.sub, repl)
     if isinstance(gate, str)

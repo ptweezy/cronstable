@@ -590,7 +590,6 @@ def _closed_output():
     return output
 
 
-@pytest.mark.asyncio
 async def test_web_metrics_handler_reports_job_state():
     cron = _cron(_TWO_JOBS)
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -649,7 +648,6 @@ jobs:
 """
 
 
-@pytest.mark.asyncio
 async def test_next_run_gate_checks_enabled_and_schedule_independently():
     # both halves of the suppression gate, pinned separately: a DISABLED
     # job with a perfectly good cron schedule gets no next-run sample, and
@@ -662,7 +660,6 @@ async def test_next_run_gate_checks_enabled_and_schedule_independently():
     assert _next_run_ts(text, job_name="boot-on") is None
 
 
-@pytest.mark.asyncio
 async def test_next_run_reads_seeded_next_fire_index():
     # Steady-state path: once the loop has seeded the next-fire index, a scrape
     # must read the job's next fire straight from cron._next_fire instead of
@@ -681,7 +678,6 @@ async def test_next_run_reads_seeded_next_fire_index():
     assert _next_run_ts(text, job_name="cron-off") is None
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("schedule", ["0 0 31W 2 *", "0 0 0 1 1 * 2025"])
 async def test_next_run_skips_known_dead_schedules(monkeypatch, schedule):
     cron = Cron(
@@ -712,7 +708,6 @@ async def test_next_run_skips_known_dead_schedules(monkeypatch, schedule):
         assert _job_enabled(text, job_name="dead") == 1
 
 
-@pytest.mark.asyncio
 async def test_web_metrics_handler_reports_pause_state():
     # the configured-job warm-up gives every job a paused sample from the
     # first scrape (0 until the scheduler pushes a pause), and no SLA
@@ -736,7 +731,6 @@ async def test_web_metrics_handler_reports_pause_state():
     assert _paused(text, job_name="beta") == 0
 
 
-@pytest.mark.asyncio
 async def test_web_metrics_handler_openmetrics_negotiation():
     cron = _cron(_TWO_JOBS)
     resp = await cron._web_metrics(
@@ -748,7 +742,6 @@ async def test_web_metrics_handler_openmetrics_negotiation():
     assert text.endswith("# EOF\n")
 
 
-@pytest.mark.asyncio
 async def test_web_metrics_handler_merges_operator_headers():
     cron = Cron(None, config_yaml=_TWO_JOBS)
     cron.web_config = {
@@ -761,7 +754,6 @@ async def test_web_metrics_handler_merges_operator_headers():
     assert resp.headers["Content-Type"] == CONTENT_TYPE_TEXT
 
 
-@pytest.mark.asyncio
 async def test_web_metrics_gzips_for_a_capable_scraper():
     # exposition text is the same metric names and label blocks repeated once
     # per job, so it compresses roughly 17x; Prometheus advertises gzip on
@@ -783,7 +775,6 @@ async def test_web_metrics_gzips_for_a_capable_scraper():
     assert gzip.decompress(zipped.body) == plain.body
 
 
-@pytest.mark.asyncio
 async def test_web_metrics_gzip_declined_when_client_says_q0():
     # "gzip;q=0" is the wire spelling for "explicitly NOT gzip"; a substring
     # test would compress for a client that cannot read it.
@@ -794,7 +785,6 @@ async def test_web_metrics_gzip_declined_when_client_says_q0():
     assert "Content-Encoding" not in resp.headers
 
 
-@pytest.mark.asyncio
 async def test_web_metrics_vary_lists_both_negotiated_axes():
     # the endpoint negotiates the exposition format on Accept and the
     # coding on Accept-Encoding; a shared cache keyed only on the
@@ -808,7 +798,6 @@ async def test_web_metrics_vary_lists_both_negotiated_axes():
     assert openmetrics.headers["Vary"] == "Accept, Accept-Encoding"
 
 
-@pytest.mark.asyncio
 async def test_web_metrics_shares_one_build_across_simultaneous_scrapers(
     monkeypatch,
 ):
@@ -849,7 +838,6 @@ async def test_web_metrics_shares_one_build_across_simultaneous_scrapers(
     assert len(builds) == 3
 
 
-@pytest.mark.asyncio
 async def test_web_metrics_content_type_override_is_case_insensitive():
     # header names are case-insensitive on the wire: a case-variant
     # operator spelling must be replaced, not emitted as a second,
@@ -876,7 +864,6 @@ async def _run_to_completion(cron, name):
     return running_job
 
 
-@pytest.mark.asyncio
 async def test_metrics_after_successful_and_failed_runs():
     config = (
         "jobs:\n"
@@ -901,7 +888,6 @@ async def test_metrics_after_successful_and_failed_runs():
     assert _permanent_failures(text, job_name="ok") == 0
 
 
-@pytest.mark.asyncio
 async def test_metrics_count_retries_and_permanent_failure():
     config = (
         "jobs:\n"
@@ -929,7 +915,6 @@ async def test_metrics_count_retries_and_permanent_failure():
     assert _permanent_failures(text, job_name="flaky") == 1
 
 
-@pytest.mark.asyncio
 async def test_metrics_count_start_failures():
     config = (
         "jobs:\n"
@@ -947,7 +932,6 @@ async def test_metrics_count_start_failures():
     assert _last_run_exit_code(text, job_name="ghost") == 127
 
 
-@pytest.mark.asyncio
 async def test_metrics_count_cancelled_runs():
     config = (
         "jobs:\n"
@@ -970,7 +954,6 @@ async def test_metrics_count_cancelled_runs():
     assert _last_run_success(text, job_name="slow") == 0
 
 
-@pytest.mark.asyncio
 async def test_retry_swallowed_by_forbid_is_not_counted():
     config = (
         "jobs:\n"
@@ -1061,7 +1044,6 @@ class FakeManager:
         return 3
 
 
-@pytest.mark.asyncio
 async def test_cluster_metrics_from_manager_view():
     cron = Cron(None, config_yaml=_TWO_JOBS)
     cron.cluster_manager = FakeManager()
@@ -1091,7 +1073,6 @@ async def test_cluster_metrics_from_manager_view():
     assert "cronstable_cluster_quorum_transitions_total" not in text
 
 
-@pytest.mark.asyncio
 async def test_cluster_metrics_survive_backend_error():
     class BrokenManager:
         def view_dict(self):
@@ -1107,7 +1088,6 @@ async def test_cluster_metrics_survive_backend_error():
     assert 'cronstable_job_enabled{job_name="alpha"}' in text
 
 
-@pytest.mark.asyncio
 async def test_cluster_transition_counters():
     cron = Cron(None, config_yaml=_TWO_JOBS)
     cron._elect_leader_configured = True
@@ -1233,7 +1213,6 @@ _REAL_HTTP_CASES = [
 ]
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(("web_config", "checks"), _REAL_HTTP_CASES)
 async def test_web_metrics_real_http_matrix(web_config, checks):
     import aiohttp
@@ -1264,7 +1243,6 @@ async def test_web_metrics_real_http_matrix(web_config, checks):
         await cron.start_stop_web_app(None)
 
 
-@pytest.mark.asyncio
 async def test_web_metrics_bucket_change_applies_on_web_restart():
     import aiohttp
 
@@ -1336,7 +1314,6 @@ def test_update_config_prunes_removed_jobs(tmp_path):
     assert 'job_name="reloaded"' not in text
 
 
-@pytest.mark.asyncio
 async def test_prune_spares_still_running_removed_job(tmp_path):
     cfg = tmp_path / "c.yaml"
     cfg.write_text(
@@ -1517,7 +1494,6 @@ class FakeStateBackend:
         return self._stats
 
 
-@pytest.mark.asyncio
 async def test_state_families_emit_lock_and_throttle_counters():
     stats = {
         "ops": {"put": {"count": 5, "errors": 1, "seconds": 0.25}},
@@ -1539,7 +1515,6 @@ async def test_state_families_emit_lock_and_throttle_counters():
     assert _state_ops(text, op="put") == 5
 
 
-@pytest.mark.asyncio
 async def test_state_families_omit_lock_and_throttle_when_idle():
     # zero acquisitions / zero throttled ops keep those families off the
     # scrape (no frozen zeros), the negative side of the gates above.
@@ -1559,7 +1534,6 @@ async def test_state_families_omit_lock_and_throttle_when_idle():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_job_families_emit_last_run_cpu_and_rss():
     from cronstable.resources import ResourceUsage
 
@@ -1584,7 +1558,6 @@ async def test_job_families_emit_last_run_cpu_and_rss():
     assert _last_run_rss(text, job_name="alpha") == 9000
 
 
-@pytest.mark.asyncio
 async def test_job_families_omit_last_run_cpu_when_unmonitored():
     # the negative side: a run without resource_usage exports neither gauge.
     cron = Cron(None, config_yaml=_TWO_JOBS)
@@ -1829,7 +1802,6 @@ def _memo_cron(monkeypatch):
     return _pinned_cron()
 
 
-@pytest.mark.asyncio
 async def test_metrics_memo_builds_once_for_concurrent_scrapers(monkeypatch):
     # The memo's whole point. Above the offload threshold the build spans an
     # executor hop, so a plain check-then-store memo lets every scraper that
@@ -1854,7 +1826,6 @@ async def test_metrics_memo_builds_once_for_concurrent_scrapers(monkeypatch):
     assert cron._metrics_response_memo[False].cached is not None
 
 
-@pytest.mark.asyncio
 async def test_metrics_memo_keeps_the_two_exposition_formats_apart(
     monkeypatch,
 ):
@@ -1869,7 +1840,6 @@ async def test_metrics_memo_keeps_the_two_exposition_formats_apart(
     assert cron._metrics_response_memo[True].cached is not None
 
 
-@pytest.mark.asyncio
 async def test_a_bust_during_a_build_is_not_undone_by_the_late_product(
     monkeypatch,
 ):
@@ -1887,7 +1857,6 @@ async def test_a_bust_during_a_build_is_not_undone_by_the_late_product(
     assert cron._metrics_response_memo[False].cached is None
 
 
-@pytest.mark.asyncio
 async def test_a_failed_build_lets_the_followers_build_their_own(monkeypatch):
     # the follower path must not inherit the leader's failure as its own
     # cancellation, nor leave an exception nobody retrieves.
@@ -1906,7 +1875,6 @@ async def test_a_failed_build_lets_the_followers_build_their_own(monkeypatch):
     assert calls == [1]
 
 
-@pytest.mark.asyncio
 async def test_a_scrape_arriving_after_a_bust_gets_a_fresh_product(
     monkeypatch,
 ):
@@ -1946,7 +1914,6 @@ async def test_a_scrape_arriving_after_a_bust_gets_a_fresh_product(
                 task.cancel()
 
 
-@pytest.mark.asyncio
 async def test_a_failed_build_promotes_exactly_one_follower(monkeypatch):
     # After a failed build resolves the shared future to None, exactly one
     # waiter self-promotes and the rest join ITS build: the old fall
@@ -1993,7 +1960,6 @@ async def test_a_failed_build_promotes_exactly_one_follower(monkeypatch):
                 task.cancel()
 
 
-@pytest.mark.asyncio
 async def test_a_cancelled_follower_does_not_cancel_the_shared_build(
     monkeypatch,
 ):

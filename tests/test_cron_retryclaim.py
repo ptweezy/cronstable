@@ -70,7 +70,6 @@ def _retryclaim_foreign(cron, job, host="node-a", secs_stale=120):
 # --- start_job_by_name ----------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_start_job_unknown_raises_404():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     with pytest.raises(cronstable.cron.ApiActionError) as ei:
@@ -78,7 +77,6 @@ async def test_retryclaim_start_job_unknown_raises_404():
     assert ei.value.status == 404
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_start_job_counts_as_pause_deferred_boot_run(monkeypatch):
     # a manual start of a job whose boot run a pause deferred IS the boot run:
     # the paused-reboot entry is retired and the durable boot marker written.
@@ -105,7 +103,6 @@ async def test_retryclaim_start_job_counts_as_pause_deferred_boot_run(monkeypatc
 # --- pause_job_by_name / _refresh_pauses_from_store / _pause_info ----------
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_pause_job_naive_until_gets_utc():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     naive = DT(1999, 12, 31, 13, 0, 0)  # naive, one hour past the frozen now
@@ -115,7 +112,6 @@ async def test_retryclaim_pause_job_naive_until_gets_utc():
     assert got == DT(1999, 12, 31, 13, 0, 0, tzinfo=UTC)
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_refresh_pauses_no_backend_returns():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     assert cron.state_backend is None
@@ -145,7 +141,6 @@ def test_retryclaim_pause_info_from_record_variants():
     assert info.since == info.until
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_refresh_pauses_from_store_skip_removed_and_replace(
     stateful_cron,
 ):
@@ -228,7 +223,6 @@ def test_retryclaim_sla_observations_skips_runjob_without_started_at():
     assert observed == 0.0 and breached is False
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_queue_sla_report_waits_for_earlier_tail(monkeypatch):
     cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
     reports = _sla_report_recorder(monkeypatch)
@@ -250,7 +244,6 @@ async def test_retryclaim_queue_sla_report_waits_for_earlier_tail(monkeypatch):
     prev.cancel()
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_queue_sla_report_reraises_cancelled(monkeypatch):
     cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
 
@@ -267,7 +260,6 @@ async def test_retryclaim_queue_sla_report_reraises_cancelled(monkeypatch):
 # --- web resume validation ------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_web_resume_job_rejects_nonstring_by():
     from aiohttp import web
 
@@ -282,7 +274,6 @@ async def test_retryclaim_web_resume_job_rejects_nonstring_by():
 # --- schedule_retry_job gate/pause returns --------------------------------
 
 
-@pytest.mark.asyncio
 async def test_retry_waits_out_an_early_timer_wakeup(monkeypatch):
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     elapsed = 0.0
@@ -315,7 +306,6 @@ async def test_retry_waits_out_an_early_timer_wakeup(monkeypatch):
     assert sleeps == pytest.approx([1.0, 0.01])
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_schedule_retry_paused_returns_when_state_gone():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     now = cronstable.cron.get_now(datetime.timezone.utc)
@@ -331,7 +321,6 @@ async def test_retryclaim_schedule_retry_paused_returns_when_state_gone():
     assert "alpha" not in cron.retry_state
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_schedule_retry_transient_gate_returns_when_cancelled(
     monkeypatch,
 ):
@@ -364,7 +353,6 @@ def test_retryclaim_note_retry_write_dropped_warns_when_state_configured(caplog)
     )
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_queue_retry_write_orders_behind_prev_no_backend():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     gate = asyncio.Event()
@@ -382,7 +370,6 @@ async def test_retryclaim_queue_retry_write_orders_behind_prev_no_backend():
     await asyncio.wait_for(task, timeout=5)
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_append_retry_record_survives_backend_error(
     stateful_cron, caplog
 ):
@@ -402,7 +389,6 @@ async def test_retryclaim_append_retry_record_survives_backend_error(
     )
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_append_pause_record_defers_without_backend():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron._state_configured = True  # a store is configured but torn down
@@ -416,7 +402,6 @@ async def test_retryclaim_append_pause_record_defers_without_backend():
 # --- _retry_consume_ok ----------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_retry_consume_ok_tolerates_slow_prev_tail(monkeypatch):
     import types
 
@@ -436,7 +421,6 @@ async def test_retryclaim_retry_consume_ok_tolerates_slow_prev_tail(monkeypatch)
     slow.cancel()
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_retry_consume_ok_reraises_cancelled():
     import types
 
@@ -453,7 +437,6 @@ async def test_retryclaim_retry_consume_ok_reraises_cancelled():
 # --- _acquire_retry_claim -------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_acquire_retry_claim_timeout_returns_none(monkeypatch):
     import types
 
@@ -470,7 +453,6 @@ async def test_retryclaim_acquire_retry_claim_timeout_returns_none(monkeypatch):
     assert got is None
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_acquire_retry_claim_error_returns_none(caplog):
     import logging
     import types
@@ -495,7 +477,6 @@ async def test_retryclaim_acquire_retry_claim_error_returns_none(caplog):
 # --- _retry_consume_decision (cross-node) ---------------------------------
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_consume_decision_eligible_but_no_backend(monkeypatch):
     cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
     monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
@@ -506,7 +487,6 @@ async def test_retryclaim_consume_decision_eligible_but_no_backend(monkeypatch):
     assert decision == "launch"  # degrades to the classic consume_ok
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_consume_decision_aborts_on_foreign_record(monkeypatch):
     import types
 
@@ -539,7 +519,6 @@ async def test_retryclaim_consume_decision_aborts_on_foreign_record(monkeypatch)
     assert released == [lease]
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_consume_decision_defers_for_live_claimer(monkeypatch):
     import types
 
@@ -563,7 +542,6 @@ async def test_retryclaim_consume_decision_defers_for_live_claimer(monkeypatch):
     assert decision == "defer"  # a live claimer holds the lease
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_consume_decision_read_timeout_fail_closed_defers(
     monkeypatch,
 ):
@@ -588,7 +566,6 @@ async def test_retryclaim_consume_decision_read_timeout_fail_closed_defers(
     assert decision == "defer"  # cannot serialize + fail-closed
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_consume_decision_read_cancelled_propagates(monkeypatch):
     import types
 
@@ -608,7 +585,6 @@ async def test_retryclaim_consume_decision_read_cancelled_propagates(monkeypatch
         await cron._retry_consume_decision(cron.cron_jobs["j"], 1, quiet=True)
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_consume_decision_adopts_late_lease_and_launches(
     monkeypatch,
 ):
@@ -652,7 +628,6 @@ async def test_retryclaim_consume_decision_adopts_late_lease_and_launches(
     assert released == [own]  # the adopted lease is released
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_consume_decision_list_error_fail_closed_defers(
     monkeypatch,
 ):
@@ -688,14 +663,12 @@ async def test_retryclaim_consume_decision_list_error_fail_closed_defers(
 # --- _retry_claim_scan ----------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_retry_claim_scan_inactive_returns():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     # cross-node resume inactive (no backend) -> returns without scanning
     await cron._retry_claim_scan()
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_retry_claim_scan_logs_and_continues_on_error(
     monkeypatch, caplog
 ):
@@ -716,7 +689,6 @@ async def test_retryclaim_retry_claim_scan_logs_and_continues_on_error(
 # --- _maybe_claim_retry ---------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_maybe_claim_retry_guards(monkeypatch):
     import types
 
@@ -743,7 +715,6 @@ async def test_retryclaim_maybe_claim_retry_guards(monkeypatch):
     assert "j" not in cron.retry_state
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_maybe_claim_retry_disabled_or_no_retries(monkeypatch):
     import types
 
@@ -756,7 +727,6 @@ async def test_retryclaim_maybe_claim_retry_disabled_or_no_retries(monkeypatch):
     assert "j" not in cron.retry_state
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_maybe_claim_retry_list_error_returns(monkeypatch):
     import types
 
@@ -772,7 +742,6 @@ async def test_retryclaim_maybe_claim_retry_list_error_returns(monkeypatch):
     assert "j" not in cron.retry_state
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_maybe_claim_retry_acquire_timeout_returns(monkeypatch):
     import types
 
@@ -797,7 +766,6 @@ async def test_retryclaim_maybe_claim_retry_acquire_timeout_returns(monkeypatch)
     assert "j" not in cron.retry_state
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_maybe_claim_retry_release_error_swallowed(monkeypatch):
     import types
 
@@ -830,7 +798,6 @@ async def test_retryclaim_maybe_claim_retry_release_error_swallowed(monkeypatch)
     assert "j" not in cron.retry_state
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_maybe_claim_retry_claims_and_arms(
     stateful_cron, monkeypatch
 ):
@@ -879,7 +846,6 @@ async def test_retryclaim_maybe_claim_retry_claims_and_arms(
 # --- _claim_retry_under_lease ---------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_claim_under_lease_no_backend_false():
     cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
     now = cronstable.cron.get_now(datetime.timezone.utc)
@@ -889,7 +855,6 @@ async def test_retryclaim_claim_under_lease_no_backend_false():
     assert ok is False
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_claim_under_lease_recheck_mismatch_false(
     stateful_cron,
 ):
@@ -905,7 +870,6 @@ async def test_retryclaim_claim_under_lease_recheck_mismatch_false(
     assert ok is False
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_claim_under_lease_list_error_false(stateful_cron):
     cron = await stateful_cron(_RETRYCLAIM_RETRY_JOB)
     job = cron.cron_jobs["j"]
@@ -919,7 +883,6 @@ async def test_retryclaim_claim_under_lease_list_error_false(stateful_cron):
     assert ok is False
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_claim_under_lease_durable_read_error_false(
     stateful_cron, monkeypatch
 ):
@@ -939,7 +902,6 @@ async def test_retryclaim_claim_under_lease_durable_read_error_false(
     assert ok is False
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_claim_under_lease_superseded_by_run(
     stateful_cron, monkeypatch
 ):
@@ -1115,7 +1077,6 @@ def test_retryclaim_cluster_owner_moved_variants():
 # --- _reap_retry_task -----------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_reap_retry_task_ignores_cancelled():
     async def _forever():
         await asyncio.sleep(100)
@@ -1130,7 +1091,6 @@ async def test_retryclaim_reap_retry_task_ignores_cancelled():
     cronstable.cron.Cron._reap_retry_task("j", task)
 
 
-@pytest.mark.asyncio
 async def test_retryclaim_reap_retry_task_logs_exception(caplog):
     import logging
 

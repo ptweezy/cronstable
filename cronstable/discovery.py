@@ -16,7 +16,7 @@ import asyncio
 import logging
 import re
 import socket
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger("cronstable")
 
@@ -50,7 +50,7 @@ def _probe_zeroconf() -> bool:
     try:
         from zeroconf import ServiceInfo as _service_info
         from zeroconf.asyncio import AsyncZeroconf as _async_zeroconf
-    except Exception as exc:  # pragma: no cover - bare baseline
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover - bare baseline
         logger.debug("bonjour: python-zeroconf is unavailable: %s", exc)
         return False
     # Bound only after BOTH imports succeeded, so a half-import can never
@@ -104,7 +104,7 @@ _MDNS_OP_TIMEOUT = 10.0
 _ADDR_TIMEOUT = 5.0
 
 
-def primary_address() -> Optional[str]:
+def primary_address() -> str | None:
     """This host's primary outbound IPv4 address, or ``None``.
 
     The connected-UDP trick: connecting a datagram socket selects the
@@ -184,15 +184,15 @@ class BonjourAdvertiser:
     """
 
     def __init__(self) -> None:
-        self._zeroconf: Optional[Any] = None
-        self._info: Optional[Any] = None
-        self._signature: Optional[dict[str, Any]] = None
+        self._zeroconf: Any | None = None
+        self._info: Any | None = None
+        self._signature: dict[str, Any] | None = None
 
     @property
     def active(self) -> bool:
         return self._info is not None
 
-    async def start_stop(self, advert: Optional[dict[str, Any]]) -> None:
+    async def start_stop(self, advert: dict[str, Any] | None) -> None:
         """Converge the running advert onto ``advert``.
 
         ``advert`` is ``{"name", "port", "properties"}`` plus an
@@ -257,7 +257,7 @@ class BonjourAdvertiser:
                 zeroconf.async_register_service(info),
                 timeout=_MDNS_OP_TIMEOUT,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - never fatal
             logger.error(
                 "bonjour: failed to register the %s advert: %s",
                 SERVICE_TYPE,
@@ -271,7 +271,7 @@ class BonjourAdvertiser:
                     await asyncio.wait_for(
                         zeroconf.async_close(), timeout=_MDNS_OP_TIMEOUT
                     )
-                except Exception as close_exc:
+                except Exception as close_exc:  # noqa: BLE001 - never fatal
                     logger.warning(
                         "bonjour: close after failed register failed: %s",
                         close_exc,
@@ -286,7 +286,7 @@ class BonjourAdvertiser:
             int(advert["port"]),
         )
 
-    async def _resolve_address(self) -> Optional[str]:
+    async def _resolve_address(self) -> str | None:
         """:func:`primary_address` off-loop, bounded.
 
         The gethostbyname fallback inside it is a blocking resolver
@@ -315,13 +315,13 @@ class BonjourAdvertiser:
                     zeroconf.async_unregister_service(info),
                     timeout=_MDNS_OP_TIMEOUT,
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - never fatal
             logger.warning("bonjour: unregister failed: %s", exc)
         try:
             await asyncio.wait_for(
                 zeroconf.async_close(), timeout=_MDNS_OP_TIMEOUT
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - never fatal
             logger.warning("bonjour: close failed: %s", exc)
 
     async def stop(self) -> None:

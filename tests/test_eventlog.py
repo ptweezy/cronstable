@@ -279,7 +279,6 @@ def test_eventlog_outcome_survives_a_context_without_the_hook():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_eventlog_reporter_is_a_noop_when_disabled(fake_event_log):
     job_config = _job_config(_BARE_JOB)
     await EventLogReporter().report(
@@ -290,7 +289,6 @@ async def test_eventlog_reporter_is_a_noop_when_disabled(fake_event_log):
     assert fake_event_log.opened == []
 
 
-@pytest.mark.asyncio
 async def test_eventlog_reporter_is_a_noop_on_posix(
     fake_event_log, monkeypatch
 ):
@@ -309,7 +307,6 @@ async def test_eventlog_reporter_is_a_noop_on_posix(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_eventlog_reporter_writes_the_success_event(fake_event_log):
     job_config = _job_config()
     await EventLogReporter().report(
@@ -329,7 +326,6 @@ async def test_eventlog_reporter_writes_the_success_event(fake_event_log):
     assert fake_event_log.opened == ["cronstable"]
 
 
-@pytest.mark.asyncio
 async def test_eventlog_reporter_separates_failure_from_permanent_failure(
     fake_event_log,
 ):
@@ -345,7 +341,6 @@ async def test_eventlog_reporter_separates_failure_from_permanent_failure(
     assert [r["event_id"] for r in fake_event_log.written] == [1001, 1002]
 
 
-@pytest.mark.asyncio
 async def test_eventlog_reporter_reports_an_sla_breach_as_late(
     fake_event_log,
 ):
@@ -387,7 +382,6 @@ jobs:
 """
 
 
-@pytest.mark.asyncio
 async def test_eventlog_reporter_reports_a_notify_event_by_severity(
     fake_event_log,
 ):
@@ -476,7 +470,6 @@ def test_eventlog_strings_drop_nul_and_lone_surrogates():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_eventlog_report_never_awaits_the_writer(fake_event_log):
     # report() runs INLINE on the reaper, so a slow EventLog service must
     # not delay a job's completion handling.
@@ -491,7 +484,6 @@ async def test_eventlog_report_never_awaits_the_writer(fake_event_log):
     assert len(fake_event_log.written) == 1
 
 
-@pytest.mark.asyncio
 async def test_eventlog_writer_reopens_after_an_invalid_handle(
     fake_event_log,
 ):
@@ -511,7 +503,6 @@ async def test_eventlog_writer_reopens_after_an_invalid_handle(
     assert len(fake_event_log.closed) >= 1
 
 
-@pytest.mark.asyncio
 async def test_eventlog_writer_continues_when_the_source_will_not_open(
     fake_event_log, caplog
 ):
@@ -525,7 +516,6 @@ async def test_eventlog_writer_continues_when_the_source_will_not_open(
     assert "could not open the event source" in caplog.text
 
 
-@pytest.mark.asyncio
 async def test_eventlog_writer_drops_and_logs_when_the_queue_is_full(
     fake_event_log, caplog, monkeypatch
 ):
@@ -567,7 +557,6 @@ async def test_eventlog_writer_drops_and_logs_when_the_queue_is_full(
         writer.join(2.0)
 
 
-@pytest.mark.asyncio
 async def test_retire_event_log_writers_drops_a_renamed_source(
     fake_event_log,
 ):
@@ -580,7 +569,6 @@ async def test_retire_event_log_writers_drops_a_renamed_source(
     assert "alpha" not in cronstable.job._EVENTLOG_WRITERS
 
 
-@pytest.mark.asyncio
 async def test_retire_event_log_writers_releases_the_source_handle(
     fake_event_log,
 ):
@@ -636,7 +624,6 @@ def test_eventlog_writers_are_capped(caplog):
     assert "refusing to open more than" in caplog.text
 
 
-@pytest.mark.asyncio
 async def test_close_event_log_writers_without_a_writer():
     # idempotent, and safe when nothing was ever created
     await close_event_log_writers()
@@ -654,7 +641,6 @@ def test_reporter_list_has_the_six_reporters():
     ]
 
 
-@pytest.mark.asyncio
 async def test_eventlog_writer_thread_is_not_joined_at_interpreter_exit():
     # the property, not the flag: a wedged ReportEventW must not be able to
     # hold interpreter exit open, which is what a ThreadPoolExecutor's own

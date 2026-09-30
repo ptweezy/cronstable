@@ -250,6 +250,9 @@ select = [
     # Bugbear warnings
     "B",
     "B9",
+    # Blind except: each broad `except Exception` carries a
+    # `# noqa: BLE001 - <reason>` marker
+    "BLE001",
     # mccabe complexity warnings
     "C",
     # Pycodestyle errors https://pycodestyle.pycqa.org/en/latest/intro.html#error-codes
@@ -259,10 +262,12 @@ select = [
     # Pycodestyle warnings
     "W",
     # pyupgrade: only the typing-modernization codes (builtin generics, PEP
-    # 604 unions, deprecated typing imports); the full UP set stays off
+    # 604 unions and optionals, deprecated typing imports); the full UP set
+    # stays off
     "UP006",
     "UP007",
     "UP035",
+    "UP045",
     "I",  # <= import sorting
 ]
 

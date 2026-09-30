@@ -51,13 +51,12 @@ from collections.abc import Callable, Coroutine
 from typing import (
     TYPE_CHECKING,
     Any,
-    Optional,
     cast,
 )
 
 from cronstable import _cliargs
 from cronstable.cronexpr import LOCAL_ZONE, CronTab
-from cronstable.croninfo import (  # noqa: F401  (re-exported for tests/back-compat)
+from cronstable.croninfo import (
     Finding,
     ScheduleEntry,
     _local_tzinfo,
@@ -193,7 +192,7 @@ SORT_KEYS = ["name", "status", "last", "next", "duration"]
 # ===================================================================
 def _job_frame(
     job: dict[str, Any],
-) -> tuple[str, Optional[datetime.tzinfo]]:
+) -> tuple[str, datetime.tzinfo | None]:
     """``(label, zone)`` a job's schedule is read in, as the daemon reads
     it: a configured ``timezone`` outranks the ``utc`` flag.  ``zone`` is
     None for the host clock (the label ``local``); an unknown zone name
@@ -212,7 +211,7 @@ def _job_frame(
     return "local", None
 
 
-def fmt_in(sec: Optional[float]) -> str:
+def fmt_in(sec: float | None) -> str:
     """``in 42s`` / ``in 3m`` / ``now``: the next-fire column."""
     if sec is None:
         return "—"
@@ -227,7 +226,7 @@ def fmt_in(sec: Optional[float]) -> str:
     return "in %dd" % (sec // 86400)
 
 
-def fmt_til(iso: Optional[str]) -> str:
+def fmt_til(iso: str | None) -> str:
     """``til HH:MM`` (UTC) for a pause-expiry stamp."""
     t = parse_iso(iso)
     if t is None:
@@ -236,7 +235,7 @@ def fmt_til(iso: Optional[str]) -> str:
     return "til %s" % stamp.strftime("%H:%M")
 
 
-def fmt_ago(iso: Optional[str], now: Optional[float] = None) -> str:
+def fmt_ago(iso: str | None, now: float | None = None) -> str:
     """``42s ago`` / ``3m ago`` from an ISO timestamp."""
     t = parse_iso(iso)
     if t is None:
@@ -253,7 +252,7 @@ def fmt_ago(iso: Optional[str], now: Optional[float] = None) -> str:
     return "%dd ago" % (delta // 86400)
 
 
-def fmt_ago_any(value: Any, now: Optional[float] = None) -> str:
+def fmt_ago_any(value: Any, now: float | None = None) -> str:
     """:func:`fmt_ago` over either an ISO string or epoch seconds.
 
     DAG run documents stamp epoch floats (``createdAt``/``updatedAt``)
@@ -269,7 +268,7 @@ def fmt_ago_any(value: Any, now: Optional[float] = None) -> str:
     return fmt_ago(value, now)
 
 
-def ago_short(iso: Optional[str], now: Optional[float] = None) -> str:
+def ago_short(iso: str | None, now: float | None = None) -> str:
     """Compact age for dense cells: ``42s`` / ``3m`` / ``7h`` / ``2d``."""
     t = parse_iso(iso)
     if t is None:
@@ -284,7 +283,7 @@ def ago_short(iso: Optional[str], now: Optional[float] = None) -> str:
     return "%dd" % (delta // 86400)
 
 
-def fmt_duration(sec: Optional[float]) -> str:
+def fmt_duration(sec: float | None) -> str:
     """``850ms`` / ``4.2s`` / ``3m10s`` / ``2h04m`` for run durations."""
     if sec is None:
         return "—"
@@ -306,13 +305,13 @@ def fmt_countdown(sec: float) -> str:
     return "%s:%s" % (pad2(s // 60), pad2(s % 60))
 
 
-def fmt_percent(p: Optional[float]) -> str:
+def fmt_percent(p: float | None) -> str:
     if p is None:
         return "—"
     return ("%.1f%%" % p) if p < 10 else ("%d%%" % round(p))
 
 
-def fmt_bytes(n: Optional[float]) -> str:
+def fmt_bytes(n: float | None) -> str:
     if n is None:
         return "—"
     value = float(n)
@@ -325,7 +324,7 @@ def fmt_bytes(n: Optional[float]) -> str:
     return "—"  # pragma: no cover - unreachable
 
 
-def parse_iso(value: Any) -> Optional[float]:
+def parse_iso(value: Any) -> float | None:
     """ISO-8601 -> POSIX seconds; naive stamps are pinned to UTC.
 
     Mirrors the daemon's own tolerant parser: the payloads cronstable emits
@@ -348,7 +347,7 @@ def parse_iso(value: Any) -> Optional[float]:
     return parsed.timestamp()
 
 
-def utc_clock(now: Optional[float] = None) -> str:
+def utc_clock(now: float | None = None) -> str:
     t = datetime.datetime.fromtimestamp(
         now if now is not None else time.time(), tz=datetime.timezone.utc
     )
@@ -427,7 +426,7 @@ HEAT_RANK = {
 }
 
 
-def outcome_key(outcome: Optional[str]) -> str:
+def outcome_key(outcome: str | None) -> str:
     """State key for a run outcome: ``fail``/``cancelled``/``unknown``/
     ``skipped``, else ``ok``. Anything painting a run goes through here
     so a sixth copy of the ladder cannot drift again."""
@@ -463,7 +462,7 @@ DAG_STATE_COLOR = {
 }
 
 
-def outcome_color(outcome: Optional[str]) -> str:
+def outcome_color(outcome: str | None) -> str:
     """Theme color key for a run outcome, via :func:`outcome_key`."""
     return OUTCOME_COLOR[outcome_key(outcome)]
 
@@ -511,7 +510,7 @@ def sla_overdue(job: dict[str, Any]) -> bool:
 
 def correlate(
     failing: list[dict[str, Any]],
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Group failing jobs by (exit_code, fail_reason); dominant group wins.
 
     Port of the web ``correlate()``: the returned dict carries the group
@@ -527,7 +526,7 @@ def correlate(
             last.get("fail_reason") or "",
         )
         groups.setdefault(key, []).append(job)
-    best: Optional[dict[str, Any]] = None
+    best: dict[str, Any] | None = None
     for group in groups.values():
         if len(group) < 2:
             continue
@@ -552,7 +551,7 @@ def correlate(
     return best
 
 
-def cluster_alert(data: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+def cluster_alert(data: dict[str, Any] | None) -> dict[str, Any] | None:
     """Distill /cluster into one alert signal (web ``setClusterAlert``)."""
     if not data or not data.get("enabled"):
         return None
@@ -583,8 +582,8 @@ def cluster_alert(data: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
 
 def verdict_info(
     jobs: list[dict[str, Any]],
-    alert: Optional[dict[str, Any]],
-) -> tuple[Optional[dict[str, Any]], list[str]]:
+    alert: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, list[str]]:
     """One operator headline, or ``None`` when healthy.
 
     Port of the web ``verdictInfo()``: returns ``(verdict, incident_set)``
@@ -1399,7 +1398,7 @@ def prefs_path() -> str:
         return os.path.join(base, "cronstable", "tui.json")
 
 
-def load_prefs(path: Optional[str] = None) -> dict[str, Any]:
+def load_prefs(path: str | None = None) -> dict[str, Any]:
     """Read prefs; unknown keys are dropped, bad values fall back."""
     prefs = dict(PREF_DEFAULTS)
     target = path or prefs_path()
@@ -1422,7 +1421,7 @@ def load_prefs(path: Optional[str] = None) -> dict[str, Any]:
     return prefs
 
 
-def save_prefs(prefs: dict[str, Any], path: Optional[str] = None) -> None:
+def save_prefs(prefs: dict[str, Any], path: str | None = None) -> None:
     """Best-effort persist; the TUI never fails over a prefs write."""
     target = path or prefs_path()
     try:
@@ -1517,7 +1516,7 @@ class PendulumMark:
 
     def __init__(
         self,
-        seed: Optional[int] = None,
+        seed: int | None = None,
         connected: bool = False,
         breeze: bool = True,
     ) -> None:
@@ -1725,7 +1724,7 @@ class PendulumMark:
         )
 
     # ---- projection -------------------------------------------------
-    def frame(self) -> tuple[str, Optional[str]]:
+    def frame(self) -> tuple[str, str | None]:
         """The mark's cell: ``(glyph, ink)``, ink None for the
         wordmark's own.  Buckets carry hysteresis so a pose riding an
         edge cannot flicker."""
@@ -1748,7 +1747,7 @@ class PendulumMark:
         glyph = ("l", "/", "\\", "_")[b]
         if self.mode == "balance":
             if self.t - self.catch_t < 0.9:
-                ink: Optional[str] = "ok"  # the catch, flashed
+                ink: str | None = "ok"  # the catch, flashed
             else:
                 self._gust = self._wind_ema > (
                     _MARK_GUST_OFF if self._gust else _MARK_GUST_ON
@@ -1891,7 +1890,7 @@ class KeyDecoder:
         return ["esc"] if pending == "\x1b" else []
 
     @staticmethod
-    def _try_escape(seq: str) -> tuple[bool, Optional[str]]:
+    def _try_escape(seq: str) -> tuple[bool, str | None]:
         """``(complete, key-or-None)`` for a buffered escape sequence."""
         if len(seq) == 1:
             return (False, None)
@@ -1929,7 +1928,7 @@ class PosixKeyReader:
         self._fd = fd
         self._decoder = KeyDecoder()
         self._queue: "asyncio.Queue[str]" = asyncio.Queue()
-        self._flusher: Optional[asyncio.TimerHandle] = None
+        self._flusher: asyncio.TimerHandle | None = None
         loop.add_reader(fd, self._on_readable)
 
     def _on_readable(self) -> None:
@@ -1981,7 +1980,7 @@ if sys.platform == "win32":  # pragma: no cover (windows)
             while not self._stop:
                 try:
                     ch = msvcrt.getwch()
-                except Exception:
+                except Exception:  # noqa: BLE001 - no console: stop reading
                     return
                 if ch in ("\x00", "\xe0"):
                     code = msvcrt.getwch()
@@ -2226,8 +2225,8 @@ class Api:
     def __init__(
         self,
         url: str,
-        token: Optional[str],
-        ssl_context: Optional[Any] = None,
+        token: str | None,
+        ssl_context: Any | None = None,
     ) -> None:
         self.url = url.rstrip("/")
         self.token = token
@@ -2304,7 +2303,7 @@ class Api:
     async def post(
         self,
         path: str,
-        body: Optional[dict[str, Any]] = None,
+        body: dict[str, Any] | None = None,
         timeout_s: float = 15.0,
     ) -> tuple[int, Any]:
         """POST; returns ``(status, parsed-body-or-text)``, raising only
@@ -2410,11 +2409,11 @@ class LogTail:
         #: the whole buffer.  A wholesale reset replaces ``lines`` with a
         #: new object, so identity alone catches that case.
         self.dropped = 0
-        self.ended: Optional[str] = None  # end reason ("" = plain end)
-        self.error: Optional[str] = None
+        self.ended: str | None = None  # end reason ("" = plain end)
+        self.error: str | None = None
         self.follow = True
         self._on_change = on_change
-        self._task: Optional["asyncio.Task[None]"] = None
+        self._task: "asyncio.Task[None] | None" = None
 
     def start(self) -> "asyncio.Task[None]":
         if self._task is None or self._task.done():
@@ -2464,7 +2463,7 @@ class LogTail:
             # is the next run's output and flushes through, so runs
             # stack up behind their end markers, like the page.
             expect = self._last_block() if dedupe_next else []
-            staged: Optional[list[tuple[str, str, float]]] = (
+            staged: list[tuple[str, str, float]] | None = (
                 [] if dedupe_next else None
             )
             dedupe_next = False
@@ -2522,8 +2521,6 @@ class LogTail:
                                 )
                             self._trim()
                             self._on_change()
-            except asyncio.CancelledError:
-                raise
             except Unauthorized:
                 self.error = "unauthorized"
                 self._on_change()
@@ -2679,7 +2676,7 @@ class Painter:
         self,
         text: str,
         fg: str = "fg",
-        bg: Optional[str] = None,
+        bg: str | None = None,
         bold: bool = False,
         dim: bool = False,
         reverse: bool = False,
@@ -2830,7 +2827,7 @@ INPUT_HOMES = {
 
 
 #: payload types of the per-frame memo slots (see App.__init__)
-_TimelineEntry = tuple[str, Optional[str], str, Any, str, Any]
+_TimelineEntry = tuple[str, str | None, str, Any, str, Any]
 _PaletteRow = tuple[str, str, Callable[[], Any]]
 _FleetMatrix = tuple[list[dict[str, Any]], int, int, int, list[str]]
 _DagGraphLayer = tuple[int, list[str], list[tuple[str, list[str]]]]
@@ -2851,9 +2848,9 @@ class App:
         keys: Any,
         prefs: dict[str, Any],
         start_wallboard: bool = False,
-        start_job: Optional[str] = None,
-        boot: Optional[bool] = None,
-        prefs_file: Optional[str] = None,
+        start_job: str | None = None,
+        boot: bool | None = None,
+        prefs_file: str | None = None,
     ) -> None:
         self.api = api
         self.term = term
@@ -2873,17 +2870,17 @@ class App:
         self.health_counts: dict[str, int] = {}
         self._health_keyed: list[tuple[str, dict[str, Any]]] = []
         self._col_flags = (False, False, False, False)
-        self._wb_shown: Optional[
-            tuple[int, list[tuple[str, dict[str, Any]]]]
-        ] = None
+        self._wb_shown: tuple[int, list[tuple[str, dict[str, Any]]]] | None = (
+            None
+        )
         self.fetched_mono = 0.0  # monotonic stamp of the last good /jobs
         self.version = ""
         self.job_set_id = ""
-        self.cluster: Optional[dict[str, Any]] = None
-        self.fleet: Optional[dict[str, Any]] = None
+        self.cluster: dict[str, Any] | None = None
+        self.fleet: dict[str, Any] | None = None
         self.dags: list[dict[str, Any]] = []
-        self.state_data: Optional[dict[str, Any]] = None
-        self.node: Optional[dict[str, Any]] = None
+        self.state_data: dict[str, Any] | None = None
+        self.node: dict[str, Any] | None = None
         self.connected = False
         self.conn_error = ""
 
@@ -2900,7 +2897,7 @@ class App:
         self.open_overlays: list[str] = []  # stack, last = topmost
         self.wallboard = bool(start_wallboard)
         self.booting = False
-        self.focus: Optional[str] = None
+        self.focus: str | None = None
         self.inputs: dict[str, str] = dict.fromkeys(INPUT_HOMES, "")
         self.quit = False
         self._start_job = start_job
@@ -2916,7 +2913,7 @@ class App:
         self._mark_egg_toast = False
 
         # ---- verdict / alarm (fleetSound port) ----
-        self.verdict: Optional[dict[str, Any]] = None
+        self.verdict: dict[str, Any] | None = None
         self.incident_set: list[str] = []
         self.prev_fin: dict[str, str] = {}
         self.just_failed: set[str] = set()
@@ -2924,11 +2921,11 @@ class App:
         self.alarm_ack = False
 
         # ---- drawer ----
-        self.drawer_job: Optional[str] = None
+        self.drawer_job: str | None = None
         self.drawer_tab = "logs"
-        self.drawer_runs: Optional[dict[str, Any]] = None
-        self.drawer_res: Optional[dict[str, Any]] = None
-        self.log_tail: Optional[LogTail] = None
+        self.drawer_runs: dict[str, Any] | None = None
+        self.drawer_res: dict[str, Any] | None = None
+        self.log_tail: LogTail | None = None
         self.log_scroll = 0  # rows up from the tail; 0 = following
         self.log_matches: list[int] = []
         self.log_match_idx = 0
@@ -2936,20 +2933,20 @@ class App:
         self.timestamps = bool(prefs["timestamps"])
 
         # ---- DAG drawer ----
-        self.dag_name: Optional[str] = None
+        self.dag_name: str | None = None
         self.dag_tab = "runs"
         self.dag_runs: list[dict[str, Any]] = []
-        self.dag_run: Optional[dict[str, Any]] = None
-        self.dag_run_key: Optional[str] = None
-        self.dag_xcom: Optional[dict[str, Any]] = None
+        self.dag_run: dict[str, Any] | None = None
+        self.dag_run_key: str | None = None
+        self.dag_xcom: dict[str, Any] | None = None
         self.dag_sel = 0
-        self.dag_task_tail: Optional[LogTail] = None
+        self.dag_task_tail: LogTail | None = None
         # Each memo holds one task snapshot. API refreshes replace the
         # task containers; closing the drawer releases the snapshots.
-        self._dag_graph_memo: Optional[tuple[Any, list[_DagGraphLayer]]] = None
-        self._dag_graph_run_memo: Optional[
-            tuple[list[Any], dict[str, Any]]
-        ] = None
+        self._dag_graph_memo: tuple[Any, list[_DagGraphLayer]] | None = None
+        self._dag_graph_run_memo: tuple[list[Any], dict[str, Any]] | None = (
+            None
+        )
 
         # ---- multi-tail ----
         self.tails: list[LogTail] = []
@@ -2977,7 +2974,7 @@ class App:
         # schedule pressure: computed LOCALLY from the /jobs snapshot via
         # croninfo (the same analyzers the daemon serves), so the panel
         # works against any daemon version; recomputed when stale.
-        self.pressure: Optional[dict[str, Any]] = None
+        self.pressure: dict[str, Any] | None = None
         self.press_dups: list[dict[str, Any]] = []
         self.press_suggest: dict[str, dict[str, Any]] = {}
         self.press_computed = 0.0
@@ -2986,17 +2983,17 @@ class App:
         # stops a slow load from being double-spawned past the 60s gate)
         self._heat_busy = False
         # week calendar: 7-day fire outlook computed locally, like pressure
-        self.week: Optional[dict[str, Any]] = None
+        self.week: dict[str, Any] | None = None
         self.week_computed = 0.0
         self._week_busy = False
         self.state_tab = "view"
-        self.state_detail: Optional[dict[str, Any]] = None
+        self.state_detail: dict[str, Any] | None = None
         self.state_sel = 0
         self.settings_sel = 0
         self.panel_scroll = 0
         self.dags_sel = 0
         self.fleet_fail_only = False
-        self.node_history: Optional[dict[str, Any]] = None
+        self.node_history: dict[str, Any] | None = None
 
         # ---- wallboard / zen / boot ----
         self.zen_on = False
@@ -3020,23 +3017,23 @@ class App:
         # single-slot rendered-body caches for the pressure and week
         # panels (see render_press / render_week); also theme-inked,
         # also cleared by _retheme()
-        self._press_body: Optional[tuple[Any, ...]] = None
-        self._week_body: Optional[tuple[Any, ...]] = None
+        self._press_body: tuple[Any, ...] | None = None
+        self._week_body: tuple[Any, ...] | None = None
         # wrapped-row counts per line, valid for one content width (a
         # resize or a timestamp toggle changes it and clears the memo)
         self._wrap_rows_cache: dict[str, int] = {}
         self._wrap_width = -1
         # the wrapped buffer's per-entry start rows, carried between
         # frames and extended by what the buffer gained (see _wrap_starts)
-        self._wrap_tally: Optional[tuple[Any, ...]] = None
+        self._wrap_tally: tuple[Any, ...] | None = None
         # single-slot rendered bodies for the drawer's history and
         # resources tabs, theme-inked like _press_body and cleared with it
-        self._history_body: Optional[tuple[Any, ...]] = None
-        self._res_body: Optional[tuple[Any, ...]] = None
+        self._history_body: tuple[Any, ...] | None = None
+        self._res_body: tuple[Any, ...] | None = None
         # ink-free single-slot memos: the schedule tab's parsed facts, the
         # palette's match list, the timeline entries, the fleet matrix
-        self._sched_facts: Optional[tuple[Any, ...]] = None
-        self._palette_memo: Optional[
+        self._sched_facts: tuple[Any, ...] | None = None
+        self._palette_memo: (
             tuple[
                 str,
                 list[dict[str, Any]],
@@ -3044,24 +3041,26 @@ class App:
                 bool,
                 list[_PaletteRow],
             ]
-        ] = None
-        self._timeline_memo: Optional[
-            tuple[list[dict[str, Any]], bool, list[_TimelineEntry]]
-        ] = None
-        self._fleet_memo: Optional[
-            tuple[dict[str, Any], bool, _FleetMatrix]
-        ] = None
+            | None
+        ) = None
+        self._timeline_memo: (
+            tuple[list[dict[str, Any]], bool, list[_TimelineEntry]] | None
+        ) = None
+        self._fleet_memo: tuple[dict[str, Any], bool, _FleetMatrix] | None = (
+            None
+        )
         # last inputs of _log_search_recompute, so a repaint with an
         # unchanged needle and buffer skips the full rescan
-        self._log_search_state: Optional[
-            tuple[str, Optional["LogTail"], int, Any]
-        ] = None
+        self._log_search_state: (
+            tuple[str, "LogTail | None", int, Any] | None
+        ) = None
         # what the last scan actually covered: (needle, tail, the buffer
         # list itself, LogTail.dropped at the time, entries scanned, the
         # last entry scanned).  _log_search_carry resumes from it.
-        self._log_search_scan: Optional[
+        self._log_search_scan: (
             tuple[str, "LogTail", list[tuple[str, str, float]], int, int, Any]
-        ] = None
+            | None
+        ) = None
         self.toasts: list[tuple[str, str, float]] = []
         self._dirty_event = asyncio.Event()
         self._poll_wakeup = asyncio.Event()
@@ -3115,7 +3114,7 @@ class App:
         self.toasts.append((kind, oneline(message), time.monotonic() + 3.0))
         self.mark()
 
-    def top_overlay(self) -> Optional[str]:
+    def top_overlay(self) -> str | None:
         return self.open_overlays[-1] if self.open_overlays else None
 
     def is_open(self, name: str) -> bool:
@@ -3142,12 +3141,12 @@ class App:
             self.tails = []
         self.mark()
 
-    def selected_job(self) -> Optional[dict[str, Any]]:
+    def selected_job(self) -> dict[str, Any] | None:
         if not self.view:
             return None
         return self.view[min(self.sel, len(self.view) - 1)]
 
-    def next_run_seconds(self, job: dict[str, Any]) -> Optional[float]:
+    def next_run_seconds(self, job: dict[str, Any]) -> float | None:
         """scheduled_in, drift-corrected since the poll (web port)."""
         sched = job.get("scheduled_in")
         if sched is None:
@@ -3912,12 +3911,12 @@ class App:
 
     def timeline_entries(
         self,
-    ) -> list[tuple[str, Optional[str], str, Any, str, Any]]:
+    ) -> list[tuple[str, str | None, str, Any, str, Any]]:
         raise NotImplementedError
 
     def _timeline_cached(
         self,
-    ) -> list[tuple[str, Optional[str], str, Any, str, Any]]:
+    ) -> list[tuple[str, str | None, str, Any, str, Any]]:
         """:meth:`timeline_entries` for the current payload and filter,
         built once rather than per frame and per key: the entries are a
         pure function of the two, and the slot pins the list it was
@@ -4806,7 +4805,7 @@ class AppKeys(AppPalette):
             if spec:
                 await self.dag_backfill(spec)
 
-    def _match_job(self, query: str) -> Optional[str]:
+    def _match_job(self, query: str) -> str | None:
         if query in self.by_name:
             return query
         scored = sorted(
@@ -5211,7 +5210,7 @@ class AppKeys(AppPalette):
         if not reset and state == self._log_search_state:
             return
         self._log_search_state = state
-        prev: Optional[int] = None
+        prev: int | None = None
         if not reset and self.log_matches:
             prev = self.log_matches[
                 min(self.log_match_idx, len(self.log_matches) - 1)
@@ -5246,7 +5245,7 @@ class AppKeys(AppPalette):
                 self.log_match_idx = len(self.log_matches) - 1
 
     def _log_search_carry(
-        self, needle: str, tail: Optional["LogTail"]
+        self, needle: str, tail: "LogTail | None"
     ) -> tuple[list[int], int]:
         """Matches already known for this needle, and where to resume.
 
@@ -5463,7 +5462,7 @@ class AppRender(AppKeys):
         paint: Painter,
         cols: int,
         lines: int,
-        cut: Optional[int] = None,
+        cut: int | None = None,
     ) -> list[str]:
         """The default screen's rows, laid out for ``cols``.
 
@@ -5528,7 +5527,7 @@ class AppRender(AppKeys):
         return paint.row(left_text, paint.style(" " * max(1, gap)), right_text)
 
     def render_toolbar(
-        self, paint: Painter, cols: int, cut: Optional[int] = None
+        self, paint: Painter, cols: int, cut: int | None = None
     ) -> str:
         filter_active = self.focus == "filter"
         filt = self.inputs["filter"]
@@ -5587,7 +5586,7 @@ class AppRender(AppKeys):
         return cut_to_width(paint.row(*spans), cols if cut is None else cut)
 
     def render_verdict_bar(
-        self, paint: Painter, cols: int, cut: Optional[int] = None
+        self, paint: Painter, cols: int, cut: int | None = None
     ) -> str:
         v = self.verdict or {}
         color = "fail" if v.get("sev") == "crit" else "warn"
@@ -5671,7 +5670,7 @@ class AppRender(AppKeys):
         paint: Painter,
         cols: int,
         body_rows: int,
-        cut: Optional[int] = None,
+        cut: int | None = None,
     ) -> list[str]:
         layout = self._columns(cols)
         # the title row is a pure function of the layout and widths, so
@@ -5729,7 +5728,7 @@ class AppRender(AppKeys):
         layout: list[tuple[str, int]],
         cols: int,
         selected: bool,
-        cut: Optional[int],
+        cut: int | None,
         frame: _RowFrame,
     ) -> str:
         glyphs, now, drift, sep, marker = frame
@@ -5869,7 +5868,7 @@ class AppRender(AppKeys):
         paint: Painter,
         job: dict[str, Any],
         width: int,
-        bg: Optional[str],
+        bg: str | None,
         dim: bool = False,
     ) -> str:
         """The styled spark bars for ``job``, memoised until the next poll.
@@ -5892,7 +5891,7 @@ class AppRender(AppKeys):
         return span
 
     def render_footer(
-        self, paint: Painter, cols: int, cut: Optional[int] = None
+        self, paint: Painter, cols: int, cut: int | None = None
     ) -> str:
         # the hints never change, so the padded, styled, cut row is a pure
         # function of the geometry and lives in the chrome cache
@@ -6320,7 +6319,7 @@ class AppOverlays(AppRender):
     # ---- incident timeline ------------------------------------------
     def timeline_entries(
         self,
-    ) -> list[tuple[str, Optional[str], str, Any, str, Any]]:
+    ) -> list[tuple[str, str | None, str, Any, str, Any]]:
         """(name, finished_at, outcome, exit, reason, duration), newest
         first: every job's most recent finish, like the web overlay."""
         out = []
@@ -7101,7 +7100,7 @@ class AppOverlays(AppRender):
         self,
         paint: Painter,
         data: dict[str, Any],
-        sug: Optional[dict[str, Any]],
+        sug: dict[str, Any] | None,
         dups: list[dict[str, Any]],
         width: int,
     ) -> list[str]:
@@ -8042,7 +8041,7 @@ class AppDrawers(AppOverlays):
     def _schedule_facts(
         self,
         text: str,
-        name: Optional[str],
+        name: str | None,
         frame: str,
         tz: datetime.tzinfo,
     ) -> tuple[datetime.tzinfo, str, list[datetime.datetime]]:
@@ -8601,7 +8600,7 @@ class TuiApp(AppDrawers):
                 "fg",
             ):
                 return
-            soonest: Optional[float] = None
+            soonest: float | None = None
             for job in jobs:
                 sched = job.get("scheduled_in")
                 if sched is not None and (soonest is None or sched < soonest):
@@ -8691,7 +8690,7 @@ async def _race_skip(
 add_tui_command = _cliargs.add_tui_command
 
 
-def _resolve_token(args: Any) -> Optional[str]:
+def _resolve_token(args: Any) -> str | None:
     if getattr(args, "token", None):
         return str(args.token)
     env_name = getattr(args, "token_env", ENV_TOKEN) or ENV_TOKEN
@@ -8699,7 +8698,7 @@ def _resolve_token(args: Any) -> Optional[str]:
     return value or None
 
 
-def _resolve_tls(args: Any) -> Optional["ssl.SSLContext"]:
+def _resolve_tls(args: Any) -> "ssl.SSLContext | None":
     """Flag then environment, like :func:`_resolve_token`, into a client
     SSL context (or ``None`` to leave the default transport alone).
 
@@ -8795,7 +8794,7 @@ def dispatch(args: Any) -> int:
         prefs["ascii"] = True
     if getattr(args, "poll", None) is not None:
         prefs["poll_ms"] = max(0, int(float(args.poll) * 1000))
-    boot: Optional[bool] = None
+    boot: bool | None = None
     if getattr(args, "no_boot", False):
         boot = False
     elif getattr(args, "boot", False):

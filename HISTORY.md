@@ -1,5 +1,22 @@
 # History
 
+## 1.2.60
+
+- A job's verification record redacts every line of a PEM private key that
+  the `verify` command prints, including the base64 body.
+- `sentry.maxStringLength` sets the Sentry SDK's `max_value_length`, so
+  Sentry truncates longer string values in an event. The default is 8192
+  characters, and `0` sets no limit.
+- A manual start of a pooled job answers `503` when pool state is
+  unavailable. `cron_list_pools`, `cron_cancel_queued`,
+  `cron_preview_recovery`, and `cron_recover_dag` report an unavailable
+  pool or recovery store as a tool error, matching the `503` from the REST
+  routes.
+- Before the `kubernetes` cluster backend restarts for rotated TLS files, it
+  checks that the kubeconfig, CA, client certificate, and key (or the
+  in-cluster CA) load. A half-written file keeps the running backend until a
+  later reload, as with the `etcd` and gossip backends.
+
 ## 1.2.59
 
 - WinGet installs and upgrades use signed setup executables that display

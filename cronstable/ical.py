@@ -33,7 +33,7 @@ import hashlib
 import itertools
 import math
 from collections.abc import Sequence
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import _local_tzinfo, _walk_fires, describe_cron
@@ -61,8 +61,8 @@ class CalendarEntry(NamedTuple):
 
     name: str
     tab: CronTab
-    timezone: Optional[datetime.tzinfo] = None
-    avg_duration: Optional[float] = None
+    timezone: datetime.tzinfo | None = None
+    avg_duration: float | None = None
 
 
 def _escape(text: str) -> str:
@@ -109,7 +109,7 @@ def _stamp(dt: datetime.datetime) -> str:
     return dt.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _block_seconds(avg_duration: Optional[float]) -> int:
+def _block_seconds(avg_duration: float | None) -> int:
     """The rendered event length for a job's typical runtime."""
     if avg_duration is None or avg_duration <= 0:
         return _MIN_BLOCK
@@ -143,7 +143,7 @@ def render_calendar(
     days: int,
     per_job_cap: int = 100,
     calname: str = "cronstable",
-    now: Optional[datetime.datetime] = None,
+    now: datetime.datetime | None = None,
     prodid_version: str = "",
 ) -> str:
     """The complete ``.ics`` text for ``entries`` over ``[start, start+days)``.

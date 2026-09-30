@@ -24,7 +24,7 @@ import socket
 import sys
 import tarfile
 from collections.abc import Iterator
-from typing import Any, Optional
+from typing import Any
 
 from cronstable.config import ConfigError, parse_config
 from cronstable.state import (
@@ -175,7 +175,7 @@ def _safe_members(
         yield member
 
 
-def _lease_fence(payload: bytes) -> Optional[int]:
+def _lease_fence(payload: bytes) -> int | None:
     """The fence counter in a lease file's JSON; ``None`` if unparseable."""
     try:
         return int(json.loads(payload)["fence"])
@@ -230,7 +230,7 @@ def cmd_restore(config_arg: str, archive: str, force: bool) -> int:
                     # may hold an OS lock on that very inode: replacing it
                     # would split the lock across two inodes.
                     continue
-                current: Optional[int] = None
+                current: int | None = None
                 current_exists = os.path.exists(target)
                 if current_exists:
                     try:
@@ -286,7 +286,7 @@ def cmd_restore(config_arg: str, archive: str, force: bool) -> int:
 def cmd_migrate(
     config_arg: str,
     dest_path: str,
-    dest_deployment: Optional[str],
+    dest_deployment: str | None,
     force: bool,
 ) -> int:
     """Copy the store to another path/mount (FS <-> S3 Files migration).
@@ -488,7 +488,7 @@ async def _sweep_blobs_async(
     grace: float,
     dry_run: bool,
     pruned_tokens: set[str],
-) -> tuple[int, Optional[str]]:
+) -> tuple[int, str | None]:
     """One orphan-blob sweep; ``(count, why-skipped-or-None)``.
 
     Biased to KEEP on every doubt, exactly like the daemon's pass

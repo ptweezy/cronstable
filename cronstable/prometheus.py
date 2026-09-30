@@ -34,7 +34,6 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import (
     TYPE_CHECKING,
     Any,
-    Optional,
 )
 
 import cronstable.version
@@ -249,7 +248,7 @@ class _SharedLabels(dict[str, str]):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.block: Optional[str] = None
+        self.block: str | None = None
 
 
 def _render_label_block(key: tuple[tuple[str, str], ...]) -> str:
@@ -286,7 +285,7 @@ def _render_label_block(key: tuple[tuple[str, str], ...]) -> str:
 
 
 def _make_label_block_builder(
-    cache: Optional[_LabelBlockCache] = None,
+    cache: _LabelBlockCache | None = None,
 ) -> Callable[[dict[str, str]], str]:
     """A builder for the ``{k="v",...}`` block that memoizes whole blocks.
 
@@ -331,7 +330,7 @@ def _make_label_block_builder(
 
 def iter_family_samples(
     families: Iterable[MetricFamily],
-    label_cache: Optional[_LabelBlockCache] = None,
+    label_cache: _LabelBlockCache | None = None,
 ) -> Iterator[tuple[str, str, str]]:
     """Yield ``(sample_name, label_block, value)`` for every sample.
 
@@ -364,7 +363,7 @@ def iter_family_samples(
 def render_families(
     families: Iterable[MetricFamily],
     openmetrics: bool = False,
-    label_cache: Optional[_LabelBlockCache] = None,
+    label_cache: _LabelBlockCache | None = None,
 ) -> str:
     """Render metric families as exposition text.
 
@@ -415,7 +414,7 @@ def render_families(
 
 def resolve_metrics_config(
     web_config: dict[str, Any],
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Resolve the raw ``web.metrics`` option into effective settings.
 
     Returns ``None`` when the endpoint is disabled, else a dict with
@@ -472,8 +471,8 @@ class _JobMetrics:
         # cumulative per configured bound (observations <= bound); the +Inf
         # bucket is duration_count itself.
         self.bucket_counts = [0] * n_buckets
-        self.last_success_time: Optional[float] = None
-        self.last_failure_time: Optional[float] = None
+        self.last_success_time: float | None = None
+        self.last_failure_time: float | None = None
         # CPU accounting over the resource-monitored runs (monitorResources).
         # The two sums back a per-mode counter; cpu_count lets a scrape tell
         # "no monitored runs yet" (all zero) from "monitored, used ~0 CPU".
@@ -526,7 +525,7 @@ class PrometheusMetrics:
         # the scrape's job order, memoized (a sort per scrape grows with
         # the fleet, about 14 ms at 100,000 jobs) and dropped wherever
         # _jobs gains or loses a name (_job, prune)
-        self._sorted_job_names: Optional[list[str]] = None
+        self._sorted_job_names: list[str] | None = None
         self._buckets: tuple[float, ...] = DEFAULT_DURATION_BUCKETS
         # The histogram "le" label strings are a pure function of the (fixed
         # between config changes) bucket bounds, so render them once here (and
@@ -536,8 +535,8 @@ class PrometheusMetrics:
             _bucket_bound(b) for b in self._buckets
         )
         self._start_time = time.time()
-        self._last_reload_ok: Optional[bool] = None
-        self._last_reload_success_time: Optional[float] = None
+        self._last_reload_ok: bool | None = None
+        self._last_reload_success_time: float | None = None
         self._leader_transitions = 0
         self._quorum_transitions = 0
         # durable-state writes that failed and were dropped, by kind
@@ -570,9 +569,9 @@ class PrometheusMetrics:
         # and mismatches. The next set_duration_buckets call resolves the
         # slot: adopted when the bounds it applies equal the parked ones,
         # dropped otherwise (the snapshot is then genuinely stale).
-        self._pending_histogram_seed: Optional[
-            tuple[tuple[float, ...], dict[str, dict[str, Any]]]
-        ] = None
+        self._pending_histogram_seed: (
+            tuple[tuple[float, ...], dict[str, dict[str, Any]]] | None
+        ) = None
 
     # -- configuration ----------------------------------------------------
 
@@ -682,8 +681,8 @@ class PrometheusMetrics:
         self,
         name: str,
         outcome: str,
-        duration: Optional[float],
-        resources: Optional["ResourceUsage"] = None,
+        duration: float | None,
+        resources: "ResourceUsage | None" = None,
     ) -> None:
         job = self._job(name)
         job.runs[outcome] = job.runs.get(outcome, 0) + 1
@@ -802,7 +801,7 @@ class PrometheusMetrics:
         if not isinstance(jobs, dict):
             return 0
         raw_buckets = snapshot.get("buckets")
-        snapshot_buckets: Optional[tuple[float, ...]] = None
+        snapshot_buckets: tuple[float, ...] | None = None
         if isinstance(raw_buckets, list):
             try:
                 snapshot_buckets = tuple(float(b) for b in raw_buckets)

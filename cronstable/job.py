@@ -27,7 +27,6 @@ from socket import gethostname
 from typing import (
     TYPE_CHECKING,
     Any,
-    Optional,
 )
 from urllib.parse import urlsplit, urlunsplit
 
@@ -38,7 +37,7 @@ from cronstable.config import (
     _resolve_secret,
     schedule_object_to_crontab,
 )
-from cronstable.redact import redact_secrets
+from cronstable.redact import redact_lines
 from cronstable.resources import ResourceMonitor, ResourceUsage
 from cronstable.statsd import StatsdJobMetricWriter
 
@@ -152,7 +151,7 @@ def is_cmd_shell(shell: str) -> bool:
 
 
 def shell_spawn(
-    shell: str, command: str, windows: Optional[bool] = None
+    shell: str, command: str, windows: bool | None = None
 ) -> tuple[Any, list[str], dict[str, Any]]:
     """The spawn call, argv and extra kwargs for ``command`` under ``shell``.
 
@@ -309,7 +308,7 @@ class _MirrorWriter:
         self._wake = threading.Event()
         self._idle = threading.Event()
         self._idle.set()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self.dropped_batches = 0
         self._drop_logged = False
         self._drop_warn_pending = False
@@ -469,7 +468,7 @@ class JobOutputStream:
         self._limit = limit
         # each item is (stream_name, line) with stream_name "stdout"/"stderr"
         # Silent runs and rehydrated summaries need no ring at all.
-        self._lines: Optional[deque[tuple[str, str]]] = None
+        self._lines: deque[tuple[str, str]] | None = None
         self._subscribers: list["asyncio.Queue"] = []
         self.closed = False
         # total lines ever published: `published - len(lines)` is the
@@ -579,8 +578,8 @@ class StreamReader:
         stream: asyncio.StreamReader,
         stream_prefix: str,
         save_limit: int,
-        on_line: Optional[Callable[[str, str], None]] = None,
-        max_line_length: Optional[int] = None,
+        on_line: Callable[[str, str], None] | None = None,
+        max_line_length: int | None = None,
     ) -> None:
         self.save_top: list[str] = []
         self.save_bottom: deque[str] = deque()
@@ -772,7 +771,7 @@ class StreamReader:
         logger.warning("job %s: ignored a very long line", self.job_name)
         return True
 
-    async def join(self, timeout: Optional[float] = None) -> tuple[str, int]:
+    async def join(self, timeout: float | None = None) -> tuple[str, int]:
         """Drain to end-of-file; return ``(output, discarded_lines)``.
 
         EOF needs every write-end of the pipe closed, including any a
@@ -816,8 +815,8 @@ class StreamReader:
 
 
 async def _resolve_secret_async(
-    spec: Optional[dict[str, Any]], what: str
-) -> Optional[str]:
+    spec: dict[str, Any] | None, what: str
+) -> str | None:
     """:func:`config._resolve_secret`, off the event loop for a file source.
 
     The reporters run from the completion path, so a ``fromFile`` secret on
@@ -843,10 +842,10 @@ class Reporter:
 
 class SentryReporter(Reporter):
     def __init__(self) -> None:
-        # Remember the last (dsn, environment) we initialized the global
-        # Sentry client with, so we don't rebuild the client/transport on
-        # every single report.
-        self._inited_key: Optional[tuple[str, Optional[str]]] = None
+        # Remember the last (dsn, environment, value limit) we initialized
+        # the global Sentry client with, so we don't rebuild the
+        # client/transport on every single report.
+        self._inited_key: tuple[str, str | None, int | None] | None = None
 
     async def report(
         self, success: bool, job: "RunningJob", config: dict[str, Any]
@@ -867,7 +866,6 @@ class SentryReporter(Reporter):
         # Imported past the early returns so the sentry_sdk import cost is
         # paid only when a job actually reports to Sentry.
         import sentry_sdk
-        import sentry_sdk.utils
 
         # template_vars is rebuilt on every property access, so one read
         # serves the body render and every fingerprint line
@@ -881,12 +879,14 @@ class SentryReporter(Reporter):
 
         kwargs = {}
         if config.get("maxStringLength"):
-            sentry_sdk.utils.MAX_STRING_LENGTH = (  # type:ignore
-                config["maxStringLength"]
-            )
+            kwargs["max_value_length"] = config["maxStringLength"]
         if config.get("environment"):
             kwargs["environment"] = config["environment"]
-        init_key = (dsn, kwargs.get("environment"))
+        init_key = (
+            dsn,
+            kwargs.get("environment"),
+            kwargs.get("max_value_length"),
+        )
         if init_key != self._inited_key:
             sentry_sdk.init(dsn=dsn, **kwargs)
             self._inited_key = init_key
@@ -986,8 +986,8 @@ class MailReporter(Reporter):
     async def _converse(
         smtp: Any,
         mail: dict[str, Any],
-        username: Optional[str],
-        password: Optional[str],
+        username: str | None,
+        password: str | None,
         message: EmailMessage,
     ) -> None:
         await smtp.connect()
@@ -1704,7 +1704,7 @@ class _EventLogWriter:
     def __init__(self, source: str) -> None:
         self.source = source
         self._queue: Queue = Queue(EVENTLOG_QUEUE_LIMIT)
-        self._handle: Optional[int] = None
+        self._handle: int | None = None
         self._dropped = 0
         self._logged_codes: set[int] = set()
         self._thread = threading.Thread(
@@ -1840,7 +1840,7 @@ _EVENTLOG_WRITERS: dict[str, _EventLogWriter] = {}
 _EVENTLOG_CAP_LOGGED = False
 
 
-def _eventlog_writer(source: str) -> Optional[_EventLogWriter]:
+def _eventlog_writer(source: str) -> _EventLogWriter | None:
     """The writer for ``source``, minting one if the cap allows."""
     global _EVENTLOG_CAP_LOGGED
     writer = _EVENTLOG_WRITERS.get(source)
@@ -2095,6 +2095,22 @@ async def _fan_out_reports(
             logger.error(error_fmt, error_arg, result, exc_info=result)
 
 
+#: Characters of each verifier stream kept in the verification record.
+VERIFY_OUTPUT_LIMIT = 16384
+
+
+def _redacted_check_output(text: str | None) -> str | None:
+    """Redact and cap one verifier stream for the verification record.
+
+    :func:`cronstable.redact.redact_lines` masks every line of a PEM private
+    key; one ``redact_secrets`` pass over the whole text masks only the
+    ``BEGIN`` line.
+    """
+    if not text:
+        return text
+    return "\n".join(redact_lines(text.split("\n")))[:VERIFY_OUTPUT_LIMIT]
+
+
 class JobRetryState:
     def __init__(
         self, initial_delay: float, multiplier: float, max_delay: float
@@ -2118,7 +2134,7 @@ class JobRetryState:
         self.armed_at: datetime | None = None
         # Durable pool generation: a settled ladder cannot be revived by
         # an already queued attempt, including after a daemon restart.
-        self.pool_retry: Optional[dict[str, str]] = None
+        self.pool_retry: dict[str, str] | None = None
 
     def next_delay(self) -> float:
         delay = self.delay
@@ -2140,13 +2156,13 @@ class RunningJob:
     def __init__(
         self,
         config: JobConfig,
-        retry_state: Optional[JobRetryState],
+        retry_state: JobRetryState | None,
         *,
-        extra_env: Optional[dict[str, str]] = None,
-        state_token: Optional[str] = None,
-        run_id: Optional[str] = None,
-        dag_ref: Optional[Any] = None,
-        output: Optional[JobOutputStream] = None,
+        extra_env: dict[str, str] | None = None,
+        state_token: str | None = None,
+        run_id: str | None = None,
+        dag_ref: Any | None = None,
+        output: JobOutputStream | None = None,
         output_prefix: str = "",
     ) -> None:
         self.config = config
@@ -2154,7 +2170,7 @@ class RunningJob:
         # its completion to cronstable.dagrun instead of the record/retry
         # path. An opaque marker carrying (dag, run_key, taskkey, ...).
         self.dag_ref = dag_ref
-        self.on_verifying: Optional[Callable[[], Awaitable[None]]] = None
+        self.on_verifying: Callable[[], Awaitable[None]] | None = None
         # environment the daemon injects on top of the job's own (loopback
         # state-API URL, per-run bearer token, run context); applied after
         # config.environment so it wins over a same-named user override.
@@ -2172,8 +2188,8 @@ class RunningJob:
         # live, broadcastable view of this run's captured output (web UI tail)
         self.output = output if output is not None else JobOutputStream()
         self._output_prefix = output_prefix
-        self.verification: Optional[dict[str, Any]] = None
-        self._verifier: Optional[RunningJob] = None
+        self.verification: dict[str, Any] | None = None
+        self._verifier: RunningJob | None = None
         self.pool_ticket: Any = None
         self._stderr_reader: StreamReader | None = None
         self._stdout_reader: StreamReader | None = None
@@ -2188,8 +2204,8 @@ class RunningJob:
         # _resource_monitor samples the process tree; resource_usage holds
         # the finished result (None when off/unavailable), finalized in
         # _on_stop before the statsd emission that reports it.
-        self._resource_monitor: Optional[ResourceMonitor] = None
-        self.resource_usage: Optional[ResourceUsage] = None
+        self._resource_monitor: ResourceMonitor | None = None
+        self.resource_usage: ResourceUsage | None = None
         # set when the subprocess could not be launched at all (e.g. the
         # command does not exist). Lets wait() treat it as a normal job
         # failure instead of raising RuntimeError("process is not running").
@@ -2280,8 +2296,6 @@ class RunningJob:
             # one; see STATSD_START_FLUSH_TIMEOUT.
             try:
                 await asyncio.wait_for(task, STATSD_START_FLUSH_TIMEOUT)
-            except asyncio.CancelledError:
-                raise
             except asyncio.TimeoutError:
                 # the documented "host that misses this window" case: the
                 # open is still in flight and stays pooled, nothing to say
@@ -2476,7 +2490,7 @@ class RunningJob:
                 max_line_length=config.maxLineLength,
             )
 
-    def live_resources(self) -> Optional[dict[str, Any]]:
+    def live_resources(self) -> dict[str, Any] | None:
         """Current live CPU/memory of this running instance, or ``None``.
 
         Read by the scheduler while the job is still running (the dashboard's
@@ -2487,7 +2501,7 @@ class RunningJob:
             return None
         return self._resource_monitor.snapshot()
 
-    def live_resource_series(self) -> Optional[list[list[float]]]:
+    def live_resource_series(self) -> list[list[float]] | None:
         """The run-so-far CPU/RSS chart series, or ``None``.
 
         Kept separate from :meth:`live_resources` so the polled /jobs payload
@@ -2643,16 +2657,13 @@ class RunningJob:
             "duration": (finished - check.started_at).total_seconds()
             if check.started_at is not None
             else None,
-            "stdout": redact_secrets(check.stdout)[:16384]
-            if check.stdout
-            else check.stdout,
-            "stderr": redact_secrets(check.stderr)[:16384]
-            if check.stderr
-            else check.stderr,
+            "stdout": _redacted_check_output(check.stdout),
+            "stderr": _redacted_check_output(check.stderr),
             "stdout_discarded": check.stdout_discarded,
             "stderr_discarded": check.stderr_discarded,
             "output_truncated": any(
-                len(s or "") > 16384 for s in (check.stdout, check.stderr)
+                len(s or "") > VERIFY_OUTPUT_LIMIT
+                for s in (check.stdout, check.stderr)
             )
             or bool(check.stdout_discarded or check.stderr_discarded),
         }
@@ -2695,7 +2706,7 @@ class RunningJob:
         return self.fail_reason is not None
 
     @property
-    def fail_reason(self) -> Optional[str]:
+    def fail_reason(self) -> str | None:
         if self.verification and self.verification["outcome"] == "failure":
             return "verification failed: {}".format(
                 self.verification.get("fail_reason") or "check failed"
@@ -2867,7 +2878,7 @@ class SlaBreachContext:
         check: str,
         threshold_seconds: float,
         observed_seconds: float,
-        last_success_at: Optional[str] = None,
+        last_success_at: str | None = None,
     ) -> None:
         self.config = config
         self.sla_check = check
@@ -2963,7 +2974,7 @@ class NotifyEventContext:
         name: str,
         subject: str,
         message: str,
-        fields: Optional[dict[str, Any]] = None,
+        fields: dict[str, Any] | None = None,
     ) -> None:
         self.event = event
         self.config = _NotifyJobShim(name)

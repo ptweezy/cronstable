@@ -29,7 +29,7 @@ import weakref
 from collections import defaultdict, deque
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 try:
     import psutil
@@ -182,7 +182,7 @@ class _SeriesRecorder:
         return out
 
 
-def _parse_series(raw: Any) -> Optional[list[list[float]]]:
+def _parse_series(raw: Any) -> list[list[float]] | None:
     """Sanitise a ``series`` field from a ledger record, or ``None``.
 
     Applies the same distrust as :meth:`ResourceUsage.from_dict`: entries
@@ -231,7 +231,7 @@ class ResourceUsage:
     # job's monitorResources.history); None when series capture is off or
     # nothing was recorded.  Defaulted so pre-existing construction sites
     # (and summary-only ledger records) stay valid.
-    series: Optional[list[list[float]]] = None
+    series: list[list[float]] | None = None
 
     @property
     def cpu_total_seconds(self) -> float:
@@ -259,7 +259,7 @@ class ResourceUsage:
         return data
 
     @classmethod
-    def from_dict(cls, data: Any) -> Optional["ResourceUsage"]:
+    def from_dict(cls, data: Any) -> "ResourceUsage | None":
         """Rebuild from :meth:`to_dict` output; ``None`` if malformed.
 
         Survives foreign / hand-edited ledger records the same way the run
@@ -298,7 +298,7 @@ class ResourceUsage:
         )
 
 
-def _ppid_index() -> Optional[dict[int, list[int]]]:
+def _ppid_index() -> dict[int, list[int]] | None:
     """``ppid -> child pids`` for the whole table, from ONE snapshot.
 
     ``psutil``'s ``children(recursive=True)`` scans the ENTIRE process table
@@ -349,16 +349,16 @@ class _SharedSampleTicker:
         # a fresh registration is sampled immediately, so even a very short
         # run has a chance of one reading).
         self._due: dict["ResourceMonitor", float] = {}
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
         self._wake = asyncio.Event()
         # The latest table snapshot and the loop-clock instant it was
         # taken, so a monitor stopping between ticks can fold its final
         # reading against it rather than walking the table again (see
         # ResourceMonitor.stop).
-        self._index: Optional[dict[int, list[int]]] = None
+        self._index: dict[int, list[int]] | None = None
         self._index_at = 0.0
 
-    def recent_index(self, max_age: float) -> Optional[dict[int, list[int]]]:
+    def recent_index(self, max_age: float) -> dict[int, list[int]] | None:
         """The last table snapshot, if it is younger than ``max_age``.
 
         ``None`` when there is none yet, when the walk failed, or when it
@@ -418,8 +418,6 @@ class _SharedSampleTicker:
                         await asyncio.wait_for(self._wake.wait(), delay)
                     except asyncio.TimeoutError:
                         pass
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - a sampler bug must not crash it
             logger.warning(
                 "resource sampling ticker stopped on an unexpected error",
@@ -429,7 +427,7 @@ class _SharedSampleTicker:
     @staticmethod
     def _sample_batch(
         monitors: list["ResourceMonitor"],
-    ) -> Optional[dict[int, list[int]]]:
+    ) -> dict[int, list[int]] | None:
         # Worker thread. One table snapshot; each monitor folds its own
         # tree. The snapshot is returned so the caller can retain it for
         # monitors that stop before the next tick.
@@ -483,7 +481,7 @@ class ResourceMonitor:
         # the loop-shared sampling ticker this monitor registered with (see
         # _SharedSampleTicker); None until start() attaches, and again after
         # stop() unregisters.
-        self._ticker: Optional[_SharedSampleTicker] = None
+        self._ticker: _SharedSampleTicker | None = None
         self._proc: Any = None  # psutil.Process, once attached
         # Accumulated totals.  CPU time is tracked per tree member: _members
         # maps a (pid, create_time) key -- so a reused pid reads as a new
@@ -508,14 +506,14 @@ class ResourceMonitor:
         # monotonic instant) of the last sample, deriving the percentage.
         self._live_rss = 0
         self._live_cpu_percent = 0.0
-        self._prev_cpu: Optional[tuple] = None
+        self._prev_cpu: tuple | None = None
 
     @property
     def available(self) -> bool:
         """Whether monitoring could actually attach to the process."""
         return self._proc is not None
 
-    def snapshot(self) -> Optional[dict[str, Any]]:
+    def snapshot(self) -> dict[str, Any] | None:
         """Current live usage of the running tree, or ``None`` if unsampled.
 
         Read by the scheduler while the job is still running (see
@@ -534,7 +532,7 @@ class ResourceMonitor:
             "rss_bytes": self._live_rss,
         }
 
-    def series(self) -> Optional[list[list[float]]]:
+    def series(self) -> list[list[float]] | None:
         """The run-so-far ``[t, cpu%, rss]`` chart series, oldest first.
 
         ``None`` when series capture is off (history 0) or nothing has been
@@ -572,7 +570,7 @@ class ResourceMonitor:
         self._ticker = _loop_ticker()
         self._ticker.register(self)
 
-    def _sample(self, index: Optional[dict[int, list[int]]] = None) -> None:
+    def _sample(self, index: dict[int, list[int]] | None = None) -> None:
         """Read the process tree once, folding it into the running totals.
 
         Runs in a worker thread (the shared ticker's batch, or stop()'s
@@ -621,7 +619,7 @@ class ResourceMonitor:
         return tree
 
     def _sample_locked(
-        self, index: Optional[dict[int, list[int]]] = None
+        self, index: dict[int, list[int]] | None = None
     ) -> None:
         proc = self._proc
         if proc is None:
@@ -667,7 +665,7 @@ class ResourceMonitor:
         # tree but failed this round's read (a transient AccessDenied, say)
         # has NOT departed: carry its last reading forward instead, or its
         # next successful read would double-count on top of the banked value.
-        live_pids: Optional[set[int]] = None
+        live_pids: set[int] | None = None
         for key, (user, system) in self._members.items():
             if key in live:
                 continue
@@ -713,7 +711,7 @@ class ResourceMonitor:
         if self._recorder is not None:
             self._recorder.add(time.time(), self._live_cpu_percent, rss)
 
-    async def stop(self) -> Optional[ResourceUsage]:
+    async def stop(self) -> ResourceUsage | None:
         """Stop sampling and return the accumulated usage (``None`` if none).
 
         Idempotent: a second call (or a call after a monitor that never
@@ -794,14 +792,14 @@ class _CgroupV2Reader:
         proc_cgroup: str = "/proc/self/cgroup",
     ) -> None:
         self._root = os.path.normpath(root)
-        self._dir: Optional[str] = None
+        self._dir: str | None = None
         try:
             self._dir = self._resolve_own_dir(self._root, proc_cgroup)
         except Exception:  # noqa: BLE001 - never fatal
             self._dir = None
 
     @staticmethod
-    def _resolve_own_dir(root: str, proc_cgroup: str) -> Optional[str]:
+    def _resolve_own_dir(root: str, proc_cgroup: str) -> str | None:
         """Locate this process's cgroup directory, or ``None``.
 
         Only the unified (v2) hierarchy is supported, marked by the
@@ -813,7 +811,7 @@ class _CgroupV2Reader:
         """
         if not os.path.isfile(os.path.join(root, "cgroup.controllers")):
             return None
-        rel: Optional[str] = None
+        rel: str | None = None
         with open(proc_cgroup, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 # the v2 entry is "0::<path>"; v1 lines carry controller
@@ -850,7 +848,7 @@ class _CgroupV2Reader:
             d = parent
 
     @staticmethod
-    def _read_first_line(path: str) -> Optional[str]:
+    def _read_first_line(path: str) -> str | None:
         try:
             with open(path, encoding="ascii", errors="replace") as fh:
                 return fh.readline().strip()
@@ -858,7 +856,7 @@ class _CgroupV2Reader:
             return None
 
     @staticmethod
-    def _read_stat_field(path: str, field: str) -> Optional[int]:
+    def _read_stat_field(path: str, field: str) -> int | None:
         """A ``<field> <value>`` line from a flat keyed file, or ``None``."""
         try:
             with open(path, encoding="ascii", errors="replace") as fh:
@@ -870,11 +868,11 @@ class _CgroupV2Reader:
             return None
         return None
 
-    def memory_limit(self) -> Optional[int]:
+    def memory_limit(self) -> int | None:
         """Lowest ``memory.max`` on the path to the root, or ``None``."""
         if self._dir is None:
             return None
-        limit: Optional[int] = None
+        limit: int | None = None
         for d in self._ancestry():
             raw = self._read_first_line(os.path.join(d, "memory.max"))
             if raw is None or raw == "max":
@@ -887,7 +885,7 @@ class _CgroupV2Reader:
                 limit = value
         return limit
 
-    def memory_used(self) -> Optional[int]:
+    def memory_used(self) -> int | None:
         """``memory.current`` less reclaimable file cache, or ``None``."""
         if self._dir is None:
             return None
@@ -909,11 +907,11 @@ class _CgroupV2Reader:
             current -= inactive
         return max(0, current)
 
-    def cpu_limit(self) -> Optional[float]:
+    def cpu_limit(self) -> float | None:
         """Lowest ``cpu.max`` quota on the path, in CPUs, or ``None``."""
         if self._dir is None:
             return None
-        limit: Optional[float] = None
+        limit: float | None = None
         for d in self._ancestry():
             raw = self._read_first_line(os.path.join(d, "cpu.max"))
             if raw is None:
@@ -935,7 +933,7 @@ class _CgroupV2Reader:
                 limit = value
         return limit
 
-    def cpu_usage_seconds(self) -> Optional[float]:
+    def cpu_usage_seconds(self) -> float | None:
         """Cumulative CPU seconds consumed by our slice, or ``None``."""
         if self._dir is None:
             return None
@@ -976,7 +974,7 @@ class NodeResourceSampler:
     def __init__(self) -> None:
         self._proc: Any = None
         # snapshot() memoisation (see NODE_SNAPSHOT_TTL).
-        self._cache: Optional[dict[str, Any]] = None
+        self._cache: dict[str, Any] | None = None
         self._cache_time = 0.0
         if psutil is not None:
             try:
@@ -991,18 +989,18 @@ class NodeResourceSampler:
         # The CPU reading is a delta between snapshots, so prime it here the
         # same way the psutil counters are primed above.
         self._cgroup = _CgroupV2Reader()
-        self._cgroup_prev_cpu: Optional[tuple[float, float]] = None
+        self._cgroup_prev_cpu: tuple[float, float] | None = None
         if self._cgroup.available:
             usage = self._cgroup.cpu_usage_seconds()
             if usage is not None:
                 self._cgroup_prev_cpu = (usage, time.monotonic())
         # background node history (see start_history): a bounded ring of
         # [t, cpu%, mem%] points feeding the dashboard's node chart.
-        self._history: Optional[deque[list[float]]] = None
+        self._history: deque[list[float]] | None = None
         self._history_interval = NODE_HISTORY_INTERVAL
-        self._history_task: Optional[asyncio.Task] = None
+        self._history_task: asyncio.Task | None = None
 
-    def snapshot(self) -> Optional[dict[str, Any]]:
+    def snapshot(self) -> dict[str, Any] | None:
         """Current node CPU%/memory (+ this daemon's own), or ``None``."""
         if psutil is None:
             return None
@@ -1139,15 +1137,13 @@ class NodeResourceSampler:
                         ]
                     )
                 await asyncio.sleep(self._history_interval)
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - history must never crash the loop
             logger.warning(
                 "node history sampler stopped on an unexpected error",
                 exc_info=True,
             )
 
-    def history(self) -> Optional[dict[str, Any]]:
+    def history(self) -> dict[str, Any] | None:
         """The retained node history, or ``None`` when never started.
 
         ``points`` is oldest-first ``[t, cpu%, mem%]``; ``interval`` is the
@@ -1164,7 +1160,7 @@ class NodeResourceSampler:
 
 def resolve_node_history_config(
     web_config: dict[str, Any],
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Resolve the raw ``web.nodeHistory`` option into effective settings.
 
     Returns ``None`` when disabled, else ``{"interval", "points"}``.  Enabled

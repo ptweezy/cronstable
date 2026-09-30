@@ -490,6 +490,41 @@ def test_ca_and_client_cert_files_resolve_against_the_kubeconfig_dir(
     assert t.b.tls_files_changed() is True
 
 
+@pytest.mark.parametrize("victim", ["ca", "cert", "key", "kubeconfig"])
+def test_tls_files_not_loadable_mid_rotation(tmp_path, victim):
+    # start_stop_cluster consults this before tearing the running backend
+    # down for a rotation: a half-written file must keep the healthy one.
+    material = _write_tls(tmp_path, cn="kube-ca", suffix="client")
+    t = _loaded(
+        tmp_path,
+        cluster={"certificate-authority": material["ca"]},
+        user={
+            "client-certificate": material["cert"],
+            "client-key": material["key"],
+        },
+    )
+    assert t.b.tls_files_loadable() is True
+    path = t.b.kubeconfig if victim == "kubeconfig" else material[victim]
+    with open(path, "w") as handle:
+        handle.write("{")
+    assert t.b.tls_files_loadable() is False
+
+
+def test_in_cluster_ca_not_loadable_mid_rotation(tmp_path, monkeypatch):
+    monkeypatch.setattr(kubernetes_backend, "_SA_DIR", str(tmp_path))
+    material = _write_tls(tmp_path, cn="kube-ca", suffix="client")
+    ca = tmp_path / "ca.crt"
+    with open(material["ca"], "rb") as handle:
+        ca.write_bytes(handle.read())
+    b = _backend()
+    # nothing tracked yet: nothing on disk to dry-run
+    assert b.tls_files_loadable() is True
+    b._record_tls_files([str(ca)])
+    assert b.tls_files_loadable() is True
+    ca.write_text("")
+    assert b.tls_files_loadable() is False
+
+
 async def test_embedded_data_material_uses_temp_files_removed_on_close(
     tmp_path,
 ):

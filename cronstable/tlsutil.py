@@ -22,7 +22,6 @@ import ssl
 from collections.abc import Callable, Mapping, Sequence
 from typing import (
     Any,
-    Optional,
 )
 
 # The keys of a listener `tls:` block, in the order the rotation check stats
@@ -40,7 +39,7 @@ LISTENER_TLS_KEYS = ("cert", "key", "clientCa")
 JOB_API_TLS_KEYS = ("cert", "key")
 
 
-def listener_tls_configured(tls: Optional[Mapping[str, Any]]) -> bool:
+def listener_tls_configured(tls: Mapping[str, Any] | None) -> bool:
     """Whether a ``tls`` block actually names material to serve.
 
     A `tls:` block can be PRESENT but empty of values: strictyaml maps a
@@ -64,7 +63,7 @@ def build_listener_ssl_context(
     cert: str,
     key: str,
     *,
-    client_ca: Optional[str] = None,
+    client_ca: str | None = None,
 ) -> ssl.SSLContext:
     """A server context serving ``cert``/``key``.
 
@@ -134,11 +133,11 @@ def build_mutual_client_ssl_context(
 
 def build_verifying_client_ssl_context(
     *,
-    ca: Optional[str] = None,
-    cert: Optional[str] = None,
-    key: Optional[str] = None,
+    ca: str | None = None,
+    cert: str | None = None,
+    key: str | None = None,
     insecure: bool = False,
-) -> Optional[ssl.SSLContext]:
+) -> ssl.SSLContext | None:
     """A client context for the CLI clients, or ``None`` for "library default".
 
     ``ca`` pins a private trust anchor (an internally-issued or self-signed
@@ -178,7 +177,7 @@ def build_verifying_client_ssl_context(
 # --------------------------------------------------------------------------
 
 
-def file_signature(path: str) -> Optional[tuple[int, int]]:
+def file_signature(path: str) -> tuple[int, int] | None:
     """``(st_mtime_ns, st_size)`` for ``path``, or ``None`` if it cannot be
     stat'ed.
 
@@ -197,7 +196,7 @@ def file_signature(path: str) -> Optional[tuple[int, int]]:
 
 def tls_file_signature(
     tls: Mapping[str, Any], keys: Sequence[str]
-) -> dict[str, Optional[tuple[int, int]]]:
+) -> dict[str, tuple[int, int] | None]:
     """A cheap on-disk fingerprint of the ``keys`` named in ``tls``.
 
     An SSL context is built once and loads the certificate and key into
@@ -210,7 +209,7 @@ def tls_file_signature(
     An absent or ``None`` entry (an optional ``clientCa``) records ``None``
     rather than raising, so an optional-material block is safe to pass whole.
     """
-    out: dict[str, Optional[tuple[int, int]]] = {}
+    out: dict[str, tuple[int, int] | None] = {}
     for key in keys:
         path = tls.get(key)
         out[key] = file_signature(path) if path else None
@@ -235,7 +234,7 @@ def contexts_loadable(*builders: Callable[[], ssl.SSLContext]) -> bool:
     return True
 
 
-def listener_tls_loadable(tls: Optional[Mapping[str, Any]]) -> bool:
+def listener_tls_loadable(tls: Mapping[str, Any] | None) -> bool:
     """Whether a ``{cert, key, clientCa?}`` block loads into a server context
     right now.
 

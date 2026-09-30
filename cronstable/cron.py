@@ -31,7 +31,6 @@ from typing import (
     Any,
     Generic,
     NamedTuple,
-    Optional,
     TypeVar,
 )
 from urllib.parse import urlparse
@@ -373,7 +372,7 @@ WEB_PAIR_LINK_FALLBACK = "https://relay.cronstable.com/pair"
 # tests/test_openapi.py diffs it (plus _WEB_SCOPE_OVERRIDES' keys) against
 # docs/openapi.yaml. Rows keep registration order; append conditional
 # groups at the end.
-WEB_ROUTES: "tuple[tuple[str, str, str, Optional[str]], ...]" = (
+WEB_ROUTES: "tuple[tuple[str, str, str, str | None], ...]" = (
     ("GET", "/version", "_web_get_version", None),
     ("GET", "/job-set-id", "_web_job_set_id", None),
     ("GET", "/cluster", "_web_get_cluster", None),
@@ -519,7 +518,7 @@ def _accepts_json(request: "web.Request") -> bool:
     return False
 
 
-def _origin_matches_host(origin: str, host: Optional[str]) -> bool:
+def _origin_matches_host(origin: str, host: str | None) -> bool:
     """Whether a browser ``Origin`` header names this request's own ``Host``.
 
     The same-origin test behind the CSRF/DNS-rebinding gate. Compares
@@ -565,7 +564,7 @@ class ApiActionError(Exception):
         self.status = status
 
 
-def _strip_headers(headers: Optional[Any], *names: str) -> dict[str, str]:
+def _strip_headers(headers: Any | None, *names: str) -> dict[str, str]:
     """A fresh dict of ``headers`` minus ``names``, case-insensitively.
 
     ``names`` must be given lowercase.  ``None`` or an empty mapping
@@ -580,7 +579,7 @@ def _strip_headers(headers: Optional[Any], *names: str) -> dict[str, str]:
     }
 
 
-def _strip_content_type(headers: Optional[Any]) -> dict[str, str]:
+def _strip_content_type(headers: Any | None) -> dict[str, str]:
     """The mapping minus any Content-Type, in any spelling.
 
     An endpoint's own Content-Type wins over an operator-configured
@@ -612,7 +611,7 @@ def _error_body(message: str) -> str:
 def _api_error(
     factory: "type[web.HTTPException]",
     message: str,
-    headers: Optional[Any] = None,
+    headers: Any | None = None,
 ) -> web.HTTPException:
     """An aiohttp error response carrying the uniform JSON envelope.
 
@@ -630,7 +629,7 @@ def _api_error(
 
 
 def _http_for_action_error(
-    ex: "ApiActionError", headers: Optional[Any] = None
+    ex: "ApiActionError", headers: Any | None = None
 ) -> web.HTTPException:
     """Map an :class:`ApiActionError` to the matching aiohttp response.
 
@@ -642,6 +641,7 @@ def _http_for_action_error(
         403: web.HTTPForbidden,
         404: web.HTTPNotFound,
         409: web.HTTPConflict,
+        503: web.HTTPServiceUnavailable,
     }
     factory = status_map.get(ex.status, web.HTTPBadRequest)
     return _api_error(factory, ex.message, headers)
@@ -723,8 +723,6 @@ async def _error_envelope_middleware(request, handler):
             headers=headers,
             content_type="application/json",
         )
-    except asyncio.CancelledError:
-        raise  # a disconnected client is not an error to report
     except asyncio.TimeoutError:
         # a store call that outran its budget: aiohttp would answer 500,
         # but the accurate status is a gateway timeout, and either way the
@@ -817,20 +815,20 @@ class JobRunInfo:
     # "success" | "failure" | "cancelled" | "skipped" (a pause held the slot
     # back) | "unknown" (rehydrated row whose outcome did not survive)
     outcome: str
-    exit_code: Optional[int]
-    started_at: Optional[datetime.datetime]
+    exit_code: int | None
+    started_at: datetime.datetime | None
     finished_at: datetime.datetime
-    fail_reason: Optional[str]
+    fail_reason: str | None
     output: JobOutputStream
     # sampled CPU time + peak RSS when the job opted into monitorResources;
     # None otherwise. The reaper fills it from the finished RunningJob.
-    resource_usage: Optional[ResourceUsage] = None
-    verification: Optional[dict[str, Any]] = None
+    resource_usage: ResourceUsage | None = None
+    verification: dict[str, Any] | None = None
     # why a synthetic "skipped" row exists ("paused"); None for real runs.
-    skip_reason: Optional[str] = None
+    skip_reason: str | None = None
     # Elapsed seconds, derived once at construction (both operands are
     # immutable). compare=False keeps equality over the recorded fields.
-    duration: Optional[float] = field(default=None, init=False, compare=False)
+    duration: float | None = field(default=None, init=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.started_at is not None:
@@ -1003,8 +1001,8 @@ def _run_stats(runs: list[JobRunInfo]) -> dict[str, Any]:
     # leaves these all None/absent so the dashboard hides the section.
     cpu_totals: list[float] = []
     rss_values: list[int] = []
-    newest: Optional[JobRunInfo] = None
-    newest_key: Optional[datetime.datetime] = None
+    newest: JobRunInfo | None = None
+    newest_key: datetime.datetime | None = None
     # One walk over `runs`: the trends builder folds five windows of up to
     # TREND_SCAN_LIMIT records per build, so each extra pass over the list
     # is paid five times over.  The sums and extremes run over the collected
@@ -1112,7 +1110,7 @@ def _activity_jobs(
     }
 
 
-def _parse_iso_utc(value: Any) -> Optional[datetime.datetime]:
+def _parse_iso_utc(value: Any) -> datetime.datetime | None:
     """Parse an ISO-8601 string to an AWARE datetime, or ``None``.
 
     Ledger records written by cronstable are always aware UTC, but the parsers
@@ -1136,7 +1134,7 @@ def _parse_iso_utc(value: Any) -> Optional[datetime.datetime]:
 
 def _in_pause_window(
     when: datetime.datetime,
-    window: tuple[Optional[datetime.datetime], datetime.datetime],
+    window: tuple[datetime.datetime | None, datetime.datetime],
 ) -> bool:
     """Whether ``when`` falls inside a durable pause window.
 
@@ -1279,8 +1277,8 @@ def _retry_armed_at(
 
 
 def _job_run_info_from_dict(
-    rec: dict[str, Any], *, output: Optional[JobOutputStream] = None
-) -> Optional["JobRunInfo"]:
+    rec: dict[str, Any], *, output: JobOutputStream | None = None
+) -> "JobRunInfo | None":
     """Rebuild a :class:`JobRunInfo` from a durable ledger record.
 
     Inverse of :meth:`JobRunInfo.to_dict`, used to warm in-memory history
@@ -1397,7 +1395,7 @@ def _json_response(
     payload: Any,
     *,
     status: int = 200,
-    headers: Optional[Any] = None,
+    headers: Any | None = None,
 ) -> web.Response:
     """A JSON ``web.Response`` serialized with the orjson-accelerated encoder.
 
@@ -1474,17 +1472,17 @@ class _ResponseMemo(Generic[_ProductT]):
 
     def __init__(self) -> None:
         # (loop.time stamp, product) of the newest stored build, or None
-        self.cached: Optional[tuple[float, _ProductT]] = None
+        self.cached: tuple[float, _ProductT] | None = None
         # the in-flight build's future, for followers to join
-        self.inflight: Optional["asyncio.Future[Optional[_ProductT]]"] = None
+        self.inflight: "asyncio.Future[_ProductT | None] | None" = None
         # the _memo_gen the in-flight build registered under; a joiner
         # compares it against the current one before trusting the product
         self.inflight_gen = 0
 
     def finish(
         self,
-        fut: "asyncio.Future[Optional[_ProductT]]",
-        product: Optional[_ProductT],
+        fut: "asyncio.Future[_ProductT | None]",
+        product: _ProductT | None,
     ) -> None:
         """Release the single-flight slot and wake this build's followers.
 
@@ -1499,7 +1497,7 @@ class _ResponseMemo(Generic[_ProductT]):
             fut.set_result(product)
 
 
-def _etag_matches(header: Optional[str], etag: str) -> bool:
+def _etag_matches(header: str | None, etag: str) -> bool:
     """Whether an ``If-None-Match`` header carries ``etag``.
 
     Handles the comma-separated list form, the ``*`` wildcard, and a
@@ -1520,7 +1518,7 @@ def _etag_matches(header: Optional[str], etag: str) -> bool:
     return False
 
 
-def _accepts_gzip(header: Optional[str]) -> bool:
+def _accepts_gzip(header: str | None) -> bool:
     """Whether a client's ``Accept-Encoding`` positively allows gzip.
 
     A bare substring test would also match ``gzip;q=0``, which is the wire
@@ -1562,7 +1560,7 @@ def _gzip_body(body: bytes) -> bytes:
 def _jobs_response_product(
     payload: list[dict[str, Any]],
     next_fire: dict[str, datetime.datetime],
-) -> tuple[str, bytes, Optional[bytes]]:
+) -> tuple[str, bytes, bytes | None]:
     """The full /jobs response product: ETag, body, and gzipped body.
 
     The tag hashes a CANONICAL variant with the volatile relative
@@ -1601,13 +1599,13 @@ def _jobs_response_product(
 
 
 def _conditional_response(
-    etag: Optional[str],
+    etag: str | None,
     body: bytes,
-    gz: Optional[bytes],
+    gz: bytes | None,
     *,
-    if_none_match: Optional[str],
+    if_none_match: str | None,
     gzip_ok: bool,
-    headers: Optional[Any] = None,
+    headers: Any | None = None,
 ) -> web.Response:
     """The ONE conditional-serve tail for the memoized JSON endpoints.
 
@@ -1640,9 +1638,9 @@ def _conditional_response(
 def _cachable_json_response(
     payload: Any,
     *,
-    if_none_match: Optional[str],
+    if_none_match: str | None,
     gzip_ok: bool,
-    headers: Optional[Any] = None,
+    headers: Any | None = None,
     use_etag: bool = True,
 ) -> web.Response:
     """A :func:`_json_response` that can 304 and gzip, for the poll fan-out.
@@ -1686,7 +1684,7 @@ def _cachable_json_response(
 
 def _cachable_json_product(
     payload: Any,
-) -> tuple[str, bytes, Optional[bytes]]:
+) -> tuple[str, bytes, bytes | None]:
     """A memoized JSON endpoint's product: ETag, body, and gzipped body.
 
     Plain sibling of :func:`_jobs_response_product`: the tag hashes the
@@ -1716,7 +1714,7 @@ def _metrics_response_product(
     render: Callable[..., str],
     families: Any,
     openmetrics: bool,
-) -> tuple[bytes, Optional[bytes]]:
+) -> tuple[bytes, bytes | None]:
     """The full /metrics response product: body bytes and gzipped body.
 
     Pure over ``families`` (a freshly built list referenced by nobody
@@ -1761,7 +1759,7 @@ def naturaltime(seconds: float) -> str:
     return "in {} day{}".format(int(days), "s" if days >= 2 else "")
 
 
-def get_now(timezone: Optional[datetime.tzinfo]) -> datetime.datetime:
+def get_now(timezone: datetime.tzinfo | None) -> datetime.datetime:
     return datetime.datetime.now(timezone)
 
 
@@ -1777,7 +1775,7 @@ async def _noop_state_write() -> None:
 
 def next_sleep_interval(
     subminute: bool = False,
-    now: Optional[datetime.datetime] = None,
+    now: datetime.datetime | None = None,
 ) -> float:
     """Seconds to sleep until the next scheduling tick.
 
@@ -1799,7 +1797,7 @@ def next_sleep_interval(
 
 
 def schedule_slot(
-    job: JobConfig, now: Optional[datetime.datetime] = None
+    job: JobConfig, now: datetime.datetime | None = None
 ) -> datetime.datetime:
     """The scheduling instant to test ``job`` against on this tick.
 
@@ -1827,9 +1825,9 @@ def schedule_slot(
 
 
 #: Built once, on the first web start (see :func:`_access_log_class`).
-_ACCESS_LOG_CLASS: Optional[type] = None
+_ACCESS_LOG_CLASS: type | None = None
 #: Built once, on the first held listener (see :func:`_held_site_class`).
-_HELD_SITE_CLASS: Optional[type] = None
+_HELD_SITE_CLASS: type | None = None
 
 
 def _redact_query_token(path_qs: str) -> str:
@@ -2004,8 +2002,8 @@ def _held_listen_keys(listen: Iterable[str]) -> set[tuple[str, int]]:
 def web_site_from_url(
     runner: web.AppRunner,
     url: str,
-    ssl_context: Optional[ssl.SSLContext] = None,
-    held: Optional[_HeldListeners] = None,
+    ssl_context: ssl.SSLContext | None = None,
+    held: _HeldListeners | None = None,
 ) -> web.BaseSite:
     """One listener for ``url``, TLS-wrapped when the url says ``https``.
 
@@ -2094,7 +2092,7 @@ class _StopEvent(asyncio.Event):
 
 
 def _parse_guarded(
-    config_arg: str, guard: Optional[Callable[[str], None]]
+    config_arg: str, guard: Callable[[str], None] | None
 ) -> tuple[CronstableConfig, frozenset[str]]:
     """Parse ``config_arg`` after the optional ``guard`` accepts it.
 
@@ -2110,10 +2108,10 @@ def _parse_guarded(
 class Cron:
     def __init__(
         self,
-        config_arg: Optional[str],
+        config_arg: str | None,
         *,
-        config_yaml: Optional[str] = None,
-        config_guard: Optional[Callable[[str], None]] = None,
+        config_yaml: str | None = None,
+        config_guard: Callable[[str], None] | None = None,
     ) -> None:
         # Prometheus accumulators (GET /metrics); owned here so counters
         # survive web-app restarts, and created before update_config.
@@ -2161,16 +2159,16 @@ class Cron:
         # _shared_response_product, busting in _bust_response_memos.
         # /metrics keeps one memo per exposition format.
         self._jobs_response_memo: _ResponseMemo[
-            tuple[str, bytes, Optional[bytes]]
+            tuple[str, bytes, bytes | None]
         ] = _ResponseMemo()
         self._metrics_response_memo: dict[
-            bool, "_ResponseMemo[tuple[bytes, Optional[bytes]]]"
+            bool, "_ResponseMemo[tuple[bytes, bytes | None]]"
         ] = {False: _ResponseMemo(), True: _ResponseMemo()}
         self._fleet_response_memo: _ResponseMemo[
-            tuple[str, bytes, Optional[bytes]]
+            tuple[str, bytes, bytes | None]
         ] = _ResponseMemo()
         self._activity_response_memo: _ResponseMemo[
-            tuple[str, bytes, Optional[bytes]]
+            tuple[str, bytes, bytes | None]
         ] = _ResponseMemo()
         # The MCP cron_query_metrics snapshot: the same universe /metrics
         # renders, materialised once per window and filtered per call. It
@@ -2254,24 +2252,24 @@ class Cron:
         self._dead_schedules: set[str] = set()
         # wall-clock minute of the last housekeeping pass; gates that work
         # to once per minute even when sub-minute jobs wake the loop.
-        self._last_housekeeping_minute: Optional[datetime.datetime] = None
+        self._last_housekeeping_minute: datetime.datetime | None = None
         # Config-reload skip cache: sources, stat fingerprint, and the
         # config produced; reload_config skips the reparse when the
         # fingerprint is unchanged.
         self._config_sources: frozenset[str] = frozenset()
-        self._config_sig: Optional[tuple] = None
-        self._last_config: Optional[CronstableConfig] = None
+        self._config_sig: tuple | None = None
+        self._last_config: CronstableConfig | None = None
         # Run the Windows service host's ownership check before every
         # file parse, including startup (see _parse_guarded).
         self._config_guard = config_guard
         # the optional `notify:` block; None keeps job-runs-only reporting.
         # Set in both the config_yaml (test) path below and _apply_reload.
-        self._notify_config: Optional[dict[str, Any]] = None
+        self._notify_config: dict[str, Any] | None = None
         # the `push:` section's running service and its source config,
         # managed by start_stop_push; also published module-globally
         # (push.set_service) for the stateless reporter singletons.
-        self._push_service: Optional[push.PushService] = None
-        self._applied_push_config: Optional[dict[str, Any]] = None
+        self._push_service: push.PushService | None = None
+        self._applied_push_config: dict[str, Any] | None = None
         # the opt-in Bonjour/mDNS advert; follows the web app's lifecycle.
         self._bonjour = discovery.BonjourAdvertiser()
         # cluster-wide concurrency slots: lease per running slot-gated job,
@@ -2298,7 +2296,7 @@ class Cron:
         # (None when unreadable) pins the pid's identity so a recycled
         # pid never counts. Declared above the config load and pruned in
         # _apply_reload with the other per-job maps.
-        self._boot_survivors: dict[str, tuple[int, Optional[float]]] = {}
+        self._boot_survivors: dict[str, tuple[int, float | None]] = {}
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -2351,16 +2349,16 @@ class Cron:
         # BEFORE aiohttp's shutdown wait: a tail never finishes on its own
         # and would freeze teardown for the full 60s timeout. None marks an
         # app whose teardown has begun, which refuses new tails.
-        self._web_sse_queues: dict[Any, Optional[set[asyncio.Queue]]] = {}
+        self._web_sse_queues: dict[Any, set[asyncio.Queue] | None] = {}
         # the leadership backend, when a cluster section is configured
-        self.cluster_manager: Optional[LeadershipBackend] = None
+        self.cluster_manager: LeadershipBackend | None = None
         # optional election-inert second gossip manager so non-gossip
         # clusters can share fleet data; None when unused (with backend:
         # gossip the election mesh already IS the fleet backend).
-        self.observability_mesh: Optional[LeadershipBackend] = None
+        self.observability_mesh: LeadershipBackend | None = None
         # durable state backend when a `state` section is configured; None
         # keeps the classic stateless behavior.
-        self.state_backend: Optional[StateBackend] = None
+        self.state_backend: StateBackend | None = None
         # in-flight fire-and-forget durable writes, tracked so they are not
         # GC'd mid-flight and can be flushed at shutdown; durability never
         # gates the loop.
@@ -2403,10 +2401,10 @@ class Cron:
         # instant of the FIRST catch-up evaluation: deferred retries count
         # missed slots against this, not a later "now" (the live scheduler
         # ran statelessly in between).
-        self._catchup_reference: Optional[datetime.datetime] = None
+        self._catchup_reference: datetime.datetime | None = None
         # in-flight catch-up evaluation; a background task, never inline
         # (a slow mount must degrade catch-up, not delay launches).
-        self._catchup_eval_task: Optional[asyncio.Task] = None
+        self._catchup_eval_task: asyncio.Task | None = None
         # Resume windows are separate from the fixed startup reference.
         # Keep disjoint gaps separate: merging across ordinary live fires
         # would replay those fires under run-all. Bounded per job.
@@ -2445,7 +2443,7 @@ class Cron:
         self._retry_claim_next = 0.0
         # the in-flight GC pass, if any (single-flight; a slow store must
         # not stack passes).
-        self._gc_task: Optional[asyncio.Task] = None
+        self._gc_task: asyncio.Task | None = None
         # newest in-flight retry-ladder write per job, so a settle chains
         # after its pending: unordered appends could land inverted and
         # resurrect a consumed retry on the next boot.
@@ -2456,7 +2454,7 @@ class Cron:
         self._pause_write_tail: dict[str, asyncio.Task] = {}
         # the in-flight housekeeping refresh of the paused/ streams, if any
         # (single-flight; a slow store must not stack refresh passes).
-        self._pause_refresh_task: Optional[asyncio.Task] = None
+        self._pause_refresh_task: asyncio.Task | None = None
         # same ordering guard for the inflight/ stream: a near-instant
         # run's close could sort BEFORE its open, which the next restart
         # would reconcile as a spurious interrupted run.
@@ -2509,18 +2507,18 @@ class Cron:
         # lock-fidelity latch for the slot gate: None until probed, "" when
         # locks behave, else the reason they cannot be trusted. Reset when
         # the backend is rebuilt.
-        self._slot_fidelity: Optional[str] = None
+        self._slot_fidelity: str | None = None
         # store_identity of the store holding this process's slot leases;
         # kept across a failed restart so a move or section removal during
         # that outage still drops them.
-        self._slot_store: Optional[tuple[str, str]] = None
+        self._slot_store: tuple[str, str] | None = None
         # the in-flight cross-node retry claim scan, if any (single-flight;
         # see _retry_claim_scan).
-        self._retry_claim_task: Optional[asyncio.Task] = None
+        self._retry_claim_task: asyncio.Task | None = None
         # the loopback job-state API, built when state.jobApi starts and
         # torn down with the backend; None keeps the classic behavior (no
         # endpoint, no injected CRONSTABLE_STATE_* env).
-        self._job_api: Optional["JobStateAPI"] = None
+        self._job_api: "JobStateAPI | None" = None
         # job-API analogue of _web_tls_signature (same in-place-rotation
         # rationale); cleared by _stop_job_api.
         self._job_api_tls_signature: dict[str, Any] | None = None
@@ -2539,7 +2537,7 @@ class Cron:
         )
 
         startup = True
-        applied_logging_config: Optional[LoggingConfig] = None
+        applied_logging_config: LoggingConfig | None = None
         while not self._stop_event.is_set():
             # Housekeeping runs at most once per wall-clock minute even when
             # a sub-minute schedule ticks faster. In pure minute-tick mode
@@ -2550,7 +2548,7 @@ class Cron:
             )
             # None when housekeeping is skipped or the reload failed; on
             # failure we keep running the previously loaded jobs.
-            config: Optional[CronstableConfig] = None
+            config: CronstableConfig | None = None
             if (
                 startup
                 or not self._wakes_subminute()
@@ -2610,7 +2608,7 @@ class Cron:
                 ):
                     try:
                         logging.config.dictConfig(config.logging_config)
-                    except Exception as ex:
+                    except Exception as ex:  # noqa: BLE001 - never fatal
                         logger.error(
                             "Error while configuring logging: %s\n"
                             "Check for correct format at "
@@ -3207,7 +3205,7 @@ class Cron:
 
     async def _build_fleet_product(
         self,
-    ) -> tuple[str, bytes, Optional[bytes]]:
+    ) -> tuple[str, bytes, bytes | None]:
         # the merge reads live gossip state so it stays on the loop; the
         # product over the merged dict is pure and offloads for a large
         # fleet (see _FLEET_SERIALIZE_OFFLOAD_MIN).
@@ -3321,7 +3319,7 @@ class Cron:
             # so exactly one waiter (the first to see the free slot)
             # self-promotes and the rest join its build
         gen = self._memo_gen
-        fut: "asyncio.Future[Optional[_ProductT]]" = loop.create_future()
+        fut: "asyncio.Future[_ProductT | None]" = loop.create_future()
         memo.inflight = fut
         memo.inflight_gen = gen
         try:
@@ -3391,7 +3389,7 @@ class Cron:
 
     async def _metrics_product(
         self, openmetrics: bool
-    ) -> tuple[bytes, Optional[bytes]]:
+    ) -> tuple[bytes, bytes | None]:
         """One shared ``/metrics`` product (body, gz) per exposition format.
 
         The TTL global is read at call time, not bound at definition, so a
@@ -3406,7 +3404,7 @@ class Cron:
 
     async def _build_metrics_product(
         self, openmetrics: bool
-    ) -> tuple[bytes, Optional[bytes]]:
+    ) -> tuple[bytes, bytes | None]:
         # The family build reads live scheduler state, so it stays on the
         # loop; the render and the compression are pure over that
         # freshly-built list, so a large job set does both on the executor
@@ -3542,8 +3540,8 @@ class Cron:
         """
         now = get_now(datetime.timezone.utc)
         total = enabled = running = paused = failing = never_fires = 0
-        soonest_name: Optional[str] = None
-        soonest_in: Optional[float] = None
+        soonest_name: str | None = None
+        soonest_in: float | None = None
         for name, job in self.cron_jobs.items():
             total += 1
             is_running = bool(self.running_jobs.get(name))
@@ -3587,7 +3585,7 @@ class Cron:
                 soonest_name = name
         mgr = self.cluster_manager
         node_name = self._node_name()
-        next_fire: Optional[dict[str, Any]] = None
+        next_fire: dict[str, Any] | None = None
         if soonest_name is not None and soonest_in is not None:
             when = self._next_fire.get(soonest_name)
             next_fire = {
@@ -3833,7 +3831,7 @@ class Cron:
         )
 
     async def start_stop_push(
-        self, push_config: Optional[dict[str, Any]]
+        self, push_config: dict[str, Any] | None
     ) -> None:
         """Converge the push service onto ``push_config``, never raising.
 
@@ -3851,9 +3849,7 @@ class Cron:
                 "it was and continuing the housekeeping pass"
             )
 
-    async def _converge_push(
-        self, push_config: Optional[dict[str, Any]]
-    ) -> None:
+    async def _converge_push(self, push_config: dict[str, Any] | None) -> None:
         """The convergence itself; see :meth:`start_stop_push`."""
         if push_config == self._applied_push_config and (
             push_config is None
@@ -3891,7 +3887,7 @@ class Cron:
         logger.info("push: service running (registry %s)", store.describe())
 
     @staticmethod
-    def _zone_from_name(tz_name: Optional[str]) -> datetime.tzinfo:
+    def _zone_from_name(tz_name: str | None) -> datetime.tzinfo:
         """A ``?tz=`` query value as a tzinfo (UTC when absent).
 
         Raises ValueError for an unknown name; the handlers turn that
@@ -3908,7 +3904,7 @@ class Cron:
             raise ValueError("unknown timezone: {}".format(tz_name)) from None
 
     @staticmethod
-    def _timezone_error(tz_name: Optional[str]) -> Optional[str]:
+    def _timezone_error(tz_name: str | None) -> str | None:
         """The 400 message for a bad ``?tz=`` value, or None when valid.
 
         Built from the requested name, never the caught exception (whose
@@ -3924,7 +3920,7 @@ class Cron:
         return None
 
     @staticmethod
-    def _period_error(period: str) -> Optional[str]:
+    def _period_error(period: str) -> str | None:
         """The 400 message for an unsupported ``?period=`` value, or
         ``None`` when it is valid.
 
@@ -3975,9 +3971,9 @@ class Cron:
     def schedule_preview_payload(
         self,
         expr: str,
-        tz_name: Optional[str] = None,
+        tz_name: str | None = None,
         count: int = 12,
-        seed: Optional[str] = None,
+        seed: str | None = None,
     ) -> dict[str, Any]:
         """Parse, describe, preview and lint one schedule expression.
 
@@ -4066,7 +4062,7 @@ class Cron:
         )
         return _json_response(payload, headers=headers)
 
-    def _job_or_dag_schedule(self, name: str) -> Optional[JobConfig]:
+    def _job_or_dag_schedule(self, name: str) -> JobConfig | None:
         """The named job, or a DAG's synthetic ``dag:<name>`` schedule job.
 
         DAG schedule jobs launch real work on real instants, so "why did
@@ -4084,7 +4080,7 @@ class Cron:
 
     def schedule_why_payload(
         self, name: str, at: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Why a job's schedule did (not) select a timestamp
         (``GET /schedule/why``, MCP ``cron_why_no_run``).
 
@@ -4100,7 +4096,7 @@ class Cron:
         # a schedule match says nothing about whether the fire would LAUNCH:
         # an active pause skips it, so the answer must carry that fact.
         pause = self._pause_active(name)
-        pause_note: Optional[dict[str, str]] = None
+        pause_note: dict[str, str] | None = None
         if pause is not None:
             message = "job is paused until {} (by {})".format(
                 pause.until.isoformat(), pause.by
@@ -4256,8 +4252,8 @@ class Cron:
     def schedule_pressure_payload(
         self,
         hours: int = 24,
-        tz_name: Optional[str] = None,
-        entries: Optional[list[ScheduleEntry]] = None,
+        tz_name: str | None = None,
+        entries: list[ScheduleEntry] | None = None,
     ) -> dict[str, Any]:
         """The fleet collision heatmap (``GET /schedule/pressure``).
 
@@ -4291,7 +4287,7 @@ class Cron:
         return payload
 
     def schedule_duplicates_payload(
-        self, entries: Optional[list[ScheduleEntry]] = None
+        self, entries: list[ScheduleEntry] | None = None
     ) -> dict[str, Any]:
         """Semantically identical schedules (``GET /schedule/duplicates``).
 
@@ -4312,8 +4308,8 @@ class Cron:
     def schedule_suggest_payload(
         self,
         period: str = "hourly",
-        tz_name: Optional[str] = None,
-        entries: Optional[list[ScheduleEntry]] = None,
+        tz_name: str | None = None,
+        entries: list[ScheduleEntry] | None = None,
     ) -> dict[str, Any]:
         """The least-loaded slot for a new job (``GET /schedule/suggest``).
 
@@ -4344,7 +4340,7 @@ class Cron:
         )
 
     async def schedule_pressure_payload_async(
-        self, hours: int = 24, tz_name: Optional[str] = None
+        self, hours: int = 24, tz_name: str | None = None
     ) -> dict[str, Any]:
         """Executor-offloaded :meth:`schedule_pressure_payload`."""
         return await self._schedule_payload_offload(
@@ -4358,7 +4354,7 @@ class Cron:
         )
 
     async def schedule_suggest_payload_async(
-        self, period: str = "hourly", tz_name: Optional[str] = None
+        self, period: str = "hourly", tz_name: str | None = None
     ) -> dict[str, Any]:
         """Executor-offloaded :meth:`schedule_suggest_payload`."""
         return await self._schedule_payload_offload(
@@ -4412,7 +4408,7 @@ class Cron:
         payload = await self.schedule_suggest_payload_async(period, tz)
         return _json_response(payload, headers=headers)
 
-    def _avg_duration(self, name: str) -> Optional[float]:
+    def _avg_duration(self, name: str) -> float | None:
         """Mean runtime in seconds over retained history, or ``None``.
 
         The dashboard's own definition (:func:`_run_stats`'s
@@ -4431,8 +4427,8 @@ class Cron:
         return sum(durations) / len(durations) if durations else None
 
     def _calendar_entries(
-        self, name: Optional[str] = None
-    ) -> Optional[list[CalendarEntry]]:
+        self, name: str | None = None
+    ) -> list[CalendarEntry] | None:
         """The calendar renderer's rows: the fleet, or one job when ``name``.
 
         ``None`` for an unknown job; a known job with no timetable or a
@@ -4467,13 +4463,13 @@ class Cron:
 
     def calendar_payload(
         self,
-        name: Optional[str] = None,
+        name: str | None = None,
         days: int = 14,
         per_job: int = 100,
-        start: Optional[datetime.datetime] = None,
-        now: Optional[datetime.datetime] = None,
-        entries: Optional[list[CalendarEntry]] = None,
-    ) -> Optional[str]:
+        start: datetime.datetime | None = None,
+        now: datetime.datetime | None = None,
+        entries: list[CalendarEntry] | None = None,
+    ) -> str | None:
         """The iCalendar feed text: the fleet, or one job when ``name``.
 
         One VEVENT per upcoming fire over ``[start, start+days)``, from
@@ -4502,7 +4498,7 @@ class Cron:
         )
 
     async def _web_calendar_response(
-        self, name: Optional[str], request: web.Request
+        self, name: str | None, request: web.Request
     ) -> web.Response:
         days = self._web_int_query(request, "days", default=14, lo=1, hi=60)
         per_job = self._web_int_query(
@@ -4542,7 +4538,7 @@ class Cron:
             request.match_info["name"], request
         )
 
-    async def start_job_by_name(self, name: str) -> Optional[str]:
+    async def start_job_by_name(self, name: str) -> str | None:
         """Launch a job now (`POST /jobs/{name}/start`, MCP `cron_run_job`).
 
         Raises :class:`ApiActionError` for an unknown (404) or disabled (409)
@@ -4653,7 +4649,7 @@ class Cron:
         self._paused[name] = info
         self._bust_response_memos()
 
-    def _clear_pause(self, name: str) -> Optional[PauseInfo]:
+    def _clear_pause(self, name: str) -> PauseInfo | None:
         """Drop a pause window; the ONE writer that removes from ``_paused``.
 
         The removing half of :meth:`_set_pause`, under the same funnel
@@ -4670,8 +4666,8 @@ class Cron:
         self,
         name: str,
         *,
-        duration: Optional[int] = None,
-        until: Optional[datetime.datetime] = None,
+        duration: int | None = None,
+        until: datetime.datetime | None = None,
         note: str = "",
         by: str = "api",
         channel: str = "api",
@@ -4775,8 +4771,8 @@ class Cron:
     def _pause_active(
         self,
         name: str,
-        now: Optional[datetime.datetime] = None,
-    ) -> Optional[PauseInfo]:
+        now: datetime.datetime | None = None,
+    ) -> PauseInfo | None:
         """The job's live pause window, or ``None``; expiry enforced HERE.
 
         The one pause read every consumer goes through: expiry is judged
@@ -4867,8 +4863,6 @@ class Cron:
                 backend.list_stream_names(PAUSE_STREAM_PREFIX),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - keep last known state
             logger.warning(
                 "state: cannot refresh pause state (keeping the last known "
@@ -4896,8 +4890,6 @@ class Cron:
                     backend.list_records(stream, limit=1, newest_first=True),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception as ex:  # noqa: BLE001 - keep last known state
                 logger.warning(
                     "state: cannot refresh pause state for %s (keeping the "
@@ -4948,8 +4940,8 @@ class Cron:
 
     @staticmethod
     def _pause_info_from_record(
-        rec: Optional[dict[str, Any]],
-    ) -> Optional[PauseInfo]:
+        rec: dict[str, Any] | None,
+    ) -> PauseInfo | None:
         """Rebuild a :class:`PauseInfo` from a durable ``paused`` record.
 
         ``None`` for anything else on top of the stream (a ``resumed``
@@ -5239,7 +5231,7 @@ class Cron:
         body: Callable[[], Coroutine[Any, Any, None]],
         *,
         spawn: Callable[[Coroutine[Any, Any, None]], asyncio.Task],
-        after: Optional[Iterable[Optional[asyncio.Task]]] = None,
+        after: Iterable[asyncio.Task | None] | None = None,
         bug_log: str | None = None,
     ) -> asyncio.Task:
         """Spawn ``body()`` behind ``name``'s current tail and become the tail.
@@ -5275,8 +5267,6 @@ class Cron:
                 return
             try:
                 await body()
-            except asyncio.CancelledError:
-                raise
             except Exception:  # pragma: no cover - defensive
                 logger.exception(bug_log, name)
 
@@ -5504,8 +5494,8 @@ class Cron:
         name: str,
         job: JobConfig,
         running: bool,
-        now: Optional[datetime.datetime] = None,
-    ) -> Optional[float]:
+        now: datetime.datetime | None = None,
+    ) -> float | None:
         """Seconds until the job's next scheduled run.
 
         ``None`` when not applicable: disabled, currently running, a
@@ -5535,9 +5525,7 @@ class Cron:
             # no future occurrence; the engine's answer would be None too,
             # found only after walking the remaining horizon
             return None
-        seconds: Optional[float] = job.next_delay(
-            get_now(datetime.timezone.utc)
-        )
+        seconds: float | None = job.next_delay(get_now(datetime.timezone.utc))
         return seconds
 
     def _schedule_never_fires(self, name: str, job: JobConfig) -> bool:
@@ -5591,7 +5579,7 @@ class Cron:
         self,
         name: str,
         job: JobConfig,
-        now: Optional[datetime.datetime] = None,
+        now: datetime.datetime | None = None,
     ) -> dict[str, Any]:
         # one instant for the whole payload (a looping caller's pass instant,
         # or a fresh read): scheduled_in, pause expiry and SLA observations
@@ -5820,7 +5808,7 @@ class Cron:
             for name, job in self.cron_jobs.items()
         ]
 
-    def job_detail_payload(self, name: str) -> Optional[dict[str, Any]]:
+    def job_detail_payload(self, name: str) -> dict[str, Any] | None:
         """One job's full dict, or ``None`` when there is no such job."""
         job = self.cron_jobs.get(name)
         if job is None:
@@ -5841,7 +5829,7 @@ class Cron:
 
     async def _build_jobs_product(
         self,
-    ) -> tuple[str, bytes, Optional[bytes]]:
+    ) -> tuple[str, bytes, bytes | None]:
         # Build on the loop (it reads live scheduler state), then hash +
         # serialize off it for a large fleet.  The tag is keyed on the
         # ABSOLUTE next-fire, not the relative scheduled_in, so it stays
@@ -5953,7 +5941,7 @@ class Cron:
         )
 
     def _dag_run_lookup_reason(
-        self, name: str, run_key: Optional[str] = None
+        self, name: str, run_key: str | None = None
     ) -> str:
         """Why a DAG run lookup came back empty.
 
@@ -6031,8 +6019,6 @@ class Cron:
             inv = await asyncio.wait_for(
                 backend.inventory(), timeout=STATE_OP_TIMEOUT
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - degrade to health only
             logger.warning("state: inventory failed (%s)", ex)
             inv = {
@@ -6096,8 +6082,6 @@ class Cron:
             docs = await asyncio.wait_for(
                 backend.list_documents(ns), timeout=STATE_OP_TIMEOUT
             )
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - degrade to empty
             docs = []
         # KV values are stripped to a size/type summary (a KV value is
@@ -6159,8 +6143,6 @@ class Cron:
                 backend.list_records(stream, limit=limit, newest_first=True),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - degrade to empty
             recs = []
         return {"stream": stream, "records": recs}
@@ -6332,7 +6314,7 @@ class Cron:
         default: int,
         lo: int,
         hi: int,
-        alias: Optional[str] = None,
+        alias: str | None = None,
     ) -> int:
         """A clamped integer query param; falls back to ``default`` on a
         missing or unparseable value (a bad query is never a 400 here).
@@ -6367,7 +6349,7 @@ class Cron:
             )
         return body
 
-    def job_runs_payload(self, name: str) -> Optional[dict[str, Any]]:
+    def job_runs_payload(self, name: str) -> dict[str, Any] | None:
         """Retained run history + stats for one job, or ``None`` if unknown.
 
         Behind ``GET /jobs/{name}/runs`` and MCP ``cron_list_runs``.
@@ -6475,7 +6457,7 @@ class Cron:
 
     async def _build_activity_product(
         self, limit: int = RUN_HISTORY_LIMIT
-    ) -> tuple[str, bytes, Optional[bytes]]:
+    ) -> tuple[str, bytes, bytes | None]:
         # Past the /jobs offload gate, the row projection (jobs x runs of
         # dict builds and isoformat calls, the expensive half at fleet
         # scale) rides the SAME executor hop as the serialize/hash/gzip,
@@ -6519,7 +6501,7 @@ class Cron:
 
     def job_resources_payload(
         self, name: str, max_runs: int
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """CPU/RSS series for a job's live + recent runs, or ``None``.
 
         Behind ``GET /jobs/{name}/resources`` and MCP
@@ -6585,7 +6567,7 @@ class Cron:
             )
         return _json_response(payload, headers=self._web_headers())
 
-    async def job_trends_payload(self, name: str) -> Optional[dict[str, Any]]:
+    async def job_trends_payload(self, name: str) -> dict[str, Any] | None:
         """SLA trend aggregates over the durable run ledger, or ``None``.
 
         Behind ``GET /jobs/{name}/trends`` and MCP ``cron_get_job_trends``
@@ -6606,7 +6588,7 @@ class Cron:
             # serve that within the TTL instead of re-scanning up to
             # TREND_SCAN_LIMIT records again (see JOB_TRENDS_CACHE_TTL).
             return cached[1]
-        recs: Optional[list[dict[str, Any]]] = None
+        recs: list[dict[str, Any]] | None = None
         backend = self.state_backend
         if backend is not None:
             try:
@@ -6621,8 +6603,6 @@ class Cron:
                     ),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception as ex:  # noqa: BLE001 - degrade, never 500
                 logger.warning(
                     "state: cannot read the run ledger for trends on %s "
@@ -6648,8 +6628,8 @@ class Cron:
     def _job_trends_build(
         self,
         name: str,
-        recs: Optional[list[dict[str, Any]]],
-        fallback: Optional[list[JobRunInfo]],
+        recs: list[dict[str, Any]] | None,
+        fallback: list[JobRunInfo] | None,
     ) -> dict[str, Any]:
         """Parse and aggregate for :meth:`job_trends_payload` (executor side).
 
@@ -6707,7 +6687,7 @@ class Cron:
             "windows": windows,
         }
 
-    def _job_output(self, name: str) -> Optional[JobOutputStream]:
+    def _job_output(self, name: str) -> JobOutputStream | None:
         # the live output of the most recent running instance, else the last
         # finished run's retained output, else nothing captured yet.
         running = self.running_jobs.get(name) or []
@@ -6718,7 +6698,7 @@ class Cron:
 
     def _dag_task_output(
         self, dag_name: str, run_key: str, taskkey: str
-    ) -> Optional[JobOutputStream]:
+    ) -> JobOutputStream | None:
         """The live output stream of a DAG task instance, or ``None``.
 
         A DAG task runs as a :class:`RunningJob` under the template name
@@ -6859,9 +6839,9 @@ class Cron:
 
     @staticmethod
     def _tail_payload(
-        output: Optional[JobOutputStream],
+        output: JobOutputStream | None,
         tail: int,
-        cursor: Optional[int],
+        cursor: int | None,
     ) -> dict[str, Any]:
         """Poll-friendly snapshot of a retained output buffer.
 
@@ -6897,8 +6877,8 @@ class Cron:
         }
 
     def job_logs_tail_payload(
-        self, name: str, tail: int = 100, cursor: Optional[int] = None
-    ) -> Optional[dict[str, Any]]:
+        self, name: str, tail: int = 100, cursor: int | None = None
+    ) -> dict[str, Any] | None:
         """Last retained log lines of a job, or ``None`` if unknown.
 
         Behind MCP ``cron_tail_job_logs``, the poll/cursor projection of the
@@ -6917,8 +6897,8 @@ class Cron:
         run_key: str,
         taskkey: str,
         tail: int = 100,
-        cursor: Optional[int] = None,
-    ) -> Optional[dict[str, Any]]:
+        cursor: int | None = None,
+    ) -> dict[str, Any] | None:
         """Last retained log lines of a running DAG task instance, or ``None``.
 
         Behind MCP ``cron_tail_dag_task_logs``.  Only a currently-running
@@ -6983,9 +6963,9 @@ class Cron:
 
     def _web_restart_reason(
         self,
-        web_config: Optional[WebConfig],
-        mcp_config: Optional[MCPConfig],
-    ) -> Optional[str]:
+        web_config: WebConfig | None,
+        mcp_config: MCPConfig | None,
+    ) -> str | None:
         """Why the running web app must be torn down, or None to keep it.
 
         The same reason-string triage :meth:`start_stop_cluster` uses, for the
@@ -7040,8 +7020,8 @@ class Cron:
         return reason
 
     def _build_web_tls(
-        self, web_tls: Optional[dict[str, Any]]
-    ) -> "tuple[Optional[ssl.SSLContext], Optional[dict[str, Any]], bool]":
+        self, web_tls: dict[str, Any] | None
+    ) -> "tuple[ssl.SSLContext | None, dict[str, Any] | None, bool]":
         """``(context, file signature, failed)`` for a listener about to start.
 
         On failure the caller must NOT fall back to a plaintext listener and
@@ -7050,8 +7030,8 @@ class Cron:
         and never trying again.
         """
         # Callers gate on tlsutil.listener_tls_configured, so cert and key
-        # are present here; the Optional is only so the guarded call site
-        # type-checks.
+        # are present here; the parameter admits None only so the guarded
+        # call site type-checks.
         assert web_tls is not None
         # Snapshot the files BEFORE loading them: a rotation landing in the
         # gap then compares unequal on the next reload, which is a spurious
@@ -7077,9 +7057,9 @@ class Cron:
 
     async def _web_retiring_runner(
         self,
-        web_config: Optional[WebConfig],
-        mcp_config: Optional[MCPConfig],
-    ) -> Optional[web.AppRunner]:
+        web_config: WebConfig | None,
+        mcp_config: MCPConfig | None,
+    ) -> web.AppRunner | None:
         """The running runner a due restart replaces, or None.
 
         A restart retires the runner only after its replacement is built,
@@ -7105,8 +7085,8 @@ class Cron:
 
     async def start_stop_web_app(
         self,
-        web_config: Optional[WebConfig],
-        mcp_config: Optional[MCPConfig] = None,
+        web_config: WebConfig | None,
+        mcp_config: MCPConfig | None = None,
     ):
         retiring = await self._web_retiring_runner(web_config, mcp_config)
 
@@ -7355,8 +7335,8 @@ class Cron:
                 self._web_tcp_bound.append((scheme, sockname))
 
     def _bonjour_advert(
-        self, web_config: Optional[WebConfig]
-    ) -> Optional[dict[str, Any]]:
+        self, web_config: WebConfig | None
+    ) -> dict[str, Any] | None:
         """The `_cronstable._tcp` advert the current web state calls for.
 
         None whenever there is nothing (or no wish) to advertise: the
@@ -7387,7 +7367,7 @@ class Cron:
 
     def _advertisable_listener(
         self,
-    ) -> Optional[tuple[str, int, Optional[str]]]:
+    ) -> tuple[str, int, str | None] | None:
         """The one (scheme, port, address) worth advertising, or None.
 
         All three must describe the SAME listener: the advert exists to
@@ -7405,7 +7385,7 @@ class Cron:
         interface than the one the socket lives on) and None for a
         wildcard bind, where the advertiser probes the primary address.
         """
-        candidates: list[tuple[str, int, Optional[str]]] = []
+        candidates: list[tuple[str, int, str | None]] = []
         skipped_v6 = False
         for scheme, sockname in self._web_tcp_bound:
             host, port = str(sockname[0]), int(sockname[1])
@@ -7476,7 +7456,7 @@ class Cron:
         )
 
     async def start_stop_cluster(
-        self, cluster_config: Optional[ClusterConfig]
+        self, cluster_config: ClusterConfig | None
     ) -> None:
         # Track the election intent up front so the leader gate can fail closed
         # even if the manager (below) is absent or fails to start.
@@ -7638,7 +7618,7 @@ class Cron:
                 return
             self.cluster_manager = manager
 
-    def node_resource_snapshot(self) -> Optional[dict[str, Any]]:
+    def node_resource_snapshot(self) -> dict[str, Any] | None:
         """This node's live CPU/memory for gossip and GET /node.
 
         The callable installed as the gossip node-stats provider; also used by
@@ -7647,7 +7627,7 @@ class Cron:
         """
         return self._node_sampler.snapshot()
 
-    def _fleet_backend(self) -> Optional[LeadershipBackend]:
+    def _fleet_backend(self) -> LeadershipBackend | None:
         """The backend that answers the fleet view / carries fleet gossip.
 
         The observability overlay mesh when one is running (a lease cluster
@@ -7662,7 +7642,7 @@ class Cron:
         )
 
     async def start_stop_observability(
-        self, cluster_config: Optional[ClusterConfig]
+        self, cluster_config: ClusterConfig | None
     ) -> None:
         """(Re)build the gossip observability overlay to match the config.
 
@@ -7762,9 +7742,7 @@ class Cron:
             task.cancel()
         self._slot_pursuits.clear()
 
-    async def start_stop_state(
-        self, state_config: Optional[StateConfig]
-    ) -> None:
+    async def start_stop_state(self, state_config: StateConfig | None) -> None:
         """(Re)build the durable state backend to match the config.
 
         Rebuilt only when the ``state`` section is added, removed or
@@ -7938,7 +7916,7 @@ class Cron:
         # not a missed one. None for a plaintext endpoint (no cert/key), which
         # therefore never triggers a rotation restart.
         job_api_tls = job_api_cfg.get("tls")
-        tls_signature: Optional[dict[str, Any]] = None
+        tls_signature: dict[str, Any] | None = None
         if tlsutil.listener_tls_configured(job_api_tls):
             # listener_tls_configured is truthy only when cert and key are
             # present, so the block is non-None here; the assert is only so
@@ -7975,9 +7953,7 @@ class Cron:
         except (OSError, asyncio.TimeoutError) as ex:
             logger.warning("state: job API did not stop cleanly: %s", ex)
 
-    def _job_api_tls_files_changed(
-        self, tls: Optional[dict[str, Any]]
-    ) -> bool:
+    def _job_api_tls_files_changed(self, tls: dict[str, Any] | None) -> bool:
         """Whether the running job API's TLS files differ from what it loaded.
 
         The only thing that makes an in-place cert rotation of this
@@ -8183,8 +8159,6 @@ class Cron:
                 backend.list_stream_names(PAUSE_STREAM_PREFIX),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - keep everything on any doubt
             logger.warning(
                 "state: not reclaiming dead pause streams this GC pass: "
@@ -8206,8 +8180,6 @@ class Cron:
                     backend.list_records(stream, limit=1, newest_first=True),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception as ex:  # noqa: BLE001 - keep this one on doubt
                 logger.warning(
                     "state: keeping the pause stream of %s this GC pass "
@@ -8240,8 +8212,6 @@ class Cron:
                 backend.list_stream_names(MANIFEST_STREAM_PREFIX),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning(
                 "state: skipping garbage collection: cannot enumerate the "
@@ -8275,8 +8245,6 @@ class Cron:
                         timeout=STATE_OP_TIMEOUT,
                     )
                 )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning(
                 "state: skipping garbage collection: cannot read the "
@@ -8288,7 +8256,7 @@ class Cron:
         # Prove absence before deleting: unless manifest history spans a
         # full grace window, a job could be missing simply because nobody
         # recorded manifests yet; defer rather than collect.
-        oldest: Optional[datetime.datetime] = None
+        oldest: datetime.datetime | None = None
         for rec in manifests:
             at = _parse_iso_utc(rec.get("at"))
             if at is not None and (oldest is None or at < oldest):
@@ -8348,8 +8316,6 @@ class Cron:
                 ),
                 timeout=STATE_GC_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning("state: garbage collection failed: %s", ex)
             return
@@ -8390,8 +8356,6 @@ class Cron:
                 backend.list_document_namespaces(DAG_RUN_NS_PREFIX),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning(
                 "state: leaving artifact streams unmanaged this GC pass: "
@@ -8422,8 +8386,6 @@ class Cron:
                     run_id = body.get("runId")
                     if run_id:
                         art_scopes.add(xcom_scope(dag_name, str(run_id)))
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning(
                 "state: leaving artifact streams unmanaged this GC pass: "
@@ -8453,8 +8415,6 @@ class Cron:
                 backend.list_stream_names_audit(ARTIFACT_STREAM_PREFIX),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning(
                 "state: skipping the orphan-blob sweep: cannot enumerate "
@@ -8479,8 +8439,6 @@ class Cron:
                 backend.sweep_orphan_blobs(referenced, grace),
                 timeout=STATE_GC_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning(
                 "state: skipping the orphan-blob sweep: an artifact record "
@@ -8532,7 +8490,7 @@ class Cron:
         return token
 
     @staticmethod
-    def _resolve_web_token(web_config: WebConfig) -> Optional[str]:
+    def _resolve_web_token(web_config: WebConfig) -> str | None:
         # The scalar web.authToken: an all-scopes token, or None when not
         # configured. _resolve_web_tokens builds on it.
         auth = web_config.get("authToken")
@@ -8543,7 +8501,7 @@ class Cron:
     @staticmethod
     def _resolve_web_tokens(
         web_config: WebConfig,
-    ) -> "Optional[list[_WebToken]]":
+    ) -> "list[_WebToken] | None":
         """Resolve every configured web bearer token into a lookup table.
 
         Scalar authToken becomes an all-scopes token; each authTokens
@@ -8898,7 +8856,7 @@ class Cron:
 
     def _compute_next_fire(
         self, job: JobConfig, after: datetime.datetime
-    ) -> Optional[datetime.datetime]:
+    ) -> datetime.datetime | None:
         """The aware-UTC instant ``job`` next fires strictly after ``after``.
 
         Resolved in the job's frame (:attr:`JobConfig.frame`): its zone,
@@ -9019,7 +8977,7 @@ class Cron:
             ]
             heapq.heapify(self._fire_heap)
 
-    def _peek_soonest_fire(self) -> Optional[datetime.datetime]:
+    def _peek_soonest_fire(self) -> datetime.datetime | None:
         """The soonest valid next-fire instant, or ``None`` if nothing is
         scheduled.  Discards stale heap entries from the top as it goes."""
         heap = self._fire_heap
@@ -9086,7 +9044,7 @@ class Cron:
         job: JobConfig,
         fire_slot: datetime.datetime,
         now: datetime.datetime,
-    ) -> tuple[list[datetime.datetime], Optional[datetime.datetime]]:
+    ) -> tuple[list[datetime.datetime], datetime.datetime | None]:
         """The slots a due job launches this pass, plus its new next-fire.
 
         Within CATCHUP_LIMIT of ``now``, walk occurrence by occurrence
@@ -9174,7 +9132,7 @@ class Cron:
         """The durable checkpoint stream for a job's catch-up cycles."""
         return CATCHUP_STREAM_PREFIX + name
 
-    async def _pending_catchup_watermark(self, name: str) -> Optional[str]:
+    async def _pending_catchup_watermark(self, name: str) -> str | None:
         """The watermark of an unfinished backfill cycle, if one is open.
 
         An ``open`` without a following ``close`` means a previous
@@ -9199,7 +9157,7 @@ class Cron:
 
     async def _pause_excusal_window(
         self, name: str
-    ) -> Optional[tuple[Optional[datetime.datetime], datetime.datetime]]:
+    ) -> tuple[datetime.datetime | None, datetime.datetime] | None:
         """The newest durable pause window ``(since, until)``, for catch-up.
 
         Slots inside a pause window while the daemon was DOWN are not
@@ -9220,8 +9178,6 @@ class Cron:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - degrade to no window
             logger.warning(
                 "catch-up: cannot read the %s pause stream (%s); assuming "
@@ -9237,7 +9193,7 @@ class Cron:
         return None
 
     async def _checkpoint_catchup(
-        self, name: str, kind: str, watermark: Optional[str]
+        self, name: str, kind: str, watermark: str | None
     ) -> bool:
         """Append an ``open``/``close`` catch-up checkpoint (best-effort).
 
@@ -9276,7 +9232,7 @@ class Cron:
         return True
 
     async def _close_catchup_pin(
-        self, name: str, watermark: Optional[str], pinned: bool
+        self, name: str, watermark: str | None, pinned: bool
     ) -> bool:
         """Close ``name``'s open catch-up cycle when ``pinned``.
 
@@ -9309,7 +9265,7 @@ class Cron:
         )
         return False
 
-    async def _pinned_catchup_names(self) -> Optional[set[str]]:
+    async def _pinned_catchup_names(self) -> set[str] | None:
         """Jobs with a catch-up checkpoint stream in the store, from one
         listing; None when the listing cannot be trusted, so the caller
         asks each stream instead."""
@@ -9321,8 +9277,6 @@ class Cron:
                 backend.list_stream_names_audit(CATCHUP_STREAM_PREFIX),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - the per-job read decides
             return None
         if not complete:
@@ -9331,7 +9285,7 @@ class Cron:
         return {name[prefix:] for name in names}
 
     async def _retire_catchup_pin(
-        self, name: str, pinned: Optional[set[str]]
+        self, name: str, pinned: set[str] | None
     ) -> bool:
         """Close the open checkpoint of a job nothing will backfill.
 
@@ -9343,8 +9297,6 @@ class Cron:
             return True
         try:
             pending = await self._pending_catchup_watermark(name)
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - defer, never latch
             logger.warning(
                 "catch-up: cannot read the checkpoint of %s (%s); will retry",
@@ -9361,8 +9313,8 @@ class Cron:
         job: JobConfig,
         now: datetime.datetime,
         *,
-        resume: Optional[ResumeCatchup] = None,
-    ) -> tuple[int, Optional[str], bool]:
+        resume: ResumeCatchup | None = None,
+    ) -> tuple[int, str | None, bool]:
         """How many catch-up launches ``job`` is owed, and from where.
 
         Steps the schedule forward (DST-safe) from the durable last-run
@@ -9453,7 +9405,7 @@ class Cron:
         return count, watermark, pinned
 
     def _resume_satisfied(
-        self, job: JobConfig, after: Optional[datetime.datetime]
+        self, job: JobConfig, after: datetime.datetime | None
     ) -> bool:
         """An attempt after the gap satisfies run-once, even on failure."""
         started = self._sla_last_start.get(job.name)
@@ -9523,8 +9475,6 @@ class Cron:
         else:
             try:
                 unresolved = await self._evaluate_catch_up(now)
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - defer, never surface: this
                 # runs as a detached task, so an escaped exception would be
                 # an unretrieved-task warning and a silently dead catch-up.
@@ -9544,17 +9494,17 @@ class Cron:
         self,
         now: datetime.datetime,
         *,
-        only: Optional[str] = None,
-        resume: Optional[ResumeCatchup] = None,
+        only: str | None = None,
+        resume: ResumeCatchup | None = None,
     ) -> bool:
         """One catch-up evaluation pass; returns whether jobs stay pending."""
         unresolved = False
         done = self._catchup_done if resume is None else set()
         # the stream listing serves only the retire branch below, and only
         # on the first pass that reaches it: list on demand, once per pass
-        listing: list[Optional[set[str]]] = []
+        listing: list[set[str] | None] = []
 
-        async def pinned_names() -> Optional[set[str]]:
+        async def pinned_names() -> set[str] | None:
             if not listing:
                 listing.append(await self._pinned_catchup_names())
             return listing[0]
@@ -9605,8 +9555,6 @@ class Cron:
                             real = resume.after.isoformat()
                         if real is not None:
                             await self._checkpoint_catchup(name, "open", real)
-                except asyncio.CancelledError:
-                    raise
                 except Exception as ex:  # noqa: BLE001 - defer, never latch
                     logger.warning(
                         "catch-up: cannot pin the pre-pause watermark for %s "
@@ -9644,8 +9592,6 @@ class Cron:
                     if resume is None
                     else self._missed_occurrences(job, now, resume=resume)
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception as ex:  # noqa: BLE001 - defer, never crash
                 logger.warning(
                     "catch-up: cannot read the %s watermark (%s); will retry",
@@ -9692,7 +9638,7 @@ class Cron:
         offset: float,
         now: datetime.datetime,
         *,
-        resume: Optional[ResumeCatchup] = None,
+        resume: ResumeCatchup | None = None,
     ) -> None:
         """Launch a job's catch-up runs, after its jitter offset.
 
@@ -9746,8 +9692,6 @@ class Cron:
                     if resume is None
                     else self._missed_occurrences(job, now, resume=resume)
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception as ex:  # noqa: BLE001 - drop, resume on restart
                 logger.warning(
                     "catch-up: cannot re-read the %s watermark after its "
@@ -9769,7 +9713,7 @@ class Cron:
             # the wait is anti-stampede pacing, so it is bounded; an
             # always-overlapping job would otherwise starve the backfill
             # forever and leave its checkpoint open.
-            max_wait: Optional[float] = (
+            max_wait: float | None = (
                 None
                 if job.concurrencyPolicy == "Forbid"
                 else CATCHUP_IDLE_WAIT_LIMIT
@@ -9844,15 +9788,13 @@ class Cron:
             if not await self._wait_job_idle(job.name, max_wait=max_wait):
                 return
             await self._checkpoint_catchup(job.name, "close", watermark)
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - a backfill must never kill the loop
             logger.exception(
                 "catch-up: unexpected error backfilling %s", job.name
             )
 
     async def _wait_job_idle(
-        self, name: str, *, max_wait: Optional[float] = None
+        self, name: str, *, max_wait: float | None = None
     ) -> bool:
         """Wait until no instance of ``name`` is running (backfill pacing).
 
@@ -9896,8 +9838,6 @@ class Cron:
                     pending = await self._evaluate_catch_up(
                         window.observed, only=name, resume=window
                     )
-                except asyncio.CancelledError:
-                    raise
                 except Exception:  # noqa: BLE001 - defer, never lose a gap
                     logger.exception(
                         "catch-up: unexpected error evaluating resume for %s; "
@@ -9945,7 +9885,7 @@ class Cron:
         self._pools.service()
 
     async def spawn_jobs(
-        self, startup: bool, now: Optional[datetime.datetime] = None
+        self, startup: bool, now: datetime.datetime | None = None
     ) -> None:
         """Launch the jobs due on this pass.
 
@@ -10209,7 +10149,7 @@ class Cron:
             return self._same_boot(rec)
         return False
 
-    def _boot_survivor_running(self, name: str) -> Optional[int]:
+    def _boot_survivor_running(self, name: str) -> int | None:
         """The still-live pid of a previous daemon's run of ``name``.
 
         Re-validates the reconciliation's finding at consult time: the
@@ -10284,8 +10224,6 @@ class Cron:
             return True
         try:
             covered = await self._reboot_marker_covers(job)
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - policy decides below
             if isinstance(ex, asyncio.TimeoutError):
                 self._reboot_gate_sick = True
@@ -10329,8 +10267,6 @@ class Cron:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - policy decides below
             self.metrics.state_write_dropped("reboot-marker")
             if isinstance(ex, asyncio.TimeoutError):
@@ -10344,8 +10280,6 @@ class Cron:
                     try:
                         if await self._reboot_marker_covers(job):
                             return True
-                    except asyncio.CancelledError:
-                        raise
                     except Exception:  # noqa: BLE001 - stays unknown
                         pass
             if fail_closed:
@@ -10729,7 +10663,7 @@ class Cron:
     def job_should_run(
         startup: bool,
         job: JobConfig,
-        slot: Optional[datetime.datetime] = None,
+        slot: datetime.datetime | None = None,
     ) -> bool:
         if not job.enabled:
             logger.debug(
@@ -10844,8 +10778,8 @@ class Cron:
         job: JobConfig,
         *,
         with_retries: bool = True,
-        pool_ticket: Optional[Ticket] = None,
-        catchup_after: Optional[datetime.datetime] = None,
+        pool_ticket: Ticket | None = None,
+        catchup_after: datetime.datetime | None = None,
     ) -> bool:
         """Accept a job into its pool queue or launch it immediately.
 
@@ -10881,7 +10815,7 @@ class Cron:
         self,
         job: JobConfig,
         with_retries: bool,
-        pool_ticket: Optional[Ticket] = None,
+        pool_ticket: Ticket | None = None,
     ) -> bool:
         """The body of :meth:`maybe_launch_job`, under its per-job lock."""
         retry_current = True
@@ -10951,7 +10885,7 @@ class Cron:
                 retry_state.count = saved["count"]
                 retry_state.pool_retry = pool_ticket.payload.get("retryGuard")
                 self.retry_state[job.name] = retry_state
-        run_token: Optional[str] = None
+        run_token: str | None = None
         try:
             # register with the loopback state API BEFORE the child
             # launches, so the child's first callback is already
@@ -11033,10 +10967,10 @@ class Cron:
     async def _prepare_job_api_run(
         self,
         job: JobConfig,
-        retry_state: Optional[JobRetryState],
+        retry_state: JobRetryState | None,
         *,
-        pool_ticket: Optional[Ticket] = None,
-    ) -> tuple[Optional[str], dict[str, str]]:
+        pool_ticket: Ticket | None = None,
+    ) -> tuple[str | None, dict[str, str]]:
         """Register this run with the loopback state API; return its env.
 
         Mints the run id + token, stages the job's secrets, registers the
@@ -11082,7 +11016,7 @@ class Cron:
     def _slot_mutex(self, name: str) -> asyncio.Lock:
         return self._slot_locks.setdefault(name, asyncio.Lock())
 
-    async def _slot_fidelity_reason(self) -> Optional[str]:
+    async def _slot_fidelity_reason(self) -> str | None:
         """The reason the store's locks cannot fence, or ``None`` (they can).
 
         Probed once per backend generation (see
@@ -11098,8 +11032,6 @@ class Cron:
                 reason = await asyncio.wait_for(
                     backend.verify_locking(), timeout=STATE_OP_TIMEOUT
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - inconclusive; retry later
                 return None
             self._slot_fidelity = reason or ""
@@ -11114,7 +11046,7 @@ class Cron:
 
     async def _acquire_slot_lease(
         self, backend: StateBackend, lease_name: str
-    ) -> Optional[Lease]:
+    ) -> Lease | None:
         """``acquire_lease`` for a cluster slot; timeout or store error
         maps to ``None`` so the caller's read-back-and-policy path
         decides. Never raises (bar cancellation): an escaped store error
@@ -11129,8 +11061,6 @@ class Cron:
             )
         except asyncio.TimeoutError:
             return None
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - a raised store error is as
             # ambiguous as a timeout; fail closed via the read-back path
             # rather than letting it escape and crash the loop.
@@ -11195,7 +11125,7 @@ class Cron:
                 # denied, sick, or timed out: a bounded read tells a
                 # foreign holder apart from a store that cannot answer
                 # (the lease API fails closed; None alone proves nothing).
-                observed: Optional[Lease] = None
+                observed: Lease | None = None
                 answered = False
                 try:
                     observed = await asyncio.wait_for(
@@ -11205,8 +11135,6 @@ class Cron:
                     answered = observed is not None
                 except asyncio.TimeoutError:
                     pass
-                except asyncio.CancelledError:
-                    raise
                 except Exception:  # noqa: BLE001 - a raised store error here
                     # is as ambiguous as a timeout: leave answered=False so the
                     # "store did not answer" branch below returns _unavailable
@@ -11312,8 +11240,6 @@ class Cron:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - give up, log, no launch
             logger.warning(
                 "Job %s: could not record the cluster Replace cancel "
@@ -11329,14 +11255,12 @@ class Cron:
             if self._stop_event.is_set():
                 return
             await asyncio.sleep(poll)
-            current: Optional[Lease] = observed
+            current: Lease | None = observed
             try:
                 current = await asyncio.wait_for(
                     backend.read_lease(self._slot_name(name)),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - keep waiting
                 pass
             now = get_now(datetime.timezone.utc).timestamp()
@@ -11396,8 +11320,6 @@ class Cron:
                     ),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - the listener is best-effort
                 recs = []
             rec = recs[0] if recs else None
@@ -11415,8 +11337,6 @@ class Cron:
                 )
             except asyncio.TimeoutError:
                 continue  # unknown; retry next period
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - a RAISED store error is as
                 # ambiguous as a timeout and must NOT kill the renewer: a
                 # dead renewer lets the lease expire under a live holder
@@ -11440,14 +11360,12 @@ class Cron:
             if renewed is not None:
                 self._slot_leases[name] = renewed
                 continue
-            observed: Optional[Lease] = None
+            observed: Lease | None = None
             try:
                 observed = await asyncio.wait_for(
                     backend.read_lease(self._slot_name(name)),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - ambiguous; retry
                 continue
             if observed is not None and (
@@ -11497,8 +11415,6 @@ class Cron:
     async def _cancel_replaced_instance(self, running_job: RunningJob) -> None:
         try:
             await running_job.cancel()
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - the reaper still completes the run
             logger.warning(
                 "Job %s: cancelling the replaced instance failed",
@@ -11549,8 +11465,6 @@ class Cron:
                 await asyncio.wait_for(
                     backend.release_lease(lease), timeout=STATE_OP_TIMEOUT
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception as ex:  # noqa: BLE001 - TTL is the fallback
                 logger.warning(
                     "state: failed to release the concurrency slot for %s "
@@ -11585,8 +11499,6 @@ class Cron:
                         backend.release_lease(observed),
                         timeout=STATE_OP_TIMEOUT,
                     )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - best-effort cleanup
                 pass
 
@@ -11719,7 +11631,7 @@ class Cron:
     async def _bounded_boot_scan(
         self,
         items: list[tuple[str, JobConfig]],
-        step: Callable[[str, JobConfig], Awaitable[Optional[str]]],
+        step: Callable[[str, JobConfig], Awaitable[str | None]],
         timeout_message: str,
     ) -> int:
         """Run ``step`` over ``items`` behind a small bounded worker pool.
@@ -11742,8 +11654,6 @@ class Cron:
                     break
                 try:
                     outcome = await step(name, job)
-                except asyncio.CancelledError:
-                    raise  # shutdown still unwinds the scan
                 except Exception:  # noqa: BLE001 - degrade, never crash
                     # gather() without return_exceptions hands the first
                     # exception to the awaiter but does NOT cancel the
@@ -11794,7 +11704,7 @@ class Cron:
 
     async def _reconcile_one_inflight(
         self, name: str, job: JobConfig
-    ) -> Optional[str]:
+    ) -> str | None:
         """One job's step of the boot reconciliation scan (see the caller).
 
         Returns ``"timeout"`` when the in-flight read timed out, which tells
@@ -11817,8 +11727,6 @@ class Cron:
             )
         except asyncio.TimeoutError:
             return "timeout"
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning(
                 "state: cannot read the in-flight record of %s: %s",
@@ -11873,7 +11781,7 @@ class Cron:
 
     @staticmethod
     def _pid_could_be_record(
-        started: Optional[float], rec: dict[str, Any]
+        started: float | None, rec: dict[str, Any]
     ) -> bool:
         """False only when the pid's process provably postdates ``rec``.
 
@@ -11916,8 +11824,6 @@ class Cron:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - reconciliation is best-effort
             return
         rec = recs[0] if recs else None
@@ -11949,7 +11855,7 @@ class Cron:
     def _reconcile_open_record(
         self,
         name: str,
-        job: Optional[JobConfig],
+        job: JobConfig | None,
         rec: dict[str, Any],
         reason: str,
     ) -> None:
@@ -12147,8 +12053,6 @@ class Cron:
                                 )
                             try:
                                 await self._handle_finished_job(job)
-                            except asyncio.CancelledError:
-                                raise
                             except Exception:
                                 # Per-job, so one job's failure to finish
                                 # does not skip the rest of the batch. No
@@ -12178,8 +12082,6 @@ class Cron:
                         # a later job's exception would strand their
                         # dag_run entries as RUNNING indefinitely.
                         await self._dag.flush_completions()
-                except asyncio.CancelledError:
-                    raise
                 except Exception:  # pragma: no cover
                     logger.exception("please report this as a bug (3)")
                     await asyncio.sleep(1)
@@ -12247,7 +12149,7 @@ class Cron:
         self,
         name: str,
         info: JobRunInfo,
-        promote: Optional[bool] = None,
+        promote: bool | None = None,
     ) -> None:
         """Record one finished-run row; the ONE writer of ``run_history``
         and ``last_run``.
@@ -12408,7 +12310,7 @@ class Cron:
         """The durable stream name for this host's counter snapshots."""
         return COUNTER_STREAM_PREFIX + self._state_host
 
-    def _run_prune_keep(self) -> Optional[int]:
+    def _run_prune_keep(self) -> int | None:
         """How many per-job records (``runs/<job>`` and the archived
         output in ``logs/<job>``) an append prunes down to, or None.
 
@@ -12444,7 +12346,7 @@ class Cron:
         self,
         name: str,
         info: JobRunInfo,
-        archive_lines: Optional[list[tuple[str, str]]] = None,
+        archive_lines: list[tuple[str, str]] | None = None,
     ) -> None:
         """Append one finished run to the durable ledger, prune, and archive.
 
@@ -12599,8 +12501,6 @@ class Cron:
                     ),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception as ex:  # noqa: BLE001 - the floor below stands
                 logger.warning(
                     "state: cannot widen the last-success scan for %s "
@@ -12665,7 +12565,7 @@ class Cron:
             return
         self._state_rehydrated = True
 
-        async def _warm_one(name: str, _job: JobConfig) -> Optional[str]:
+        async def _warm_one(name: str, _job: JobConfig) -> str | None:
             # existing in-memory history stays the source of truth, but
             # the staleness reference is still seeded from it (a job that
             # only FAILED during a state outage must not re-baseline).
@@ -12801,8 +12701,6 @@ class Cron:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning(
                 "state: cannot rehydrate the metric counters (the seed is "
@@ -12847,7 +12745,7 @@ class Cron:
 
     async def _rearm_pending_retry(
         self, name: str, job: JobConfig
-    ) -> Optional[str]:
+    ) -> str | None:
         """One job's step of the retry re-arm scan (see the caller).
 
         "timeout" abandons the rest of the pass; None in every other
@@ -12868,8 +12766,6 @@ class Cron:
             )
         except asyncio.TimeoutError:
             return "timeout"
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning(
                 "state: cannot read pending retries for %s: %s", name, ex
@@ -12895,8 +12791,6 @@ class Cron:
                     self.durable_last_completed_at(name),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - unknown -> guard stays open
                 durable_at = None
             parsed = (
@@ -12913,8 +12807,6 @@ class Cron:
         if isinstance(job.schedule, str) and job.schedule == "@reboot":
             try:
                 covered = await self._reboot_marker_covers(job)
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - unknown -> not covered
                 covered = False
             if not covered:
@@ -12950,7 +12842,7 @@ class Cron:
 
     def _validate_pending_retry(
         self, name: str, job: JobConfig, rec: dict[str, Any]
-    ) -> Optional[tuple[int, datetime.datetime]]:
+    ) -> tuple[int, datetime.datetime] | None:
         """Judge a pending-retry record against the LIVE job definition.
 
         Returns ``(attempt, notBefore)`` when the ladder may be re-armed;
@@ -13001,7 +12893,7 @@ class Cron:
             return None
         return attempt, not_before
 
-    async def durable_last_run_at(self, name: str) -> Optional[str]:
+    async def durable_last_run_at(self, name: str) -> str | None:
         """The last finished-run timestamp for a job, from the durable ledger.
 
         Max finished_at over the immutable records (order-independent;
@@ -13016,7 +12908,7 @@ class Cron:
         )
         return result if isinstance(result, str) else None
 
-    async def durable_last_completed_at(self, name: str) -> Optional[str]:
+    async def durable_last_completed_at(self, name: str) -> str | None:
         """The last ACTUAL-run timestamp for a job, from the durable ledger.
 
         durable_last_run_at's skip-blind twin, for the superseded-by-run
@@ -13036,8 +12928,8 @@ class Cron:
         best = derived if isinstance(derived, str) else None
 
         def _fold_pre_ranat(
-            records: list[dict[str, Any]], acc: Optional[str]
-        ) -> Optional[str]:
+            records: list[dict[str, Any]], acc: str | None
+        ) -> str | None:
             # A row with no ``ranAt`` and outcome != skipped is a real run
             # from before ``ranAt`` existed (a pause-skip row never took that
             # older shape); fold its finished_at, a row carrying ``ranAt`` is
@@ -13126,7 +13018,7 @@ class Cron:
             and info.finished_at is not None
         ]
         newest = max(reals, key=lambda i: i.finished_at, default=None)
-        latest: Optional[tuple[datetime.datetime, str]] = (
+        latest: tuple[datetime.datetime, str] | None = (
             (newest.finished_at, newest.outcome)
             if newest is not None
             else None
@@ -13155,8 +13047,6 @@ class Cron:
         if backend is not None:
             try:
                 recs = await self._list_gate_records(backend, job.name)
-            except asyncio.CancelledError:
-                raise
             except Exception as ex:  # noqa: BLE001 - policy decides below
                 if self._state_on_unavailable == "fail-closed":
                     logger.warning(
@@ -13374,8 +13264,6 @@ class Cron:
                     await job.report_failure()
                 else:
                     await job.report_success()
-            except asyncio.CancelledError:
-                raise
             except Exception:  # pragma: no cover - defensive
                 logger.exception(
                     "Unexpected error reporting the dag task run %s",
@@ -13590,7 +13478,7 @@ class Cron:
         job: JobConfig,
         attempt: int,
         not_before: datetime.datetime,
-    ) -> Optional[asyncio.Task]:
+    ) -> asyncio.Task | None:
         """Fire-and-forget append of a pending-retry record for ``job``.
 
         Carries the ABSOLUTE deadline and the job's config digest:
@@ -13617,7 +13505,7 @@ class Cron:
         return self._queue_retry_write(job.name, record)
 
     def _persist_retry_settled(
-        self, name: str, reason: str, attempt: Optional[int] = None
+        self, name: str, reason: str, attempt: int | None = None
     ) -> None:
         """Fire-and-forget append of a settled-ladder record for ``name``.
 
@@ -13888,8 +13776,6 @@ class Cron:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - policy decides below
             self.metrics.state_write_dropped("retry")
             if fail_closed:
@@ -13961,7 +13847,7 @@ class Cron:
         retry_num: int,
         *,
         quiet: bool,
-    ) -> Optional[Lease]:
+    ) -> Lease | None:
         """``acquire_lease`` for a retry claim; timeout or store error
         maps to ``None`` (same containment as _acquire_slot_lease). An
         escape here drops the due retry AND re-raises outside run()'s
@@ -13978,8 +13864,6 @@ class Cron:
             )
         except asyncio.TimeoutError:
             return None
-        except asyncio.CancelledError:
-            raise
         except Exception as ex:  # noqa: BLE001 - flock ENOLCK/EIO/ESTALE on
             # a sick shared mount is as ambiguous as a timeout; the policy
             # fork (defer under fail-closed, unserialized proceed under
@@ -14023,7 +13907,7 @@ class Cron:
             backend, job, retry_num, quiet=quiet
         )
         if lease is None:
-            observed: Optional[Lease] = None
+            observed: Lease | None = None
             try:
                 observed = await asyncio.wait_for(
                     backend.read_lease(self._retry_claim_lease(job.name)),
@@ -14031,8 +13915,6 @@ class Cron:
                 )
             except asyncio.TimeoutError:
                 pass
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - as ambiguous as a timeout;
                 # observed stays None so the policy fork below decides.
                 pass
@@ -14063,8 +13945,6 @@ class Cron:
                     ),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - policy fork below
                 if fail_closed:
                     return "defer"
@@ -14085,8 +13965,6 @@ class Cron:
                         backend.release_lease(lease),
                         timeout=STATE_OP_TIMEOUT,
                     )
-                except asyncio.CancelledError:
-                    raise
                 except Exception:  # noqa: BLE001 - TTL is the fallback
                     pass
 
@@ -14117,8 +13995,6 @@ class Cron:
                     backend.list_stream_names(RETRY_STREAM_PREFIX),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - not this pass
                 return
             names = [stream[len(RETRY_STREAM_PREFIX) :] for stream in streams]
@@ -14128,8 +14004,6 @@ class Cron:
                 continue  # a removed job's stream; GC's business
             try:
                 await self._maybe_claim_retry(name, job)
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - one job must not end the scan
                 logger.exception(
                     "state: error scanning job %s for a claimable retry",
@@ -14152,8 +14026,6 @@ class Cron:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - not this pass
             return None
         return recs[0] if recs else None
@@ -14181,7 +14053,7 @@ class Cron:
         if claimable is None:
             return
         attempt, not_before = claimable
-        lease: Optional[Lease] = None
+        lease: Lease | None = None
         try:
             lease = await asyncio.wait_for(
                 backend.acquire_lease(
@@ -14204,8 +14076,6 @@ class Cron:
                 await asyncio.wait_for(
                     backend.release_lease(lease), timeout=STATE_OP_TIMEOUT
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - TTL is the fallback
                 pass
         if not claimed:
@@ -14283,8 +14153,6 @@ class Cron:
                 self.durable_last_completed_at(name),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.CancelledError:
-            raise
         except Exception:  # noqa: BLE001 - ambiguity settles: no claim
             return False
         if (
@@ -14329,7 +14197,7 @@ class Cron:
 
     def _retry_record_claimable(
         self, name: str, job: JobConfig, rec: dict[str, Any]
-    ) -> Optional[tuple[int, datetime.datetime]]:
+    ) -> tuple[int, datetime.datetime] | None:
         """Judge whether a ladder record is another node's claimable retry.
 
         Mirrors _validate_pending_retry's checks with the cross-node
@@ -14527,7 +14395,7 @@ class Cron:
             )
 
     async def cancel_job_retries(
-        self, name: str, *, settle: Optional[str] = "superseded"
+        self, name: str, *, settle: str | None = "superseded"
     ) -> None:
         state = self.retry_state.pop(name, None)
         if state is not None:
