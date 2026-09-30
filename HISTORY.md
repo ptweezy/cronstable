@@ -16,6 +16,24 @@
   checks that the kubeconfig, CA, client certificate, and key (or the
   in-cluster CA) load. A half-written file keeps the running backend until a
   later reload, as with the `etcd` and gossip backends.
+- Speed up the dashboard's week calendar by reading only each fire's
+  instant during the walk. The calendar repaints when any job name or fire
+  time in the grid changes, including names that contain `@` or `|`. The
+  demo dashboard includes both changes.
+- Reduce daemon overhead on frequent paths. Live log streams build each
+  line's server-sent event frame from a pre-encoded prefix, and `/jobs`
+  skips process, resource, and verification scans for idle jobs. A DAG pass
+  stops advancing pending root tasks once it spends its claim quota.
+  Configuration parsing does one environment lookup per `${VAR}` reference,
+  resolves each distinct `env_file` path once, and skips report checks that
+  have nothing to validate.
+- Reduce overhead in job output capture, the state store, and the terminal
+  UI. Output that is valid UTF-8 decodes without the per-line fallback, and
+  a run holds no live-viewer list until a viewer attaches. The filesystem
+  state store reads whole files unbuffered and evicts from a full record
+  cache in constant time. Pool reads copy the stored document once. The
+  terminal UI copies styled text runs as slices when it cuts a row to
+  width.
 
 ## 1.2.59
 
