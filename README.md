@@ -19,13 +19,12 @@
 
 / kraahn-stuh-bl /
 
-A cron replacement with retries, alerts, saved run history, and workflows, plus dashboards for the web, the terminal, and iOS. Built for efficiency and machines of all sorts and sizes.
-
 ## Why cronstable?
 
-cronstable runs your commands from a schedule file, following cron's model.
-It adds retries, alerting, durable state, orchestration, clustering, and a
-live dashboard.
+cronstable is *the* modern cron replacement for anything from a single machine to a
+cluster, built with efficiency in mind. It runs your commands from a schedule
+file, following cron's model, and adds retries, alerts, saved run history,
+workflows, and dashboards for the web, the terminal, and iOS.
 
 ### Scheduling
 
