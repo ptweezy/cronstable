@@ -2,6 +2,14 @@
 
 This page covers the cronstable developer workflow (environment, tests, linters, type checks, pre-commit) and the fully automated GitHub Actions release pipeline that builds, publishes, tags, and containerizes each version. `setuptools_scm` derives version numbers from git tags; they are never hand-edited.
 
+## AI use
+
+cronstable uses AI tools openly in its development. AI-assisted development is the realistic future of software, and the project uses it to make cronstable the best it can be.
+
+AI agents raise the project's standards. They make thorough review and testing cheap, so every change gets more scrutiny than it would without them. Contributions written with AI help are welcome and held to the same standards as any other change.
+
+The project doesn't tolerate putting others down for using AI. Judge a contribution by the work itself, whatever tools produced it.
+
 ## Development environment
 
 The project targets **Python 3.10+**; 3.10, 3.11, 3.12, 3.13, and 3.14 are the tested interpreters (`pyproject.toml` `requires-python = ">=3.10"`, classifiers for 3.10 through 3.14).

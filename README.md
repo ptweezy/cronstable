@@ -1805,9 +1805,15 @@ and [Troubleshooting](https://github.com/ptweezy/cronstable/wiki/Troubleshooting
 
 ## Contributing and license
 
-Bug reports, feature ideas, and pull requests are welcome. For the development
-setup and how to sign off your commits under the Developer Certificate of
-Origin (DCO), see
+Bug reports, feature ideas, and pull requests are welcome, including ones
+written with AI help. The project uses AI openly: it's the realistic future of
+software development, and it helps make cronstable the best it can be. Because
+AI agents make thorough review and testing cheap, every change gets more
+scrutiny and the project's standards are higher. Putting others down for using
+AI isn't tolerated here (see
+[AI use](https://github.com/ptweezy/cronstable/blob/main/CONTRIBUTING.md#ai-use)).
+For the development setup and how to sign off your commits under the Developer
+Certificate of Origin (DCO), see
 [CONTRIBUTING.md](https://github.com/ptweezy/cronstable/blob/main/CONTRIBUTING.md).
 For how releases work, see
 [Contributing and Releasing](https://github.com/ptweezy/cronstable/wiki/Contributing-and-Releasing).
