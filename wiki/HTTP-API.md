@@ -10,11 +10,11 @@ configured, they also report the cluster and fleet views. This page documents
 the configuration schema, every endpoint, bearer-token authentication,
 Unix-socket permissions, and lifecycle behavior.
 
-The interface is inherited from upstream yacron; `web.authToken` and
-`web.socketMode` are cronstable additions.
+The `/version`, `/status`, and `/jobs/{name}/start` interface comes from
+upstream yacron; the rest is cronstable's.
 
 > **Looking for the browser UI?** The same HTTP interface also serves the
-> built-in **[web dashboard](Web-Dashboard)** at `/` on every `http://` listener
+> built-in **[web dashboard](Web-Dashboard)** at `/` on every listener
 > (enabled by default; disable it with `ui: false`). This page documents the REST
 > endpoints; the [web dashboard](Web-Dashboard) page describes the browser UI.
 
@@ -67,7 +67,7 @@ section. `listen` is required; the rest are optional (strictyaml `Opt(...)`).
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `listen` | sequence of strings | (required) | List of URLs to bind. Each is `http://host:port`, `https://host:port`, or `unix:///path`. An empty list disables the server. |
-| `headers` | map of string→string | (none) | Extra HTTP headers added to every `200` success response (all routes, including `/cluster` and `/job-set-id`) and to the `409` conflict body, but not the `404` or `401`. |
+| `headers` | map of string→string | (none) | Extra HTTP headers added to every `200` success response except `POST /mcp` (all routes, including `/cluster` and `/job-set-id`) and to the `409` conflict body, but not the `404` or `401`. |
 | `allowedOrigins` | sequence of strings | `[]` | Extra exact-match browser `Origin`s allowed to call the mutating `POST` endpoints (see [cross-site request defense](#cross-site-request-defense)). |
 | `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes as an all-scopes token (see [authentication](#authentication)). |
 | `authTokens` | sequence of maps (`value`/`fromFile`/`fromEnvVar` + `scopes` + optional `label`) | `[]` | Additional per-device scoped bearer tokens (`view`/`control`/`approve`). To revoke one, drop its entry and reload (see [scoped tokens](#scoped-tokens-webauthtokens)). |
@@ -77,6 +77,7 @@ section. `listen` is required; the rest are optional (strictyaml `Opt(...)`).
 | `ui` | bool | `true` | Serve the [web dashboard](Web-Dashboard) page at `/` (see [`GET /`](#get--the-dashboard-page)). `ui: false` exposes only the REST endpoints. |
 | `metrics` | bool or map | `true` | Serve the Prometheus exposition at `/metrics`. The map form tunes buckets or exempts the endpoint from `authToken` (see [`GET /metrics`](#get-metrics)). |
 | `nodeHistory` | bool or map | `true` | Background node CPU/memory sampling that feeds [`GET /node/history`](#get-nodehistory). The map form tunes cadence and window size (see [`web.nodeHistory`](Configuration-Reference#web)). |
+| `bonjour` | bool or map | `false` | Advertise the API over mDNS; see [LAN discovery](LAN-Discovery). |
 
 ### `listen` URL forms
 
@@ -140,7 +141,7 @@ JSON-RPC error object that revision requires (see
 A `404` for a named subject says what was not found, for example
 `{"error": "job 'nightly' not found"}` or, on the routes that also accept a
 DAG's schedule (`/schedule/why`, `/jobs/{name}/calendar.ics`),
-`{"error": "no job or DAG schedule named 'nightly'"}`. The `401` is the one
+`{"error": "no job or workflow schedule named 'nightly'"}`. The `401` is the one
 error whose reason says nothing: its `error` is the generic
 `401: Unauthorized`, the same bytes for a missing header, a wrong scheme, and
 an unknown token, so the response cannot be used to tell them apart.
@@ -186,8 +187,7 @@ schedule, `scheduled_in` is the literal string `"@reboot"`.
 
 A `scheduled` job whose crontab has **no future occurrence** (a fixed past
 year, an impossible date) reports `scheduled_in: null` plus `never_fires:
-true`, and the text form says `never fires (schedule has no future
-occurrence)`. See [schedule linting](Schedule-Linting). A `running` row for
+true`, and the text form says `no future runs (check the schedule)`. See [schedule linting](Schedule-Linting). A `running` row for
 such a job carries the same `never_fires: true` flag, so the dead schedule
 stays visible while an instance is still running.
 
@@ -259,7 +259,7 @@ and `cron_explain_schedule` [MCP tools](MCP) serve this same payload to
 agents.
 
 ```shell
-$ http get "http://127.0.0.1:8080/schedule/preview?expr=*/7 * * * *&count=2"
+$ http get "http://127.0.0.1:8080/schedule/preview?expr=*/7 * * * *&limit=2"
 {
     "expression": "*/7 * * * *",
     "timezone": "UTC",
@@ -273,7 +273,7 @@ $ http get "http://127.0.0.1:8080/schedule/preview?expr=*/7 * * * *&count=2"
         {
             "code": "uneven-step",
             "level": "warning",
-            "message": "'*/7' in the minute field: 7 does not divide the field's span of 60, so one interval at the wrap is only 4 minutes"
+            "message": "'*/7' in the minute field produces uneven intervals: a step of 7 does not divide evenly into 60. When the field starts over, the gap is only 4 minutes"
         }
     ]
 }
@@ -289,7 +289,7 @@ scheduler's own engine and bucketed by civil hour and minute in `tz`
 The payload carries the 24x60 `grid`, the 60-bin
 `by_minute_fires`/`by_minute_jobs` histograms, `by_hour`, the
 `busiest_minute` headline, `empty_minutes`, `top_cells` (each naming up to
-ten jobs), and an `excluded` count of disabled and `@reboot` jobs. For the
+ten jobs), and an `excluded` object counting `disabled` and `reboot` jobs. For the
 full field reference, see [schedule load](Schedule-Pressure).
 
 ### `GET /schedule/duplicates`
@@ -386,7 +386,9 @@ and whether this node is `quorate`.
 
 It also returns the elected `leader`
 (`null` when this node is not quorate, and always `null` in `spread` mode),
-`is_leader` (always `false` in `spread` mode), and a `peers` array (each with
+`is_leader` (always `false` in `spread` mode), `candidates_truncated` (`0`
+when the advertised candidate set fits its cap of 512, else the full count),
+and a `peers` array (each with
 `host`, `status`, `node_name`, `job_set_id`, `last_seen`, `last_error`,
 `mismatch_streak`, and `node_stats`).
 
@@ -416,7 +418,9 @@ peer set, so their view is lease-shaped: `backend` names the backend, `peers`
 is empty, `cluster_size`/`quorum` are `1`, `elect_leader` is `true`,
 `distribution` is `single-leader`, all three conflict flags (`conflict`,
 `size_conflict`, `policy_conflict`) are always `false`, and an extra `lease`
-block carries the backend-specific detail.
+block carries the backend-specific detail. A `fleet` boolean says whether the
+[`cluster.observability`](Configuration-Reference#observability-overlay)
+overlay provides a fleet view.
 
 This is an endpoint-reference view. The field semantics (what `quorate` means
 for a lease backend, the `lease` block contents, and the `expiry` rules that
@@ -494,7 +498,9 @@ gossip `interval` stale per peer.
 When no `cluster` section is configured, or the backend is a lease backend
 (`kubernetes` / `etcd` / `filesystem`, which carry only a lease and know
 nothing about what other nodes run), it returns
-`{"enabled": false, "nodes": []}`.
+`{"enabled": false, "nodes": []}`. A lease cluster with the
+[`cluster.observability`](Configuration-Reference#observability-overlay)
+overlay serves the same fleet view as gossip.
 
 For the gossip backend it returns `enabled: true`, the serving node's
 `node_name`, the `distribution` and `elect_leader` policy, the gossip
@@ -613,7 +619,7 @@ is `"api"` here). Pausing an already-paused job overwrites the window
 ### `POST /jobs/{name}/resume`
 
 Ends the named job's pause immediately. The optional JSON body takes `by` (a
-string, at most 100 characters). Returns `404 Not Found` for an unknown job.
+string). Returns `404 Not Found` for an unknown job.
 Otherwise `200 OK` with `{"paused": null}`, including when the job was not
 paused. Resume is a no-op then, but with a [state store](Durable-State) the
 daemon still writes the durable "resumed" record, so a pause taken on another
@@ -637,7 +643,7 @@ the endpoint the [web dashboard](Web-Dashboard) polls.
 | `never_fires` | `true` when the job is enabled but its crontab has no future occurrence (a fixed past year, an impossible date), distinguishing the dead-schedule `scheduled_in: null` from the running/disabled ones. See [schedule linting](Schedule-Linting). |
 | `schedule_findings` | The [schedule linter's](Schedule-Linting) advisory findings for this crontab, each `{code, level, message}` (empty for a clean schedule). Computed once at config load, in the job's own time zone. |
 | `schedule_resolved` | Present only for [`H` hashed schedules](Hashed-Schedules): the plain expression the `H` items resolved to for this job, so clients can compute previews while displaying the `H` the user wrote. |
-| `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. One exception: a run in progress when this host crashed is reported here as `unknown` even though it never finished. It stands at the instant it started, so a run that finished while it was still going can carry a later `finished_at`. The crash stays visible instead of hidden behind whatever outlived it. |
+| `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`, `skip_reason`, `resources`, and `ranAt` on a run that was not `skipped`), or `null` if the job has not run yet. One exception: a run in progress when this host crashed is reported here as `unknown` even though it never finished. It stands at the instant it started, so a run that finished while it was still going can carry a later `finished_at`. The crash stays visible instead of hidden behind whatever outlived it. |
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`, whose ordering note covers this tail too. |
 | `paused` | Always present: the active [runtime pause](Pausing-Jobs), `{since, until, note, by, channel}` (ISO-8601 instants), or `null` when the job is not paused. |
 | `sla` | Present only for jobs with a configured [`sla:` block](Late-Run-Detection): `{thresholds, state, breaches}`, where `thresholds` holds the non-null threshold keys, `state` is `"ok"` or `"late"`, and `breaches` lists each latched check as `{check, since, observed_seconds, threshold_seconds}` (`observed_seconds` re-measured at payload time). |
@@ -646,6 +652,8 @@ the endpoint the [web dashboard](Web-Dashboard) polls.
 | `concurrencyScope`, `slot` | Present only for `concurrencyScope: cluster` jobs: the literal scope, and `slot` as `{held, holder, refs}`: whether this node holds the job's [cluster-wide concurrency slot](Clustering-and-Leader-Election) lease, the holding node's name (`null` when unheld), and how many live instances reference it. |
 | `priority` | Present only when the job sets a non-default [scheduling priority](Commands-and-Environment#priority): one of `idle`, `below-normal`, `above-normal`, `high`. A job at the default level (`normal`, the one level never applied) carries no key. |
 | `clusterPolicy`, `clusterOwner` | Present only when leader election is configured: the job's [cluster policy](Clustering-and-Leader-Election#per-job-policy), and, under `distribution: spread` for leader-gated jobs, the node that owns the job (`null` when there is no quorum). |
+| `verification` | Present only when the job configures [result verification](Result-Verification): `{configured, running}`, where `running` says whether verification of a running instance is in progress. |
+| `pool` | Present only when the job belongs to a [resource pool](Resource-Pools): `{name, slots, priority}`, plus `queued` (the job's waiting entries, in queue order), or `queueUnavailable: true` when the pool state cannot be read. |
 
 ```shell
 $ http get http://127.0.0.1:8080/jobs
@@ -719,17 +727,17 @@ samples}` for that run.
 Besides `success`, `failure`, and `cancelled`, `outcome` can be `unknown`: a
 crash-reconciled run, recorded when the daemon exited or lost the
 [state store](Durable-State) mid-run so no completion was ever written. It is
-a non-verdict: excluded from `success_rate`, counted only in `total`, with no
+a non-verdict: excluded from `success_rate` and counted in `total` and its own `unknown` field, with no
 `started_at` or `duration` (`fail_reason` explains the interruption).
 
 `outcome` can also be `skipped`: a scheduled slot deliberately not launched,
 with `skip_reason` naming why (`"paused"`; see [pausing jobs](Pausing-Jobs)).
-Skipped rows carry no `started_at`, `exit_code`, or `duration`, and like
-`unknown` they count only in `total`. `stats` summarizes them:
+Skipped rows carry no `started_at`, `exit_code`, or `duration`, and they
+count only in `total`. `stats` summarizes them:
 
 | `stats` field | Meaning |
 | --- | --- |
-| `total`, `success`, `failure`, `cancelled` | Counts by outcome over the retained history. |
+| `total`, `success`, `failure`, `cancelled`, `unknown` | Counts by outcome over the retained history. |
 | `success_rate` | Success rate over runs that ran to completion. Cancellations are user-initiated, not a verdict on the job, so they are excluded; `null` when no run has completed. |
 | `avg_duration`, `min_duration`, `max_duration`, `last_duration` | Duration aggregates in seconds, over runs with a recorded duration; `null` when there are none. `last_duration` is the newest run in the window by finish time, not the last row of `runs`. |
 | `avg_cpu_seconds`, `max_cpu_seconds`, `last_cpu_seconds` | CPU-time aggregates over the [`monitorResources`](Resource-Monitoring) runs in the window; `null` when none were monitored. `last_cpu_seconds` reads the same newest-by-finish-time run as `last_duration`, so it is `null` when that run was not monitored. |
@@ -940,9 +948,8 @@ Body: `{"decision": "approve"|"reject", "by": "<who>"}`. `200` on success,
 
 #### `GET /dags/{name}/runs/{run_key}/xcom`
 
-The XCom outputs the run's tasks published, as a flat list of entries (task,
-key, sha256, size, timestamp) with small text values inlined and larger ones
-metadata-only. `truncated` flags a run with more entries than the cap. `404`
+The XCom outputs the run's tasks published, as an `entries` list of
+`{taskkey, key, sha256, size, at}`, with small text values inlined as `value`. `truncated` flags a run with more entries than the cap. `404`
 if the DAG or run is unknown, or if no [`state:` store](Durable-State) is
 configured; the `error` says which.
 
@@ -1209,7 +1216,7 @@ full tool catalog see [MCP](MCP); for configuration see
 ## Response headers
 
 The `web.headers` map (merged upstream but never released in yacron 0.19) is a
-string→string map applied to every `200` success response across all routes
+string→string map applied to every `200` success response except `POST /mcp`
 (`/version`, `/status`, `/cluster`, `/job-set-id`, the job routes, and the
 `200` of `/jobs/{name}/start`) and to the `409` conflict bodies of
 `/jobs/{name}/start` and `/jobs/{name}/cancel`.
@@ -1217,7 +1224,9 @@ string→string map applied to every `200` success response across all routes
 It is not applied to the `404` (unknown job) or `401` (authentication failure)
 responses, which are raised without the configured headers. One key is exempt
 everywhere: a `Content-Type` in this map (in any spelling) is ignored, because
-every endpoint owns its own content type. Example:
+every endpoint owns its own content type. The SSE log routes also fix
+`Cache-Control` and `X-Accel-Buffering`, so the map cannot override those two
+on a live stream. Example:
 
 ```yaml
 web:
@@ -1318,13 +1327,18 @@ web:
     fromEnvVar: CRONSTABLE_WEB_TOKEN
   authTokens:
     - label: parker-iphone
-      scopes: [view, control, approve]
+      scopes:
+        - view
+        - control
+        - approve
       fromEnvVar: IPHONE_TOKEN
     - label: wallboard-ipad
-      scopes: [view]
+      scopes:
+        - view
       fromFile: /run/secrets/wallboard-token
     - label: ci-trigger
-      scopes: [control]
+      scopes:
+        - control
       value: "…"
 ```
 
@@ -1344,7 +1358,7 @@ There are three scopes:
 | Scope | Grants |
 | --- | --- |
 | `view` | Every read-only `GET`: jobs, runs, DAGs, cluster/fleet, schedule intelligence, the state inspector, the SSE log tail, the calendar feeds, and `/metrics`. Also the MCP endpoint (`POST /mcp`) and its read tools. |
-| `control` | The mutating actions: `POST` start / cancel / pause / resume, DAG trigger / backfill, and the MCP tools that take them. |
+| `control` | The mutating actions: `POST` start / cancel / pause / resume, DAG trigger / backfill, and the MCP tools that take them, plus `cron_preview_recovery`. |
 | `approve` | Only the DAG approval-gate decision (`POST …/decision`). |
 
 `control` and `approve` each **imply** `view` (an action UI has to read state
@@ -1357,7 +1371,7 @@ overrides: the approval decision needs `approve`, and `/mcp` needs only
 `view`. A newly added `POST` route therefore requires `control`
 automatically rather than slipping through unguarded. Each MCP tool then
 requires the scope of the REST route it mirrors, so a `[view]` token opens a
-read-only MCP session, the mutating tools need `control`, and
+read-only MCP session, the mutating tools and `cron_preview_recovery` need `control`, and
 `cron_decide_gate` needs `approve`. No token takes through `/mcp` an action
 this table denies it over REST.
 
@@ -1400,7 +1414,9 @@ web:
     - http://0.0.0.0:8080
   authTokens:
     - label: operator
-      scopes: [control, approve]
+      scopes:
+        - control
+        - approve
       fromEnvVar: CRONSTABLE_OPERATOR_TOKEN
   anonymousScopes:
     - view
@@ -1490,7 +1506,8 @@ certificate with `--client-cert`/`--client-key`. See
 ### Cross-site request defense
 
 Independently of `authToken`, an always-on middleware refuses **cross-site
-browser requests to the mutating endpoints** (`POST /jobs/{name}/start`,
+browser requests to every mutating (`POST`/`DELETE`) endpoint except `/mcp`**
+(for example `POST /jobs/{name}/start`,
 `POST /jobs/{name}/cancel`, `POST /jobs/{name}/pause`,
 `POST /jobs/{name}/resume`, `POST /dags/{name}/trigger`,
 `POST /dags/{name}/backfill`, and the task decision route). Those POSTs are
@@ -1649,7 +1666,7 @@ section but `jobApi.enabled: false`, never starts it and injects nothing.
 | `listen` | string | (ephemeral) | Address to bind, as `host:port`, `http://host:port`, or `https://host:port`. When omitted it binds `127.0.0.1` on an OS-assigned port. An explicit port must be in `0`-`65535` (`0` = OS-assigned), and a non-loopback host needs `allowNonLoopbackBind`. `https://` needs `tls.cert`/`tls.key` and a named host (a wildcard bind is a `ConfigError`). |
 | `maxValueBytes` | int | `1048576` (1 MiB) | Reject a KV or cursor value larger than this many bytes (JSON-encoded) with `413`. `0` means no limit. |
 | `maxArtifactBytes` | int | `67108864` (64 MiB) | Reject an artifact payload larger than this many bytes with `413`. `0` means no limit. |
-| `lockTtlSeconds` | float | `30` | Default lease TTL for a job lock (floored at `5`). The daemon renews it at a third of the TTL while the job holds it. |
+| `lockTtlSeconds` | float | `30` | Default lease TTL for a job lock (minimum `5`; a smaller value is a `ConfigError`). The daemon renews it at a third of the TTL while the job holds it. |
 | `allowNonLoopbackBind` | bool | `false` | Explicit opt-in for a non-loopback `listen` host; without it such a host is a `ConfigError` (the endpoint serves per-run tokens and staged secrets). Combined with a plaintext `http://` listen it logs a warning at startup naming the exposure. |
 | `tls` | map (`cert`/`key`/`ca`) | (none) | Serves an `https://` `listen` from `cert`/`key` (required together). `ca` is the trust anchor injected into jobs as `CRONSTABLE_STATE_CACERT` so the job CLI can verify an internally-issued certificate. The context is built once at startup: rotating these files needs a daemon restart. See [listener TLS](Listener-TLS). |
 
@@ -1688,6 +1705,7 @@ so the response tells a caller nothing beyond the status. Other outcomes:
 | Status | When | Body |
 | --- | --- | --- |
 | `400` | A caller error: a missing required field, or a body that is not a JSON object. | `{"error": "..."}` |
+| `403` | A scope the job is not allowed to use (see `stateAllowedScopes`). | `{"error": "..."}` |
 | `409` | A cursor advanced with a value not comparable to its stored one (a type clash). | `{"error": "..."}` |
 | `410` | An artifact record survives but its payload blob was garbage collected. | `{"error": "..."}` |
 | `413` | A value or artifact larger than the configured `maxValueBytes` / `maxArtifactBytes`. | `{"error": "..."}` |
@@ -1700,8 +1718,9 @@ so the response tells a caller nothing beyond the status. Other outcomes:
 Every KV, cursor, idempotency, and artifact call acts in a *scope*: a namespace
 that defaults to the calling job's own name (`defaultScope` in `GET /v1/run`), so
 one job cannot read another's state by accident. Omit `scope` for that private
-namespace, or pass `scope=global` (any shared name works) for deliberate
-cross-job coordination.
+namespace, or pass `scope=global` for fleet-wide coordination. Any other scope
+name must be listed in the job's `stateAllowedScopes`, or the call is refused
+with `403`.
 
 ### Routes
 

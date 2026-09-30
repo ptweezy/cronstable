@@ -55,8 +55,6 @@ To authenticate callers, use
 
 ## Quickstart: an HTTPS dashboard
 
-<a id="1-mint-a-certificate-with-the-right-sans"></a>
-
 ### 1. Create a certificate with the required SANs
 
 The certificate's subject alternative names (SANs) must include the names
@@ -264,7 +262,7 @@ state:
 | `ca` | *(none)* | The **client-side trust anchor** handed to every job as `CRONSTABLE_STATE_CACERT`, so the job CLI can verify a certificate no public root signed. Counts as TLS material. Setting it without an `https://` listen is refused, because it would be injected into every job and used for nothing. |
 
 `listen` accepts `https://host:port`, `http://host:port`, or a bare `host:port`
-(a `unix://` path is still refused; the job CLI speaks TCP only). The same
+(a `unix://` path is refused; the job CLI speaks TCP only). The same
 pairing rules as `web.tls` apply: `cert` and `key` together, TLS material with
 no `https://` listen refused, an `https://` listen with no certificate refused.
 
@@ -275,14 +273,14 @@ Two rules are specific to this endpoint:
   `ConfigError`s. Jobs dial the address they are handed, and no certificate
   carries a SAN for "every interface", so every job would fail hostname
   verification. Name the interface explicitly (`https://10.0.0.5:9000`).
-* **The advertised URL is the configured host**, not the bound one. A job now
+* **The advertised URL is the configured host**, not the bound one. A job
   receives `CRONSTABLE_STATE_URL=https://10.0.0.5:9000`, the address it can
-  actually dial and the one the certificate covers. (The daemon still uses the
+  actually dial and the one the certificate covers. (The daemon uses the
   bound address for the ephemeral loopback default, where it is the right
   answer.)
 
-`allowNonLoopbackBind` remains required for any non-loopback `listen`. If you
-pair it with a plaintext address, the daemon now logs a warning at every load,
+`allowNonLoopbackBind` is required for any non-loopback `listen`. If you
+pair it with a plaintext address, the daemon logs a warning at every load,
 naming what crosses the network in cleartext. It is a warning and not an error.
 Terminating TLS in front of the endpoint is still a valid answer.
 
@@ -296,7 +294,7 @@ reading twice:
 | `web.tls.clientCa` | server verifies **clients** | Requires a client certificate signed by this CA. It is the caller allowlist. |
 | `state.jobApi.tls.ca` | **jobs** verify the server | Path handed to jobs as `CRONSTABLE_STATE_CACERT` so they can verify the daemon's certificate. It authenticates nobody. |
 
-Mutual TLS on the job state API is deliberately **not** in this release. The
+The job state API deliberately **does not** support mutual TLS. The
 per-run bearer token already authenticates the caller (it identifies which run
 is calling, which a certificate would not), and requiring client certificates
 would mean injecting client key material into every job's environment.
@@ -382,11 +380,11 @@ Two properties are worth planning around:
   accordingly. `http://` listeners in the same `listen` list keep their
   sockets through the restart.
 
-**The `state.jobApi` listener does not hot-reload.** It builds its context once
-when it starts and has no rotation check, so renewing its certificate in place
-changes nothing until the **daemon is restarted**. If that endpoint's
-certificate is on a short automatic renewal cycle, schedule a daemon restart to
-match it.
+**The `state.jobApi` listener has its own in-place rotation check** for `cert`
+and `key`. It skips `ca`, because jobs read that file fresh on each run. On the
+next reload pass after a change, once the new files load, the daemon restarts
+that listener alone. If the rebind fails, the endpoint stays down until the
+state config next changes.
 
 ## Troubleshooting
 

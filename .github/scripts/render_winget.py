@@ -97,7 +97,7 @@ def render(version, metadata, output):
                 for line in (Path(__file__).resolve().parents[2] / "LICENSE")
                 .read_text("utf-8")
                 .splitlines()
-                if line.startswith("Copyright ")
+                if line.startswith("Copyright (c) ")
             ),
             "CopyrightUrl": f"{REPO}/blob/{version}/LICENSE",
             "ShortDescription": "A distributed cron replacement.",

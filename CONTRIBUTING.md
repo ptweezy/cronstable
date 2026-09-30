@@ -322,8 +322,6 @@ The single [`CI`](.github/workflows/release.yml) GitHub Actions pipeline
 commit and, on a release, publishes it. Version numbers come from git tags with
 `setuptools_scm`; you never edit a version by hand.
 
-<a id="cutting-a-release"></a>
-
 ### Creating a release
 
 A release happens when **any commit in a push to `main`** has a release marker
@@ -375,9 +373,8 @@ wiki](#editing-the-wiki)). On a release it, in order:
      and `backends-live` (backend tests against an etcd server, a second etcd
      server with TLS and authentication, and a kind cluster);
    - the wheel + sdist;
-   - the self-contained PyInstaller binaries for Linux (`amd64`, `arm64`,
-     `i686`, `armv7`, `armv6`, `ppc64le`, `s390x` and `riscv64`, glibc and
-     musl), macOS (`arm64` + `amd64`) and Windows (`amd64` + `arm64`), each
+   - the self-contained PyInstaller binaries for every platform listed under
+     [installation](https://github.com/ptweezy/cronstable#installation), each
      smoke-tested with `--version`;
    - a build-only pass over every Docker image.
 
@@ -392,12 +389,12 @@ wiki](#editing-the-wiki)). On a release it, in order:
    GitHub Release, then pushes the multi-arch container images and updates the
    Homebrew tap.
 
-   The GitHub Release carries the wheel, sdist, and all the binaries
-   (`cronstable-linux-{amd64,arm64,i686,armv7,ppc64le,s390x,riscv64}`, their
-   `-musl` variants plus `cronstable-linux-armv6-musl`,
-   `cronstable-macos-{arm64,amd64}`, and
-   `cronstable-windows-{amd64,arm64}.exe`, `.zip` and `.msi`), plus a single
-   `SHA256SUMS`.
+   The GitHub Release carries the wheel, sdist, every binary and native
+   package, the Windows setup programs, MSIs, and zips, a Scoop manifest, the
+   third-party license notices, and a single `SHA256SUMS`. For the full asset
+   table, see
+   [installation](https://github.com/ptweezy/cronstable/wiki/Installation) in
+   the wiki.
 
 Because no file is committed back to *this* repo, a release never re-triggers
 the workflow. (Two jobs do push elsewhere: the Homebrew tap on a release, and

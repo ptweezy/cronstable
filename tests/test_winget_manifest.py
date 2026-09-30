@@ -125,9 +125,12 @@ def test_published_catalog_metadata_is_preserved(metadata, tmp_path):
     assert locale["Copyright"].splitlines() == [
         line
         for line in (ROOT / "LICENSE").read_text("utf-8").splitlines()
-        if line.startswith("Copyright ")
+        if line.startswith("Copyright (c) ")
     ]
     assert "cronstable contributors" in locale["Copyright"]
+    # the brand-artwork reservation is a Copyright-prefixed LICENSE line (so
+    # GitHub's license matcher skips it) but is not a copyright holder
+    assert "brand artwork" not in locale["Copyright"]
     assert locale["CopyrightUrl"] == (
         "https://github.com/ptweezy/cronstable/blob/1.2.50/LICENSE"
     )

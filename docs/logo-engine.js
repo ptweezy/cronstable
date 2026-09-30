@@ -186,8 +186,8 @@
   // them. Every mount of the shipped wordmark has the same physics, so that
   // was ~30 ms of blocking script on the critical path to first paint for an
   // answer that never changes: the default DP's gains are seeded below, and
-  // any other parameter set is solved once and kept (docs/logo-lab.html and
-  // docs/comparison.html build several sims from one set).
+  // any other parameter set is solved once and kept (docs/logo-lab.html
+  // builds several sims from one set).
   //
   // Keyed on the exact parameter string, so editing DP misses the seed and
   // falls back to the solver instead of flying stale gains. K and P are read

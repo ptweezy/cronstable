@@ -67,9 +67,9 @@ and OpenSSL explicitly, even when the build host is 64-bit. These source
 builds are best effort: only a build that passes the X-Wing sealing probe
 is bundled, and there is no fallback to the vulnerable 48.x release line.
 
-If a new binary no longer lists `xwing` in `--sealable-suites`, existing
+If a binary does not list `xwing` in `--sealable-suites`, existing
 `xwing` pairings need to be paired again under `x25519`; open the companion
-app and connect to the upgraded daemon so it can update the pairing.
+app and connect to the daemon so it can update the pairing.
 Until then, the daemon reports those devices as unsealable and cannot
 deliver their alerts. A 32-bit Python on 64-bit Windows reports the
 64-bit machine, so its dependency marker still requests cryptography;
@@ -149,7 +149,7 @@ and under `notify.report`:
 | --- | --- | --- | --- |
 | `enabled` | bool (Opt) | `false` | Opt this hook into the push channel. Enabling it anywhere requires the daemon-global `push:` section (a `ConfigError` otherwise). |
 | `priority` | `time-sensitive` or `passive` (Opt) | `time-sensitive` | Relayed to APNs as the interruption level. `time-sensitive` breaks through scheduled summaries; `passive` does not. |
-| `includeLogTail` | bool (Opt) | `true` | Carry the last captured output lines (stderr when captured, otherwise stdout, up to 40 lines) inside the sealed payload, trimmed oldest-first to fit the size cap. |
+| `includeLogTail` | bool (Opt) | `true` | Carry the last captured output lines (stderr when it has output, otherwise stdout, up to 40 lines) inside the sealed payload, trimmed oldest-first to fit the size cap. |
 
 ### The `push:` section
 
@@ -457,8 +457,9 @@ device set and say so, and the pairing endpoints answer `503` per request.
 
 The daemon-to-relay wire contract is documented in
 [`docs/relay-protocol.md`](https://github.com/ptweezy/cronstable/blob/main/docs/relay-protocol.md).
-The relay implementation lives in a separate repository and its source will
-be published; that file is the contract any implementation must satisfy.
+The relay implementation lives in the separate
+[ptweezy/cronstable-relay](https://github.com/ptweezy/cronstable-relay)
+repository; that file is the contract any implementation must satisfy.
 
 The trust model: the relay is not a trusted party. It receives ciphertext
 and routing metadata only (device token, coalescing hash, priority, event

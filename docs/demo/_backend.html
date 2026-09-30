@@ -11,7 +11,7 @@ window.CRONSTABLE_BRAND = "cronstable demo";
  *  server. A 9-node "meridian" gossip fleet is derived deterministically
  *  from the wall clock, so every 3s poll animates: countdowns tick,
  *  long-runners stay running, a fleet incident flares and self-clears.
- *  No network ever leaves the page.  See docs/comparison.html.
+ *  No network ever leaves the page.
  * ===================================================================== */
 (function () {
   "use strict";
@@ -920,8 +920,8 @@ window.CRONSTABLE_BRAND = "cronstable demo";
   // unobtrusive, honest badge (does not obscure the board)
   window.addEventListener("DOMContentLoaded", function () {
     var b = document.createElement("a");
-    b.href = "../comparison.html"; b.textContent = "▚ demo · synthetic data";
-    b.title = "cronstable interactive demo — every view is real, the data is synthetic. Back to the comparison.";
+    b.href = "https://github.com/ptweezy/cronstable"; b.textContent = "▚ demo · synthetic data";
+    b.title = "cronstable interactive demo — every view is real, the data is synthetic.";
     b.style.cssText = "position:fixed;left:10px;bottom:10px;z-index:8000;font:600 11px/1 var(--mono,monospace);" +
       "padding:5px 9px;border:1px solid var(--border2,#2a3b4d);border-radius:3px;background:var(--panel,#0b1620);" +
       "color:var(--fg-dim,#4b9cd3);text-decoration:none;opacity:.72;box-shadow:0 2px 10px rgba(0,0,0,.4)";

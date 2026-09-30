@@ -8,17 +8,25 @@ rendering, and memory use to track performance on older and smaller machines.
 ## What is measured
 
 The suite lives in [`benchmarks/`](https://github.com/ptweezy/cronstable/blob/main/benchmarks)
-and currently covers about 37 metrics across these groups:
+and registers about 100 benchmarks across these groups
+(`python benchmarks/bench.py --list` prints them all):
 
 | Group | Examples |
 |---|---|
 | `startup` | wall clock of `cronstable --version`, importing the scheduling engine, importing the full daemon graph, `--validate-config` over a 100-job file |
 | `cronexpr` | parsing plain and extended expressions (ranges, steps, `L`, `W`, `#`, `H`, seconds), `next()` search, enumerating occurrences, instant matching |
 | `config` | YAML parsing of a 300-job config, per-job `JobConfig` construction, classic crontab parsing |
-| `schedule` | building the fire schedule for 100,000 jobs from cold, reseeding it pre-parsed, schedule load over 24 hours, duplicate detection, slot suggestion |
-| `dag` | building and validating 10k-task graphs, the plan-and-claim transform over a 2k-task run |
+| `schedule` | building the fire schedule for 100,000 jobs from cold, reseeding it pre-parsed, schedule load over 48 hours, duplicate detection, slot suggestion |
+| `dag` | building and validating 10k-task graphs, the plan-and-claim transform over a 10k-task run |
 | `state` | appending durable records, cold and memoized `derive_max`, listing records, job KV round trips |
 | `json`, `fingerprint`, `redact`, `ical` | serialization round trips, job-set fingerprinting at 10k jobs, log redaction with and without secrets, iCal rendering |
+| `tui` | restyling, searching, and painting a log drawer of 5k to 20k lines, painting 2k-task graphs |
+| `webui` | web dashboard rendering in headless Chromium: 500 job rows, a 15-node fleet matrix, 5k-line logs, the week and upcoming-runs walks |
+| `loop` | the longest event-loop stall under `/jobs` polls, `/metrics` scrapes, and bursts of completions; idle loop iterations |
+| `webapi` | the `GET /jobs` handler and body size at 500 jobs, response gzip, SSE framing, bearer-token auth |
+| `cluster` | job-owner lookups, absorbing gossiped job summaries, fleet-view merges |
+| `prometheus`, `statsd`, `mcp` | `/metrics` rendering, StatsD emission, an MCP `tools/call` |
+| `job`, `resources`, `push` | the per-line output capture pipeline, reporting with no reporter configured, resource-monitor final readings, sealing push alerts |
 | `memory` | traced bytes held by parsed schedules and job configs, peak RSS of a real `--version` process and of the daemon import |
 
 Time metrics report the wall clock of a fixed workload; memory metrics report
@@ -31,7 +39,8 @@ compared. Instead the `perf` job makes a paired measurement on one runner:
 
 1. The current commit is installed into one virtualenv, and the latest
    release tag into another.
-2. The suite runs against both, interleaved, for two rounds. The harness
+2. The suite runs against both in interleaved rounds: five for in-process
+   metrics and two for subprocess (startup, peak-RSS) metrics. The harness
    itself always comes from the current checkout, so both sides run
    identical measurement code. A benchmark whose API the old release lacks
    is recorded as skipped for that side.
@@ -39,9 +48,10 @@ compared. Instead the `perf` job makes a paired measurement on one runner:
    time, median for memory) and diffs the two.
 
 A metric fails its gate only when it slows down by more than its declared
-percentage limit (25% for most timing metrics, 15% for traced memory) AND by
-more than its absolute floor. Microsecond jitter on a tiny metric can
-therefore never gate.
+percentage limit (15% for most metrics, 25% for noisier ones such as the
+subprocess, disk I/O, and peak-RSS metrics), by more than its absolute floor,
+and by more than twice its measured round-to-round noise. Microsecond jitter
+on a tiny metric can therefore never gate.
 
 On an ordinary commit or pull request the comparison only warns. On a release
 the gate is enforced: the publish jobs require `perf`, so a gated regression

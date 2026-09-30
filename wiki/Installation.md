@@ -23,12 +23,13 @@ Installing the `cronstable` distribution pulls in the following, taken from
 
 | Dependency | Version constraint |
 | --- | --- |
-| `strictyaml` | `>=1.7,<2` |
-| `aiohttp` | `>=3.10,<4` |
-| `sentry-sdk` | `>=2,<3` |
-| `aiosmtplib` | `>=3,<6` |
-| `jinja2` | `>=3,<4` |
-| `tzdata` | `>=2024.1` |
+| `strictyaml` | `>=1.7.3,<2` |
+| `aiohttp` | `>=3.14.3,<4` |
+| `sentry-sdk` | `>=2.70.0,<3` |
+| `aiosmtplib` | `>=5.1.3,<6` |
+| `jinja2` | `>=3.1.6,<4` |
+| `tzdata` | `>=2026.4` |
+| `psutil` | `>=7.2.2` |
 
 `tzdata` ships the IANA time-zone database so `zoneinfo` resolves time zones on
 minimal/slim images that do not include the system tz data. See
@@ -45,15 +46,15 @@ minimal/slim images that do not include the system tz data. See
 | Windows zip (one-directory) | GitHub Releases | Yes (embedded) | No |
 | Windows MSI | GitHub Releases | Yes (embedded) | No |
 | Homebrew | cronstable tap (release binary) | Yes (embedded) | **Yes** |
-| winget | winget-pkgs (release binary) | Yes (embedded) | **Yes** |
-| Scoop | ScoopInstaller/Extras (release binary) | Yes (embedded) | **Yes** |
+| winget | winget-pkgs (signed setup that installs the MSI) | Yes (embedded) | No |
+| Scoop | Manifest attached to each release (release binary) | Yes (embedded) | **Yes** |
 | `.deb` / `.rpm` | GitHub Releases | Yes (embedded) | **Yes** |
 | `.apk` (Alpine) | GitHub Releases | Yes (embedded) | **Yes** |
 | `.pkg` (FreeBSD) | GitHub Releases | Yes (embedded) | **Yes** |
 | `ubi` / `mise` | GitHub Releases | Yes (embedded) | **Yes** |
 | Nix | this flake | No (uses nixpkgs Python) | No |
 
-Only the standalone binary, including the copies Homebrew and winget install,
+Only the standalone binary, including the copies Homebrew and Scoop install,
 self-extracts at startup and therefore needs a writable and executable temp
 directory (see
 [standalone binary temp-directory requirement](#standalone-binary-temp-directory-requirement)).
@@ -76,15 +77,15 @@ docker run --rm \
 ```
 
 For an x86-64-v3-capable host, **`latest-amd64v3` is recommended**; substitute
-it for `latest` in the command above. Existing tags keep their current platform
-coverage and CPU requirements. See [variant selection](#amd64v3-cpu-requirements)
+it for `latest` in the command above. Tags without the `-amd64v3` suffix use the
+baseline `amd64` build on x64. See [variant selection](#amd64v3-cpu-requirements)
 before choosing a v3 image, including inside a VM.
 
 The image runs as the non-root user `65534:65534`. Its entrypoint is
 `cronstable` with default arguments `-c /etc/cronstable.d`, so it reads
 configuration from `/etc/cronstable.d` unless you override the arguments. For
 production, pin a specific version instead of `latest` (for example,
-`ghcr.io/ptweezy/cronstable:1.0.4`).
+`ghcr.io/ptweezy/cronstable:1.2.60`).
 
 To include your configuration in your own image, base it on the published
 image:
@@ -132,7 +133,7 @@ also available explicitly as `-debian`:
 # e.g. the Alpine variant, pinned to a version:
 docker run --rm \
   -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
-  ghcr.io/ptweezy/cronstable:1.0.14-alpine
+  ghcr.io/ptweezy/cronstable:1.2.60-alpine
 ```
 
 Because cronstable is a pure-Python app that supports any Python >= 3.10,
@@ -143,9 +144,9 @@ The Debian default covers the most architectures. Each variant covers the
 architectures its base image publishes:
 
 * Alpine matches Debian's full set.
-* RHEL, Fedora, openSUSE, and distroless cover `amd64`, `arm64`, `ppc64le` and
-  `s390x`.
-* Amazon Linux covers `amd64` and `arm64`.
+* Ubuntu covers `amd64`, `arm64`, `arm/v7`, `ppc64le`, `s390x`, and `riscv64`.
+* RHEL, Fedora, and openSUSE cover `amd64`, `arm64`, `ppc64le`, and `s390x`.
+* Amazon Linux and distroless cover `amd64` and `arm64`.
 
 All variants share the same non-root, read-only-friendly hardening as the
 default image.
@@ -211,7 +212,7 @@ rather than failing to build it from source.
 
 ## Install using pipx
 
-[pipx](https://github.com/pipxproject/pipx) creates the virtualenv and installs
+[pipx](https://github.com/pypa/pipx) creates the virtualenv and installs
 the program into it:
 
 ```shell
@@ -276,11 +277,11 @@ WinGet. To upgrade an MSI or setup installation, run
 
 ## Install using Scoop
 
-On Windows, through [Scoop](https://scoop.sh):
+On Windows, through [Scoop](https://scoop.sh), using the manifest attached to
+each release:
 
 ```shell
-scoop bucket add extras
-scoop install cronstable
+scoop install https://github.com/ptweezy/cronstable/releases/latest/download/cronstable.json
 ```
 
 This installs the same self-contained `.exe` the release publishes, for
@@ -501,13 +502,16 @@ See [CPU requirements](#amd64v3-cpu-requirements).
 | `cronstable-windows-amd64.msi` | Windows | x64 (amd64) | **Compatibility build.** Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
 | `cronstable-windows-arm64.msi` | Windows | ARM64 | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
 | `cronstable-windows-i686.msi` | Windows | 32-bit x86 | Machine-wide installer. Registers the [Windows service](Windows-Service). See [Windows MSI](Windows-MSI). |
+| `cronstable-windows-amd64v3-setup.exe` | Windows | x64 (amd64) / v3 | **Recommended for compatible CPUs.** Requires x86-64-v3; otherwise the same format and OS requirement as the amd64 row. |
+| `cronstable-windows-amd64-setup.exe` | Windows | x64 (amd64) | **Compatibility build.** Signed setup that embeds the MSI. WinGet installs this asset on x64. See [Windows MSI](Windows-MSI). |
+| `cronstable-windows-arm64-setup.exe` | Windows | ARM64 | Signed setup that embeds the MSI. WinGet installs this asset on ARM64. See [Windows MSI](Windows-MSI). |
 
 ### amd64v3 CPU requirements
 
 | x64 download | When to choose it |
 | --- | --- |
-| **`amd64v3` — Recommended for compatible CPUs** | The CPU and guest OS expose the full x86-64-v3 feature set. |
-| **`amd64` — Compatibility build** | The CPU or VM lacks v3, or its capabilities are uncertain. |
+| **`amd64v3`: recommended for compatible CPUs** | The CPU and guest OS expose the full x86-64-v3 feature set. |
+| **`amd64`: compatibility build** | The CPU or VM lacks v3, or its capabilities are uncertain. |
 
 `amd64v3` means the **x86-64-v3 microarchitecture level**, not a different
 operating-system ABI. It requires the complete v3 feature set, including AVX,
@@ -527,11 +531,11 @@ To select the recommended build on a compatible CPU, replace `amd64` with
 and macOS, OpenBSD, NetBSD and illumos binaries follow the same rule.
 The macOS source build targets macOS 15 and newer.
 
-The Linux packages still declare `amd64`/`x86_64`, FreeBSD retains its native
-ABI and the Windows MSI remains x64. Package managers do not enforce the CPU
-requirement. These are alternative builds of the same `cronstable` package,
+The v3 Linux packages declare `amd64`/`x86_64`, the v3 FreeBSD package uses
+the native FreeBSD ABI, and the v3 Windows MSI targets x64. Package managers
+do not enforce the CPU requirement. These are alternative builds of the same `cronstable` package,
 with the same install paths and services; choose one variant per installation.
-Homebrew, Scoop and winget keep their baseline downloads.
+Homebrew, Scoop and winget install the baseline downloads.
 
 The optimized component is the embedded CPython runtime. Linux uses pinned
 python-build-standalone v3 builds; the other operating systems compile CPython
@@ -543,7 +547,7 @@ For compatible hosts, the recommended Docker tags are `latest-amd64v3` (Debian),
 `latest-debian-amd64v3`, and `latest-<distro>-amd64v3` for the other distros.
 Replace `latest` with the release version to pin one. They use the normal
 `linux/amd64` container platform and require a compatible host CPU. The bare
-`latest` and existing distro tags keep their current platform coverage.
+`latest` and `latest-<distro>` tags use the baseline `amd64` build.
 To build locally, add `--platform linux/amd64 --build-arg PYTHON_VARIANT=amd64v3`
 to the selected Dockerfile's build command.
 
@@ -608,8 +612,8 @@ build can seal the `xwing` suite except `linux-mips64le` and `linux-armel`,
 which seal `x25519` only. Intel macOS (`macos-amd64` and `macos-amd64v3`)
 and `windows-i686` attempt patched cryptography source builds instead of
 bundling the vulnerable 48.x release line. If compilation or the sealing
-probe fails, the binary keeps `x25519` push. Existing `xwing` devices need
-to pair again under `x25519` if the upgraded daemon loses that suite.
+probe fails, the binary seals `x25519` only, and a device paired under `xwing`
+must pair again under `x25519`.
 See [Push notifications](Push-Notifications) for what the source builds
 promise and how to check a binary.
 
@@ -691,8 +695,8 @@ the first run of a browser-downloaded copy can still be blocked by SmartScreen.
 Choose **More info**, then **Run anyway**. If your policy calls for it,
 verify the download against the release's `SHA256SUMS`.
 
-The WinGet release workflow submits MSIs with a one-directory payload, using
-the compatibility build on x64. See the
+The WinGet release workflow submits signed setup executables that embed the
+MSI and its one-directory payload, using the compatibility build on x64. See the
 [WinGet installation instructions](#install-using-winget) for package availability
 and steps to switch from a portable install. For Windows deployment details,
 see [running on Windows](Running-on-Windows).

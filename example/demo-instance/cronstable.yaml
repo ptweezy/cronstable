@@ -353,8 +353,8 @@ jobs:
       cronstable cursor advance meter-rows "$next" > /dev/null
       echo "watermark now $next"
 
-  # [shows: exactly-once via `cronstable idempotent`] Scheduled hourly on
-  # purpose, rotates exactly once per day: the first run of the day wins the
+  # [shows: once-per-key claims via `cronstable idempotent`] Scheduled hourly on
+  # purpose, rotates once per day: the first run of the day wins the
   # claim (exit 0), later runs find it taken (exit 5) and skip, and a store
   # error (exit 1) fails the run rather than guessing "already done".
   - name: rotate-journal

@@ -34,8 +34,8 @@ used the syntax is passed through verbatim.
 ```yaml
 web:
   listen:
-    - "0.0.0.0:${PORT}"            # PORT from the environment
-    - "${BIND:-127.0.0.1}:8080"    # a default when BIND is unset
+    - "http://0.0.0.0:${PORT}"            # PORT from the environment
+    - "http://${BIND:-127.0.0.1}:8080"    # a default when BIND is unset
 state:
   path: ${STATE_DIR}/cronstable    # a whole path segment from the environment
 jobs:
@@ -51,15 +51,14 @@ jobs:
 
 Expansion runs **after** the document is validated against the schema, over the
 parsed values. It therefore applies to every field the schema accepts as a
-string in the `jobs`, `dags`, `web`, `state`, `cluster`, `mcp`, `defaults`, and
-`include` sections (the `logging` section is skipped, see the next section). A
+string, in every section except `logging` (see the next section). A
 `${VAR}` may sit anywhere inside such a string.
 
 Because it runs post-validation, a numeric key cannot itself be a bare
 `${VAR}`. `smtpPort: ${PORT}` fails schema validation before expansion is ever
 reached, because `${PORT}` is not an integer. Put the variable inside a string
 instead. A listen address carries its port inside a string
-(`"0.0.0.0:${PORT}"`), which is why the port can come from the environment.
+(`"http://0.0.0.0:${PORT}"`), which is why the port can come from the environment.
 
 Path-typed fields are strings, so they expand like any other. The one to watch
 is a job's [`workingDirectory`](Commands-and-Environment#workingdirectory),
@@ -78,6 +77,8 @@ expansion syntax rather than cronstable's.
 
 - a job's `command` and `shell`,
 - a DAG task's `command` and `shell`,
+- a `verify` block's `command`,
+- the `shell` in a `defaults:` block,
 - a shell reporter's whole `report.shell` block (its `command` and `shell`).
 
 These are handed to a shell at run time. That shell is meant to expand their
@@ -127,11 +128,11 @@ include:
   - ${ENVIRONMENT:-prod}.yaml
 ```
 
-The environment is read at load time. A running daemon reloads its config
-periodically and on the usual triggers, but it skips the reload when no source
-file has changed on disk. Changing an environment variable does not change a
-file on disk, so the daemon has nothing to detect. Restart (or touch the
-config) to pick it up.
+[Classic crontab](Classic-Crontabs) files are not interpolated: `${...}` in a
+crontab reaches the job verbatim.
+
+The daemon reads its own process environment, which is fixed when it starts.
+Restart it to pick up a changed variable.
 
 ## Effect on the job-set ID
 
@@ -154,7 +155,7 @@ state:
   path: ${STATE_DIR}
 web:
   listen:
-    - "0.0.0.0:${WEB_PORT:-8080}"
+    - "http://0.0.0.0:${WEB_PORT:-8080}"
 jobs:
   - name: nightly-rollup
     command: rollup --region "$REGION"   # $REGION expanded by the job's shell

@@ -9,7 +9,8 @@ See [reporting](Reporting) for the hooks and the block's shared shape, and
 behavior.
 
 It is Windows only. On any other platform it does nothing, and cronstable
-logs a warning once at startup rather than dropping reports silently.
+logs a warning on every configuration load, including `--validate-config`,
+rather than dropping reports silently.
 
 ## Enabling it
 
@@ -32,7 +33,7 @@ jobs:
 | --- | --- | --- | --- |
 | `enabled` | bool | `false` | Write records for this hook. |
 | `source` | string | `cronstable` | The event source name that records are written under. |
-| `includeOutput` | bool | `false` | Carry a bounded tail of the run's captured output as the last insertion string. |
+| `includeOutput` | bool | `false` | Carry the run's captured stderr (or stdout when stderr is empty), cut to its first 8000 characters, as the last insertion string. |
 
 `source` must be a plain name. An empty value, one containing `\` or `/`,
 and the three log names `Application`, `System`, and `Security` are refused
@@ -94,7 +95,7 @@ string rather than absent, so the arity never changes.
 | 7 | `startedAt` | ISO 8601 start instant |
 | 8 | `schedule` | the job's crontab line |
 | 9 | `detail` | per-outcome extras (SLA numbers, the event name, resource usage) |
-| 10 | `output` | a bounded output tail, when `includeOutput` is on |
+| 10 | `output` | the run's captured stderr (or stdout when stderr is empty), cut to its first 8000 characters, when `includeOutput` is on |
 
 Field 2 repeats the outcome as text so a consumer that only rule-matches
 event ID 1001 can still tell a failure from a permanent failure.
@@ -189,11 +190,12 @@ standard library's `logging.handlers.NTEventLogHandler` is not an
 alternative, because it needs pywin32, which the frozen executable does not
 carry.
 
-**On POSIX it does nothing**, and cronstable logs a warning once, naming
-every hook that enabled it:
+**On POSIX it does nothing**, and cronstable logs a warning on every
+configuration load, including `--validate-config`, naming every job, DAG
+task, or `notify` block that enabled it:
 
 ```text
-report.eventlog is enabled (job nightly-backup) but there is no Windows Event Log on this platform, so those reports are dropped; the rest of each report block still fires normally
+report.eventlog is enabled (job nightly-backup), but Windows Event Log is unavailable on this platform. Event Log reports will be skipped; other configured reporters still run normally
 ```
 
 A warning rather than a refusal, so one configuration directory can serve a

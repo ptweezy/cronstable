@@ -31,7 +31,7 @@ jobs:
 | `sla.maxTimeSinceSuccessSeconds` | int or null | `null` (off) | Breach when this many seconds pass without a successful finish. Must be `> 0` when set. |
 | `sla.lateAfterSeconds` | int or null | `null` (off) | Breach when a due scheduled slot has not started a run within this many seconds. Must be `> 0` when set. |
 | `sla.maxRuntimeSeconds` | int or null | `null` (off) | Breach while any running instance has been running longer than this. Observes only; this check never stops the run (to enforce a limit, use [`executionTimeout`](Concurrency-and-Timeouts)). Must be `> 0` when set. |
-| `onLate.report` | report block | reporter defaults | The [reporters](Reporting) fired once per breach: `mail`, `sentry`, `shell`, `webhook`. The schema matches `onFailure.report`, with overdue-specific default templates. |
+| `onLate.report` | report block | reporter defaults | The [reporters](Reporting) fired once per breach: `mail`, `sentry`, `shell`, `webhook`, `push`, and `eventlog`. The schema matches `onFailure.report`, with overdue-specific default templates. |
 
 The three thresholds are independent; set any subset. Configuring an `onLate` reporter with no thresholds raises a load-time `ConfigError` (`onLate requires sla`). Both keys merge under a [`defaults:` block](Includes-and-Defaults) and are excluded from the [job-set ID](Job-Set-ID) fingerprint.
 
@@ -84,7 +84,7 @@ Templates receive the full standard [template variable set](Reporting#templating
 ## See also
 
 - [Pausing Jobs](Pausing-Jobs): pausing suppresses a job's SLA checks.
-- [Reporting (Mail, Sentry, Shell, Webhook)](Reporting): the reporter options `onLate.report` accepts.
+- [Reporting (Mail, Sentry, Shell, Webhook, Push, Event Log)](Reporting): the reporter options `onLate.report` accepts.
 - [Metrics with Prometheus](Metrics-with-Prometheus): the metric families and the external staleness alert to pair with.
 - [Failure Detection and Retries](Failure-Detection-and-Retries): the hooks for runs that happened and failed.
 - [Hashed Schedules](Hashed-Schedules): stable `H` slots keep "was this run late?" answerable.

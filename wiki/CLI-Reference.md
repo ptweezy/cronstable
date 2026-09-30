@@ -12,13 +12,18 @@ invocations. Behavior is taken from `cronstable/__main__.py`,
 ## Synopsis
 
 ```
-cronstable [-c FILE-OR-DIR] [-l LOG_LEVEL] [-v] [--job-set-id] [--version]
+cronstable [-c FILE-OR-DIR] [-l LEVEL] [-v] [--job-set-id] [--version]
+           [--third-party-licenses] [--sealable-suites]
+cronstable init [DIRECTORY]
 cronstable state ACTION [options] [-c FILE-OR-DIR]
 cronstable state get|set|delete|keys ...  [--scope NAME | --global]
-cronstable cursor|lock|artifact|idempotent|secret ...  [--scope NAME | --global]
+cronstable cursor|lock|artifact|idempotent ...  [--scope NAME | --global]
+cronstable secret get|list ...
 cronstable xcom push|pull|list ...
-cronstable mcp [--url URL] [--token TOKEN | --token-env VAR] [--check]
-cronstable tui [--url URL] [--token TOKEN | --token-env VAR] [options]
+cronstable mcp [--url URL] [--token TOKEN] [--token-env VAR] [--cacert PATH]
+               [--client-cert PATH --client-key PATH] [--insecure] [--check]
+cronstable tui [--url URL] [--token TOKEN] [--token-env VAR] [--cacert PATH]
+               [--client-cert PATH --client-key PATH] [--insecure] [options]
 cronstable service install|remove|start|stop|reload|status|run [options]
 cronstable import-taskscheduler PATH... [-o FILE] [--timezone NAME]
 ```
@@ -61,6 +66,8 @@ route on any platform (see the [HTTP control API](HTTP-API)).
 | `-v`, `--validate-config` | flag | off | Parse and validate the configuration, then exit: `0` if valid, `1` on a configuration error. Does not start the scheduler or web server. |
 | `--job-set-id` | flag | off | Parse the configuration, print the [job-set ID](Job-Set-ID) to stdout, and exit `0`. The id hashes selected fields in each job's effective configuration, independently of job order. Exits `1` on a configuration error. |
 | `--version` | flag | off | Print the cronstable version to stdout and exit `0`. |
+| `--third-party-licenses` | flag | off | Print the bundled third-party license notices (the LGPL notice for python-zeroconf) and exit `0`. |
+| `--sealable-suites` | flag | off | Print each supported push encryption suite, one per line, verified by a test encryption, and exit `0`. |
 | `-h`, `--help` | flag | — | Print usage (argparse builtin) and exit `0`. |
 
 The other command-line surfaces are the
@@ -152,24 +159,25 @@ through `logging.config.dictConfig`; see
 
 ### `-v` / `--validate-config`
 
-Validation constructs the scheduler from the resolved configuration
-(`Cron(config)`), which parses and schema-checks every file. On success it logs
-`Configuration is valid.` and exits `0`. On any `ConfigError` (schema
-violation, unknown time zone, invalid numeric range, missing user/group,
+Validation parses and schema-checks every file (`parse_config_with_sources`,
+the same parse the scheduler runs) without constructing the scheduler. On
+success it logs `Configuration is valid.` and exits `0`. On any `ConfigError`
+(schema violation, unknown time zone, invalid numeric range, missing user/group,
 include cycle, multiple `web`/`logging` sections, and other faults) it logs
 `Configuration error: <detail>` and exits `1`. The scheduler loop and web
 server never start in this mode.
 
 The earlier default-path special case still applies: the check runs before
-`Cron(config)` is constructed, so validating while the configuration argument
+the configuration is parsed, so validating while the configuration argument
 equals the platform default (`DEFAULT_CONFIG_PATH`) and that path is absent
 exits `1` with the not-found message rather than the
 `Configuration error: ...` message.
 
 ### `--job-set-id`
 
-Constructs the scheduler from the resolved configuration exactly like
-`--validate-config`, then prints the job-set ID to stdout and exits `0`. The id
+Parses and schema-checks the resolved configuration exactly like
+`--validate-config`, without constructing the scheduler, then prints the
+job-set ID to stdout and exits `0`. The id
 is an order-independent hash of selected fields in each job's effective
 configuration. Matching values for those fields produce the same id regardless
 of file order or how the jobs are split across files. It describes configured
@@ -187,7 +195,7 @@ exactly as it does for `--validate-config`.
 
 ### `--version`
 
-Prints the version string (for example, `1.0.13`) to stdout and exits `0`. This
+Prints the version string (for example, `1.2.60`) to stdout and exits `0`. This
 check runs before the configuration is touched, so `--version` succeeds even
 when no configuration exists.
 
@@ -381,8 +389,9 @@ and need no configuration file. Behavior comes from `cronstable/jobcli.py`.
 The `state` job actions share the `cronstable state` name with the
 [admin actions](#the-state-subcommand); the action name selects the handler,
 and the job commands take no `-c`. Outside a job the injected environment is
-absent and every command exits `1` with `not running inside a cronstable job:
-CRONSTABLE_STATE_URL is not set`.
+absent and every command exits `1` with `cronstable <command>: job state
+connection is unavailable: CRONSTABLE_STATE_URL is not set. ...` (`xcom`
+reports that the workflow task context is unavailable).
 
 This section keeps to each command's synopsis, flags, and exit codes. The
 semantics live in [durable state](Durable-State#job-facing-state), which also
@@ -497,8 +506,10 @@ with `--map-index I` selecting one instance of a
 ## The `mcp` subcommand
 
 ```
-cronstable mcp [--url URL] [--token TOKEN | --token-env VAR]
-               [--protocol-version REV] [--timeout SECONDS] [--check]
+cronstable mcp [--url URL] [--token TOKEN] [--token-env VAR]
+               [--cacert PATH] [--client-cert PATH --client-key PATH]
+               [--insecure] [--protocol-version REV] [--timeout SECONDS]
+               [--check]
 ```
 
 `cronstable mcp` runs the MCP stdio bridge: a thin standard-library client that
@@ -506,21 +517,25 @@ connects a desktop MCP client (stdio transport) to a running daemon's `/mcp`
 endpoint (`--url`, default `http://127.0.0.1:8080`). Like the job-facing
 commands it needs no configuration file and never imports the daemon graph. The
 [MCP](MCP) page documents the bridge, every flag (including
-`--protocol-version` and `--timeout`), and client setup.
+`--protocol-version` and `--timeout`), and client setup. See
+[listener TLS](Listener-TLS#client-configuration) for the TLS flags
+(`--cacert`, `--client-cert`, `--client-key`, `--insecure`).
 
 ## The `tui` subcommand
 
 ```
-cronstable tui [--url URL] [--token TOKEN | --token-env VAR] [--theme NAME]
-               [--tv] [--job NAME] [--boot | --no-boot] [--ascii]
-               [--poll SECONDS]
+cronstable tui [--url URL] [--token TOKEN] [--token-env VAR]
+               [--cacert PATH] [--client-cert PATH --client-key PATH]
+               [--insecure] [--theme NAME] [--tv] [--job NAME]
+               [--boot | --no-boot] [--ascii] [--poll SECONDS]
 ```
 
 `cronstable tui` opens the terminal dashboard (the
 [web dashboard](Web-Dashboard)'s keyboard-driven TUI sibling) against a running
 daemon's web listener (`--url`, default `http://127.0.0.1:8080`). It requires
 an interactive terminal. The [terminal dashboard](Terminal-Dashboard) page
-documents every option, key, and panel.
+documents every option, key, and panel. See
+[listener TLS](Listener-TLS#client-configuration) for the TLS flags.
 
 ## The `import-taskscheduler` subcommand
 
@@ -556,8 +571,8 @@ cronstable service install [--name NAME] [-c FILE-OR-DIR]
                            [--start-type auto|delayed|demand]
                            [--log-level LEVEL] [--log-file PATH | --no-log-file]
                            [--console] [--restart-delay SECONDS] [--no-restart]
-cronstable service remove|start|stop|reload|status [--name NAME]
-                                                   [--timeout SECONDS]
+cronstable service start|stop [--name NAME] [--timeout SECONDS]
+cronstable service remove|reload|status [--name NAME]
 cronstable service run [--name NAME] [-c FILE-OR-DIR] [options]
 ```
 
@@ -584,7 +599,8 @@ When started normally (no `--version`, no `--validate-config`, no
 1. Configures logging from `-l`.
 2. Resolves and parses the configuration (`-c`), exiting `1` on error.
 3. Installs shutdown handlers. On POSIX these are bound to `SIGINT` and
-   `SIGTERM` on the event loop. On Windows cronstable instead uses
+   `SIGTERM` on the event loop, and `SIGHUP` is bound to an immediate
+   configuration reload. On Windows cronstable instead uses
    `signal.signal` for `SIGINT` (Ctrl-C) and `SIGBREAK` (Ctrl-Break) plus a
    heartbeat timer, because the Proactor loop has no `add_signal_handler`. On
    Windows, cronstable also installs a native console-control handler that
@@ -593,8 +609,10 @@ When started normally (no `--version`, no `--validate-config`, no
    [graceful shutdown on Windows](Running-on-Windows#graceful-shutdown).
 4. Runs the asyncio scheduler loop in the foreground until shutdown.
 
-The scheduler re-reads the configuration on every loop iteration, so editing
-the configuration files takes effect without a restart. A configuration that
+The scheduler checks the configuration files about once a minute and reparses
+them when a file's modification time or size changes, so edits take effect
+without a restart. On POSIX, `SIGHUP` forces an immediate reparse (on Windows,
+`cronstable service reload`). A configuration that
 becomes invalid after a successful start is logged and ignored, and the
 previously loaded jobs keep running. See
 [architecture and internals](Architecture-and-Internals).
@@ -639,7 +657,7 @@ See [running on Windows](Running-on-Windows).
 
 | Code | Condition |
 | --- | --- |
-| `0` | Setup guidance for a bare invocation with no default configuration; `--version` printed; `--validate-config` succeeded; `--job-set-id` printed; `--help`; a `state` action succeeded; or normal shutdown after a signal. |
+| `0` | Setup guidance for a bare invocation with no default configuration; `--version`, `--third-party-licenses`, or `--sealable-suites` printed; `--validate-config` succeeded; `--job-set-id` printed; `--help`; a `state` action succeeded; or normal shutdown after a signal. |
 | `1` | Configuration error (parse/schema/validation failure or unreadable configuration); a missing default path when arguments request configuration loading; an `init` refusal; or a `state` action failed (see [`state` exit codes](#state-exit-codes)). |
 | `2` | Usage error (argparse builtin): unknown option or missing required option (such as `state backup` without `-o`); an invalid `--log-level` value; `cronstable state` invoked with no action; or a `--` separator in any invocation other than `lock run` (see [`lock`](#lock-acquirereleaserun-distributed-mutexsemaphore)). |
 

@@ -90,8 +90,6 @@ and BSD/illumos retain their existing smoke and ABI checks. The source
 suite remains separate under `tests/`; acceptance does not inflate source
 coverage or run implicitly in tox.
 
-<a id="extend-toward-continuous-dogfooding"></a>
-
 ## Extend coverage for continuous operation
 
 Add focused scenarios for pool pressure, DAG recovery after forced

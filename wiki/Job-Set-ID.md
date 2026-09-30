@@ -62,6 +62,8 @@ these properties:
   * `priority` when set to anything but `normal`: the level, never the nice
     value or priority class a platform resolves it to, so a Windows replica and
     a Linux one still agree.
+  * `verify`, and `pool` with `poolSlots` / `queuePriority` / `queueTimeout`,
+    when set.
 
 Deliberately **not** part of the identity:
 
@@ -73,6 +75,8 @@ Deliberately **not** part of the identity:
   is a per-host path, and a fleet can legitimately run the same logical job
   from `D:\jobs` on a Windows replica and `/srv/jobs` on a Linux one, which
   must not read as permanent drift.
+* `sla` / `onLate`, `monitorResources`, `secrets`, `stateAllowedScopes`, and
+  the `env_file` path (its variable names still count).
 * Environment variable *values* and inline secret values (next section).
 * Everything outside the job definitions, in particular the `cluster` section
   itself. The peer list, `distribution`, and the rest of the coordination
@@ -146,7 +150,7 @@ same platform, which is what replicas are.
   (see [web dashboard](Web-Dashboard)).
 
 * **Terminal dashboard**: the header bar shows the first characters of the id,
-  and the command palette has a **Copy job set id** action (see
+  and the command palette has a **Copy job-set ID** action (see
   [terminal dashboard](Terminal-Dashboard)).
 
 * **Metrics**: the `cronstable_job_set_info{job_set_id}` info gauge. Compare it

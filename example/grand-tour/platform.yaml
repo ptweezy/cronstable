@@ -50,7 +50,7 @@
 #                   see node-entrypoint.sh / BACKEND; distribution spread vs
 #                   single-leader; clusterPolicy Leader/PreferLeader/EveryNode
 #   Durable state   cursor (ETL watermark, default + explicit --scope),
-#                   idempotent (exactly-once), lock (mutex + semaphore),
+#                   idempotent (once per key), lock (mutex + semaphore),
 #                   artifact (put/get/list), secret (fromEnvVar + fromFile),
 #                   KV (string + --json), durable retries, missed-run catch-up
 #                   (onMissed run-once AND run-all + startingDeadlineSeconds +
@@ -119,7 +119,8 @@ state:
   maxRunsPerJob: 200         # durable per-job run history retention
   # [feature: onStoreUnavailable] what to do if the store goes unreachable:
   # `degrade` (run stateless, the safe-to-demo default) vs `fail-closed` (refuse
-  # to run state-dependent jobs — the correct choice for exactly-once billing).
+  # to run state-dependent jobs, the correct choice for billing that must not
+  # double-charge).
   onStoreUnavailable: degrade
   # [feature: gcGraceSeconds] retention floor (seconds) for unreferenced state
   # beyond maxRunsPerJob; the offline `cronstable state gc` pass honors this window.
@@ -513,11 +514,11 @@ jobs:
     clusterPolicy: Leader
 
   # =====================================================================
-  #  4. Billing  (exactly-once; retries — finite AND infinite)
+  #  4. Billing  (once per key; finite AND infinite retries)
   # =====================================================================
-  # [feature: idempotent] Exactly-once side effect, fleet-wide. `idempotent`
+  # [feature: idempotent] A once-per-key side effect, fleet-wide. `idempotent`
   # claims a per-hour key once across the whole cluster: exit 0 for the node
-  # that wins the claim (do the charge), exit 1 for everyone else (skip). Even
+  # that wins the claim (do the charge), exit 5 for everyone else (skip). Even
   # a duplicate fire or a retry cannot double-charge.
   - name: charge-subscriptions
     command: |
@@ -945,7 +946,7 @@ jobs:
   # coalescing hash covers the RUN, so nine nodes failing the same job are nine
   # distinct runs and nine separate notifications. An EveryNode job on a
   # per-minute schedule is a firehose on a phone. Every push hook in this file
-  # sits on a Leader job, so each event is exactly one notification.
+  # sits on a Leader job, so each event is one notification.
   - name: alert-selftest
     command: echo "alert self-test firing from $HOSTNAME"
     schedule: "20,40 * * * *"
@@ -1197,7 +1198,8 @@ dags:
   # A scheduled fan-out ETL: discover a set of shards, process them in PARALLEL
   # (one mapped task instance per shard, each with its own retries + XCom), then
   # verify. Runs every 3 minutes and completes on its own. Across the fleet a
-  # single dag_run is advanced under ONE lease, so a task never double-launches.
+  # single dag_run is advanced under ONE lease, so a healthy fleet does not launch
+  # a task twice (crash recovery is at-least-once).
   # onMissed: run-all + catchupJitterSeconds replay missed cycles after downtime;
   # you can also deliberately replay a window with a backfill (see the README).
   - name: orders-etl

@@ -55,8 +55,9 @@ routed to the right one.
 ## What is out of scope
 
 - the public demo being readable without any credential. `demo.cronstable.com`
-  runs with `web.anonymousScopes: [view]` on purpose, so a tokenless request
-  reads jobs, run history, logs, and the calendar feeds. Its published
+  grants the `view` scope through `web.anonymousScopes` on purpose, so a
+  tokenless request reads jobs, run history, logs, and the calendar feeds. Its
+  published
   view-scoped token grants that same read-only view plus `GET /push/devices`,
   which is empty by construction: the demo configures no `push:` section. What
   *is* in scope there is any path by which a credential-less caller does any
@@ -69,8 +70,6 @@ routed to the right one.
   names, cronstable runs it. The trust boundary is who may write the config.
 - exposing the control API to a hostile network with authentication disabled.
   That is documented as unsupported, not a vulnerability.
-- missing hardening headers or similar findings on the static GitHub Pages site
-  with no demonstrated impact.
 - automated scanner output with no working proof of concept.
 
 ## Handling
@@ -89,6 +88,8 @@ bug bounty. This is an MIT-licensed project with no funding behind it.
 ## Cryptography note
 
 The push pipeline encrypts alert payloads to each paired device's public key
-(NaCl sealed box) so the relay forwards ciphertext it cannot read. Findings that
+(X-Wing, a post-quantum hybrid of ML-KEM-768 and X25519, where the platform
+supports it, and an X25519 sealed box elsewhere) so the relay forwards
+ciphertext it cannot read. Findings that
 break that property, or that let a relay operator or network observer recover
 alert content or link devices, are treated as high severity.

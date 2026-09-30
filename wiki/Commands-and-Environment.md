@@ -114,21 +114,33 @@ rather than crashing the scheduler. See
 `environment` is a list of `{key, value}` maps. Both `key` and `value` are
 strings in the schema.
 
-When `environment` is nonempty, cronstable builds the subprocess environment
-from the **full current process environment** (`dict(os.environ)`), applies the
-PyInstaller fixup (described later), and then sets or overwrites each
-configured variable by key:
+When `environment` is nonempty, when the daemon injects run variables, or when
+the [PyInstaller fixup](#pyinstaller-environment-fixup) applies, cronstable
+builds the subprocess environment from the **full current process
+environment** (`dict(os.environ)`). It applies the PyInstaller fixup, sets or
+overwrites each configured variable by key, and applies the daemon-injected
+variables last:
 
 ```python
 env = dict(os.environ)
 fixup_pyinstaller_env(env)
-for envvar in self.config.environment:
+for envvar in config.environment:
     env[envvar["key"]] = envvar["value"]
+env.update(self.extra_env)
 ```
 
-If `environment` is empty (the default) **and** there is no `env_file`, no
-`env` is passed to the subprocess, so it inherits cronstable's environment
-unchanged.
+With a `state:` section configured, the daemon injects `CRONSTABLE_STATE_URL`,
+`CRONSTABLE_STATE_TOKEN`, `CRONSTABLE_RUN_ID`, `CRONSTABLE_JOB_NAME`,
+`CRONSTABLE_ATTEMPT`, `CRONSTABLE_SCHEDULED_AT`, and `CRONSTABLE_HOST` into
+every run (`state.jobApi.enabled` defaults to `true`). A
+[workflow](Orchestration-and-DAGs) task receives its `CRONSTABLE_DAG_*`
+variables the same way. Because they are applied last, these variables
+override a job's own values for the same names. See
+[durable state](Durable-State).
+
+If `environment` is empty (the default), there is no `env_file`, and none of
+the other cases applies, no `env` is passed to the subprocess, so it inherits
+cronstable's environment unchanged.
 
 ```yaml
 jobs:
@@ -155,8 +167,9 @@ inherited environment of every job.
 
 The reporting templates' `environment` variable is the constructed subprocess
 `env` dict (`self.env`), which is only populated when the job has a nonempty
-`environment` or an `env_file`. For a job with neither, `environment` is `None`
-in templates and `{{ environment.HOSTNAME }}` renders empty. See
+`environment`, an `env_file`, or daemon-injected run variables. For a job with
+none of these, `environment` is `None` in templates and
+`{{ environment.HOSTNAME }}` renders empty. See
 [reporting (mail, Sentry, shell, webhook)](Reporting).
 
 ## env_file
@@ -164,7 +177,7 @@ in templates and `{{ environment.HOSTNAME }}` renders empty. See
 `env_file` names a file of `KEY=VALUE` lines. `parse_environment_file` in
 `cronstable/config.py` parses it:
 
-- The file is opened as **UTF-8**.
+- The file is opened as UTF-8; a leading byte-order mark is stripped.
 - Each line is stripped of surrounding spaces and a trailing newline.
 - Lines beginning with `#` and blank lines are **ignored**.
 - A line without an `=` raises `ConfigError` (`"Invalid line in env_file: ..."`).
@@ -236,7 +249,8 @@ jobs:
 
 The precedence chain for a variable is therefore: inherited process environment
 (including injected `HOSTNAME`) < `env_file` < merged `environment` (defaults
-then job, job winning). See
+then job, job winning) < daemon-injected `CRONSTABLE_*` run variables (with a
+`state:` section). See
 [includes, defaults, and multi-file config](Includes-and-Defaults) for how
 `defaults` and includes are merged overall.
 
@@ -484,23 +498,28 @@ holding root's supplementary group memberships (the classic
 
 ## PyInstaller environment fixup
 
-`fixup_pyinstaller_env` is applied to the subprocess environment, but only when
-an `env` is being constructed, that is, when `environment` or `env_file`
-produced variables. It only does anything when cronstable runs as a frozen
-PyInstaller binary (`getattr(sys, "frozen", False)`):
+On a frozen build (or when `_PYI_*` variables are inherited) every job gets a
+scrubbed copy of the environment: POSIX builds restore `LD_LIBRARY_PATH` and
+`LIBPATH` from their `_ORIG` values, and all `_PYI_*` bootloader variables are
+removed (`pyinstaller_env_leaks` and `fixup_pyinstaller_env` in
+`cronstable/job.py`):
 
 ```python
-for env_var in "LD_LIBRARY_PATH", "LIBPATH":
-    env[env_var] = env.get(f"{env_var}_ORIG", "")
+if getattr(sys, "frozen", False) and not platform.IS_WINDOWS:
+    for env_var in "LD_LIBRARY_PATH", "LIBPATH":
+        env[env_var] = env.get(f"{env_var}_ORIG", "")
+for key in [k for k in env if k.startswith("_PYI_")]:
+    del env[key]
 ```
 
-PyInstaller's bootloader overwrites `LD_LIBRARY_PATH` and `LIBPATH` so the
-bundled binary can find its own libraries, saving the caller's original values
-in `LD_LIBRARY_PATH_ORIG`/`LIBPATH_ORIG`. This fixup restores those originals
-(or empties the variable if there was no `_ORIG`) for the subprocess, so a
-child process does not inherit the frozen interpreter's library paths.
+PyInstaller's POSIX bootloader overwrites `LD_LIBRARY_PATH` and `LIBPATH` so
+the bundled binary can find its own libraries, saving the caller's original
+values in `LD_LIBRARY_PATH_ORIG`/`LIBPATH_ORIG`. Restoring them (or emptying
+the variable if there was no `_ORIG`) keeps a child process off the frozen
+interpreter's library paths. The `_PYI_*` variables link a bootloader to its
+direct child; left in place, they make any frozen binary the job runs, the
+cronstable CLI included, refuse to start. The scrub runs before the job's
+`environment` is applied, so an explicit `environment` entry wins.
 
 See [production and container deployment](Production-Deployment) for the
-frozen-binary build. Because the fixup is only applied when an `env` is
-constructed, jobs with no `environment` and no `env_file` inherit the process
-environment as-is, including any PyInstaller-clobbered values.
+frozen-binary build.

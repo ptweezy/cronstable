@@ -46,13 +46,16 @@ docker compose -f example/pulse-monitor/docker-compose.yml down
 | `liveness-probe` | every **5 s** | object `second: "*/5"` | GETs the service; fails (and pages the on-call shell hook) if it is unreachable or non-200. `concurrencyPolicy: Forbid` + `executionTimeout` keep a hung probe from stacking. |
 | `latency-slo` | every **2 s** | 7-field string `*/2 * * * * * *` | Measures round-trip time; a response slower than `PULSE_BUDGET_MS` writes to stderr, and `failsWhen.producesStderr` turns that into a failed run. |
 | `heartbeat` | every **10 s** | object `second: "*/10"` | Emits a liveness pulse so a downstream dead-man's-switch can tell the monitor itself is alive. |
-| `sla-rollup` | every **60 s** | 5-field `* * * * *` | A per-minute summary. It coexists with the second-level jobs and fires **exactly once per minute** — see below. |
+| `sla-rollup` | every **60 s** | 5-field `* * * * *` | A per-minute summary. It coexists with the second-level jobs and fires **exactly once per minute** (see below). |
 
 The two spellings are equivalent; use whichever reads better:
 
 ```yaml
 schedule: "*/5 * * * * * *"   # 7-field string: second minute hour dom month dow year
-schedule:                     # …or the object form
+```
+
+```yaml
+schedule:                     # the object form
   second: "*/5"
 ```
 

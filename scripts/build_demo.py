@@ -7,8 +7,7 @@ Two files are generated, never edited by hand:
   fake-backend script plus the note that trails it), spliced in immediately
   before the logo engine's ``<script>``.
 - docs/logo-engine.js: the dashboard's inline pendulum logo engine, extracted
-  verbatim so docs/logo-lab.html and docs/comparison.html can share it via
-  ``<script src>``. The dashboard itself keeps its inline copy; that page
+  verbatim so docs/logo-lab.html can load it via ``<script src>``. The dashboard itself keeps its inline copy; that page
   must stay a self-contained single file.
 
 tests/test_web_demo_mirror.py rebuilds both with the functions here and

@@ -26,8 +26,9 @@
 #      leader. distribution: spread hands each Leader/PreferLeader job (and
 #      DAG) its own owner node via rendezvous hashing.
 #    * state is a SHARED volume (topology: shared): cursors/locks/idempotency
-#      and every dag_run coordinate fleet-wide over it, so a task launches
-#      exactly once even though all nine nodes run the identical config.
+#      and every dag_run coordinate fleet-wide over it, so a healthy fleet
+#      launches each DAG task once even though all nine nodes run the identical
+#      config (crash recovery is at-least-once).
 #
 #  Each node's cluster section is generated at start by node-entrypoint.sh from
 #  env, so the compose file needs no per-node peer lists: every node shares one

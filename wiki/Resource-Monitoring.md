@@ -86,18 +86,13 @@ Three adjacent surfaces report the **node's** load rather than a job's. None of 
 - [`GET /node/history`](HTTP-API#get-nodehistory) serves a background-sampled CPU/memory ring (every 5s, keeping the last hour, by default) charted behind the header meter. Configure or disable it with [`web.nodeHistory`](Configuration-Reference#web).
 - [`cluster.observability`](Configuration-Reference#observability-overlay) shares each node's whole-node CPU/memory across a [cluster](Clustering-and-Leader-Election), so the dashboard's cluster panel and fleet view show where the load is.
 
-## Version notes
-
-- Per-job resource monitoring (`monitorResources: true`), the dashboard/API/Prometheus/statsd/report surfaces, `GET /node`, and `cluster.observability` were added in 1.2.8, which also made psutil a core dependency (see `HISTORY.md`).
-- The map form (`interval` / `history`), the per-run chart series, `GET /jobs/{name}/resources`, `GET /node/history` with `web.nodeHistory`, and the dashboard's **Resources** tab and node card were added in 1.2.9.
-
 ## See also
 
 - [Configuration Reference](Configuration-Reference#metrics): the per-job option table and load-time numeric validation.
 - [HTTP Control API](HTTP-API): the endpoints that carry the numbers, with response examples.
 - [Metrics with Prometheus](Metrics-with-Prometheus): the resource metric families and their restart-durability.
 - [Metrics with statsd](Metrics-with-Statsd): the exact wire format of the `cpu` / `max_rss` lines.
-- [Reporting (Mail, Sentry, Shell, Webhook)](Reporting): the resource template and environment variables.
+- [Reporting (Mail, Sentry, Shell, Webhook, Push, Event Log)](Reporting): the resource template and environment variables.
 - [Durable State](Durable-State): the run ledger the summary and series persist into.
 - [Orchestration and DAGs](Orchestration-and-DAGs): `monitorResources` on DAG tasks.
 - [Clustering and Leader Election](Clustering-and-Leader-Election): the `cluster.observability` fleet-wide node stats.

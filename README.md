@@ -125,11 +125,12 @@ workflows, and dashboards for the web, the terminal, and iOS.
 
 ## Quick start
 
-Install cronstable with pip. For Docker, Homebrew, WinGet, and standalone
-binaries, see [installation](#installation).
+Install cronstable with [pipx](https://github.com/pypa/pipx), or with
+`pip install cronstable` inside a virtual environment. For Docker, Homebrew,
+WinGet, and standalone binaries, see [installation](#installation).
 
 ```shell
-pip install cronstable
+pipx install cronstable
 ```
 
 Create a `cronstable.yaml` file with your first job:
@@ -137,7 +138,7 @@ Create a `cronstable.yaml` file with your first job:
 ```yaml
 jobs:
   - name: hello
-    command: echo "hello from cronstable on $(hostname)"
+    command: echo hello from cronstable
     schedule: "* * * * *"        # every minute
     captureStdout: true
 
@@ -180,9 +181,10 @@ extra user column, so convert its entries to YAML (see
 
 ## Installation
 
-cronstable aims to run on as many platforms and CPU architectures as physically
-possible. Every release publishes container images, standalone binaries, and
-packages for Linux, macOS, Windows, FreeBSD, OpenBSD, NetBSD, and illumos. If
+cronstable aims to run on as many platforms and CPU architectures as possible.
+Every release publishes Linux container images, standalone binaries for Linux,
+macOS, Windows, FreeBSD, OpenBSD, NetBSD, and illumos, packages for Linux and
+FreeBSD, and Windows installers. If
 your platform or architecture is missing,
 [open an issue](https://github.com/ptweezy/cronstable/issues/new) or send a
 pull request (see
@@ -195,10 +197,14 @@ Registry (`ghcr.io/ptweezy/cronstable`) and Docker Hub (`ptweezy/cronstable`).
 Mount your configuration file and start the container:
 
 ```shell
-docker run --rm \
+docker run --rm -p 8080:8080 \
   -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
   ghcr.io/ptweezy/cronstable:latest
 ```
+
+Inside a container, the dashboard must listen on all interfaces, so change the
+quick start's listener to `http://0.0.0.0:8080`. Before you expose it beyond
+your machine, set an [authentication token](#authentication).
 
 The default image is based on Debian slim and supports seven Linux platforms:
 `amd64`, `arm64`, `386`, `arm/v7`, `ppc64le`, `s390x`, and `riscv64`. It runs
@@ -265,8 +271,6 @@ configuration. For catalog availability and how to switch from a portable
 install, see the
 [WinGet installation guide](https://github.com/ptweezy/cronstable/wiki/Installation#install-using-winget).
 
-<a id="install-using-binary"></a>
-
 ### Install a standalone binary
 
 Every release attaches self-contained binaries that embed Python, so the target
@@ -275,10 +279,10 @@ system doesn't need it. Download one from the
 `curl`:
 
 ```shell
-# For an x86-64-v3 Linux CPU with glibc. Use amd64 instead of amd64v3 for
-# older CPUs, and append -musl on Alpine.
+# For an x86-64 Linux CPU with glibc. Use amd64v3 instead of amd64 on
+# x86-64-v3 CPUs, and append -musl on Alpine.
 curl -fsSL -o cronstable \
-  https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64v3
+  https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64
 chmod +x cronstable
 ./cronstable --version
 ```
@@ -300,8 +304,10 @@ and later). The `.deb` and `.rpm` packages also install a systemd unit and a
 starter configuration in `/etc/cronstable.d`. They don't start the service;
 run `systemctl enable --now cronstable` when your configuration is ready.
 
-Windows builds come in three formats:
+Windows builds come in four formats:
 
+* `cronstable-windows-<arch>-setup.exe`: a signed setup program for `amd64`,
+  `amd64v3`, and `arm64` that installs the MSI. WinGet runs this setup.
 * `cronstable-windows-<arch>.exe`: a single-file executable.
 * `cronstable-windows-<arch>.zip`: a one-directory build that extracts to a
   single `cronstable` folder and can host the
@@ -490,10 +496,9 @@ reporter work without it.
 ## Tutorials
 
 These four short walkthroughs build on the [quick start](#quick-start)
-configuration. You can copy and run each one, and each links to the wiki page
-that covers its topic in full.
-
-<a id="tutorial-1-alert-when-a-job-fails-then-retry-it"></a>
+configuration. Each example passes `cronstable --validate-config`: add it to
+your quick start file and replace the example commands with your own. Each
+tutorial links to the wiki page that covers its topic in full.
 
 ### Tutorial 1: Retry failed jobs and alert when retries fail
 
@@ -524,8 +529,10 @@ By default, a job fails when it exits with a nonzero status or writes to a
 captured stderr. To change that for a job, use
 [`failsWhen`](#failure-detection-and-retries). The webhook's default body is
 Slack-compatible, and Mattermost and Teams accept it as is. Email, Sentry, and
-shell command reports each take one more block, with Jinja2 templating over the
-run's name, output, and exit code. For details, see
+shell command reports each take one more block. Email and Sentry reports use
+Jinja2 templates over the run's name, output, and exit code, and a shell
+command receives the same details as `CRONSTABLE_*` environment variables. For
+details, see
 [failure detection and retries](https://github.com/ptweezy/cronstable/wiki/Failure-Detection-and-Retries)
 and [reporting](https://github.com/ptweezy/cronstable/wiki/Reporting) in the
 wiki.
@@ -537,7 +544,7 @@ reboot in the middle of a schedule, add a `state:` block:
 
 ```yaml
 state:
-  path: /var/lib/cronstable        # a local directory, or a shared mount for a fleet
+  path: ./cronstable-state         # a local directory, or a shared mount for a fleet
 
 jobs:
   - name: hourly-invoice-emit
@@ -581,7 +588,7 @@ publishes:
 
 ```yaml
 state:
-  path: /var/lib/cronstable        # DAGs live on the state store
+  path: ./cronstable-state         # DAGs live on the state store
 
 dags:
   - name: release-train            # no schedule: manual-only
@@ -622,8 +629,6 @@ over a list that an upstream task produced, and poll for conditions with
 `type: sensor`. For details, see
 [orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs).
 
-<a id="tutorial-4-two-replicas-zero-double-runs"></a>
-
 ### Tutorial 4: Coordinate two replicas
 
 Run the same configuration on two or more hosts that share a POSIX mount. The
@@ -639,8 +644,7 @@ cluster:
   backend: filesystem
   filesystem:
     path: /mnt/shared/cronstable      # the mount is the election store
-  nodeName: node-a                    # unique and stable for each replica
-  electLeader: true
+  electLeader: true                   # each node is named by its hostname
 
 jobs:
   - name: charge-subscriptions
@@ -691,9 +695,7 @@ examples:
 | [`crontab`](https://github.com/ptweezy/cronstable/tree/main/example/crontab) | `cronstable -c example/crontab` | Five-field user crontabs alongside YAML jobs. |
 | [`kubernetes`](https://github.com/ptweezy/cronstable/tree/main/example/kubernetes) | `kubectl apply -f example/kubernetes/deployment.yaml` | Leader election through a `coordination.k8s.io/v1` Lease. |
 | [`etcd`](https://github.com/ptweezy/cronstable/tree/main/example/etcd) | `docker compose -f example/etcd/docker-compose.yml up` | Leader election through an etcd lease, over plain HTTP. |
-| [`docker`](https://github.com/ptweezy/cronstable/tree/main/example/docker) | `docker build` | The minimal "add cronstable to your own image" recipe. |
-
-<a id="usage"></a>
+| [`docker`](https://github.com/ptweezy/cronstable/tree/main/example/docker) | `docker build -t cronstable-example example/docker` | The minimal "add cronstable to your own image" recipe. |
 
 ## Configuration
 
@@ -711,7 +713,7 @@ classic crontab (`*.crontab`, `*.cron`, or a file named `crontab`), and skips
 names that start with `_` or `.`. Without `-c`, cronstable reads
 `/etc/cronstable.d` on POSIX systems (for Windows, see [Windows](#windows)).
 `cronstable init` writes a commented starter configuration to that default
-location.
+location, which needs root; `cronstable init DIRECTORY` writes it elsewhere.
 
 cronstable runs in the foreground and logs to stdout and stderr, so run it
 under a supervisor such as systemd or a container runtime. About once a minute,
@@ -774,9 +776,11 @@ Quartz's `?` on its own in a day field. cronstable also supports these forms:
 * Nicknames such as `@hourly` and `@daily`, and `@reboot`, which runs the job
   once when cronstable starts.
 
-An expression from another dialect, such as a six-field Quartz expression that
-starts with seconds, fails with an error that explains how to convert it. For
-the full syntax, see
+A six-field expression reads its sixth field as a year. If that field can't be
+a year, as in a Quartz expression that ends in `?`, cronstable reports an error
+that explains how to convert it. A Quartz expression that ends in `*`, such as
+`0 15 10 * * *`, is valid but means something else here, so check converted
+expressions with `GET /schedule/preview`. For the full syntax, see
 [schedules and time zones](https://github.com/ptweezy/cronstable/wiki/Schedules-and-Timezones).
 
 The `schedule` option can also be an object. This job runs every 5 minutes on
@@ -914,8 +918,6 @@ in the wiki. For a runnable example, see
 a configuration directory that combines a crontab with YAML jobs and the
 dashboard.
 
-<a id="specifying-defaults"></a>
-
 ### Defaults
 
 A `defaults` section sets default values for the jobs in the same file, and
@@ -991,7 +993,7 @@ web:
 state:
   path: ${STATE_DIR}                       # required: unset fails --validate-config
 jobs:
-  - name: rollup-${REGION}
+  - name: rollup-${REGION}                 # required, like STATE_DIR
     command: run-rollup                     # ${VAR} in a command is left for the shell
     schedule:
       minute: "0"
@@ -1004,9 +1006,6 @@ own environment, not the daemon's. It also leaves the `logging` section for
 Python's `logging.config`. For the full rules, including how interpolation
 affects the [job-set ID](#job-set-id), see
 [environment variable interpolation](https://github.com/ptweezy/cronstable/wiki/Environment-Variable-Interpolation).
-
-<a id="obscure-configuration-options"></a>
-<a id="enabled-truefalse-default-true"></a>
 
 ### Disable a job
 
@@ -1083,8 +1082,6 @@ its own wiki page:
   ([Suggest a Slot](https://github.com/ptweezy/cronstable/wiki/Suggest-a-Slot)).
 
 ## Job behavior
-
-<a id="handling-failure"></a>
 
 ### Failure detection and retries
 
@@ -1221,8 +1218,6 @@ jobs:
     executionTimeout: 1            # in seconds
     killTimeout: 0.5
 ```
-
-<a id="change-to-another-usergroup"></a>
 
 ### Run as another user or group
 
@@ -1394,7 +1389,7 @@ or the `push:` section, cronstable refuses to start instead of dropping alerts:
 ```yaml
 push:
   relay:
-    url: https://relay.example.net/v1/notify
+    url: https://relay.cronstable.com/
   devicesFile: /var/lib/cronstable/devices.json
 
 defaults:
@@ -1416,7 +1411,7 @@ in the wiki.
 On Windows, the `eventlog` reporter writes each outcome to the Application
 event log, which Event Viewer, Windows Event Forwarding, SCOM, and SIEM
 connectors read. It needs no extra. Each record has a stable event ID and a
-fixed set of insertion strings, so rules that match on them keep working:
+fixed set of insertion strings for rules to match:
 
 ```yaml
 defaults:
@@ -1476,8 +1471,6 @@ my.cron.jobs.prefix.test01.duration:3|ms
 
 For details, see
 [metrics with statsd](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Statsd).
-
-<a id="remote-webhttp-interface"></a>
 
 ## HTTP API
 
@@ -1561,8 +1554,6 @@ Requests without credentials then get the `view` scope, the dashboard skips the
 token prompt and shows a view-only interface, and every route that changes
 state still requires a token. For details, see
 [public read-only access](https://github.com/ptweezy/cronstable/wiki/HTTP-API#public-read-only-access-webanonymousscopes).
-
-<a id="serving-the-api-over-tls"></a>
 
 ### TLS and client certificates
 
@@ -1705,16 +1696,14 @@ permissions. Per-job [user and group switching](#run-as-another-user-or-group)
 requires root.
 
 The published images (`ghcr.io/ptweezy/cronstable` and
-`docker.io/ptweezy/cronstable`) run as non-root and use
-`cronstable -c /etc/cronstable.d` as the entrypoint. Mount your configuration
+`docker.io/ptweezy/cronstable`) run as non-root, with `cronstable` as the
+entrypoint and `-c /etc/cronstable.d` as the default command. Mount your configuration
 read-only, and provide writable mounts for the features and jobs that need them.
 For deployment examples, including a Kubernetes `Deployment` with a restricted
 security context, baking configuration into your own image, and health checks,
 see
 [production deployment](https://github.com/ptweezy/cronstable/wiki/Production-Deployment)
 in the wiki.
-
-<a id="running-on-windows"></a>
 
 ## Windows
 

@@ -31,7 +31,6 @@ include docs/demo/index.html
 include docs/demo/_backend.html
 include docs/logo-engine.js
 include docs/logo-lab.html
-include docs/comparison.html
 include docs/palette.css
 include docs/relay-protocol.md
 

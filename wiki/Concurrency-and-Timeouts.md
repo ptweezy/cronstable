@@ -465,7 +465,7 @@ produced afterwards.
 jobs:
   - name: ignores-sigterm
     command: |
-      trap "echo '(ignoring SIGTERM)'" TERM
+      trap '' TERM   # ignore SIGTERM; sleep inherits the ignored disposition
       echo "starting..."
       sleep 10
       echo "all done."
@@ -475,6 +475,12 @@ jobs:
     executionTimeout: 1
     killTimeout: 0.5   # SIGKILL 0.5s after the (ignored) SIGTERM
 ```
+
+SIGTERM goes to the job's whole process group. A trap that only runs a
+handler does not keep the job alive, because `sleep` dies of the signal and
+the shell exits after the handler runs. `trap '' TERM` sets the ignore
+disposition, which `sleep` inherits, so the SIGKILL 0.5 seconds later ends
+the run.
 
 This example's trap spelling is POSIX (`sh` trapping SIGTERM). The Windows
 equivalent traps `SIGBREAK`: the graceful step there delivers

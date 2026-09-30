@@ -27,10 +27,13 @@ printed `icacls` commands, then run `init` again. See [who may write the
 config directory](Running-on-Windows#who-may-write-the-config-directory).
 
 The service applies the same rule to its own configuration. It refuses to
-start when any account other than SYSTEM and Administrators can write the
-`-c` path, or when that path is a junction or symbolic link, and it repeats
-the check before every reload. `install` refuses such a path up front and
-prints the same fix.
+start when Everyone, Users, Authenticated Users, or another any-user group
+can add files to the `-c` path, when an account other than SYSTEM,
+Administrators, or TrustedInstaller owns it (unless an OWNER RIGHTS entry
+holds that owner to read), or when the path is a junction or symbolic link.
+It repeats the check before every reload. The check ignores a write grant to
+a single named account. `install` refuses such a path up front and prints the
+same fix.
 
 `cronstable service status` reports the state and the process ID. `sc query
 cronstable` and the Services console (`services.msc`) see it like any other
@@ -43,7 +46,8 @@ service.
 | `pip install cronstable` / pipx | yes |
 | The published zip (a one-directory build) | yes |
 | The [MSI](Windows-MSI) | yes (registers the service itself) |
-| The published one-file `.exe` (also what winget installs) | **no** |
+| winget (a setup that embeds the MSI) | yes (registers the service itself) |
+| The published one-file `.exe` | **no** |
 
 The one-file executable cannot host a Windows service, and `install`
 refuses it by name rather than producing something that fails at start.
@@ -55,8 +59,9 @@ therefore fails on the SCM's timeout while the real program's own
 registration is refused with error 1063. Nothing in cronstable can change
 that, because it is the bootloader that forks.
 
-To run as a service, download `cronstable-windows-amd64.zip` or
-`cronstable-windows-arm64.zip` (see [running on
+To run as a service, download the one-directory zip for your architecture
+(`cronstable-windows-amd64v3.zip`, `-amd64.zip`, `-arm64.zip`, or
+`-i686.zip`; see [running on
 Windows](Running-on-Windows#one-directory-zip-hosts-the-service)), or
 install with pip or pipx. The [MSI](Windows-MSI) registers the service
 during the install with the same settings `service install` writes, so none

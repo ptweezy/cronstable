@@ -13,8 +13,9 @@ coordinate across a fleet. DAGs use the existing job runner and state store:
   so a task can call `cronstable xcom|artifact|state|lock|...`;
 - **cross-task data** (XCom, cross-communication) rides the artifact store,
   scoped per dag_run;
-- the scheduler advances each run under a single **lease**, so across a fleet a
-  task is never launched twice and a run is never double-advanced.
+- the scheduler advances each run under a single **lease**, so a healthy fleet
+  does not launch a task twice or double-advance a run (crash recovery is
+  at-least-once; see [crash-resume and the fleet](#crash-resume-and-the-fleet)).
 
 > **Opt-in and store-backed.** DAGs require a `state` section with the loopback
 > endpoint (`state.jobApi.enabled`, on by default). Without `dags:` none of
@@ -43,10 +44,12 @@ dags:
       - id: extract
         command: "echo '[1,2,3]' | cronstable xcom push --key ids"
       - id: transform
-        dependsOn: [extract]
+        dependsOn:
+          - extract
         command: "cronstable xcom pull --task extract --key ids"
       - id: load
-        dependsOn: [transform]
+        dependsOn:
+          - transform
         command: "echo loading"
 ```
 
@@ -146,8 +149,8 @@ cronstable xcom list                                            # keys in this r
 
 Outputs are content-addressed and versioned (newest wins by key). The daemon
 injects the run's identity so the CLI needs no arguments beyond the key:
-`CRONSTABLE_DAG_NAME`, `CRONSTABLE_DAG_RUN_ID`, `CRONSTABLE_DAG_TASK`,
-`CRONSTABLE_DAG_TASKKEY`, `CRONSTABLE_DAG_MAP_INDEX`, `CRONSTABLE_DAG_MAP_ITEM`,
+`CRONSTABLE_DAG_NAME`, `CRONSTABLE_DAG_RUN_ID`, `CRONSTABLE_DAG_RUN_KEY`,
+`CRONSTABLE_DAG_TASK`, `CRONSTABLE_DAG_TASKKEY`, `CRONSTABLE_DAG_MAP_INDEX`, `CRONSTABLE_DAG_MAP_ITEM`,
 `CRONSTABLE_DAG_XCOM_SCOPE`.
 
 ## Fan-out: dynamic mapping
@@ -159,7 +162,8 @@ XCom list (Airflow's `.expand()`):
       - id: list-work
         command: "echo '[\"a\",\"b\",\"c\"]' | cronstable xcom push --key items"
       - id: process
-        dependsOn: [list-work]
+        dependsOn:
+          - list-work
         expand:
           fromTask: list-work      # a direct, non-mapped dependency
           key: items               # its XCom list
@@ -169,7 +173,7 @@ XCom list (Airflow's `.expand()`):
 When `list-work` succeeds, the scheduler reads its `items` list and materializes
 `process#0`, `process#1`, `process#2`, each with its own state, retries, and
 XCom, and its item in `$CRONSTABLE_DAG_MAP_ITEM`. A downstream task that
-`dependsOn: [process]` waits for **all** the mapped instances (fan-in). An
+lists `process` in `dependsOn` waits for **all** the mapped instances (fan-in). An
 empty list resolves the mapped task to `success` immediately.
 
 The expanded item set is recorded **once** in the dag_run and never recomputed,
@@ -208,7 +212,7 @@ bursts rather than one burst of subprocesses.
 A `type: sensor` task polls an external condition on a bounded, jittered,
 durable schedule instead of running once. Its command's exit code is the
 verdict: **0 = condition met** (the task succeeds); nonzero = not yet, poke
-again after `pokeIntervalSeconds` (± `pokeJitterSeconds`) until
+again after `pokeIntervalSeconds` plus a random 0 to `pokeJitterSeconds` until
 `pokeTimeoutSeconds` elapses, after which the sensor fails.
 
 ```yaml
@@ -249,8 +253,9 @@ the first time each gate parks awaiting a decision. A whole DAG run reaching
 
 A scheduled DAG reuses the job [schedule grammar](Schedules-and-Timezones) with
 one restriction: the schedule must parse to a cron expression, so `@reboot` is
-rejected at config load (`DAG schedules must be cron expressions; @reboot is
-not supported for dags`), although `@daily` / `@hourly`-style aliases still
+rejected at config load (`dag 'd': schedule '@reboot' is not a cron
+expression; DAG schedules must be cron expressions (@reboot is not supported
+for dags)`), although `@daily` / `@hourly`-style aliases still
 work.
 
 A scheduled DAG follows the
@@ -279,8 +284,9 @@ curl -X POST .../dags/nightly-etl/backfill \
 The durable per-task state, not memory, is the source of truth. A dag_run is
 advanced only by the node holding that run's **advance lease**, a
 time-to-live (TTL) lease on the shared store renewed while the run is active,
-so across a fleet only one node ever advances a given run and a task never
-double-launches. The claim that flips a task `pending → running` is a single
+so in a healthy fleet only one node advances a given run and a task does not
+launch twice (crash recovery is at-least-once; see the delivery contract
+below). The claim that flips a task `pending → running` is a single
 atomic compare-and-set on the run document, a correctness backstop underneath
 the lease.
 

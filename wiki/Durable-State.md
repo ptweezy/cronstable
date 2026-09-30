@@ -18,7 +18,7 @@ scheduler in `cronstable/cron.py`.
 `state.path`. A **stream** is one append-only sequence of records in the store
 (one per job per feature, such as `runs/backup`). The **run ledger** is the
 durable stream of finished-run records per job (distinct from the
-[web dashboard's browser-side run ledger](Web-Dashboard#run-ledger); see
+[web dashboard's browser-side run ledger](Web-Dashboard#browser-run-history); see
 [the durable run ledger](#the-durable-run-ledger)). A **watermark** is a
 derived "last fired" cursor, computed as the maximum over a stream's immutable
 records, never stored as a mutable file. A **lease** is a TTL claim guarded by
@@ -70,7 +70,7 @@ With that alone, and no per-job changes, cronstable gains:
 * **[`@reboot` once per OS boot](#reboot-once-per-os-boot)**: an `@reboot` job
   runs once per boot per host, not once per daemon restart;
 * **[restart-durable Prometheus counters](#restart-durable-prometheus-counters)**,
-  so `cronstable_job_*` totals no longer reset to zero on every restart;
+  so `cronstable_job_*` totals carry across daemon restarts;
 * the **[`GET /jobs/{name}/trends`](#sla-trends-over-the-ledger)** endpoint,
   SLA aggregates over the ledger.
 
@@ -125,8 +125,9 @@ serve otherwise) takes these sub-keys:
 ### Per-job stateful options
 
 These options live on the job, but they read the durable store. Unless
-`state` is configured, all except `onlyIfLastSucceeded` are inert, with a
-startup warning where they would otherwise silently do nothing.
+`state` is configured, all except `onlyIfLastSucceeded` and `secrets` are
+inert, with a startup warning where they would otherwise silently do nothing;
+`secrets` without a store is a load error.
 `onlyIfLastSucceeded` alone also works without a store, from the in-memory
 history; its memory then resets on restart (see
 [depends-on-past](#depends-on-past-onlyiflastsucceeded)):
@@ -244,16 +245,19 @@ The layout under `<path>/<deploymentId>/`:
 │   ├── runs%2F<job>/     #   the run ledger
 │   ├── logs%2F<job>/     #   archived output (archiveOutput)
 │   ├── catchup%2F<job>/  #   catch-up open/close checkpoints
+│   ├── catchup-dag%2F<dag>/ # DAG catch-up checkpoints
 │   ├── retries%2F<job>/  #   pending/settled retry records
+│   ├── paused%2F<job>/   #   runtime pause records
 │   ├── reboot%2F<job>/   #   @reboot boot markers
 │   ├── inflight%2F<job>/ #   in-flight run records (open/closed)
 │   ├── slots%2F<job>/    #   cluster concurrency-slot cancel requests
 │   ├── counters%2F<host>/#   Prometheus counter snapshots
 │   ├── artifacts%2F<scope>/ # artifact records (job-facing state / DAG XCom)
-│   ├── manifests/        #   per-node job manifests (the GC anchor)
+│   ├── manifests%2F<host>/ # per-host job manifests (the GC anchor)
 │   └── meta/             #   the store's version stamp
 ├── docs/                 # mutable job-facing documents (KV, cursors,
-│                         #   idempotency claims) and dag_run documents
+│                         #   idempotency claims), dag_run documents, the
+│                         #   push device registry, and pool queues
 ├── blobs/                # content-addressed artifact payloads (sha256)
 ├── leases/               # lock + lease files (only per-run DAG advance
 │                         #   leases are ever GC'd; see the GC section)
@@ -321,7 +325,7 @@ cell rather than changing a verdict, and an interrupted run reads better where
 it was seen than a long way back in the history.
 
 > **A different feature with a similar name:** the
-> [web dashboard's opt-in run ledger](Web-Dashboard#run-ledger) records
+> [web dashboard's opt-in run ledger](Web-Dashboard#browser-run-history) records
 > finished runs into the *browser's* IndexedDB, per viewer, for the anomaly
 > heuristics. It predates durable state and stays browser-local. The
 > durable run ledger on this page is server-side, shared by every viewer,
@@ -420,8 +424,8 @@ continues to use its own startup and logical-date handling.
 
 ## In-flight runs and crash reconciliation
 
-The run ledger records *finished* runs, so a run the daemon crashed under
-used to leave no trace at all: not failed, not cancelled, absent. With a
+The run ledger records *finished* runs, so on its own it holds no trace of a
+run the daemon crashed under: not failed, not cancelled, absent. With a
 store configured, every job also gets an **in-flight record**, and two
 reconciliation passes turn an interrupted run into a visible ledger row
 instead of a silent gap:
@@ -455,9 +459,10 @@ instead of a silent gap:
   expired slot proves the previous holder made **no successful renewal** for
   a full TTL. It does *not* prove the process died (it may still be running
   if it lost store access; that overlap is the slot's documented
-  at-least-once trade). The synthetic row's `fail_reason` therefore says
-  "daemon crash, or the node lost access to the state store mid-run", never
-  asserting a crash.
+  at-least-once trade). The synthetic row's `fail_reason` therefore reads
+  `run interrupted: no completion was recorded for the run started at <time>
+  on <host>. The server may have stopped or lost access to saved state before
+  completion`, never asserting a crash.
 * **The synthetic row is a non-verdict.** The reconciled run lands in the
   ledger with outcome `unknown`:
   [`onlyIfLastSucceeded`](#depends-on-past-onlyiflastsucceeded) ignores it,
@@ -757,7 +762,8 @@ ledger**:
 }
 ```
 
-The horizon is bounded by `maxRunsPerJob` retention; on a shared mount the
+The horizon is bounded by `maxRunsPerJob` retention and by a scan of the
+newest 5000 records; on a shared mount the
 ledger merges **every node's** runs, so the numbers are fleet-wide. Each
 window's `last_duration`, `last_cpu_seconds` and `last_rss_bytes` come from
 the run in that window with the newest finish time, whichever node wrote it.
@@ -1046,6 +1052,9 @@ durable store. The same `value` / `fromFile` / `fromEnvVar` source triple
 every other cronstable secret uses:
 
 ```yaml
+state:
+  path: /var/lib/cronstable/state
+
 jobs:
   - name: build-report
     command: |
@@ -1080,7 +1089,7 @@ codes: `0` success, `1` error, `2` usage. Full flags and examples are in the
 | --- | --- |
 | `cronstable state backup -o FILE.tar.gz` | Writes an owner-only (`0o600`) `.tar.gz` of the store (records, documents, blobs, and leases; `tmp/` and `quarantine/` excluded). Safe against a live daemon. |
 | `cronstable state restore FILE.tar.gz [--force]` | Restores a backup into the store; refuses a nonempty store without `--force` (which merges, keeping the newer lease fences), and sanitizes archive members. Not safe while a daemon uses the store. |
-| `cronstable state migrate --dest PATH [--dest-deployment-id ID]` | Copies the store between paths/mounts (local ↔ Amazon S3 Files / EFS) with torn-read-safe atomic placement; then point `state.path` at the new home. |
+| `cronstable state migrate --dest PATH [--dest-deployment-id ID] [--force]` | Copies the store between paths/mounts (local ↔ Amazon S3 Files / EFS) with torn-read-safe atomic placement; refuses a nonempty destination without `--force`. Then point `state.path` at the new home. |
 | `cronstable state gc [--dry-run]` | Runs a manual [GC pass](#garbage-collection-and-manifests); reports the reclaimed streams and orphaned artifact blobs, or why the blob sweep was skipped. |
 | `cronstable state check` | Probes writability and prints an inventory of the store. |
 | `cronstable state migrate-schema [--dry-run]` | Rewrites records of older *known* record schemes to the current one. `v1` is the only scheme so far, so today this reports and converts nothing; unknown versions are left to quarantine-on-read. |
@@ -1109,7 +1118,9 @@ families (see [metrics with Prometheus](Metrics-with-Prometheus)):
   could overshoot its TTL and double-run the job the lease fences);
 * `cronstable_state_dropped_writes_total{kind}`: durable writes that failed
   and were dropped (`kind`: `run-record`, `checkpoint`, `retry`,
-  `reboot-marker`, `inflight`, `counters`, `manifest`). **This is the one to
+  `reboot-marker`, `inflight`, `counters`, `manifest`, `pause`, and
+  `overflow` for a write shed because 8192 writes are already pending).
+  **This is the one to
   alert on**: a rising rate means the durable features are silently
   degrading.
 

@@ -3,9 +3,9 @@ cronstable + Kubernetes Lease leadership backend
 
 This example runs several cronstable replicas that elect a single leader through a
 coordination.k8s.io/v1 Lease. Only the lease holder runs the `Leader` jobs, so
-you can scale for availability without double-running scheduled work -- with a
-fenced, exactly-once guarantee while the apiserver is reachable (unlike the
-best-effort gossip backend).
+you can scale for availability without double-running them. While the apiserver
+is reachable this is a fenced, single-holder election (unlike the best-effort
+gossip backend).
 
 Files
 -----

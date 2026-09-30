@@ -9,7 +9,7 @@ fleet it runs, all together:
 
 - a realistic **scheduled job set** (ingest → transform → load → report, plus
   monitoring and housekeeping),
-- **durable-state** jobs (ETL cursors, exactly-once billing, a fleet mutex and a
+- **durable-state** jobs (ETL cursors, once-per-key billing, a fleet mutex and a
   fleet semaphore, artifacts, run-scoped secrets, durable counters),
 - five **orchestration DAGs**, one per pattern (dynamic fan-out ETL, linear
   pipeline, static diamond, and two human-gated releases),
@@ -67,8 +67,9 @@ There is no coordination service beyond the shared state volume:
   no `/peer` endpoint — see *Things to try*.)
 - **Durable state** is a **shared** volume (`topology: shared`). Cursors,
   locks, idempotency keys, artifacts and **every `dag_run`** live on it and
-  coordinate **fleet-wide**, so a task launches exactly once even though all
-  nine nodes run the identical config. Each node's `cluster:` section is
+  coordinate **fleet-wide**, so a healthy fleet launches each DAG task once
+  even though all nine nodes run the identical config (crash recovery is
+  at-least-once). Each node's `cluster:` section is
   generated at start by `node-entrypoint.sh`; the job set (`platform.yaml`) is
   mounted identically into all nine.
 
@@ -108,7 +109,7 @@ or task that demonstrates it. The big ones:
 | | **filesystem** backend (shared-mount lease, no service) | `BACKEND=filesystem` |
 | | `clusterPolicy` Leader / PreferLeader / EveryNode | throughout |
 | **Durable state** | **cursor** watermark, default + explicit **`--scope`** | `incremental-orders-export`, `dedup-orders` |
-| | **idempotent** exactly-once | `charge-subscriptions` |
+| | **idempotent** once-per-key side effect | `charge-subscriptions` |
 | | **artifact** put/**get**/**list** + **secret** + **KV** (string + `--json`) | `build-daily-report` |
 | | durable **counter** | `platform-pulse-counter` |
 | | catch-up **run-once** vs **run-all** + `startingDeadlineSeconds` + `catchupJitterSeconds` | `daily-reconcile` / `hourly-invoice-emit` |
@@ -209,7 +210,8 @@ their own:
 
 8. **Crash-resume a DAG.** While an `orders-etl` run is mid-flight, stop the node
    advancing it; another node adopts the run within a lease TTL and finishes it
-   from durable state — no task double-launches.
+   from durable state. Recovery is at-least-once, so a task that was running on
+   the stopped node may run again.
 9. **Prove durability.** Note `platform-pulse-counter`'s count, then
    `restart` the fleet — the counter continues from where it left off (it lives
    in the shared store, not memory).
@@ -299,7 +301,8 @@ cluster:
   backend: etcd
   nodeName: meridian-a
   etcd:
-    endpoints: [http://etcd:2379]
+    endpoints:
+      - http://etcd:2379
     electionName: cronstable/leader
     ttl: 15
 ```

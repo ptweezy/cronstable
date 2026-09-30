@@ -1,4 +1,4 @@
-# Reporting (mail, Sentry, shell, webhook)
+# Reporting (mail, Sentry, shell, webhook, push, Event Log)
 
 Six reporters can deliver a job's outcome: Sentry, email (SMTP), an arbitrary
 shell command, an HTTP webhook (Slack-compatible by default), end-to-end
@@ -22,7 +22,7 @@ Each job has four reporting hooks, each with the same `report` block schema:
 | `onLate` | The in-process service level agreement (SLA) monitor latches a breach of one of the job's `sla:` thresholds: too long without a success, a due slot that never started, or a run exceeding its runtime bound. Fires once per breach, not per evaluation. See [late-run detection](Late-Run-Detection). |
 
 All four hooks accept the identical `report` block (`sentry`, `mail`, `shell`,
-`webhook`, `push`). The default report configuration applies independently to
+`webhook`, `push`, `eventlog`). The default report configuration applies independently to
 each hook (`_REPORT_DEFAULTS` is deep-copied into each), so configuring one hook
 does not affect the others.
 
@@ -63,7 +63,7 @@ the scheduler.
 `subject`, `body` (mail), `body` and each `fingerprint` entry (sentry), and
 `body` (webhook) are
 [jinja2](https://jinja.palletsprojects.com/) templates. Each distinct template
-source is compiled once and cached for the process lifetime (`lru_cache`), so
+source is compiled once and cached in a bounded LRU (256 sources), so
 the same template string is not recompiled on every report.
 
 These variables are available when rendering any report template:
@@ -78,14 +78,15 @@ These variables are available when rendering any report template:
 | `exit_code` | int or None | Process exit code (`retcode`). |
 | `command` | str or list | The job's command. |
 | `shell` | str | The job's shell. |
-| `environment` | dict or None | The subprocess environment (`None` when the job defines no `environment`). |
-| `host` | str | The daemon's host name (`os.environ["HOSTNAME"]`, forced to the system hostname at startup). It names which node ran the job. Always set. |
+| `environment` | dict or None | The subprocess environment (`None` when the job defines no `environment` and no state job API is running). |
+| `host` | str | The daemon's host name (`os.environ["HOSTNAME"]`, set to the system hostname at startup when `HOSTNAME` is not already in the environment). It names which node ran the job. Always set. |
 | `schedule` | str | The job's schedule as a crontab line; an object-form `schedule:` is rendered to the same string every other consumer shows (such as `CRONSTABLE_JOB_SCHEDULE`). |
 | `started_at` | str or None | ISO-8601 instant the run started, or `None` before it starts / on a failed launch (and always `None` on an [`onLate`](Late-Run-Detection) breach, which describes a run that did not happen). |
 | `run_id` | str or None | The run's id in the [durable run ledger](Durable-State), or `None` when no `state:` store is configured (and `None` on an `onLate` breach). |
 | `cpu_seconds` | float or None | Total CPU time (user + system) of the run's process tree, or `None` when the job is not [`monitorResources`](Configuration-Reference#metrics)-monitored (see [resource monitoring](Resource-Monitoring)). |
 | `cpu_user_seconds` / `cpu_system_seconds` | float or None | The user- and system-mode components of `cpu_seconds`. |
 | `max_rss_bytes` | int or None | Peak resident-set size (bytes) observed during the run, or `None` when unmonitored. |
+| `verification` | dict or None | The [`verify`](Result-Verification) check's record (outcome, fail reason, redacted output), or `None` when the job has no `verify`. |
 
 An [`onLate`](Late-Run-Detection) dispatch renders the same variable set with
 the run-shaped fields empty: `success` is `False`, `fail_reason` is
@@ -95,8 +96,7 @@ are `None`. It adds four breach variables: `sla_check`, `threshold_seconds`,
 populated, because they describe the job even when it did not run. See
 [late-run detection](Late-Run-Detection#the-onlate-report).
 
-The README's variable list omits `fail_reason`; the code provides it, and the
-default body template uses it. To capture output for reports, enable
+To capture output for reports, enable
 `captureStderr` (on by default), `captureStdout`, or both. See
 [output capturing](Output-Capturing).
 
@@ -161,8 +161,7 @@ a nonempty value.
 
 Notes on behavior:
 
-- **`validate_certs` defaults to `true`** (changed so that SMTP TLS certificate
-  validation is on by default). Unless you set `validate_certs: false`,
+- **`validate_certs` defaults to `true`**. Unless you set `validate_certs: false`,
   connections to servers with self-signed or otherwise untrusted certificates
   fail.
 - The reporter sets an `RFC 5322` `Date` header
@@ -295,9 +294,10 @@ Execution model:
 - If `command` is a **list**, the daemon runs it directly with
   `asyncio.create_subprocess_exec` (no shell).
 - If `command` is a **string** and `shell` is set (on POSIX the default
-  `/bin/sh` applies), the daemon runs it as `[shell, <flag>, command]` with
-  `asyncio.create_subprocess_exec`. The flag is per-shell: `/c` for
-  `cmd`/`cmd.exe`, `-c` for everything else.
+  `/bin/sh` applies), the daemon runs it as `[shell, "-c", command]` with
+  `asyncio.create_subprocess_exec`. On Windows a `cmd`/`cmd.exe` shell
+  instead hands the string to `asyncio.create_subprocess_shell`
+  (`%ComSpec% /c`).
 - If `command` is a **string** and `shell` resolves to a falsy value (such as
   `shell: ""`), the daemon passes the string to
   `asyncio.create_subprocess_shell`, which runs it through the system default
@@ -347,8 +347,7 @@ following variables describing the job outcome:
 argument/environment sizes. cronstable truncates each stream to a maximum of
 **16 KiB** (`1024 * 16`) when either stream individually, or the two combined,
 exceeds that limit. `CRONSTABLE_STDERR_TRUNCATED` / `CRONSTABLE_STDOUT_TRUNCATED`
-indicate per-stream whether truncation occurred. The README lists the first eight
-variables but omits the `*_TRUNCATED` pair; the code sets both.
+indicate per-stream whether truncation occurred.
 
 Example:
 
@@ -604,12 +603,12 @@ event instead of the completed/failed job wording. The template variables are:
 | Variable | Description |
 | --- | --- |
 | `event` | The event name (one of the four listed earlier). |
-| `subject` | A one-line headline (for example, `DAG 'etl' run 2026-… failed`). |
+| `subject` | A one-line headline (for example, `Workflow 'etl' run 2026-… failed`). |
 | `message` | The body detail (for example, `2 task(s) failed: extract, load`). |
 | `name` | The subject's name: the DAG name, or this node's name for cluster events. |
 | `host` | The daemon's host name. |
 | `success` | Always `False` (these are alert-worthy events). |
-| event extras | `dag_failure`/`approval_waiting`: `dag`, `run_key`, `run_id`, `taskkey`, `failed_tasks`. `leader_change`: `role`, `is_leader`, `leader`. `quorum_loss`: `quorate`. |
+| event extras | `dag_failure`/`approval_waiting`: `dag`, `run_key`, `run_id`; `failed_tasks` only on `dag_failure`; `taskkey` only on `approval_waiting`. `leader_change`: `role`, `is_leader`, `leader`. `quorum_loss`: `quorate`. |
 
 The default mail subject is `cronstable {{ event }}: {{ subject }}`, and the
 default body is `{{ message }}`. The default webhook body wraps them in the
@@ -643,15 +642,13 @@ string or empty value:
 | `fromFile` | Path to a file whose contents (stripped of surrounding whitespace) are the secret. Read as UTF-8, with a leading byte-order mark stripped as well. |
 | `fromEnvVar` | Name of an environment variable holding the secret. |
 
-Resolution order is `value`, then `fromFile`, then `fromEnvVar`; the first
-nonempty source wins. If none is set, the reporter treats the secret as absent
+The first source that is set wins (`value`, then `fromFile`, then
+`fromEnvVar`). If none is set, the reporter treats the secret as absent
 (Sentry: disabled; mail: no login).
 
-If `fromEnvVar` is set but the named environment variable is unset or empty, the
-report is **skipped** and an error is logged; cronstable no longer raises
-`KeyError` in this case. For mail, the password env-var *name* is not echoed to
-the logs, because it is tied to a secret. For sentry, the DSN env-var name is
-logged.
+A set source that resolves empty (such as a `fromEnvVar` naming an unset or
+empty variable) **skips** the report with an error naming the config key; no
+environment-variable name is logged for any reporter.
 
 ```yaml
         sentry:

@@ -102,8 +102,9 @@ same authorization as the REST API. The tools that launch configured commands
 `cron_recover_dag`) and `cron_decide_gate`, which releases the tasks waiting
 on a gate, report `destructiveHint: true` and `openWorldHint: true`, so a
 client that asks before risky calls asks before these. `cron_backfill_dag`
-defaults to `dry_run: true`. It previews the range and executes only on
-`dry_run: false` **and** `confirm: true`.
+defaults to `dry_run: true`. The default dry run confirms the workflow exists
+and echoes the range; the range itself is validated only when `dry_run: false`
+and `confirm: true` execute it.
 
 `cron_pause_job` takes `name` plus an optional `durationSeconds` and `note`,
 and holds the job's scheduled fires for the window (one hour when
@@ -242,6 +243,14 @@ daemon sends no requests. Flags:
 - `--url` (default `http://127.0.0.1:8080`): the daemon's web base URL
 - `--token` / `--token-env`: the bearer token (defaults to the
   `CRONSTABLE_WEB_TOKEN` env var if set)
+- `--cacert PATH`: verify the daemon's certificate against this CA file (a
+  private CA) instead of the system trust store (defaults to
+  `CRONSTABLE_WEB_CACERT` if set)
+- `--client-cert PATH` / `--client-key PATH`: the client certificate and key
+  for a listener that requires one through `web.tls.clientCa` (default to
+  `CRONSTABLE_WEB_CLIENT_CERT` and `CRONSTABLE_WEB_CLIENT_KEY` if set)
+- `--insecure`: skip TLS certificate verification, which can expose the bearer
+  token to an untrusted server (equivalent to `CRONSTABLE_WEB_INSECURE=1`)
 - `--protocol-version`: pin the `MCP-Protocol-Version` header of the frames
   sent before `initialize` completes (default `2025-11-25`); after
   `initialize` returns, the bridge adopts the server's negotiated version
@@ -299,7 +308,8 @@ The MCP surface matches cronstable's hardening and is safe by default:
   client. The real guards are the read-only default, the confirm gate, and
   server-side authorization.
 
-- **Attribution.** An action records the presented token's label as `by`.
+- **Attribution.** Pause, resume, and gate decisions record the presented
+  token's label as `by`.
   `cron_decide_gate` appends its optional `by` argument, up to 100
   characters, to the label as display text.
 

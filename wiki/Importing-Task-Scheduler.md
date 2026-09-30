@@ -16,12 +16,23 @@ schtasks /query /XML ONE > tasks.xml
 cronstable import-taskscheduler tasks.xml -o jobs.yaml
 ```
 
-One task, or a folder of them, from PowerShell:
+One task from PowerShell:
 
 ```powershell
 Export-ScheduledTask -TaskName "Nightly Backup" -TaskPath "\Contoso\" |
     Out-File -FilePath backup.xml
 cronstable import-taskscheduler backup.xml -o jobs.yaml
+```
+
+A folder of tasks from PowerShell, one file per task:
+
+```powershell
+New-Item -ItemType Directory -Force exports | Out-Null
+Get-ScheduledTask -TaskPath "\Contoso\" | ForEach-Object {
+    Export-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath |
+        Out-File "exports\$($_.TaskName).xml"
+}
+cronstable import-taskscheduler exports -o jobs.yaml
 ```
 
 A directory of exports, or a pipe:
@@ -202,8 +213,9 @@ is not an IANA zone name, so it cannot be written as `timezone:`, and
 inferring one would be a guess about daylight saving. If you want a zone, name
 the real one with `--timezone`.
 
-A one-shot whose instant has passed still loads. The daemon reports it as
-`never-fires` on `/status` and `/jobs` rather than refusing it, so a lapsed
+A one-shot whose instant has passed still loads. The daemon reports it with
+`"never_fires": true` on `/status` and `/jobs` (and a `never-fires`
+configuration-load warning) rather than refusing it, so a lapsed
 `TimeTrigger` appears as a job to delete instead of as a load failure.
 
 A task's URI becomes the job name. The folder separator becomes `.` and

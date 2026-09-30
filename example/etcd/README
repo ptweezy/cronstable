@@ -5,7 +5,7 @@ This example runs two cronstable instances that elect a single leader through an
 etcd key. The holder creates a lease-bound key (`cronstable/leader`) with a
 create-if-absent transaction and keeps the lease alive; if it dies, the lease
 expires, etcd deletes the key, and the other instance's transaction wins. While
-etcd is reachable this is a fenced, exactly-once election (unlike the
+etcd is reachable this is a fenced, single-holder election (unlike the
 best-effort gossip backend).
 
 The backend speaks etcd's v3 gRPC-gateway JSON/HTTP API directly over the core
@@ -49,7 +49,8 @@ password from a value / file / env var (like `web.authToken`):
   cluster:
     backend: etcd
     etcd:
-      endpoints: [https://etcd:2379]
+      endpoints:
+        - https://etcd:2379
       username: root
       password:
         fromEnvVar: ETCD_PASSWORD

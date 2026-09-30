@@ -10,7 +10,7 @@ assets or build step.
 ## Enabling and opening it
 
 The dashboard is part of the HTTP interface, so it appears as soon as you add a
-`web` section with at least one `http://` listener (see the
+`web` section with at least one `http://` or `https://` listener (see the
 [HTTP control API](HTTP-API) for the full configuration reference):
 
 ```yaml
@@ -20,7 +20,7 @@ web:
 ```
 
 Open the listener's root path in a browser, <http://127.0.0.1:8080/> for the
-preceding example. The page is served at `/` on every `http://` listener and is
+preceding example. The page is served at `/` on every `http://` or `https://` listener and is
 self-contained, so nothing else needs to be installed or hosted.
 
 The HTML document is returned with defense-in-depth security headers, including
@@ -44,7 +44,7 @@ web:
 The landing page is a single sortable, filterable table of every configured job.
 
 The header carries the wordmark (whose `l` is a live
-[pendulum simulation](#the-pendulum-wordmark)), the daemon's version, the
+[pendulum simulation](#tab-title-and-favicon)), the daemon's version, the
 [job-set ID](Job-Set-ID) as a short `#…` chip, a live UTC clock, a **node
 meter**, a **connection indicator**, and **summary pills** counting the total
 jobs and how many are running, failing, paused, and OK. Hover the `#…` chip for
@@ -63,7 +63,7 @@ Each row shows:
 
 | Column | What it shows |
 | --- | --- |
-| **Status** | The job's current health: one of **Running**, **Paused** (a [runtime pause](Pausing-Jobs), glyph `⏸`), **Failed**, **OK**, **Pending** (enabled but never run yet), **Cancelled**, or **Disabled** (`enabled: false`), each with a color and glyph. A job [late on an SLA check](Late-Run-Detection) additionally carries an **OVERDUE** badge, independent of its status. |
+| **Status** | The job's current health: one of **Running**, **Verifying** (running, with its [result verification](Result-Verification) in progress), **Queued** (waiting for a [resource pool](Resource-Pools) slot), **Paused** (a [runtime pause](Pausing-Jobs), glyph `⏸`), **Failed**, **OK**, **Unknown** (the last run was interrupted before it recorded an outcome), **Skipped** (the last scheduled slot was skipped, such as during a pause), **Pending** (enabled but never run yet), **Cancelled**, or **Disabled** (`enabled: false`), each with a color and glyph. A job [late on an SLA check](Late-Run-Detection) additionally carries an **OVERDUE** badge, independent of its status. |
 | **Job** | The job `name` and its command. |
 | **Owner** | *(cluster only, under [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load))* the node that currently **owns** the job. The dashboard highlights, in the accent color, the jobs owned by the node you're viewing, so you can see which work lands here. `EveryNode` jobs read **all nodes**, and a `Leader` job with no quorum reads **no quorum**. The column is hidden entirely outside spread mode. Sortable, so you can group jobs by node. |
 | **Schedule** | The raw schedule string; hover it for a plain-English reading. |
@@ -87,14 +87,14 @@ the window. Optional columns:
 The toolbar above the table lets you:
 
 - **filter** by typing in the search box (matches name or command; press `/` to focus it);
-- narrow by status with the **all / ok / fail / run / off** segmented control;
-- **sort** by name, status, last run, next run, or duration (from the dropdown, or by clicking a column header, including the optional columns; clicking again reverses);
+- narrow by status with the **all / ok / fail / run / queued / verifying / off** segmented control;
+- **sort** by name, status, last run, next run, or duration (from the dropdown, or by clicking a column header, including the optional **Policy**, **Next at**, and **Rate** columns but not **TZ**; clicking again reverses);
 - **run every failing job at once** with the **run failing** button.
 
 ### Paused and overdue jobs
 
 A [paused](Pausing-Jobs) job shows the **Paused** status with a `⏸` chip
-naming the pause expiry and note, counts into its own summary pill and
+counting down to expiry (hover for the note), counts into its own summary pill and
 wallboard tile, and shows `—` in the **Next** column while its slots are
 being skipped. Pausing from the dashboard is one click: the row or drawer
 button, the palette, or the `p` key, which toggles pause/resume on the selected
@@ -135,12 +135,12 @@ The Logs tab streams a job's captured output over
 it replays the most recent buffered lines first, then appends new lines live as a
 running job produces them. Features:
 
-- **ANSI color** rendering (toggle off to see raw text), with `stderr` lines distinguished from `stdout`;
+- **ANSI color** rendering (uncheck **ansi** to strip color codes), with `stderr` lines distinguished from `stdout`;
 - absolute **line numbers** and optional per-line **timestamps**;
 - in-log **search / grep**, plain-text or **regex**, with a live match count, `Enter` to jump between matches, and a **matches-only** mode that hides non-matching lines;
 - **follow** (auto-scroll) and **line-wrap** toggles;
 - one-click **download** of the buffered log, and a **clear** button;
-- **Run** and **Cancel** buttons right above the output.
+- **Run**, **Cancel**, and **Pause** (or **Resume**) buttons right above the output.
 
 Output is only available for the streams a job captures, so enable
 [`captureStdout` / `captureStderr`](Output-Capturing) on jobs whose output you
@@ -200,7 +200,7 @@ cell, and the drawer header repeats the live readings while the job runs.
 The Schedule tab turns the cron expression into a plain-English reading:
 
 - a **plain-English description** (for example, *"At 19:27, on Monday and Friday"*), understanding ranges, steps, lists, names, and the `@daily`/`@hourly`/`@reboot` macros;
-- a preview of the **next run times**, computed live in the browser and shown in the job's own [time zone](Schedules-and-Timezones) (UTC, server-local, or an arbitrary IANA zone such as `America/Los_Angeles`), each with a relative countdown;
+- a preview of the **next run times**, computed live in the browser and shown in the job's own [time zone](Schedules-and-Timezones) (UTC or an arbitrary IANA zone such as `America/Los_Angeles`; a `utc: false` job is shown in the browser's local zone, labeled "server local — approximate"), each with a relative countdown;
 - impossible schedules (such as the 31st of February) are detected and called out rather than described as if they will fire;
 - a key/value summary of whether the job is enabled, its time zone frame, a concurrency note, and its command.
 
@@ -210,16 +210,16 @@ The Schedule tab turns the cron expression into a plain-English reading:
 | :---: | :---: |
 | [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-graph.png) | [![The DAG drawer's task list with an approval gate awaiting a decision, Approve and Reject buttons armed](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-dag-approval.png) |
 
-When a [`dags:`](Orchestration-and-DAGs) section is configured, a **`⧉ dags`**
+When a [`dags:`](Orchestration-and-DAGs) section is configured, a **`⧉ workflows`**
 toolbar button appears; it stays hidden otherwise, like the cluster panel. The
-button toggles the **DAG card** (also *Toggle DAGs card* in the command
+button toggles the **workflows** card (also *Toggle workflows* in the command
 palette): one row per DAG with its latest run's state, its name and task count
 (a **fan-out** badge marks a DAG with mapped tasks), its schedule (hover for the
 plain-English reading; `manual` for an unscheduled DAG), a stacked bar of recent
 run outcomes, the total run count, and one-click **Run** / **Open** actions.
 
-**Open** (or clicking a row) opens the **DAG drawer**, with **Trigger** and
-**▦ Backfill** buttons in its header and five tabs:
+**Open** (or clicking a row) opens the **DAG drawer**, with **Trigger**,
+**▦ Backfill**, and **Retry failed tasks** buttons in its header and five tabs:
 
 - **Runs**: recent runs, newest first, each with its state and a per-state
   task tally; selecting a run drives the other tabs.
@@ -229,18 +229,21 @@ run outcomes, the total run count, and one-click **Run** / **Open** actions.
   [approval gate](Orchestration-and-DAGs#approval-gates) that is awaiting a
   decision shows **✓ Approve** / **✕ Reject** buttons, and the decision is
   recorded as made by `dashboard`; a gate decided elsewhere in the meantime
-  answers "already decided". A sensor shows its poke count and next poke, and a
+  answers "This task is no longer waiting for approval. Refreshing its status." A sensor shows its poke count and next poke, and a
   task awaiting retry shows when the next attempt is due.
 - **XCom**: the values the run's tasks published.
-- **Logs**: pick a task and tail a *running* instance's live output (the same
-  SSE stream as the job drawer's Logs tab).
+- **Logs**: pick a task and tail a *running* instance's live output (an SSE
+  stream like the job drawer's Logs tab, from the task-log endpoint).
 
 **Trigger** (and the card's **Run** button) starts a manual run now with
 [`POST /dags/{name}/trigger`](HTTP-API#post-dagsnametrigger). In the drawer, the
 new run is selected as soon as it is created. **▦ Backfill** opens a from/to ISO
 date-range form wired to
 [`POST /dags/{name}/backfill`](HTTP-API#post-dagsnamebackfill). It is disabled
-for a manual-only DAG, whose missing schedule leaves no range to anchor. DAG
+only without the `control` scope. For a manual-only DAG the form forces
+**Failed dates only**, which posts to `/dags/{name}/recover` instead.
+**Retry failed tasks** previews recovery of the selected failed run's failed
+tasks (see [workflow recovery](Workflow-Recovery)). DAG
 runs are **deep-linkable** like jobs: the URL tracks `#dag/<name>` (and
 `#dag/<name>/<run_key>` with a run selected), so you can bookmark a run or paste
 it into an incident channel.
@@ -254,7 +257,7 @@ for endpoint details.
 [![The durable-state inspector: record counts per kind, op latencies, and per-primitive tabs](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-state.png)
 
 When a [durable state](Durable-State) backend is enabled, a **`⛁ state`**
-toolbar button appears and toggles the **durable state** card (also *Toggle
+toolbar button appears and toggles the **saved state** card (also *Toggle
 state inspector* in the command palette). The page probes `GET /state` once at
 load to decide; without a backend the button never shows. The card headlines the
 backend and topology (with a `shared-lock` chip where that applies), the store
@@ -297,7 +300,7 @@ job list and renders:
 - a **summary line** with this node's name and the agreement tally, such as
   `cronstable-a` and `cronstable-a · 2/2 agreed`. When
   [leader election](Clustering-and-Leader-Election#leader-election) is on, it
-  also shows the live quorum count and this node's role:
+  also shows whether quorum holds and how many nodes it needs, and this node's role:
   - **leader**, **follower** (with the current leader's name), or **no quorum**
     when the node has stood down.
   - under
@@ -316,13 +319,15 @@ job list and renders:
       as mid-resize.
     - a **coordination policy mismatch**: a peer running a different
       `distribution` / `elect_leader`.
-- a **per-peer table** with the on-screen headers **Peer** | **Node** | **Owns**
-  | **Status** | **Job set**. It lists each peer's address, reported node name,
-  status, and the short form of its job-set ID. The **Owns** column, counting
+- a **per-peer table** with the on-screen headers **Peer** | **Node** | **Load**
+  | **Owns** | **Status** | **Job set**. It lists each peer's address, reported node name,
+  status, and the short form of its job-set ID. The **Load** column appears
+  when peers share node stats through
+  [`cluster.observability`](Configuration-Reference#observability-overlay). The **Owns** column, counting
   how many jobs each node owns, is present only under
   [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load),
   so the whole job-to-node distribution is visible; it pairs with the per-job
-  **Owner** column in the job table earlier. Outside spread it reads `—`. Each
+  **Owner** column in the job table earlier. Each
   peer also carries a colored **status dot**:
   - green for `agreed`.
   - amber for `syncing`.
@@ -376,8 +381,9 @@ status dot and data age (`live` for the serving node, `41s ago` for a peer). A
 briefly unreachable peer keeps its last-known cells with a growing age instead
 of going blank, and a node whose job set exceeds the gossip payload cap (512
 jobs) is flagged **partial**. Summaries are observability data only: they never
-influence election or run decisions. Like the swimlane, the view is gossip-only,
-because lease backends carry no summaries, so the button is hidden there.
+influence election or run decisions. On a lease backend the view needs
+[`cluster.observability`](Configuration-Reference#observability-overlay);
+without it the button is hidden.
 
 Separately from the in-panel summary, a cluster incident also raises the
 page-level **CLUSTER ALERT** bar at the top of the dashboard. This red incident
@@ -401,8 +407,6 @@ the kubernetes `namespace` or the etcd `leaseId` when present. There, `no
 quorum` means *the lease store is unreachable from this node*, not "no
 majority". For the full `GET /cluster` field semantics, see
 [clustering and leader election](Clustering-and-Leader-Election#observing-the-cluster).
-
-<a id="merged-multi-tail"></a>
 
 ## Live logs
 
@@ -435,8 +439,6 @@ presets.
   appears only for the streams a job captures
   ([`captureStdout` / `captureStderr`](Output-Capturing)).
 
-<a id="incident-tools-verdict-bar-timeline-and-mitigate-console"></a>
-
 ## Incident tools: verdict bar, timeline, and job actions panel
 
 None of these need a cluster; they all work on a single node.
@@ -456,7 +458,7 @@ the bar to the red **CLUSTER ALERT** severity described earlier under
 The **incident timeline** (press `i`, or *Incident timeline* in the command
 palette) lists each job's most recent finished run, newest first, with its
 relative time, outcome, failure reason, exit code, and duration. Use
-**failing only** to filter the list. Jobs grouped by the verdict bar are
+**failures only** to filter the list. Jobs grouped by the verdict bar are
 highlighted.
 
 The **job actions panel** (*Review actions for failing jobs* in the palette, or the
@@ -465,7 +467,7 @@ verdict bar's `▸ review actions` button) acts on the failing set in bulk. Guar
 [start/cancel endpoints](HTTP-API#post-jobsnamestart) staggered a few hundred
 milliseconds apart (gentle on the daemon), with a live per-job ✓/✕ result log
 and a final tally; you can stop the sequence while it runs. The panel can also
-open [live logs](#merged-multi-tail) for the selected jobs, and copy a ready-made
+open [live logs](#live-logs) for the selected jobs, and copy a ready-made
 **Markdown incident summary** (timestamp, host, version, cluster state, and a
 per-job table) for your incident channel or ticket.
 
@@ -508,20 +510,18 @@ It also respects `prefers-reduced-motion`. The
 `example/zen-demo/docker-compose.yml` demo boots a single calm node to
 demonstrate it.
 
-<a id="next-fire-radar"></a>
-
 ## Upcoming runs
 
 The **`⌁ upcoming`** toolbar button (or *Toggle upcoming runs* in the palette)
 opens an **upcoming runs** panel answering "what runs next", fleet-wide: a feed of
-the next eight scheduled runs, each with a live countdown (hover one for the
+each job's next run, with the soonest eight listed, each with a live countdown (hover one for the
 wall-clock time and the schedule's plain-English reading), above a
 **ten-minute track** on which every fire due inside the window drifts toward
 *now* as a mark. Clicking an entry or a mark opens that job's drawer, and the
 panel header counts everything upcoming. The browser computes fire times with
 the same cron engine as the
 [Schedule tab](#schedule-in-plain-english-in-the-right-timezone) and the
-[schedule preview](#cron-sandbox). Disabled jobs, and schedules the engine cannot
+[schedule preview](#schedule-preview). Disabled jobs, and schedules the engine cannot
 preview (such as `@reboot`), are omitted.
 
 ## Week calendar
@@ -535,15 +535,15 @@ past times today appear dimmed. Clicking a chip opens the job's
 
 Jobs scheduled more than about eight times a day appear in a **background
 hum** summary below the grid. Subscribe in a calendar app using the fleet's
-**iCal feed** (`⤓ .ics feed`) in the card header or the per-job feed in its
+**iCal feed** (`⤓ calendar feed`) in the card header or the per-job feed in its
 Schedule tab. See [calendar export](Calendar-Export).
 
 ## Activity heatmap
 
 [![The activity heatmap punchcard: one row per job, cells colored by worst outcome in the bucket and shaded by run volume](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-heatmap.png)
 
-The **`▦ heat`** header button (or *Toggle activity heatmap* in the palette)
-adds a grid: one row per job, 24 time buckets across a **6h / 24h /
+The **`▦ activity`** toolbar button (or *Toggle activity heatmap* in the palette)
+adds a grid: one row per job (the first 80), 24 time buckets across a **6h / 24h /
 7d** window, each cell colored by the worst outcome in that bucket and shaded
 by run volume. Hover a cell for the bucket's tally (such as `3 ok / 1 fail`);
 click a cell or a job name to open that job. The dashboard fills the card with
@@ -551,11 +551,9 @@ one batched [`GET /activity`](HTTP-API#get-activity) fetch, falling back to
 per-job [run history](HTTP-API#get-jobsnameruns) fetches against an older
 daemon, so the card's horizon is bounded by the daemon's in-memory history.
 
-<a id="schedule-pressure"></a>
-
 ## Schedule load
 
-The **`▥ schedule load`** header button (or *Toggle schedule load* in the
+The **`▥ schedule load`** toolbar button (or *Toggle schedule load* in the
 palette) shows upcoming scheduled runs over the next 24
 hours, fetched from [`/schedule/pressure`](HTTP-API#get-schedulepressure)
 using the server’s scheduling engine. The card shows
@@ -571,8 +569,6 @@ and the data refreshes about once a minute. With the panel enabled, the
 grid, so the room sees when many jobs are scheduled at once. See
 [schedule load](Schedule-Pressure).
 
-<a id="cron-sandbox"></a>
-
 ## Schedule preview
 
 *Schedule preview* in the palette opens a scratchpad for schedule expressions: type
@@ -584,8 +580,6 @@ schedules and `@reboot` are called out). It cross-references your live jobs to
 show which ones use the same schedule, and keeps a browser-local list of recent
 expressions. The same engine powers the dashboard's schedule advisories
 (overlapping runs, jobs scheduled together, and daylight saving time changes).
-
-<a id="run-ledger"></a>
 
 ## Browser run history
 
@@ -604,7 +598,7 @@ Runs that finish between refreshes may be missed.
 
 Press `Ctrl-K` (or `⌘K`, or `Ctrl-P`) to open a **fuzzy command palette**. It
 searches both global actions (refresh, run all failing jobs, cycle theme, toggle
-effects, open settings, set the access token…) and a per-job action for every job
+reduce motion, open settings, set the access token…) and a per-job action for every job
 (open its logs, run it, cancel it, copy its command, view its schedule). Type to
 filter, arrow keys to move, `Enter` to run.
 
@@ -628,7 +622,7 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 | `g` | Refresh now |
 | `t` | Cycle the theme |
 | `T` | Flip light / dark (dark ↔ paper) |
-| `i` | Open the [incident timeline](#incident-tools-verdict-bar-timeline-and-mitigate-console) |
+| `i` | Open the [incident timeline](#incident-tools-verdict-bar-timeline-and-job-actions-panel) |
 | `w` | Toggle the [wallboard / TV mode](#wallboard--tv-mode) |
 | `a` | Acknowledge the [failure alarm](#settings-themes-and-notifications) |
 | `?` | Show the shortcut list |
@@ -652,13 +646,13 @@ The settings panel (and the command palette) expose:
 - An **interface font** choice: the terminal monospace (default) or a proportional sans-serif that is easier to read at length. Log output, cron expressions, and keycaps stay monospace either way, and numerals stay tabular so clocks don't jitter.
 - A **UI scale** of 100% / 110% / 125% / 140% that enlarges the whole dashboard, useful for wallboard TVs viewed from across the room.
 - A **reduce motion** switch that stops the spinners, pulsing status dots, and the boot self-test without touching your OS preference (`prefers-reduced-motion` is always honored).
-- The **boot self-test**: a BIOS-style POST screen on load that runs real probes against the daemon, job set, cluster, and schedules as it types. It replays only after a 12-hour cooldown, any key dismisses it, and re-enabling the toggle clears the cooldown so the next load shows it.
+- **Startup check** (the boot self-test): a BIOS-style POST screen on load that runs real probes against the daemon, job set, cluster, and schedules as it types. It replays only after a 12-hour cooldown, any key dismisses it, and re-enabling the toggle clears the cooldown so the next load shows it.
 - **Desktop notifications** that fire when a job fails, after you grant the browser permission.
 - **Audible cues**: a short tick when a run succeeds and a buzz when one fails, at a selectable **cue volume** of 25% / 50% / 75% / 100%. A failure also arms a repeating **failure alarm** that sounds until acknowledged with `a`, which works on the wallboard too; the all-clear, or a fresh failure, re-arms it.
 - **Alarm escalation**: the wallboard reddens and the alarm quickens the longer a failure goes unacknowledged. The cue interval ramps from every 6 seconds down to roughly every 1.6 by the ten-minute mark, and `a` silences it until the next failure.
 - A **refresh interval** of 1s / 2s / 3s / 5s / 10s, or paused.
 - The **zen screensaver** toggle and its idle delay, for the [wallboard](#wallboard--tv-mode).
-- The opt-in **[browser run history](#run-ledger)**, with its storage stats, export, and purge buttons.
+- The opt-in **[browser run history](#browser-run-history)**, with its storage stats and **export** and **clear history** buttons.
 
 All preferences are remembered in the browser's `localStorage`, so the dashboard
 comes back the way you left it.
@@ -726,7 +720,7 @@ pinned tab reads as the app rather than as an alarm.
 
 A hidden tab keeps polling at a slow 30-second cadence rather than stopping,
 so the title, [desktop notifications](#settings-themes-and-notifications),
-the audible alarm, and the [run ledger](#run-ledger) stay current while you
+the audible alarm, and the [run ledger](#browser-run-history) stay current while you
 work elsewhere. The foreground refresh interval resumes the moment the tab
 returns.
 
@@ -768,15 +762,15 @@ The dashboard is a thin client over the [HTTP control API](HTTP-API):
 
 - it polls `GET /jobs` on the refresh interval for the overview (each job carries a compact tail of recent runs for the sparkline);
 - it polls `GET /cluster` on the same interval for the [cluster panel](#cluster-panel) (the panel stays hidden unless a cluster section is configured);
-- `GET /node` (the header's [node meter](#the-job-overview)) and `GET /dags` (the [DAG card](#dag-orchestration)) ride the same poll;
+- `GET /node` (the header's [node meter](#the-job-overview)), `GET /dags` (the [workflows card](#dag-orchestration)), and `GET /pools` (the resource pools card) ride the same poll;
 - while the [fleet view](#fleet-view-every-nodes-runs-in-one-pane) is open, `GET /fleet` rides the same poll (the daemon answers it from gossip state it already holds);
 - the [state inspector](#durable-state-inspector) probes `GET /state` once at load (to decide whether to offer its button), polls it only while the card is open, and drills into scopes with `GET /state/documents` / `GET /state/records`;
 - the **node resources** card refetches `GET /node/history` while it is open;
 - opening a job's **History** tab fetches `GET /jobs/{name}/runs` (full retained history plus aggregate stats); the [activity heatmap](#activity-heatmap) fills from one batched [`GET /activity`](HTTP-API#get-activity) fetch and keeps the capped per-job loop as a fallback against an older daemon;
 - opening a job's **Resources** tab fetches `GET /jobs/{name}/resources` lazily, never on the poll loop, and refetches it at the live view's selectable pace while the tab stays open;
 - opening the **Logs** tab opens the `GET /jobs/{name}/logs` SSE stream;
-- the [live logs panel](#merged-multi-tail) opens up to four of those SSE streams at once (one per tailed job) and re-attaches them as runs come and go;
-- the [DAG drawer](#dag-orchestration) fetches `GET /dags/{name}/runs`, the selected run's document and XCom list, and a running task's log SSE stream; its buttons call `POST /dags/{name}/trigger`, `POST /dags/{name}/backfill`, and the approval decision endpoint;
+- the [live logs panel](#live-logs) opens up to four of those SSE streams at once (one per tailed job) and re-attaches them as runs come and go;
+- the [DAG drawer](#dag-orchestration) fetches `GET /dags/{name}/runs`, the selected run's document and XCom list, and a running task's log SSE stream; its buttons call `POST /dags/{name}/trigger`, `POST /dags/{name}/backfill`, `POST /dags/{name}/recover`, `POST /dags/{name}/runs/{run_key}/recover`, and the approval decision endpoint;
 - the **Run** / **Stop** buttons call `POST /jobs/{name}/start` and `POST /jobs/{name}/cancel`;
 - the version in the header comes from `GET /version`, and the [job-set ID](Job-Set-ID) chip beside it from `GET /job-set-id` (each fetched once at load).
 

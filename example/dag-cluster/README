@@ -7,14 +7,15 @@ tier coordinating across a fleet with no coordination service beyond the shared
 mount itself:
 
   * a dag_run is a single document on the shared store; each run is advanced
-    only by the node holding that run's advance lease, so a task is launched
-    exactly once across the fleet (never double-fired);
+    only by the node holding that run's advance lease, so a healthy fleet
+    launches each task once;
   * `cluster.backend: filesystem` elects a leader using that same shared mount
     (a flock-guarded TTL lease), so only the leader creates the scheduled runs;
   * cross-task data (XCom) and per-task state ride the durable store on
     the same store, so any node can inspect or act on any run;
   * kill the leader mid-run and another node adopts its in-flight runs within a
-    lease TTL and resumes them from durable per-task state (crash-resume).
+    lease TTL and resumes them from durable per-task state (crash-resume, which
+    is at-least-once: a task that was running may run again).
 
 On a real fleet the shared mount is an Amazon S3 Files / EFS / NFS volume; here
 it is a local Docker volume shared by the three containers. The config is

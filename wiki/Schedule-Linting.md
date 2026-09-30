@@ -12,7 +12,7 @@ Each finding has a stable `code`, a `level`, and a one-line `message`. A `warnin
 |------|-------|---------------|
 | `never-fires` | warning | The schedule has no future occurrence: a fixed year in the past, or a date that never exists (`0 0 30 2 *`). The job stays loaded but never runs. |
 | `day-fields-both-restricted` | warning | Day-of-month and day-of-week are both restricted. In cronstable, a day must satisfy **both** (`0 0 13 * 5` is Friday the 13th). Classic Vixie cron instead fires when *either* matches, so a schedule imported from a system crontab fires less often here than it did there. See [Schedules and Timezones](Schedules-and-Timezones). |
-| `uneven-step` | warning | A `*/n` step where `n` does not divide the field's span. `*/7` in the minute field fires at :56 and then :00 four minutes later, because star steps restart at the wrap. |
+| `uneven-step` | warning | A `*/n` or `H/n` step where `n` does not divide the field's span. `*/7` in the minute field fires at :56 and then :00 four minutes later, because star steps restart at the wrap. |
 | `uneven-step` (day-of-month) | note | Any `*/n` day-of-month step: values restart at day 1 every month and month lengths differ, so `*/2` is not "every 48 hours". |
 | `skipped-months` | warning | The smallest selected day of month never occurs in one of the selected months (`0 0 31 1,4 *` never fires in April), so that month is skipped entirely. |
 | `leap-day-only` | note | February runs can only match day 29, which exists only in leap years. |
@@ -27,20 +27,18 @@ The DST rules run in the job's frame: its explicit `timezone:`, or the host's lo
 - **Config load.** Every finding is logged when the job parses (`warning` findings at `WARNING`, `note` findings at `INFO`), so the load or reload that introduces a risky schedule says so immediately:
 
   ```
-  WARNING:cronstable.config:job 'parked': schedule '0 0 1 1 * 2020': [never-fires] no future occurrence: the year column ends at 2020, so this schedule will never fire again
+  WARNING:cronstable.config:job 'parked': schedule '0 0 1 1 * 2020': [never-fires] no future runs: the last year in this schedule is 2020
   ```
 
-- **The HTTP API.** `GET /jobs` carries each job's findings verbatim (`schedule_findings`, a list of `{code, level, message}`) plus a computed `never_fires` boolean. `GET /status` marks dead schedules with `never_fires: true` (and says `never fires` in the plain-text form). `GET /schedule/preview` lints arbitrary expressions before they become jobs. See [HTTP API](HTTP-API).
+- **The HTTP API.** `GET /jobs` carries each job's findings verbatim (`schedule_findings`, a list of `{code, level, message}`) plus a computed `never_fires` boolean. `GET /status` marks dead schedules with `never_fires: true` (and says `no future runs (check the schedule)` in the plain-text form). `GET /schedule/preview` lints arbitrary expressions before they become jobs. See [HTTP API](HTTP-API).
 - **The terminal dashboard.** The schedule preview (`x`) lints as you type, and a job's schedule drawer shows findings in the job's own time zone, so DST notes carry real dates. See the [terminal dashboard](Terminal-Dashboard).
-
-<a id="dead-schedules-are-loud-not-fatal"></a>
 
 ## Schedules that never run
 
 A `never-fires` finding does not reject the configuration: existing configs may use a past year (`schedule: "0 0 1 1 * 2020"`) to disable a job. Besides the load-time warning, the scheduler logs once per load or reload when it removes such a schedule from its fire index:
 
 ```
-WARNING:cronstable:job 'parked': schedule '0 0 1 1 * 2020' has no future occurrence and will NEVER fire; fix the schedule or disable the job (its status reports never_fires)
+WARNING:cronstable:job 'parked': schedule '0 0 1 1 * 2020' has no future runs; update the schedule or disable the job (status: never_fires)
 ```
 
 Status responses report `never_fires` until the schedule changes. To disable a job explicitly, use `enabled: false`.

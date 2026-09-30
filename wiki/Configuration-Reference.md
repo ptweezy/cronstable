@@ -72,6 +72,7 @@ push: { ... }       # optional: E2E-encrypted push alerts (relay + device regist
 | `mcp` | `Map` | No | Enables the Model Context Protocol server (`POST /mcp` on the web listeners, plus the `cronstable mcp` stdio bridge) so AI agents can observe and, opt-in, control jobs/DAGs. Requires a `web` section. Off by default. See [`mcp`](#mcp) later and [MCP](MCP). |
 | `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [clustering and leader election](Clustering-and-Leader-Election). |
 | `state` | `Map` | No | Enables the opt-in durable state store: restart-durable run history, missed-run catch-up, restart-surviving retries, and once-per-boot `@reboot` runs. Without it, cronstable is stateless: everything stays in memory. See [durable state](Durable-State). |
+| `pools` | `MapPattern(Str, Map)` | No | Named resource pools (`slots` 1-10000, `maxQueued` default 1000, 1-10000). Requires `state`. See [resource pools](Resource-Pools). |
 | `logging` | `Map` (Python `logging.config` dictConfig) | No | Custom logging configuration. See [logging configuration](Logging-Configuration). |
 | `notify` | `Map` | No | Daemon and orchestration event notifications (DAG failures, approval gates, leadership changes) through the standard reporter block. See [`notify`](#notify) later and [reporting](Reporting). |
 | `push` | `Map` | No | The daemon-global relay endpoint and paired-device registry behind the end-to-end encrypted `push` reporter. See [`push`](#push) later and [push notifications](Push-Notifications). |
@@ -82,8 +83,8 @@ push: { ... }       # optional: E2E-encrypted push alerts (relay + device regist
 | --- | --- | --- | --- |
 | `listen` | `Seq(Str)` | required | Listen URLs, such as `http://127.0.0.1:8080`, `https://0.0.0.0:8443`, or `unix:///tmp/cronstable.sock`. `http://` and `https://` listeners work everywhere, and a list may mix schemes, each address serving the same app over its own transport. An `https://` entry needs the later `tls.cert`/`tls.key` keys, and both a host and a port. Windows does not support `unix://` listeners (the Proactor loop lacks `create_unix_server`); they are skipped with the warning `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform`. Use an `http://` listener instead. See [running on Windows](Running-on-Windows) and [listener TLS](Listener-TLS). |
 | `headers` | `MapPattern(Str, Str)` | none | Extra HTTP response headers applied to all endpoints. A `Content-Type` entry (in any spelling) is ignored: every endpoint owns its own content type. |
-| `allowedOrigins` | `Seq(Str)` | `[]` | Extra exact-match browser `Origin`s allowed to call the **mutating** endpoints (`POST /jobs/{name}/start`, `/jobs/{name}/cancel`, `/dags/{name}/trigger`, `/dags/{name}/backfill`, task decisions). Cross-site browser requests to them are refused `403` as a CSRF/DNS-rebinding defense. Same-origin requests (the served dashboard) and clients that send no `Origin` (curl, monitoring) always pass. `/mcp` keeps enforcing its own `mcp.allowedOrigins`. A `headers` entry of `Access-Control-Allow-Origin: <origin>` allow-lists that origin implicitly. `Access-Control-Allow-Origin: "*"` disables the check (logged loudly). |
-| `authToken` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | none | Opt-in bearer-token auth. When set but resolving empty, cronstable refuses to start. |
+| `allowedOrigins` | `Seq(Str)` | `[]` | Extra exact-match browser `Origin`s allowed to call the **mutating** endpoints: every mutating (non-GET/HEAD/OPTIONS) route except `/mcp`, such as job start/cancel/pause/resume, DAG trigger/backfill/recover, task decisions, `/push/devices`, and `/shutdown`. Cross-site browser requests to them are refused `403` as a CSRF/DNS-rebinding defense. Same-origin requests (the served dashboard) and clients that send no `Origin` (curl, monitoring) always pass. `/mcp` keeps enforcing its own `mcp.allowedOrigins`. A `headers` entry of `Access-Control-Allow-Origin: <origin>` allow-lists that origin implicitly. `Access-Control-Allow-Origin: "*"` disables the check (logged loudly). |
+| `authToken` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | none | Opt-in bearer-token auth. When set but resolving empty, cronstable does not start the web API (it logs the error; scheduled jobs keep running). `--validate-config` does not resolve token sources, so it does not catch this. |
 | `authTokens` | `Seq(Map)`, each with the `authToken` source triple, `scopes` (`Seq` of `view`/`control`/`approve`), and an optional `label` | none | Multiple named bearer tokens with per-token scopes (`control` and `approve` imply `view`). `label` identifies a token in logs and lets you revoke it by dropping the entry and reloading. Tokens must resolve nonempty and be distinct from each other and from `authToken`. See [HTTP control API](HTTP-API#authentication). |
 | `anonymousScopes` | `Seq(Enum)`, accepting only `view` | none | Scopes granted to requests that present no credential at all, so the instance serves a public read-only board (dashboard, run history, log tails, calendar feeds, `/metrics`). The schema rejects `control` and `approve`, so no anonymous path to a mutating route can be configured. `GET /push/devices` is excluded as well, and a presented-but-wrong token is still `401` rather than a downgrade to this grant. Requires at least one `authToken`/`authTokens` entry, because a tokenless daemon already grants every scope to everyone. See [public read-only access](HTTP-API#public-read-only-access-webanonymousscopes). |
 | `socketMode` | `Str` | none | Octal permissions applied to a `unix://` listen socket. It only ever applies to unix sockets, so it is irrelevant on Windows, where `unix://` listeners are unsupported. |
@@ -164,7 +165,7 @@ job's `clusterPolicy`. `cluster.backend` selects the coordination mechanism:
   POSIX mount, with no coordination service at all. Its safety additionally
   rests on synchronized clocks; see its table later.
 
-There must be exactly one `cluster` block across the whole configuration; a
+There can be at most one `cluster` block across the whole configuration; a
 duplicate in an included file or a second config-directory file raises a
 `ConfigError`. Defaults come from `DEFAULT_CLUSTER` (plus `DEFAULT_K8S` /
 `DEFAULT_ETCD` / `DEFAULT_FILESYSTEM` for the lease backends) and are applied
@@ -236,7 +237,7 @@ native client). Defaults from `DEFAULT_ETCD`:
 | `electionName` | `Str` | `cronstable/leader` | The etcd key contended for; its value is the holder's `nodeName`. There is **no separate `identity` key** for etcd (the holder identity is always `cluster.nodeName`), but leadership is fenced on the **bound lease id**, not this string, so a duplicate `nodeName` cannot make two nodes both lead. See [node identity](Clustering-and-Leader-Election#node-identity-for-the-lease-backends). |
 | `ttl` | `Int` | `15` | Lease time-to-live, seconds. Must be `>= 3`: the leader holds the key only until `ttl` minus a 1s clock-skew margin, so a smaller `ttl` would make a fresh winner treat its own lease as already expired (no `Leader` job would ever run). The keepalive cadence is ~`ttl/3` against the **effective** ttl, which etcd may grant smaller than requested (a smaller granted TTL narrows the fence window). |
 | `username` | `Str` or null | null | etcd auth username (omit for an auth-less cluster). Pair it with a resolvable `password`. The auth token is re-fetched automatically when it expires (re-auth on a `401`). |
-| `password` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | unset | etcd auth password source, resolved like `web.authToken` from exactly one of `value` / `fromFile` / `fromEnvVar`; a configured-but-empty source fails closed. |
+| `password` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | unset | etcd auth password source, resolved like `web.authToken` from the first set of `value`, `fromFile`, `fromEnvVar`; a configured-but-empty source fails closed. |
 | `tls.ca` / `tls.cert` / `tls.key` | `Str` or null | null | Optional client TLS for `https://` endpoints. `tls.cert` and `tls.key` are all-or-nothing (a client certificate needs its private key), enforced at load. |
 
 etcd load-time guards: any TLS material (`tls.ca`/`tls.cert`/`tls.key`) requires
@@ -328,9 +329,10 @@ mesh purely to carry that data.
 Two shapes:
 
 - **`backend: gossip`**: the election mesh already exchanges `/peer` bodies, so
-  `observability` is an opt-in marker. `observability: { shareNodeStats: true }`
-  adds node CPU/memory to what that mesh already gossips. `listen`/`tls`/`peers`
-  here are a `ConfigError` (redundant), and so are the overlay tuning keys
+  `observability` is an opt-in marker. An `observability` block with
+  `shareNodeStats: true` adds node CPU/memory to what that mesh already
+  gossips. `listen`/`tls`/`peers` here are a `ConfigError` (redundant), and so
+  are the overlay tuning keys
   `nodeName`/`interval`/`driftAfter`/`connectTimeout` (there is no overlay mesh
   to tune; the stats gossip at `cluster.interval`, so set the cluster-level keys
   instead). The stats ride each `/peer` response as an
@@ -348,7 +350,10 @@ cluster:
     leaseName: cronstable-leader
   observability:                 # a gossip mesh JUST for the fleet view
     listen: "0.0.0.0:8140"
-    tls: { ca: /tls/ca.pem, cert: /tls/node.pem, key: /tls/node.key }
+    tls:
+      ca: /tls/ca.pem
+      cert: /tls/node.pem
+      key: /tls/node.key
     peers:
       - host: node-b:8140
       - host: node-c:8140
@@ -372,7 +377,7 @@ backend. A local path gives single-node durability, while a shared Amazon EFS
 (NFSv4) / S3 Files mount gives the same durability and coordination fleet-wide
 (the same code either way; the mount decides the reach).
 
-There must be exactly one `state` block across the whole configuration; a
+There can be at most one `state` block across the whole configuration; a
 duplicate in an included file or a second config-directory file raises a
 `ConfigError`. Defaults come from `DEFAULT_STATE` and are applied only when a
 `state` section is present. (The [web dashboard](Web-Dashboard)'s browser-side
@@ -388,7 +393,7 @@ store.)
 | `onStoreUnavailable` | `Enum(["degrade", "fail-closed"])` | `degrade` | What the stateful features do while the store is configured but unavailable (down, unreadable, unresponsive). `degrade`: durable-truth gates fail open to the in-memory state and failed writes are dropped with a warning (counted in `cronstable_state_dropped_writes_total`). `fail-closed`: prefer not running over possibly running wrong, so the `onlyIfLastSucceeded` gate blocks, a due durable retry defers until the store answers, and an unverifiable `@reboot` boot marker skips the boot run. Plain scheduled fires are **never** gated on the store under either policy. |
 | `gcGraceSeconds` | `Int` | `604800` (7 days) | Age past which durable state belonging to a job that no recent manifest references (no node's loaded config under this `deploymentId` has mentioned it for this long) is garbage collected. `<= 0` disables automatic GC. Values between `1` and `86399` are a `ConfigError` at load: a grace below the manifest cadence would make live peers' manifests look stale and collect their state. |
 | `maxOpsPerSecond` | `Int` or `Float` | `0` | Token-bucket cap on store operations per second (burst of one second's tokens), for request-rate/cost control on mounts that bill per request; throttled ops queue and are counted. `0` disables throttling. Must be `>= 0` (a negative value is a `ConfigError` at load). Lease (coordination) operations bypass the bucket: a lease renew queued behind bulk writes could overshoot its TTL and double-run the very job the lease exists to fence. |
-| `slotTtlSeconds` | `Int` or `Float` | `30` | TTL, in seconds, of the per-job concurrency slot lease taken for `concurrencyScope: cluster` jobs; the running holder renews it at a third of this, and a crashed holder's slot frees itself after at most this long. Must be `>= 5` (a `ConfigError` at load, `state.slotTtlSeconds must be >= 5`): the renew cadence needs headroom, and below ~5s one slow renew on a network mount expires a still-running holder's slot and invites the cross-node double-run the lease exists to fence. |
+| `slotTtlSeconds` | `Int` or `Float` | `30` | TTL, in seconds, of the per-job concurrency slot lease taken for `concurrencyScope: cluster` jobs; the running holder renews it at a third of this, and a crashed holder's slot frees itself after at most this long. Must be `>= 5` (a `ConfigError` at load, `state.slotTtlSeconds must be >= 5 and finite`): the renew cadence needs headroom, and below ~5s one slow renew on a network mount expires a still-running holder's slot and invites the cross-node double-run the lease exists to fence. |
 | `jobApi` | `Map` | *(see the next table)* | The [job-facing state endpoint](Durable-State#job-facing-state): a loopback HTTP server the daemon injects into every job's environment, backing the `cronstable state\|cursor\|lock\|artifact\|idempotent\|secret` commands. A nested block (merged over its defaults, so a partial block keeps the rest). |
 
 The `state.jobApi` sub-keys:
@@ -399,7 +404,7 @@ The `state.jobApi` sub-keys:
 | `listen` | `Str` | *(ephemeral)* | Override the bind, as an `http://host:port` or `https://host:port` URL, or a bare `host:port` (a `unix://` URL is a `ConfigError`: the job CLI speaks TCP only). Unset binds an OS-assigned ephemeral port on `127.0.0.1`. An explicit port must be an integer in `0`-`65535` (a `ConfigError` otherwise; `0` or omitting the port keeps the ephemeral bind), and a non-loopback host is a `ConfigError` unless `allowNonLoopbackBind` is also `true`. `https://` requires the later `tls.cert`/`tls.key` keys and a named host: a wildcard (`0.0.0.0`, `::`) is a `ConfigError`, because jobs dial the address they are handed and no certificate covers every interface. The address advertised to jobs as `CRONSTABLE_STATE_URL` is the configured host, not the bound one. |
 | `maxValueBytes` | `Int` | `1048576` | Cap (bytes) on one KV / cursor value; a larger set is refused (HTTP 413). Must be `>= 0`. |
 | `maxArtifactBytes` | `Int` | `67108864` | Cap (bytes) on one artifact payload; a larger put is refused (HTTP 413). Must be `>= 0`. |
-| `lockTtlSeconds` | `Int` or `Float` | `30` | TTL of a job mutex/semaphore lease, renewed by the daemon at a third of this. Must be `>= 5` (a `ConfigError`, `state.jobApi.lockTtlSeconds must be >= 5`), for the same reason as `slotTtlSeconds`. |
+| `lockTtlSeconds` | `Int` or `Float` | `30` | TTL of a job mutex/semaphore lease, renewed by the daemon at a third of this. Must be `>= 5` (a `ConfigError`, `state.jobApi.lockTtlSeconds must be >= 5 and finite`), for the same reason as `slotTtlSeconds`. |
 | `allowNonLoopbackBind` | `Bool` | `false` | Explicit opt-in for a non-loopback `listen` host. Without it, a non-loopback host is a `ConfigError`: the endpoint serves per-run bearer tokens and staged job secrets, so exposing it beyond this host needs a deliberate choice. With it set and a plaintext `http://` listen, startup logs a warning naming the exposure (those bytes cross the network in the clear). Pair it with the `tls` keys that follow to serve the endpoint over TLS in-process, or terminate TLS in front of it. |
 | `tls.cert` | `EmptyNone() \| Str` | none | Path to the certificate (chain) an `https://` `listen` serves. Required together with `tls.key`: one without the other is a `ConfigError` at load, as is TLS material with a non-`https://` `listen`, or an `https://` `listen` with no certificate. This listener builds its TLS context once at startup and has no rotation detection, so replacing these files takes effect on the next daemon restart. Mutual TLS is not offered here: the per-run bearer token already authenticates the caller. See [listener TLS](Listener-TLS). |
 | `tls.key` | `EmptyNone() \| Str` | none | Path to the private key for `tls.cert`. |
@@ -424,7 +429,7 @@ Per-DAG keys:
 | --- | --- | --- | --- |
 | `name` | `Str` | required | Unique DAG name. |
 | `tasks` | `Seq(Map)` | required | The task nodes (at least one). |
-| `schedule` | `Str` or `Map` | none | Same grammar as a job's `schedule`, except it must parse to a cron expression: `@reboot` is a `ConfigError` (`DAG schedules must be cron expressions; @reboot is not supported for dags`), while `@daily`/`@hourly`-style aliases still work. Omit for a manual-only DAG. |
+| `schedule` | `Str` or `Map` | none | Same grammar as a job's `schedule`, except it must parse to a cron expression: `@reboot` is a `ConfigError` (`dag 'etl': schedule '@reboot' is not a cron expression; DAG schedules must be cron expressions (@reboot is not supported for dags)`), while `@daily`/`@hourly`-style aliases still work. Omit for a manual-only DAG. |
 | `timezone` / `utc` | `Str` / `Bool` | as jobs | Schedule time base, as jobs. |
 | `onMissed` | `skip` / `run-once` / `run-all` | `skip` | Missed-run catch-up on restart, as jobs. |
 | `startingDeadlineSeconds` | `Int` | none | Bound how old a missed run may be to replay. |
@@ -454,7 +459,8 @@ Plus the shared launch fields a job takes: `shell`, `environment`,
 `captureStdout` / `captureStderr`, `monitorResources`, `saveLimit`,
 `maxLineLength`, `streamPrefix`, `failsWhen`, `executionTimeout`,
 `killTimeout`, `priority`, `statsd`, `user` / `group`, `env_file`,
-`workingDirectory`, `secrets`, `stateAllowedScopes`, and report-only
+`workingDirectory`, `secrets`, `stateAllowedScopes`, `verify`, `pool`,
+`poolSlots`, `queuePriority`, `queueTimeout`, and report-only
 `onFailure` / `onSuccess` hooks (each accepts a `report` block that fires on
 the task's runs; there is no `onFailure.retry` on a task, because a task's
 attempts come from the node's `retries` field listed earlier). Where a task's
@@ -481,7 +487,7 @@ semantics and templates.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `events` | `Seq(Enum)` | all four | Which events to deliver: `dag_failure` (a DAG run reached a terminal failed state), `approval_waiting` (an approval gate began awaiting a decision), `leader_change` (this node acquired or lost scheduled-job leadership), `quorum_loss` (this node left quorum, so `Leader` jobs stand down). |
-| `report` | `_report_schema` (`mail`/`sentry`/`shell`/`webhook`/`push`) | event-worded defaults | The reporter block fired per event, sharing the per-job `report` schema; its default subject/body templates are worded for daemon events rather than run completions. |
+| `report` | `_report_schema` (`mail`/`sentry`/`shell`/`webhook`/`push`/`eventlog`) | event-worded defaults | The reporter block fired per event, sharing the per-job `report` schema; its default subject/body templates are worded for daemon events rather than run completions. |
 
 ### `push`
 
@@ -512,9 +518,9 @@ in a `defaults` block (only the common keys are).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `name` | `Str` | required | Job identifier, unique across the whole assembled configuration (all files and includes together): the scheduler tracks jobs by name, so a duplicate is a `ConfigError` at load naming the colliding definitions. A job name must also differ from every [DAG's](Orchestration-and-DAGs) schedule job name (`dag:<dag name>`). Other names beginning with `dag:` are valid. Used in logs, the stream prefix, reports, statsd, and the HTTP API. |
+| `name` | `Str` | required | Job identifier, unique across the whole assembled configuration (all files and includes together): the scheduler tracks jobs by name, so a duplicate is a `ConfigError` at load naming the duplicated job names. A job name must also differ from every [DAG's](Orchestration-and-DAGs) schedule job name (`dag:<dag name>`). Other names beginning with `dag:` are valid. Used in logs, the stream prefix, reports, statsd, and the HTTP API. |
 | `command` | `Str` or `Seq(Str)` | required | A shell command string (run through `shell`) or an argv list (run directly, no shell). The shell used for a string `command` is platform-specific: `/bin/sh` on POSIX, and cmd.exe through `%ComSpec%` on Windows when `shell` is left empty. An argv list bypasses the shell on every platform. See [commands and environment](Commands-and-Environment) and [running on Windows](Running-on-Windows). |
-| `schedule` | `Str` or `Map` | required | A crontab string (5, 6, or 7 fields), the literal `@reboot`, or a mapping with `second`, `minute`, `hour`, `dayOfMonth`, `month`, `year`, `dayOfWeek` (each `Str`, all optional). The mapping is assembled into a crontab: 5 fields normally, 6 when `year` is set, 7 when `second` is set (second/year emitted only when used, the rest default to `*`). A `second` schedules at second granularity; `year` restricts to specific years. See [schedules and timezones](Schedules-and-Timezones). |
+| `schedule` | `Str` or `Map` | required | A crontab string (5, 6, or 7 fields), an `@yearly`/`@annually`/`@monthly`/`@weekly`/`@daily`/`@hourly` nickname, the literal `@reboot`, or a mapping with `second`, `minute`, `hour`, `dayOfMonth`, `month`, `year`, `dayOfWeek` (each `Str`, all optional). The mapping is assembled into a crontab: 5 fields normally, 6 when `year` is set, 7 when `second` is set (second/year emitted only when used, the rest default to `*`). A `second` schedules at second granularity; `year` restricts to specific years. See [schedules and timezones](Schedules-and-Timezones). |
 | `shell` | `Str` | `/bin/sh` (POSIX) / empty (Windows) | Shell used to run a string `command`. Ignored when `command` is a list. The default is platform-specific: on POSIX a string `command` runs as `["/bin/sh", "-c", command]`; on Windows the default is empty, which routes a string `command` through the Windows command processor `%ComSpec%` (cmd.exe) by using `asyncio.create_subprocess_shell`. For PowerShell or another interpreter set `shell:` explicitly, or pass `command` as a list to bypass the shell entirely (on every platform). The `shell` field itself works on all OSes. See [running on Windows](Running-on-Windows). |
 | `enabled` | `Bool` | `true` | When `false`, the job is parsed and validated but never scheduled or runnable. |
 
@@ -640,7 +646,7 @@ blocks in full; their schema and `_REPORT_DEFAULTS` are summarized here.
 | `password` | `Map` with `value`/`fromFile`/`fromEnvVar` (each `EmptyNone() \| Str`) | all `None` | SMTP login password source. |
 | `tls` | `Bool` | `false` | Use implicit TLS. |
 | `starttls` | `Bool` | `false` | Use STARTTLS. |
-| `validate_certs` | `Bool` | `true` | Validate TLS certificates. Defaults to `true` in cronstable (a breaking change from upstream). |
+| `validate_certs` | `Bool` | `true` | Validate TLS certificates. |
 | `html` | `Bool` | `false` | Send the body as HTML. |
 
 #### `report.sentry`
@@ -719,7 +725,8 @@ the schema summary.
 | `onLate.report` | `_report_schema` | overdue-variant defaults | Reporters fired once per latched breach. Same schema as the earlier hooks; the defaults swap in an overdue subject/body, a Slack-compatible overdue webhook body, and the sentry fingerprint `["cronstable", "sla", "{{ name }}"]`. |
 
 If all three `sla` keys are unset, configuring an `onLate` reporter (a mail
-`to`/`from`, a sentry `dsn`, a shell `command`, a webhook `url`) is a load-time
+`to`/`from`, a sentry `dsn`, a shell `command`, a webhook `url`, or an enabled
+`push` or `eventlog` block) is a load-time
 `ConfigError` (`onLate requires sla`). Both keys merge normally under
 `defaults:` and are excluded from the [job-set ID](Job-Set-ID) fingerprint,
 like the catch-up options. The monitor does not evaluate disabled and
@@ -750,7 +757,7 @@ in-memory history alone (the gate then resets on restart). See
 | `environment` | `Seq(Map({"key": Str, "value": Str}))` | `[]` | Environment variables set for the process. Both `key` and `value` are required per entry. Merged by key with `defaults` and with `env_file` (config values win). |
 | `env_file` | `Str` | none | Path to a `KEY=VALUE` file; blank lines and `#` comments are ignored. Variables in `environment` override file values. A read error or a line without `=` raises a `ConfigError`. |
 | `workingDirectory` | `Str` or null | none | Directory the job's process starts in, the equivalent of the "Start in" box on a Task Scheduler action. Unset inherits cronstable's own working directory; under a `defaults:` block that sets it, a bare `workingDirectory:` on a job opts that one job back out to inheriting. The daemon expands `~` and `${VAR}` and makes the result absolute at load, so a relative value settles against cronstable's working directory once rather than per run. It deliberately does not check that the directory exists at load, because a load also happens on hosts that are not the target. The OS checks at spawn, and a missing directory records the run as a launch failure (exit `127`) whose log line names it. Not part of the [job-set ID](Job-Set-ID). See [commands and environment](Commands-and-Environment#workingdirectory) and [running on Windows](Running-on-Windows#working-directory). |
-| `secrets` | `Seq(Map({"name": Str, "value"/"fromFile"/"fromEnvVar": Str}))` | `[]` | Run-scoped secrets staged for the job over the [job-facing state endpoint](Durable-State#run-scoped-secrets) rather than placed in the environment, so they never show in `/proc/<pid>/environ`. Each needs a `name` and exactly one source (a nameless or sourceless entry is a `ConfigError`; a same-named entry merges last-wins, like `environment`). A job reads one with `cronstable secret get NAME`. Requires a `state` section with `jobApi` enabled, else load fails naming the offending job(s). |
+| `secrets` | `Seq(Map({"name": Str, "value"/"fromFile"/"fromEnvVar": Str}))` | `[]` | Run-scoped secrets staged for the job over the [job-facing state endpoint](Durable-State#run-scoped-secrets) rather than placed in the environment, so they never show in `/proc/<pid>/environ`. Each needs a `name` and at least one source; when several are set, `value` wins over `fromFile`, which wins over `fromEnvVar` (a nameless or sourceless entry is a `ConfigError`; a same-named entry merges last-wins, like `environment`). A job reads one with `cronstable secret get NAME`. Requires a `state` section with `jobApi` enabled, else load fails naming the offending job(s). |
 | `stateAllowedScopes` | `Seq(Str)` | `[]` | Extra scope names (besides the job's own name and `global`) this job's `cronstable state\|cursor\|lock\|artifact` calls may explicitly name through `--scope`. Naming any other scope (most dangerously another job's own name, which IS that job's private scope) is refused (`403`). See [scopes](Durable-State#scopes). |
 
 ```yaml
@@ -878,8 +885,7 @@ node sampler entirely.
 strictyaml enforces only the type (`Int`/`Float`). After type validation,
 `JobConfig._validate_numeric_ranges` enforces value ranges (plus one
 cross-field rule) and raises a `ConfigError` (prefixed `Job <name>:`) on
-violation. These checks run at load time, not at run time. New in the cronstable
-fork.
+violation. These checks run at load time, not at run time.
 
 | Rule | Condition |
 | --- | --- |
@@ -895,7 +901,7 @@ fork.
 | `onFailure.retry.maximumDelay > 0` | only when a `retry` block is present |
 | `onFailure.retry.backoffMultiplier > 0` | only when a `retry` block is present |
 | `sla.maxTimeSinceSuccessSeconds > 0`, `sla.lateAfterSeconds > 0`, `sla.maxRuntimeSeconds > 0` | each only when set |
-| an `onLate` reporter requires an `sla` threshold | when a reporter is configured (a mail `to`/`from`, a sentry `dsn`, a shell `command`, a webhook `url`) while all three `sla` keys are unset |
+| an `onLate` reporter requires an `sla` threshold | when a reporter is configured (a mail `to`/`from`, a sentry `dsn`, a shell `command`, a webhook `url`, or an enabled `push` or `eventlog` block) while all three `sla` keys are unset |
 | `monitorResources.interval >= 0.1` | always (a sub-100ms cadence would busy-loop the process-table walk) |
 | `0 <= monitorResources.history <= 2000` | always (bounds what one run adds to a durable ledger record) |
 

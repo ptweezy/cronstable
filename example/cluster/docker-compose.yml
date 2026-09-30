@@ -64,12 +64,12 @@
 #    Now each leader-gated job is owned by a (possibly different) node via
 #    rendezvous hashing, so the work fans out instead of piling on the leader.
 #    With these job names and all three nodes healthy you will see:
-#        tick-leader-only    -> runs on cronstable-c
-#        tick-prefer-leader  -> runs on cronstable-b
+#        tick-leader-only    -> runs on cronstable-a
+#        tick-prefer-leader  -> runs on cronstable-c
 #    (vs both on cronstable-a under the default single-leader mode). The cluster
 #    panel shows the role as "spread (per-job owner)" and each job's drawer /
 #    `curl -s localhost:8080/jobs` shows its "clusterOwner". Same quorum gate,
-#    same guarantee — purely a load optimization.
+#    same best-effort guarantee: spread only moves load.
 #
 #    For a bigger playground (10 nodes, more jobs, several CPU-heavy, spread on
 #    by default so you can watch the load fan out in `docker stats`), see

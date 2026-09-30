@@ -93,7 +93,7 @@ on the Installation page.
 Job <name> wants to change user or group, but cronstable is not running as superuser
 ```
 
-**Cause.** A job sets `user` and/or `group`. `_resolve_user_group` raises this
+**Cause.** A job sets `user`, `group`, or both. `_resolve_user_group` raises this
 `ConfigError` whenever `self.uid` or `self.gid` is set and `os.geteuid() != 0`.
 Dropping to another user requires the daemon itself to start as root.
 
@@ -159,7 +159,8 @@ time (`hmac.compare_digest`). A wrong or absent token returns `401`. See the
 **Cause.** Per-address failures are warned-and-skipped, not fatal. A malformed
 `http://` URL (missing host or port) or an unsupported scheme raises `ValueError`
 internally and is skipped. A bind `OSError` (port in use, permission, bad socket
-path) is likewise skipped. Only `http://` and `unix://` schemes are supported. The
+path) is likewise skipped. Only `http://`, `https://` (which needs `web.tls`), and
+`unix://` schemes are supported. The
 `web: started listening on <url>` message is logged only after the bind succeeds.
 
 **Windows note.** `unix://` listeners are *not* supported on Windows (the Proactor
@@ -168,8 +169,8 @@ verbatim warning
 `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform`.
 Use an `http://` listener instead. See [running on Windows](Running-on-Windows).
 
-**Fix.** Use a supported scheme with host and port (`http://127.0.0.1:8080`) or a
-`unix://` path, and resolve the bind error. For a `unix://` socket on a read-only
+**Fix.** Use a supported scheme with host and port (`http://127.0.0.1:8080`, or
+`https://127.0.0.1:8443` with `web.tls`) or a `unix://` path, and resolve the bind error. For a `unix://` socket on a read-only
 root filesystem, point it at a writable volume and optionally set `web.socketMode`
 (octal string) for permissions.
 
@@ -201,9 +202,9 @@ startup and it did not.
 
 **Cause.** At startup (`startup=True`), `job_should_run` returns `True` *only* for
 jobs whose schedule is the literal string `@reboot`; all CronTab-scheduled jobs return
-`False` and wait for their next matching minute. The daemon wakes aligned to the start
-of each minute and runs a CronTab job when `crontab.test(now.replace(second=0))`
-matches.
+`False` and wait for their next matching minute. The daemon tests the job's schedule
+against the current slot, truncated to the job's resolution (the minute, or the second
+for a seven-field schedule), and runs the job on a match.
 
 **Fix.** Use `schedule: "@reboot"` for run-on-start behavior; use a normal crontab
 expression or schedule object otherwise. See
@@ -291,8 +292,8 @@ them.
 ### A job is marked failed on nonzero exit or any stderr
 
 **Symptom.** A job that looks successful is reported as failed. The log shows a
-`fail_reason` such as `failsWhen=nonzeroReturn and retcode=<n>` or
-`failsWhen=producesStderr and stderr is not empty`.
+`fail_reason` such as `command exited with code <n>` or
+`command wrote to stderr (configured to count as a failure)`.
 
 **Cause.** `fail_reason` is computed from `failsWhen`. The defaults are:
 
@@ -417,11 +418,10 @@ validation error.
 **Cause.** The mail `validate_certs` default is `True` (a change from yacron;
 `_REPORT_DEFAULTS["mail"]["validate_certs"] = True`). The mail reporter passes
 `validate_certs=mail["validate_certs"]` to `aiosmtplib.SMTP`, so delivery to servers
-with self-signed or otherwise invalid certificates that previously worked silently now
-fails.
+with self-signed or otherwise invalid certificates fails.
 
 **Fix.** Fix the server certificate, or set `validate_certs: false` on the `mail`
-report block to restore the old behavior. Related mail TLS keys: `tls` (default
+report block to skip certificate validation. Related mail TLS keys: `tls` (default
 `false`, implicit TLS), `starttls` (default `false`). See
 [reporting (mail, Sentry, shell, webhook)](Reporting).
 
@@ -435,13 +435,19 @@ crash the scheduler. Reporters run concurrently with `return_exceptions=True`.
 **Cause.** Each reporter early-returns when not configured:
 
 - Sentry returns unless a DSN resolves, and logs
-  `sentry: dsn env var '<name>' is not set; not reporting` when `fromEnvVar` is unset.
+  `sentry: sentry.dsn is configured but resolved to an empty secret; not reporting`
+  when the configured source (for example, an unset `fromEnvVar`) is empty.
 - Mail returns unless both `to` and `from` are set, and logs
-  `mail: password env var is not set; not sending email` when a `fromEnvVar` password
-  is unset.
+  `mail: mail.password is configured but resolved to an empty secret; not sending email`
+  when a configured password source is empty.
 - The shell reporter returns when `command` is `None`.
 - The webhook reporter returns unless a `url` resolves, and logs
-  `webhook: url env var '<name>' is not set; not reporting` when `fromEnvVar` is unset.
+  `webhook: webhook.url is configured but resolved to an empty secret; not reporting`
+  when the configured source is empty.
+
+These messages name the setting and omit the environment variable name. When a `fromFile`
+source cannot be read, the message reads `<key>.fromFile could not be read: <error>`
+in place of the empty-secret text.
 
 A successful-job mail with an empty rendered body is also skipped.
 
@@ -550,7 +556,7 @@ may double-run during the outage).
 **Fix.** Restore a quorum: heal the partition or bring failed peers back so a
 majority is mutually reachable (gossip), or restore reachability to the apiserver
 or etcd (lease backends). See
-[why the quorum gate is safe](Clustering-and-Leader-Election#why-the-quorum-gate-is-safe)
+[why the quorum gate limits double-runs](Clustering-and-Leader-Election#why-the-quorum-gate-limits-double-runs)
 and, for the lease backends, [failure modes](Clustering-and-Leader-Election#failure-modes).
 
 ### Duplicate `nodeName` conflict (`conflict: true` with `conflict_names`)
@@ -693,10 +699,14 @@ on [concurrency and timeouts](Concurrency-and-Timeouts).
 
 Read the bootstrap log first: by default
 `<config directory>\logs\cronstable-service.log`. A service has no stderr,
-so that file is where a startup failure is recorded. The service refuses a
-`-c` path that does not exist, or that another account can write, before that
-log opens, and records the reason in the Application event log as event ID
-1020. See [where a service logs](Windows-Service#where-a-service-logs).
+so that file is where a startup failure is recorded. The service refuses an
+untrusted `-c` path before that log opens, and records the reason in the
+Application event log as event ID 1020. It refuses a path that does not exist,
+a path that Everyone, Users, Authenticated Users, or another any-user group can
+add files to, a path owned by an account other than SYSTEM, Administrators, or
+TrustedInstaller (unless an OWNER RIGHTS entry holds that owner to read), and a
+junction or symbolic link. The check ignores a write grant to a single named
+account. See [where a service logs](Windows-Service#where-a-service-logs).
 
 `cronstable service status` decodes the last failure without opening
 anything:
@@ -718,7 +728,7 @@ directory and name it with `-c`.
 ### `install` says a one-file build cannot host a service
 
 It cannot, and this is not a cronstable limitation to work around. The
-published one-file `.exe` (which is what winget installs) unpacks itself and
+published one-file `.exe` unpacks itself and
 runs the program in a **child** process. The process the Service Control
 Manager starts and watches therefore never registers with the service
 dispatcher, and the start fails on the Service Control Manager's timeout.
@@ -728,6 +738,7 @@ Use one of these:
 - Download `cronstable-windows-<arch>.zip` (a one-directory build) and run
   `service install` from its extracted `cronstable.exe`.
 - Install the [MSI](Windows-MSI), which registers the service itself.
+- Install with winget, which installs the MSI.
 - Install with pip or pipx.
 
 The `schtasks` recipe on the

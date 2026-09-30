@@ -1,7 +1,8 @@
 # A clustered cronstable DAG deployment: three nodes share one state store and
-# elect a leader over it, so each dag_run is advanced by exactly one node and a
-# task never double-launches -- even though all three nodes run this identical
-# config. See the "Orchestration and DAGs" and "Durable State" wiki pages.
+# elect a leader over it, so each dag_run is advanced by one node at a time and
+# a healthy fleet does not launch a task twice, even though all three nodes run
+# this identical config. See the "Orchestration and DAGs" and "Durable State"
+# wiki pages.
 #
 #   docker compose -f example/dag-cluster/docker-compose.yml up --build
 #
@@ -12,11 +13,13 @@
 #   * `state` is a shared POSIX mount (here a Docker volume shared by all three
 #     nodes). Every dag_run is one document on it, per-task state and XCom ride
 #     the durable store, and each run is advanced only by the node holding
-#     that run's advance lease -- so a task is launched exactly once.
+#     that run's advance lease, so a healthy fleet launches each task once.
 #   * `cluster.backend: filesystem` elects a leader using the SAME shared mount
 #     (a flock-guarded TTL lease), so only the leader CREATES the scheduled
 #     runs. Kill the leader and another node adopts its in-flight runs within a
-#     lease TTL and resumes them from durable state (crash-resume).
+#     lease TTL and resumes them from durable state (crash-resume). Recovery is
+#     at-least-once: a task that was running at the crash may run again, so
+#     keep task side effects safe to repeat.
 
 state:
   # The shared store. `topology: shared` tells the backend this mount is shared

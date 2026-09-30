@@ -29,10 +29,11 @@ An uncaptured stream cannot produce a failure reason. `producesStderr` fires onl
 
 `fail_reason` returns the first matching condition, in this fixed order, or `None` if none match:
 
-1. `always` is true -> `"failsWhen=always"`.
-2. `nonzeroReturn` is true and `retcode != 0` -> `"failsWhen=nonzeroReturn and retcode={retcode}"`.
-3. `producesStdout` is true and stdout is nonempty or any stdout lines were discarded -> `"failsWhen=producesStdout and stdout is not empty"`.
-4. `producesStderr` is true and stderr is nonempty or any stderr lines were discarded -> `"failsWhen=producesStderr and stderr is not empty"`.
+1. A [`verify`](Result-Verification) check failed -> `"verification failed: <reason>"`.
+2. `always` is true -> `"configured to mark every run as failed (failsWhen.always)"`.
+3. `nonzeroReturn` is true and `retcode != 0` -> `"command exited with code <n>"`.
+4. `producesStdout` is true and stdout is nonempty or any stdout lines were discarded -> `"command wrote to stdout (configured to count as a failure)"`.
+5. `producesStderr` is true and stderr is nonempty or any stderr lines were discarded -> `"command wrote to stderr (configured to count as a failure)"`.
 
 The first match wins, and later conditions are not evaluated. Report templates receive the resulting string as the `fail_reason` variable, and the shell reporter receives it as `CRONSTABLE_FAIL_REASON`. The boolean `failed` is `fail_reason is not None`.
 

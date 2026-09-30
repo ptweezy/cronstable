@@ -6,14 +6,17 @@
 # recorded on the same durable store the rest of cronstable's state features use.
 # There is NO new coordination service: a dag_run is one mutable document, a
 # task is an ordinary job invocation, cross-task data (XCom) rides the artifact
-# store, and a fleet advances each run under a single lease so a task never
-# double-launches. See the "Orchestration and DAGs" wiki page.
+# store, and a fleet advances each run under a single lease, so no task launches
+# twice while the fleet is healthy (crash recovery is at-least-once: keep task
+# side effects safe to repeat). See the "Orchestration and DAGs" wiki page.
 #
 # DAGs require a `state` section with the loopback endpoint enabled (the tasks
 # reach the store -- and their XCom -- through `cronstable xcom|artifact|state`).
 
 state:
-  path: /var/lib/cronstable/state
+  # Relative to the daemon's working directory, so the example runs as any
+  # user; production uses a path such as /var/lib/cronstable/state.
+  path: ./cronstable-state
   jobApi:
     enabled: true
 

@@ -61,10 +61,6 @@ The preceding example, from `README.md`, displays each log line with an
 embedded timestamp and routes all root-logger output to stdout with a `simple`
 formatter.
 
-> The ability to configure yacron's own logging was added in yacron 0.19.0
-> (upstream issues #81/#82/#83). The `datefmt` line in the README example was a
-> later fix.
-
 ### Top-level keys
 
 The strictyaml schema validates only the *top-level* keys of the `logging:`
@@ -101,17 +97,26 @@ to tune their levels independently, or rely on `root:` to catch them all:
 | --- | --- | --- |
 | `cronstable` | `cron.py`, `job.py` | Scheduler lifecycle, job start/spawn/exit, retries, web server start/stop, shutdown, and most operational messages. |
 | `cronstable.config` | `config.py` | Configuration parsing diagnostics, such as the converted schedule string at `DEBUG`. |
+| `cronstable.cluster` | `cluster.py` | Peer attestation, gossip, and leader election. See [clustering and leader election](Clustering-and-Leader-Election). |
+| `cronstable.backends.etcd`, `cronstable.backends.filesystem`, `cronstable.backends.kubernetes` | `backends/etcd.py`, `backends/filesystem.py`, `backends/kubernetes.py` | Leader-election lease backends. |
+| `cronstable.state` | `state.py` | The durable state store. See [durable state](Durable-State). |
+| `cronstable.jobapi` | `jobapi.py` | The job-facing state endpoint. |
+| `cronstable.dagrun` | `dagrun.py` | DAG run orchestration. See [orchestration and DAGs](Orchestration-and-DAGs). |
+| `cronstable.pools` | `pools.py` | Resource pool admission. See [resource pools](Resource-Pools). |
+| `cronstable.mcp` | `mcp.py` | The MCP server. See [MCP](MCP). |
 | `statsd` | `statsd.py` | statsd metric-writer diagnostics. See [metrics with statsd](Metrics-with-Statsd). |
 | `prometheus` | `prometheus.py` | Prometheus `/metrics` endpoint diagnostics, such as a cluster-backend read failing during a scrape. See [metrics with Prometheus](Metrics-with-Prometheus). |
+| `tui` | `tui.py` | Terminal dashboard diagnostics, logged only by `cronstable tui`. |
 
-Because `cronstable.config` is a child of `cronstable`, configuring the `cronstable`
-logger affects it too (subject to `propagate`). The `statsd` logger is a
-separate top-level logger.
+Because every `cronstable.*` logger is a child of `cronstable`, configuring the
+`cronstable` logger affects them too (subject to `propagate`). The `statsd`,
+`prometheus`, and `tui` loggers are separate top-level loggers.
 
 ## Reload and error handling
 
-The daemon re-reads its configuration on every scheduler tick (roughly once per
-minute; see [architecture and internals](Architecture-and-Internals)). The
+The daemon checks its configuration about once a minute, reparsing when a file
+changes (or on `SIGHUP`); see
+[architecture and internals](Architecture-and-Internals). The
 `logging:` section participates in this reload with specific rules, implemented
 in `cron.py`:
 
@@ -128,10 +133,6 @@ in `cron.py`:
   picked up on the next reload **without restarting cronstable**. The broken
   version was never marked applied, so the corrected version still counts as
   "changed" and is retried.
-
-This behavior (re-apply on change, mark applied only on success) was
-introduced as a fix so a logging section fixed after an error, or changed at
-runtime, is picked up without a restart.
 
 If the loaded configuration has no `logging:` section, the scheduler never calls
 `dictConfig`, and whatever logging configuration is currently in effect (the

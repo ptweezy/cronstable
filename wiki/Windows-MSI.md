@@ -58,9 +58,12 @@ inherited from `%ProgramData%`. It sets these permissions only on a directory
 it creates and preserves existing directories and their permissions.
 
 Before it reads anything, the service checks its configuration directory. It
-refuses to start when the directory is missing, is a junction or symbolic
-link, or can be written by any account other than SYSTEM and Administrators,
-and it repeats the check before every reload. [Where a service
+refuses to start when the directory is missing or is a junction or symbolic
+link, when Everyone, Users, Authenticated Users, or another any-user group
+can add files to it, or when an account other than SYSTEM, Administrators, or
+TrustedInstaller owns it (unless an OWNER RIGHTS entry holds that owner to
+read). It repeats the check before every reload. The check ignores a write
+grant to a single named account. [Where a service
 logs](Windows-Service#where-a-service-logs) describes how the service reports
 a refusal, and [who may write the config
 directory](Running-on-Windows#who-may-write-the-config-directory) has the fix.
@@ -98,7 +101,7 @@ Pass public properties on the `msiexec` command line
 | `CONFIGDIR` | `C:\ProgramData\cronstable` | The configuration directory in the service's command line. The MSI creates only the default directory. Before starting the service with a custom path, create a directory writable only by SYSTEM and Administrators, for example, with `cronstable init`. |
 | `ADDPATH` | `1` | `0` skips adding the install directory to the system `PATH`. |
 | `STARTSERVICE` | unset | `1` starts the service at the end of the install, including a first install. Pass it when the configuration is deployed ahead of the package. |
-| `INSTALLFOLDER` | `C:\Program Files\cronstable` | The install directory. |
+| `INSTALLFOLDER` | `C:\Program Files\cronstable` (`C:\Program Files (x86)\cronstable` for the i686 package on 64-bit Windows) | The install directory. |
 
 `CONFIGDIR` and `ADDPATH` are remembered: an upgrade installed without
 them keeps the existing install's values, so a fleet push never has to

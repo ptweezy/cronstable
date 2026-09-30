@@ -26,7 +26,8 @@ configuration, otherwise `%APPDATA%\cronstable`, falling back to `~` if
 A single file is read as UTF-8, validated against `CONFIG_SCHEMA` with
 strictyaml, and parsed by `parse_config_string`. The top level accepts an empty
 document (`EmptyDict()`) or a mapping with the optional keys `defaults`, `jobs`,
-`web`, `include`, and `logging` (all `Opt(...)`, none is required). See the
+`dags`, `pools`, `include`, `web`, `mcp`, `cluster`, `state`, `logging`,
+`notify`, and `push` (all `Opt(...)`, none is required). See the
 [configuration reference](Configuration-Reference) for the per-job and `web`
 schemas, and [logging configuration](Logging-Configuration) for the `logging`
 schema.
@@ -54,9 +55,12 @@ are **aggregated** across the directory:
 | Aggregate | Behavior across files |
 | --- | --- |
 | `jobs` | Concatenated in sorted-filename order (`jobs.extend(...)`). |
+| `dags` | Concatenated in sorted-filename order. |
+| `pools` | Merged across files. A pool name defined in two files raises `ConfigError("duplicate pool '<name>'")`. |
 | `defaults` | Merged across files with `mergedicts` into a single directory-wide `job_defaults` (used only as the returned `job_defaults`; see the following caveat). |
 | `web` | At most one. A second file containing a `web` block raises `ConfigError("Multiple 'web' configurations found: first in <file>, now in <file>")`. |
 | `logging` | At most one. A second file containing a `logging` block raises `ConfigError("Multiple 'logging' configurations found: ...")`. |
+| `cluster`, `state`, `mcp`, `notify`, `push` | At most one each. A second file containing the same block raises `ConfigError("Multiple '<kind>' configurations found: first in <file>, now in <file>")`. |
 
 Per-file parse errors are collected, keyed by path. If any occurred, they are
 raised together as a single `ConfigError` whose message joins the individual
@@ -174,8 +178,7 @@ supported on Windows`); see [running on Windows](Running-on-Windows). The merged
 both define `environment`, the two lists merge into a dictionary keyed by `key`
 (default entries first, then the job's), so a job's variable **overrides** the
 default with the same name instead of producing two list entries with the same
-key. This is a behavior change from yacron (which concatenated the lists,
-yielding duplicate-keyed entries). See
+key. See
 [commands and environment](Commands-and-Environment) for `environment` and
 `env_file`.
 
@@ -232,6 +235,8 @@ reference, such as `- ${ENVIRONMENT:-prod}.yaml`. Each file is also expanded
 against the environment as it is parsed, so an included file resolves its own
 `${VAR}` references (see
 [environment-variable interpolation](Environment-Variable-Interpolation)).
+Classic crontab files are not interpolated: `${...}` in a crontab reaches the
+job verbatim.
 
 An included file may be YAML or a [classic crontab](Classic-Crontabs) (same
 recognition rules as `-c`). Crontab entries always carry the built-in
@@ -254,6 +259,12 @@ results are merged into the including file as follows:
   define `web`, parsing raises `ConfigError("multiple web configs")`.
 - **`logging`** from an included file is adopted if this file has none. If both
   define `logging`, parsing raises `ConfigError("multiple logging configs")`.
+- **`cluster`**, **`state`**, **`mcp`**, **`notify`**, and **`push`** are
+  adopted the same way; a block defined in both files raises
+  `ConfigError("multiple <kind> configs")`.
+- **DAGs** from included files are appended to this file's DAG list.
+- **Pools** from included files are merged with this file's pools. A pool name
+  defined in both raises `ConfigError("duplicate pool '<name>'")`.
 
 The intended use is to put common definitions (reporting defaults, `shell`, and
 `environment`) in a fragment named so directory mode skips it, for example with

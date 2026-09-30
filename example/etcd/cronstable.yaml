@@ -3,8 +3,8 @@
 # Several instances run from this same config; only the holder of a lease-bound
 # etcd key (electionName below) runs the Leader-gated jobs. The holder keeps a
 # short-TTL lease alive; if it dies, the lease expires, etcd deletes the key,
-# and another instance's create-if-absent transaction wins -- a fenced,
-# exactly-once election while etcd is reachable.
+# and another instance's create-if-absent transaction wins: a fenced,
+# single-holder election while etcd is reachable.
 #
 # The backend talks to etcd over its v3 gRPC-gateway JSON/HTTP API using the
 # core aiohttp dependency (no etcd3/grpc client), so it needs no extra

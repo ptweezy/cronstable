@@ -1,5 +1,5 @@
 /* cronstable theme palette, shared by the docs-site pages
-   (logo-lab.html, comparison.html).
+   (logo-lab.html).
 
    cronstable/web/index.html is the canonical copy: the dashboard must stay
    a self-contained single file, so it inlines these same values, and
@@ -9,7 +9,7 @@
    lives with the dashboard's copy.
 
    Each rule carries two selectors: the dashboard's html[data-theme="..."]
-   convention (comparison.html) and the logo lab's data-pal/data-mode pair.
+   convention and the logo lab's data-pal/data-mode pair.
    The lab cannot adopt data-theme: an embedding artifact viewer stamps
    data-theme="dark|light" on the root, which the lab treats as a host
    signal, so plain data-theme palette selectors would be clobbered there. */

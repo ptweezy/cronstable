@@ -21,8 +21,8 @@ uncertain. See [CPU requirements](Installation#amd64v3-cpu-requirements).
 
 | Architecture | pip / pipx | Standalone binary | Zip (one-directory) | MSI |
 | --- | --- | --- | --- | --- |
-| `amd64v3` (x64) — Recommended for compatible CPUs | Use the release binary for the optimized runtime | `cronstable-windows-amd64v3.exe` | `cronstable-windows-amd64v3.zip` | `cronstable-windows-amd64v3.msi` |
-| `amd64` (x64) — Compatibility build | `pip install cronstable` | `cronstable-windows-amd64.exe` | `cronstable-windows-amd64.zip` | `cronstable-windows-amd64.msi` |
+| `amd64v3` (x64): recommended for compatible CPUs | Use the release binary for the optimized runtime | `cronstable-windows-amd64v3.exe` | `cronstable-windows-amd64v3.zip` | `cronstable-windows-amd64v3.msi` |
+| `amd64` (x64): compatibility build | `pip install cronstable` | `cronstable-windows-amd64.exe` | `cronstable-windows-amd64.zip` | `cronstable-windows-amd64.msi` |
 | `arm64` (ARM64) | `pip install cronstable` | `cronstable-windows-arm64.exe` | `cronstable-windows-arm64.zip` | `cronstable-windows-arm64.msi` |
 | `i686` (32-bit x86) | `pip install cronstable` | `cronstable-windows-i686.exe` | `cronstable-windows-i686.zip` | `cronstable-windows-i686.msi` |
 
@@ -59,16 +59,17 @@ behavior, and first-start steps.
 
 ### winget
 
-The Windows Package Manager installs the standalone binary and puts
-`cronstable` on your `PATH`:
+The Windows Package Manager installs a signed setup that embeds the MSI. It
+puts `cronstable` on the system `PATH` and registers the
+[Windows service](Windows-Service):
 
 ```shell
 winget install ptweezy.cronstable
 ```
 
 Upgrade later with `winget upgrade ptweezy.cronstable`. The winget package is
-a per-user install of the portable executable. For a machine-wide deployment,
-use the preceding MSI or the following zip.
+a machine-wide install and needs administrator approval. See
+[Install using WinGet](Installation#install-using-winget) for details.
 
 ### pip / pipx
 
@@ -504,7 +505,7 @@ installed.
 
 See [Windows service](Windows-Service) for the full command set, logging
 behavior, and the installation format that cannot host a service: the published
-one-file `.exe` (also what winget installs), whose bootloader runs the program
+one-file `.exe`, whose bootloader runs the program
 in a child process the SCM never sees.
 
 ### Task Scheduler, for the one-file executable
@@ -581,7 +582,8 @@ logging:
       formatter: file
   root:
     level: INFO
-    handlers: [file]
+    handlers:
+      - file
 ```
 
 See [logging configuration](Logging-Configuration) for the section's
@@ -887,7 +889,7 @@ output) under a directory whose ACL is already restricted to the account
 running the daemon, for example:
 
 ```shell
-icacls C:\ProgramData\cronstable\state /inheritance:r /grant "SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F"
+icacls C:\ProgramData\cronstable\state /inheritance:r /grant *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F
 ```
 
 See [durable state](Durable-State) for what the store holds.
@@ -963,7 +965,7 @@ works as documented elsewhere in this wiki:
 - [Output Capturing](Output-Capturing)
 - [Concurrency and Timeouts](Concurrency-and-Timeouts)
 - [Failure Detection and Retries](Failure-Detection-and-Retries)
-- [Reporting (Mail, Sentry, Shell, Webhook)](Reporting)
+- [Reporting (Mail, Sentry, Shell, Webhook, Push, Event Log)](Reporting)
 - [Metrics with statsd](Metrics-with-Statsd) and
   [Metrics with Prometheus](Metrics-with-Prometheus)
 - [HTTP Control API](HTTP-API) and [Web Dashboard](Web-Dashboard)

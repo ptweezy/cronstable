@@ -1,7 +1,7 @@
 # Architecture and internals
 
 Internal design reference for developers reading or extending cronstable. It maps
-the modules, describes the single-threaded asyncio event loop, the scheduler
+the modules, describes the asyncio event loop, the scheduler
 main loop and hot reload, the running-job lifecycle, the retry state machine,
 concurrency handling, and signal-driven shutdown. It references functions by
 name rather than repeating the option reference. For option semantics, see the
@@ -17,25 +17,39 @@ user/group switching remain POSIX-only and are runtime-gated on `IS_WINDOWS`
 rather than blocking import. For the operator-facing walkthrough, see
 [running on Windows](Running-on-Windows).
 
+The following table is a partial map of the core modules. The package also
+holds smaller helpers (for example, `_json`, `_gzip`, `tlsutil`, and `redact`)
+and the modules behind individual features.
+
 | Module | Responsibility |
 | --- | --- |
 | `cronstable/__main__.py` | CLI entry point. Argument parsing, basic logging setup, event-loop creation, shutdown-handler registration (delegated to `platform.install_shutdown_handlers`), and process exit codes. |
 | `cronstable/platform.py` | The single home for all per-OS branches: `DEFAULT_SHELL`, `DEFAULT_CONFIG_PATH`, `supports_unix_sockets`, `encode_argv`, `install_shutdown_handlers`, and the `IS_WINDOWS` flag. The rest of the codebase reads the same on every platform. |
 | `cronstable/config.py` | strictyaml `CONFIG_SCHEMA`, `DEFAULT_CONFIG`, `_REPORT_DEFAULTS`. Configuration loading from a file or directory. Include handling and dict merging (`mergedicts`). `JobConfig` parsing/validation. `CronstableConfig` dataclass. |
 | `cronstable/cronexpr.py` | The built-in cron expression engine: `CronTab` parsing (5/6/7-field dialect, names, `L` forms, `@`-nicknames), `next()` (strictly-future, DST-correct, 2099 horizon), and `test()`. A stdlib-only leaf module, behavior-compatible with the parse-crontab library it replaced, enforced by the golden vectors in `tests/data/cron_golden.json`. See [schedules and time zones](Schedules-and-Timezones). |
-| `cronstable/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
-| `cronstable/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`, `WebhookReporter`), and `JobRetryState`. |
+| `cronstable/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`reload_config` / `update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
+| `cronstable/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`, `WebhookReporter`, `PushReporter`, `EventLogReporter`), and `JobRetryState`. |
 | `cronstable/fingerprint.py` | The order-independent **job-set ID**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and `cluster.py` (peer comparison). |
 | `cronstable/leadership.py` | The `LeadershipBackend` abstract base class defines the interface `cron.py` uses to check whether a node may run a job. `LeaseBackend` provides the shared implementation for backends with a single lease holder. The `make_backend` factory lazily imports and constructs the backend selected by `cluster.backend`: `ClusterManager` for `gossip`, or `KubernetesBackend`, `EtcdBackend`, or `FilesystemBackend` for the corresponding lease backend. |
 | `cronstable/backends/kubernetes.py` | `KubernetesBackend` (a `LeaseBackend`): a `coordination.k8s.io/v1` `Lease` driven over either the official `kubernetes` client or a hand-rolled apiserver REST transport (`cluster.kubernetes.clientLibrary` chooses `auto`/`library`/`http`). |
 | `cronstable/backends/etcd.py` | `EtcdBackend` (a `LeaseBackend`): a lease-backed key/election against etcd's v3 gRPC-gateway JSON/HTTP API, a single fully-portable transport with no optional client library. |
 | `cronstable/backends/filesystem.py` | `FilesystemBackend` (a `LeaseBackend`): leader election through the flock-guarded, fence-counted TTL lease of `state.FilesystemStateBackend` over a shared POSIX mount (Amazon S3 Files / EFS / NFSv4). No coordination service: the mount is the store. Stdlib-only. |
+| `cronstable/backends/_common.py` | Shared election state and helpers for the lease backends, including the on-disk TLS file signature behind in-place certificate rotation. |
 | `cronstable/backends/__init__.py` | Shared backend helpers, notably the pure `select_transport(client_library, native_available, backend)` the kubernetes backend uses to pick its transport (`auto` prefers the native client, `library` requires it, `http` forces the hand-rolled path). |
-| `cronstable/cluster.py` | The `gossip` backend: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop) is one concrete `LeadershipBackend`, plus the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. Imports `config` and `fingerprint`; no dependency on `cron.py`. See [clustering and leader election](Clustering-and-Leader-Election). |
+| `cronstable/cluster.py` | The `gossip` backend: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop) is one concrete `LeadershipBackend`, plus the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. No dependency on `cron.py`. See [clustering and leader election](Clustering-and-Leader-Election). |
 | `cronstable/statsd.py` | `StatsdJobMetricWriter` and the UDP `StatsdClientProtocol` that emits best-effort statsd metrics. |
 | `cronstable/prometheus.py` | `PrometheusMetrics` accumulators plus the hand-rolled text/OpenMetrics exposition renderer behind `GET /metrics`. |
 | `cronstable/state.py` | The opt-in durable state store: the `StateBackend` ABC and the single `FilesystemStateBackend` concrete, serving both a local directory and an Amazon S3 Files / EFS (NFSv4) mount. The mount, not the code, decides the reach (`detect_topology` probes it). Immutable schema-versioned JSON records written with temp file + atomic rename (unknown/corrupt records are quarantined on read, never fatal), derived-maximum cursors, advisory-`flock` TTL leases with a monotonic fence, and the `make_state_backend` factory. `start_stop_state` constructs the backend only when a `state:` section is configured. Stdlib-only, so the stateless install pays nothing. |
 | `cronstable/state_admin.py` | Offline administration of the durable store behind the `cronstable state ...` subcommands: `backup`/`restore`, `migrate` (between paths/mounts), manual `gc`, `check` (writability probe + inventory), and `migrate-schema`. Works straight from the `state` config section with no running daemon, and stays safe against a live one. Imported lazily by `__main__.py` only when a `state` subcommand is used. |
+| `cronstable/jobapi.py` / `cronstable/jobstate.py` | The loopback HTTP API jobs use to reach durable state, and the job state operations it serves over the storage backend. |
+| `cronstable/dag.py` / `cronstable/dagrun.py` | DAG orchestration: the pure state machine, and the runtime driver that makes it durable. |
+| `cronstable/pools.py` | Durable admission queues shared by jobs and DAG tasks. |
+| `cronstable/croninfo.py` | Schedule descriptions and analysis (including the advisory schedule lint) shared by the CLI, API, and dashboards. |
+| `cronstable/resources.py` | CPU and memory sampling for job subprocesses (`monitorResources`). |
+| `cronstable/push.py` | The engine behind the end-to-end encrypted `push` reporter. |
+| `cronstable/mcp.py` | The Model Context Protocol (MCP) server. |
+| `cronstable/tui.py` | The terminal dashboard for a running daemon. |
+| `cronstable/winservice.py` | Runs cronstable as a Windows service. |
 | `cronstable/version.py` | Generated version string (`version`), served by the web `/version` endpoint and printed by `--version`. |
 
 The dependency direction is `__main__` -> `cron` -> (`config`, `job`,
@@ -46,19 +60,20 @@ The dependency direction is `__main__` -> `cron` -> (`config`, `job`,
 modules lazily, so `backends/` never enters the import graph unless
 `cluster.backend` selects a lease backend.
 
-`cluster.py` depends on `config` and `fingerprint` only. The lease backends
-depend on `config` and `leadership`; `backends.filesystem` also depends on
-`state` and `platform`, because it embeds a private `FilesystemStateBackend`
-as its lease store. `config.py` has no dependency on `cron.py` or `job.py`.
+`cluster.py` depends on `config`, `fingerprint`, `leadership`, `tlsutil`,
+`_gzip`, and `_json`, and has no dependency on `cron.py`. The lease backends
+depend on `config`, `leadership`, and `backends._common`;
+`backends.filesystem` also depends on `state` and `platform`, because it
+embeds a private `FilesystemStateBackend` as its lease store. `config.py` has no dependency on `cron.py` or `job.py`.
 
-`prometheus.py` is a leaf module like `statsd.py`: it imports only
-`cronstable.version` at module scope, `cron.py` imports it, and its renderer
-late-imports `cronstable.cron` helpers at scrape time to break the cycle.
+`prometheus.py` imports only `cronstable.version` and `cronstable.cronexpr` at
+module scope, `cron.py` imports it, and its renderer late-imports
+`cronstable.cron` helpers at scrape time to break the cycle.
 `platform.py` is a leaf module with no cronstable dependencies, imported by
 `__main__`, `config`, `cron`, and `job` wherever per-OS behavior is needed.
 
-`state.py` depends only on `config` and `platform`. `cron.py` imports it and
-builds the backend with `make_state_backend` inside `start_stop_state` (only
+`state.py` depends on `config`, `platform`, and `_json`. `cron.py` imports it
+and builds the backend with `make_state_backend` inside `start_stop_state` (only
 when a `state:` section is configured). `__main__` imports `state_admin.py`
 (which depends on `config` and `state`) lazily for the `cronstable state ...`
 subcommands, so `state_admin` never enters the daemon's import graph.
@@ -75,10 +90,10 @@ it. `main_loop(loop)` still accepts a caller-supplied loop, which the test
 suite relies on. A loop passed in stays the caller's to close, while one built
 by `_run_daemon` is closed there.
 
-The daemon runs on Windows too. The loop is created the same way on every OS,
-and the only difference is shutdown-handler wiring through
-`platform.install_shutdown_handlers` (Windows uses the Proactor loop, which
-lacks `add_signal_handler`). `_run_daemon` also installs an explicitly sized,
+The daemon runs on Windows too. On POSIX the daemon runs on uvloop when the
+`speedups` extra is installed, and on stock asyncio otherwise; Windows uses the
+Proactor loop. POSIX also wires `SIGHUP` to an immediate reload.
+`_run_daemon` also installs an explicitly sized,
 named default thread pool (see `executor_workers()`).
 
 `main_loop` parses arguments (`-c/--config`, `-l/--log-level`,
@@ -95,11 +110,12 @@ daemon branch reaches `Cron(args.config)`, whose construction calls
 way. With `--version`, the version is printed and the process exits 0 before
 any config is loaded.
 
-The whole daemon is single-threaded: one event loop drives the scheduler loop,
-the reaper task, all running-job subprocess waits, the reporters, and the
-aiohttp web server. Concurrency is cooperative through `await`; there are no
-worker threads and no locks (the code comments note that `asyncio` being
-single-threaded is what makes certain flag-based guards safe without locking).
+Scheduling logic runs on one event-loop thread, which drives the scheduler
+loop, the reaper task, all running-job subprocess waits, the reporters, and the
+aiohttp web server. Concurrency is cooperative through `await`. Blocking work
+(config reparse, file-backed secrets, calendar and metrics rendering) runs on
+the sized default thread pool, output mirroring runs on its own writer thread,
+and the per-job launch and slot mutexes are `asyncio.Lock`s.
 
 `__main__` delegates shutdown-handler registration to
 `platform.install_shutdown_handlers`, which returns a cleanup function called in
@@ -120,20 +136,23 @@ a ~0.25s heartbeat timer so the handler runs while the loop is blocked in IOCP.
 self._wait_for_running_jobs_task = asyncio.create_task(self._wait_for_running_jobs())
 ```
 
-It then enters `while not self._stop_event.is_set():`. Each iteration performs,
-in order:
+It then enters `while not self._stop_event.is_set():`. Each iteration performs
+the following steps in order. Steps 1 to 4 are housekeeping, which runs at most
+once per wall-clock minute, even when a sub-minute schedule wakes the loop more
+often.
 
-1. **Hot reload.** `config = self.update_config()` re-reads the configuration
-   from disk and rebuilds `self.cron_jobs` (an `OrderedDict` of name ->
-   `JobConfig`). On `ConfigError`, the error is logged and `self.cron_jobs` is
-   left unchanged, because `update_config` only assigns `self.cron_jobs` on a
-   successful parse. The loop keeps running the previously loaded jobs.
-   `config` is initialized to `None` at the top of each iteration so a failed
-   parse does not dereference an unbound config later in the body. Any other
-   exception is logged as `"please report this as a bug (1)"`.
+1. **Hot reload.** `config = await self.reload_config()` reparses the
+   configuration off the loop, skipping the parse when the config files' stat
+   signature is unchanged, and rebuilds `self.cron_jobs` (an `OrderedDict` of
+   name -> `JobConfig`). On `ConfigError`, the error is logged and
+   `self.cron_jobs` is left unchanged, because `reload_config` only assigns
+   `self.cron_jobs` on a successful parse. The loop keeps running the
+   previously loaded jobs. `config` is initialized to `None` at the top of
+   each iteration so a failed parse does not dereference an unbound config
+   later in the body. Any other exception is logged as `"please report this as a bug (1)"`.
 
 2. **Cluster start/stop.** `await self.start_stop_cluster(config.cluster_config)`
-   runs inside the same `try` as `update_config`, immediately after it, and
+   runs inside the same `try` as `reload_config`, immediately after it, and
    reconciles the leadership backend (`self.cluster_manager`, typed
    `Optional[LeadershipBackend]`, so it may be the gossip `ClusterManager` or a
    `KubernetesBackend`/`EtcdBackend`) against the (possibly changed) `cluster`
@@ -149,7 +168,12 @@ in order:
    itself needs a restart. (See "Cluster manager" and
    [clustering and leader election](Clustering-and-Leader-Election).)
 
-3. **Web app start/stop.** `await self.start_stop_web_app(config.web_config)`
+   The same `try` block then reconciles the observability overlay
+   (`start_stop_observability`), the state backend (`start_stop_state`), and
+   push (`start_stop_push`).
+
+3. **Web app start/stop.**
+   `await self.start_stop_web_app(config.web_config, config.mcp_config)`
    reconciles the running aiohttp server against the (possibly changed) web
    config. It runs only when the config parsed, and *after* the cluster
    reconcile, under its **own** error handling. A `ConfigError` (for example, an
@@ -168,28 +192,27 @@ in order:
    error pointing at the Python `logging.config` dictionary-schema docs and the
    offending config.
 
-5. **Spawn due jobs.** `await self.spawn_jobs(startup)`.
+5. **Service due work.** `await self._service_slots(startup)` reads the clock
+   once, after housekeeping, then runs `spawn_jobs`, catch-up, the DAG
+   scheduler, and pool servicing.
 
-6. **Sleep to the next minute boundary.** `next_sleep_interval()` computes the
-   seconds until the next minute boundary in UTC as `now.replace(second=0) +
-   WAKEUP_INTERVAL` (where `WAKEUP_INTERVAL` is one minute). Because
-   `replace(second=0)` clears only the seconds field, the target retains `now`'s
-   sub-second component, so the wake-up lands at the same fractional offset past
-   the next minute rather than exactly `:00.000000`. The loop then does
-   `await asyncio.wait_for(self._stop_event.wait(), sleep_interval)`, so a
-   shutdown signal wakes it immediately. A `TimeoutError` (the normal case)
-   means the minute elapsed.
+6. **Sleep until the next wake.** `_sleep_interval()` returns the smallest of
+   the soonest job fire, the next housekeeping minute boundary
+   (`next_sleep_interval()`), and the next DAG wake. The loop then waits on
+   `_wake_event` with that timeout, so a shutdown or a `SIGHUP` reload request
+   wakes it immediately.
 
 `startup` is `True` only on the first iteration and is set to `False`
-immediately after the first `spawn_jobs`. This drives the `@reboot` startup
+immediately after the first `_service_slots`. This drives the `@reboot` startup
 pass (see the next section).
 
 ### Startup pass (`@reboot`)
 
-`spawn_jobs(startup)` iterates `self.cron_jobs.values()` and calls
-`launch_scheduled_job(job)` for every job where both `job_should_run(startup,
-job)` **and** `self._cluster_allows(job)` are true (and first logs any
-leadership transition through `_log_cluster_role`).
+`spawn_jobs(startup, now)` first logs any leadership transition through
+`_log_cluster_role`. At startup only `@reboot` jobs are considered.
+Afterwards due jobs come from a next-fire index, advanced with bounded
+catch-up, then gated by `_cluster_allows` and launched in config order through
+`launch_scheduled_job`.
 
 `_cluster_allows` is always `True` unless `cluster.electLeader` is configured.
 Then it consults the job's `clusterPolicy` against the elected-leader state.
@@ -221,13 +244,13 @@ scheduled-job retry). See
 - when `startup` is `True`, returns `True` only for jobs whose schedule is the
   string `"@reboot"`, and `False` for all others;
 - when `startup` is `False`, evaluates `CronTab` schedules with
-  `crontab.test(get_now(job.timezone).replace(second=0))` and returns `True`
-  when the current minute matches. Non-`CronTab` schedules (that is,
+  `crontab.test(schedule_slot(job))` (the current second for a second-level
+  job, otherwise the current minute) and returns `True` when that slot
+  matches. Non-`CronTab` schedules (that is,
   `"@reboot"`) return `False` on non-startup iterations, so a `@reboot` job
   runs once at daemon start and never on the regular cadence.
 
-As `README.md` puts it, `@reboot` "will only run the job when cronstable is
-initially executed."
+Without a `state:` section, a `@reboot` job runs each time the daemon starts.
 
 When a `state:` section is configured, a non-cluster-deferred `@reboot` job
 additionally passes through `_reboot_boot_gate` before launching: a durable
@@ -288,16 +311,20 @@ schedule new retries.
 
 ## Configuration hot reload
 
-`update_config` is the single point of reload. When `config_arg` is `None`
-(the unit-test path) it returns an empty `CronstableConfig`. Otherwise it calls
-`parse_config(self.config_arg)`, which dispatches on whether the argument is a
-directory (`_parse_config_dir`) or a single file (`parse_config_file`). On
-success it overwrites `self.cron_jobs` with a fresh `OrderedDict` keyed by job
-name and returns the full `CronstableConfig` (jobs, web config, job defaults,
-logging config).
+The run loop reloads through `reload_config`, which reparses off the loop only
+when the config files' stat signature changed; `update_config` is the
+synchronous twin used at construction. When `config_arg` is `None` (the
+unit-test path) both return an empty `CronstableConfig`. Otherwise they call
+`parse_config_with_sources`, which runs `parse_config(config_arg)` and records
+the files the parse read for the next signature check. `parse_config`
+dispatches on whether the argument is a directory (`_parse_config_dir`) or a
+single file (`parse_config_file`). On success the reload overwrites
+`self.cron_jobs` with a fresh `OrderedDict` keyed by job name and returns the
+full `CronstableConfig` (jobs, web config, job defaults, logging config).
 
-Because reload happens once per minute at the top of the loop, configuration
-edits take effect within a minute without a restart. Schedule parsing, include
+Because housekeeping checks for a reload at most once per wall-clock minute,
+and immediately on `SIGHUP`, configuration edits take effect within a minute
+without a restart. Schedule parsing, include
 merging, and defaults application all happen inside `parse_config*`. See
 [includes, defaults, and multi-file config](Includes-and-Defaults).
 
@@ -309,13 +336,14 @@ merging, and defaults application all happen inside `parse_config*`. See
   currently applied `self.web_config`, the old server is cleaned up and
   `self.web_runner` is reset to `None`.
 - If a `web_config` with a nonempty `listen` list exists and no runner is
-  running, a new `web.Application` is built. When `authToken` is configured,
-  `_resolve_web_token` resolves the bearer token from exactly one source
-  (`value`, `fromFile`, or `fromEnvVar`) and raises `ConfigError` if it
-  resolves to empty (fail-closed). `_make_auth_middleware` then enforces a
+  running, a new `web.Application` is built. When `authToken` or scoped
+  `authTokens` entries are configured, `_resolve_web_tokens` resolves each
+  bearer token from its source, in the precedence `value`, then `fromFile`,
+  then `fromEnvVar` (the first set source wins), and raises `ConfigError` if
+  one resolves to empty (fail-closed). `_make_auth_middleware` then enforces a
   case-insensitive `Bearer` scheme and a constant-time `hmac.compare_digest`
-  token comparison. Routes are `GET /version`, `GET /status`, and
-  `POST /jobs/{name}/start`. `web_site_from_url` turns each `listen` URL into a
+  token comparison. Routes come from the `WEB_ROUTES` table (see
+  [HTTP API](HTTP-API)). `web_site_from_url` turns each `listen` URL into a
   site (TCP for `http://host:port`, Unix socket for `unix://path`). On a
   malformed URL or a bind error, the daemon logs a warning and skips that
   address rather than stopping the reload. `_apply_socket_mode` applies
@@ -339,7 +367,7 @@ The scheduler checks whether a node may run a job through the
 selected by `cluster.backend`. It imports backend modules only when needed,
 so using gossip does not load the lease implementations:
 
-- **`gossip`** (default) -> `cluster.ClusterManager`, the original mTLS,
+- **`gossip`** (default) -> `cluster.ClusterManager`, the mTLS,
   no-shared-state, best-effort quorum election (detailed later). Zero new
   dependencies.
 - **`kubernetes`** -> `backends.kubernetes.KubernetesBackend`, a
@@ -447,7 +475,8 @@ pick the owner of a given job by rendezvous (highest-random-weight) hashing
 `manager.distribution` to call the leader or the per-job variant. The choice is
 purely about *which node* runs a job, so the quorum gate and the guarantee are
 unchanged. Because the owner is a deterministic function of the job name and the
-agreeing member set, all quorate nodes agree, and a membership change only
+agreeing member set, all quorate nodes with a converged view agree, and a
+membership change only
 reassigns the affected jobs.
 
 ### The peer attestation payload
@@ -501,7 +530,17 @@ election. The full body:
   // candidates): stronger than mutual_agreeing. A poller folds these into its
   // spread Leader-path owner set, so it only ever defers a job to a node
   // vouched able to run it.
-  "quorate_vouched": ["cronstable-a", "cronstable-b", "cronstable-c"]
+  "quorate_vouched": ["cronstable-a", "cronstable-b", "cronstable-c"],
+  // per-job run summaries for the fleet view (GET /fleet). Observability
+  // only, never an election input; capped, and job_summaries_truncated is
+  // true when the cap dropped jobs.
+  "job_summaries": {
+    "hourly-report": {
+      "running": false, "enabled": true, "scheduled_in": 1800.0,
+      "last": { "outcome": "success", "finished_at": "...", "duration": 1.2, "exit_code": 0 }
+    }
+  },
+  "job_summaries_truncated": false
 }
 ```
 
@@ -605,11 +644,13 @@ calls `await running_job.start()`, and registers the instance with
    console process groups, which both shields the job from the daemon console's
    Ctrl-C and makes it a `CTRL_BREAK_EVENT` target for `cancel()`.
 
-   `start()` also assembles `env` (only when the job has `environment` entries,
+   `start()` also assembles `env` (when the job has `environment` entries, when
+   the daemon injects `CRONSTABLE_*` run variables, or on a PyInstaller build,
    layering them over `os.environ` after `fixup_pyinstaller_env`), sets
    `preexec_fn=self._demote` when a uid/gid is configured, requests
-   `stdout`/`stderr` PIPEs per `captureStdout`/`captureStderr`, sets the stream
-   buffer `limit` to `maxLineLength`, and records `execution_deadline =
+   `stdout`/`stderr` PIPEs per `captureStdout`/`captureStderr`, sets the pipe
+   flow-control `limit` to 64 KiB (`_READ_CHUNK`; the reader enforces
+   `maxLineLength`), and records `execution_deadline =
    time.perf_counter() + executionTimeout` when a timeout is set. Arguments are
    encoded with `platform.encode_argv` before spawning (UTF-8 bytes on POSIX;
    passed as `str` unchanged on Windows for `CreateProcessW`).
@@ -700,9 +741,10 @@ calls `await running_job.start()`, and registers the instance with
    *or* lines were discarded). `failed` is `fail_reason is not None`.
 
 6. **Reporting.** `report_failure`, `report_permanent_failure`, and
-   `report_success` each delegate to `_report_common`, which runs all three
-   `REPORTERS` (`SentryReporter`, `MailReporter`, `ShellReporter`,
-   `WebhookReporter`) concurrently with
+   `report_success` each delegate to `_report_common`, which calls
+   `_fan_out_reports` to run all six `REPORTERS` (`SentryReporter`,
+   `MailReporter`, `ShellReporter`, `WebhookReporter`, `PushReporter`,
+   `EventLogReporter`) concurrently with
    `asyncio.gather(..., return_exceptions=True)`. An exception from any one
    reporter is logged and does not stop the others. Each reporter reads the
    relevant sub-key of the report config (`onFailure["report"]`,
@@ -714,17 +756,20 @@ calls `await running_job.start()`, and registers the instance with
 
 ### StreamReader
 
-Each captured stream gets a `StreamReader` whose `_read` task loops on
-`stream.readline()`, decodes UTF-8 with `errors="replace"`, and for live output
-prefixes each line with `streamPrefix` (formatted with `job_name`/`stream_name`)
-and writes it to the daemon's own `sys.stdout`/`sys.stderr` with `_emit` (bytes
-write with an ASCII-replacement fallback).
+Each captured stream gets a `StreamReader` whose `_read` task reads
+`stream.read(_READ_CHUNK)` chunks and splits them on newlines. Each line is
+decoded by `_decode_output_line` (UTF-8, then the OEM code page on Windows,
+then UTF-8 with replacement). For live output it prefixes each line with
+`streamPrefix` (formatted with `job_name`/`stream_name`) and hands the lines in
+batches to a mirror writer thread, which writes them to the daemon's own
+`sys.stdout`/`sys.stderr` with `_emit` (bytes write with an ASCII-replacement
+fallback).
 
 For retention it keeps the first `saveLimit // 2` lines in `save_top` and the
 last `saveLimit - saveLimit // 2` lines in a bounded `save_bottom` deque,
-incrementing `discarded_lines` for every evicted or never-saved line. A
-`ValueError` from an over-long line (exceeding the buffer `limit`) is logged as
-a warning and skipped. `join()` awaits the reader task and returns the
+incrementing `discarded_lines` for every evicted or never-saved line. A line
+longer than `maxLineLength` bytes is dropped with the warning
+`ignored a very long line`. `join()` awaits the reader task and returns the
 assembled text (top lines, an optional `"[.... N lines discarded ...]"` marker,
 then bottom lines) plus the discard count. See
 [output capturing](Output-Capturing).
@@ -874,16 +919,18 @@ When a job has a `statsd` config, `RunningJob` builds a
 `StatsdJobMetricWriter`. `_on_start` sends `{prefix}.start:1|g`; `_on_stop`
 sends `{prefix}.stop:1|g`, `{prefix}.success:{0|1}|g`, and
 `{prefix}.duration:{ms}|ms`, where success is `0 if self.job.failed else 1`
-and duration is wall time between start and stop in milliseconds.
+and duration is wall time between start and stop in milliseconds. For a
+monitored run the stop datagram also carries `{prefix}.cpu:{ms}|ms` and
+`{prefix}.max_rss:{bytes}|g`.
 
 Each `send_to_statsd` call is one fire-and-forget UDP datagram, so there are two
 datagrams per run: `job_started` sends the single `.start` line, and
-`job_stopped` sends the three stop metrics concatenated (newline-delimited) into
+`job_stopped` sends the stop metrics concatenated (newline-delimited) into
 one datagram. `job_stopped` also early-returns without sending if `start_time`
-is `None` (that is, `job_started` never ran). `send_to_statsd` opens a
-datagram endpoint with `StatsdClientProtocol`, which sends in `connection_made`
-and is immediately closed. Send failures are caught as `OSError` at the
-`RunningJob` call sites and logged as warnings so telemetry never crashes the
+is `None` (that is, `job_started` never ran). `send_to_statsd` sends through a
+pooled per-target UDP endpoint (`StatsdClientProtocol`), rebuilt every 60 s or
+after an error. `_on_start` catches `OSError` and `_on_stop` catches any
+`Exception`, and both log a warning so telemetry never crashes the
 scheduler. See [metrics with statsd](Metrics-with-Statsd).
 
 ## Prometheus metrics
@@ -891,22 +938,24 @@ scheduler. See [metrics with statsd](Metrics-with-Statsd).
 The pull-side sibling of statsd is the `PrometheusMetrics` registry in
 `cronstable/prometheus.py`, owned by the `Cron` object rather than the web app,
 so counters survive web-app restarts and cluster-manager rebuilds across
-reloads (they reset only on process restart; `update_config` prunes series for
+reloads (they reset only on process restart; `_apply_reload` prunes series for
 jobs removed from the config).
 
 Synchronous in-memory hooks in `cron.py` record cumulative state: `_record_run`
 (run outcomes and the duration histogram), `schedule_retry_job` (retries
-actually launched), the permanent-failure branches, `update_config` (reload
-success/failure), and the leadership- and quorum-transition latches. Gauges are
-not stored at all: `Cron._web_metrics` calls the renderer, which computes them
+actually launched), the permanent-failure branches, `reload_config` and
+`update_config` (reload success/failure), and the leadership- and
+quorum-transition latches. Gauges are not stored at all: `Cron._web_metrics` calls the renderer, which computes them
 at scrape time from `cron_jobs`, `running_jobs`, `last_run`, and
 `cluster_manager.view_dict()`. If a backend read fails during a scrape, the
-cluster block degrades to `cronstable_cluster_enabled` alone instead of failing
-the whole scrape. See [metrics with Prometheus](Metrics-with-Prometheus).
+cluster block degrades to `cronstable_cluster_enabled` and the transition
+counters instead of failing the whole scrape. See [metrics with Prometheus](Metrics-with-Prometheus).
 
 ## Concurrency model summary
 
-- One process, one thread, one event loop.
+- One process, with scheduling logic on one event-loop thread. Blocking work
+  runs on the sized default thread pool, and output mirroring on its own
+  writer thread.
 - One long-lived scheduler coroutine (`Cron.run`) and one long-lived reaper
   coroutine (`_wait_for_running_jobs`).
 - One short-lived `wait()` task per running job, plus one

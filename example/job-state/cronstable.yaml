@@ -16,8 +16,10 @@ state:
   # A local directory gives single-node durability; point this at an Amazon
   # S3 Files / EFS mount and the identical setup coordinates the whole fleet
   # (the locks and cursors below then exclude/converge across every node that
-  # mounts it). See the Durable State wiki page.
-  path: /var/lib/cronstable/state
+  # mounts it). See the Durable State wiki page. This path is relative to the
+  # daemon's working directory, so the example runs as any user; production
+  # uses a path such as /var/lib/cronstable/state.
+  path: ./cronstable-state
   jobApi:
     enabled: true            # the default; set false to keep the durable
                              # scheduler features but expose nothing to jobs
@@ -55,7 +57,7 @@ jobs:
       cronstable idempotent "$key" && rc=0 || rc=$?
       if [ "$rc" -eq 0 ]; then
         echo "charging today's invoices"
-        # ... the exactly-once side effect ...
+        # ... the once-per-key side effect ...
       elif [ "$rc" -eq 5 ]; then
         echo "already charged for today; skipping"
       else

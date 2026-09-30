@@ -26,8 +26,9 @@ fingerprint of selected fields in the node's effective job configuration.
 Matching IDs indicate agreement on those fields, including jobs that are not
 currently executing. A **quorum** is a strict majority of the cluster,
 `⌊N / 2⌋ + 1` nodes. A node is **quorate** when it currently sees a quorum of
-agreeing members. **Fenced** means a shared store guarantees a single holder
-(the lease backends). A **lease** is a short-lived, auto-expiring claim on that
+agreeing members. **Fenced** means a shared store allows one lease holder at a
+time: Kubernetes and etcd, and `filesystem` while clock skew stays under about
+2 s. A **lease** is a short-lived, auto-expiring claim on that
 store that the holder keeps renewing. A **bridge** is a set of members that two
 mutually-unreachable nodes can both still reach (the sides see the bridge, not
 each other). A **thin bridge** is one of fewer than `quorum - 1` shared
@@ -122,8 +123,9 @@ attestation first, confirm the peers agree, then turn on election:
    You can confirm the peers reach `agreed` on `GET /cluster` before trusting
    the topology.
 
-4. **Run `cronstable --validate-config`** to catch a bad peer list, TLS paths, or
-   lease ordering at rest. See the [command-line reference](CLI-Reference).
+4. **Run `cronstable --validate-config`** to catch a bad peer list, blank TLS
+   paths (the files themselves are read when the listener starts), or lease
+   ordering at rest. See the [command-line reference](CLI-Reference).
 
 5. **Roll the replicas one at a time**, letting each converge to `agreed` before
    the next (change membership incrementally so majorities always overlap; see
@@ -227,7 +229,8 @@ cluster:
 ```
 
 Run `cronstable --validate-config` before deploying to catch a bad `cluster`
-section (peer list, TLS paths, lease ordering) at rest rather than at startup.
+section (peer list, blank TLS paths, lease ordering) at rest rather than at
+startup. The TLS files themselves are read when the listener starts.
 See the [command-line reference](CLI-Reference). Address formats are part of
 that load-time validation: `listen` and every `peers[].host` must be
 `host:port` with a port in 1-65535, and an IPv6 literal must be written
@@ -389,9 +392,10 @@ abandoning, or transferring retries are documented in
 * The computed size, quorum, elected leader, and whether this node is the leader
   are all shown at `GET /cluster` and in the dashboard panel.
 
-### Why the quorum gate is safe
+### Why the quorum gate limits double-runs
 
-The quorum gate is what makes this safe with **no shared state**. Two strict
+Without **shared state**, the quorum gate gives best-effort at-most-once under
+one shared `N`. Two strict
 majorities of `N` cannot be disjoint, so under a clean network partition at most
 one side is quorate, and therefore (within about one poll `interval`) **at
 most one leader exists**.
@@ -465,8 +469,10 @@ The daemon closes this the same way as a duplicate `nodeName`. Each node
 reports its declared `N` on `/peer`, and any reachable peer that **declares a
 different `N`** is treated as a first-class `conflict`, whatever job set that
 peer runs: this node's `Leader` jobs **fail closed** until the cluster
-reconverges on one `N`. Both sides of a resize observe the mismatch and stand
-down, so no firing double-runs while the roll-out is under way.
+reconverges on one `N`. A node stands down when it can reach a peer that
+declares a different `N`, so a resize rolled out on a connected network does
+not double-run. Old-size and new-size groups that cannot reach each other can
+each still lead.
 
 The comparison ignores job-set agreement on purpose. A resize rolled out
 together with a job change (a `peers` edit and a job edit in the same deploy)
@@ -489,7 +495,8 @@ is *not* gated: it already accepts double-runs as the price of never skipping.
 > same-`N` but different-*membership* divergence (for example, swapping one
 > peer for another while keeping the count). To stay safe, change membership
 > **one node at a time**: a change of one member keeps the old and new
-> majorities overlapping, so every step of the roll has at most one leader.
+> majorities overlapping, so each step keeps the quorum gate's best-effort
+> at-most-once behavior.
 > Let each change converge (the dashboard shows `agreed` on every node) before
 > the next.
 
@@ -719,7 +726,10 @@ workload fans out roughly evenly across the cluster.
 ```yaml
 cluster:
   listen: "0.0.0.0:8443"
-  tls: { ca: /etc/cronstable/cluster-ca.pem, cert: /etc/cronstable/this-node.pem, key: /etc/cronstable/this-node.key }
+  tls:
+    ca: /etc/cronstable/cluster-ca.pem
+    cert: /etc/cronstable/this-node.pem
+    key: /etc/cronstable/this-node.key
   peers:
     - host: cronstable-b.internal:8443
     - host: cronstable-c.internal:8443
@@ -729,10 +739,9 @@ cluster:
 
 What to know:
 
-* **Same safety, not more.** Spread keeps the quorum gate and is at-most-once
-  for `Leader` jobs, no weaker than single-leader. Under a clean partition every
-  quorate node sees the same member set and computes the same owner, so at most
-  one node runs each job.
+* **Same best-effort guarantee.** Spread keeps the quorum gate, so `Leader` jobs
+  get single-leader's best-effort at-most-once behavior. In a converged view
+  every quorate node computes the same owner for a job.
 
   The subtle case is a *thin bridge*, a quorate pair that share too few
   witnesses to confirm each other. Because the rendezvous winner is per-job, it
@@ -744,7 +753,8 @@ What to know:
   Spread closes this by folding the *unconfirmed* peers a quorate neighbor
   vouches for into each job's rendezvous and deferring to any that outrank it
   (two strict majorities of one `N` always overlap, so a co-owner you cannot
-  see is always gossiped to you). The price is the same fail-closed trade
+  see normally appears in a shared peer's `/peer` report, except across a thin
+  bridge or while views converge). The price is the same fail-closed trade
   single-leader makes: a job whose owner no quorate peer can currently confirm
   stands down until the view converges.
 
@@ -786,11 +796,12 @@ leader-gated jobs `tick-leader-only` (`Leader`) and `tick-prefer-leader`
 
 | Job | `single-leader` (default) | `spread` |
 | --- | --- | --- |
-| `tick-leader-only` | runs on `cronstable-a` (the leader) | runs on `cronstable-c` |
-| `tick-prefer-leader` | runs on `cronstable-a` (the leader) | runs on `cronstable-b` |
+| `tick-leader-only` | runs on `cronstable-a` (the leader) | runs on `cronstable-a` |
+| `tick-prefer-leader` | runs on `cronstable-a` (the leader) | runs on `cronstable-c` |
 
-So switching to `spread` moves the two jobs onto two *different* nodes instead
-of putting both on the leader. The owner is a deterministic function of the job
+Under `spread`, `tick-prefer-leader` moves to `cronstable-c` while
+`tick-leader-only` stays on `cronstable-a`, so the two jobs run on different
+nodes. The owner is a deterministic function of the job
 name and the live member set, so it stays put until membership changes (then
 only the affected jobs move). You can confirm it live:
 
@@ -808,8 +819,8 @@ top-level [`notify:` block](Reporting#daemon-event-notifications-notify) fires a
 reporter (webhook, mail, …) on the `leader_change` event (this node acquired or
 lost scheduled-job leadership) and the `quorum_loss` event (this node left
 quorum, so its `Leader` jobs stood down). Both are also exported as the
-`cronstable_cluster_leader_transitions` /
-`cronstable_cluster_quorum_transitions` [Prometheus metrics](Metrics-with-Prometheus).
+`cronstable_cluster_leader_transitions_total` /
+`cronstable_cluster_quorum_transitions_total` [Prometheus metrics](Metrics-with-Prometheus).
 
 `GET /cluster` on the [web/HTTP interface](HTTP-API) returns the current view as
 JSON. When no `cluster` section is configured it returns
@@ -884,7 +895,8 @@ consolidated view for `spread` mode, where each job's runs land on a different
 node. The summaries are display-only: election, quorum, and every run/skip
 decision ignore them, and a malformed summary from a peer degrades to
 "no data for that node". The lease backends exchange nothing node-to-node, so
-`/fleet` reports `enabled: false` there.
+`/fleet` reports `enabled: false` there unless `cluster.observability` provides
+an overlay mesh.
 
 **Gossip as a secondary data plane (`cluster.observability`).** The same gossip
 mechanism can carry more than election. Opt in and each node also gossips its
@@ -1073,8 +1085,10 @@ contexts with the new material. An in-place renewal (the cert-manager, Vault,
 or Kubernetes mounted-secret pattern of same paths, new bytes) therefore needs
 **no manual restart**. A detected change is dry-run loaded first, so a
 half-written cert observed mid-rotation is retried rather than tearing the
-cluster down. This is `gossip`-only. The lease backends use no per-node mTLS
-certs.
+cluster down. The etcd and Kubernetes backends run the same in-place rotation
+check on their client TLS files (`cluster.etcd.tls.*`, the kubeconfig's
+CA/cert/key) and rebuild the backend once the new files load. The filesystem
+backend uses no TLS.
 
 For the operational runbooks (leaf-cert rotation, rolling the cluster **CA** with
 trust overlap, and recovering from an `untrusted` cascade), see
@@ -1110,8 +1124,8 @@ has no optional client.
 
 * **No peer list, no peer mTLS, no quorum math.** The store decides leadership,
   so the gossip-only keys `listen`, `tls`, `peers`, `interval`, and
-  `driftAfter` are ignored (the daemon logs a one-line startup advisory for
-  each). A lease backend **always elects**, so `electLeader` is implied and
+  `driftAfter` are ignored (the daemon logs one startup advisory naming the
+  ignored keys). A lease backend **always elects**, so `electLeader` is implied and
   `electLeader: false` is likewise ignored with an advisory (configuring a
   lease backend *is* opting into leadership). The cluster is logically a single
   holder (`cluster_size` / `quorum` report `1`), and `GET /cluster` returns
@@ -1130,7 +1144,9 @@ has no optional client.
 * **Local-expiry safety.** A holder only calls itself leader until a
   *locally-computed* lease deadline (renew time + duration, minus a small
   clock-skew margin), so a node whose renew loop stalls self-demotes **without a
-  network round-trip**, and never two holders act at once.
+  network round-trip**. On Kubernetes and etcd, two holders therefore do not
+  act at once. On `filesystem` this holds only while inter-host clock skew stays
+  within the ~2 s budget.
 
 * **`PreferLeader` keeps never-skip semantics.** A node that currently **cannot
   reach** the coordination store runs a `PreferLeader` job anyway (it may
@@ -1216,7 +1232,7 @@ Leadership is fenced on the **lease**, but each node still carries an identity:
   Kubernetes, the dashboard and `GET /cluster` strip the token back to the
   readable name, and no run/skip decision ever string-compares it.
 
-A duplicate identity therefore no longer silently breaks the fence, but give
+A duplicate identity therefore does not break the fence, but give
 each node a **stable, unique name** anyway so the holder shown in the dashboard,
 `kubectl get lease`, or `etcdctl get` unambiguously names one node. In Kubernetes
 both a Deployment and a StatefulSet give each pod a unique hostname; a
@@ -1305,12 +1321,19 @@ Point the backend at one or more etcd endpoints (tried in order for failover):
 cluster:
   backend: etcd
   etcd:
-    endpoints: [http://etcd-0:2379, http://etcd-1:2379]
+    endpoints:
+      - http://etcd-0:2379
+      - http://etcd-1:2379
     electionName: cronstable/leader   # the key; its value is the holder's nodeName
     ttl: 15                         # lease TTL, seconds (>= 3; keepalive every ~ttl/3)
-    # username: root               # for an auth-enabled cluster …
-    # password: { fromEnvVar: ETCD_PASSWORD }
-    # tls: { ca: /etc/etcd/ca.pem, cert: /etc/etcd/client.pem, key: /etc/etcd/client.key }
+    # For an auth-enabled cluster, use https:// endpoints and add:
+    # username: root
+    # password:
+    #   fromEnvVar: ETCD_PASSWORD
+    # tls:
+    #   ca: /etc/etcd/ca.pem
+    #   cert: /etc/etcd/client.pem
+    #   key: /etc/etcd/client.key
 ```
 
 * **Transport.** Speaks etcd's v3 gRPC-gateway JSON/HTTP API directly over
@@ -1322,7 +1345,9 @@ cluster:
   `web.authToken`); a configured-but-empty source fails closed at load. The auth
   token is obtained at startup and **re-fetched automatically when it expires**
   (cronstable re-authenticates on an etcd `401`), so a token TTL does not wedge the
-  backend. Always pair a `username` with a resolvable `password`.
+  backend. Always pair a `username` with a resolvable `password`. Authentication
+  requires every endpoint to be `https://`: a `username` or `password` with any
+  `http://` endpoint is a configuration error at load.
 
 * **TLS.** For `https://` endpoints set `tls.ca` (and `tls.cert` / `tls.key` for
   client-cert auth). `http://` and `https://` endpoints are detected per-URL.

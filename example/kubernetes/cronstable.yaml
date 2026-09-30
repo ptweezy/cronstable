@@ -2,7 +2,7 @@
 #
 # Several replicas run from this same config; only the holder of the
 # coordination.k8s.io/v1 Lease named below runs the Leader-gated jobs. This is
-# a fenced, exactly-once election (as long as the apiserver is reachable),
+# a fenced, single-holder election (as long as the apiserver is reachable),
 # unlike the best-effort gossip backend.
 #
 # The backend reaches the apiserver over its in-cluster service-account
@@ -30,7 +30,7 @@ cluster:
     # clientLibrary: auto   # auto (default) | library | http
 
 jobs:
-  - name: charge-cards            # exactly-once-ish: skip-tolerant, must not double-run
+  - name: charge-cards            # skip-tolerant, must not double-run
     command: echo "charging cards on $(hostname)"
     schedule: "*/2 * * * *"
     clusterPolicy: Leader         # the default; only the lease holder runs it

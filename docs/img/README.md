@@ -1,7 +1,7 @@
 # Image assets
 
 Almost everything in this directory is ordinary product documentation: dashboard
-screenshots, diagrams, and comparison images. Those files are under the same
+screenshots and diagrams. Those files are under the same
 MIT License as the rest of the repository (see [LICENSE](../../LICENSE)).
 
 Five files, the rendered brand artwork, are excluded from the MIT grant:

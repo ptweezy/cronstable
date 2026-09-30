@@ -57,8 +57,9 @@ history.
   exists for a mixed listen set. Startup raises a `ConfigError` whenever any
   routable listener lacks a token. `mcp.allowUnauthenticated: true` is the
   explicit override.
-- Offset paging, not opaque cursors (§5.1): list tools take
-  `offset`/`limit` and return a `nextOffset`. Only the two log-tail tools
+- Offset paging, not opaque cursors (§5.1): `cron_get_status` and
+  `cron_list_jobs` take `offset`/`limit` and return `nextOffset`; other list
+  tools take a clamped `limit`. Only the two log-tail tools
   take a `cursor`, an integer position for polling newly appended lines.
 - Resources and prompts are toolset-scoped (§5.3/§5.4): the `dags` resource
   templates and the `why_did_dag_run_fail` / `backfill_plan` prompts
@@ -74,7 +75,7 @@ history.
   names, workflow names, and recent run keys.
 - TLS is served by the daemon, not only by a reverse proxy (§6): where the
   design text says to terminate TLS/mTLS in a reverse proxy and cites the
-  [HTTP control API](HTTP-API) page for it, `web.listen` now accepts
+  [HTTP control API](HTTP-API) page for it, `web.listen` accepts
   `https://` addresses served from a `web.tls` block, and
   `web.tls.clientCa` makes those listeners require a client certificate.
   That mTLS listener satisfies the fail-closed token gate on its own,

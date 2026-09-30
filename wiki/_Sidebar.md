@@ -34,7 +34,7 @@
   - [Clustering and Leader Election](Clustering-and-Leader-Election)
   - [Job-Set ID](Job-Set-ID)
 - **Integrations**
-  - [Reporting (Mail, Sentry, Shell, Webhook)](Reporting)
+  - [Reporting (Mail, Sentry, Shell, Webhook, Push, Event Log)](Reporting)
   - [Push Notifications](Push-Notifications)
   - [Windows Event Log](Windows-Event-Log)
   - [Metrics with Prometheus](Metrics-with-Prometheus)

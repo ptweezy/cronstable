@@ -29,7 +29,6 @@ FRAGMENT = os.path.join(ROOT, "docs", "demo", "_backend.html")
 # test_logo_engine_extract_matches_the_dashboards_inline_copy)
 ENGINE_JS = os.path.join(ROOT, "docs", "logo-engine.js")
 LAB = os.path.join(ROOT, "docs", "logo-lab.html")
-COMPARISON = os.path.join(ROOT, "docs", "comparison.html")
 # the theme palette those two pages share; the dashboard keeps its own
 # inline copy (self-containment), so the values are pinned by parity below
 PALETTE = os.path.join(ROOT, "docs", "palette.css")
@@ -247,8 +246,7 @@ def test_logo_engine_extract_matches_the_dashboards_inline_copy():
     """The pendulum logo engine has two copies left and one is generated.
 
     The dashboard inlines it (that page must stay a self-contained single
-    file); the logo lab and the comparison page share docs/logo-engine.js
-    via ``<script src>``; the demo mirror's inline copy is generated from
+    file); the logo lab loads docs/logo-engine.js via ``<script src>``; the demo mirror's inline copy is generated from
     the dashboard's by scripts/build_demo.py.  So the only drift still
     possible is dashboard vs the extracted file, and that is what this pins,
     byte for byte.
@@ -281,7 +279,7 @@ def test_logo_engine_extract_matches_the_dashboards_inline_copy():
 
     # and the docs pages actually consume the shared copy, exactly once,
     # instead of quietly regrowing an inline fork
-    for path in (LAB, COMPARISON):
+    for path in (LAB,):
         page = _read(path)
         count = page.count('<script src="logo-engine.js"></script>')
         assert count == 1, (

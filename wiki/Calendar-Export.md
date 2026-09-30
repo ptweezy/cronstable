@@ -19,11 +19,11 @@ Query parameters (values outside the range are clamped):
 | Parameter | Default | Range | Meaning |
 |-----------|---------|-------|---------|
 | `days` | 14 | 1 to 60 | the window: every fire in `[now, now+days)` becomes an event |
-| `per_job` | 100 | 1 to 1000 | event cap per job; a capped job is flagged with an `X-CRONSTABLE-TRUNCATED` line in the feed |
+| `limit` | 100 | 1 to 1000 | event cap per job (`per_job` is accepted as an alias); a capped job is flagged with an `X-CRONSTABLE-TRUNCATED` line in the feed |
 
 ```console
 curl http://localhost:8080/calendar.ics
-curl "http://localhost:8080/calendar.ics?days=30&per_job=20"
+curl "http://localhost:8080/calendar.ics?days=30&limit=20"
 curl http://localhost:8080/jobs/nightly-backup/calendar.ics
 ```
 

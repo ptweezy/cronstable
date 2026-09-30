@@ -13,8 +13,6 @@ See [deviations from cron](#deviations-from-cron) before migrating an
 existing crontab. The loader is implemented in `cronstable/crontabs.py`
 and `cronstable/config.py`.
 
-<a id="how-a-crontab-is-recognised"></a>
-
 ## How a crontab is recognized
 
 The file *name* decides whenever it can:
@@ -25,7 +23,7 @@ The file *name* decides whenever it can:
 | a file named exactly `crontab` (case-insensitive), for example, a `crontab -l > crontab` export | classic crontab |
 | `*.yml`, `*.yaml` | YAML, always; never content-sniffed |
 | anything else, passed explicitly with `-c` or pulled in with `include:` | content-sniffed (described later) |
-| anything else, inside a config directory | skipped, as before |
+| anything else, inside a config directory | skipped |
 
 Name recognition also fires on `/etc/crontab`, but *system* crontabs
 (`/etc/crontab`, `/etc/cron.d`) carry a sixth user column that cronstable
@@ -42,9 +40,9 @@ works even though the file has no telling name. It looks at the first
 meaningful (non-blank, non-comment) line only, and accepts only shapes no
 valid cronstable YAML document can open with: a `NAME=value` assignment, a
 line starting with `@`, or five valid cron fields followed by a command.
-Anything inconclusive is parsed as YAML, so extensionless YAML configs keep
-their exact pre-existing behavior. When in doubt, name the file `*.crontab`
-and the question never arises.
+Anything inconclusive is parsed as YAML, so an extensionless YAML config is
+never mistaken for a crontab. When in doubt, name the file `*.crontab` and the
+question never arises.
 
 A YAML configuration can also pull a crontab in directly:
 
@@ -86,9 +84,11 @@ Specifically:
 - **Entries:** five time fields, then the rest of the line is the command.
   Ranges (`1-5`), steps (`*/5`), lists (`1,15,30`), and month/weekday names
   (`jan`, `mon-fri`) are supported. Day-of-week accepts both `0` and `7` as
-  Sunday. The field dialect is the same built-in cron engine that parses
-  YAML `schedule` strings, so both formats accept identical expressions
-  (see [schedules and time zones](Schedules-and-Timezones)).
+  Sunday. The fields go through the same built-in cron engine that parses
+  YAML `schedule` strings, so both formats share one field dialect; a
+  crontab entry is always five fields (no year or seconds column), and only
+  crontabs accept `@midnight` (see
+  [schedules and time zones](Schedules-and-Timezones)).
 - **Nicknames:** `@reboot`, `@yearly`, `@annually`, `@monthly`, `@weekly`,
   `@daily`, `@midnight`, `@hourly`. `@midnight` is rewritten to its synonym
   `@daily` at load time. `@reboot` behaves exactly like a YAML `@reboot`

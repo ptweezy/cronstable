@@ -36,6 +36,10 @@ For fonts missing the status glyphs, use `--ascii`.
 | `--url URL` | Daemon web listener (default `http://127.0.0.1:8080`). |
 | `--token TOKEN` | Bearer token for `web.authToken`-protected daemons. |
 | `--token-env VAR` | Environment variable to read the token from when `--token` is absent (default `CRONSTABLE_WEB_TOKEN`). |
+| `--cacert PATH` | Verify the server certificate with this CA file instead of the system trust store (default `CRONSTABLE_WEB_CACERT` if set). |
+| `--client-cert PATH` | Client certificate for a listener that requires one through `web.tls.clientCa` (default `CRONSTABLE_WEB_CLIENT_CERT` if set). |
+| `--client-key PATH` | Private key for `--client-cert` (default `CRONSTABLE_WEB_CLIENT_KEY` if set). |
+| `--insecure` | Disable TLS certificate verification, which can expose the bearer token to an untrusted server (same as `CRONSTABLE_WEB_INSECURE=1`). |
 | `--theme NAME` | Start on a theme (`standard`, `carolina`, `amber`, `green`, `modern`, each also as `NAME-light`). The choice persists (default: remembered, else `standard`). |
 | `--tv` | Start on the wallboard, like opening the page at `#tv`. |
 | `--job NAME` | Open a job's drawer at startup, like `#job/NAME`. |
@@ -75,8 +79,6 @@ Inside the **Logs** tab, `f`/`t`/`w` toggle follow/timestamps/wrap;
 log to your home directory as
 `cronstable-<job>-<YYYYmmdd-HHMMSS>.log` (a toast confirms the exact
 path).
-
-<a id="what-made-the-trip"></a>
 
 ## Features
 
@@ -176,27 +178,29 @@ a row. `Enter`, `Space`, `←` or `→` cycle or toggle the selected value.
 Every change saves immediately to the preferences file, whose path the panel's
 footer shows.
 
-The panel has twelve rows. **Theme**, **Light / dark**, **Color
+The panel has thirteen rows. **Theme**, **Light / dark**, **Color
 vision**, and **ASCII glyphs** are the
 [themes and accessibility](#themes-and-accessibility) settings described
 earlier. **Refresh interval** is the `--poll` cadence, 1s–10s or paused.
 **Wrap log lines** and **Log timestamps** are the **Logs** tab's `w`/`t`
-toggles. **Audible cues (bell)** is off by default. The panel also has
-**Boot self-test**. Two rows live only here:
+toggles. **Audible cues (bell)** is off by default. **Startup checks**
+turns the boot self-test on or off (also in the palette as "Toggle
+startup checks"). **Compact density** drops the schedule and sparkline
+columns from the jobs board so the rest fits a narrower terminal (also
+in the palette as "Toggle compact density"). Three rows live only here:
 
-- **Compact density** drops the schedule and sparkline columns from
-  the jobs board so the rest fits a narrower terminal (also in the
-  palette as "Toggle compact density").
 - **Zen screensaver** and **Zen idle** govern the wallboard's
-  screensaver. On a board (nothing failing or running, data fresh), it
-  engages after the keyboard has been idle for the **Zen idle**
+  screensaver. On an idle board (nothing failing or running, data fresh),
+  it engages after the keyboard has been idle for the **Zen idle**
   interval: 30, 60, 90, 120, or 300 seconds, default 90. Any key wakes
   it without acting.
+- **Living logo** animates the logo mark. With it off, the mark holds
+  still.
 
 ## Clipboard
 
 The copy actions are `c` on a job, the palette's "Copy version" and
-"Copy job set id", and the incident writeup. Each takes two paths at
+"Copy job-set ID", and the incident writeup. Each takes two paths at
 once: an OSC 52 escape asking the terminal emulator itself to set the
 system clipboard, plus the platform's copy tool (`clip.exe` on Windows,
 `pbcopy` on macOS, `wl-copy` or `xclip` on Linux, whichever is

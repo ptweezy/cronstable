@@ -6,9 +6,8 @@ the Kubernetes `Deployment` manifest, building a custom image from the published
 image, and the few cases that require a writable path. The published Docker
 image is Linux-only. See [installation](Installation) for the package/binary
 install methods and the [HTTP control API](HTTP-API) for the optional web
-interface. For native Windows deployment with the
-`cronstable-windows-amd64.exe` / `cronstable-windows-arm64.exe` /
-`cronstable-windows-i686.exe` binaries, see
+interface. For native Windows deployment (the MSI, winget, the
+one-directory zip, or the standalone `.exe`), see
 [running on Windows](Running-on-Windows).
 
 ## Why cronstable fits a locked-down pod
@@ -29,8 +28,8 @@ published image. If you do not use that feature, drop root entirely. See
 ## The published image
 
 Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386`,
-`linux/arm/v7`, `linux/ppc64le`, and `linux/s390x`) images are published to the
-GitHub Container Registry on every release.
+`linux/arm/v7`, `linux/ppc64le`, `linux/s390x`, and `linux/riscv64`) images are
+published to the GitHub Container Registry on every release.
 
 For compatible x86-64-v3 hosts, **the explicit `-amd64v3` tags are recommended**
 (for example, `latest-amd64v3` and `latest-alpine-amd64v3`). Existing tags
@@ -42,7 +41,7 @@ See [CPU requirements and variant selection](Installation#amd64v3-cpu-requiremen
 | Property | Value |
 | --- | --- |
 | Registry/image | `ghcr.io/ptweezy/cronstable` |
-| Tags | the release version (for example, `1.0.4`), plus `latest` |
+| Tags | the release version (for example, `1.2.60`), plus `latest` |
 | Base | `python:3.14-slim` (multi-stage; runtime stage copies a self-contained venv) |
 | User | `65534:65534` (`nobody`), set with `USER` in the `Dockerfile` |
 | Entrypoint | `cronstable` |
@@ -70,7 +69,7 @@ docker run --rm \
 ```
 
 For production, pin a specific version instead of `latest`
-(for example, `ghcr.io/ptweezy/cronstable:1.0.4`).
+(for example, `ghcr.io/ptweezy/cronstable:1.2.60`).
 
 ### Baking config into your own image
 
@@ -220,8 +219,8 @@ separate from the optional web API port, so plan the pod network for it:
 
 On the [web API](HTTP-API), cronstable serves a `GET /version` that returns
 `200` after the daemon is up, which makes a cheap liveness probe. Enable an
-`http://` [web listener](HTTP-API) (for example `web.listen: ["http://0.0.0.0:8080"]`)
-and point the probe at it:
+`http://` [web listener](HTTP-API) (for example, a `web.listen` entry of
+`http://0.0.0.0:8080`) and point the probe at it:
 
 ```yaml
           ports:
@@ -238,7 +237,8 @@ and point the probe at it:
 If you protect the web API with a `web.authToken`, only the dashboard page (`/`)
 stays unauthenticated, so `/version` returns `401` without the bearer
 token. Either add the `Authorization` header to the probe
-(`httpGet.httpHeaders`) or point it at `/`.
+(`httpGet.httpHeaders`) or point it at `/` (when the dashboard is enabled; with
+`web.ui: false` there is no `/` route).
 
 For clustered deployments, do **not** turn quorum loss into a pod restart: a
 `livenessProbe` that fails on lost quorum would restart exactly the nodes you
@@ -340,12 +340,16 @@ the `electLeader` 2-node rejection. See
 ## Writable-path exceptions
 
 A read-only root filesystem is sufficient for the published image in the normal
-case. Two features need a small writable mount.
+case. Two features need a small writable mount, described in the following
+sections. The durable state store (`state.path`) and the filesystem election
+backend also need a writable volume, as does an out-of-cluster kubeconfig that
+embeds `client-certificate-data`/`client-key-data` (set `TMPDIR` to a writable
+mount).
 
 ### 1. Unix-socket web interface
 
 If you enable the optional [HTTP control API](HTTP-API) on a Unix socket
-(`web.listen: [unix:///path/cronstable.sock]`), cronstable binds a `UnixSite` and
+(a `web.listen` entry such as `unix:///path/cronstable.sock`), cronstable binds a `UnixSite` and
 creates the socket file at that path, a write. Point the socket at a small
 writable volume (a Kubernetes `emptyDir`) rather than the root filesystem:
 
@@ -364,7 +368,7 @@ writable volume (a Kubernetes `emptyDir`) rather than the root filesystem:
           emptyDir: {}
 ```
 
-with `web.listen: [unix:///run/cronstable/cronstable.sock]` in your
+with `unix:///run/cronstable/cronstable.sock` as a `web.listen` entry in your
 configuration. (TCP listeners such as `http://0.0.0.0:8080` need no writable
 path.) The optional `web.socketMode` config key, if set, `chmod`s the socket
 after bind.

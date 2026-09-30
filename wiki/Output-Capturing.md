@@ -40,7 +40,7 @@ strictyaml schema and `DEFAULT_CONFIG`.
 | `captureStderr` | boolean | `true` | Capture the job's standard error: read, prefix, re-emit to cronstable's stderr, and retain for reports/failure checks. |
 | `streamPrefix` | string | `"[{job_name} {stream_name}] "` | Format string prepended to each re-emitted captured line. Supports `{job_name}` and `{stream_name}`. Set to `""` to disable. |
 | `saveLimit` | integer | `4096` | Maximum lines retained per captured stream for reporting. Must be `>= 0`. `0` retains nothing but still counts discarded lines. |
-| `maxLineLength` | integer | `16777216` (16 MiB) | Maximum bytes the asyncio reader buffers per line. Must be `> 0`. Lines exceeding it are skipped with a warning. |
+| `maxLineLength` | integer | `16777216` (16 MiB) | Maximum length of one captured line, in bytes. Must be `> 0`. Lines exceeding it are skipped with a warning. |
 
 `saveLimit` and `maxLineLength` are validated at config load time. A non-integer
 fails the strictyaml schema, and `saveLimit < 0` or `maxLineLength <= 0` raises
@@ -50,14 +50,20 @@ a `ConfigError`.
 
 When a stream is captured, cronstable launches the subprocess with that stream
 connected to a pipe (`asyncio.subprocess.PIPE`) and starts a `StreamReader` task
-that loops over `readline()`. For each line:
+that reads the pipe in 64 KiB chunks (`stream.read(65536)`) and splits them on
+newlines. For each line:
 
-1. The raw bytes are decoded with `"utf-8"` and `errors="replace"`, so a job
-   that emits non-UTF-8 bytes does not crash the reader. Invalid sequences
-   become the Unicode replacement character.
-2. The decoded line, with `streamPrefix` formatted and prepended, is written to
-   cronstable's own stdout (for stdout lines) or stderr (for stderr lines) and
-   flushed. Job stderr is written to cronstable's stderr, never to stdout.
+1. The raw bytes are decoded as strict UTF-8. On Windows, a line that is not
+   valid UTF-8 is retried with the console's OEM code page. Anything still
+   undecodable is decoded as UTF-8 with `errors="replace"`, so a job that
+   emits invalid bytes does not crash the reader. Invalid sequences become
+   the Unicode replacement character.
+2. The decoded line, with `streamPrefix` formatted and prepended, is queued
+   for cronstable's own stdout (for stdout lines) or stderr (for stderr
+   lines). The queued lines go in batches to one mirror writer thread, so a
+   stalled consumer of cronstable's output cannot block the scheduler; while
+   the consumer stays stalled, the oldest batches are dropped. Job stderr is written to
+   cronstable's stderr, never to stdout.
 3. The (unprefixed) line is retained according to `saveLimit`.
 
 If a stream is not captured, no pipe is created for it and no `StreamReader` is
@@ -65,11 +71,12 @@ started. The child inherits cronstable's corresponding file descriptor.
 
 ### Encoding of re-emitted lines
 
-Re-emitted lines are written as encoded bytes to the underlying buffer so
-cronstable controls the encoding. If the console encoding cannot represent the text
-(`UnicodeEncodeError`), cronstable falls back to encoding as ASCII with
-replacement. Retained output (used in reports) is the UTF-8/`replace`-decoded
-string and is unaffected by this console fallback.
+Re-emitted lines are written as encoded bytes to the underlying buffer, in the
+stream's own declared encoding with `errors="replace"`, so a character that
+encoding cannot represent becomes `?`. cronstable falls back to ASCII with
+replacement only when the stream's encoding is unknown or broken. Retained
+output (used in reports) is the decoded string and is unaffected by this
+encoding step.
 
 ## streamPrefix
 
@@ -142,17 +149,19 @@ matters for failure detection (described later).
 
 ## maxLineLength
 
-`maxLineLength` (default 16 MiB) is passed as the `limit` to the asyncio stream
-reader when either stream is captured. It bounds how many bytes the reader
-buffers for a single line. If a line exceeds this limit, `readline()` raises a
-`ValueError`, which the `StreamReader` catches. The reader logs a warning
+`maxLineLength` (default 16 MiB) caps one line's length in bytes, measured
+before decoding. The `StreamReader` enforces it with its own length check. The
+asyncio `limit` set at spawn is the 64 KiB read chunk size, which only sets how
+much unread output asyncio buffers per pipe. When a line, or a run of output
+with no newline yet, grows past the cap, the reader drops it and logs a warning
 
 ```
 job <name>: ignored a very long line
 ```
 
-and continues reading the next line. The oversized line is neither retained nor
-re-emitted, and is **not** counted as a discarded line.
+and keeps reading; whatever follows the dropped bytes is read as an ordinary
+line. The oversized line is neither retained nor re-emitted, and is **not**
+counted as a discarded line.
 
 ## Interaction with failure detection
 
@@ -201,7 +210,7 @@ jobs:
 
 ## See also
 
-- [Reporting (Mail, Sentry, Shell, Webhook)](Reporting): how captured `stdout`/`stderr`
+- [Reporting (Mail, Sentry, Shell, Webhook, Push, Event Log)](Reporting): how captured `stdout`/`stderr`
   appear in report templates and shell-reporter environment variables.
 - [Failure Detection and Retries](Failure-Detection-and-Retries):
   `failsWhen.producesStdout` / `producesStderr`.

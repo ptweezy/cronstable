@@ -18,7 +18,7 @@ web:
 $ curl http://127.0.0.1:8080/metrics
 # HELP cronstable_info cronstable build information.
 # TYPE cronstable_info gauge
-cronstable_info{version="1.0.13"} 1
+cronstable_info{version="1.2.60"} 1
 ...
 ```
 
@@ -127,35 +127,38 @@ Emitted when a [durable state store](Durable-State) is configured (a `state:` se
 | Metric | Type | Description |
 | --- | --- | --- |
 | `cronstable_state_info{backend, topology}` | gauge (info) | Static store facts: the backend implementation (`filesystem`) and the effective topology (`single-node` / `shared`, after `topology: auto` resolves); always `1`. |
-| `cronstable_state_ops_total{op}` | counter | Store operations by kind: `op="append"` / `"list"` / `"derive-max"` / `"prune"` / `"lease-acquire"` / `"lease-renew"` / `"lease-release"` / `"lease-read"` / `"start"` / `"gc"`. Each `op` value appears after that operation has first run. |
+| `cronstable_state_ops_total{op}` | counter | Store operations by kind, for example `op="append"` / `"list"` / `"derive-max"` / `"prune"` / `"lease-acquire"` / `"lease-renew"` / `"lease-release"` / `"lease-read"` / `"start"` / `"gc"`. Each `op` value appears after that operation has first run. |
 | `cronstable_state_op_errors_total{op}` | counter | Store operations that raised, same `op` label. |
 | `cronstable_state_op_seconds_total{op}` | counter | Seconds spent inside store operations. For mean in-store latency per operation, divide by `cronstable_state_ops_total`, for example `rate()` over `rate()`. |
 | `cronstable_state_lock_acquisitions_total` | counter | Advisory-lock acquisitions by the store. Emitted after it goes nonzero. |
 | `cronstable_state_lock_wait_seconds_total` | counter | Seconds spent waiting to acquire the store's advisory locks: the lock-contention signal. Emitted alongside `cronstable_state_lock_acquisitions_total`. |
 | `cronstable_state_throttled_ops_total` | counter | Store operations delayed by the `state.maxOpsPerSecond` token bucket. Emitted after it goes nonzero. |
 | `cronstable_state_throttle_wait_seconds_total` | counter | Seconds those operations spent queued behind the rate limit. Emitted alongside `cronstable_state_throttled_ops_total`. |
-| `cronstable_state_dropped_writes_total{kind}` | counter | Durable writes that failed and were dropped (with a logged warning), by `kind="run-record"` / `"checkpoint"` / `"retry"` / `"reboot-marker"` / `"counters"` / `"manifest"`. Writes are fire-and-forget under either `onStoreUnavailable` policy. Emitted after it goes nonzero: the single most alertable state signal. |
+| `cronstable_state_dropped_writes_total{kind}` | counter | Durable writes that failed and were dropped (with a logged warning), by `kind="run-record"` / `"checkpoint"` / `"retry"` / `"reboot-marker"` / `"counters"` / `"manifest"` / `"inflight"` / `"pause"` / `"overflow"` (a write shed because 8192 were already pending). Writes are fire-and-forget under either `onStoreUnavailable` policy. Emitted after it goes nonzero: the single most alertable state signal. |
+| `cronstable_state_workers_inflight{lane}` | gauge | State worker threads in flight per lane, `lane="bulk"` / `"lease"`. Sustained at capacity signals a slow or wedged mount. |
+| `cronstable_state_workers_capacity{lane}` | gauge | Worker-thread concurrency cap per lane. |
+| `cronstable_state_workers_peak{lane}` | gauge | Highest number of worker threads in flight per lane. |
 
 If reading the store's stats fails during a scrape, the state families are omitted from that scrape, with the error logged, rather than the scrape failing. The following cluster block follows the same degradation contract. `cronstable_state_dropped_writes_total` is the exception: the scheduler accumulates it as it drops writes, and it is not read from the store, so it keeps being served even when the store itself cannot be read.
 
 ### Cluster
 
-Emitted when a [cluster](Clustering-and-Leader-Election) is configured. The values mirror the pre-derived fields of [`GET /cluster`](HTTP-API#get-cluster), so the same alert rules documented there apply.
+`cronstable_cluster_enabled` is always present (`0` with no cluster section or a failed backend). The rest of the block appears while a [cluster](Clustering-and-Leader-Election) backend runs. The values mirror the pre-derived fields of [`GET /cluster`](HTTP-API#get-cluster), so the same alert rules documented there apply.
 
 | Metric | Type | Description |
 | --- | --- | --- |
 | `cronstable_cluster_enabled` | gauge | `1` when a leadership backend is running on this node (`0` also covers a configured backend that failed to start). |
-| `cronstable_cluster_info{backend, node_name, distribution}` | gauge (info) | Backend (`gossip`/`kubernetes`/`etcd`), this node's name, and the ownership distribution; always `1`. |
+| `cronstable_cluster_info{backend, node_name, distribution}` | gauge (info) | Backend (`gossip`/`kubernetes`/`etcd`/`filesystem`), this node's name, and the ownership distribution; always `1`. |
 | `cronstable_cluster_size` / `cronstable_cluster_quorum` | gauge | Effective cluster size N and the quorum threshold (lease backends report `1`/`1`). |
 | `cronstable_cluster_quorate` | gauge | Whether this node is part of a quorum: the single most alertable cluster signal. |
 | `cronstable_cluster_is_leader` | gauge | Whether this node holds scheduled-job leadership. Always `0` under `distribution: spread` (ownership is per job there), mirroring `GET /cluster`. |
 | `cronstable_cluster_leader_info{leader}` | gauge (info) | The observed leader's name; absent when there is none. |
-| `cronstable_cluster_conflict{kind}` | gauge | The three fail-closed conflict gates, `kind="nodename"` / `"size"` / `"policy"`. Any `1` means Leader jobs are standing down cluster-wide. |
+| `cronstable_cluster_conflict{kind}` | gauge | The three fail-closed conflict gates, `kind="nodename"` / `"size"` / `"policy"`. Any `1` means this node's `Leader` jobs are standing down. |
 | `cronstable_cluster_peers{status}` | gauge | Gossip backend only: configured peers by observed status (`agreed`, `syncing`, `drifted`, `unreachable`, `untrusted`, `conflict`, `self`, `unknown`), zero-filled so alert series never vanish. |
 | `cronstable_cluster_leader_transitions_total` | counter | Times this node acquired or lost leadership. Observed at scheduler cadence (once per minute), so a flap shorter than a scheduler tick may be missed. Emitted only when `electLeader` is on (an observe-only cluster has no leadership to transition). |
 | `cronstable_cluster_quorum_transitions_total` | counter | Times this node joined or left quorum (same cadence and `electLeader` caveats). |
 
-If a backend read fails during a scrape, the cluster block degrades to `cronstable_cluster_enabled` alone (with the error logged by the `prometheus` logger) rather than the whole scrape failing.
+If a backend read fails during a scrape, the cluster block degrades to `cronstable_cluster_enabled` and the transition counters (with the error logged by the `prometheus` logger) rather than the whole scrape failing.
 
 ## Semantics and guarantees
 
@@ -163,7 +166,7 @@ If a backend read fails during a scrape, the cluster block degrades to `cronstab
 - **Counters agree with the API.** `cronstable_job_runs_total` increments at the exact point a run enters the run history (`GET /jobs/{name}/runs`), so the two surfaces can never disagree on outcomes.
 - **Counters survive reloads. With durable state, they survive restarts.** The accumulators live on the daemon, not the web app, so even a configuration reload that restarts the web server or the cluster manager keeps them. Without a `state:` section, a process restart resets them, which is normal for Prometheus counters. With a [durable state store](Durable-State) configured, the per-job counters are snapshotted durably and seeded back on boot for the jobs still in the configuration:
 
-  - Counters covered: runs by outcome, retries, permanent and start failures, the duration histogram, and the last success/failure timestamps.
+  - Counters covered: runs by outcome, retries, permanent and start failures, the duration histogram, the last success/failure timestamps, and the SLA breach counters.
   - Cadence: at most one write per 15 seconds while running, plus a final snapshot on clean shutdown.
   - Histograms: seeded only if the `durationBuckets` bounds are unchanged.
 
@@ -178,28 +181,30 @@ groups:
   - name: cronstable
     rules:
       # a job's most recent run failed
-      - alert: YacronJobFailed
+      - alert: CronstableJobFailed
         expr: cronstable_job_last_run_success == 0
         for: 5m
       # a job that should run hourly has not succeeded for 2 hours
-      - alert: YacronJobStale
+      - alert: CronstableJobStale
         expr: time() - cronstable_job_last_success_timestamp_seconds > 7200
       # the config file on disk is broken; the daemon is running stale config
-      - alert: YacronConfigBroken
+      - alert: CronstableConfigBroken
         expr: cronstable_config_last_reload_successful == 0
         for: 10m
-      # the cluster cannot elect a leader: Leader jobs are not running anywhere
-      - alert: YacronClusterNotQuorate
+      # this node has lost quorum (gossip) or cannot reach the lease store;
+      # its Leader jobs are standing down
+      - alert: CronstableClusterNotQuorate
         expr: cronstable_cluster_quorate == 0
         for: 5m
       # more than one node believes it is the leader (split-brain)
-      - alert: YacronMultipleLeaders
+      # (inert under distribution: spread; compare clusterOwner instead)
+      - alert: CronstableMultipleLeaders
         expr: sum(cronstable_cluster_is_leader) > 1
 ```
 
 The [clustering monitoring guide](Clustering-and-Leader-Election#monitoring-and-alerting) discusses the cluster signals in depth.
 
-The preceding staleness rule (`YacronJobStale`) is the external backstop to pair with per-job [late-run detection](Late-Run-Detection). The in-process `sla:` monitor gives per-job thresholds and rich `onLate` notifications, but it stops with the daemon. A Prometheus rule on `time() - cronstable_job_last_success_timestamp_seconds`, plus `up == 0` on the scrape itself, still fires when the daemon, its host, or its network is gone.
+The preceding staleness rule (`CronstableJobStale`) is the external backstop to pair with per-job [late-run detection](Late-Run-Detection). The in-process `sla:` monitor gives per-job thresholds and rich `onLate` notifications, but it stops with the daemon. A Prometheus rule on `time() - cronstable_job_last_success_timestamp_seconds`, plus `up == 0` on the scrape itself, still fires when the daemon, its host, or its network is gone.
 
 ## See also
 

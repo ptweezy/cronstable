@@ -29,17 +29,17 @@ Any other value raises `ConfigError("invalid schedule: ...")`.
 The crontab dialect is implemented by cronstable's own built-in engine (`cronstable/cronexpr.py`, no third-party dependency). Field syntax is the dialect cronstable has always accepted, not the system `cron(5)` man page. It takes ranges `1-5`, steps `*/5` (and `5/15`: start plus step, running to the field's end), lists `1,15,30`, and case-insensitive names like `mon`/`jan`. The notable rules:
 
 - **Day-of-week** accepts `0`–`7`, with both `0` and `7` meaning Sunday. A range ending in `0` wraps its end to Sunday-as-7, so `sat-sun` and `6-0` mean Saturday+Sunday.
-- **`L`** alone in day-of-month is the month's last day (`0 0 L * *`); `L<n>` in day-of-week is the month's *last* such weekday (`L5` = last Friday). No other field takes an `L`.
+- **`L`** alone in day-of-month is the month's last day (`0 0 L * *`); `L<n>` (or a numeric range `L<a>-<b>`) in day-of-week is the month's *last* such weekday (`L5` = last Friday). No other field takes an `L`.
 - **Business-day forms**: in day-of-month, `L-<n>` counts back from the month's final day (`L-3` = three days before it), `<n>W` is the weekday nearest day *n* within the same month, and `LW` is the month's last weekday. In day-of-week, `<d>#<n>` is the month's *n*-th such weekday (`5#3` = third Friday, `mon#1` = first Monday). Exact edge rules, examples, and Quartz porting notes: [business-day schedules](Business-Day-Schedules).
 - **`?`** standing alone in day-of-month or day-of-week reads as `*` (the Quartz spelling of "unrestricted"), so a seven-field Quartz expression (whose column layout matches cronstable's) parses verbatim. `?` anywhere else is an error.
 - **Day-of-month AND day-of-week**: when both are restricted, a day must satisfy *both* (`0 0 13 * 5` fires only on Friday the 13th). Vixie cron fires when *either* matches; cronstable deliberately keeps the AND rule its schedules have always had. The [schedule linter](Schedule-Linting) warns whenever a schedule uses the combination.
-- **`year`** accepts 1970–2099, and `next()` never searches past 2099: a schedule with no remaining occurrence (`year: "2020"`, or an impossible date like Feb 30) never fires. It is legal (a fixed past year is a working idiom for parking a job), but it is no longer silent. Config load logs a `never-fires` warning, the scheduler warns once at seed time, and `/status` and `/jobs` report `never_fires` (see [schedule linting](Schedule-Linting)).
+- **`year`** accepts 1970–2099, and `next()` never searches past 2099: a schedule with no remaining occurrence (`year: "2020"`, or an impossible date like Feb 30) never fires. It is legal (a fixed past year is a working idiom for parking a job), and it is reported: config load logs a `never-fires` warning, the scheduler warns once at seed time, and `/status` and `/jobs` report `never_fires` (see [schedule linting](Schedule-Linting)).
 
-Earlier releases delegated this dialect to the third-party parse-crontab library. The built-in engine is behavior-compatible with it, vector-by-vector. See `tests/gen_cron_golden.py` and `tests/data/cron_golden.json` for the recorded compatibility corpus.
+The built-in engine is behavior-compatible with the third-party parse-crontab library, vector-by-vector. See `tests/gen_cron_golden.py` and `tests/data/cron_golden.json` for the recorded compatibility corpus.
 
 Expressions in **other dialects** fail with a hint instead of a bare field error:
 
-- `#` or `W` outside its one valid field: the hint names the right field. Both are dialect now, in day-of-week and day-of-month respectively.
+- `#` or `W` outside its one valid field: the hint names the right field. `#` is valid in day-of-week and `W` in day-of-month.
 - Quartz's trailing-L (`5L`): the hint points at this dialect's `L5` spelling.
 - A six-field seconds-first Quartz layout (`0 */5 * * * ?`): the hint explains that cronstable's sixth field is a year, and how to convert it (append a trailing `*`).
 
@@ -88,11 +88,11 @@ jobs:
       second: "*/15"
 ```
 
-The `second` field takes the same syntax as any other (`*`, `*/5`, `0,30`, `10-20`), and `second: "*"` fires every second. While **any enabled job** specifies seconds, the scheduler switches from its once-a-minute cadence to once-a-second (see [how the scheduler ticks](#how-the-scheduler-ticks)). When none do, the original minute cadence and its zero overhead are retained. Minute-granular jobs are unaffected either way: they still fire exactly once in their scheduled minute. Second-level scheduling is a YAML-only feature: [classic crontab files](Classic-Crontabs) stay five-field and minute-granular.
+The `second` field takes the same syntax as any other (`*`, `*/5`, `0,30`, `10-20`), and `second: "*"` fires every second. While **any enabled job** specifies seconds, the scheduler wakes at each second boundary a schedule pins instead of once a minute (see [how the scheduler ticks](#how-the-scheduler-ticks)). When none do, it keeps the minute cadence and its zero overhead. Minute-granular jobs are unaffected either way: they still fire exactly once in their scheduled minute. Second-level scheduling is a YAML-only feature: [classic crontab files](Classic-Crontabs) stay five-field and minute-granular.
 
 ## Form 2: `@reboot`
 
-The exact string `"@reboot"` is stored as-is (not parsed into a `CronTab`). A `@reboot` job runs **only once, at daemon startup**, and never on a recurring schedule.
+The exact string `"@reboot"` is stored as-is (not parsed into a `CronTab`). A `@reboot` job runs **only once, at daemon startup**, and never on a recurring schedule. With a `state` section it runs once per host boot: restarting the daemon without rebooting the host does not rerun it. See [durable state](Durable-State).
 
 ```yaml
 jobs:
@@ -101,7 +101,7 @@ jobs:
     schedule: "@reboot"
 ```
 
-Behavior comes from `Cron.job_should_run` (`cronstable/cron.py`). On the first scheduler pass the `startup` flag is `True` and a `@reboot` job returns `True`. On every subsequent pass `startup` is `False`, so `@reboot` jobs return `False`. Conversely, `CronTab`-scheduled jobs return `False` during the startup pass and are only evaluated on later passes. There is no recurring `@reboot`.
+Behavior comes from `Cron.job_should_run` (`cronstable/cron.py`). On the first scheduler pass the `startup` flag is `True` and a `@reboot` job returns `True`. On every subsequent pass `startup` is `False`, so `@reboot` jobs return `False`. Conversely, `CronTab`-scheduled jobs return `False` during the startup pass and are only evaluated on later passes. There is no recurring `@reboot`. With a `state` section, a durable boot marker also skips the startup run when this host boot already had one.
 
 To keep a long-running process alive, `README.md` recommends a `@reboot` schedule combined with `onFailure.retry.maximumRetries: -1` (retry forever), so cronstable relaunches the process whenever it exits or fails.
 
@@ -135,7 +135,7 @@ jobs:
 
 Only the columns you use are emitted, matching the engine's end-column rule from [Form 1](#form-1-crontab-string-5-6-or-7-fields):
 
-- neither `second` nor `year` → a five-field line (`f"{minute} {hour} {day} {month} {dow}"`), exactly as before;
+- neither `second` nor `year` → a five-field line (`f"{minute} {hour} {day} {month} {dow}"`);
 - `year` only → a six-field line with the trailing year column;
 - `second` present → a full seven-field line (`year` defaults to `*` if unset).
 
@@ -155,13 +155,7 @@ schedule:
   year: "2017"
 ```
 
-> **Upgrade note (breaking for object-form `year`).** Earlier releases accepted `year` in the schema but silently dropped it when building the crontab string, so it had no effect: a job with an object-form `year` ran every year. It is **now honored**.
->
-> If you have such a job, upgrading changes its behavior. `year: "2017"` now pins the schedule to 2017 (a past year means the job stops firing).
->
-> Honoring `year` also changes that job's [job-set fingerprint](Configuration-Reference). During a rolling upgrade of a cluster, the old and new binaries compute different `job_set_id`s for the identical config, and they do not treat each other as agreed peers until every node is upgraded (the same transient, self-healing drift as any config rollout, and leader election stays at-most-once throughout).
->
-> Jobs that do **not** use object-form `year` are unaffected: their fingerprint is byte-for-byte identical to before. To keep the old "runs every year" behavior, remove the `year` key.
+A past `year` means the job never fires again. To run the schedule every year, omit the `year` key.
 
 ## Timezone resolution
 
@@ -180,7 +174,7 @@ Resolution order (`timezone` wins):
 
 The resolved value is a `datetime.tzinfo` (or `None`) stored on the job and passed to `get_now(job.timezone)` when the schedule is tested. Because `utc` is `true` by default, **schedules are interpreted in UTC unless you opt out.**
 
-Time zone names are resolved through the standard-library `zoneinfo`, with the `tzdata` package providing the database. Because cronstable depends on `tzdata>=2024.1`, resolution works on minimal and distroless images that lack a system zoneinfo database. (Before the migration documented in `HISTORY.md`, cronstable used `pytz`. Invalid time zones now raise `ConfigError` rather than being silently accepted.)
+Time zone names are resolved through the standard-library `zoneinfo`, with the `tzdata` package providing the database. Because cronstable depends on `tzdata>=2026.4`, resolution works on minimal and distroless images that lack a system zoneinfo database. An invalid time zone name raises `ConfigError`.
 
 Local time:
 
@@ -210,7 +204,7 @@ The scheduler does not run a per-job timer, and it does not scan every job on a 
 
 - **The next-fire index.** Every enabled `CronTab` job carries the instant it next fires: an aware **UTC** datetime in `Cron._next_fire`, mirrored into the `_fire_heap` min-heap. Each instant is computed by `crontab.next()` in the job's *own* frame (its `timezone`, or `LOCAL_ZONE`, the host's local clock, when it has none) and stored back in UTC. So a job's DST offset is handled where it applies, and the heap still orders everything on one absolute timeline. `@reboot` and disabled jobs are not in the index.
 - **Sleep until the soonest fire.** Each iteration sleeps until the earliest instant in the heap, capped at the next whole UTC minute so housekeeping (described later) still runs about once a minute. On wake, `_due_names` pops only the jobs whose instant has arrived, and nothing else is touched. An idle wake over a large fleet is an O(1) heap peek, and a wake with a due cohort does crontab work only for that cohort. Cost scales with **jobs due**, not jobs configured.
-- **Structural, forward-only de-duplication.** A fired slot cannot fire twice because advancing the index moves the job's next fire strictly *past* the slot it just fired (`_advance` → `_set_next_fire`). There is no per-tick already-fired check: `_last_run_slot` is retained only for status and introspection, and no longer gates launching. So a minute-level job fires exactly once in its minute, and a second-level job exactly once per matching second, however often the loop wakes.
+- **Structural, forward-only de-duplication.** A fired slot cannot fire twice because advancing the index moves the job's next fire strictly *past* the slot it just fired (`_advance` → `_set_next_fire`). There is no per-tick already-fired check: `_last_run_slot` is retained only for status and introspection, and does not gate launching. So a minute-level job fires exactly once in its minute, and a second-level job exactly once per matching second, however often the loop wakes.
 - **Immune to clock steps.** The sleep length is derived from the wall clock but realized against the event loop's **monotonic** clock (`asyncio.wait_for`), and firing compares the wall clock against the fixed, forward-only instants in the heap. So a wall-clock or NTP step is absorbed on the next wake. A step **backward** defers the pending fire (it is not re-fired), and a step **forward** does not cause a catch-up storm (see the next item).
 - **Bounded catch-up.** If a job's due instant is less than `CATCHUP_LIMIT` (10 s) behind, as happens on a slow pass such as many simultaneous launches or the once-a-minute config reload, `_advance` replays each missed occurrence in the window. A gap of at least 10 s counts as a stall, suspend, or forward clock jump: the job resumes at the current slot (firing once only if *now* itself matches) and resyncs in O(1) with a warning. Stateful jobs with `onMissed: run-once` or `run-all` also queue background recovery for skipped slots, using the [durable catch-up safeguards](Durable-State#missed-run-catch-up). The scheduling pass never enumerates a long missed window. This applies to minute- and second-level jobs.
 - **No spurious run for the period in progress at startup.** At startup the index is seeded **strictly-future** (the first boundary *after* the start instant) for every scheduled job, so a job whose minute or second is already under way does not fire immediately. It first fires at the next matching boundary. `@reboot` jobs are unaffected and still fire once at startup.
@@ -219,7 +213,7 @@ The scheduler does not run a per-job timer, and it does not scan every job on a 
 Implications:
 
 - **Second-level schedules fire on time.** With a `second` field the loop wakes exactly at each second boundary the schedule pins, so `*/15 * * * * * *` fires at seconds 0/15/30/45.
-- **No cost when unused.** With no second-level job the effective cadence is still about once a minute. Housekeeping (config reload, cluster and web upkeep, and logging) is gated to run at most once per wall-clock minute (`Cron._needs_subminute()` is `True` only while some enabled job pins a `second`). So a second-level job that wakes the loop many times a minute does not reread and reparse the config on every wake.
+- **No cost when unused.** With no second-level job the effective cadence is still about once a minute. Housekeeping (config reload, cluster and web upkeep, and logging) is gated to run at most once per wall-clock minute (`Cron._wakes_subminute()` is `True` while a second-level job or a pending DAG wake shortens the sleep). So a second-level job that wakes the loop many times a minute does not reread and reparse the config on every wake.
 - A job whose schedule matches a given slot fires at most once for that slot. If multiple instances would overlap, [`concurrencyPolicy`](Concurrency-and-Timeouts) governs the outcome.
 - A job that is [disabled](Configuration-Reference) (`enabled: false`) returns `False` from `job_should_run` regardless of schedule and never fires, including at `@reboot`. A disabled second-level job is also absent from the next-fire index, so it adds no scheduling cost.
 

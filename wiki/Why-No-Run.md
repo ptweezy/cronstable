@@ -58,8 +58,6 @@ and after the timestamp, computed in the job's time zone.
   replaced by its hashed values. `allowed` names the concrete slot, so
   "minute 0 is not in 16" tells you where the hash landed.
 
-<a id="when-the-answer-is-genuinely-surprising"></a>
-
 ## Day-field and daylight saving rules
 
 Two scheduling semantics produce misses (or odd runs) that look like

@@ -27,8 +27,10 @@ Both parameters are optional: `hours` is 1 to 168 (default 24), and `tz` sets th
 | `by_hour` | Scheduled runs per hour row. |
 | `busiest_minute` | `{minute, jobs, fires}`: the "37 jobs are scheduled at :00" headline. |
 | `empty_minutes` | The minutes of the hour with no scheduled runs. |
-| `top_cells` | The busiest times, each naming up to ten of its jobs. |
-| `jobs`, `total_fires`, `excluded` | Fleet totals, plus how many jobs were excluded as disabled or `@reboot`. |
+| `top_cells` | The six busiest cells (`hour`, `minute`, `fires`), each naming up to ten of its `jobs`. |
+| `jobs`, `total_fires` | Fleet totals: jobs analyzed and scheduled runs in the window. |
+| `excluded` | `{"disabled": n, "reboot": n}`: how many jobs were excluded as disabled or `@reboot`. |
+| `start`, `hours`, `timezone` | The window's start in the display timezone, its length after clamping, and the display timezone name. |
 
 See [HTTP API](HTTP-API) for the route table. The same analyzer backs the `cron_schedule_pressure` [MCP tool](MCP), so an AI agent can check schedule load directly.
 

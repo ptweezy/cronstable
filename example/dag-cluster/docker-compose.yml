@@ -1,7 +1,8 @@
 # Three cronstable nodes sharing one state store, running the same DAG config and
 # electing a leader over the store (backend: filesystem) -- no etcd, no gossip
-# certs, no Kubernetes. Each dag_run is advanced by exactly one node under its
-# advance lease, so a task launches exactly once across the fleet.
+# certs, no Kubernetes. Each dag_run is advanced by one node at a time under its
+# advance lease, so a healthy fleet launches each task once (crash recovery is
+# at-least-once).
 #
 #   docker compose -f example/dag-cluster/docker-compose.yml up --build
 #
