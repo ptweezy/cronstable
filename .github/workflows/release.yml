@@ -2178,7 +2178,7 @@ jobs:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@v7.0.1
       - name: Build binary (OpenBSD 7.9 amd64)
-        uses: vmactions/openbsd-vm@v1.4.7
+        uses: vmactions/openbsd-vm@v1.4.8
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2278,7 +2278,7 @@ jobs:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@v7.0.1
       - name: Build binary (NetBSD 11.0 amd64)
-        uses: vmactions/netbsd-vm@v1.5.0
+        uses: vmactions/netbsd-vm@v1.5.2
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2386,7 +2386,7 @@ jobs:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@v7.0.1
       - name: Build binary (OmniOS r151054 amd64)
-        uses: vmactions/omnios-vm@v1.3.6
+        uses: vmactions/omnios-vm@v1.3.7
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
