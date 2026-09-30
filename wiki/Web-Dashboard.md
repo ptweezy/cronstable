@@ -689,26 +689,6 @@ instead. For the pairing flow this feeds, see
 | :---: |
 | [![The dashboard in the standard light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-standard-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-theme-standard-light.png) |
 
-## The pendulum wordmark
-
-The `l` in the header's "cronstable" is a **live cart-and-double-pendulum
-simulation**, not a canned animation: the page integrates the full nonlinear
-dynamics (RK4, 240 times a second) and balances the linkage with an LQR
-controller whose gains are computed at page load. It doubles as a status
-indicator. While the daemon is live the letter stands upright, riding out
-small disturbances. When the connection is lost the motor cuts, and the letter
-collapses out of the word and swings. When the signal returns, a planner
-threads the swing back up into a balance catch that is verified by a
-closed-loop rollout before it is committed.
-
-Sweeping the pointer across the header brushes the linkage, and right-clicking
-the wordmark knocks it clean over so you can watch a full recovery (on a touch
-screen, a tap nudges it). Under reduced motion the mark parks in a still pose
-that stays honest about daemon state, upright when live and hanging when not.
-Without JavaScript, the letter is printed.
-
-I like to call him double-P, Peter Parker, or PP.
-
 ## Tab title and favicon
 
 The browser tab is the dashboard's smallest display, and the one that stays
