@@ -20,11 +20,11 @@ section: admin
 priority: optional
 maintainer: Parker Loflin <parker@cronstable.dev>
 description: |
-  Cron daemon with a schedule model you can inspect.
-  cronstable runs scheduled jobs from a declarative configuration and answers
-  questions cron cannot: what runs next, why a job did not run, which schedules
-  collide, and what happened on the last run. It has a dashboard, an HTTP API,
-  durable run history, dependency graphs, clustering and reporting.
+  Modern cron with retries, alerts, run history, and dashboards.
+  cronstable runs your commands from a schedule file, following cron's model,
+  and adds retries, alerts, saved run history, workflows, and dashboards for
+  the web, the terminal, and iOS. It runs on a single machine or across a
+  cluster.
   ${PKG_CPU_NOTE}
 vendor: Parker Loflin
 homepage: https://github.com/ptweezy/cronstable

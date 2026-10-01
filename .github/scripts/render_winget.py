@@ -100,7 +100,10 @@ def render(version, metadata, output):
                 if line.startswith("Copyright (c) ")
             ),
             "CopyrightUrl": f"{REPO}/blob/{version}/LICENSE",
-            "ShortDescription": "A distributed cron replacement.",
+            "ShortDescription": (
+                "A modern cron with retries, alerts, saved run history, "
+                "workflows, and dashboards for single machines and clusters."
+            ),
             "Moniker": "cronstable",
             "Tags": [
                 "cron",

@@ -20,7 +20,7 @@ rust_cleanup = '''
 ; \
     rm -rf /var/lib/apt/lists/*
 '''
-description = "A modern, rootless-container-friendly cron replacement."
+description = "A modern cron with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters."
 extra_labels = '''
       org.opencontainers.image.url="https://github.com/ptweezy/cronstable" \
       org.opencontainers.image.documentation="https://github.com/ptweezy/cronstable/wiki" \
@@ -39,7 +39,7 @@ rust_setup = '''
     RUST_SETUP="apk add --no-cache curl \
         && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" \
 '''
-description = "A modern, rootless-container-friendly cron replacement (Alpine)."
+description = "A modern cron with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (Alpine)."
 
 # Amazon Linux's default Python is too old; use 3.11 in both stages.
 [amazonlinux]
@@ -56,7 +56,7 @@ RUN set -eux; \
     retry dnf --setopt=retries=10 install -y python3.11; \
     dnf clean all
 '''
-description = "A modern, rootless-container-friendly cron replacement (Amazon Linux 2023)."
+description = "A modern cron with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (Amazon Linux 2023)."
 
 # Debian 13 provides the same Python 3.13 layout as the distroless runtime.
 # An absolute entrypoint and exec-form smoke check work without a shell.
@@ -71,7 +71,7 @@ toolchain = '''
 python = "python3.13"
 runtime = "gcr.io/distroless/python3-debian13"
 entrypoint = "[\"/opt/venv/bin/cronstable\"]"
-description = "A modern, rootless-container-friendly cron replacement (distroless)."
+description = "A modern cron with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (distroless)."
 
 # System libsodium avoids PyNaCl's bundled autotools tests under QEMU.
 # The runtime must carry libsodium to match the builder link.
@@ -94,7 +94,7 @@ rust_cleanup = '''
 ; \
     dnf clean all
 '''
-description = "A modern, rootless-container-friendly cron replacement (Fedora)."
+description = "A modern cron with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (Fedora)."
 
 # python313 includes ensurepip; no separate pip package is needed.
 # System libsodium avoids emulated bundled-library builds; ship libsodium26.
@@ -123,7 +123,7 @@ rust_cleanup = '''
 ; \
     zypper clean --all
 '''
-description = "A modern, rootless-container-friendly cron replacement (openSUSE Leap)."
+description = "A modern cron with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (openSUSE Leap)."
 
 # UBI builder and ubi-minimal runtime share their Python 3.12 layout.
 [rhel]
@@ -145,7 +145,7 @@ rust_cleanup = '''
 ; \
     dnf clean all
 '''
-description = "A modern, rootless-container-friendly cron replacement (RHEL/UBI 10)."
+description = "A modern cron with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (RHEL/UBI 10)."
 
 [ubuntu]
 build_args = "ARG UBUNTU_VERSION=26.04"
@@ -172,4 +172,4 @@ rust_cleanup = '''
 ; \
     rm -rf /var/lib/apt/lists/*
 '''
-description = "A modern, rootless-container-friendly cron replacement (Ubuntu)."
+description = "A modern cron with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (Ubuntu)."

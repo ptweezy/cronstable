@@ -139,7 +139,7 @@ COMPLETION_MAX = 100
 
 SERVER_NAME = "cronstable"
 SERVER_DESCRIPTION = (
-    "A cron replacement with retries, alerts, saved run history, "
+    "A modern cron with retries, alerts, saved run history, "
     "workflows, and dashboards."
 )
 SERVER_WEBSITE = "https://github.com/ptweezy/cronstable"
