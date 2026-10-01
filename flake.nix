@@ -74,7 +74,7 @@
         let
           currentPackages = import ./nix/python-packages.nix { inherit pkgs; };
           # The compatibility adapter is the only consumer of backported recipes.
-          # Retirement steps: wiki/Contributing-and-Releasing.md, Intel Mac support.
+          # Retirement steps: wiki/Release-Pipeline.md, Intel Mac support.
           pythonPackages =
             if pkgs.stdenv.hostPlatform.system == "x86_64-darwin" then
               import ./nix/intel-darwin.nix {

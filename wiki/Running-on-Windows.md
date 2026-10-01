@@ -30,7 +30,7 @@ The test suite runs on Windows (both x64 and ARM64) in CI on every commit. A
 small set of POSIX-only tests is skipped there, each with a stated reason: the
 tests for per-job user/group switching, privilege drop, POSIX signal delivery,
 and POSIX file modes. Every release builds all three Windows architectures
-plus the amd64v3 variant. See [contributing and releasing](Contributing-and-Releasing)
+plus the amd64v3 variant. See [release pipeline](Release-Pipeline)
 for the build and release workflow.
 
 ## Installation

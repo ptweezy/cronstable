@@ -53,6 +53,6 @@
 - **Reference and Development**
   - [Architecture and Internals](Architecture-and-Internals)
   - [MCP Server Design](MCP-Server-Design)
-  - [Contributing and Releasing](Contributing-and-Releasing)
+  - [Release Pipeline](Release-Pipeline)
   - [Performance Benchmarks](Performance-Benchmarks)
   - [Troubleshooting and FAQ](Troubleshooting)

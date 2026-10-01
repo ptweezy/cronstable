@@ -1759,8 +1759,7 @@ jobs:
   # steps are shared with binaries-macos-experimental (macOS 26, ship: false,
   # never signed or attached). Shipped rows keep the bare `macos-<arch>` asset
   # names the Release and Homebrew formula expect. Intel rows gate and ship
-  # like ARM; retirement map: wiki/Contributing-and-Releasing.md, "Intel Mac
-  # support".
+  # like ARM; retirement map: wiki/Release-Pipeline.md, "Intel Mac support".
   binaries-macos:
     needs:
       - version

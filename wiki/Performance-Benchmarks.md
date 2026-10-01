@@ -79,7 +79,11 @@ A feature can be worth a measured cost. To ship one, start a pushed commit's
 subject line with `[perf:accept]`. The regression is still measured and
 listed in the release notes, but it does not fail the gate. Only commit
 subjects are scanned, exactly like the `[release]` marker described in
-[contributing and releasing](Contributing-and-Releasing).
+[release pipeline](Release-Pipeline#triggering-a-release).
+
+The markers in this section and the next take effect when a commit reaches
+`main`, so the maintainer applies them. In a pull request, explain an
+intentional regression in the description instead.
 
 ## Overriding the gate
 
@@ -110,8 +114,8 @@ to add a benchmark, is in
 
 ## Related pages
 
-- [Contributing and Releasing](Contributing-and-Releasing): the release
-  pipeline this gate is part of, and the `[release]` marker syntax.
+- [Release Pipeline](Release-Pipeline): the pipeline this gate is part of,
+  and the `[release]` marker syntax.
 - [Architecture and Internals](Architecture-and-Internals): the components
   the benchmark groups map onto.
 - [Schedule Pressure](Schedule-Pressure), [Duplicate Schedule Detection](Duplicate-Schedule-Detection),

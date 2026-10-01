@@ -1795,11 +1795,11 @@ and [Troubleshooting](https://github.com/ptweezy/cronstable/wiki/Troubleshooting
 ## Contributing and license
 
 Bug reports, feature ideas, and pull requests are welcome, including ones
-written with AI help. For the development setup and how to sign off your
-commits under the Developer Certificate of Origin (DCO), see
+written with AI help. For the development setup, the Developer Certificate of
+Origin (DCO) sign-off, and how to open a pull request, see
 [CONTRIBUTING.md](https://github.com/ptweezy/cronstable/blob/main/CONTRIBUTING.md).
 For how releases work, see
-[Contributing and Releasing](https://github.com/ptweezy/cronstable/wiki/Contributing-and-Releasing).
+[Release Pipeline](https://github.com/ptweezy/cronstable/wiki/Release-Pipeline).
 The [performance benchmarks](https://github.com/ptweezy/cronstable/wiki/Performance-Benchmarks)
 compare speed and memory use against the latest release on every commit to
 catch regressions before release.

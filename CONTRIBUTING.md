@@ -1,6 +1,21 @@
 # Contributing to cronstable
 
-This guide explains how to develop, test, and release cronstable.
+This guide is for anyone changing cronstable's code or documentation. It
+covers the path from a fork to a merged pull request:
+
+1. [Agree on the approach](#before-you-start) in an issue, unless the change
+   is a small fix.
+2. [Set up](#development-setup) your fork and a development environment.
+3. [Make the change](#making-a-change) on its own branch, with tests and
+   documentation.
+4. [Run the checks](#running-the-checks).
+5. [Sign off](#signing-off-your-commits-dco) each commit.
+6. [Open a pull request](#opening-a-pull-request) against `main`.
+
+One person maintains cronstable. The maintainer reviews every pull request and
+cuts every release, so you never release anything yourself. The
+[Release Pipeline](https://github.com/ptweezy/cronstable/wiki/Release-Pipeline)
+wiki page documents continuous integration (CI) and the release process.
 
 To report a security vulnerability, follow the private reporting process
 in [SECURITY.md](SECURITY.md).
@@ -12,44 +27,29 @@ the realistic future of software, and the project uses it to make cronstable
 the best it can be.
 
 The project is maintained to be production ready for every kind of user and for
-jobs of any type or importance. Opinions on AI vary, but for a product at that
-level, AI review and input are expected.
+jobs of any type or importance. AI agents raise the project's standards. They
+make thorough review and testing cheap, so every change gets more scrutiny
+than it would without them.
 
-AI agents raise the project's standards. They make thorough review and testing
-cheap, so every change gets more scrutiny than it would without them.
 Contributions written with AI help are welcome and held to the same standards
-as any other change.
+as any other change. You don't need to say whether or how you used AI. You're
+responsible for everything you submit, so make sure you understand a change
+before you open a pull request. The
+[sign-off](#signing-off-your-commits-dco) on each commit certifies that you
+have the right to submit it, and that applies to code an AI tool wrote.
 
 The project doesn't tolerate putting others down for using AI. Judge a
 contribution by the work itself, whatever tools produced it.
 
-## Signing off your commits (DCO)
+## Before you start
 
-The project uses the [Developer Certificate of Origin](DCO) (DCO), a
-lightweight, sign-off-based alternative to a contributor license agreement
-(CLA). By signing off, you certify that you wrote the patch, or otherwise have
-the right to submit it under the project's license. The full text is in the
-[DCO](DCO) file.
-
-Add a sign-off to each commit with `-s`:
-
-```sh
-git commit -s -m "Fix retry scheduling"
-```
-
-This appends a trailer with the name and email from your Git configuration:
-
-```text
-Signed-off-by: Your Name <you@example.com>
-```
-
-The `dco` job in continuous integration (CI) checks that every commit in a pull
-request includes this trailer. To add missing sign-offs to a branch, run:
-
-```sh
-git rebase --signoff origin/main
-git push --force-with-lease
-```
+- To report a bug,
+  [open an issue](https://github.com/ptweezy/cronstable/issues/new). The issue
+  template lists the details to include.
+- For a new feature or a large change, open an issue to agree on the approach
+  before you write the code.
+- A small fix, such as a typo or a contained bug fix, can go straight to a
+  pull request.
 
 ## Development setup
 
@@ -60,95 +60,198 @@ three in CI, including Windows ARM64.
 cronstable uses [uv](https://docs.astral.sh/uv/) for local development.
 The `tox-uv` plugin also lets tox use uv to create environments and install
 dependencies. uv can install the Python 3.10–3.14 interpreters used by the
-test matrix. After installing uv, run:
+test matrix.
+
+Install uv and fork
+[ptweezy/cronstable](https://github.com/ptweezy/cronstable) on GitHub. Then
+clone your fork, add the main repository as the `upstream` remote, install
+the package, and activate the environment:
 
 ```sh
-git clone https://github.com/ptweezy/cronstable
+git clone https://github.com/<your-username>/cronstable
 cd cronstable
+git remote add upstream https://github.com/ptweezy/cronstable
 uv venv                                         # create .venv (uv picks a suitable Python)
 uv pip install -e ".[dev]"                      # editable install with the dev extra
+. .venv/bin/activate                            # Windows: .venv\Scripts\activate
 ```
 
-To use Python's built-in `venv` module and pip, run:
+To use Python's built-in `venv` module and pip instead of uv, run:
 
 ```sh
 python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"                         # or: pip install -r requirements_dev.txt
 ```
 
-> **Note:** OS-specific behavior lives in
-> [`cronstable/platform.py`](cronstable/platform.py) (default shell, default
-> configuration location, Unix socket support, and shutdown handlers).
-> The POSIX-only `user`/`group` feature imports `grp`/`pwd` lazily and is
-> rejected on Windows. mypy is pinned to the `linux` platform. It type-checks
-> the POSIX API surface, and the Windows branches are runtime-guarded, so
-> type checking is identical on every OS. The coverage check measures
-> Windows-specific branches on Windows when they use
-> `# pragma: no cover (windows)`. A bare `# pragma: no cover` excludes them
-> on every OS. See
-> [the pragma vocabulary](#coverage-pragmas).
+The browser tests need Chromium, which Playwright downloads separately.
+Without it, those tests are skipped:
 
-## Generated build files
+```sh
+python -m playwright install chromium
+```
 
-Edit `pyproject.toml` to change development dependencies or minimum versions
-for optional dependencies. The build generator uses it to produce
-`requirements_dev.txt`, `requirements_min.txt`, and
-`pyinstaller/requirements/*.txt`. For `tox -e mindeps`,
-`requirements_min.txt` pins minimum runtime and test dependency versions.
-Binary build jobs select their own optional dependencies, failure policies,
-and platform-specific version limits.
+Start each change on its own branch from the latest `main`:
 
-The generated `requirements_dev_freethreaded.txt` omits only `orjson`, which
-does not support free-threaded Python. With Python 3.14t installed, run
-`tox -e py314t-posix` to test the standard-library JSON fallback with the
-same test suite and coverage floor.
+```sh
+git fetch upstream
+git switch -c fix-retry-scheduling upstream/main
+```
 
-The eight Dockerfiles share `docker/templates/Dockerfile`; distro-specific
-base images, packages, and runtime settings live in `docker/images.toml`.
-The supported image paths and platforms remain in `.github/docker-matrix.json`.
-After changing these inputs, regenerate with Python 3.11 or newer:
+## Making a change
+
+### Tests
+
+Cover new or changed behavior with tests. For a bug fix, include a test that
+fails without the fix. Each test run enforces the coverage floor that
+`tox.ini` sets for its coverage profile, so new code needs tests that
+exercise it. The Codecov statuses on a pull request are informational and
+can't fail it. Codecov merges both profiles, so its figure can read lower
+than either tox run.
+[Running the checks](#running-the-checks) explains the profiles and how the
+suite runs.
+
+### Documentation
+
+Update the documentation in the same pull request as the behavior it
+describes:
+
+- Each feature has its own page in [`wiki/`](wiki) and its own section in
+  `README.md`. For a new feature, add both, and list the new page in
+  `wiki/_Sidebar.md` and `wiki/Home.md`.
+- Follow the
+  [Google developer documentation style guide](https://developers.google.com/style).
+- Describe what cronstable does, as if it had always worked that way. Don't
+  write documentation as a change log, such as "now supports" or "no longer
+  requires".
+- Leave `HISTORY.md` to the maintainer, who writes the release notes there.
+  If your change affects users, describe the effect in the pull request
+  description.
+
+### Editing the wiki
+
+Edit [`wiki/`](wiki) in this repo, not the wiki in the browser. The
+[GitHub wiki](https://github.com/ptweezy/cronstable/wiki) is a published copy:
+every push to `main` runs the pipeline's `wiki` job, which mirrors
+`wiki/*.md` onto it (one file per page, named as the page's URL:
+`Web-Dashboard.md` → `/wiki/Web-Dashboard`).
+
+The `wiki/` directory is the source of truth. On the next push to `main`, the
+`wiki` job overwrites an edit made in the wiki's web UI and **deletes** a page
+created there. The job prints every page it adds, changes, or deletes to the
+run log.
+
+Pages link to each other with bare wiki links, such as
+`[Installation](Installation)`, which resolve only on the published wiki.
+Those links are dead when you browse `wiki/*.md` in the repository, so leave
+them as they are. Link images by their absolute
+`raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/` URL, which
+resolves in both places.
+
+### Platform-specific code
+
+OS-specific behavior lives in
+[`cronstable/platform.py`](cronstable/platform.py): the default shell, the
+default configuration location, Unix socket support, and shutdown handlers.
+The POSIX-only `user`/`group` feature imports `grp`/`pwd` lazily and is
+rejected on Windows.
+
+mypy is pinned to the `linux` platform, so type checking gives the same result
+on every OS and covers the POSIX-only APIs, such as `grp`, `pwd`, and
+`os.setuid`. mypy skips a branch guarded by `sys.platform == "win32"`, so
+only the Windows test runs exercise that code.
+
+Coverage is measured separately on Windows and POSIX. When a branch can run on
+only one of them, annotate it as [Coverage pragmas](#coverage-pragmas)
+describes.
+
+### Job options
+
+To add a simple job option, add one entry to
+`cronstable.config.JOB_SCALAR_FIELDS`. The entry declares the option's
+default, its YAML validator, and its identity policy.
+
+The identity policy controls whether the option's value goes into the job's
+digest, a hash of the job's effective configuration. cronstable stores a job's
+pending retries and its `@reboot` markers with that digest, and drops a pending
+retry or reruns an `@reboot` job when the stored digest differs from the job's.
+The policy has three values:
+
+- `always`: the value is always hashed.
+- `nondefault`: the value is hashed only when it differs from the default.
+- `exclude`: the value is never hashed.
+
+Use `nondefault` for a new option that affects how a job runs. A job that
+leaves the option at its default then keeps the same digest after an upgrade,
+so its stored retries and markers stay valid. Use `exclude` only when a
+change to the option's value should keep a job's stored retries and markers
+valid. Leave `always` to the options that already use it, because on a new
+option it changes every job's digest. The tests in
+`tests/test_fingerprint.py` compare digests against fixed values and fail when
+one changes.
+
+Options that need normalization or that hold secrets are handled outside the
+table, by their own code in `cronstable/config.py` and
+`cronstable/fingerprint.py`.
+
+### Generated build files
+
+Some checked-in files are generated. Edit their inputs and leave the generated
+files to the generator:
+
+- `pyproject.toml` declares the development dependencies and the minimum
+  versions for optional dependencies. From it, the generator writes
+  `requirements_dev.txt`, `requirements_dev_freethreaded.txt`,
+  `requirements_min.txt`, and `pyinstaller/requirements/*.txt`.
+- `docker/templates/Dockerfile` is the template for all eight Dockerfiles.
+  `docker/images.toml` holds each distro's base images, packages, and runtime
+  settings, and `.github/docker-matrix.json` lists the supported image paths
+  and platforms.
+
+After changing an input, regenerate with Python 3.11 or newer. The second
+command verifies that every generated file is current:
 
 ```sh
 python scripts/generate_build_files.py
 python scripts/generate_build_files.py --check
 ```
 
-Commit the generated files with their inputs. CI checks freshness before its
-static checks. Builds consume the checked-in files directly, including on
-Python 3.10; they do not run the generator.
+Commit the generated files with their inputs. CI runs the same verification
+before its static checks. Builds use the checked-in files directly, including
+on Python 3.10, and never run the generator.
 
-Dependabot updates `pyproject.toml` and excludes generated requirements.
-Regenerate the files in dependency update pull requests before merging.
+`requirements_min.txt` pins the minimum runtime and test dependency versions
+for `tox -e mindeps`. Each file in `pyinstaller/requirements/` holds one
+optional dependency's minimum version, and the binary build jobs choose which
+of them each platform installs.
 
-Simple job options declare their default, YAML validator, and fingerprint
-policy together in `cronstable.config.JOB_SCALAR_FIELDS`. Normalization and
-secret-bearing values keep explicit code paths. An added identity field must
-preserve the existing v1 digests when its value is the default; the fingerprint
-tests protect persisted retries and reboot markers from accidental changes.
-
-## Branching
-
-The project develops on a single branch, `main`. Open your pull request
-against it.
-
-A new push cancels the previous CI run, whether that run is active or queued.
-To fully test a particular commit, wait for its checks to finish before
-pushing again. Release runs use a separate concurrency group and are not
-canceled by later pushes.
+`requirements_dev_freethreaded.txt` omits only `orjson`, which does not
+support free-threaded Python. With Python 3.14t installed, run
+`tox -e py314t-posix` to test the standard-library JSON fallback with the
+same test suite and coverage floor.
 
 ## Running the checks
 
-For tests of the actual packaged executable, see
-[binary acceptance](acceptance/README.md). That separate suite drives real
-scheduled jobs, state CLI calls, pending retries across restart, and graceful
-shutdown on native Linux, macOS, and Windows binary builds. It requires an
-explicit binary path and runs independently of the source coverage suite.
-
-`tox` drives the source tests and static checks:
+`tox` drives the source tests and static checks. Before you open a pull
+request, run the static checks and the test suite on your current
+interpreter, with the same commands that CI uses:
 
 ```sh
-tox                # all envs: py310-py314 (each in a windows and a posix arm),
-                   # lint, mypy, bandit, openapi
+tox -e lint,mypy,bandit,openapi
+tox -e py-windows,py-posix
+```
+
+A test run measures coverage under one of two profiles, Windows or POSIX. A
+profile excludes the branches that can't run on its OS and sets its own
+coverage floor. Each test environment exists twice, once per profile, and tox
+skips the one that doesn't match your OS, so the second command works on
+every OS.
+
+The rest of this section is reference for running one check or testing a
+specific kind of change. To run everything, or one check at a time:
+
+```sh
+tox                # all envs: py310-py314 (each with a windows and a posix
+                   # profile), lint, mypy, bandit, openapi
 tox -e lint        # ruff check + ruff format --check
 tox -e mypy        # mypy
 tox -e bandit      # bandit security lint (medium+ severity)
@@ -164,18 +267,21 @@ tox -e mindeps     # the suite on the oldest dependency versions pyproject.toml 
 tox -e deep        # thorough property tests, then three randomized full-suite runs
 ```
 
-Each Python version has a Windows environment and a POSIX environment.
-The `platform` setting in `tox.ini` skips environments that don't match
-your OS. If every selected environment is skipped, tox exits with code 1.
+The environment you select determines the profile:
 
-Run `tox` to select the matching environments automatically, or use
-`tox -e py-windows,py-posix` as CI does. On Windows, selecting only
-`py-posix` fails because that environment is skipped.
+- A bare `tox` runs every interpreter with the profile that matches your OS.
+  The `platform` setting in `tox.ini` skips the other one.
+- If every selected environment is skipped, tox exits with code 1. On
+  Windows, `tox -e py-posix` alone fails for that reason.
+- Environments without an OS suffix, such as `py` and `py312`, run the full
+  suite with the POSIX coverage profile, and so does a bare `pytest --cov`
+  or a run from an IDE. On Windows, use `tox` or
+  `tox -e py-windows` so coverage measures the Windows branches and excludes
+  the POSIX-only ones.
 
-Environments without an OS suffix, such as `py` and `py312`, run the full
-suite with the POSIX coverage profile. On Windows, use `tox` or
-`tox -e py-windows` so coverage measures Windows branches and excludes
-POSIX-specific branches.
+`tox.ini` declares `requires = tox-uv`, so `tox` provisions its environments
+and installs dependencies with uv automatically. To use virtualenv and pip
+instead, run `tox --runner virtualenv`.
 
 ### How the suite runs
 
@@ -183,15 +289,16 @@ The root `pyproject.toml` configures the source test suite. Install the
 development dependencies before running it. The suite uses these rules:
 
 - **Warnings are errors by default.** Pytest treats warnings as errors
-  unless `filterwarnings` contains an exception. Document a reason for each
-  exception.
+  unless `filterwarnings` contains an exception. Add a comment with the
+  reason for each exception.
 - **Test order is random.** `pytest-randomly` shuffles the order on every
   run and prints the seed in the header. To replay a failing order, run
   `pytest -p randomly --randomly-seed=N`. To run in file order, pass
   `-p no:randomly`.
 - **Each test has a 270-second timeout.** If a test exceeds the timeout,
   `pytest-timeout` reports the failure and prints every thread's stack.
-  When the timeout mechanism supports recovery, the test run continues.
+  On Linux and macOS, the run then continues with the next test. On Windows,
+  the run stops.
 
 A warning from an object's finalizer, such as a warning about an unclosed
 socket or event loop, can fail a later test when garbage collection runs.
@@ -223,34 +330,23 @@ examples.
 `tests/test_backend_live.py` runs the etcd and Kubernetes backends against
 real servers. Configure the servers with `CRONSTABLE_LIVE_ETCD`,
 `CRONSTABLE_LIVE_ETCD_AUTH`, or `CRONSTABLE_LIVE_K8S`; the module docstring
-explains each variable. Tests skip servers that aren't configured.
-The `backends-live` CI job provisions all three configurations and sets
-`CRONSTABLE_LIVE_REQUIRED=1` to fail if any test would skip.
+explains each variable. Tests skip servers that aren't configured, so a
+local run needs none of them. The `backends-live` CI job provisions all three
+configurations and sets `CRONSTABLE_LIVE_REQUIRED=1`, which turns a skip into
+a failure.
 
-The scheduled `nightly` workflow runs the `deep` environment, the suite with
-`PYTHONDEVMODE=1`, and mutation tests for modules whose behavior depends on
-their inputs. Mutation testing introduces small code changes and checks
-whether the tests detect them. `[tool.mutmut]` in `pyproject.toml` selects the
-modules and tests. To test mutations in one module locally:
+The scheduled `nightly` workflow runs only on `main`. It runs the `deep`
+environment, the suite with `PYTHONDEVMODE=1`, and mutation tests for modules
+with no timing-dependent behavior, such as the cron expression parser.
+Mutation testing introduces small code changes and checks whether the tests
+detect them. `[tool.mutmut]` in `pyproject.toml` selects the modules and
+tests. To test mutations in one module locally:
 
 ```sh
 pip install mutmut
 mutmut run "cronstable.redact*"
 mutmut results
 ```
-
-### Running release pipeline tests
-
-Release pipeline tests are in `.github/tests` and also run in the full test
-suite. To run them independently, use Python 3.11 or newer and run these
-commands from the repository root:
-
-```sh
-python -m pip install packaging pytest strictyaml
-python -m pytest .github/tests -q
-```
-
-Pytest discovers this suite's configuration in `.github/tests/pytest.ini`.
 
 ### Coverage pragmas
 
@@ -274,32 +370,66 @@ platform-specific APIs, annotate both with their respective OS labels.
 Leave platform branches unannotated when tests can exercise them on either
 OS by monkeypatching `IS_WINDOWS`. When you add annotations:
 
-- Tagging an `if` header excludes that clause only. An `else` needs its own
-  tag. A fall-through tail (code after the `if` block rather than inside an
-  `else`) has no header to tag at all, which is why `cronstable/platform.py`
-  spells its POSIX arms out as explicit `else` clauses.
-- The token may sit anywhere after `cover`, so a site can keep the trailing
-  prose that explains it.
-- Keep the guard spelled the way the tests drive it. They exercise several
-  Windows arms from Linux by monkeypatching `platform.IS_WINDOWS`, which cannot
-  patch `sys.platform`. Rewriting such a guard to `sys.platform == "win32"`
-  sends the test down the POSIX arm for real.
+- An annotation on an `if` line excludes that clause only, so an `else` needs
+  its own annotation. Code that follows the `if` block without an `else` has
+  no line to annotate. Write the POSIX branch as an explicit `else` clause, as
+  `cronstable/platform.py` does.
+- The OS label can sit anywhere after `cover`, so the comment can go on to
+  explain the exclusion: `# pragma: no cover (windows) - Windows-only path`.
+- Keep each guard in the form its tests use. Several tests run Windows
+  branches on Linux by monkeypatching `platform.IS_WINDOWS`, which leaves
+  `sys.platform` unchanged. If you rewrite such a guard as
+  `sys.platform == "win32"`, those tests run the POSIX branch instead.
 
-`tests/test_coverage_profiles.py` holds the vocabulary and both profiles, and
-fails a branch that is tagged on one side only.
+`tests/test_coverage_profiles.py` checks the annotation forms and both
+profiles, and fails when only one side of a branch is annotated.
 
-`tox.ini` declares `requires = tox-uv`, so `tox` provisions its environments and
-installs dependencies with uv automatically.
-To use virtualenv and pip instead, run
-`tox --runner virtualenv`.
+### Release pipeline tests
 
-## Performance benchmarks
+Release pipeline tests are in `.github/tests`, and the full test suite
+includes them. To run only these tests, for example after you change a
+workflow, use Python 3.11 or newer and run these commands from the repository
+root:
 
-CI benchmarks every commit against the latest release: startup time, schedule
-math at 100k-job scale, configuration parsing, state I/O, memory footprint, and
-more. On a release, it fails the pipeline if a metric regresses past its
-declared limit. The release notes then carry a per-metric diff chart. Check
-your own changes locally with:
+```sh
+python -m pip install packaging pytest strictyaml
+python -m pytest .github/tests -q
+```
+
+Pytest discovers this suite's configuration in `.github/tests/pytest.ini`.
+
+### Binary acceptance tests
+
+The [binary acceptance](acceptance/README.md) suite tests the actual packaged
+executable. It drives real scheduled jobs, state CLI calls, pending retries
+across restart, and graceful shutdown on native Linux, macOS, and Windows
+binary builds. It requires an explicit binary path and runs independently of
+the source coverage suite. CI runs it against each native binary that it
+builds, including on a pull request.
+
+### Building the container image
+
+The top-level [`Dockerfile`](Dockerfile) and the per-distro
+`docker/Dockerfile.*` files build the official images;
+[Generated build files](#generated-build-files) explains where they come from.
+Every pull request builds every image without pushing it, so a broken
+`Dockerfile` fails CI.
+
+Build and run the image locally the same way CI does (the version is read from
+git, or pass `--build-arg VERSION=X.Y.Z`):
+
+```sh
+docker build -t cronstable .
+docker run --rm -v "$PWD/example/docker/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" cronstable
+```
+
+### Performance benchmarks
+
+CI benchmarks every commit, including each pull request, against the latest
+release: startup time, schedule math at 100k-job scale, configuration parsing,
+state I/O, memory footprint, and more. On a pull request, a regression past a
+metric's declared limit shows as a warning. Check your own changes locally
+with:
 
 ```sh
 python benchmarks/bench.py --quick --json before.json
@@ -308,139 +438,88 @@ python benchmarks/bench.py --quick --json after.json
 python benchmarks/compare.py --baseline before.json --current after.json --md diff.md
 ```
 
-To ship an intentional, measured regression, start a pushed commit's subject
-with `[perf:accept]` (subjects only, like the `[release]` marker). To publish
-regardless of what the perf job finds, use `[perf:ignore]` instead, or the
-`perf` dropdown of a manual run: the comparison still runs and is attached to
-the release, but nothing in it gates. The full harness reference, including
+If your change is slower on purpose, explain why in the pull request
+description and include the comparison. The full harness reference, including
 how to add a benchmark, is in [benchmarks/README.md](benchmarks/README.md).
+
+## Signing off your commits (DCO)
+
+The project uses the [Developer Certificate of Origin](DCO) (DCO), a
+lightweight, sign-off-based alternative to a contributor license agreement
+(CLA). By signing off, you certify that you wrote the patch, or otherwise have
+the right to submit it under the project's license. The full text is in the
+[DCO](DCO) file.
+
+Add a sign-off to each commit with `-s`:
+
+```sh
+git commit -s -m "Fix retry scheduling"
+```
+
+This appends a trailer with the name and email from your Git configuration:
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
+The `dco` CI job checks that every commit in a pull request includes this
+trailer. To add missing sign-offs to a branch, run:
+
+```sh
+git rebase --signoff upstream/main
+git push --force-with-lease
+```
+
+## Commit subjects
+
+Pull requests merge with a merge commit, so each of your commits lands on
+`main` as you wrote it. Give each commit a short subject line that says what it
+does.
+
+Don't start a commit subject with `[release]`, `[release:major]`,
+`[release:minor]`, `[release:patch]`, `[perf:accept]`, or `[perf:ignore]`.
+The pipeline reads these markers from the subjects of commits that reach
+`main`, so a marked commit in your pull request cuts a release or changes the
+performance gate when it merges.
+
+## Opening a pull request
+
+Push your branch to your fork, then open a pull request against `main`, the
+project's only long-lived branch:
+
+```sh
+git push -u origin fix-retry-scheduling
+```
+
+In the description, explain what the change does and why, and describe any
+effect on users.
+
+After you open the pull request:
+
+1. The `CI` workflow runs the full build and test pipeline on your branch,
+   with the signing and publishing jobs skipped. Until you've had a pull
+   request merged, each run waits for the maintainer to approve it. A new push
+   cancels the previous run, whether that run is active or queued. To fully
+   test a particular commit, wait for its checks to finish before pushing
+   again.
+2. GitHub Copilot reviews each push to a pull request that isn't a draft.
+   CodeQL code scanning and GitHub code quality analysis also run. A new alert
+   at warning level or above, or a security alert of medium severity or
+   higher, blocks the merge.
+3. The maintainer reviews the pull request. A push after approval dismisses
+   the approval, and every review conversation, including Copilot's, must be
+   resolved before the pull request can merge.
+4. The branch must be up to date with `main` before it merges. When `main`
+   moves ahead, select **Update branch** on the pull request, or merge
+   `upstream/main` into your branch. The DCO check skips merge commits.
+5. The maintainer merges the pull request with a merge commit.
+
+A CI failure that reaches `main` blocks the next release, so fix failures
+before the merge.
 
 ## Releasing
 
-The single [`CI`](.github/workflows/release.yml) GitHub Actions pipeline
-**automates** releases: one workflow builds and tests everything on every
-commit and, on a release, publishes it. Version numbers come from git tags with
-`setuptools_scm`; you never edit a version by hand.
-
-### Creating a release
-
-A release happens when **any commit in a push to `main`** has a release marker
-at the **start of its subject line** (the first line of the commit message):
-
-```text
-[release:minor] Add retry backoff to the HTTP reporter
-```
-
-It does not need to be the latest commit in the push. But only subject lines
-are scanned, and only a marker that begins the subject counts. Prose that
-mentions a marker in a commit body (or anywhere else in a subject) never
-triggers or escalates a release.
-
-Valid markers (the bump level is optional; case is ignored):
-
-| Marker             | Bump  | 1.0.5 → |
-| ------------------ | ----- | ------- |
-| `[release]`        | minor | 1.1.0   |
-| `[release:major]`  | major | 2.0.0   |
-| `[release:minor]`  | minor | 1.1.0   |
-| `[release:patch]`  | patch | 1.0.6   |
-
-If more than one commit in the push carries a marker, the **latest** such
-commit wins. (File contents like this document are never scanned; only commit
-subjects are.)
-
-You can also release manually without a marker: **Actions → release → Run
-workflow**, then pick the bump level from the dropdown. The same form has a
-`perf` dropdown that overrides the perf gate: `accept` reports regressions
-without gating on them, `ignore` publishes whatever the perf job finds.
-
-### What the pipeline does
-
-The same pipeline runs on every commit and pull request; only the publish
-steps are gated behind the release check. The lone exception is the `wiki` job,
-which publishes documentation on every push to `main` (see [editing the
-wiki](#editing-the-wiki)). On a release it, in order:
-
-1. **decides** whether to release and at what level (the strict marker check,
-   which only fires on a push to `main` or a manual dispatch);
-2. **computes** the next version from the latest `X.Y.Z` tag (refusing if that
-   tag already exists);
-3. **builds and tests everything in parallel**, all at the computed version:
-
-   - `tox` (py310–py314 on Linux, Windows, and macOS, plus Linux and
-     Windows on arm64; lint, mypy);
-   - `tox-mindeps` (the suite with the oldest supported dependency versions)
-     and `backends-live` (backend tests against an etcd server, a second etcd
-     server with TLS and authentication, and a kind cluster);
-   - the wheel + sdist;
-   - the self-contained PyInstaller binaries for every platform listed under
-     [installation](https://github.com/ptweezy/cronstable#installation), each
-     smoke-tested with `--version`;
-   - a build-only pass over every Docker image.
-
-   This whole matrix is the **gate**: a red anywhere (a failed test, a broken
-   binary, or a broken `Dockerfile`) means no release.
-
-4. **only after the entire gate is green**, publishes the wheel + sdist to PyPI
-   through [Trusted Publishing with OpenID Connect
-   (OIDC)](https://docs.pypi.org/trusted-publishers/): there is no API token to
-   manage or leak;
-5. **after a successful publish**, creates and pushes the `X.Y.Z` tag and a
-   GitHub Release, then pushes the multi-arch container images and updates the
-   Homebrew tap.
-
-   The GitHub Release carries the wheel, sdist, every binary and native
-   package, the Windows setup programs, MSIs, and zips, a Scoop manifest, the
-   third-party license notices, and a single `SHA256SUMS`. For the full asset
-   table, see
-   [installation](https://github.com/ptweezy/cronstable/wiki/Installation) in
-   the wiki.
-
-Because no file is committed back to *this* repo, a release never re-triggers
-the workflow. (Two jobs do push elsewhere: the Homebrew tap on a release, and
-the wiki on a `main` commit. But both targets are separate repositories, and a
-push to either raises no event here.)
-
-Because the tag is created *after* publishing, a failed publish leaves no
-orphan tag and a re-run cleanly retries the same version.
-
-## Container image
-
-The single [`CI`](.github/workflows/release.yml) pipeline builds and publishes
-the official image from the top-level [`Dockerfile`](Dockerfile) (and the
-per-distro `docker/Dockerfile.*`):
-
-- **On every commit and pull request** it builds every image *without* pushing
-  (the `docker` gate job), across their full published arch sets, so a broken
-  `Dockerfile` fails CI before a release.
-- **On a release**, after the whole gate is green, the `docker-push` job builds
-  and pushes each distro's multi-arch image, tagged `<version>` and `:latest`,
-  to both `ghcr.io/ptweezy/cronstable` and `docker.io/ptweezy/cronstable`. The
-  job authenticates to the GitHub Container Registry (GHCR) with the built-in
-  `GITHUB_TOKEN`, and to Docker Hub with the `DOCKERHUB_USERNAME` and
-  `DOCKERHUB_TOKEN` repository secrets (skipped if unset). The Debian base owns
-  the bare tags; variants get a `-<distro>` suffix.
-
-Build it locally the same way CI does (the version is read from git, or pass
-`--build-arg VERSION=X.Y.Z`):
-
-```sh
-docker build -t cronstable .
-docker run --rm -v "$PWD/example/docker/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" cronstable
-```
-
-## Editing the wiki
-
-Edit [`wiki/`](wiki) in this repo, not the wiki in the browser. The
-[GitHub wiki](https://github.com/ptweezy/cronstable/wiki) is a published copy:
-every push to `main` runs the pipeline's `wiki` job, which mirrors
-`wiki/*.md` onto it (one file per page, named as the page's URL:
-`Web-Dashboard.md` → `/wiki/Web-Dashboard`).
-
-The mirror is authoritative, so it **deletes**: on the next push to `main`, the
-`wiki` job reverts a page created or edited from the wiki's web UI. The job
-prints every add/modify/delete to the run log.
-
-Pages link to each other with bare wiki links, `[Installation](Installation)`,
-which only resolve after publishing. Expect those links to be dead when you
-browse `wiki/*.md` here; that is not a bug.
+The maintainer cuts releases from `main`, and a merged change ships in the
+next one. Version numbers come from git tags, so never edit a version by hand.
+The [Release Pipeline](https://github.com/ptweezy/cronstable/wiki/Release-Pipeline)
+wiki page documents how releases are triggered, built, signed, and published.

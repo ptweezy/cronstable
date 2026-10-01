@@ -70,5 +70,5 @@ package type.
 
 The `winget` job uses `verify_winget_release.py` to compare the published installers
 and `SHA256SUMS` with the scanned hashes before submitting the saved manifests.
-See `wiki/Contributing-and-Releasing.md` for steps to investigate validation
+See `wiki/Release-Pipeline.md` for steps to investigate validation
 failures and resubmit a package.
