@@ -1428,6 +1428,38 @@ async def test_config_guard_runs_before_every_parse(
     assert cron.metrics._last_reload_ok is False
 
 
+def test_parse_frees_the_yaml_parse_tree(tmp_path):
+    # strictyaml's parse tree is cyclic garbage, so refcounting never frees
+    # it, and an idle daemon may not reach the full collection that does.
+    def yaml_objects():
+        return sum(
+            1
+            for obj in gc.get_objects()
+            if str(type(obj).__module__).startswith("strictyaml")
+        )
+
+    def jobs(tag):
+        return "jobs:\n" + "".join(
+            "  - name: job-{0}\n    command: echo {1} {0}\n"
+            '    schedule: "{0} 3 * * *"\n'.format(i, tag)
+            for i in range(20)
+        )
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(jobs("first"))
+    cronstable.cron._parse_guarded(str(cfg), None)  # builds the schema once
+    gc.collect()
+    baseline = yaml_objects()
+    cfg.write_text(jobs("second"))  # new bytes, so the file is parsed again
+    gc.disable()  # only the parse's own collect may free the tree
+    try:
+        config, _sources = cronstable.cron._parse_guarded(str(cfg), None)
+        assert len(config.jobs) == 20
+        assert yaml_objects() <= baseline
+    finally:
+        gc.enable()
+
+
 def test_cluster_allows_per_policy():
     import types
 

@@ -2722,6 +2722,28 @@ class RunningJob:
         transport = getattr(self.proc, "_transport", None)
         if transport is not None:
             transport.close()
+            if platform.IS_WINDOWS:
+                self._unlink_drained_pipes(transport)
+
+    def _unlink_drained_pipes(self, transport: Any) -> None:
+        """Detach each drained pipe transport from its protocol.
+
+        A closed Proactor pipe transport and its protocol reference each
+        other, and the transport owns a 64 KiB read buffer that would wait
+        for the cycle collector. A pipe whose ``connection_lost`` is still
+        pending keeps its protocol, because that callback calls it.
+        """
+        for fd, reader in (
+            (1, self._stdout_reader),
+            (2, self._stderr_reader),
+        ):
+            if reader is None:
+                continue
+            pipe = transport.get_pipe_transport(fd)
+            if pipe is not None and getattr(
+                pipe.get_protocol(), "disconnected", False
+            ):
+                pipe.set_protocol(None)
 
     @property
     def failed(self) -> bool:

@@ -2117,7 +2117,9 @@ def _parse_guarded(
     """
     if guard is not None:
         guard(config_arg)
-    return parse_config_with_sources(config_arg)
+    parsed = parse_config_with_sources(config_arg)
+    gc.collect()
+    return parsed
 
 
 class Cron:

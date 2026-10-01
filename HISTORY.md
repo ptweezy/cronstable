@@ -13,6 +13,13 @@
 - The amd64 and arm64 Docker images include uvloop, the `speedups` extra's
   event loop, as the POSIX binaries do. The other image architectures have
   no uvloop wheel and run on stock asyncio.
+- Reduce daemon memory. After parsing its configuration, the daemon frees
+  the YAML parse tree, about 20 KB per job, which an idle daemon otherwise
+  keeps until its next full garbage collection. An idle daemon with 3,000
+  jobs uses 73 MB on Linux instead of 113 MB. On Windows, a finished run
+  frees the 64 KiB read buffer of each captured stream once its output is
+  drained, so a daemon running 20 jobs every 3 seconds peaks at 69 MB
+  instead of 99 MB.
 
 ## 1.2.60
 

@@ -1639,6 +1639,68 @@ async def test_capture_pipes_do_not_buffer_a_whole_maxlinelength():
     assert job.stdout == "hi\n"
 
 
+@pytest.mark.skipif(
+    not IS_WINDOWS, reason="the Proactor pipe transport is Windows-only"
+)
+async def test_finished_run_frees_its_pipe_transports_without_the_collector():
+    # A closed Proactor pipe transport and its protocol reference each other,
+    # and the transport owns a 64 KiB read buffer. Only a full collection
+    # frees that cycle, and an idle daemon rarely runs one, so a drained run
+    # has to break it.
+    import weakref
+
+    job = _running_job(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print(out="out", err="err"))
+        + """
+    schedule: "* * * * *"
+    captureStdout: true
+    captureStderr: true
+"""
+    )
+    gc.collect()
+    gc.disable()  # only refcounting may free the transports
+    try:
+        await job.start()
+        pipes = [
+            weakref.ref(job.proc._transport.get_pipe_transport(fd))
+            for fd in (1, 2)
+        ]
+        await job.wait()
+        assert (job.stdout, job.stderr) == ("out\n", "err\n")
+        del job
+        # let the loop drop its last handles on the closed transports
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert [ref() for ref in pipes] == [None, None]
+    finally:
+        gc.enable()
+
+
+def test_unlink_drained_pipes_leaves_a_pipe_with_connection_lost_pending():
+    # A killed run's pipes are closed but their connection_lost has not run
+    # yet, and that callback calls the protocol: only a drained pipe may
+    # lose it. A stream the run did not capture has no pipe to ask for.
+    job = _running_job(_CAPTURE_STDERR_JOB)
+    job._stdout_reader = None
+    job._stderr_reader = Mock()
+    pipe = Mock()
+    transport = Mock()
+    transport.get_pipe_transport.return_value = pipe
+
+    pipe.get_protocol.return_value = Mock(disconnected=False)
+    job._unlink_drained_pipes(transport)
+    pipe.set_protocol.assert_not_called()
+
+    pipe.get_protocol.return_value = Mock(disconnected=True)
+    job._unlink_drained_pipes(transport)
+    pipe.set_protocol.assert_called_once_with(None)
+    assert [c.args for c in transport.get_pipe_transport.call_args_list] == [
+        (2,),
+        (2,),
+    ]
+
+
 async def test_monitor_resources_populates_usage():
     # a monitored job records CPU time + peak RSS on the RunningJob, which the
     # reaper then folds into the run record / metrics.
