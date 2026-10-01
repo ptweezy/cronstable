@@ -20,7 +20,7 @@
 / kraahn-stuh-bl /
 
 cronstable is *the* modern cron replacement for anything from a single machine to a
-cluster, built with efficiency in mind. It runs your commands from a schedule
+cluster, built with efficiency, security, and stability in mind. It runs your commands from a schedule
 file, following cron's model, and adds retries, alerts, saved run history,
 workflows, and dashboards for the web, the terminal, and iOS.
 
@@ -28,13 +28,6 @@ workflows, and dashboards for the web, the terminal, and iOS.
 
 ### Scheduling
 
-* **Schedule introspection**: ask why a job did or didn't run at a given
-  moment, and get a field-by-field answer from the scheduler's own match test.
-  Collision heatmaps, duplicate detection, and slot suggestions help you place
-  new jobs (see [schedule introspection](#schedule-introspection)).
-* **Schedule linting**: catch schedules that can never run, uneven intervals,
-  and times that daylight saving time skips or repeats (see
-  [schedule linting](https://github.com/ptweezy/cronstable/wiki/Schedule-Linting)).
 * **YAML and classic crontab files**: define jobs in YAML, or load an existing
   crontab (see [classic crontab files](#classic-crontab-files)).
 * **Business-day and hashed schedules**: run on the last weekday of the month
@@ -47,6 +40,13 @@ workflows, and dashboards for the web, the terminal, and iOS.
 * **iCal calendar export**: subscribe to upcoming runs in your calendar app,
   or view them in the dashboard's week calendar (see
   [calendar export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export)).
+* **Schedule introspection**: ask why a job did or didn't run at a given
+  moment, and get a field-by-field answer from the scheduler's own match test.
+  Collision heatmaps, duplicate detection, and slot suggestions help you place
+  new jobs (see [schedule introspection](#schedule-introspection)).
+* **Schedule linting**: catch schedules that can never run, uneven intervals,
+  and times that daylight saving time skips or repeats (see
+  [schedule linting](https://github.com/ptweezy/cronstable/wiki/Schedule-Linting)).
 
 ### Failure handling
 
