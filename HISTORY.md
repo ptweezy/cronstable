@@ -1,5 +1,12 @@
 # History
 
+## 1.2.62
+
+- The Windows setup window shows a cronstable icon in its title bar and on
+  its taskbar button: the pendulum from the logo, on the dark tile of the
+  iOS app icon. The setup executable, the installed application entry, and
+  User Account Control (UAC) prompts keep the full cronstable logo.
+
 ## 1.2.61
 
 - Gzip web and cluster responses with ISA-L when the `speedups` extra

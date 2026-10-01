@@ -9,6 +9,9 @@
           Compressed="yes"
           DisableModify="yes">
     <BootstrapperApplication>
+      <!-- The setup window's icon. build_setup.sh adds the theme attribute
+           that names it. -->
+      <Payload SourceFile="$(sys.SOURCEFILEDIR)..\windows\cronstable-pendulum.ico" />
       <bal:WixStandardBootstrapperApplication
           Theme="hyperlinkLicense"
           LicenseUrl=""

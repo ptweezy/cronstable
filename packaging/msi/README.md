@@ -47,7 +47,18 @@ transparent canvas for the setup window. `packaging/windows/cronstable.ico`
 contains the same image at 16, 20, 24, 32, 40, 48, 64, 128, and 256 pixels.
 PyInstaller embeds the icon in both Windows executable layouts, the MSI uses
 it for `ARPPRODUCTICON`, and the bundle uses it for its executable and elevation
-helper. The artwork follows the
+helper.
+
+The setup window's title bar and taskbar button show
+`packaging/windows/cronstable-pendulum.ico`, because the wordmark is illegible
+at 16 pixels. It contains the pendulum from the iOS app icon
+(`docs/img/ios-icon.png`), cropped closer on the same dark rounded tile, at the
+same nine sizes. The stock WiX theme names no window icon, so
+`build_setup.sh` builds the bundle once, extracts the theme, adds the icon to
+its `Window` element, and builds the bundle again with that theme. `setup.wxs`
+includes the icon as a payload beside the theme.
+
+The artwork follows the
 [brand asset policy](../../LICENSING.md#brand-assets).
 
 The signing job builds each bundle from a signed MSI, detaches and signs the

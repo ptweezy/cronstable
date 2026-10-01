@@ -31,6 +31,7 @@ The following files are excluded:
 | `docs/**/logo-balance-light.gif`, `docs/**/logo-balance-light.webp` | the animated wordmark, light |
 | `docs/**/ios-icon.png` | the iOS app icon |
 | `packaging/windows/cronstable.ico`, `packaging/windows/cronstable-logo.png` | the Windows app and installer wordmark |
+| `packaging/windows/cronstable-pendulum.ico` | the Windows setup window icon |
 
 These files are the finished logo artwork, not source code. You may reproduce
 them **unmodified** when you refer to cronstable itself. This is the same

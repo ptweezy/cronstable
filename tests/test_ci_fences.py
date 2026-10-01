@@ -282,6 +282,24 @@ def test_msi_build_recipe_is_shared_and_pinned():
         )
 
 
+def test_setup_window_icon_is_a_bundle_payload():
+    # build_setup.sh names the setup window's icon in the theme, and
+    # WixStdBA refuses a theme whose icon is missing, so the file must be
+    # a payload of the bundle under the same name.
+    script_path = os.path.join(ROOT, ".github", "scripts", "build_setup.sh")
+    with open(script_path, encoding="utf-8") as fobj:
+        script = fobj.read()
+    icons = set(re.findall(r'<Window IconFile="([^"]+)" ', script))
+    assert len(icons) == 1, "build_setup.sh must name one window icon"
+    (icon,) = icons
+    with open(
+        os.path.join(ROOT, "packaging", "msi", "setup.wxs"), encoding="utf-8"
+    ) as fobj:
+        payloads = re.findall(r'<Payload SourceFile="([^"]+)"', fobj.read())
+    assert [p.rsplit("\\", 1)[-1] for p in payloads] == [icon], payloads
+    assert os.path.isfile(os.path.join(ROOT, "packaging", "windows", icon))
+
+
 def test_msi_smoke_checks_first_launch_before_uninstall():
     for job_name, step_name in [
         ("binaries-windows", "Smoke-test MSI (install, verify, uninstall)"),
