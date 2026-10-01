@@ -2,94 +2,90 @@
 
 ## Supported versions
 
-Releases come from a single release line. Security fixes land on the latest
-released version. There are no long-term-support branches.
+cronstable has a single release line and no long-term-support branches. Only
+the latest release is supported, and a security fix ships as a new release.
 
-| Version | Supported |
-| --- | --- |
-| latest `1.2.x` release | yes |
-| anything older | no, upgrade first |
-
-If you are pinned to an older version and cannot upgrade, say so in the report.
-The advisory then notes the first fixed version so you can backport locally.
+If you can't upgrade from an older version, say so in your report. The
+advisory then names the first fixed version and links the fix, so you can
+backport it.
 
 ## Reporting a vulnerability
 
-**Please do not open a public issue for a security problem.**
+**Don't open a public issue for a security problem.**
 
-Report it privately through GitHub:
+Report it privately through GitHub. Open the
+[advisory form](https://github.com/ptweezy/cronstable/security/advisories/new),
+or go to the repository's **Security** tab and click **Report a
+vulnerability**. Only you and the maintainer can see the report. The report,
+the fix, and the published advisory stay in one place.
 
-1. Go to <https://github.com/ptweezy/cronstable/security/advisories/new>
-   (repository → **Security** → **Report a vulnerability**).
-2. Describe the issue and how to reproduce it.
+If you have them, include the following:
 
-That channel is private between you and the maintainer. It is preferred
-because it keeps the report, the fix, and the published advisory in one place.
+- The cronstable version (`cronstable --version`) and how you installed it,
+  for example pip, Docker image, standalone binary, or system package
+- The relevant part of the config, with secrets redacted
+- A minimal reproduction, and what an attacker gains
+- Whether the daemon was reachable from a network, and by whom
 
-Helpful things to include, when you have them:
+## In scope
 
-- the cronstable version (`cronstable --version`) and how it was installed
-  (pip, Docker image, standalone binary, distro package)
-- the relevant part of the config, with secrets redacted
-- a minimal reproduction, and what an attacker gains
-- whether the daemon was exposed to a network, and to whom
-
-## What is in scope
-
-- the `cronstable` daemon and CLI, including job execution, privilege handling,
-  and the state store
-- the HTTP control API and web dashboard (`web:`), including authentication,
+- The `cronstable` daemon and CLI, including job execution, privilege
+  handling, and the state store
+- The HTTP control API and web dashboard (`web:`), including authentication,
   token scoping, and the Server-Sent Events stream
-- the MCP server
-- the encrypted push pipeline in `cronstable/push.py` and the device-pairing
-  flow, on both the daemon and companion-app sides, including anything that
-  could expose plaintext alert content or a device key
-- the published container images and standalone binaries
-- the hosted services operated for this project: `relay.cronstable.com` (source
-  in [ptweezy/cronstable-relay](https://github.com/ptweezy/cronstable-relay))
+- The MCP server
+- The encrypted push pipeline in `cronstable/push.py` and device pairing, in
+  both the daemon and the iOS app, including anything that could expose
+  plaintext alert content or a device key
+- The published container images and standalone binaries
+- The hosted services that the project operates: the push relay at
+  `relay.cronstable.com` (source in
+  [ptweezy/cronstable-relay](https://github.com/ptweezy/cronstable-relay))
   and the public demo at `demo.cronstable.com`
 
-A report about the relay can go to either repository's advisory page. It is
-routed to the right one.
+Report an issue in the relay, the demo, or the iOS app through the same
+advisory form.
 
-## What is out of scope
+## Out of scope
 
-- the public demo being readable without any credential. `demo.cronstable.com`
-  grants the `view` scope through `web.anonymousScopes` on purpose, so a
-  tokenless request reads jobs, run history, logs, and the calendar feeds. Its
-  published
-  view-scoped token grants that same read-only view plus `GET /push/devices`,
-  which is empty by construction: the demo configures no `push:` section. What
-  *is* in scope there is any path by which a credential-less caller does any
-  of the following:
-  - reaches a `control` or `approve` route
-  - reads `GET /push/devices`
-  - otherwise acts on the daemon
-- configurations that hand cronstable a deliberately dangerous job, such as a
-  crontab line that a local user can already edit. Whatever command a config
-  names, cronstable runs it. The trust boundary is who may write the config.
-- exposing the control API to a hostile network with authentication disabled.
-  That is documented as unsupported, not a vulnerability.
-- automated scanner output with no working proof of concept.
+- The public demo's intended visitor access. Without a credential, anyone can
+  read the jobs, run history, logs, metrics, and calendar feeds on
+  `demo.cronstable.com`. Anyone can also start, cancel, pause, and resume the
+  sample jobs, and trigger and decide the sample workflows, because a gateway
+  in front of the daemon forwards an allowlist of those actions. The
+  published view token grants the same access. The
+  [demo instance README](https://github.com/ptweezy/cronstable/blob/main/example/demo-instance/README.md)
+  lists what the gateway allows. A visitor getting past the gateway is in
+  scope: for example, acting on a job outside the allowlist, reaching a route
+  that the gateway doesn't forward (device pairing, MCP, backfill, shutdown),
+  or recovering the private operator token.
+- A config that names a dangerous command, such as a crontab line that a
+  local user can already edit. cronstable runs whatever command a config
+  names. The trust boundary is who can write the config.
+- An API listener that a hostile network can reach while no token is
+  configured. The API is unauthenticated by default, and the
+  [authentication documentation](https://github.com/ptweezy/cronstable/wiki/HTTP-API#authentication)
+  tells you to restrict access or set a token.
+- Automated scanner output with no working proof of concept.
 
-## Handling
+## What to expect
 
-One person maintains cronstable, so response times are best effort, not
-contractual. What you can expect:
+One person maintains cronstable, so response times are best effort. You can
+expect the following:
 
-- an acknowledgment that the report was received and read
-- an assessment of whether it is in scope, and a severity call
-- a fix on the latest release line, and a published GitHub Security Advisory
-  with a CVE where one is warranted
+- An acknowledgment that the maintainer received and read your report
+- An assessment of whether the issue is in scope, and a severity rating
+- A fix in a new release, and a published GitHub Security Advisory with a
+  CVE where one is warranted
 
-Unless you ask to stay anonymous, credit is given in the advisory. There is no
-bug bounty. This is an MIT-licensed project with no funding behind it.
+The advisory credits you unless you ask to stay anonymous. There is no bug
+bounty: cronstable is an MIT-licensed project with no funding.
 
-## Cryptography note
+## Push encryption
 
-The push pipeline encrypts alert payloads to each paired device's public key
-(X-Wing, a post-quantum hybrid of ML-KEM-768 and X25519, where the platform
-supports it, and an X25519 sealed box elsewhere) so the relay forwards
-ciphertext it cannot read. Findings that
-break that property, or that let a relay operator or network observer recover
-alert content or link devices, are treated as high severity.
+The daemon encrypts each alert to the paired device's public key, so the
+relay forwards ciphertext that it can't read. The encryption is X-Wing, a
+post-quantum hybrid of ML-KEM-768 and X25519, where the platform supports it,
+and an X25519 sealed box elsewhere. The maintainer treats a finding as high
+severity if it lets a relay operator or a network observer recover alert
+content or link devices.
