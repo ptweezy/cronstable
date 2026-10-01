@@ -556,6 +556,32 @@ async def test_tls_files_loadable_true_then_false_on_corruption(tmp_path):
         pytest.fail("tls_files_loadable must swallow load errors, not raise")
 
 
+def test_free_port_never_returns_a_port_twice(monkeypatch):
+    # bind(0) can return a port the kernel released a moment ago. Two nodes
+    # of one test given that port fail with "address already in use".
+    import types
+
+    from tests import _helpers
+
+    ports = iter([40001, 40001, 40002])
+
+    class _Socket:
+        def bind(self, address):
+            self.port = next(ports)
+
+        def getsockname(self):
+            return ("127.0.0.1", self.port)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        _helpers, "socket", types.SimpleNamespace(socket=_Socket)
+    )
+    monkeypatch.setattr(_helpers, "_handed_out_ports", set())
+    assert [_free_port(), _free_port()] == [40001, 40002]
+
+
 async def test_mtls_round_trip_agreed(tmp_path):
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()

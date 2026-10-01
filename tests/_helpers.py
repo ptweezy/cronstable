@@ -397,13 +397,27 @@ requires_xwing = pytest.mark.skipif(
 # parameters, documented on each.
 
 
+#: Ports :func:`_free_port` has already returned in this process.
+_handed_out_ports: set[int] = set()
+
+
 def _free_port():
-    s = socket.socket()
-    try:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-    finally:
-        s.close()
+    """A loopback TCP port that no earlier call returned.
+
+    The kernel can give ``bind(0)`` a port it released a moment ago, so
+    without the record two back-to-back calls can return one port for both
+    nodes of a test.
+    """
+    while True:
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        finally:
+            s.close()
+        if port not in _handed_out_ports:
+            _handed_out_ports.add(port)
+            return port
 
 
 def _gen_ca(cn):
