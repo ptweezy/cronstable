@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=83", "setuptools_scm>=8"]
+requires = ["setuptools>=84.0.0", "setuptools_scm>=10.3.4"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -44,7 +44,7 @@ dependencies = [
     # PyPI withdrew 1.7.0 because it causes an import error.
     "strictyaml>=1.7.3,<2",
     "aiohttp>=3.14.3,<4",
-    "sentry-sdk>=2.70.0,<3",
+    "sentry-sdk>=2.71.0,<3",
     "aiosmtplib>=5.1.3,<6",
     "jinja2>=3.1.6,<4",
     # zoneinfo's tz database, so timezones resolve on minimal/slim images
@@ -92,17 +92,17 @@ cronstable = "cronstable.__main__:main"
 # Official Kubernetes client for the `kubernetes` leadership backend. Without
 # it (or where its grpc/protobuf wheels are missing) the backend falls back to
 # its own apiserver REST transport over aiohttp. The etcd backend needs none.
-kubernetes = ["kubernetes>=27"]
+kubernetes = ["kubernetes>=36.0.3"]
 # uvloop's faster event loop; cronstable falls back to stock asyncio without
 # it. Windows has no uvloop build (and needs the Proactor loop for
 # subprocesses), so the marker skips it there.
 speedups = [
-    "uvloop>=0.19; sys_platform != 'win32'",
+    "uvloop>=0.22.1; sys_platform != 'win32'",
     # orjson speeds the state-persistence and cluster-gossip JSON paths
     # (cronstable._json falls back to stdlib json). Optional because some
     # targets (riscv64, armv6, musl ppc64le/s390x) have no wheel; Windows
     # does, so no marker.
-    "orjson>=3.11.6",
+    "orjson>=3.12.0",
     # isal (ISA-L) gzips web and cluster responses with SIMD deflate
     # (cronstable._gzip falls back to stdlib zlib). The marker lists only
     # targets with a wheel, so pip never tries the sdist, which builds ISA-L
@@ -135,7 +135,7 @@ push = [
 # Zero-config LAN discovery (the opt-in `web.bonjour` mDNS advert; see
 # cronstable.discovery). Same fail-closed contract: web.bonjour without this
 # installed is a ConfigError, never a silent no-advert.
-discovery = ["zeroconf>=0.151.3"]
+discovery = ["zeroconf>=0.151.5"]
 dev = [
     # Canonical dev list: scripts/generate_build_files.py emits
     # requirements_dev.txt for tox and pip. Edit dependencies here.
@@ -145,12 +145,12 @@ dev = [
     # orjson is wheel-only here: the marker skips targets that would need a
     # Rust source build. py314t uses a generated list without it, because no
     # marker can detect the free-threaded ABI that orjson rejects.
-    "orjson>=3.11.6; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+    "orjson>=3.12.0; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
     # isal reuses the speedups marker; tests/test_gzip.py covers both
     # backends wherever it installs.
     "isal>=1.8.0; python_version < '3.15' and ((sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64'))",
     "pynacl>=1.6.2",
-    "zeroconf>=0.151.3",
+    "zeroconf>=0.151.5",
     # Browser-backed tests require a separate `playwright install chromium`
     # step after pip installs the library. No wheel/sdist exists on win-arm64.
     "playwright; platform_machine != 'ARM64' or sys_platform != 'win32'",
@@ -167,7 +167,7 @@ dev = [
     "crontab>=1.0.5,<2",
     # Property tests generate schedules, configuration, Task XML, and
     # protocol payloads to check invariants (tests/test_properties_*.py).
-    "hypothesis>=6.168.1",
+    "hypothesis>=6.168.3",
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
