@@ -69,7 +69,7 @@ def main(argv):
 
     manifest = {
         "version": version,
-        "description": "Modern cron with retries, alerts, run history, and dashboards",
+        "description": "Job scheduler with retries, alerts, run history, and dashboards",
         "homepage": REPO,
         "license": "MIT",
         "architecture": architecture,

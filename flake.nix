@@ -1,5 +1,5 @@
 {
-  description = "cronstable, a modern cron with retries, alerts, run history, and dashboards";
+  description = "cronstable, a job scheduler with retries, alerts, run history, and dashboards";
 
   # nixos-unstable supplies the newer Python dependencies this project needs.
   # PyPI releases can still arrive first; nix/python-packages.nix bridges
@@ -106,7 +106,7 @@
             pythonImportsCheck = [ "cronstable" ];
 
             meta = with pkgs.lib; {
-              description = "Modern cron with retries, alerts, run history, and dashboards";
+              description = "Job scheduler with retries, alerts, run history, and dashboards";
               homepage = "https://github.com/ptweezy/cronstable";
               license = licenses.mit;
               mainProgram = "cronstable";

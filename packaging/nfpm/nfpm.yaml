@@ -20,11 +20,11 @@ section: admin
 priority: optional
 maintainer: Parker Loflin <parker@cronstable.dev>
 description: |
-  Modern cron with retries, alerts, run history, and dashboards.
-  cronstable runs your commands from a schedule file, following cron's model,
-  and adds retries, alerts, saved run history, workflows, and dashboards for
-  the web, the terminal, and iOS. It runs on a single machine or across a
-  cluster.
+  Job scheduler with retries, alerts, run history, and dashboards.
+  cronstable runs your commands on a schedule, defined in YAML or loaded from
+  an existing crontab, and adds retries, alerts, saved run history, workflows,
+  and dashboards for the web, the terminal, and iOS. It runs on a single
+  machine or across a cluster.
   ${PKG_CPU_NOTE}
 vendor: Parker Loflin
 homepage: https://github.com/ptweezy/cronstable

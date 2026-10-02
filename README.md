@@ -19,10 +19,11 @@
 
 / kraahn-stuh-bl /
 
-cronstable is *the* modern cron replacement for anything from a single machine to a
-cluster, built with efficiency, security, and stability in mind. It runs your commands from a schedule
-file, following cron's model, and adds retries, alerts, saved run history,
-workflows, and dashboards for the web, the terminal, and iOS.
+cronstable is a fun little job scheduler for anything from a single machine to a cluster,
+built with efficiency, security, and stability in mind. It runs your commands
+on a schedule, defined in YAML or loaded from an existing crontab, and adds
+retries, alerts, saved run history, workflows, and dashboards for the web, the
+terminal, and iOS.
 
 ## Why cronstable?
 
@@ -502,9 +503,8 @@ tutorial links to the wiki page that covers its topic in full.
 
 ### Tutorial 1: Retry failed jobs and alert when retries fail
 
-Classic cron doesn't retry a failed job. This example retries with exponential
-backoff, and it posts to a Slack channel only if the job still fails after its
-last retry:
+This example retries a failed job with exponential backoff, and it posts to a
+Slack channel only if the job still fails after its last retry:
 
 ```yaml
 jobs:

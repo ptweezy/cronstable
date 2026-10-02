@@ -61,7 +61,7 @@ RUN /opt/venv/bin/pip uninstall -y pip || true
 # Runtime packages must match the builder interpreter and shared libraries.
 FROM amazonlinux:${AL_VERSION}
 LABEL org.opencontainers.image.title="cronstable" \
-      org.opencontainers.image.description="A modern cron with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (Amazon Linux 2023)." \
+      org.opencontainers.image.description="A job scheduler with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (Amazon Linux 2023)." \
       org.opencontainers.image.source="https://github.com/ptweezy/cronstable" \
       org.opencontainers.image.licenses="MIT"
 ENV PYTHONUNBUFFERED=1 \

@@ -65,7 +65,7 @@ RUN /opt/venv/bin/pip uninstall -y pip || true
 # Runtime packages must match the builder interpreter and shared libraries.
 FROM python:3.14-slim
 LABEL org.opencontainers.image.title="cronstable" \
-      org.opencontainers.image.description="A modern cron with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters." \
+      org.opencontainers.image.description="A job scheduler with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters." \
       org.opencontainers.image.source="https://github.com/ptweezy/cronstable" \
       org.opencontainers.image.url="https://github.com/ptweezy/cronstable" \
       org.opencontainers.image.documentation="https://github.com/ptweezy/cronstable/wiki" \

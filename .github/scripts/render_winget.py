@@ -101,7 +101,7 @@ def render(version, metadata, output):
             ),
             "CopyrightUrl": f"{REPO}/blob/{version}/LICENSE",
             "ShortDescription": (
-                "A modern cron with retries, alerts, saved run history, "
+                "A job scheduler with retries, alerts, saved run history, "
                 "workflows, and dashboards for single machines and clusters."
             ),
             "Moniker": "cronstable",
