@@ -75,12 +75,13 @@ def manifest(path, version, amd64v3=False):
         "name": "cronstable",
         "version": version,
         "origin": "sysutils/cronstable",
-        "comment": "Modern cron with retries, alerts, run history, and dashboards",
+        "comment": "Job scheduler with retries, alerts, run history, and dashboards",
         "desc": (
-            "cronstable runs your commands from a schedule file, following "
-            "cron's model, and adds retries, alerts, saved run history, "
-            "workflows, and dashboards for the web, the terminal, and iOS. "
-            "It runs on a single machine or across a cluster.\n\n"
+            "cronstable runs your commands on a schedule, defined in YAML or "
+            "loaded from an existing crontab, and adds retries, alerts, saved "
+            "run history, workflows, and dashboards for the web, the "
+            "terminal, and iOS. It runs on a single machine or across a "
+            "cluster.\n\n"
             "This package carries a self-contained binary with Python embedded, "
             "so it needs no Python on the host."
         ),

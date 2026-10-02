@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cronstable"
-description = "A modern cron with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters."
+description = "A job scheduler with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

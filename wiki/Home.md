@@ -1,6 +1,6 @@
 # cronstable™ wiki
 
-cronstable is an asyncio-based cron replacement for Linux, macOS, and Windows. Define jobs in YAML or load [classic Vixie crontabs](Classic-Crontabs). It supports failure notifications, retries with exponential backoff, statsd and Prometheus metrics, and an optional HTTP control API with a [web dashboard](Web-Dashboard) to monitor and control jobs.
+cronstable is an asyncio-based job scheduler for Linux, macOS, and Windows. Define jobs in YAML or load [classic Vixie crontabs](Classic-Crontabs). It supports failure notifications, retries with exponential backoff, statsd and Prometheus metrics, and an optional HTTP control API with a [web dashboard](Web-Dashboard) to monitor and control jobs.
 
 An optional [durable state store](Durable-State) preserves run history across restarts and enables missed-run catch-up, job state, and [DAG workflows](Orchestration-and-DAGs). The [MCP server](MCP) lets AI agents inspect the daemon and, with control enabled, act on jobs and DAGs.
 
