@@ -113,10 +113,45 @@ def test_the_live_backend_lane_cannot_pass_hollow():
     assert 'totals["skipped"] == 0' in run["run"]
 
 
+def test_the_test_envs_install_the_dev_extra():
+    # configparser reads each section alone, so `[testenv]` here is the
+    # base that every env without its own `extras` inherits.
+    base = _tox()["testenv"]
+    assert base["extras"].split() == ["!py314t:", "dev"]
+    # orjson has no free-threaded build, so 3.14t swaps the extra for the
+    # generated list without it. Both keys carry the factor: dropping
+    # either one installs orjson there or leaves the env with no test deps.
+    assert base["deps"].split() == [
+        "py314t:",
+        "-rrequirements/dev-freethreaded.txt",
+    ]
+    assert os.path.exists(
+        os.path.join(ROOT, "requirements", "dev-freethreaded.txt")
+    )
+    # mypy installs the package to resolve the runtime deps and nothing
+    # else; inheriting the extra would type-check against the dev tools.
+    assert _tox()["testenv:mypy"]["extras"].strip() == ""
+
+
+def test_the_chromium_steps_install_the_playwright_the_dev_extra_names():
+    # The workflows install Chromium through a host `pip install
+    # playwright`, which matches the tox env's playwright only while the
+    # dev extra leaves it unpinned. A pin there belongs in these steps too.
+    dev = _pyproject()["project"]["optional-dependencies"]["dev"]
+    (line,) = [dep for dep in dev if dep.startswith("playwright")]
+    assert line.partition(";")[0].strip() == "playwright"
+    for name in ("release.yml", "nightly.yml"):
+        path = os.path.join(ROOT, ".github", "workflows", name)
+        with open(path, encoding="utf-8") as fobj:
+            assert "pip install playwright\n" in fobj.read(), name
+
+
 def test_the_mindeps_lane_installs_the_generated_floor_pins():
     env = _tox()["testenv:mindeps"]
-    assert "-rrequirements_min.txt" in env["deps"]
-    assert "-rrequirements_dev.txt" in env["deps"]
+    assert env["deps"].split() == ["-rrequirements/min.txt"]
+    # as constraints, the pins also bind the resolve of the dev extra
+    assert env["constraints"].split() == ["requirements/min.txt"]
+    assert "extras" not in env
     job = _load_workflow("release.yml")["jobs"]["tox-mindeps"]
     assert "tox -e mindeps" in str(job["steps"])
     # the oldest supported Python, where every pinned floor has a wheel
@@ -130,7 +165,7 @@ def test_the_mindeps_lane_installs_the_generated_floor_pins():
 
 def test_minimum_pins_cover_every_runtime_dependency():
     project = _pyproject()["project"]
-    with open(os.path.join(ROOT, "requirements_min.txt")) as fobj:
+    with open(os.path.join(ROOT, "requirements", "min.txt")) as fobj:
         pins = {
             line.split("==")[0]
             for line in fobj.read().splitlines()

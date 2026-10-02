@@ -1028,7 +1028,7 @@ def test_importing_the_daemon_loads_no_zeroconf():
     # those imports to module scope stays silent on a machine without it.
     assert probe["ZEROCONF-INSTALLED"] == 1, (
         "zeroconf is not installed in this environment, so the door check "
-        "below would pass vacuously. It is required by requirements_dev.txt; "
+        "below would pass vacuously. The dev extra requires it; "
         "install the `discovery` extra or fix the environment."
     )
     assert probe["ZEROCONF-AFTER-IMPORT"] == 0, (

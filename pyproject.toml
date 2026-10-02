@@ -137,8 +137,9 @@ push = [
 # installed is a ConfigError, never a silent no-advert.
 discovery = ["zeroconf>=0.151.5"]
 dev = [
-    # Canonical dev list: scripts/generate_build_files.py emits
-    # requirements_dev.txt for tox and pip. Edit dependencies here.
+    # Canonical dev list: tox and pip install this extra, and
+    # scripts/generate_build_files.py derives requirements/min.txt and
+    # requirements/dev-freethreaded.txt from it. Edit dependencies here.
     # cryptography (mTLS and X-Wing tests) reuses the push marker and its
     # linux32 caveat; those tests skip where it is absent.
     "cryptography>=50.0.1,<51; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",

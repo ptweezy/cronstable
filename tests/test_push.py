@@ -9,8 +9,8 @@ zeroconf).
 
 PyNaCl (x25519 sealed boxes) and cryptography (X-Wing HPKE), both
 carried by the push extra, are dev dependencies: PyNaCl has wheels on
-every CI cell, cryptography on every cell except win-arm64 (see
-requirements_dev.txt). Only the tests that actually touch key material
+every CI cell, cryptography on every cell except win-arm64 (see the dev
+extra in pyproject.toml). Only the tests that actually touch key material
 skip without them (the ``requires_pynacl`` and ``requires_xwing``
 markers); the
 store, config-validation, handler-scope, /whoami, lifecycle and Bonjour

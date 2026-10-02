@@ -6,6 +6,10 @@
   its taskbar button: the pendulum from the logo, on the dark tile of the
   iOS app icon. The setup executable, the installed application entry, and
   User Account Control (UAC) prompts keep the full cronstable logo.
+- The `dev` extra is the one development dependency list: tox and CI install
+  it, as `pip install -e ".[dev]"` does. The two generated lists that tox
+  also reads are in `requirements/`: `min.txt` for `tox -e mindeps` and
+  `dev-freethreaded.txt` for Python 3.14t.
 
 ## 1.2.61
 

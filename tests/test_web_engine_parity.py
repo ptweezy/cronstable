@@ -9,7 +9,7 @@ Playwright, and every mutually-valid expression must agree on the next
 eight fire instants and on the plain-English description, byte for byte.
 
 Runs wherever Playwright and its Chromium build are both present.
-``requirements_dev.txt`` installs the library (fenced by
+The ``dev`` extra installs the library (fenced by
 ``test_playwright_is_installed_where_a_wheel_exists``); the browser is a
 separate download that pip does not do, so CI fetches it in one matrix cell
 and this differential self-skips in the rest, like the legacy-library

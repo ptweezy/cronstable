@@ -39,16 +39,13 @@ def test_checked_in_build_files_are_current(generator):
 
 def test_free_threaded_dependencies_omit_only_orjson(generator):
     files = generator.generated_files()
-
-    def requirements(name):
-        return {
-            line
-            for line in files[name].splitlines()
-            if line and not line.startswith("#")
-        }
-
-    regular = requirements("requirements_dev.txt")
-    free_threaded = requirements("requirements_dev_freethreaded.txt")
+    project = generator.tomllib.loads((ROOT / "pyproject.toml").read_text())
+    regular = set(project["project"]["optional-dependencies"]["dev"])
+    free_threaded = {
+        line
+        for line in files["requirements/dev-freethreaded.txt"].splitlines()
+        if line and not line.startswith("#")
+    }
     assert regular - free_threaded == {
         line for line in regular if line.startswith("orjson>=")
     }
@@ -94,7 +91,7 @@ def test_push_dependencies_resolve_without_vulnerable_legacy_crypto(
             assert vulnerable not in spec
 
 
-def test_dependency_bump_reaches_dev_binary_and_every_image(
+def test_dependency_bump_reaches_min_pins_binary_and_every_image(
     generator, tmp_path
 ):
     for name in (
@@ -111,7 +108,11 @@ def test_dependency_bump_reaches_dev_binary_and_every_image(
     original = generator.extra_floors(data)["orjson"]
     project.write_text(project.read_text().replace(original, "orjson>=99.0"))
     files = generator.generated_files(tmp_path)
-    assert "orjson>=99.0;" in files["requirements_dev.txt"]
+    assert "orjson==99.0;" in files["requirements/min.txt"]
+    assert not any(
+        line.startswith("orjson")
+        for line in files["requirements/dev-freethreaded.txt"].splitlines()
+    )
     assert files["pyinstaller/requirements/orjson.txt"] == "orjson>=99.0\n"
     matrix = json.loads((tmp_path / ".github/docker-matrix.json").read_text())
     for row in matrix:
@@ -121,7 +122,7 @@ def test_dependency_bump_reaches_dev_binary_and_every_image(
 def test_check_reports_stale_files_without_writing(
     generator, tmp_path, monkeypatch
 ):
-    path = tmp_path / "requirements_dev.txt"
+    path = tmp_path / "generated.txt"
     path.write_text("old\n")
     monkeypatch.setattr(generator, "ROOT", tmp_path)
     monkeypatch.setattr(

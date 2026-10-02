@@ -429,13 +429,14 @@ jobs:
       # dashboard and daemon cron engine differential
       # (tests/test_web_engine_parity.py) self-skips. One cell suffices: the
       # differential is platform-independent and Chromium is ~150 MB. The
-      # spec is the unpinned requirements_dev.txt line so the browser matches
-      # the tox env playwright; on a skew the enforcement step below fails.
+      # spec is unpinned, like the dev extra's playwright line
+      # (tests/test_ci_lanes.py checks that), so the browser matches the tox
+      # env playwright; on a skew the enforcement step below fails.
       - name: Install Chromium for the web engine differential
         if: matrix.os == 'ubuntu-26.04' && matrix.python == '3.14'
         run: |
           set -euo pipefail
-          pip install "$(grep -E '^playwright' requirements_dev.txt)"
+          pip install playwright
           python -m playwright install --with-deps chromium
       # Both envs on every runner: the one for the other OS skips (the tox.ini
       # `platform` key), so each cell measures its own OS coverage profile.
@@ -548,7 +549,7 @@ jobs:
       - preflight
       - tox
 
-  # Tests the pyproject.toml dependency floors (requirements_min.txt) on the
+  # Tests the pyproject.toml dependency floors (requirements/min.txt) on the
   # oldest Python; every other job resolves newer versions.
   tox-mindeps:
     runs-on: ubuntu-26.04
@@ -578,7 +579,7 @@ jobs:
         with:
           python-version: '3.14'
       - name: Install the package, development dependencies, and Kubernetes client
-        run: pip install -e '.[kubernetes]' -r requirements_dev.txt
+        run: pip install -e '.[kubernetes,dev]'
       - name: Start etcd without TLS or authentication
         run: |
           set -euo pipefail

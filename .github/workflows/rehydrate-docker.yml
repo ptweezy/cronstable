@@ -104,7 +104,7 @@ jobs:
       - name: Test the release with fresh dependencies
         run: |
           set -euo pipefail
-          python -m pip install -r requirements_dev.txt '.[speedups,push,discovery]'
+          python -m pip install '.[dev,speedups,push,discovery]'
           # A released suite never receives later race fixes, so a failure
           # blocks the refresh only when it repeats.
           if ! python -m pytest -q; then

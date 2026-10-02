@@ -17,15 +17,15 @@ updates:
       github-actions:
         patterns: ["*"]
 
-  # pyproject.toml owns dependency floors: apply a requirements_min.txt bump
+  # pyproject.toml owns dependency floors: apply a requirements/min.txt bump
   # there (extras too), then run scripts/generate_build_files.py. Keep
-  # requirements_min.txt scanned; excluding it leaves the dependency graph
-  # reporting obsolete vulnerable pins.
+  # requirements/min.txt scanned; excluding it leaves the dependency graph
+  # reporting obsolete vulnerable pins. Dependabot reads requirements files
+  # one directory below `directory`, so "/" covers requirements/.
   - package-ecosystem: pip
     directory: "/"
     exclude-paths:
-      - "requirements_dev.txt"
-      - "requirements_dev_freethreaded.txt"
+      - "requirements/dev-freethreaded.txt"
       - "pyinstaller/requirements/**"
     schedule:
       interval: weekly

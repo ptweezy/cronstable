@@ -80,7 +80,7 @@ To use Python's built-in `venv` module and pip instead of uv, run:
 
 ```sh
 python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"                         # or: pip install -r requirements_dev.txt
+pip install -e ".[dev]"                         # editable install with the dev extra
 ```
 
 The browser tests need Chromium, which Playwright downloads separately.
@@ -198,10 +198,11 @@ table, by their own code in `cronstable/config.py` and
 Some checked-in files are generated. Edit their inputs and leave the generated
 files to the generator:
 
-- `pyproject.toml` declares the development dependencies and the minimum
-  versions for optional dependencies. From it, the generator writes
-  `requirements_dev.txt`, `requirements_dev_freethreaded.txt`,
-  `requirements_min.txt`, and `pyinstaller/requirements/*.txt`.
+- `pyproject.toml` declares the development dependencies in its `dev` extra
+  and the minimum versions for optional dependencies. The `dev` extra is what
+  pip, uv, and tox install. From `pyproject.toml`, the generator writes
+  `requirements/min.txt`, `requirements/dev-freethreaded.txt`, and
+  `pyinstaller/requirements/*.txt`.
 - `docker/templates/Dockerfile` is the template for all eight Dockerfiles.
   `docker/images.toml` holds each distro's base images, packages, and runtime
   settings, and `.github/docker-matrix.json` lists the supported image paths
@@ -219,13 +220,13 @@ Commit the generated files with their inputs. CI runs the same verification
 before its static checks. Builds use the checked-in files directly, including
 on Python 3.10, and never run the generator.
 
-`requirements_min.txt` pins the minimum runtime and test dependency versions
+`requirements/min.txt` pins the minimum runtime and test dependency versions
 for `tox -e mindeps`. Each file in `pyinstaller/requirements/` holds one
 optional dependency's minimum version, and the binary build jobs choose which
 of them each platform installs.
 
-`requirements_dev_freethreaded.txt` omits only `orjson`, which does not
-support free-threaded Python. With Python 3.14t installed, run
+`requirements/dev-freethreaded.txt` lists the `dev` extra without `orjson`,
+which does not support free-threaded Python. With Python 3.14t installed, run
 `tox -e py314t-posix` to test the standard-library JSON fallback with the
 same test suite and coverage floor.
 

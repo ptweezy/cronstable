@@ -57,7 +57,7 @@ def minimum_requirements(project):
     """Pin each declared minimum version and preserve environment markers.
 
     The ``mindeps`` tox environment installs these requirements alongside
-    ``requirements_dev.txt`` to test the oldest supported runtime and test
+    the ``dev`` extra to test the oldest supported runtime and test
     dependencies. Omit dependencies without a declared minimum version.
     """
     pins = []
@@ -94,19 +94,15 @@ def generated_files(root=ROOT):
     project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
     dev = project["optional-dependencies"]["dev"]
     files = {
-        "requirements_dev.txt": GENERATED
-        + "# Install with: pip install -r requirements_dev.txt\n"
-        + "\n".join(dev)
-        + "\n",
         # PEP 508 markers cannot distinguish a free-threaded interpreter.
         # orjson rejects that ABI; exercise cronstable's stdlib fallback.
-        "requirements_dev_freethreaded.txt": GENERATED
+        "requirements/dev-freethreaded.txt": GENERATED
         + "# Free-threaded Python: all dev dependencies except orjson.\n"
         + "\n".join(
             line for line in dev if re.match(r"[\w.-]+", line)[0] != "orjson"
         )
         + "\n",
-        "requirements_min.txt": GENERATED
+        "requirements/min.txt": GENERATED
         + "# Pinned minimum dependency versions for tox -e mindeps.\n"
         + "\n".join(minimum_requirements(project))
         + "\n",

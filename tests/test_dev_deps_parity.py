@@ -14,7 +14,7 @@ def test_playwright_is_installed_where_a_wheel_exists():
     # importorskip-guarded, and playwright was in neither dependency list, so
     # it skipped everywhere and the dashboard's second implementation of the
     # schedule dialect shipped with nothing comparing it to the first.
-    # requirements_dev.txt now installs playwright wherever a wheel exists;
+    # The dev extra installs playwright wherever a wheel exists;
     # this fails loudly if that line is dropped or its marker stops matching,
     # instead of degrading back to a silent skip (the same way the orjson
     # guard in tests/test_json_portability.py works).

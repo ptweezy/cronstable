@@ -32,7 +32,7 @@ jobs:
       - name: Install Chromium
         run: |
           set -euo pipefail
-          pip install "$(grep -E '^playwright' requirements_dev.txt)"
+          pip install playwright
           python -m playwright install --with-deps chromium
       - run: tox -e deep
 
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - run: pip install -e . -r requirements_dev.txt
+      - run: pip install -e '.[dev]'
       # Allow twice the usual timeout for Python development mode.
       - run: python -m pytest -q --timeout=540 -o faulthandler_timeout=600
 
@@ -68,7 +68,7 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - run: pip install -e . -r requirements_dev.txt mutmut
+      - run: pip install -e '.[dev]' mutmut
       # [tool.mutmut] in pyproject.toml selects the sources and tests.
       # Limit this job to mutations in one module.
       - name: Mutate cronstable.${{ matrix.module }}
