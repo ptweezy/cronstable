@@ -42,7 +42,7 @@ COPY pyinstaller/verify_extra.py /tmp/deps/verify_extra.py
 RUN set -eux; \
     RUST_SETUP="zypper --non-interactive refresh \
         && zypper --non-interactive install rust cargo" \
-    sh /tmp/deps/install_orjson.sh "orjson>=3.11.6"; \
+    sh /tmp/deps/install_orjson.sh "orjson>=3.12.0"; \
     zypper clean --all
 
 # Only these project-install layers depend on this commit and its version.

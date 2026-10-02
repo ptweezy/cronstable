@@ -41,7 +41,7 @@ RUN set -eux; \
     RUST_SETUP="apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update \
         && apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates \
         && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" \
-    sh /tmp/deps/install_orjson.sh "orjson>=3.11.6"; \
+    sh /tmp/deps/install_orjson.sh "orjson>=3.12.0"; \
     rm -rf /var/lib/apt/lists/*
 
 # Only these project-install layers depend on this commit and its version.

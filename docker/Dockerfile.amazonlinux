@@ -38,7 +38,7 @@ RUN /opt/venv/bin/python -c 'from nacl.public import PrivateKey, SealedBox; k = 
 COPY docker/install_orjson.sh /tmp/deps/install_orjson.sh
 COPY pyinstaller/verify_extra.py /tmp/deps/verify_extra.py
 RUN set -eux; \
-    sh /tmp/deps/install_orjson.sh "orjson>=3.11.6"
+    sh /tmp/deps/install_orjson.sh "orjson>=3.12.0"
 
 # Only these project-install layers depend on this commit and its version.
 ARG VERSION=""

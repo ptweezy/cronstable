@@ -39,7 +39,7 @@ COPY pyinstaller/verify_extra.py /tmp/deps/verify_extra.py
 RUN set -eux; \
     RUST_SETUP="apk add --no-cache curl \
         && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" \
-    sh /tmp/deps/install_orjson.sh "orjson>=3.11.6"
+    sh /tmp/deps/install_orjson.sh "orjson>=3.12.0"
 
 # Only these project-install layers depend on this commit and its version.
 ARG VERSION=""
