@@ -68,9 +68,11 @@ _PROBE = """
   };
   for (const el of document.querySelectorAll("[data-xss],[data-xssattr]"))
     bad.push("marker " + where(el));
+  // the run-parameters dialog is the page's one form; any other is injected
+  const paramForm = document.getElementById("paramForm");
   for (const el of document.querySelectorAll(
       "img,iframe,object,embed,form,base,link[rel=import]"))
-    bad.push("element " + where(el));
+    if (el !== paramForm) bad.push("element " + where(el));
   for (const el of document.querySelectorAll("*")) {
     for (const a of el.attributes) {
       if (/^on/i.test(a.name)) bad.push("handler " + where(el));
