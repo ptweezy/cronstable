@@ -71,7 +71,7 @@ Each row shows:
 | **Took** | The last run's duration. |
 | **Next** | A live countdown to the next scheduled run (`—` while running, paused, or disabled). |
 | **Trend** | A **sparkline** of recent runs: one bar per run, height by duration, colored by outcome (pause-skipped slots paint neutral, not green). |
-| **Actions** | One-click **Run** (or **Stop**, for a running job), **Pause** (or **Resume**, for a paused job), and **Logs**. |
+| **Actions** | One-click **Run** (or **Stop**, for a running job), **Pause** (or **Resume**, for a paused job), and **Logs**. For a job that declares [run parameters](Commands-and-Environment#params), **Run** opens a dialog with a field for each parameter, set to its default, when your token can choose values. Without the `params` scope, **Run** starts the job with its defaults. |
 
 Use **⊞ cols** in the table header to show or hide columns. The choice is saved
 per browser. The table widens as needed and scrolls horizontally if it exceeds
@@ -112,6 +112,8 @@ spells them out beside the badge.
 
 Clicking a job (or pressing `Enter` on the selected row) opens a detail drawer
 with four tabs: **Logs**, **History**, **Resources**, and **Schedule**. The
+**History** tab lists the parameter values each run of a job that declares
+them took. The
 drawer header repeats the job's status, its schedule (with the plain-English
 reading), the running PID(s), and a one-click button to copy the command. For a
 running job with [resource monitoring](Resource-Monitoring) on, the header adds
@@ -224,8 +226,20 @@ run outcomes, the total run count, and one-click **Run** / **Open** actions.
 - **Runs**: recent runs, newest first, each with its state and a per-state
   task tally; selecting a run drives the other tabs.
 - **Graph**: the task graph, each node colored by its task's state as the run
-  advances.
-- **Tasks**: per-task state, attempts, and timings. An
+  advances. A node whose task sets a
+  [`triggerRule`](Orchestration-and-DAGs#tasks-and-dependencies) other than
+  `all_success` carries a badge for the rule: **all done**, **none failed**,
+  **1+ success** (`none_failed_min_one_success`), or **1+ failed**
+  (`all_done_min_one_failed`). A node whose task has a
+  [`when:` condition](Orchestration-and-DAGs#conditions-on-parameters-and-xcom-values) carries a diamond on its left edge. A node's
+  tooltip names the full rule, the task's `skipExitCodes`, its `when:`
+  comparisons, and why a skipped task was skipped.
+- **Tasks**: per-task state, attempts, and timings, with the same rule badge
+  beside the task name. A task that has a `when:` condition carries a
+  **when** badge, and hovering it lists the comparisons. A skipped task
+  shows why it was skipped, such as `skipped itself, exit code 99`,
+  `upstream skipped: full-load`, or
+  `param mode equals full: the value is incremental`. An
   [approval gate](Orchestration-and-DAGs#approval-gates) that is awaiting a
   decision shows **✓ Approve** / **✕ Reject** buttons, and the decision is
   recorded as made by `dashboard`; a gate decided elsewhere in the meantime
@@ -239,11 +253,30 @@ run outcomes, the total run count, and one-click **Run** / **Open** actions.
 [`POST /dags/{name}/trigger`](HTTP-API#post-dagsnametrigger). In the drawer, the
 new run is selected as soon as it is created. **▦ Backfill** opens a from/to ISO
 date-range form wired to
-[`POST /dags/{name}/backfill`](HTTP-API#post-dagsnamebackfill). It is disabled
-only without the `control` scope. For a manual-only DAG the form forces
+[`POST /dags/{name}/backfill`](HTTP-API#post-dagsnamebackfill). Its
+confirmation shows how many runs the backfill created and how many dates
+already had one. It is disabled only without the `control` scope. For a manual-only DAG the form forces
 **Failed dates only**, which posts to `/dags/{name}/recover` instead.
+
+For a workflow that declares
+[run parameters](Orchestration-and-DAGs#run-parameters), **Trigger**, the
+card's **Run** button, and **run backfill** open a parameter dialog in place
+of sending the request at once:
+
+- Each parameter has one field, filled with its default: a list for a
+  parameter with `allowed` values, a checkbox for a `boolean`, and a text
+  box otherwise. The field shows the parameter's description and
+  constraints.
+- **Run** sends the values in their declared types. When the daemon refuses
+  them, each reason appears under its field and the dialog stays open.
+- A workflow with no parameters keeps its one-click trigger.
+
+A selected run lists the values it stores in a **parameters** row under the
+drawer's header, and the header names the token that started the run.
 **Retry failed tasks** previews recovery of the selected failed run's failed
-tasks (see [workflow recovery](Workflow-Recovery)). DAG
+tasks (see [workflow recovery](Workflow-Recovery)). The preview lists each
+reused task that stays skipped, with its reason, under **Stays skipped**, and
+the parameters the recovery run reuses. DAG
 runs are **deep-linkable** like jobs: the URL tracks `#dag/<name>` (and
 `#dag/<name>/<run_key>` with a run selected), so you can bookmark a run or paste
 it into an incident channel.
@@ -748,7 +781,9 @@ buttons, the DAG Trigger and Backfill buttons, "run failing", and the mitigate
 console. The palette entries and the `r`/`x`/`p` shortcuts that reach those
 same actions go with them, so a read-only visitor is never offered a button
 whose request can only fail with `403`. Without `approve`, the dashboard draws a
-waiting gate as a state rather than as a pair of decision buttons.
+waiting gate as a state rather than as a pair of decision buttons. Without
+`params`, the dashboard skips the parameter dialog, and a trigger or a
+backfill starts runs with the declared defaults.
 
 The same rule covers a scoped `web.authTokens` entry and a
 [public read-only board](HTTP-API#public-read-only-access-webanonymousscopes).

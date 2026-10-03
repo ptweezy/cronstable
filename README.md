@@ -74,7 +74,8 @@ terminal, and iOS.
   and idempotency keys (see
   [durable state](https://github.com/ptweezy/cronstable/wiki/Durable-State)).
 * **Durable workflows**: run tasks as a directed acyclic graph (DAG) with
-  dependencies, data sharing, dynamic fan-out, sensors, and approval gates
+  dependencies, data sharing, dynamic fan-out, conditional branching, sensors,
+  and approval gates
   (see [workflow orchestration](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs)).
 * **Selective workflow recovery**: retry failed tasks or replay failed dates
   while reusing successful results (see
@@ -626,7 +627,15 @@ running, so make task side effects safe to repeat, for example with an
 Scheduled DAGs also support catch-up and `backfill` over a date range. Tasks
 can pass data with `cronstable xcom push` and `cronstable xcom pull`, fan out
 over a list that an upstream task produced, and poll for conditions with
-`type: sensor`. For details, see
+`type: sensor`. A task can skip itself with an exit code listed in
+`skipExitCodes`, and a `triggerRule` such as `none_failed_min_one_success`
+joins the branches. A workflow can declare run parameters under `params:`.
+A manual or API trigger supplies the values, cronstable checks them, and
+each task reads them as `CRONSTABLE_PARAM_<NAME>` variables. A task with
+`when:` runs only when a parameter, or a value that an upstream task
+published, meets its comparisons. Otherwise the task is skipped and its
+command never starts. A plain job can declare `params:` too, and a manual
+start supplies its values. For details, see
 [orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs).
 
 ### Tutorial 4: Coordinate two replicas

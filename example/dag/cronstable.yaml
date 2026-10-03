@@ -86,13 +86,104 @@ dags:
           - publish-gate
         command: "echo publishing the day's load"
 
-  # A manual-only DAG (no schedule): it never fires on its own; trigger it with
-  # `POST /dags/adhoc-report/trigger` on the control API (or a backfill).
-  - name: adhoc-report
+  # A branching DAG. Each load task guards itself: its command exits 99 on the
+  # days it does not apply, and `skipExitCodes` turns that exit into a
+  # `skipped` task. `publish` joins the two branches with
+  # none_failed_min_one_success, so it runs after the branch that ran. The
+  # default all_success would skip it whenever either branch skipped.
+  - name: nightly-load
+    schedule: "0 3 * * *"
     tasks:
       - id: extract
-        command: "echo extract | cronstable xcom push --key rows"
+        command: "echo extracting"
+
+      # Sunday: the full load runs, and the incremental load skips itself.
+      - id: full-load
+        dependsOn:
+          - extract
+        skipExitCodes:
+          - 99
+        command: |
+          [ "$(date +%u)" = 7 ] || exit 99
+          echo "full load"
+
+      # Every other day the two swap.
+      - id: incremental-load
+        dependsOn:
+          - extract
+        skipExitCodes:
+          - 99
+        command: |
+          [ "$(date +%u)" != 7 ] || exit 99
+          echo "incremental load"
+
+      - id: publish
+        dependsOn:
+          - full-load
+          - incremental-load
+        triggerRule: none_failed_min_one_success
+        command: "echo publishing the load"
+
+      # A failure handler: all_done_min_one_failed waits for every upstream,
+      # runs when at least one of them failed, and is skipped otherwise. The
+      # run still ends `failed` when a task failed.
+      - id: alert
+        dependsOn:
+          - full-load
+          - incremental-load
+          - publish
+        triggerRule: all_done_min_one_failed
+        command: "echo paging on-call"
+
+  # A manual-only DAG (no schedule): it never fires on its own; trigger it with
+  # `POST /dags/adhoc-report/trigger` on the control API.
+  #
+  # `params` declares the values a caller can supply with the trigger:
+  #   curl -X POST .../dags/adhoc-report/trigger \
+  #        -d '{"params": {"region": "us", "max_rows": 500}}'
+  # cronstable checks each value against its declaration, stores the checked
+  # values in the run document, and hands them to every task as
+  # CRONSTABLE_PARAM_<NAME>. A trigger with no body uses the defaults. With
+  # scoped web tokens, supplying values needs the `params` scope as well as
+  # `control`. Every reader of the run sees the values, so keep a secret in a
+  # task's `secrets:` block.
+  - name: adhoc-report
+    params:
+      - name: region
+        default: eu
+        allowed:
+          - eu
+          - us
+          - apac
+        description: Region to report on
+      - name: max_rows
+        type: integer
+        default: 1000
+        minimum: 1
+        maximum: 100000
+    tasks:
+      - id: extract
+        command: |
+          echo "extract $CRONSTABLE_PARAM_REGION, $CRONSTABLE_PARAM_MAX_ROWS rows" \
+            | cronstable xcom push --key rows
       - id: report
         dependsOn:
           - extract
         command: "cronstable xcom pull --task extract --key rows"
+
+      # A `when:` condition. The scheduler compares the run's `region` when
+      # this task becomes ready. For any region other than `us` the task ends
+      # `skipped` and its command never starts. A comparison can also read a
+      # value that an upstream task published:
+      #   - xcom:
+      #       task: extract
+      #       key: rows
+      #     notIn:
+      #       - "0"
+      - id: us-compliance-copy
+        dependsOn:
+          - extract
+        when:
+          - param: region
+            equals: us
+        command: "echo writing the US compliance copy"

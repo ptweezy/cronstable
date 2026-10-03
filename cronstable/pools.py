@@ -262,6 +262,7 @@ class PoolScheduler:
         key=None,
         resume=False,
         catchup_after=None,
+        params=None,
     ):
         slot = self.cron._last_run_slot.get(job.name)
         retry_state = (
@@ -279,23 +280,29 @@ class PoolScheduler:
             key = self._key(
                 ("retry", retry_state.pool_retry, retry_state.count)
             )
+        payload = {
+            "kind": "job",
+            "withRetries": with_retries,
+            "manual": manual,
+            "catchupAfter": catchup_after.isoformat()
+            if catchup_after is not None
+            else None,
+            "targetHost": self.cron._state_host
+            if manual or job.clusterPolicy == "EveryNode"
+            else None,
+            "scheduledAt": slot.isoformat()
+            if slot is not None and not manual
+            else None,
+        }
+        if params is not None:
+            # the run parameter values a manual start supplied, already
+            # checked; the launch reads them back from the entry. An entry
+            # without the key runs with the job's defaults.
+            payload["params"] = params
         return await self.enqueue(
             job,
             key=key,
-            payload={
-                "kind": "job",
-                "withRetries": with_retries,
-                "manual": manual,
-                "catchupAfter": catchup_after.isoformat()
-                if catchup_after is not None
-                else None,
-                "targetHost": self.cron._state_host
-                if manual or job.clusterPolicy == "EveryNode"
-                else None,
-                "scheduledAt": slot.isoformat()
-                if slot is not None and not manual
-                else None,
-            },
+            payload=payload,
             retry_state=retry_state,
             resume=resume,
         )

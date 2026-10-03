@@ -1569,6 +1569,77 @@ def bench_dag_plan():
 
 
 @bench(
+    "dag.join_verdict_2k",
+    "dag",
+    detail="plan_and_claim over 2k joins below skipped branches, 4 rules",
+    repeats=(3, 2, 1),
+)
+def bench_dag_join_verdict():
+    """Resolve joins whose upstreams hold skipped branches.
+
+    Each join reads three upstreams, one succeeded and two skipped, so its
+    verdict comes from the rule arms after the upstream loop, including the
+    ``none_failed_min_one_success`` recheck. The joins rotate through
+    ``all_success`` and the three branching rules.
+    """
+    dag = _dag_module()
+    rules = [
+        getattr(dag, name, None)
+        for name in (
+            "ALL_SUCCESS",
+            "NONE_FAILED",
+            "NONE_FAILED_MIN_ONE_SUCCESS",
+            "ALL_DONE_MIN_ONE_FAILED",
+        )
+    ]
+    if None in rules or not hasattr(dag, "plan_and_claim"):
+        raise Skip("dag branching trigger rules not present")
+    n = _n(2000)
+    width = 99  # a multiple of 3: every window of 3 holds one success
+    tasks = [dag.TaskSpec(id="u%d" % i) for i in range(width)]
+    for i in range(n):
+        tasks.append(
+            dag.TaskSpec(
+                id="j%d" % i,
+                depends_on=tuple("u%d" % ((i + k) % width) for k in range(3)),
+                trigger_rule=rules[i % len(rules)],
+            )
+        )
+    spec = dag.DagSpec.build("joins", tasks)
+    now = 1700000000.0
+    body = dag.new_run_body(
+        dag="joins",
+        run_key="bench",
+        run_id="bench-run",
+        logical_date=None,
+        kind="scheduled",
+        now=now,
+        spec=spec,
+    )
+    for i in range(width):
+        body["tasks"]["u%d" % i]["state"] = "skipped" if i % 3 else "success"
+    transform = dag.plan_and_claim(spec, now, "bench-proc", "bench-host", {})
+    t0 = time.perf_counter()
+    new_body, _result = transform(body)
+    dt = time.perf_counter() - t0
+    # all_success and all_done_min_one_failed skip here; the other two rules
+    # are ready, and all but one claim batch of those stays pending.
+    skipped = sum(
+        1
+        for key, entry in new_body["tasks"].items()
+        if key[0] == "j" and entry["state"] == "skipped"
+    )
+    expected = sum(1 for i in range(n) if i % len(rules) in (0, 3))
+    if skipped != expected:
+        raise RuntimeError(
+            "join verdicts skipped %d of the expected %d joins; the fixture "
+            "or the verdict path broke and the region timed the wrong work"
+            % (skipped, expected)
+        )
+    return dt
+
+
+@bench(
     "dag.finish_fanin_1k",
     "dag",
     detail="record 1k mapped-task completions to a run doc (durable)",

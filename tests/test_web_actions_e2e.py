@@ -736,3 +736,124 @@ def test_copy_incident_summary(browser, tmp_path):
             # The Markdown table preserves the quoted text.
             json.dumps(text)
             assert any(ln.startswith("| pipe|name | Failed") for ln in lines)
+
+
+# --------------------------------------------------------------------------
+# run parameters: the dialog a job that declares `params` opens from Run
+# --------------------------------------------------------------------------
+
+
+def _param_job():
+    """A job whose command is an argv list, so it runs on every platform."""
+    import sys
+
+    return e2e.job(
+        "report",
+        [sys.executable, "-c", "pass"],
+        params=[
+            {
+                "name": "region",
+                "default": "eu",
+                "allowed": ["eu", "us"],
+                "description": "Region to report on",
+            },
+            {"name": "rows", "type": "integer", "default": 100, "minimum": 1},
+            {"name": "dry", "type": "boolean", "default": False},
+        ],
+    )
+
+
+def _job_posts(page):
+    return [
+        (r["path"], json.loads(r["body"]) if r["body"] else None)
+        for r in page.faults.requests
+        if r["method"] == "POST"
+    ]
+
+
+def test_run_opens_a_form_for_a_job_with_params(browser, tmp_path):
+    import sys
+
+    jobs = [_param_job(), e2e.job("plain", [sys.executable, "-c", "pass"])]
+    with e2e.Daemon(tmp_path, jobs=jobs) as daemon:
+        with e2e.open_page(browser, daemon.url, prefs={"pollMs": 1000}) as page:
+            page.faults.record()
+            # a job that declares nothing stays one click
+            _click(page, '#rows [data-run="plain"]')
+            e2e.wait_toast(page, "▶ started plain")
+            assert not page.is_visible("#paramWrap .modal")
+            assert _job_posts(page)[-1] == ("/jobs/plain/start", None)
+
+            _click(page, '#rows [data-run="report"]')
+            page.wait_for_selector("#paramWrap.open")
+            assert page.inner_text("#paramTitle") == "Run report"
+            assert "its command reads them" in page.inner_text("#paramMsg")
+            # each field starts at the declared default
+            assert page.evaluate(
+                """() => [...document.querySelectorAll(
+                    '#paramFields .paramfield')].map((f) => {
+                      const c = f.querySelector('input, select');
+                      return [f.getAttribute('data-param'), c.tagName,
+                              c.type === 'checkbox' ? c.checked : c.value];
+                    })"""
+            ) == [
+                ["region", "SELECT", "eu"],
+                ["rows", "INPUT", "100"],
+                ["dry", "INPUT", False],
+            ]
+            # text that is not a value of the type never leaves the page
+            sent = len(_job_posts(page))
+            page.fill("#paramF1", "lots")
+            page.click("#paramGo")
+            page.wait_for_function(
+                """() => document.querySelector(
+                    '#paramFields [data-param="rows"] .perr').textContent"""
+            )
+            assert len(_job_posts(page)) == sent
+            # a value the daemon refuses comes back under its field
+            page.fill("#paramF1", "0")
+            page.click("#paramGo")
+            page.wait_for_function(
+                """() => document.querySelector(
+                    '#paramFields [data-param="rows"] .perr')
+                      .textContent.includes('at least 1')"""
+            )
+            assert page.is_visible("#paramWrap .modal")
+            # corrected values start the run and close the dialog
+            page.fill("#paramF1", "5")
+            page.select_option("#paramF0", "us")
+            page.click("#paramGo")
+            e2e.wait_toast(page, "▶ started report")
+            page.wait_for_function(
+                "!document.getElementById('paramWrap').classList"
+                ".contains('open')"
+            )
+            assert _job_posts(page)[-1] == (
+                "/jobs/report/start",
+                {"params": {"region": "us", "rows": 5, "dry": False}},
+            )
+            e2e.wait_row_status(page, "report", "OK")
+        last = daemon.jobs()["report"]["last_run"]
+        assert last["outcome"] == "success"
+        assert last["params"] == {"region": "us", "rows": 5, "dry": False}
+
+
+def test_job_param_form_is_hidden_without_the_params_scope(browser, tmp_path):
+    auth = {
+        "authTokens": [
+            {"value": "ctl-token", "scopes": ["control"], "label": "ci"},
+        ]
+    }
+    with e2e.Daemon(tmp_path, auth=auth, jobs=[_param_job()]) as daemon:
+        with e2e.open_page(
+            browser, daemon.url, token="ctl-token", prefs={"pollMs": 1000}
+        ) as page:
+            page.faults.record()
+            _click(page, '#rows [data-run="report"]')
+            e2e.wait_toast(page, "▶ started report")
+            assert not page.is_visible("#paramWrap .modal")
+            # one click, no body: the run takes the declared defaults
+            assert _job_posts(page)[-1] == ("/jobs/report/start", None)
+            e2e.wait_row_status(page, "report", "OK")
+        last = daemon.jobs("ctl-token")["report"]["last_run"]
+        assert last["params"] == {"region": "eu", "rows": 100, "dry": False}

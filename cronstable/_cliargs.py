@@ -114,7 +114,8 @@ def add_state_job_actions(actions: Any) -> None:
 
 
 def add_job_commands(sub: Any) -> None:
-    """Add the top-level `cursor|lock|artifact|idempotent|secret` commands."""
+    """Add the top-level `cursor|lock|artifact|idempotent|secret|param`
+    commands."""
     # cursor
     cursor = sub.add_parser(
         "cursor", help="read or advance a saved processing position (cursor)"
@@ -278,6 +279,20 @@ def add_job_commands(sub: Any) -> None:
     sget.add_argument("name")
     secret_actions.add_parser(
         "list", help="list secrets available to the current run"
+    )
+
+    # param
+    param = sub.add_parser(
+        "param", help="read a parameter of the current workflow run"
+    )
+    param_actions = param.add_subparsers(
+        dest="param_command", metavar="ACTION"
+    )
+    pget = param_actions.add_parser("get", help="print a parameter's value")
+    pget.add_argument("name")
+    param_actions.add_parser("list", help="list the run's parameter names")
+    param_actions.add_parser(
+        "dump", help="print every parameter of the run as one JSON object"
     )
 
 

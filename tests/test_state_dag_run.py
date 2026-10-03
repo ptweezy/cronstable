@@ -20,6 +20,7 @@ over the loopback endpoint.
 
 import asyncio
 import copy
+import dataclasses
 import datetime
 import json
 import logging
@@ -739,16 +740,83 @@ async def test_backfill_creates_runs(tmp_path, dag_cron):
     )
     assert res["ok"] is True
     assert res["created"] == 3
-    # idempotent: re-running the same backfill creates no duplicates
+    assert res["existing"] == 0
+    assert res["existingRunKeys"] == []
+    first_keys = res["runKeys"]
+    assert first_keys == [
+        dag.run_key_for_logical("2026-01-01T0{}:00:00+00:00".format(hour))
+        for hour in range(3)
+    ]
+    # idempotent: re-running the same backfill creates no duplicates, and
+    # the response says so
     res2 = await cron._dag.backfill(
         "bf", "2026-01-01T00:00:00+00:00", "2026-01-01T02:30:00+00:00"
     )
-    assert res2["created"] == 3  # stepped again, but create-if-absent
+    assert res2["created"] == 0
+    assert res2["runKeys"] == []
+    assert res2["existing"] == 3
+    assert res2["existingRunKeys"] == first_keys
     runs = await cron._dag.list_runs("bf")
     keys = {r["runKey"] for r in runs}
-    assert len(keys) == 3  # exactly three distinct runs
+    assert keys == set(first_keys)  # exactly three distinct runs
+    # a wider range reports the new dates apart from the ones it left alone
+    res3 = await cron._dag.backfill(
+        "bf", "2026-01-01T00:00:00+00:00", "2026-01-01T04:30:00+00:00"
+    )
+    assert (res3["created"], res3["existing"]) == (2, 3)
+    assert res3["existingRunKeys"] == first_keys
+    assert set(res3["runKeys"]).isdisjoint(first_keys)
     bad = await cron._dag.backfill("bf", "bad", "worse")
     assert bad["ok"] is False
+
+
+async def test_backfill_cap_counts_created_and_existing(
+    tmp_path, monkeypatch, dag_cron
+):
+    # DAG_MAX_CATCHUP bounds the instants one call visits, whether each one
+    # creates a run or finds one.
+    yaml = (
+        "dags:\n  - name: bf\n    schedule: '0 * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await dag_cron(yaml)
+    _set_cmd(cron, "bf", "a", [_PY, "-c", "pass"])
+    monkeypatch.setattr(dagrun, "DAG_MAX_CATCHUP", 2)
+    window = ("2026-01-01T00:00:00+00:00", "2026-01-01T05:30:00+00:00")
+    first = await cron._dag.backfill("bf", *window)
+    assert (first["created"], first["existing"]) == (2, 0)
+    again = await cron._dag.backfill("bf", *window)
+    assert (again["created"], again["existing"]) == (0, 2)
+    assert again["existingRunKeys"] == first["runKeys"]
+
+
+async def test_backfill_without_a_backend_raises(tmp_path, dag_cron):
+    # like trigger_run: an unavailable store must not read as a range of
+    # runs that already existed.
+    yaml = (
+        "dags:\n  - name: bf\n    schedule: '0 * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    import aiohttp
+
+    cron = await dag_cron(yaml)
+    base = await _start_web(cron)
+    window = {
+        "from": "2026-01-01T00:00:00+00:00",
+        "to": "2026-01-01T02:30:00+00:00",
+    }
+    backend = cron.state_backend
+    cron.state_backend = None
+    try:
+        with pytest.raises(RuntimeError, match="could not be recorded"):
+            await cron._dag.backfill("bf", window["from"], window["to"])
+        # over HTTP that is a 500, as for a trigger
+        async with aiohttp.ClientSession() as s:
+            async with s.post(base + "/dags/bf/backfill", json=window) as r:
+                assert r.status == 500
+    finally:
+        cron.state_backend = backend
+        await cron.start_stop_web_app(None)
 
 
 async def test_backfill_nonutc_range_dedupes_with_utc(tmp_path, dag_cron):
@@ -1565,7 +1633,11 @@ async def test_http_approval_decision_and_backfill(tmp_path, dag_cron):
                 },
             ) as r:
                 assert r.status == 200
-                assert (await r.json())["created"] == 2
+                result = await r.json()
+                assert result["created"] == 2
+                assert result["existing"] == 0
+                assert len(result["runKeys"]) == 2
+                assert result["existingRunKeys"] == []
     finally:
         await cron.start_stop_web_app(None)
 
@@ -2019,10 +2091,10 @@ async def test_one_launch_failure_does_not_skip_the_batch(tmp_path, dag_cron):
     _set_cmd(cron, "lf", "b", [_PY, "-c", "pass"])
     orig = cron._dag._launch_task
 
-    async def flaky(dagcfg, ref, run_id, intent):
+    async def flaky(dagcfg, ref, run_id, intent, params=None):
         if intent.task_id == "a":
             raise RuntimeError("boom")
-        return await orig(dagcfg, ref, run_id, intent)
+        return await orig(dagcfg, ref, run_id, intent, params)
 
     cron._dag._launch_task = flaky
     run_key = await cron._dag.trigger_run("lf")
@@ -4541,7 +4613,7 @@ async def test_launch_cancel_propagates_out_of_advance(
     cron = await dag_cron(yaml)
     _set_cmd(cron, "lp", "a", [_PY, "-c", "pass"])
 
-    async def _cancel(dagcfg, ref, run_id, intent):
+    async def _cancel(dagcfg, ref, run_id, intent, params=None):
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(cron._dag, "_launch_task", _cancel)
@@ -5149,3 +5221,856 @@ async def test_same_store_forget_keeps_buffered_completions(
 
 async def _noop_flush():
     return None
+
+
+# ===========================================================================
+# Run engine level: a build adopts and advances only runs at or below
+# dag.ENGINE_LEVEL, and warns about live peers below a level its dags need.
+# ===========================================================================
+
+
+async def _raise_engine(cron, dag_name, run_key, level):
+    """Rewrite a run document as one a newer build created at ``level``."""
+
+    def _raise(body):
+        body["engine"] = level
+        return body, None
+
+    await cron._dag._mutate(dag_name, run_key, _raise)
+
+
+def _refusals(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if "leaving the run for an upgraded node" in r.getMessage()
+    ]
+
+
+async def test_adopt_scan_leaves_a_run_above_the_engine_level(
+    tmp_path, caplog, dag_cron
+):
+    cron = await dag_cron(_LINEAR)
+    dagcfg = cron.cron_dags["lin"]
+    backend = cron.state_backend
+    assert await cron._dag._create_doc(dagcfg, "newer", None, "manual")
+    await _raise_engine(cron, "lin", "newer", dag.ENGINE_LEVEL + 1)
+    before = await cron._dag.get_run("lin", "newer")
+    ref = ("lin", "newer")
+    with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+        # both scan shapes, twice over: never owned, never rewritten, and
+        # one log line for the run however often the scan meets it
+        for full in (False, True, False, True):
+            await cron._dag._adopt_one_dag(backend, "lin", dagcfg, full=full)
+        await cron._dag.reconcile_on_boot()
+    assert ref not in cron._dag._owned
+    assert await backend.read_lease(cron._dag._lease_name(ref)) is None
+    assert await cron._dag.get_run("lin", "newer") == before
+    assert not any(cron.running_jobs.values())
+    (line,) = _refusals(caplog)
+    assert "lin/newer" in line
+    assert "level {} and".format(dag.ENGINE_LEVEL + 1) in line
+    assert cron._dag._engine_refused == {ref}
+
+    # a newer node finishes the run: the scan drops it from the refused set
+    def _finish(body):
+        body["state"] = dag.SUCCESS
+        return body, None
+
+    await cron._dag._mutate("lin", "newer", _finish)
+    await cron._dag._adopt_one_dag(backend, "lin", dagcfg, full=False)
+    assert cron._dag._engine_refused == set()
+
+
+async def test_adopt_full_pass_prunes_a_refused_run_that_was_deleted(
+    tmp_path, dag_cron
+):
+    cron = await dag_cron(_LINEAR)
+    dagcfg = cron.cron_dags["lin"]
+    cron._dag._engine_refused.add(("lin", "gone"))
+    cron._dag._engine_refused.add(("removed-dag", "x"))
+    await cron._dag._adopt_one_dag(
+        cron.state_backend, "lin", dagcfg, full=True
+    )
+    assert cron._dag._engine_refused == {("removed-dag", "x")}
+    # the scan's entry point forgets refused runs of dags no longer loaded
+    await cron._dag._adopt_orphans()
+    assert cron._dag._engine_refused == set()
+
+
+async def test_advance_releases_an_owned_run_above_the_engine_level(
+    tmp_path, caplog, dag_cron
+):
+    # the backstop under the scan checks: a run this node already owns
+    # turns out to be above its level (the document was re-created under
+    # the same key by a newer node).
+    cron = await dag_cron(_LINEAR)
+    dagcfg = cron.cron_dags["lin"]
+    assert await cron._dag._create_doc(dagcfg, "newer", None, "manual")
+    await _raise_engine(cron, "lin", "newer", dag.ENGINE_LEVEL + 1)
+    before = await cron._dag.get_run("lin", "newer")
+    ref = ("lin", "newer")
+    with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+        assert await cron._dag._try_own(dagcfg, ref)
+    await _drain_pending(cron)
+    assert ref not in cron._dag._owned
+    assert ref not in cron._dag._wake
+    # released, not left to lapse out its TTL: a capable node can take the
+    # run at once
+    lease = await cron.state_backend.read_lease(cron._dag._lease_name(ref))
+    assert lease is None
+    assert await cron._dag.get_run("lin", "newer") == before
+    assert not any(cron.running_jobs.values())
+    assert len(_refusals(caplog)) == 1
+
+
+async def test_recovery_run_above_the_engine_level_is_not_prepared(
+    tmp_path, dag_cron
+):
+    cron = await dag_cron(_LINEAR)
+    dagcfg = cron.cron_dags["lin"]
+    key = "recovery-" + "0" * 64
+    assert await cron._dag._create_doc(dagcfg, key, None, "recovery")
+
+    def _as_newer_recovery(body):
+        body["engine"] = dag.ENGINE_LEVEL + 1
+        body["recovery"] = {"status": "preparing", "artifacts": []}
+        return body, None
+
+    await cron._dag._mutate("lin", key, _as_newer_recovery)
+    before = await cron._dag.get_run("lin", key)
+    assert await cron._dag._try_own(dagcfg, ("lin", key))
+    await _drain_pending(cron)
+    # neither prepared nor failed: the document is exactly as the newer
+    # node left it
+    assert await cron._dag.get_run("lin", key) == before
+    assert ("lin", key) not in cron._dag._owned
+
+
+async def test_run_records_and_completes_at_its_dags_engine_level(
+    tmp_path, monkeypatch, dag_cron
+):
+    monkeypatch.setattr(dag, "ENGINE_LEVEL", 2)
+    cron = await dag_cron(_LINEAR)
+    _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+    _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+    dagcfg = cron.cron_dags["lin"]
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=2)
+    run_key = await cron._dag.trigger_run("lin")
+    body = await _drive(cron, "lin", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert body["engine"] == 2
+    # a base-level dag's document carries no key at all
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=1)
+    plain = await _drive(cron, "lin", await cron._dag.trigger_run("lin"))
+    assert plain["state"] == dag.SUCCESS
+    assert "engine" not in plain
+
+
+async def _manifest(cron, host, *, age=0.0, **fields):
+    at = _utcnow() - datetime.timedelta(seconds=age)
+    record = {"host": host, "at": at.isoformat(), **fields}
+    await cron.state_backend.append_record("manifests/" + host, record)
+
+
+async def test_manifest_advertises_the_engine_level(tmp_path, dag_cron):
+    cron = await dag_cron(_LINEAR)
+    await cron._persist_manifest()
+    records = await cron.state_backend.list_records(
+        cron._manifest_stream(), limit=1, newest_first=True
+    )
+    assert records[0]["dagEngine"] == dag.ENGINE_LEVEL
+
+
+async def test_peer_dag_engines_reads_each_live_hosts_newest_manifest(
+    tmp_path, monkeypatch, dag_cron
+):
+    from cronstable import cron as cron_mod
+
+    cron = await dag_cron(_LINEAR)
+    await cron._persist_manifest()  # this node's own stream is not a peer
+    await _manifest(cron, "pre-engine")  # a build with no dagEngine key
+    await _manifest(cron, "upgraded", age=60.0, dagEngine=1)
+    await _manifest(cron, "upgraded", dagEngine=3)  # the newest record wins
+    await _manifest(cron, "garbled", dagEngine="3")
+    await _manifest(
+        cron, "stopped", age=cron_mod.MANIFEST_LIVE_SECONDS + 60, dagEngine=1
+    )
+    await cron.state_backend.append_record("manifests/no-clock", {"x": 1})
+    assert await cron._peer_dag_engines() == {
+        "pre-engine": 1,
+        "upgraded": 3,
+        "garbled": 1,
+    }
+
+    async def _boom(prefix):
+        raise OSError("mount gone")
+
+    monkeypatch.setattr(cron.state_backend, "list_stream_names", _boom)
+    assert await cron._peer_dag_engines() is None
+    monkeypatch.undo()
+    backend = cron.state_backend
+    cron.state_backend = None
+    try:
+        assert await cron._peer_dag_engines() is None
+    finally:
+        cron.state_backend = backend
+
+
+async def test_fleet_check_warns_about_peers_below_a_dags_level(
+    tmp_path, monkeypatch, caplog, dag_cron
+):
+    cron = await dag_cron(_LINEAR)
+    sched = cron._dag
+    dagcfg = cron.cron_dags["lin"]
+    reads = []
+    read_peers = cron._peer_dag_engines
+
+    async def _counted():
+        reads.append(1)
+        return await read_peers()
+
+    monkeypatch.setattr(cron, "_peer_dag_engines", _counted)
+
+    # every dag at the base level: no store read, no warning
+    await sched._check_fleet(dagrun._now())
+    assert reads == []
+    assert "fleetWarnings" not in (await sched.list_dags())[0]
+
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=2)
+    await _manifest(cron, "old-host")
+    await _manifest(cron, "new-host", dagEngine=2)
+    with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+        await sched._check_fleet(dagrun._now())
+        assert len(reads) == 1
+        (entry,) = await sched.list_dags()
+        (warning,) = entry["fleetWarnings"]
+        assert "old-host" in warning and "level 1" in warning
+        assert "needs level 2" in warning
+        # inside the interval nothing is re-read...
+        await sched._check_fleet(dagrun._now())
+        assert len(reads) == 1
+        # ...and past it the same finding is not logged again
+        sched._next_fleet_check = 0.0
+        await sched._check_fleet(dagrun._now())
+        assert len(reads) == 2
+    logged = [r for r in caplog.records if "old-host" in r.getMessage()]
+    assert len(logged) == 1
+
+    # a store that cannot answer keeps the last result
+    async def _unreadable():
+        return None
+
+    monkeypatch.setattr(cron, "_peer_dag_engines", _unreadable)
+    sched._next_fleet_check = 0.0
+    await sched._check_fleet(dagrun._now())
+    assert (await sched.list_dags())[0]["fleetWarnings"] == [warning]
+    monkeypatch.setattr(cron, "_peer_dag_engines", _counted)
+
+    # the peer upgrades: the warning clears at the next check
+    await _manifest(cron, "old-host", dagEngine=2)
+    sched._next_fleet_check = 0.0
+    await sched._check_fleet(dagrun._now())
+    assert "fleetWarnings" not in (await sched.list_dags())[0]
+    assert sched._fleet_logged == set()
+
+
+async def test_fleet_check_runs_at_once_when_a_reload_changes_the_needs(
+    tmp_path, dag_cron
+):
+    cron = await dag_cron(_LINEAR)
+    sched = cron._dag
+    dagcfg = cron.cron_dags["lin"]
+    await _manifest(cron, "peer", dagEngine=2)
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=2)
+    await sched._check_fleet(dagrun._now())
+    assert sched._fleet_warnings == {}
+    # a reload raises what the dag needs: checked on the next pass, well
+    # inside FLEET_CHECK_INTERVAL
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=3)
+    await sched._check_fleet(dagrun._now())
+    assert list(sched._fleet_warnings) == ["lin"]
+    # ...and a reload back to the base level clears it without a read
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=1)
+    await sched._check_fleet(dagrun._now())
+    assert sched._fleet_warnings == {} and sched._fleet_needs == {}
+    # a backend swap drops the old store's findings and re-anchors the check
+    sched._fleet_warnings = {"lin": ["stale"]}
+    sched._engine_refused.add(("lin", "x"))
+    sched.forget()
+    assert sched._fleet_warnings == {} and sched._engine_refused == set()
+    assert sched._next_fleet_check == 0.0
+
+
+# ===========================================================================
+# Branching: skip exit codes and the join rules, with real task processes
+# ===========================================================================
+
+_BRANCH = """
+dags:
+  - name: load
+    tasks:
+      - id: extract
+        command: 'x'
+      - id: full
+        command: 'x'
+        dependsOn:
+          - extract
+        skipExitCodes:
+          - 99
+      - id: incremental
+        command: 'x'
+        dependsOn:
+          - extract
+        skipExitCodes:
+          - 99
+      - id: publish
+        command: 'x'
+        dependsOn:
+          - full
+          - incremental
+        triggerRule: none_failed_min_one_success
+      - id: alert
+        command: 'x'
+        dependsOn:
+          - full
+          - incremental
+          - publish
+        triggerRule: all_done_min_one_failed
+"""
+
+_OK = [_PY, "-c", "pass"]
+
+
+def _exit(code):
+    return [_PY, "-c", "import sys; sys.exit({})".format(code)]
+
+
+async def _branch_cron(dag_cron, **commands):
+    cron = await dag_cron(_BRANCH)
+    for task_id in ("extract", "full", "incremental", "publish", "alert"):
+        _set_cmd(cron, "load", task_id, commands.get(task_id, _OK))
+    return cron
+
+
+async def test_branch_runs_the_side_whose_guard_did_not_skip(
+    tmp_path, dag_cron
+):
+    cron = await _branch_cron(dag_cron, incremental=_exit(99))
+    run_key = await cron._dag.trigger_run("load")
+    body = await _drive(cron, "load", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert _states(body) == {
+        "extract": dag.SUCCESS,
+        "full": dag.SUCCESS,
+        "incremental": dag.SKIPPED,
+        "publish": dag.SUCCESS,
+        "alert": dag.SKIPPED,
+    }
+    skipped = body["tasks"]["incremental"]
+    assert skipped["exitCode"] == 99
+    assert skipped["failReason"] is None
+    assert skipped["skipReason"] == {
+        "kind": "exit_code",
+        "detail": "exit code 99",
+    }
+    assert body["tasks"]["alert"]["skipReason"]["kind"] == "trigger_rule"
+    # the run records the level a node needs to advance it
+    assert body["engine"] == dag.BRANCHING_PARAMS_ENGINE_LEVEL
+    assert cron._dag._summarize_run(body)["taskStates"] == {
+        "success": 3,
+        "skipped": 2,
+    }
+
+
+async def test_branch_failure_reaches_the_handler_and_fails_the_run(
+    tmp_path, dag_cron
+):
+    cron = await _branch_cron(
+        dag_cron, full=_exit(1), incremental=_exit(99)
+    )
+    run_key = await cron._dag.trigger_run("load")
+    body = await _drive(cron, "load", run_key)
+    assert _states(body) == {
+        "extract": dag.SUCCESS,
+        "full": dag.FAILED,
+        "incremental": dag.SKIPPED,
+        "publish": dag.UPSTREAM_FAILED,
+        "alert": dag.SUCCESS,
+    }
+    # the handler ran and succeeded, and the run is still failed
+    assert body["state"] == dag.FAILED
+    assert "skipReason" not in body["tasks"]["full"]
+
+
+async def test_both_guards_skipping_ends_the_run_successful_with_no_work(
+    tmp_path, dag_cron
+):
+    cron = await _branch_cron(dag_cron, full=_exit(99), incremental=_exit(99))
+    run_key = await cron._dag.trigger_run("load")
+    body = await _drive(cron, "load", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert _states(body)["publish"] == dag.SKIPPED
+    assert body["tasks"]["publish"]["skipReason"] == {
+        "kind": "trigger_rule",
+        "detail": "none_failed_min_one_success: no upstream succeeded",
+    }
+
+
+async def test_an_unlisted_exit_code_still_fails(tmp_path, dag_cron):
+    cron = await _branch_cron(dag_cron, full=_exit(98))
+    run_key = await cron._dag.trigger_run("load")
+    body = await _drive(cron, "load", run_key)
+    assert _states(body)["full"] == dag.FAILED
+    assert body["tasks"]["full"]["exitCode"] == 98
+    assert body["state"] == dag.FAILED
+
+
+async def test_list_dags_exports_rules_and_skip_codes(tmp_path, dag_cron):
+    cron = await dag_cron(_BRANCH + _LINEAR.replace("dags:\n", ""))
+    by_name = {d["name"]: d for d in await cron._dag.list_dags()}
+    tasks = {t["id"]: t for t in by_name["load"]["tasks"]}
+    assert tasks["full"]["skipExitCodes"] == [99]
+    assert tasks["publish"]["triggerRule"] == "none_failed_min_one_success"
+    assert tasks["alert"]["triggerRule"] == "all_done_min_one_failed"
+    # the key appears only on a task that sets it
+    assert "skipExitCodes" not in tasks["extract"]
+    assert "skipExitCodes" not in tasks["publish"]
+    for task in by_name["lin"]["tasks"]:
+        assert "skipExitCodes" not in task
+        assert task["triggerRule"] == "all_success"
+
+
+async def test_a_skip_runs_no_verify_step(tmp_path, dag_cron):
+    marker = tmp_path / "verified"
+    yaml = (
+        "dags:\n  - name: v\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "        skipExitCodes:\n          - 99\n"
+        "        verify:\n          command: 'x'\n"
+    )
+    cron = await dag_cron(yaml)
+    template = cron.cron_dags["v"].task_templates["a"]
+    template.verify["command"] = [
+        _PY,
+        "-c",
+        "open({!r}, 'w').close()".format(str(marker)),
+    ]
+    _set_cmd(cron, "v", "a", _exit(99))
+    body = await _drive(cron, "v", await cron._dag.trigger_run("v"))
+    assert _states(body) == {"a": dag.SKIPPED}
+    assert not marker.exists()
+    assert body["tasks"]["a"]["verification"] == {
+        "outcome": "skipped",
+        "fail_reason": "command skipped the task",
+    }
+    # the same task without the skip does run its check
+    _set_cmd(cron, "v", "a", _OK)
+    body = await _drive(cron, "v", await cron._dag.trigger_run("v"))
+    assert _states(body) == {"a": dag.SUCCESS}
+    assert marker.exists()
+
+
+async def test_a_skip_after_a_failed_attempt_uses_no_further_attempt(
+    tmp_path, dag_cron
+):
+    marker = tmp_path / "second-attempt"
+    yaml = (
+        "dags:\n  - name: r\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n        retries: 2\n"
+        "        skipExitCodes:\n          - 99\n"
+    )
+    cron = await dag_cron(yaml)
+    # attempt 0 fails; attempt 1 exits with the skip code
+    script = (
+        "import sys; from pathlib import Path; p = Path({!r}); "
+        "code = 99 if p.exists() else 1; p.touch(); sys.exit(code)"
+    ).format(str(marker))
+    _set_cmd(cron, "r", "a", [_PY, "-c", script])
+    body = await _drive(cron, "r", await cron._dag.trigger_run("r"))
+    entry = body["tasks"]["a"]
+    assert entry["state"] == dag.SKIPPED
+    assert entry["attempt"] == 1  # one failed attempt, and the skip used none
+    assert body["state"] == dag.SUCCESS
+
+
+async def test_a_sensor_poke_that_exits_with_a_skip_code_skips_the_sensor(
+    tmp_path, dag_cron
+):
+    yaml = (
+        "dags:\n  - name: s\n    tasks:\n"
+        "      - id: wait\n        type: sensor\n        command: 'x'\n"
+        "        pokeIntervalSeconds: 0\n"
+        "        skipExitCodes:\n          - 99\n"
+        "      - id: after\n        command: 'x'\n"
+        "        dependsOn:\n          - wait\n"
+    )
+    cron = await dag_cron(yaml)
+    _set_cmd(cron, "s", "wait", _exit(99))
+    _set_cmd(cron, "s", "after", _OK)
+    body = await _drive(cron, "s", await cron._dag.trigger_run("s"))
+    assert _states(body) == {"wait": dag.SKIPPED, "after": dag.SKIPPED}
+    assert body["tasks"]["wait"]["pokeCount"] == 1
+    assert body["tasks"]["after"]["skipReason"] == {
+        "kind": "upstream",
+        "detail": "upstream skipped: wait",
+    }
+    assert body["state"] == dag.SUCCESS
+
+
+async def test_skip_codes_travel_with_the_launch_across_a_reload(
+    tmp_path, dag_cron
+):
+    # an exit code means what the command that produced it was configured
+    # to mean, so a reload changes the codes of instances launched after it
+    cron = await _branch_cron(dag_cron, full=_exit(99), incremental=_exit(99))
+    dagcfg = cron.cron_dags["load"]
+    run_key = await cron._dag.trigger_run("load")
+    # `extract` is running; finish it so both guards launch
+    await _reap_running(cron)
+    await _drain_pending(cron)
+    running = {
+        rj.dag_ref.task_id: rj
+        for jobs in cron.running_jobs.values()
+        for rj in jobs
+    }
+    assert set(running) == {"full", "incremental"}
+    assert running["full"].skip_exit_codes == (99,)
+    # the reload: `full` no longer lists any skip code
+    tasks = [
+        dataclasses.replace(t, skip_exit_codes=()) if t.id == "full" else t
+        for t in dagcfg.spec.tasks
+    ]
+    dagcfg.spec = dag.DagSpec.build("load", tasks)
+    body = await _drive(cron, "load", run_key)
+    # the in-flight instance keeps the codes it launched with
+    assert _states(body)["full"] == dag.SKIPPED
+    # an instance launched after the reload fails on the same exit
+    body = await _drive(cron, "load", await cron._dag.trigger_run("load"))
+    assert _states(body)["full"] == dag.FAILED
+    assert _states(body)["incremental"] == dag.SKIPPED
+
+
+async def test_a_queued_skip_completion_is_retried_as_a_skip(
+    tmp_path, dag_cron
+):
+    # the retry queue carries the skip: a completion RMW that failed must
+    # not come back as the failure its exit code would otherwise be
+    yaml = (
+        "dags:\n  - name: q\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "        skipExitCodes:\n          - 99\n"
+    )
+    cron = await dag_cron(yaml)
+    _set_cmd(cron, "q", "a", _exit(99))
+    run_key = await cron._dag.trigger_run("q")
+    ref = ("q", run_key)
+
+    async def _stalled(dag_name, key, transform):
+        raise asyncio.TimeoutError()
+
+    orig = cron._dag._mutate
+    cron._dag._mutate = _stalled
+    await _reap_running(cron)
+    await _drain_pending(cron)
+    cron._dag._mutate = orig
+    queued = cron._dag._pending_completions[(ref, "a")]
+    assert queued["skipped"] is True and queued["exitCode"] == 99
+    queued["nextTryAt"] = 0.0
+    await cron._dag._retry_completions(dagrun._now())
+    await _drain_pending(cron)
+    assert not cron._dag._pending_completions
+    body = await _drive(cron, "q", run_key)
+    assert _states(body) == {"a": dag.SKIPPED}
+    assert body["state"] == dag.SUCCESS
+
+
+# ===========================================================================
+# when: conditions over parameters and XCom, with real task processes
+# ===========================================================================
+
+_WHEN = """
+dags:
+  - name: cond
+    params:
+      - name: mode
+        default: incremental
+        allowed:
+          - incremental
+          - full
+    tasks:
+      - id: extract
+        command: 'x'
+      - id: full
+        command: 'x'
+        dependsOn:
+          - extract
+        when:
+          - param: mode
+            equals: full
+      - id: incremental
+        command: 'x'
+        dependsOn:
+          - extract
+        when:
+          - param: mode
+            notEquals: full
+          - xcom:
+              task: extract
+              key: row_count
+            notIn:
+              - '0'
+      - id: publish
+        command: 'x'
+        dependsOn:
+          - full
+          - incremental
+        triggerRule: none_failed_min_one_success
+"""
+
+
+def _push(key, path):
+    return [_PY, "-m", "cronstable", "xcom", "push", "--key", key, str(path)]
+
+
+async def _when_cron(dag_cron, tmp_path, published):
+    """The `cond` workflow with `extract` publishing ``published`` (bytes)
+    as ``row_count``, or nothing when it is ``None``."""
+    cron = await dag_cron(_WHEN)
+    for task_id in ("full", "incremental", "publish"):
+        _set_cmd(cron, "cond", task_id, _OK)
+    if published is None:
+        _set_cmd(cron, "cond", "extract", _OK)
+    else:
+        value = tmp_path / "row_count"
+        value.write_bytes(published)
+        _set_cmd(cron, "cond", "extract", _push("row_count", value))
+    return cron
+
+
+async def _trigger_when(cron, mode):
+    started = await cron._dag.trigger("cond", params={"mode": mode})
+    return await _drive(cron, "cond", started["runKey"])
+
+
+async def test_when_on_a_parameter_picks_the_branch(tmp_path, dag_cron):
+    cron = await _when_cron(dag_cron, tmp_path, b"12\n")
+    body = await _trigger_when(cron, "full")
+    assert body["state"] == dag.SUCCESS
+    assert _states(body) == {
+        "extract": dag.SUCCESS,
+        "full": dag.SUCCESS,
+        "incremental": dag.SKIPPED,
+        "publish": dag.SUCCESS,
+    }
+    assert body["engine"] == dag.BRANCHING_PARAMS_ENGINE_LEVEL
+    assert body["tasks"]["full"]["whenMet"] is True
+    skipped = body["tasks"]["incremental"]
+    assert skipped["skipReason"] == {
+        "kind": "condition",
+        "detail": "param mode notEquals full: the value is full",
+    }
+    # no process started for it: no attempt, no pid, no exit code
+    assert skipped["attempt"] == 0 and skipped["startedAt"] is None
+    assert skipped["exitCode"] is None and "whenMet" not in skipped
+
+
+async def test_when_on_an_xcom_value_runs_the_task(tmp_path, dag_cron):
+    # the published bytes end in one newline, which the comparison drops
+    cron = await _when_cron(dag_cron, tmp_path, b"12\n")
+    body = await _trigger_when(cron, "incremental")
+    assert _states(body) == {
+        "extract": dag.SUCCESS,
+        "full": dag.SKIPPED,
+        "incremental": dag.SUCCESS,
+        "publish": dag.SUCCESS,
+    }
+    assert body["tasks"]["incremental"]["whenMet"] is True
+    assert body["tasks"]["full"]["skipReason"]["detail"] == (
+        "param mode equals full: the value is incremental"
+    )
+
+
+@pytest.mark.parametrize(
+    "published, incremental, detail",
+    [
+        pytest.param(b"0\n", dag.SKIPPED, "the value is 0", id="a-value-listed"),
+        pytest.param(b"0\r\n", dag.SKIPPED, "the value is 0", id="crlf"),
+        # only one trailing newline is dropped
+        pytest.param(b"0\n\n", dag.SUCCESS, None, id="two-newlines"),
+        # no usable value passes notIn
+        pytest.param(None, dag.SUCCESS, None, id="unpublished"),
+        pytest.param(b"0" * 4097, dag.SUCCESS, None, id="oversized"),
+        pytest.param(b"\xff\xfe0", dag.SUCCESS, None, id="not-utf-8"),
+    ],
+)
+async def test_when_xcom_values_the_comparison_reads(
+    tmp_path, dag_cron, published, incremental, detail
+):
+    cron = await _when_cron(dag_cron, tmp_path, published)
+    body = await _trigger_when(cron, "incremental")
+    assert _states(body)["incremental"] == incremental
+    if detail is None:
+        assert _states(body)["publish"] == dag.SUCCESS
+    else:
+        assert body["tasks"]["incremental"]["skipReason"] == {
+            "kind": "condition",
+            "detail": "xcom extract/row_count notIn 0: " + detail,
+        }
+        # both branches skipped, so the join has nothing to publish
+        assert _states(body)["publish"] == dag.SKIPPED
+    assert body["state"] == dag.SUCCESS
+
+
+async def test_read_xcom_text_outcomes(tmp_path, dag_cron, monkeypatch):
+    cron = await dag_cron(_WHEN)
+    backend = cron.state_backend
+    scope = dag.xcom_scope("cond", "run-1")
+
+    async def put(key, data):
+        await jobstate.artifact_put(
+            backend, scope, dag.xcom_name("extract", key), data
+        )
+
+    read = cron._dag._read_xcom_text
+    await put("plain", b"full")
+    await put("line", b"full\n")
+    await put("crlf", b"full\r\n")
+    await put("lines", b"a\nb\n")
+    await put("empty", b"")
+    await put("edge", b"x" * dag.MAX_CONDITION_XCOM_BYTES)
+    await put("big", b"x" * (dag.MAX_CONDITION_XCOM_BYTES + 1))
+    await put("binary", b"\xff\xfe")
+    await put("accent", "café\n".encode())
+    assert await read("run-1", "cond", "extract", "plain") == "full"
+    assert await read("run-1", "cond", "extract", "line") == "full"
+    assert await read("run-1", "cond", "extract", "crlf") == "full"
+    assert await read("run-1", "cond", "extract", "lines") == "a\nb"
+    assert await read("run-1", "cond", "extract", "empty") == ""
+    assert await read("run-1", "cond", "extract", "edge") == "x" * 4096
+    assert await read("run-1", "cond", "extract", "accent") == "café"
+    assert await read("run-1", "cond", "extract", "big") is dag.XCOM_TOO_LARGE
+    assert (
+        await read("run-1", "cond", "extract", "binary") is dag.XCOM_NOT_TEXT
+    )
+    assert (
+        await read("run-1", "cond", "extract", "never")
+        is dag.XCOM_UNPUBLISHED
+    )
+    # another run's value is not this run's
+    assert (
+        await read("run-2", "cond", "extract", "plain")
+        is dag.XCOM_UNPUBLISHED
+    )
+    # a store that cannot answer is unknown, never "not published"
+    _break_record_reads(
+        monkeypatch, backend, jobstate.ARTIFACT_STREAM_PREFIX + scope
+    )
+    assert await read("run-1", "cond", "extract", "plain") is None
+    monkeypatch.undo()
+    assert await read("run-1", "cond", "extract", "plain") == "full"
+
+    async def _hang(*args, **kwargs):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(jobstate, "artifact_get", _hang)
+    assert await read("run-1", "cond", "extract", "plain") is None
+
+
+async def test_a_condition_read_that_fails_is_retried_not_guessed(
+    tmp_path, dag_cron
+):
+    cron = await _when_cron(dag_cron, tmp_path, b"12\n")
+    started = await cron._dag.trigger("cond", params={"mode": "incremental"})
+    ref = ("cond", started["runKey"])
+    real = cron._dag._read_xcom_text
+    calls = []
+
+    async def _unanswered(run_id, dag_name, taskkey, key):
+        calls.append((taskkey, key))
+        return None
+
+    cron._dag._read_xcom_text = _unanswered
+    # `extract` finishes; the advance that follows cannot read the value
+    await _reap_running(cron)
+    await _drain_pending(cron)
+    body = await cron._dag.get_run(*ref)
+    assert calls and set(calls) == {("extract", "row_count")}
+    assert _states(body)["incremental"] == dag.PENDING
+    assert "whenMet" not in body["tasks"]["incremental"]
+    # the parameter comparison on the other branch needed no read
+    assert _states(body)["full"] == dag.SKIPPED
+    # the read is retried on the advance-failed backoff, not the idle floor
+    wake = cron._dag._wake[ref] - dagrun._now()
+    assert 0 < wake <= dagrun.ADVANCE_RETRY_DELAY
+    # the store answers on the next pass and the task runs
+    cron._dag._read_xcom_text = real
+    body = await _drive(cron, *ref)
+    assert _states(body) == {
+        "extract": dag.SUCCESS,
+        "full": dag.SKIPPED,
+        "incremental": dag.SUCCESS,
+        "publish": dag.SUCCESS,
+    }
+    assert body["state"] == dag.SUCCESS
+
+
+async def test_a_mapped_task_with_a_met_condition_expands_without_a_wait(
+    tmp_path, dag_cron
+):
+    yaml = (
+        "dags:\n  - name: mw\n    params:\n"
+        "      - name: go\n        type: boolean\n        default: true\n"
+        "    tasks:\n"
+        "      - id: gen\n        command: 'x'\n"
+        "      - id: work\n        command: 'x'\n"
+        "        dependsOn:\n          - gen\n"
+        "        expand:\n          fromTask: gen\n          key: items\n"
+        "        when:\n          - param: go\n            equals: 'true'\n"
+    )
+    cron = await dag_cron(yaml)
+    items = tmp_path / "items.json"
+    items.write_text('["a", "b"]')
+    _set_cmd(cron, "mw", "gen", _push("items", items))
+    _set_cmd(cron, "mw", "work", _OK)
+    started = await cron._dag.trigger("mw")
+    ref = ("mw", started["runKey"])
+    await _reap_running(cron)
+    await _drain_pending(cron)
+    body = await cron._dag.get_run(*ref)
+    # the placeholder recorded its condition, and the run asked to be
+    # advanced again at once: the fan-out does not wait out the idle floor
+    assert body["tasks"]["work"]["whenMet"] is True
+    assert cron._dag._wake[ref] <= dagrun._now()
+    body = await _drive(cron, *ref)
+    assert body["state"] == dag.SUCCESS
+    assert _states(body) == {
+        "gen": dag.SUCCESS,
+        "work": dag.EXPANDED,
+        "work#0": dag.SUCCESS,
+        "work#1": dag.SUCCESS,
+    }
+    # with the condition unmet, no instance is ever created
+    started = await cron._dag.trigger("mw", params={"go": False})
+    body = await _drive(cron, "mw", started["runKey"])
+    assert _states(body) == {"gen": dag.SUCCESS, "work": dag.SKIPPED}
+    assert body["mapped"] == {}
+    assert body["tasks"]["work"]["skipReason"] == {
+        "kind": "condition",
+        "detail": "param go equals true: the value is false",
+    }
+
+
+async def test_list_dags_exports_when(tmp_path, dag_cron):
+    cron = await dag_cron(_WHEN + _LINEAR.replace("dags:\n", ""))
+    by_name = {d["name"]: d for d in await cron._dag.list_dags()}
+    tasks = {t["id"]: t for t in by_name["cond"]["tasks"]}
+    assert tasks["full"]["when"] == [{"param": "mode", "equals": "full"}]
+    assert tasks["incremental"]["when"] == [
+        {"param": "mode", "notEquals": "full"},
+        {"xcom": {"task": "extract", "key": "row_count"}, "notIn": ["0"]},
+    ]
+    # the key appears only on a task that sets it
+    assert "when" not in tasks["extract"] and "when" not in tasks["publish"]
+    for task in by_name["lin"]["tasks"]:
+        assert "when" not in task

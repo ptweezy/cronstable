@@ -44,6 +44,7 @@ which HA replicas are.
 import hashlib
 import json
 from collections.abc import Iterable
+from dataclasses import asdict
 from operator import attrgetter
 from typing import (
     Any,
@@ -392,6 +393,15 @@ def canonical_job(
             "priority": job.queuePriority,
             "timeout": job.queueTimeout,
         }
+    if job.params:
+        # The declaration decides which values a run can take, so replicas
+        # that disagree on it must show as drift, and a pool entry queued
+        # under another declaration is cancelled. A description is display
+        # text and stays out, as it does in a workflow's recovery revision.
+        out["params"] = [
+            {k: v for k, v in asdict(spec).items() if k != "description"}
+            for spec in job.params
+        ]
     return out
 
 

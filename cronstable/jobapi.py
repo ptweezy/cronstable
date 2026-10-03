@@ -141,7 +141,8 @@ class RunContext:
     reach straight into another job's private namespace (which is simply that
     job's name), reading, overwriting or destroying its state.  ``secrets`` is
     the run-scoped, in-memory staging table -- resolved by the daemon at
-    launch and dropped when the run ends.
+    launch and dropped when the run ends.  ``params`` is the workflow run's
+    stored parameter map, empty for a run that has none.
 
     ``token_bytes`` is the token pre-encoded for the constant-time compare in
     :meth:`JobStateAPI._run`, which scans every live run on every request:
@@ -159,6 +160,7 @@ class RunContext:
     default_scope: str
     allowed_scopes: set[str] = field(default_factory=set)
     secrets: dict[str, str] = field(default_factory=dict)
+    params: dict[str, Any] = field(default_factory=dict)
     token_bytes: bytes = field(init=False, repr=False, default=b"")
 
     def __post_init__(self) -> None:
@@ -807,6 +809,8 @@ class JobStateAPI:
             web.post("/v1/lock/release", self._h_lock_release),
             web.get("/v1/secret/get", self._h_secret_get),
             web.get("/v1/secret/list", self._h_secret_list),
+            web.get("/v1/param/get", self._h_param_get),
+            web.get("/v1/param/list", self._h_param_list),
         ]
 
     # --- request helpers -------------------------------------------------
@@ -1127,3 +1131,18 @@ class JobStateAPI:
     async def _h_secret_list(self, request: web.Request) -> web.Response:
         ctx = self._run(request)
         return _json_response({"names": sorted(ctx.secrets)})
+
+    # --- handlers: param -------------------------------------------------
+
+    async def _h_param_get(self, request: web.Request) -> web.Response:
+        ctx = self._run(request)
+        name = self._require(request.query.get("name"), "name")
+        if name not in ctx.params:
+            raise JobStateError(
+                "this run has no parameter {!r}".format(name), status=404
+            )
+        return _json_response({"value": ctx.params[name]})
+
+    async def _h_param_list(self, request: web.Request) -> web.Response:
+        ctx = self._run(request)
+        return _json_response({"params": ctx.params})

@@ -56,10 +56,17 @@ from cronstable import version as _version
 from cronstable.cron import (
     PAUSE_BY_MAX,
     WEB_ANON_REQUEST_KEY,
+    WEB_PARAMS_SCOPE,
     WEB_TOKEN_REQUEST_KEY,
     ApiActionError,
     _load_index_bytes,
 )
+from cronstable.dagrun import (
+    DagScheduler,
+    TriggerConflict,
+    TriggerInputError,
+)
+from cronstable.params import ParamError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no import cost / no cycle
     from cronstable.cron import Cron
@@ -1109,8 +1116,13 @@ class MCPHandler:
                 "cron_run_job",
                 "Run job now",
                 "Launch a job immediately, following its concurrencyPolicy. "
-                "Requires confirm=true.",
-                obj({"name": _STR, "confirm": _BOOL}, ["name"]),
+                "params supplies values for the run parameters the job "
+                "declares (see cron_list_jobs); without it the run uses "
+                "the defaults. With scoped web tokens, supplying params "
+                "needs the params scope. Requires confirm=true.",
+                obj(
+                    {"name": _STR, "params": _OBJ, "confirm": _BOOL}, ["name"]
+                ),
                 self._t_run_job,
                 mutating=True,
                 destructive=True,
@@ -1164,8 +1176,24 @@ class MCPHandler:
                 "dags",
                 "cron_trigger_dag",
                 "Run workflow now",
-                "Start a workflow run now. Requires confirm=true.",
-                obj({"dag": _STR, "confirm": _BOOL}, ["dag"]),
+                "Start a workflow run now. params supplies values for "
+                "the run parameters the workflow declares (see "
+                "cron_list_dags); without it the run uses the defaults. "
+                "With scoped web tokens, supplying params needs the params "
+                "scope. logical_date sets the run's logical date. "
+                "request_id makes the call repeatable: a second call with "
+                "the same request_id returns the first run. Requires "
+                "confirm=true.",
+                obj(
+                    {
+                        "dag": _STR,
+                        "params": _OBJ,
+                        "logical_date": _STR,
+                        "request_id": _STR,
+                        "confirm": _BOOL,
+                    },
+                    ["dag"],
+                ),
                 self._t_trigger_dag,
                 mutating=True,
                 destructive=True,
@@ -1175,14 +1203,18 @@ class MCPHandler:
                 "dags",
                 "cron_backfill_dag",
                 "Run workflow for past dates",
-                "Run a scheduled workflow for an ISO date range. dry_run "
-                "(default true) previews the runs. To start them, set "
-                "dry_run=false and confirm=true.",
+                "Run a scheduled workflow for an ISO date range. params "
+                "supplies run parameter values for the runs this call "
+                "creates; a date that already has a run keeps its values. "
+                "With scoped web tokens, supplying params needs the params "
+                "scope. dry_run (default true) previews the runs. To start "
+                "them, set dry_run=false and confirm=true.",
                 obj(
                     {
                         "dag": _STR,
                         "from": _STR,
                         "to": _STR,
+                        "params": _OBJ,
                         "dry_run": _BOOL,
                         "confirm": _BOOL,
                     },
@@ -1636,13 +1668,22 @@ class MCPHandler:
     async def _t_run_job(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         _require_confirm(args, "running")
-        queued = await self._cron.start_job_by_name(name)
-        if queued is not None:
+        try:
+            started = await self._cron.start_job(name, _run_params(args))
+        except ParamError as ex:
+            return _tool_error(_param_error_text(ex))
+        # the values the run takes, for a job that declares parameters
+        values = (
+            {} if started["params"] is None else {"params": started["params"]}
+        )
+        if started["queued"] is not None:
             return _result(
-                {"queued": name, "queueId": queued},
+                {"queued": name, "queueId": started["queued"], **values},
                 "queued job {!r}".format(name),
             )
-        return _result({"started": name}, "started job {!r}".format(name))
+        return _result(
+            {"started": name, **values}, "started job {!r}".format(name)
+        )
 
     async def _t_cancel_job(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
@@ -1781,12 +1822,38 @@ class MCPHandler:
     async def _t_trigger_dag(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")
         _require_confirm(args, "triggering")
-        run_key = await self._cron._dag.trigger_run(dag)
-        if run_key is None:
+        logical = args.get("logical_date")
+        if logical is not None and not isinstance(logical, str):
+            raise _ToolInputError("logical_date must be an ISO 8601 string")
+        request_id = args.get("request_id")
+        if request_id is not None and not (
+            isinstance(request_id, str) and 1 <= len(request_id) <= 200
+        ):
+            raise _ToolInputError(
+                "request_id must be a string of 1 to 200 characters"
+            )
+        params = _run_params(args)
+        try:
+            result = await self._cron._dag.trigger(
+                dag,
+                params=params,
+                logical_date=logical,
+                request_id=request_id,
+                triggered_by=_attribution(None),
+            )
+        except ParamError as ex:
+            return _tool_error(_param_error_text(ex))
+        except (TriggerInputError, TriggerConflict) as ex:
+            return _tool_error(str(ex))
+        if result is None:
             return _tool_error("dag not found: {!r}".format(dag))
         return _result(
-            {"dag": dag, "runKey": run_key},
-            "triggered dag {!r} (run {})".format(dag, run_key),
+            {"dag": dag, **result},
+            (
+                "triggered dag {!r} (run {})"
+                if result["created"]
+                else "dag {!r} already has run {} for this request_id"
+            ).format(dag, result["runKey"]),
         )
 
     async def _t_backfill_dag(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1795,6 +1862,15 @@ class MCPHandler:
         end = _req_str(args, "to")
         if dag not in self._cron.cron_dags:
             return _tool_error("dag not found: {!r}".format(dag))
+        params = _run_params(args)
+        try:
+            # checked before the preview, so a dry run reports the values a
+            # real run would refuse
+            resolved = DagScheduler._resolve_params(
+                self._cron.cron_dags[dag], params
+            )
+        except ParamError as ex:
+            return _tool_error(_param_error_text(ex))
         # dry_run defaults TRUE, tested by IDENTITY like _require_confirm:
         # only the literal boolean false may take the destructive branch.
         # ``args.get("dry_run", True)`` applied the default only when the
@@ -1809,6 +1885,7 @@ class MCPHandler:
                     "to": end,
                     "dryRun": True,
                     "wouldExecute": False,
+                    **({} if resolved is None else {"params": resolved}),
                 },
                 "DRY RUN: would backfill dag {!r} from {} to {}. Call again "
                 "with dry_run=false and confirm=true to execute.".format(
@@ -1816,11 +1893,24 @@ class MCPHandler:
                 ),
             )
         _require_confirm(args, "backfilling")
-        result = await self._cron._dag.backfill(dag, start, end)
+        try:
+            result = await self._cron._dag.backfill(
+                dag,
+                start,
+                end,
+                params=params,
+                triggered_by=_attribution(None),
+            )
+        except ParamError as ex:
+            return _tool_error(_param_error_text(ex))
         if not result.get("ok"):
             return _tool_error(str(result.get("reason")))
         return _result(
-            result, "backfilled dag {!r} from {} to {}".format(dag, start, end)
+            result,
+            "backfilled dag {!r} from {} to {}: {} created, {} already "
+            "existed".format(
+                dag, start, end, result["created"], result["existing"]
+            ),
         )
 
     async def _t_decide_gate(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -2734,6 +2824,45 @@ def _require_confirm(args: dict[str, Any], gerund: str) -> None:
                 gerund
             )
         )
+
+
+def _run_params(args: dict[str, Any]) -> dict[str, Any] | None:
+    """The ``params`` argument of a call that starts runs, or ``None``.
+
+    Applies the check the REST twins apply: a caller whose token lacks the
+    ``params`` scope cannot supply values.
+    """
+    supplied = args.get("params")
+    if supplied is None:
+        return None
+    if not isinstance(supplied, dict):
+        raise _ToolInputError("params must be an object")
+    caller = _caller.get()
+    if (
+        supplied
+        and caller is not None
+        and WEB_PARAMS_SCOPE not in caller.scopes
+    ):
+        raise _ToolInputError(
+            "the presented web token lacks the {!r} scope that supplying "
+            "run parameters requires (the REST route for the same action "
+            "is gated identically); call again without params to use the "
+            "defaults".format(WEB_PARAMS_SCOPE)
+        )
+    return supplied
+
+
+def _param_error_text(ex: ParamError) -> str:
+    """A refused parameter map as one line the model can correct from."""
+    if not ex.errors:
+        return str(ex)
+    return "{}: {}".format(
+        ex,
+        "; ".join(
+            "{} {}".format(name, reason)
+            for name, reason in sorted(ex.errors.items())
+        ),
+    )
 
 
 def _attribution(supplied: Any) -> str:

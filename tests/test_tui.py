@@ -957,7 +957,15 @@ class FakeDaemon:
         name = request.match_info["name"]
         self.posts.append("dag/%s/backfill" % name)
         self.post_bodies.append(await request.json())
-        return web.json_response({"dag": name, "queued": 2})
+        return web.json_response(
+            {
+                "ok": True,
+                "created": 2,
+                "existing": 0,
+                "runKeys": ["2026-01-01T00:00:00_00:00", "2026-01-02T00:00:00_00:00"],
+                "existingRunKeys": [],
+            }
+        )
 
     async def _dag_decision(self, request):
         self.posts.append(
@@ -3024,6 +3032,41 @@ async def test_dag_action_error_and_status_paths(tmp_path):
     assert any("range too wide" in m for m in _msgs(app))
 
 
+@pytest.mark.parametrize(
+    "payload, suffix",
+    [
+        ({"ok": True, "created": 2, "existing": 1}, " (2 runs, 1 already existed)"),
+        ({"ok": True, "created": 1, "existing": 0}, " (1 run)"),
+        ({"ok": True, "created": 0, "existing": 3}, " (0 runs, 3 already existed)"),
+        # an older daemon counts the dates it visited and sends no `existing`
+        ({"ok": True, "created": 4}, " (4 runs)"),
+        ({}, ""),
+        ("not json", ""),
+        ({"created": True}, ""),
+    ],
+)
+def test_backfill_counts(payload, suffix):
+    assert tui._backfill_counts(payload) == suffix
+
+
+async def test_dag_backfill_toast_reports_created_and_existing(tmp_path):
+    app = _bare_app(tmp_path)
+    app.dag_name = "d"
+    app.toasts = []
+    refreshed = []
+
+    async def _refresh():
+        refreshed.append(1)
+
+    # the success path spawns a run-list refresh; no daemon is listening
+    app._load_dag_runs = _refresh
+    app.api.post = _post_status(200, {"ok": True, "created": 2, "existing": 1})
+    await app.dag_backfill("2026-01-01..2026-01-02")
+    assert "▶ backfill queued (2 runs, 1 already existed)" in _msgs(app)
+    await asyncio.sleep(0)
+    assert refreshed == [1]
+
+
 async def test_save_log_success_and_oserror(tmp_path, monkeypatch):
     app = _bare_app(tmp_path)
     # no tail / no drawer job -> silent no-op
@@ -4073,6 +4116,176 @@ def test_dag_graph_cache_tracks_metadata_and_run_updates(tmp_path, dict_form):
     assert strip_ansi(rows[0]).strip() == "0 [child failed]"
     assert strip_ansi(rows[1]).strip() == "1 [root]"
     assert "child -> root" in _txt(rows)
+
+
+def test_dag_graph_names_a_non_default_trigger_rule_on_the_first_edge(
+    tmp_path,
+):
+    tasks = [
+        {"id": "full", "triggerRule": "all_success"},
+        {"id": "incremental"},
+        {
+            "id": "publish",
+            "dependsOn": ["full", "incremental"],
+            "triggerRule": "none_failed_min_one_success",
+        },
+        {"id": "plain", "dependsOn": ["full"], "triggerRule": "all_success"},
+    ]
+    app = _bare_app(tmp_path)
+    app.prefs["ascii"] = True
+    rows = app._dag_graph_tab(_paint(app), {"tasks": tasks}, 120, 20)
+    assert [strip_ansi(row).rstrip() for row in rows] == [
+        " 0 [full] [incremental]",
+        " 1 [plain] [publish]",
+        "     full -> plain",
+        "     full -> publish · none_failed_min_one_success",
+        "     incremental -> publish",
+    ]
+
+
+def test_dag_graph_names_a_task_s_when_comparisons(tmp_path):
+    tasks = [
+        {"id": "extract"},
+        # a root has no edge, so its comparisons get a row of their own
+        {"id": "full", "when": [{"param": "mode", "equals": "full"}]},
+        {
+            "id": "incremental",
+            "dependsOn": ["extract"],
+            "when": [
+                {"param": "mode", "notEquals": "full"},
+                {
+                    "xcom": {"task": "extract", "key": "row_count"},
+                    "notIn": ["0", ""],
+                },
+            ],
+        },
+        {
+            "id": "publish",
+            "dependsOn": ["full", "incremental"],
+            "triggerRule": "none_failed_min_one_success",
+            "when": [{"param": "dry", "in": [False, 2, 0.5]}],
+        },
+    ]
+    app = _bare_app(tmp_path)
+    app.prefs["ascii"] = True
+    rows = app._dag_graph_tab(_paint(app), {"tasks": tasks}, 160, 20)
+    assert [strip_ansi(row).rstrip() for row in rows] == [
+        " 0 [extract] [full]",
+        "     full · when param mode equals full",
+        " 1 [incremental]",
+        "     extract -> incremental · when param mode notEquals full; "
+        "xcom extract/row_count notIn 0,",
+        " 2 [publish]",
+        "     full -> publish · none_failed_min_one_success · when param dry "
+        "in false, 2, 0.5",
+        "     incremental -> publish",
+    ]
+    # the marker is cut with the row it sits on
+    narrow = app._dag_graph_tab(_paint(app), {"tasks": tasks}, 40, 20)
+    assert all(text_width(strip_ansi(row)) <= 36 for row in narrow)
+
+
+@pytest.mark.parametrize(
+    "when, text",
+    [
+        ([{"param": "mode", "equals": "full"}], "param mode equals full"),
+        ([{"param": "n", "notIn": [1, 2]}], "param n notIn 1, 2"),
+        ([{"param": "dry", "equals": True}], "param dry equals true"),
+        (
+            [{"xcom": {"task": "a", "key": "k"}, "in": ["x", "y"]}],
+            "xcom a/k in x, y",
+        ),
+        (
+            [{"param": "a", "equals": "1"}, {"param": "b", "notEquals": "2"}],
+            "param a equals 1; param b notEquals 2",
+        ),
+        # an XCom comparison value can hold a line break: the phrase is
+        # one line
+        (
+            [{"xcom": {"task": "a", "key": "k"}, "equals": "two\nlines\r\n"}],
+            "xcom a/k equals two lines",
+        ),
+        ([], ""),
+        (None, ""),
+        ("mode", ""),
+        ([None, "x"], ""),
+    ],
+)
+def test_when_text(when, text):
+    assert tui.when_text(when) == text
+
+
+def test_dag_tasks_tab_shows_a_condition_skip(tmp_path):
+    app = _bare_app(tmp_path)
+    app.dag_run_key = "manual-1"
+    app.dag_run = {
+        "tasks": {
+            "full": {
+                "state": "skipped",
+                "skipReason": {
+                    "kind": "condition",
+                    "detail": "param mode equals full: the value is inc",
+                },
+            },
+        }
+    }
+    rows = [
+        strip_ansi(row).rstrip()
+        for row in app._dag_tasks_tab(_paint(app), 120, 20)
+    ]
+    assert rows[1].endswith(" · param mode equals full: the value is inc")
+
+
+def test_dag_tasks_tab_shows_why_a_task_was_skipped(tmp_path):
+    app = _bare_app(tmp_path)
+    app.dag_run_key = "manual-1"
+    app.dag_run = {
+        "tasks": {
+            "guard": {
+                "state": "skipped",
+                "skipReason": {"kind": "exit_code", "detail": "exit code 99"},
+            },
+            "after": {
+                "state": "skipped",
+                "attempt": 1,
+                "skipReason": {
+                    "kind": "upstream",
+                    "detail": "upstream skipped: guard",
+                },
+            },
+            "gate": {
+                "state": "skipped",
+                "skipReason": {"kind": "approval", "detail": "rejected by x"},
+            },
+            "old": {"state": "skipped"},
+        }
+    }
+    rows = [
+        strip_ansi(row).rstrip()
+        for row in app._dag_tasks_tab(_paint(app), 120, 20)
+    ]
+    by_task = {row.split()[0]: row for row in rows[1:]}
+    assert by_task["guard"].endswith(" · skipped itself, exit code 99")
+    assert by_task["after"].endswith(" · try 1 · upstream skipped: guard")
+    # a rejected gate and a run that recorded no reason add nothing
+    assert by_task["gate"].split() == ["gate", "skipped"]
+    assert by_task["old"].split() == ["old", "skipped"]
+
+
+@pytest.mark.parametrize(
+    "reason, text",
+    [
+        ({"kind": "exit_code", "detail": "exit code 3"}, "skipped itself, exit code 3"),
+        ({"kind": "trigger_rule", "detail": "r: no upstream failed"}, "r: no upstream failed"),
+        ({"kind": "a_newer_kind", "detail": "why"}, "why"),
+        ({"kind": "approval", "detail": "rejected by x"}, ""),
+        ({"kind": "exit_code"}, ""),
+        (None, ""),
+        ("exit code 3", ""),
+    ],
+)
+def test_skip_reason_text(reason, text):
+    assert tui.skip_reason_text(reason) == text
 
 
 @pytest.mark.parametrize("width,height", [(80, 0), (80, -1), (4, 20)])
@@ -5181,3 +5394,363 @@ def test_drawer_schedule_local_frame_uses_the_host_zone(tmp_path, monkeypatch):
     app.drawer_job = "ny"
     app._drawer_schedule(paint, 70, 24)
     assert str(zones[1]) == "America/New_York"
+
+
+# --------------------------------------------------------------------------
+# workflow run parameters: the input row, its words, the run's stored values
+# --------------------------------------------------------------------------
+
+_DECLARED = [
+    {
+        "name": "target",
+        "type": "string",
+        "default": "staging",
+        "allowed": ["staging", "prod"],
+    },
+    {"name": "batch_size", "type": "integer", "default": 500},
+    {"name": "dry", "type": "boolean", "default": False},
+    {"name": "ratio", "type": "number", "default": 0.5},
+    {"name": "ticket", "type": "string", "required": True},
+]
+
+
+def test_parse_param_words_types_each_value():
+    words = tui.split_words(
+        'target=prod batch_size=20 dry=yes ratio=1.5 ticket="OPS 1"'
+    )
+    assert tui.parse_param_words(words, _DECLARED) == {
+        "target": "prod",
+        "batch_size": 20,
+        "dry": True,
+        "ratio": 1.5,
+        "ticket": "OPS 1",
+    }
+    assert tui.parse_param_words([], _DECLARED) == {}
+    # a value keeps every "=" after the first
+    assert tui.parse_param_words(["ticket=a=b"], _DECLARED) == {
+        "ticket": "a=b"
+    }
+
+
+@pytest.mark.parametrize(
+    "words,message",
+    [
+        (["target"], "target is not name=value"),
+        (["=x"], "=x is not name=value"),
+        (["colour=red"], "colour is not a declared parameter"),
+        (["batch_size=lots"], "batch_size must be an integer"),
+        (["dry=maybe"], "dry must be true or false"),
+    ],
+)
+def test_parse_param_words_refusals(words, message):
+    with pytest.raises(ValueError, match=message):
+        tui.parse_param_words(words, _DECLARED)
+
+
+def test_split_words_keeps_backslashes_and_hashes():
+    # a Windows path is a value like any other, and "#" starts no comment
+    assert tui.split_words(r'path=C:\tmp\new note="a b" tag=#1') == [
+        r"path=C:\tmp\new",
+        "note=a b",
+        "tag=#1",
+    ]
+    assert tui.split_words("  ") == []
+
+
+def test_parse_param_words_tolerates_a_missing_declaration():
+    with pytest.raises(ValueError, match="x is not a declared parameter"):
+        tui.parse_param_words(["x=1"], None)
+    with pytest.raises(ValueError, match="unclosed quote"):
+        tui.split_words('ticket="OPS')
+
+
+def test_param_hint_and_error_detail():
+    assert tui.param_hint(_DECLARED) == (
+        "target=staging (staging|prod)  batch_size=500  dry=false"
+        "  ratio=0.5  ticket=?"
+    )
+    assert tui.param_hint(None) == ""
+    assert tui._error_detail("plain text") == ""
+    assert tui._error_detail({"error": "bad date range"}) == (
+        " — bad date range"
+    )
+    assert tui._error_detail(
+        {
+            "error": "invalid parameters for workflow 'd'",
+            "paramErrors": {"ticket": "is required", "batch_size": "x"},
+        }
+    ) == " — invalid parameters for workflow 'd': batch_size x; ticket is required"
+
+
+async def _no_load(*a, **k):
+    return None
+
+
+def _param_app(tmp_path):
+    # the run list reload a trigger spawns would open a real session
+    app = _bare_app(tmp_path)
+    app._load_dag_runs = _no_load
+    return app
+
+
+async def test_dag_trigger_opens_the_parameter_row(tmp_path):
+    app = _param_app(tmp_path)
+    app.dags = [{"name": "d", "params": _DECLARED}, {"name": "plain"}]
+    posted = []
+
+    async def post(path, body=None):
+        posted.append((path, body))
+        return 200, {"runKey": "manual-1"}
+
+    app.api.post = post
+    # a workflow that declares nothing triggers at once, with no body
+    await app.dag_trigger_or_prompt("plain")
+    assert posted == [("/dags/plain/trigger", None)]
+    assert app.focus is None
+    # a declaration opens the workflow and focuses the row instead
+    await app.dag_trigger_or_prompt("d")
+    assert app.is_open("dag") and app.dag_name == "d"
+    assert app.focus == "params"
+    assert len(posted) == 1
+    panel = _txt(app.render_dag_panel(_paint(app), 100, 24))
+    assert "run with name=value (Enter runs):" in panel
+    assert "target=staging (staging|prod)" in panel and "ticket=?" in panel
+    # a word that cannot be sent keeps the row and sends nothing
+    app.inputs["params"] = "batch_size=lots"
+    await app.handle_key("enter")
+    assert any("batch_size must be an integer" in m for m in _msgs(app))
+    assert app.focus == "params" and len(posted) == 1
+    # typed values go out as JSON types
+    app.inputs["params"] = "ticket=OPS-1 batch_size=20 dry=true"
+    await app.handle_key("enter")
+    assert posted[-1] == (
+        "/dags/d/trigger",
+        {"params": {"ticket": "OPS-1", "batch_size": 20, "dry": True}},
+    )
+    assert app.focus is None and app.inputs["params"] == ""
+    # an empty row runs with the defaults: no body
+    await app.handle_key("t")
+    assert app.focus == "params"
+    await app.handle_key("enter")
+    assert posted[-1] == ("/dags/d/trigger", None)
+    app.close("dag")
+    await asyncio.sleep(0.05)
+
+
+async def test_refused_params_keep_the_row_for_a_correction(tmp_path):
+    app = _param_app(tmp_path)
+    app.dags = [{"name": "d", "params": _DECLARED}]
+    app.open_dag("d")
+    app.focus = "params"
+    app.inputs["params"] = "batch_size=0"
+    app.api.post = _post_status(
+        400,
+        {
+            "error": "invalid parameters for workflow 'd'",
+            "paramErrors": {
+                "batch_size": "must be at least 1",
+                "ticket": "is required",
+            },
+        },
+    )
+    await app.handle_key("enter")
+    assert any(
+        "HTTP 400" in m
+        and "batch_size must be at least 1; ticket is required" in m
+        for m in _msgs(app)
+    )
+    assert app.focus == "params"
+    assert app.inputs["params"] == "batch_size=0"
+    # a token without the params scope reads the daemon's reason
+    app.api.post = _post_status(403, {"error": "token 'ci' does not grant"})
+    await app.handle_key("enter")
+    assert any("HTTP 403 — token 'ci'" in m for m in _msgs(app))
+    # a 401 hands over to the token input and drops the row's text
+    app.api.post = _raise_unauth
+    await app.handle_key("enter")
+    assert app.focus == "token" and app.inputs["params"] == ""
+    _reset_token(app)
+    # with no workflow open the commit just releases the input
+    app.dag_name = None
+    app.focus = "params"
+    await app.dag_trigger_from_input("x=1")
+    assert app.focus is None
+    await asyncio.sleep(0.05)
+
+
+async def test_backfill_row_takes_params(tmp_path):
+    app = _param_app(tmp_path)
+    app.dags = [{"name": "d", "params": _DECLARED}]
+    app.dag_name = "d"
+    posted = []
+
+    async def post(path, body=None):
+        posted.append((path, body))
+        return 200, {"created": 1, "existing": 0}
+
+    app.api.post = post
+    await app.dag_backfill("2026-01-01..2026-01-02 target=prod batch_size=7")
+    assert posted[-1] == (
+        "/dags/d/backfill",
+        {
+            "from": "2026-01-01",
+            "to": "2026-01-02",
+            "params": {"target": "prod", "batch_size": 7},
+        },
+    )
+    # dates alone send no params key
+    await app.dag_backfill("2026-01-01 2026-01-02")
+    assert posted[-1][1] == {"from": "2026-01-01", "to": "2026-01-02"}
+    sent = len(posted)
+    await app.dag_backfill("2026-01-01..2026-01-02 colour=red")
+    assert any(
+        "backfill: colour is not a declared parameter" in m
+        for m in _msgs(app)
+    )
+    await app.dag_backfill("target=prod")
+    assert any("backfill wants: FROM..TO" in m for m in _msgs(app))
+    assert len(posted) == sent
+    app.open("dag")
+    app.focus = "backfill"
+    panel = _txt(app.render_dag_panel(_paint(app), 100, 24))
+    assert "backfill FROM..TO name=value:" in panel
+    app.dags = [{"name": "d"}]
+    panel = _txt(app.render_dag_panel(_paint(app), 100, 24))
+    assert "backfill FROM..TO:" in panel
+    await asyncio.sleep(0.05)
+
+
+def test_tasks_tab_shows_the_stored_params(tmp_path):
+    app = _bare_app(tmp_path)
+    app.dag_name = "d"
+    app.dag_tab = "tasks"
+    app.dag_run_key = "manual-1"
+    app.dag_run = {
+        "params": {"target": "prod", "batch_size": 250, "dry": True},
+        "tasks": {"release": {"state": "success"}},
+    }
+    tasks = _txt(app.render_dag_panel(_paint(app), 100, 24))
+    assert "run manual-1 · target=prod  batch_size=250  dry=true" in tasks
+    # a run that stores none keeps the bare head
+    app.dag_run = {"tasks": {"release": {"state": "success"}}}
+    tasks = _txt(app.render_dag_panel(_paint(app), 100, 24))
+    assert " run manual-1\n" in tasks
+
+
+# --------------------------------------------------------------------------
+# run parameters for a job: the row under the drawer's head
+# --------------------------------------------------------------------------
+
+_JOB_DECLARED = [
+    {"name": "region", "type": "string", "default": "eu", "allowed": ["eu", "us"]},
+    {"name": "rows", "type": "integer", "default": 100},
+    {"name": "dry", "type": "boolean", "default": False},
+]
+
+
+def _job_param_app(tmp_path):
+    # opening the real drawer would start a log stream against a daemon
+    app = _bare_app(tmp_path)
+
+    def open_drawer(name, tab="logs"):
+        app.drawer_job = name
+        app.drawer_tab = tab
+        app.open("drawer")
+
+    app.open_drawer = open_drawer
+    app.refresh_now = lambda: None
+    app.log_tail = _stub_tail(app, [])
+    app.jobs = [
+        {"name": "report", "enabled": True, "params": _JOB_DECLARED},
+        {"name": "plain", "enabled": True},
+    ]
+    app.by_name = {job["name"]: job for job in app.jobs}
+    return app
+
+
+async def test_run_opens_the_parameter_row_for_a_job_that_declares_params(
+    tmp_path,
+):
+    app = _job_param_app(tmp_path)
+    posted = []
+
+    async def post(path, body=None):
+        posted.append((path, body))
+        return 200, {"started": "report"}
+
+    app.api.post = post
+    # a job that declares nothing starts at once, with no body
+    await app.run_job_or_prompt("plain")
+    assert posted == [("/jobs/plain/start", None)]
+    assert app.focus is None and not app.is_open("drawer")
+    # a declaration opens the job and focuses the row instead
+    await app.run_job_or_prompt("report")
+    assert app.is_open("drawer") and app.drawer_job == "report"
+    assert app.focus == "jobparams" and len(posted) == 1
+    panel = _txt(app.render_drawer_panel(_paint(app), 100, 24))
+    assert "run with name=value (Enter runs):" in panel
+    assert "region=eu (eu|us)" in panel and "rows=100" in panel
+    # a word that cannot be sent keeps the row and sends nothing
+    app.inputs["jobparams"] = "rows=lots"
+    await app.handle_key("enter")
+    assert any("rows must be an integer" in m for m in _msgs(app))
+    assert app.focus == "jobparams" and len(posted) == 1
+    # typed values go out as JSON types
+    app.inputs["jobparams"] = "region=us rows=5 dry=true"
+    await app.handle_key("enter")
+    assert posted[-1] == (
+        "/jobs/report/start",
+        {"params": {"region": "us", "rows": 5, "dry": True}},
+    )
+    assert app.focus is None and app.inputs["jobparams"] == ""
+    # the row is gone once the run starts
+    assert "run with name=value" not in _txt(
+        app.render_drawer_panel(_paint(app), 100, 24)
+    )
+    # an empty row starts the job with its defaults: no body
+    await app.handle_key("r")
+    assert app.focus == "jobparams"
+    await app.handle_key("enter")
+    assert posted[-1] == ("/jobs/report/start", None)
+    # the bulk rerun never prompts
+    app.jobs[0]["last_run"] = {"outcome": "failure", "exit_code": 1}
+    before = len(posted)
+    await app.run_all_failing()
+    assert app.focus is None
+    assert all(body is None for _path, body in posted[before:])
+    app.close("drawer")
+    await asyncio.sleep(0.05)
+
+
+async def test_refused_job_params_keep_the_row_for_a_correction(tmp_path):
+    app = _job_param_app(tmp_path)
+    app.open_drawer("report")
+    app.focus = "jobparams"
+    app.inputs["jobparams"] = "rows=0"
+    app.api.post = _post_status(
+        400,
+        {
+            "error": "invalid parameters for job 'report'",
+            "paramErrors": {"rows": "must be at least 1"},
+        },
+    )
+    await app.handle_key("enter")
+    assert any(
+        "HTTP 400" in m and "rows must be at least 1" in m for m in _msgs(app)
+    )
+    assert app.focus == "jobparams" and app.inputs["jobparams"] == "rows=0"
+    # a token without the params scope reads the daemon's reason
+    app.api.post = _post_status(403, {"error": "token 'ci' does not grant"})
+    await app.handle_key("enter")
+    assert any("HTTP 403 — token 'ci'" in m for m in _msgs(app))
+    # a 401 hands over to the token input and drops the row's text
+    app.api.post = _raise_unauth
+    await app.handle_key("enter")
+    assert app.focus == "token" and app.inputs["jobparams"] == ""
+    _reset_token(app)
+    # with no job open the commit just releases the input
+    app.drawer_job = None
+    app.focus = "jobparams"
+    await app.run_job_from_input("x=1")
+    assert app.focus is None
+    await asyncio.sleep(0.05)

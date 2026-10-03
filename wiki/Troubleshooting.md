@@ -651,6 +651,145 @@ the preceding 2-node case, which is rejected).
 node, or grow by one to tolerate an extra failure. See
 [sizing the cluster](Clustering-and-Leader-Election#sizing-the-cluster).
 
+## Workflows
+
+### A workflow run stays `running` and a node logs "leaving the run for an upgraded node"
+
+**Symptom.** A run stays `running` with its tasks `pending`, and a node logs
+`dag run <dag>/<run>: needs run engine level <N> and this build supports level
+<M>; leaving the run for an upgraded node`. `GET /dags` can list
+`fleetWarnings` for the same workflow.
+
+**Cause.** The nodes on the shared store run different cronstable versions,
+and the run's workflow uses a feature that the logging node's build does not
+support. A node advances only runs at or below its own
+[run engine level](Orchestration-and-DAGs#run-engine-levels), so it leaves
+this run for a node that reaches the level.
+
+**Fix.** Upgrade cronstable on the node that logged the line and on each host
+that a `fleetWarnings` entry names. An upgraded node adopts the run on its
+next adoption scan, which runs every 30 seconds. To avoid the wait during a
+rollout, upgrade every node on the store before a configuration uses the
+newer feature.
+
+### A join task is skipped when one branch skips
+
+**Symptom.** A task below two or more branches ends `skipped` although one
+branch ran, and its `skipReason` reads `upstream skipped: <task>`. At load the
+daemon logs `dag '<dag>': task '<task>' uses triggerRule all_success and joins
+upstreams that can end skipped`.
+
+**Cause.** The task's `triggerRule` is `all_success`, the default. Under that
+rule a skipped upstream cascades `skipped` to the task, so a join below
+alternative branches is skipped whenever one branch skips itself.
+
+**Fix.** Set `triggerRule: none_failed_min_one_success` on the join. It then
+runs after the branch that ran and is skipped only when every branch skipped.
+Use `none_failed` to run the join in that case too. See
+[conditional branching](Orchestration-and-DAGs#conditional-branching).
+
+### A task fails with an exit code that was meant to skip it
+
+**Symptom.** A task ends `failed` with `command exited with code 99`, and the
+command exits `99` to say that it has nothing to do.
+
+**Cause.** No exit code skips a task by default. A task ends `skipped` only
+when its command exits with a code listed in the task's own `skipExitCodes`.
+A `defaults:` block cannot set the key, because it is a graph field. A run
+stopped by `executionTimeout` or a cancel also never skips.
+
+**Fix.** List the code on the task:
+
+```yaml
+        skipExitCodes:
+          - 99
+```
+
+### A task is skipped and its reason starts with `param` or `xcom`
+
+**Symptom.** A task ends `skipped` without starting. Its `skipReason` has the
+kind `condition` and a detail such as
+`param mode equals full: the value is incremental`.
+
+**Cause.** The task has a [`when:` condition](Orchestration-and-DAGs#conditions-on-parameters-and-xcom-values), and the comparison that
+the detail names did not hold for this run. The text after the colon is what
+the comparison read.
+
+**Fix.** Start a run whose parameters meet the condition, for example with
+`{"params": {"mode": "full"}}` in the trigger body. A scheduled run stores
+each parameter's default, so a branch that has to run on schedule needs a
+condition that the defaults meet. If a task below the skipped one was skipped
+as well, set `triggerRule: none_failed_min_one_success` on the join.
+
+### A condition on an XCom value reads "the key is not published"
+
+**Symptom.** A task ends `skipped`, and its `skipReason` detail reads
+`xcom extract/row_count equals full: the key is not published`. In the
+reverse case, a task with `notEquals` or `notIn` runs although the upstream
+task published nothing.
+
+**Cause.** The comparison found no value to read. The upstream task did not
+publish the key in this run, or it published under another key name. A
+published value larger than 4096 bytes and one that is not UTF-8 text also
+count as no value, and the detail says which. A source with no value fails
+`equals` and `in`, and passes `notEquals` and `notIn`.
+
+**Fix.** Publish the value in the upstream task before it exits, and use the
+same key in `xcom.key`:
+
+```bash
+echo "$rows" | cronstable xcom push --key row_count
+```
+
+To skip the task whenever the value is missing, compare with `in` and list
+the accepted values, because a missing value never passes `in`.
+
+### A start or a trigger answers `403` although the token has `control`
+
+**Symptom.** `POST /jobs/{name}/start`, `POST /dags/{name}/trigger`, or
+`POST /dags/{name}/backfill` answers `403` with `token '<label>' does not
+grant the 'params' permission required to supply run parameters`. The same
+token starts the run when the request has no `params`.
+
+**Cause.** Choosing
+[run parameter](Orchestration-and-DAGs#run-parameters) values needs the
+`params` scope in addition to `control`. A token with `control` alone starts
+runs with the declared defaults.
+
+**Fix.** Add `params` to the token's `scopes` in
+[`web.authTokens`](HTTP-API#scoped-tokens-webauthtokens), or send the request
+without `params` to use the defaults. The scalar `web.authToken` holds every
+scope.
+
+### A start or a trigger answers `400` with `paramErrors`
+
+**Symptom.** A job start, a trigger, or a backfill answers `400`, and the
+body lists a reason for each parameter under `paramErrors`, such as
+`must be an integer`, `is not a declared parameter`, or `is required`.
+
+**Cause.** cronstable checks the values against the job's or the workflow's
+`params:` declaration and coerces nothing. A job or a workflow that declares
+no parameters refuses every value. The string `"500"` is refused for an
+`integer`, a name the workflow does not declare is refused, and a `required`
+parameter has no default. A refused request creates no run.
+
+**Fix.** Send each value in its declared JSON type, and read the declaration
+from the workflow's entry in `GET /dags`. A workflow whose configuration
+sets a required parameter cannot be started without a value for it.
+
+### A Windows job or task misreads a parameter that holds `&`, `|`, or `%`
+
+**Symptom.** A job or a workflow task on Windows reads
+`%CRONSTABLE_PARAM_TARGET%`, and the command misbehaves for a value that
+holds `&`, `|`, or `%`.
+
+**Cause.** `cmd.exe` parses the text of an expanded `%VAR%` again, so a
+value's special characters act as command syntax.
+
+**Fix.** Read the variable with delayed expansion (`!CRONSTABLE_PARAM_TARGET!`)
+or from PowerShell (`$env:CRONSTABLE_PARAM_TARGET`), and constrain the
+parameter with `allowed` or `pattern` in its declaration.
+
 ## Concurrency and termination
 
 ### Overlapping runs, skipped runs, or a job killed mid-run

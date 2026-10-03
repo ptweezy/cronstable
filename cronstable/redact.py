@@ -275,6 +275,18 @@ _STEPS: tuple[
     for (pattern, repl), gate in zip(_PATTERNS, _PATTERN_GATES, strict=True)
 )
 
+_SECRET_NAME = re.compile("(?i)(?:" + "|".join(_KEY_KEYWORDS) + ")")
+
+
+def is_secret_name(name: str) -> bool:
+    """Whether ``name`` holds a keyword the key=value pattern redacts under.
+
+    Decides which names a configuration may not use for a value every
+    reader sees, such as a run parameter.
+    """
+    return _SECRET_NAME.search(name) is not None
+
+
 _PEM_BEGIN = re.compile(r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _PEM_END = re.compile(r"(?i)-----END [A-Z0-9 ]*PRIVATE KEY-----")
 

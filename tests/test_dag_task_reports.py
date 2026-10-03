@@ -259,3 +259,78 @@ async def test_launch_failed_task_reports_failure(tmp_path):
     assert server.requests, "launch-failed attempt fired no onFailure report"
     payload = json.loads(server.requests[0]["body"])
     assert "d.t1" in payload["text"]
+
+
+# ---------------------------------------------------------------------------
+# A run its command skipped (skipExitCodes) fires neither hook
+# ---------------------------------------------------------------------------
+
+_DAG_WITH_BOTH_HOOKS = """
+defaults:
+  onFailure:
+    report:
+      webhook:
+        url:
+          value: https://example.invalid/failed
+  onSuccess:
+    report:
+      webhook:
+        url:
+          value: https://example.invalid/ok
+
+dags:
+  - name: d
+    tasks:
+      - id: t1
+        command: "true"
+"""
+
+
+async def test_finished_dag_task_that_skipped_reports_nothing():
+    cron = Cron(None, config_yaml=_DAG_WITH_BOTH_HOOKS)
+    job = _task_job(cron, retcode=99)
+    job.skip_exit_codes = (99,)
+    assert job.skipped and not job.failed
+    await cron._handle_finished_dag_task(job)
+    assert cron._completion_tasks == set()
+    # the same exit code with no skip code listed is an ordinary failure
+    job = _task_job(cron, retcode=99)
+    calls = []
+
+    async def record_failure():
+        calls.append("failure")
+
+    job.report_failure = record_failure
+    await cron._handle_finished_dag_task(job)
+    await cron._drain_completions()
+    assert calls == ["failure"]
+
+
+def test_running_job_skips_only_on_its_own_listed_exit():
+    cron = Cron(None, config_yaml=_DAG_WITH_BOTH_HOOKS)
+    job = _task_job(cron, retcode=99)
+    # no codes: the exit is whatever failsWhen says
+    assert not job.skipped
+    assert job.fail_reason == "command exited with code 99"
+    job.skip_exit_codes = (3, 99)
+    assert job.skipped and job.fail_reason is None
+    # the skip is decided ahead of failsWhen
+    job.config.failsWhen = dict(job.config.failsWhen, always=True)
+    assert job.skipped and job.fail_reason is None
+    job.config.failsWhen = dict(job.config.failsWhen, always=False)
+    # an unlisted code, a clean exit, and a timeout are not skips
+    for retcode in (98, 0, -100, None):
+        job.retcode = retcode
+        assert not job.skipped
+    # a run the daemon terminated never skips, whatever code it left
+    job.retcode = 99
+    job._terminated = True
+    assert not job.skipped
+    assert job.fail_reason == "command exited with code 99"
+    job._terminated = False
+    # nor does a command that never started (the conventional 127)
+    job.skip_exit_codes = (127,)
+    job.retcode = 127
+    assert job.skipped
+    job.start_failed = True
+    assert not job.skipped

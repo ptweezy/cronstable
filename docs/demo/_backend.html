@@ -228,7 +228,9 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     J("platform-pulse-counter", "*/3 * * * *", { p: LD, o: "meridian-g", cmd: 'cronstable kv incr pulse-count --scope global' }),
     // manual / on-demand (never fire on their own)
     J("run-schema-migration", "0 0 1 1 *", { p: LD, manual: 1, cmd: 'echo "run-schema-migration (manual only)"' }),
-    J("reindex-search", "0 0 1 1 *", { p: LD, manual: 1, cmd: 'echo "reindex-search (manual only)"' }),
+    J("reindex-search", "0 0 1 1 *", { p: LD, manual: 1, cmd: 'echo "reindex-search $CRONSTABLE_PARAM_INDEX (manual only)"',
+      params: [{ name: "index", type: "string", default: "products", allowed: ["products", "orders", "all"], description: "Index to rebuild" },
+               { name: "full", type: "boolean", default: false }] }),
     // disabled
     J("legacy-nightly-sync", "0 1 * * *", { p: LD, o: "meridian-a", disabled: 1, cmd: 'echo "legacy-nightly-sync is retired; flip enabled to true to schedule"' }),
     // legacy crontab file
@@ -269,6 +271,7 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     var d = { name: job.name, enabled: !job.disabled, schedule: job.schedule, command: job.cmd,
       captureStdout: !job.cap0, captureStderr: !job.cap0, utc: job.tz !== "local", timezone: job.tz && job.tz !== "local" ? job.tz : null,
       running: false, pids: [], scheduled_in: null, last_run: null, history: [], paused: null };
+    if (job.params) d.params = job.params;
     // runtime pause: a user action (OVERLAY, including an explicit resume as
     // null) wins over the roster fixture's standing maintenance pause. The
     // fixture anchors on the hour so its record (and the render signatures
@@ -455,7 +458,11 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     "release-train": { enabled: true, schedule: null, retainRuns: 20,
       tasks: [task("build"), task("approve", "approval", ["build"]), task("canary", "sensor", ["build"]), task("publish", "task", ["approve", "canary"], "all_done")] },
     "hotfix-release": { enabled: true, schedule: null, retainRuns: 20,
-      tasks: [task("build-hotfix"), task("approve", "approval", ["build-hotfix"]), task("deploy", "task", ["approve"])] },
+      params: [{ name: "target", type: "string", default: "staging", allowed: ["staging", "prod"], description: "Environment to deploy to" },
+               { name: "batch_size", type: "integer", default: 500, minimum: 1, maximum: 10000 },
+               { name: "dry_run", type: "boolean", default: false }],
+      tasks: [task("build-hotfix"), task("approve", "approval", ["build-hotfix"]),
+              Object.assign(task("deploy", "task", ["approve"]), { when: [{ param: "dry_run", equals: false }] })] },
     "nightly-close": { enabled: true, schedule: "0 1 * * *", retainRuns: 20, tz: "America/New_York",
       tasks: [task("freeze-ledgers"), task("post-journals", "task", ["freeze-ledgers"]), task("close-books", "task", ["post-journals"])] },
   };
@@ -487,6 +494,7 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     return DAG_ORDER.map(function (name) {
       var def = DAGS[name], runs = dagRuns(name), d = { name: name, enabled: def.enabled, scheduled: !!def.schedule, retainRuns: def.retainRuns, tasks: def.tasks };
       if (def.schedule) d.schedule = def.schedule;
+      if (def.params) d.params = def.params;
       if (runs.length) {
         var lr = runs[0], counts = {}; runs.forEach(function (r) { counts[r.state] = (counts[r.state] || 0) + 1; });
         d.latestRun = { runKey: lr.runKey, state: lr.state, kind: lr.kind, createdAt: lr.createdAt, updatedAt: lr.updatedAt };
@@ -632,7 +640,28 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     var t = nowMs() - 30000, rk = "manual-0ea2f0a42037";
     OVERLAY.dagRuns.push(makeManualRun("release-train", rk, t, "awaiting"));
   }
-  function makeManualRun(dag, rk, t, mode) {
+  // the map a run stores: the declared defaults under the supplied values
+  function resolveParams(def, supplied) {
+    if (!def.params) return null;
+    var out = {};
+    def.params.forEach(function (p) { out[p.name] = supplied && supplied[p.name] !== undefined ? supplied[p.name] : p.default; });
+    return out;
+  }
+  // the first when: comparison a run's parameters do not meet, worded as the
+  // daemon words a skipReason detail; "" when every comparison holds
+  function whenUnmet(tk, params) {
+    var hit = "";
+    (tk.when || []).forEach(function (c) {
+      if (hit || !c.param) return;
+      var op = ["equals", "notEquals", "in", "notIn"].filter(function (k) { return c[k] !== undefined; })[0];
+      var want = [].concat(c[op]), have = (params || {})[c.param];
+      if ((want.indexOf(have) >= 0) !== (op === "equals" || op === "in")) {
+        hit = "param " + c.param + " " + op + " " + want.join(", ") + ": the value is " + have;
+      }
+    });
+    return hit;
+  }
+  function makeManualRun(dag, rk, t, mode, params) {
     var def = DAGS[dag];
     var rec = { dag: dag, runKey: rk, createdAt: t, kind: "manual", _mode: mode, _decision: null };
     rec.doc = function () {
@@ -646,7 +675,9 @@ window.CRONSTABLE_BRAND = "cronstable demo";
           else { state = "running"; started = t / 1000 + 6; extra.awaitingApproval = true; extra.approval = null; }
         } else if (tk.type === "sensor") { state = rec._decision ? "success" : "running"; started = t / 1000 + 6; if (state === "running") { extra.pokeCount = Math.floor(el / 10); extra.nextPokeAt = now / 1000 + 10; extra.firstPokeAt = t / 1000 + 6; } else fin = now / 1000; }
         else { // publish / deploy — waits on approval
-          if (rec._decision === "approve") { state = el > 20 ? "success" : "running"; started = now / 1000 - 2; if (state === "success") fin = now / 1000; }
+          var unmet = whenUnmet(tk, params);
+          if (rec._decision === "approve" && unmet) { state = "skipped"; fin = now / 1000; extra.skipReason = { kind: "condition", detail: unmet }; }
+          else if (rec._decision === "approve") { state = el > 20 ? "success" : "running"; started = now / 1000 - 2; if (state === "success") fin = now / 1000; if (tk.when) extra.whenMet = true; }
           else if (rec._decision === "reject") { state = "upstream_failed"; }
           else state = "pending";
         }
@@ -654,8 +685,11 @@ window.CRONSTABLE_BRAND = "cronstable demo";
           startedAt: started, finishedAt: fin, exitCode: state === "success" ? 0 : null, failReason: null, resources: null, updatedAt: now / 1000 }, extra);
       });
       var over = def.tasks.every(function (tk) { return ["success", "skipped", "failed", "upstream_failed"].indexOf(tasks[tk.id].state) >= 0; });
-      return { dag: dag, runKey: rk, runId: "01JZ" + Math.floor(hash(dag + rk) * 1e6).toString(36).toUpperCase(), logicalDate: null, kind: "manual",
-        state: over ? (rec._decision === "reject" && def === DAGS["hotfix-release"] ? "failed" : "success") : "running", createdAt: t / 1000, updatedAt: now / 1000, mapped: {}, tasks: tasks };
+      var doc = { dag: dag, runKey: rk, runId: "01JZ" + Math.floor(hash(dag + rk) * 1e6).toString(36).toUpperCase(), logicalDate: null, kind: "manual",
+        state: over ? (rec._decision === "reject" && def === DAGS["hotfix-release"] ? "failed" : "success") : "running", createdAt: t / 1000, updatedAt: now / 1000, mapped: {}, tasks: tasks,
+        triggeredBy: "authToken" };
+      if (params) { doc.engine = 2; doc.params = params; }
+      return doc;
     };
     return rec;
   }
@@ -845,7 +879,10 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     if ((m = /^\/jobs\/([^/]+)\/runs$/.exec(url))) { var r = buildJobRuns(decodeURIComponent(m[1])); return r ? J200(r) : E(404, "unknown job"); }
     if ((m = /^\/jobs\/([^/]+)\/resources$/.exec(url))) { var rr = buildResources(decodeURIComponent(m[1])); return rr ? J200(rr) : E(404, "unknown job"); }
     if ((m = /^\/jobs\/([^/]+)\/trends$/.exec(url))) { var tr = buildTrends(decodeURIComponent(m[1])); return tr ? J200(tr) : E(404, "unknown job"); }
-    if ((m = /^\/jobs\/([^/]+)\/start$/.exec(url)) && method === "POST") { var jn = decodeURIComponent(m[1]); var jb = BYNAME[jn]; if (!jb) return E(404); if (jb.disabled) return E(409, "job is disabled"); OVERLAY.started[jn] = { at: nowMs(), dur: (jb.run || 3) * 1000 }; return E(200); }
+    if ((m = /^\/jobs\/([^/]+)\/start$/.exec(url)) && method === "POST") { var jn = decodeURIComponent(m[1]); var jb = BYNAME[jn]; if (!jb) return E(404); if (jb.disabled) return E(409, "job is disabled"); OVERLAY.started[jn] = { at: nowMs(), dur: (jb.run || 3) * 1000 };
+      if (!jb.params) return E(200);
+      var sb; try { sb = JSON.parse(opts && opts.body || "{}"); } catch (e) { sb = {}; }
+      return J200({ started: jn, params: resolveParams(jb, sb.params) }); }
     if ((m = /^\/jobs\/([^/]+)\/cancel$/.exec(url)) && method === "POST") { return BYNAME[decodeURIComponent(m[1])] ? E(200) : E(404); }
     if ((m = /^\/jobs\/([^/]+)\/pause$/.exec(url)) && method === "POST") {
       var pn = decodeURIComponent(m[1]); if (!BYNAME[pn]) return E(404);
@@ -892,10 +929,10 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     if ((m = /^\/dags\/([^/]+)\/runs\/([^/]+)\/xcom$/.exec(url))) return J200(buildXcom(decodeURIComponent(m[1]), decodeURIComponent(m[2])));
     if ((m = /^\/dags\/([^/]+)\/runs\/([^/]+)$/.exec(url))) { var doc = buildDagRun(decodeURIComponent(m[1]), decodeURIComponent(m[2])); return doc ? J200(doc) : E(404); }
     if ((m = /^\/dags\/([^/]+)\/runs$/.exec(url))) { var dr = buildDagRuns(decodeURIComponent(m[1]), qs.limit ? parseInt(qs.limit, 10) : 50); return dr ? J200(dr) : E(404); }
-    if ((m = /^\/dags\/([^/]+)\/trigger$/.exec(url)) && method === "POST") { var dg = decodeURIComponent(m[1]); if (!DAGS[dg]) return E(404); var k = "manual-" + Math.floor(hash(dg + nowMs()) * 0xffffffffff).toString(16).slice(0, 12); OVERLAY.dagRuns.push(makeManualRun(dg, k, nowMs(), DAGS[dg].tasks.some(function (t) { return t.type === "approval"; }) ? "awaiting" : "run")); return J200({ dag: dg, runKey: k }); }
-    if ((m = /^\/dags\/([^/]+)\/backfill$/.exec(url)) && method === "POST") { var db = decodeURIComponent(m[1]); if (!DAGS[db] || !DAGS[db].schedule) return E(400, "unschedulable dag"); var b; try { b = JSON.parse(opts && opts.body || "{}"); } catch (e) { b = {}; } if (typeof b.from !== "string" || typeof b.to !== "string") return E(400, "from/to required"); var created = prevFires(DAGS[db].schedule, Date.parse(b.to), 200, Date.parse(b.from)).length; return J200({ ok: true, created: created }); }
+    if ((m = /^\/dags\/([^/]+)\/trigger$/.exec(url)) && method === "POST") { var dg = decodeURIComponent(m[1]); if (!DAGS[dg]) return E(404); var tb; try { tb = JSON.parse(opts && opts.body || "{}"); } catch (e) { tb = {}; } var rp = resolveParams(DAGS[dg], tb.params); var k = "manual-" + Math.floor(hash(dg + nowMs()) * 0xffffffffff).toString(16).slice(0, 12); OVERLAY.dagRuns.push(makeManualRun(dg, k, nowMs(), DAGS[dg].tasks.some(function (t) { return t.type === "approval"; }) ? "awaiting" : "run", rp)); var tr = { dag: dg, name: dg, runKey: k, created: true }; if (rp) tr.params = rp; return J200(tr); }
+    if ((m = /^\/dags\/([^/]+)\/backfill$/.exec(url)) && method === "POST") { var db = decodeURIComponent(m[1]); if (!DAGS[db] || !DAGS[db].schedule) return E(400, "unschedulable dag"); var b; try { b = JSON.parse(opts && opts.body || "{}"); } catch (e) { b = {}; } if (typeof b.from !== "string" || typeof b.to !== "string") return E(400, "from/to required"); var created = prevFires(DAGS[db].schedule, Date.parse(b.to), 200, Date.parse(b.from)).length; return J200({ ok: true, created: created, existing: 0 }); }
 
-    if (url === "/whoami") return J200({ authenticated: true, label: "authToken", scopes: ["view", "control", "approve"], allScopes: true });
+    if (url === "/whoami") return J200({ authenticated: true, label: "authToken", scopes: ["view", "control", "approve", "params"], allScopes: true });
     if (url === "/push/devices" && method === "GET") return J200({ devices: [{ id: "a1b2c3d4e5f60718", name: "Parker's iPhone", platform: "ios", publicKey: "(demo)", pushToken: "…4Q9zXk", createdAt: "2026-07-20T14:02:11+00:00", createdBy: "authToken" }] });
     if (url === "/push/devices" && method === "POST") { var dv; try { dv = JSON.parse(opts && opts.body || "{}"); } catch (e) { dv = {}; } return J200({ device: { id: "ffeeddccbbaa9988", name: dv.name || "device", platform: dv.platform || "ios", publicKey: "(demo)", pushToken: "…demo42", createdAt: "2026-07-23T00:00:00+00:00", createdBy: "authToken" }, created: true }); }
     if ((m = /^\/push\/devices\/([^/]+)\/test$/.exec(url)) && method === "POST") return J200({ device: decodeURIComponent(m[1]), status: 200, error: null });

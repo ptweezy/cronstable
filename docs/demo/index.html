@@ -826,6 +826,17 @@
   .modal input:focus { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 2px var(--selbg); }
   .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 
+  /* ---------- run-parameters modal ---------- */
+  .paramfields { display: grid; gap: 12px; max-height: 56vh; overflow: auto; padding: 2px; }
+  .paramfield label { display: block; font-size: 12px; margin-bottom: 4px; }
+  .paramfield select {
+    width: 100%; padding: 8px 10px; border-radius: var(--radius); border: 1px solid var(--border2);
+    background: var(--bg2); color: var(--fg);
+  }
+  .paramfield .phint { color: var(--fg-dim); font-size: 11px; margin-top: 3px; overflow-wrap: anywhere; }
+  .paramfield .perr, #paramError { color: var(--fail); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
+  .paramfield .perr:empty, #paramError:empty { display: none; }
+
   /* ---------- pair-a-device modal ---------- */
   /* the QR itself is deliberately theme-independent: dark modules on a
      light tile scan reliably whatever the dashboard theme */
@@ -1459,6 +1470,7 @@
   .daggraph .edge { stroke: var(--border2); stroke-width: 1.4; fill: none; }
   .daggraph .node { cursor: pointer; }
   .daggraph .node rect { stroke-width: 1.5; }
+  .daggraph .node .when { fill: var(--panel); stroke-width: 1.5; }
   .daggraph .node:hover rect { filter: brightness(1.25); }
 
   /* XCom viewer */
@@ -1752,6 +1764,7 @@
       </button>
     </div>
     <div class="meta" id="dgMeta"></div>
+    <div class="meta" id="dgParams" style="display:none"></div>
     <div id="dgBackfill" style="display:none; margin-top:8px; gap:6px; align-items:center;" class="approw">
       <span class="faint">backfill</span>
       <input type="text" id="dgBfFrom" placeholder="from ISO (2026-07-01T00:00:00)" style="width:220px" autocomplete="off" spellcheck="false">
@@ -1925,6 +1938,24 @@
       <button class="btn" id="pairCopy" style="margin-right:auto">Copy</button>
       <button class="btn primary" id="pairClose">Close</button>
     </div>
+  </div>
+</div>
+
+<!-- run-parameters modal: the trigger and the backfill of a workflow that
+     declares params. BEFORE the token modal for the reason the pair modal
+     gives: its submit is where a stale token 401s. -->
+<div class="overlay" id="paramWrap">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="paramTitle" aria-describedby="paramMsg">
+    <h3 id="paramTitle">Run workflow</h3>
+    <p id="paramMsg"></p>
+    <form id="paramForm" autocomplete="off">
+      <div class="paramfields" id="paramFields"></div>
+      <div id="paramError" role="alert"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="paramCancel">Cancel</button>
+        <button type="submit" class="btn primary" id="paramGo">Run</button>
+      </div>
+    </form>
   </div>
 </div>
 
@@ -2252,7 +2283,9 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     J("platform-pulse-counter", "*/3 * * * *", { p: LD, o: "meridian-g", cmd: 'cronstable kv incr pulse-count --scope global' }),
     // manual / on-demand (never fire on their own)
     J("run-schema-migration", "0 0 1 1 *", { p: LD, manual: 1, cmd: 'echo "run-schema-migration (manual only)"' }),
-    J("reindex-search", "0 0 1 1 *", { p: LD, manual: 1, cmd: 'echo "reindex-search (manual only)"' }),
+    J("reindex-search", "0 0 1 1 *", { p: LD, manual: 1, cmd: 'echo "reindex-search $CRONSTABLE_PARAM_INDEX (manual only)"',
+      params: [{ name: "index", type: "string", default: "products", allowed: ["products", "orders", "all"], description: "Index to rebuild" },
+               { name: "full", type: "boolean", default: false }] }),
     // disabled
     J("legacy-nightly-sync", "0 1 * * *", { p: LD, o: "meridian-a", disabled: 1, cmd: 'echo "legacy-nightly-sync is retired; flip enabled to true to schedule"' }),
     // legacy crontab file
@@ -2293,6 +2326,7 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     var d = { name: job.name, enabled: !job.disabled, schedule: job.schedule, command: job.cmd,
       captureStdout: !job.cap0, captureStderr: !job.cap0, utc: job.tz !== "local", timezone: job.tz && job.tz !== "local" ? job.tz : null,
       running: false, pids: [], scheduled_in: null, last_run: null, history: [], paused: null };
+    if (job.params) d.params = job.params;
     // runtime pause: a user action (OVERLAY, including an explicit resume as
     // null) wins over the roster fixture's standing maintenance pause. The
     // fixture anchors on the hour so its record (and the render signatures
@@ -2479,7 +2513,11 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     "release-train": { enabled: true, schedule: null, retainRuns: 20,
       tasks: [task("build"), task("approve", "approval", ["build"]), task("canary", "sensor", ["build"]), task("publish", "task", ["approve", "canary"], "all_done")] },
     "hotfix-release": { enabled: true, schedule: null, retainRuns: 20,
-      tasks: [task("build-hotfix"), task("approve", "approval", ["build-hotfix"]), task("deploy", "task", ["approve"])] },
+      params: [{ name: "target", type: "string", default: "staging", allowed: ["staging", "prod"], description: "Environment to deploy to" },
+               { name: "batch_size", type: "integer", default: 500, minimum: 1, maximum: 10000 },
+               { name: "dry_run", type: "boolean", default: false }],
+      tasks: [task("build-hotfix"), task("approve", "approval", ["build-hotfix"]),
+              Object.assign(task("deploy", "task", ["approve"]), { when: [{ param: "dry_run", equals: false }] })] },
     "nightly-close": { enabled: true, schedule: "0 1 * * *", retainRuns: 20, tz: "America/New_York",
       tasks: [task("freeze-ledgers"), task("post-journals", "task", ["freeze-ledgers"]), task("close-books", "task", ["post-journals"])] },
   };
@@ -2511,6 +2549,7 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     return DAG_ORDER.map(function (name) {
       var def = DAGS[name], runs = dagRuns(name), d = { name: name, enabled: def.enabled, scheduled: !!def.schedule, retainRuns: def.retainRuns, tasks: def.tasks };
       if (def.schedule) d.schedule = def.schedule;
+      if (def.params) d.params = def.params;
       if (runs.length) {
         var lr = runs[0], counts = {}; runs.forEach(function (r) { counts[r.state] = (counts[r.state] || 0) + 1; });
         d.latestRun = { runKey: lr.runKey, state: lr.state, kind: lr.kind, createdAt: lr.createdAt, updatedAt: lr.updatedAt };
@@ -2656,7 +2695,28 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     var t = nowMs() - 30000, rk = "manual-0ea2f0a42037";
     OVERLAY.dagRuns.push(makeManualRun("release-train", rk, t, "awaiting"));
   }
-  function makeManualRun(dag, rk, t, mode) {
+  // the map a run stores: the declared defaults under the supplied values
+  function resolveParams(def, supplied) {
+    if (!def.params) return null;
+    var out = {};
+    def.params.forEach(function (p) { out[p.name] = supplied && supplied[p.name] !== undefined ? supplied[p.name] : p.default; });
+    return out;
+  }
+  // the first when: comparison a run's parameters do not meet, worded as the
+  // daemon words a skipReason detail; "" when every comparison holds
+  function whenUnmet(tk, params) {
+    var hit = "";
+    (tk.when || []).forEach(function (c) {
+      if (hit || !c.param) return;
+      var op = ["equals", "notEquals", "in", "notIn"].filter(function (k) { return c[k] !== undefined; })[0];
+      var want = [].concat(c[op]), have = (params || {})[c.param];
+      if ((want.indexOf(have) >= 0) !== (op === "equals" || op === "in")) {
+        hit = "param " + c.param + " " + op + " " + want.join(", ") + ": the value is " + have;
+      }
+    });
+    return hit;
+  }
+  function makeManualRun(dag, rk, t, mode, params) {
     var def = DAGS[dag];
     var rec = { dag: dag, runKey: rk, createdAt: t, kind: "manual", _mode: mode, _decision: null };
     rec.doc = function () {
@@ -2670,7 +2730,9 @@ window.CRONSTABLE_BRAND = "cronstable demo";
           else { state = "running"; started = t / 1000 + 6; extra.awaitingApproval = true; extra.approval = null; }
         } else if (tk.type === "sensor") { state = rec._decision ? "success" : "running"; started = t / 1000 + 6; if (state === "running") { extra.pokeCount = Math.floor(el / 10); extra.nextPokeAt = now / 1000 + 10; extra.firstPokeAt = t / 1000 + 6; } else fin = now / 1000; }
         else { // publish / deploy — waits on approval
-          if (rec._decision === "approve") { state = el > 20 ? "success" : "running"; started = now / 1000 - 2; if (state === "success") fin = now / 1000; }
+          var unmet = whenUnmet(tk, params);
+          if (rec._decision === "approve" && unmet) { state = "skipped"; fin = now / 1000; extra.skipReason = { kind: "condition", detail: unmet }; }
+          else if (rec._decision === "approve") { state = el > 20 ? "success" : "running"; started = now / 1000 - 2; if (state === "success") fin = now / 1000; if (tk.when) extra.whenMet = true; }
           else if (rec._decision === "reject") { state = "upstream_failed"; }
           else state = "pending";
         }
@@ -2678,8 +2740,11 @@ window.CRONSTABLE_BRAND = "cronstable demo";
           startedAt: started, finishedAt: fin, exitCode: state === "success" ? 0 : null, failReason: null, resources: null, updatedAt: now / 1000 }, extra);
       });
       var over = def.tasks.every(function (tk) { return ["success", "skipped", "failed", "upstream_failed"].indexOf(tasks[tk.id].state) >= 0; });
-      return { dag: dag, runKey: rk, runId: "01JZ" + Math.floor(hash(dag + rk) * 1e6).toString(36).toUpperCase(), logicalDate: null, kind: "manual",
-        state: over ? (rec._decision === "reject" && def === DAGS["hotfix-release"] ? "failed" : "success") : "running", createdAt: t / 1000, updatedAt: now / 1000, mapped: {}, tasks: tasks };
+      var doc = { dag: dag, runKey: rk, runId: "01JZ" + Math.floor(hash(dag + rk) * 1e6).toString(36).toUpperCase(), logicalDate: null, kind: "manual",
+        state: over ? (rec._decision === "reject" && def === DAGS["hotfix-release"] ? "failed" : "success") : "running", createdAt: t / 1000, updatedAt: now / 1000, mapped: {}, tasks: tasks,
+        triggeredBy: "authToken" };
+      if (params) { doc.engine = 2; doc.params = params; }
+      return doc;
     };
     return rec;
   }
@@ -2869,7 +2934,10 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     if ((m = /^\/jobs\/([^/]+)\/runs$/.exec(url))) { var r = buildJobRuns(decodeURIComponent(m[1])); return r ? J200(r) : E(404, "unknown job"); }
     if ((m = /^\/jobs\/([^/]+)\/resources$/.exec(url))) { var rr = buildResources(decodeURIComponent(m[1])); return rr ? J200(rr) : E(404, "unknown job"); }
     if ((m = /^\/jobs\/([^/]+)\/trends$/.exec(url))) { var tr = buildTrends(decodeURIComponent(m[1])); return tr ? J200(tr) : E(404, "unknown job"); }
-    if ((m = /^\/jobs\/([^/]+)\/start$/.exec(url)) && method === "POST") { var jn = decodeURIComponent(m[1]); var jb = BYNAME[jn]; if (!jb) return E(404); if (jb.disabled) return E(409, "job is disabled"); OVERLAY.started[jn] = { at: nowMs(), dur: (jb.run || 3) * 1000 }; return E(200); }
+    if ((m = /^\/jobs\/([^/]+)\/start$/.exec(url)) && method === "POST") { var jn = decodeURIComponent(m[1]); var jb = BYNAME[jn]; if (!jb) return E(404); if (jb.disabled) return E(409, "job is disabled"); OVERLAY.started[jn] = { at: nowMs(), dur: (jb.run || 3) * 1000 };
+      if (!jb.params) return E(200);
+      var sb; try { sb = JSON.parse(opts && opts.body || "{}"); } catch (e) { sb = {}; }
+      return J200({ started: jn, params: resolveParams(jb, sb.params) }); }
     if ((m = /^\/jobs\/([^/]+)\/cancel$/.exec(url)) && method === "POST") { return BYNAME[decodeURIComponent(m[1])] ? E(200) : E(404); }
     if ((m = /^\/jobs\/([^/]+)\/pause$/.exec(url)) && method === "POST") {
       var pn = decodeURIComponent(m[1]); if (!BYNAME[pn]) return E(404);
@@ -2916,10 +2984,10 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     if ((m = /^\/dags\/([^/]+)\/runs\/([^/]+)\/xcom$/.exec(url))) return J200(buildXcom(decodeURIComponent(m[1]), decodeURIComponent(m[2])));
     if ((m = /^\/dags\/([^/]+)\/runs\/([^/]+)$/.exec(url))) { var doc = buildDagRun(decodeURIComponent(m[1]), decodeURIComponent(m[2])); return doc ? J200(doc) : E(404); }
     if ((m = /^\/dags\/([^/]+)\/runs$/.exec(url))) { var dr = buildDagRuns(decodeURIComponent(m[1]), qs.limit ? parseInt(qs.limit, 10) : 50); return dr ? J200(dr) : E(404); }
-    if ((m = /^\/dags\/([^/]+)\/trigger$/.exec(url)) && method === "POST") { var dg = decodeURIComponent(m[1]); if (!DAGS[dg]) return E(404); var k = "manual-" + Math.floor(hash(dg + nowMs()) * 0xffffffffff).toString(16).slice(0, 12); OVERLAY.dagRuns.push(makeManualRun(dg, k, nowMs(), DAGS[dg].tasks.some(function (t) { return t.type === "approval"; }) ? "awaiting" : "run")); return J200({ dag: dg, runKey: k }); }
-    if ((m = /^\/dags\/([^/]+)\/backfill$/.exec(url)) && method === "POST") { var db = decodeURIComponent(m[1]); if (!DAGS[db] || !DAGS[db].schedule) return E(400, "unschedulable dag"); var b; try { b = JSON.parse(opts && opts.body || "{}"); } catch (e) { b = {}; } if (typeof b.from !== "string" || typeof b.to !== "string") return E(400, "from/to required"); var created = prevFires(DAGS[db].schedule, Date.parse(b.to), 200, Date.parse(b.from)).length; return J200({ ok: true, created: created }); }
+    if ((m = /^\/dags\/([^/]+)\/trigger$/.exec(url)) && method === "POST") { var dg = decodeURIComponent(m[1]); if (!DAGS[dg]) return E(404); var tb; try { tb = JSON.parse(opts && opts.body || "{}"); } catch (e) { tb = {}; } var rp = resolveParams(DAGS[dg], tb.params); var k = "manual-" + Math.floor(hash(dg + nowMs()) * 0xffffffffff).toString(16).slice(0, 12); OVERLAY.dagRuns.push(makeManualRun(dg, k, nowMs(), DAGS[dg].tasks.some(function (t) { return t.type === "approval"; }) ? "awaiting" : "run", rp)); var tr = { dag: dg, name: dg, runKey: k, created: true }; if (rp) tr.params = rp; return J200(tr); }
+    if ((m = /^\/dags\/([^/]+)\/backfill$/.exec(url)) && method === "POST") { var db = decodeURIComponent(m[1]); if (!DAGS[db] || !DAGS[db].schedule) return E(400, "unschedulable dag"); var b; try { b = JSON.parse(opts && opts.body || "{}"); } catch (e) { b = {}; } if (typeof b.from !== "string" || typeof b.to !== "string") return E(400, "from/to required"); var created = prevFires(DAGS[db].schedule, Date.parse(b.to), 200, Date.parse(b.from)).length; return J200({ ok: true, created: created, existing: 0 }); }
 
-    if (url === "/whoami") return J200({ authenticated: true, label: "authToken", scopes: ["view", "control", "approve"], allScopes: true });
+    if (url === "/whoami") return J200({ authenticated: true, label: "authToken", scopes: ["view", "control", "approve", "params"], allScopes: true });
     if (url === "/push/devices" && method === "GET") return J200({ devices: [{ id: "a1b2c3d4e5f60718", name: "Parker's iPhone", platform: "ios", publicKey: "(demo)", pushToken: "…4Q9zXk", createdAt: "2026-07-20T14:02:11+00:00", createdBy: "authToken" }] });
     if (url === "/push/devices" && method === "POST") { var dv; try { dv = JSON.parse(opts && opts.body || "{}"); } catch (e) { dv = {}; } return J200({ device: { id: "ffeeddccbbaa9988", name: dv.name || "device", platform: dv.platform || "ios", publicKey: "(demo)", pushToken: "…demo42", createdAt: "2026-07-23T00:00:00+00:00", createdBy: "authToken" }, created: true }); }
     if ((m = /^\/push\/devices\/([^/]+)\/test$/.exec(url)) && method === "POST") return J200({ device: decodeURIComponent(m[1]), status: 200, error: null });
@@ -6305,6 +6373,7 @@ var qrcode = function() {
     seenFirst: false,
     connected: true,
     auth: null,                // /whoami payload; null until the probe resolves (scope-aware chrome)
+    paramForm: null,           // the open run-parameters dialog: { dag, decl, backfill }
     clusterNode: null,         // this node's name (from /cluster), for owner self-highlight
     clusterSpread: false,      // distribution: spread is active (drives the Owner column)
     palette: { open: false, items: [], cur: 0 },
@@ -6367,6 +6436,8 @@ var qrcode = function() {
   }
   const canControl = () => canScope("control");
   const canApprove = () => canScope("approve");
+  // choosing run parameter values; without it a run uses the declared defaults
+  const canParams = () => canScope("params");
   // A public-view instance: no token stored, and the daemon answered the
   // credential-less /whoami with a restricted anonymous grant.
   function publicView() {
@@ -9058,17 +9129,34 @@ var qrcode = function() {
     state.seenFirst = true;
   }
 
-  async function runJob(name) {
+  // Start a job. One that declares `params` opens the parameter dialog
+  // first, for a token that may choose values. `defaults` skips the dialog
+  // and starts the run with the declared defaults, which is what a bulk
+  // action wants.
+  async function runJob(name, defaults) {
+    if (!defaults && jobParamDecl(name).length && canParams()) { openParamForm(name, null, true); return; }
+    await postJobStart(name, null);
+  }
+  // POST the start. Resolves true on success, null after a failure it has
+  // already reported, and the error body for refused parameters, which the
+  // dialog shows under its fields.
+  async function postJobStart(name, params) {
     try {
-      const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/start", { method: "POST" });
+      const opts = { method: "POST" };
+      if (params) { opts.headers = { "Content-Type": "application/json" }; opts.body = JSON.stringify({ params: params }); }
+      const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/start", opts);
       if (res.ok) {
         toast("ok", (res.status === 202 ? "Queued " : "▶ started ") + name);
         if (res.status === 202) loadPools();
         if (res.status !== 202 && state.drawerJob === name) setTimeout(() => startStream(name, true), 250);
         setTimeout(loadJobs, 300);
-      } else if (res.status === 409) { const error = await res.json(); toast("err", error.error || "Job could not be queued"); }
+        return true;
+      }
+      if (params && (res.status === 400 || res.status === 403)) return await errorBody(res);
+      if (res.status === 409) { const error = await res.json(); toast("err", error.error || "Job could not be queued"); }
       else { toast("err", "could not start (HTTP " + res.status + ")"); }
     } catch (e) { if (e.message !== "unauthorized") toast("err", "could not start " + name); }
+    return null;
   }
   async function cancelJob(name) {
     try {
@@ -9097,7 +9185,7 @@ var qrcode = function() {
   function runAllFailing() {
     const failing = state.jobs.filter((j) => health(j).key === "fail" && j.enabled);
     if (!failing.length) { toast("info", "no failing jobs"); return; }
-    failing.forEach((j) => runJob(j.name));
+    failing.forEach((j) => runJob(j.name, true));
     toast("info", "restarting " + failing.length + " failing job" + (failing.length > 1 ? "s" : ""));
   }
 
@@ -9273,7 +9361,8 @@ var qrcode = function() {
         "<td>" + fmtDuration(r.duration) + "</td>" +
         (hasRes ? "<td>" + (r.resources ? fmtDuration(r.resources.cpu_total_seconds) : "—") + "</td>" +
                   "<td>" + (r.resources ? fmtBytes(r.resources.max_rss_bytes) : "—") + "</td>" : "") +
-        '<td class="reason">' + esc(r.fail_reason || "") + verificationDetail(r.verification) + "</td>" +
+        '<td class="reason">' + esc(r.fail_reason || "") + verificationDetail(r.verification) +
+          (r.params ? ' <span class="faint runparams" title="' + escAttr(paramsText(r.params)) + '">' + esc(truncStr(paramsText(r.params), 60)) + "</span>" : "") + "</td>" +
       "</tr>";
     }
     const table = '<table class="runtable"><thead><tr><th>Outcome</th><th>Exit</th><th>Finished</th><th>Took</th>' +
@@ -10691,7 +10780,7 @@ var qrcode = function() {
   function anyOverlayOpen() {
     return state.palette.open || state.timeline.open || state.mitigate.open || state.sandbox.open || state.tail.open ||
       !!(state.dagDrawer && state.dagDrawer.dag) ||
-      ["settingsWrap", "helpWrap", "modalWrap", "pairWrap"].some((id) => $(id).classList.contains("open"));
+      ["settingsWrap", "helpWrap", "modalWrap", "pairWrap", "paramWrap"].some((id) => $(id).classList.contains("open"));
   }
   // ---- focus management (trap + restore) for modal surfaces ----
   function focusables(c) {
@@ -10702,6 +10791,7 @@ var qrcode = function() {
   // topmost open surface, in stacking order
   function activeSurface() {
     if ($("modalWrap").classList.contains("open")) return $("modalWrap");
+    if ($("paramWrap").classList.contains("open")) return $("paramWrap");
     if ($("settingsWrap").classList.contains("open")) return $("settingsWrap");
     if ($("helpWrap").classList.contains("open")) return $("helpWrap");
     if ($("pairWrap").classList.contains("open")) return $("pairWrap");
@@ -10825,6 +10915,7 @@ var qrcode = function() {
     if (e.key === "Escape") {
       if ($("colsMenu").classList.contains("open")) return toggleColsMenu(false);
       if ($("modalWrap").classList.contains("open")) return closeModal();
+      if ($("paramWrap").classList.contains("open")) return closeParamForm();
       if ($("settingsWrap").classList.contains("open")) return closeSettings();
       if ($("helpWrap").classList.contains("open")) return closeHelp();
       if ($("pairWrap").classList.contains("open")) return closePair();
@@ -10909,6 +11000,42 @@ var qrcode = function() {
       "</span>" + esc(DST_LABEL[s] || s || "?") + "</span>";
   }
   function truncStr(s, n) { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+  // a task's triggerRule as a short badge label; the default rule gets none.
+  // A rule this page does not know shows under its own name.
+  const RULE_LABEL = {
+    all_done: "all done", none_failed: "none failed",
+    none_failed_min_one_success: "1+ success", all_done_min_one_failed: "1+ failed",
+  };
+  function ruleLabel(spec) {
+    const rule = spec && spec.triggerRule;
+    return !rule || rule === "all_success" ? "" : (RULE_LABEL[rule] || rule.replace(/_/g, " "));
+  }
+  // a task's when: comparisons as one phrase, in the words the configuration
+  // uses: "param mode equals full; xcom extract/row_count notIn 0"
+  const WHEN_OPS = ["equals", "notEquals", "in", "notIn"];
+  function whenText(spec) {
+    return ((spec && spec.when) || []).map((c) => {
+      const src = c.xcom ? "xcom " + c.xcom.task + "/" + c.xcom.key : "param " + c.param;
+      const op = WHEN_OPS.find((k) => c[k] !== undefined) || "";
+      const want = c[op];
+      return src + " " + op + " " + (Array.isArray(want) ? want.join(", ") : String(want));
+    }).join("; ");
+  }
+  // why a task entry is skipped, from its skipReason ({kind, detail})
+  function skipReasonText(reason) {
+    if (!reason || !reason.detail) return "";
+    return reason.kind === "exit_code" ? "skipped itself, " + reason.detail : String(reason.detail);
+  }
+  // the reused tasks a recovery leaves skipped, each with its recorded reason
+  function recoverySkipsHtml(plan) {
+    const skips = plan.preservedSkipped || {};
+    const keys = Object.keys(skips).sort();
+    if (!keys.length) return "";
+    return '<p class="recskips">Stays skipped: ' + keys.map((k) => {
+      const why = skipReasonText(skips[k]);
+      return esc(k) + (why ? ' <span class="faint">(' + esc(why) + ")</span>" : "");
+    }).join(", ") + "</p>";
+  }
 
   // epoch-second time helpers (DAG timestamps are float epoch seconds; only
   // logicalDate is ISO). Reuse the ISO formatters via a conversion.
@@ -11118,7 +11245,15 @@ var qrcode = function() {
     if (run) {
       bits.push('<span class="kbadge">' + esc(run.kind || "?") + "</span>");
       if (run.createdAt) bits.push('<span>started <b data-ago-epoch="' + escAttr(run.createdAt) + '">' + agoEpoch(run.createdAt) + "</b></span>");
+      if (run.triggeredBy) bits.push("<span>by <b>" + esc(truncStr(run.triggeredBy, 40)) + "</b></span>");
     }
+    // the values the run stores; its tasks read exactly these
+    const runParams = run && run.params && typeof run.params === "object" ? Object.entries(run.params) : [];
+    $("dgParams").style.display = runParams.length ? "" : "none";
+    $("dgParams").innerHTML = runParams.length
+      ? '<span class="faint">parameters</span>' + runParams.map(([k, v]) =>
+          '<span title="' + escAttr(k + " = " + paramText(v)) + '">' + esc(k) + " <b>" + esc(truncStr(paramText(v), 48)) + "</b></span>").join("")
+      : "";
     if (run && run.recovery) {
       const recovery = run.recovery;
       bits.push('<a href="#" data-source-run="' + escAttr(recovery.sourceRunKey) + '">Source run</a>');
@@ -11317,6 +11452,9 @@ var qrcode = function() {
       bits.push('<span class="' + (recon ? "recon" : "faint") + '" title="' + escAttr(e.failReason) + '">' +
         (recon ? "⚠ " : "") + esc(truncStr(e.failReason, 48)) + "</span>");
     }
+    // a rejected gate already says who rejected it, in the approval bit above
+    const skipWhy = e.skipReason && e.skipReason.kind !== "approval" ? skipReasonText(e.skipReason) : "";
+    if (skipWhy) bits.push('<span class="faint skipwhy" title="' + escAttr(skipWhy) + '">' + esc(truncStr(skipWhy, 56)) + "</span>");
     // sampled CPU/peak-RSS, present only when the task ran with monitorResources
     if (e.resources) {
       bits.push('<span class="faint nowrap" title="' +
@@ -11345,8 +11483,15 @@ var qrcode = function() {
     const tcls = opts.inst ? "inst" : "";
     const typeBadge = (!opts.inst && spec && spec.type && spec.type !== "task")
       ? ' <span class="kbadge">' + esc(spec.type) + "</span>" : "";
+    const rule = opts.inst ? "" : ruleLabel(spec);
+    const ruleBadge = rule
+      ? ' <span class="kbadge rulebadge" title="' + escAttr("triggerRule: " + spec.triggerRule) + '">' + esc(rule) + "</span>" : "";
+    // the task runs only when its comparisons hold; the tooltip lists them
+    const when = opts.inst ? "" : whenText(spec);
+    const whenBadge = when
+      ? ' <span class="kbadge whenbadge" title="' + escAttr("when: " + when) + '">when</span>' : "";
     return '<tr class="' + (opts.isGroup ? "fanhead" : "") + '">' +
-      '<td class="' + tcls + '">' + label + typeBadge + "</td>" +
+      '<td class="' + tcls + '">' + label + typeBadge + ruleBadge + whenBadge + "</td>" +
       "<td>" + dstCell(st) + "</td>" +
       '<td class="muted">' + esc(attempt) + "</td>" +
       "<td>" + exit + "</td>" +
@@ -11443,11 +11588,26 @@ var qrcode = function() {
       const fill = st ? "color-mix(in srgb, var(--" + v + ") 22%, var(--panel))" : "var(--panel)";
       const stroke = "var(--" + v + ")";
       const glyph = st ? dstGlyph(st) : (t.type === "approval" ? "?" : t.type === "sensor" ? "⏲" : "·");
-      svg += '<g class="node" data-gtask="' + escAttr(t.id) + '"><title>' + escAttr(t.id + (st ? " · " + st : "") + (t.type !== "task" ? " (" + t.type + ")" : "")) + "</title>";
+      const rule = ruleLabel(t);
+      const when = whenText(t);
+      const skipWhy = run && st === "skipped" ? skipReasonText(((run.tasks || {})[t.id] || {}).skipReason) : "";
+      svg += '<g class="node" data-gtask="' + escAttr(t.id) + '"><title>' + escAttr(t.id + (st ? " · " + st : "") + (skipWhy ? " (" + skipWhy + ")" : "") +
+        (t.type !== "task" ? " (" + t.type + ")" : "") + (rule ? " · triggerRule: " + t.triggerRule : "") +
+        ((t.skipExitCodes || []).length ? " · skips on exit " + t.skipExitCodes.join(", ") : "") +
+        (when ? " · when: " + when : "")) + "</title>";
       svg += '<rect x="' + p.x + '" y="' + p.y + '" width="' + L.NW + '" height="' + L.NH + '" rx="3" style="fill:' + fill + ';stroke:' + stroke + '"/>';
       svg += '<text x="' + (p.x + 8) + '" y="' + (p.y + L.NH / 2 + 3.5) + '">' + esc(glyph + " " + truncStr(t.id, 17)) + "</text>";
       if (t.type !== "task") svg += '<text x="' + (p.x + L.NW - 6) + '" y="' + (p.y + 10) + '" text-anchor="end" style="fill:var(--fg-faint);font-size:8px">' + esc(t.type) + "</text>";
       if (t.mapped) svg += '<text x="' + (p.x + L.NW - 6) + '" y="' + (p.y + L.NH - 4) + '" text-anchor="end" style="fill:var(--fg-faint);font-size:8px">fan-out</text>';
+      // the rule badge takes the corner the type and fan-out labels leave
+      // free: a mapped task is always a plain task, so one always is
+      if (rule) svg += '<text class="rule" x="' + (p.x + L.NW - 6) + '" y="' + (t.type !== "task" ? p.y + L.NH - 4 : p.y + 10) + '" text-anchor="end" style="fill:var(--fg-faint);font-size:8px">' + esc(rule) + "</text>";
+      // a decision diamond where the edges enter a task that has when:
+      if (when) {
+        const cy = p.y + L.NH / 2;
+        svg += '<path class="when" d="M' + (p.x - 5) + " " + cy + " L" + p.x + " " + (cy - 5) + " L" + (p.x + 5) + " " + cy +
+          " L" + p.x + " " + (cy + 5) + 'Z" style="stroke:' + stroke + '"/>';
+      }
       svg += "</g>";
     });
     holder.innerHTML = svg + "</svg>";
@@ -11572,17 +11732,165 @@ var qrcode = function() {
       else toast("err", "decision failed (HTTP " + res.status + ")");
     } catch (e) { if (e.message !== "unauthorized") toast("err", "decision failed"); }
   }
+  // ---- run parameters ----
+  // A workflow's `params` declaration (GET /dags) drives one dialog, shared
+  // by the trigger and the backfill. A token without the `params` scope
+  // never sees it: its runs use the declared defaults, as the daemon
+  // enforces.
+  function dagParamDecl(name) {
+    const d = state.dags.byName[name];
+    return (d && d.params) || [];
+  }
+  // a job's declaration (GET /jobs), which opens the same dialog from Run
+  function jobParamDecl(name) {
+    const j = (state.byName || {})[name];
+    return (j && j.params) || [];
+  }
+  // a run's stored values as "name = value" text
+  function paramsText(params) {
+    return Object.entries(params || {}).map(([k, v]) => k + " = " + paramText(v)).join(", ");
+  }
+  // a value as a task reads it: text as it is, anything else as JSON text
+  function paramText(v) { return typeof v === "string" ? v : JSON.stringify(v); }
+  function recoveryParamsHtml(plan) {
+    const entries = Object.entries(plan.params || {});
+    if (!entries.length) return "";
+    return "<p>Parameters: " + esc(entries.map(([k, v]) => k + " = " + paramText(v)).join(", ")) + "</p>";
+  }
+  function paramFieldHtml(p, i) {
+    const id = "paramF" + i;
+    const def = p.required ? null : p.default;
+    let control;
+    if (p.type === "boolean") {
+      control = '<input type="checkbox" id="' + id + '"' + (def === true ? " checked" : "") + ">";
+    } else if (p.allowed && p.allowed.length) {
+      control = '<select id="' + id + '">' + (p.required ? '<option value="">choose…</option>' : "") +
+        p.allowed.map((v) => '<option value="' + escAttr(paramText(v)) + '"' + (!p.required && v === def ? " selected" : "") + ">" + esc(paramText(v)) + "</option>").join("") +
+        "</select>";
+    } else {
+      control = '<input type="text" id="' + id + '" value="' + escAttr(def == null ? "" : paramText(def)) + '"' +
+        (p.type === "string" ? "" : ' inputmode="' + (p.type === "integer" ? "numeric" : "decimal") + '"') +
+        (p.maxLength ? ' maxlength="' + escAttr(p.maxLength) + '"' : "") + ' autocomplete="off" spellcheck="false">';
+    }
+    const hints = [];
+    if (p.description) hints.push(p.description);
+    if (p.minimum != null && p.maximum != null) hints.push(p.minimum + " to " + p.maximum);
+    else if (p.minimum != null) hints.push("at least " + p.minimum);
+    else if (p.maximum != null) hints.push("at most " + p.maximum);
+    if (p.pattern) hints.push("matches " + p.pattern);
+    return '<div class="paramfield" data-param="' + escAttr(p.name) + '">' +
+      '<label for="' + id + '"><b>' + esc(p.name) + '</b> <span class="faint">' + esc(p.type) + (p.required ? " · required" : "") + "</span></label>" +
+      control +
+      (hints.length ? '<div class="phint">' + esc(hints.join(" · ")) + "</div>" : "") +
+      '<div class="perr" role="alert"></div></div>';
+  }
+  // The value a field holds, in the declared JSON type: the daemon coerces
+  // nothing. `undefined` leaves the parameter out, so the daemon applies the
+  // default or reports it as required. Throws the reason to show under the
+  // field.
+  function paramFieldValue(p, i) {
+    const f = $("paramF" + i);
+    if (p.type === "boolean") return f.checked;
+    if (p.type === "string") {
+      // an empty required field is a value the caller has not supplied
+      return f.value === "" && (p.required || (p.allowed && p.allowed.length)) ? undefined : f.value;
+    }
+    const t = f.value.trim();
+    if (t === "") return undefined;
+    const n = Number(t);
+    if (p.type === "integer") {
+      if (!/^[+-]?\d+$/.test(t) || !Number.isSafeInteger(n)) throw new Error("must be an integer");
+      return n;
+    }
+    if (!/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(t) || !Number.isFinite(n)) throw new Error("must be a number");
+    return n;
+  }
+  // `job` is true when `name` is a job, started through POST /jobs/{name}/start
+  function openParamForm(name, backfill, job) {
+    if (!openOverlay("paramWrap")) return;
+    const decl = job ? jobParamDecl(name) : dagParamDecl(name);
+    state.paramForm = { dag: name, decl: decl, backfill: backfill || null, job: !!job };
+    $("paramTitle").textContent = (backfill ? "Backfill " : "Run ") + name;
+    $("paramMsg").textContent = backfill
+      ? "These values apply to the runs this backfill creates. A date that already has a run keeps its values."
+      : job
+        ? "The run records these values, and its command reads them. Everyone who can view this job sees them."
+        : "The run stores these values, and its tasks read them. Everyone who can view this workflow sees them.";
+    $("paramFields").innerHTML = decl.map(paramFieldHtml).join("");
+    $("paramError").textContent = "";
+    $("paramGo").textContent = backfill ? "Run backfill" : "Run";
+    $("paramGo").disabled = false;
+    focusFirst($("paramWrap"));
+  }
+  function closeParamForm() { if (closeOverlay("paramWrap")) state.paramForm = null; }
+  // Each reason goes under its field. A name with no field (the declaration
+  // changed since the last poll) joins the summary line.
+  function showParamErrors(errors, message) {
+    const rest = [];
+    const rows = [...document.querySelectorAll("#paramFields .paramfield")];
+    rows.forEach((r) => { r.querySelector(".perr").textContent = ""; });
+    for (const [name, why] of Object.entries(errors || {})) {
+      const row = rows.find((r) => r.getAttribute("data-param") === name);
+      if (row) row.querySelector(".perr").textContent = name + " " + why;
+      else rest.push(name + " " + why);
+    }
+    $("paramError").textContent = [message].concat(rest).filter(Boolean).join(" · ");
+  }
+  async function submitParamForm() {
+    const form = state.paramForm;
+    if (!form) return;
+    const params = {}, errors = {};
+    form.decl.forEach((p, i) => {
+      try { const v = paramFieldValue(p, i); if (v !== undefined) params[p.name] = v; }
+      catch (e) { errors[p.name] = e.message; }
+    });
+    if (Object.keys(errors).length) { showParamErrors(errors, ""); return; }
+    $("paramGo").disabled = true;
+    const result = form.job
+      ? await postJobStart(form.dag, params)
+      : form.backfill
+        ? await postBackfill(form.dag, form.backfill.from, form.backfill.to, params)
+        : await postTrigger(form.dag, params);
+    if (state.paramForm !== form) return;
+    $("paramGo").disabled = false;
+    if (result === true) closeParamForm();
+    else if (result) showParamErrors(result.paramErrors, result.error);
+  }
+  // An error response as { error, paramErrors }. 4xx bodies are the uniform
+  // JSON envelope; the raw-text fallback keeps an older daemon's plain body.
+  async function errorBody(res) {
+    const t = await res.text().catch(() => "");
+    try { const j = JSON.parse(t); if (j && typeof j === "object" && j.error) return j; } catch (_) {}
+    return { error: t || "HTTP " + res.status };
+  }
+  function errorBodyText(body) {
+    const errs = Object.entries(body.paramErrors || {}).map(([n, w]) => n + " " + w);
+    return body.error + (errs.length ? ": " + errs.join("; ") : "");
+  }
   async function dagTrigger(name) {
+    if (dagParamDecl(name).length && canParams()) { openParamForm(name); return; }
+    const result = await postTrigger(name, null);
+    if (result && result !== true) toast("err", "trigger: " + errorBodyText(result));
+  }
+  // POST the trigger. Resolves true on success, null after a failure it has
+  // already reported, and the error body for a refusal the caller shows.
+  async function postTrigger(name, params) {
     try {
-      const res = await apiFetch("/dags/" + encodeURIComponent(name) + "/trigger", { method: "POST" });
+      const opts = { method: "POST" };
+      if (params) { opts.headers = { "Content-Type": "application/json" }; opts.body = JSON.stringify({ params: params }); }
+      const res = await apiFetch("/dags/" + encodeURIComponent(name) + "/trigger", opts);
       if (res.ok) {
         let rk = null; try { rk = (await res.json()).runKey; } catch (_) {}
         toast("ok", "▶ triggered " + name);
         loadDags();
         if (state.dagDrawer.dag === name) { setTimeout(() => { loadDagRuns(); if (rk) selectDagRun(rk, true); }, 300); }
-      } else if (res.status === 404) toast("err", "no such dag");
-      else toast("err", "trigger failed (HTTP " + res.status + ")");
+        return true;
+      }
+      if (res.status === 404) { toast("err", "no such dag"); return null; }
+      if (res.status === 400 || res.status === 403 || res.status === 409) return await errorBody(res);
+      toast("err", "trigger failed (HTTP " + res.status + ")");
     } catch (e) { if (e.message !== "unauthorized") toast("err", "trigger failed"); }
+    return null;
   }
   async function dagBackfill() {
     const dag = state.dagDrawer.dag;
@@ -11592,22 +11900,28 @@ var qrcode = function() {
       await previewRecovery("/dags/" + encodeURIComponent(dag) + "/recover", { from, to });
       return;
     }
+    if (dagParamDecl(dag).length && canParams()) { openParamForm(dag, { from: from, to: to }); return; }
+    const result = await postBackfill(dag, from, to, null);
+    if (result && result !== true) toast("err", "backfill: " + errorBodyText(result));
+  }
+  // POST the backfill; resolves like postTrigger.
+  async function postBackfill(dag, from, to, params) {
     try {
+      const body = { from: from, to: to };
+      if (params) body.params = params;
       const res = await apiFetch("/dags/" + encodeURIComponent(dag) + "/backfill",
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ from: from, to: to }) });
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       if (res.ok) {
-        let created = null; try { created = (await res.json()).created; } catch (_) {}
-        toast("ok", "▦ backfill queued" + (created != null ? " (" + created + " run" + (created === 1 ? "" : "s") + ")" : ""));
+        let r = {}; try { r = (await res.json()) || {}; } catch (_) {}
+        const created = r.created;
+        toast("ok", "▦ backfill queued" + (created != null ? " (" + created + " run" + (created === 1 ? "" : "s") + (r.existing ? ", " + r.existing + " already existed" : "") + ")" : ""));
         $("dgBackfill").style.display = "none";
         setTimeout(loadDagRuns, 300);
-      } else {
-        // 4xx bodies are the uniform JSON envelope {"error": msg}; keep the
-        // raw-text fallback so an older daemon's plain body still shows
-        const t = await res.text().catch(() => "");
-        let msg = t; try { msg = JSON.parse(t).error || t; } catch (_) {}
-        toast("err", "backfill: " + (msg || "HTTP " + res.status));
+        return true;
       }
+      return await errorBody(res);
     } catch (e) { if (e.message !== "unauthorized") toast("err", "backfill failed"); }
+    return null;
   }
 
   function verificationDetail(result) {
@@ -11703,7 +12017,7 @@ var qrcode = function() {
       const preserved = plans.reduce((n, p) => n + p.preserved.length, 0);
       $("dgRecovery").style.display = "";
       $("dgRecovery").innerHTML = '<div class="card" style="padding:16px"><h3>Review recovery</h3><p>' + tasks + ' tasks will run; ' + preserved + ' task results will be reused across ' + plans.length + (plans.length === 1 ? ' run.</p>' : ' runs.</p>') +
-        plans.map(p => '<details><summary>' + esc(p.sourceRunKey) + '</summary><p>Run: ' + esc(p.tasks.join(", ")) + '</p><p>Reuse: ' + esc(p.preserved.join(", ") || "none") + '</p><p>Configuration: <code>' + esc(p.configurationRevision) + '</code></p><p>Artifacts: ' + esc(p.artifacts.map(a => a.name).join(", ") || "none") + '</p></details>').join("") +
+        plans.map(p => '<details><summary>' + esc(p.sourceRunKey) + '</summary><p>Run: ' + esc(p.tasks.join(", ")) + '</p><p>Reuse: ' + esc(p.preserved.join(", ") || "none") + '</p>' + recoverySkipsHtml(p) + recoveryParamsHtml(p) + '<p>Configuration: <code>' + esc(p.configurationRevision) + '</code></p><p>Artifacts: ' + esc(p.artifacts.map(a => a.name).join(", ") || "none") + '</p></details>').join("") +
         (changed ? '<p><label><input type="checkbox" id="dgRecoveryConfig"> Use the current configuration, which differs from the source run.</label></p>' : '') +
         '<p class="faint">Recovery preserves the source run. Selected commands run again and may repeat external side effects.</p>' +
         '<button class="btn primary" id="dgRecoveryGo"' + (!tasks ? " disabled" : "") + '>Start recovery</button> <button class="btn" id="dgRecoveryDismiss">Dismiss</button></div>';
@@ -12256,6 +12570,11 @@ var qrcode = function() {
     $("tokenCancel").addEventListener("click", closeModal);
     $("modalWrap").addEventListener("click", (e) => { if (e.target === $("modalWrap")) closeModal(); });
     $("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("tokenSave").click(); });
+
+    // run parameters
+    $("paramForm").addEventListener("submit", (e) => { e.preventDefault(); submitParamForm(); });
+    $("paramCancel").addEventListener("click", closeParamForm);
+    $("paramWrap").addEventListener("click", (e) => { if (e.target === $("paramWrap")) closeParamForm(); });
 
     // pair a device
     $("openPair").addEventListener("click", () => { closeSettings(); openPair(); });

@@ -19,6 +19,7 @@ cronstable state ACTION [options] [-c FILE-OR-DIR]
 cronstable state get|set|delete|keys ...  [--scope NAME | --global]
 cronstable cursor|lock|artifact|idempotent ...  [--scope NAME | --global]
 cronstable secret get|list ...
+cronstable param get|list|dump ...
 cronstable xcom push|pull|list ...
 cronstable mcp [--url URL] [--token TOKEN] [--token-env VAR] [--cacert PATH]
                [--client-cert PATH --client-key PATH] [--insecure] [--check]
@@ -378,7 +379,7 @@ option, or a missing required one such as `backup` without `-o`).
 Alongside the earlier offline `state` admin actions, a *running job's* command
 line reaches the daemon's durable store through the job-facing commands
 `state get|set|delete|keys`, `cursor`, `lock`, `artifact`, `idempotent`,
-`secret`, and `xcom`.
+`secret`, `param`, and `xcom`.
 
 These thin clients of the
 [loopback state endpoint](HTTP-API#job-facing-state-endpoints-loopback) read
@@ -403,8 +404,9 @@ Every KV, cursor, artifact, lock, and idempotency command acts in a *scope*, a
 namespace defaulting to the calling job's own name, and takes two mutually
 exclusive override flags: `--scope NAME` (act in the named scope) and
 `--global` (act in the shared `global` scope, for deliberate cross-job
-coordination). `secret` and `xcom` take neither flag: a run's secrets are
-always its own, and the daemon injects the DAG run's XCom scope.
+coordination). `secret`, `param`, and `xcom` take neither flag: a run's
+secrets and parameters are always its own, and the daemon injects the DAG
+run's XCom scope.
 
 The commands share one exit-code convention, made for shell branching:
 
@@ -414,7 +416,7 @@ The commands share one exit-code convention, made for shell branching:
 | `1` | An error (a transport or store failure). |
 | `2` | Usage error (argparse; such as a command invoked with no action). |
 | `3` | A `lock acquire` / `lock run` did not get the lock. |
-| `4` | The looked-up key, cursor, artifact, secret, or XCom key does not exist (`state delete` of an absent key too). |
+| `4` | The looked-up key, cursor, artifact, secret, parameter, or XCom key does not exist (`state delete` of an absent key too). |
 | `5` | The `idempotent` key was already claimed (a duplicate). |
 
 ### `state get|set|delete|keys` (durable key/value)
@@ -487,6 +489,28 @@ cronstable secret list
 ```
 
 No flags. `get` exits `4` if no secret of that name is staged for this run.
+
+### `param get|list|dump` (run parameters)
+
+```
+cronstable param get NAME
+cronstable param list
+cronstable param dump
+```
+
+Read the run parameters of the calling run: a
+[workflow run's](Orchestration-and-DAGs#run-parameters) in a task, and a
+[job's](Commands-and-Environment#params) in a job run. No flags.
+
+- `get` prints one value as its `CRONSTABLE_PARAM_<NAME>` variable holds it:
+  a string as it is, a number as its JSON text, and a boolean as `true` or
+  `false`. It exits `4` when the run has no parameter of that name.
+- `list` prints the parameter names, sorted, one per line.
+- `dump` prints every value as one JSON object, with each value in its
+  declared JSON type.
+
+In a run of a job or a workflow that declares no parameters, `list` prints
+nothing and `dump` prints `{}`.
 
 ### `xcom push|pull|list` (DAG cross-task data)
 

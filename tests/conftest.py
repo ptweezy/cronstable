@@ -200,17 +200,25 @@ class Req:
     handler tests build one per direct handler call.  ``body`` (a
     JSON-ready object) arms ``can_read_body`` and ``json()`` for the
     POST-handler tests; without it the request carries no body.
+    ``storage`` is the request storage the auth middleware files the
+    matched token in, which handlers read with ``get``.
     """
 
-    def __init__(self, query=None, match=None, headers=None, body=None):
+    def __init__(
+        self, query=None, match=None, headers=None, body=None, storage=None
+    ):
         self.query = query or {}
         self.match_info = match or {}
         self.headers = headers or {}
         self.can_read_body = body is not None
         self._body = body
+        self._storage = storage or {}
 
     async def json(self):
         return self._body
+
+    def get(self, key, default=None):
+        return self._storage.get(key, default)
 
 
 def _cron(yaml):

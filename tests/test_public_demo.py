@@ -545,10 +545,11 @@ async def test_gateway_uses_real_unmodified_daemon_listener(monkeypatch):
     cron = Cron(None, config_yaml=CONFIG)
     started = []
 
-    async def start(name):
+    async def start(name, params=None):
         started.append(name)
+        return {"queued": None, "params": None}
 
-    monkeypatch.setattr(cron, "start_job_by_name", start)
+    monkeypatch.setattr(cron, "start_job", start)
     await cron.start_stop_web_app(parse_config_string(CONFIG, "").web_config)
     try:
         port = cron.web_runner.addresses[0][1]

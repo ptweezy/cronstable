@@ -1,6 +1,8 @@
 import copy
+import dataclasses
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -213,3 +215,386 @@ def test_configuration_revision_hashes_environment_names_only(tmp_path, monkeypa
     assert revision("orange77") == revision("correct-horse")
     added = "          - key: MODE\n            value: full\n"
     assert revision("orange77", added) != revision("orange77")
+
+
+def _launch(**over):
+    """A launch template with every digested field spelled out, so the
+    pinned revision below does not depend on the host's defaults."""
+    fields = dict(
+        command="./run.sh",
+        shell="/bin/sh",
+        workingDirectory=None,
+        user=None,
+        group=None,
+        executionTimeout=None,
+        killTimeout=30,
+        failsWhen={
+            "producesStdout": False,
+            "producesStderr": True,
+            "nonzeroReturn": True,
+            "always": False,
+        },
+        verify=None,
+        pool=None,
+        poolSlots=1,
+        queueTimeout=None,
+        queuePriority=0,
+        environment=[],
+    )
+    fields.update(over)
+    return SimpleNamespace(**fields)
+
+
+def _pinned_config(spec_type=dag.TaskSpec, spec_params=(), **spec_extra):
+    """One task of every kind: plain, sensor, mapped, approval, all_done."""
+    specs = [
+        spec_type(id="extract", **spec_extra),
+        spec_type(
+            id="wait",
+            type=dag.SENSOR,
+            depends_on=("extract",),
+            poke_interval=5.0,
+            poke_timeout=60.0,
+            poke_jitter=1.5,
+            **spec_extra,
+        ),
+        spec_type(
+            id="work",
+            depends_on=("extract", "wait"),
+            max_attempts=3,
+            retry_delay=2.5,
+            expand=dag.ExpandSpec(from_task="extract", key="items"),
+            **spec_extra,
+        ),
+        spec_type(
+            id="gate",
+            type=dag.APPROVAL,
+            depends_on=("work",),
+            on_reject=dag.SKIPPED,
+            **spec_extra,
+        ),
+        spec_type(
+            id="cleanup",
+            depends_on=("gate",),
+            trigger_rule=dag.ALL_DONE,
+            **spec_extra,
+        ),
+    ]
+    launches = {
+        "extract": _launch(
+            environment=[{"key": "B", "value": "2"}, {"key": "A", "value": "1"}]
+        ),
+        "wait": _launch(command=["test", "-e", "/tmp/flag"], shell=""),
+        "work": _launch(pool="db", poolSlots=2, queuePriority=5),
+        "gate": _launch(command=None),
+        "cleanup": _launch(executionTimeout=90.0, workingDirectory="/srv"),
+    }
+    return SimpleNamespace(
+        tasks=[
+            SimpleNamespace(spec=spec, job_template=launches[spec.id])
+            for spec in specs
+        ],
+        spec=SimpleNamespace(params=spec_params),
+    )
+
+
+def test_configuration_revision_is_pinned():
+    # Every run document stores this digest, and recovery compares it with
+    # the live configuration. A change to the digest input makes every
+    # finished run read as "configuration changed", so a new value here needs
+    # a recorded reason.
+    assert recovery.configuration_revision(_pinned_config()) == (
+        "b35b543ab1f3ea49572aed23088e42499b0705eed1526cbba3a15bc021afd185"
+    )
+
+
+def test_configuration_revision_reads_only_its_listed_spec_fields():
+    @dataclasses.dataclass(frozen=True, slots=True)
+    class WiderSpec(dag.TaskSpec):
+        added_later: tuple = ()
+
+    # the two lists cover every TaskSpec field; a new field fails here until
+    # someone decides how it enters the digest.
+    assert set(recovery._SPEC_KEYS) | set(recovery._OPTIONAL_SPEC_KEYS) == {
+        f.name for f in dataclasses.fields(dag.TaskSpec)
+    }
+    assert not set(recovery._SPEC_KEYS) & set(recovery._OPTIONAL_SPEC_KEYS)
+    for name, default in recovery._OPTIONAL_SPEC_KEYS.items():
+        assert getattr(dag.TaskSpec(id="t"), name) == default
+    wider = _pinned_config(WiderSpec, added_later=(99,))
+    assert "added_later" in dataclasses.asdict(wider.tasks[0].spec)
+    assert recovery.configuration_revision(
+        wider
+    ) == recovery.configuration_revision(_pinned_config())
+
+
+def test_configuration_revision_reads_skip_exit_codes_only_when_set():
+    # the pinned digest above is the "unset" half: a DAG with no
+    # skipExitCodes keeps the revision it had before the key existed.
+    plain = recovery.configuration_revision(_pinned_config())
+    assert recovery.configuration_revision(
+        _pinned_config(skip_exit_codes=())
+    ) == plain
+    with_codes = recovery.configuration_revision(
+        _pinned_config(skip_exit_codes=(99,))
+    )
+    assert with_codes != plain
+    assert with_codes != recovery.configuration_revision(
+        _pinned_config(skip_exit_codes=(98,))
+    )
+
+
+def test_recovery_refuses_a_run_above_the_engine_level():
+    source = {"state": "failed", "engine": dag.ENGINE_LEVEL + 1}
+    with pytest.raises(recovery.RecoveryError, match="engine level"):
+        recovery.plan(None, source)
+
+
+async def _failed_branch(dag_cron, tmp_path):
+    """The branching diamond with a full load that fails until `ready`.
+
+    The incremental guard skips itself, so the source run ends failed with
+    one skipped branch, an `upstream_failed` join, and a handler that ran.
+    """
+    from tests.test_state_dag_run import _BRANCH, _exit, _set_cmd
+
+    cron = await dag_cron(_BRANCH)
+    ready = tmp_path / "ready"
+    for task in cron.cron_dags["load"].tasks:
+        _set_cmd(cron, "load", task.spec.id, [sys.executable, "-c", "pass"])
+    _set_cmd(cron, "load", "full", [
+        sys.executable, "-c",
+        f"from pathlib import Path; assert Path({str(ready)!r}).exists()",
+    ])
+    _set_cmd(cron, "load", "incremental", _exit(99))
+    key = await cron._dag.trigger_run("load")
+    source = await _drive(cron, "load", key)
+    assert source["state"] == "failed"
+    assert source["tasks"]["incremental"]["state"] == "skipped"
+    assert source["tasks"]["publish"]["state"] == "upstream_failed"
+    assert source["tasks"]["alert"]["state"] == "success"
+    return cron, key, source, ready
+
+
+async def test_recovery_keeps_a_skipped_branch_and_resets_the_join_and_handler(dag_cron, tmp_path):
+    cron, key, source, ready = await _failed_branch(dag_cron, tmp_path)
+    preview = await cron._dag.recover("load", key)
+    # the join and the handler sit below the failure; the skipped branch
+    # does not
+    assert preview["tasks"] == ["alert", "full", "publish"]
+    assert preview["preserved"] == ["extract", "incremental"]
+    assert preview["preservedSkipped"] == {
+        "incremental": {"kind": "exit_code", "detail": "exit code 99"},
+    }
+    ready.touch()
+    result = await cron._dag.recover("load", key, plan_token=preview["planToken"])
+    finished = await _drive(cron, "load", result["runKey"])
+    assert finished["state"] == "success"
+    assert finished["engine"] == dag.BRANCHING_PARAMS_ENGINE_LEVEL
+    states = {k: v["state"] for k, v in finished["tasks"].items()}
+    assert states == {
+        "extract": "success",
+        "full": "success",
+        "incremental": "skipped",
+        # evaluated again under its rule, against the preserved skip and
+        # the rerun branch
+        "publish": "success",
+        # reset with the failure it handled, and nothing failed this time
+        "alert": "skipped",
+    }
+    kept = finished["tasks"]["incremental"]
+    assert kept["reusedFrom"] == key
+    assert kept["skipReason"] == source["tasks"]["incremental"]["skipReason"]
+    assert finished["tasks"]["alert"]["skipReason"]["kind"] == "trigger_rule"
+    assert await cron._dag.get_run("load", key) == source
+
+
+async def test_recovery_from_a_guard_decides_its_branch_again(dag_cron, tmp_path):
+    from tests.test_state_dag_run import _exit, _set_cmd
+
+    cron, key, _, ready = await _failed_branch(dag_cron, tmp_path)
+    ready.touch()
+    # this time the incremental guard lets its branch run and the full one
+    # does not: recovering from both guards decides both again
+    _set_cmd(cron, "load", "incremental", [sys.executable, "-c", "pass"])
+    _set_cmd(cron, "load", "full", _exit(99))
+    preview = await cron._dag.recover(
+        "load", key, mode="from", tasks=["full", "incremental"],
+    )
+    assert preview["tasks"] == ["alert", "full", "incremental", "publish"]
+    assert preview["preserved"] == ["extract"]
+    assert "preservedSkipped" not in preview
+    assert preview["configurationChanged"]  # the commands changed
+    result = await cron._dag.recover(
+        "load", key, mode="from", tasks=["full", "incremental"],
+        plan_token=preview["planToken"], allow_config_change=True,
+    )
+    finished = await _drive(cron, "load", result["runKey"])
+    assert finished["state"] == "success"
+    states = {k: v["state"] for k, v in finished["tasks"].items()}
+    assert states["full"] == "skipped"
+    assert states["incremental"] == "success"
+    assert states["publish"] == "success"
+    assert "reusedFrom" not in finished["tasks"]["full"]
+
+
+def test_recovery_preview_names_reused_skips_recorded_without_a_reason():
+    # a run from a build that recorded no skipReason still lists the task
+    spec = dag.DagSpec.build("d", [
+        dag.TaskSpec("gate", type=dag.APPROVAL, on_reject=dag.SKIPPED),
+        dag.TaskSpec("after", depends_on=("gate",)),
+        dag.TaskSpec("other"),
+    ])
+    config = SimpleNamespace(
+        name="d",
+        spec=spec,
+        tasks=[SimpleNamespace(spec=t, job_template=_launch()) for t in spec.tasks],
+    )
+    source = dag.new_run_body(
+        dag="d", run_key="k", run_id="r", logical_date=None, kind="manual",
+        now=1.0, spec=spec,
+    )
+    source["state"] = "failed"
+    source["tasks"]["gate"]["state"] = "skipped"
+    source["tasks"]["after"]["state"] = "skipped"
+    source["tasks"]["after"]["skipReason"] = {"kind": "upstream", "detail": "upstream skipped: gate"}
+    source["tasks"]["other"]["state"] = "failed"
+    plan = recovery.plan(config, source)
+    assert plan["tasks"] == ["other"]
+    assert plan["preservedSkipped"] == {
+        "after": {"kind": "upstream", "detail": "upstream skipped: gate"},
+        "gate": None,
+    }
+
+
+def test_configuration_revision_reads_when_only_when_set():
+    # the pinned digest is the "unset" half: a DAG with no `when:` keeps the
+    # revision it had before the key existed.
+    plain = recovery.configuration_revision(_pinned_config())
+    assert recovery.configuration_revision(_pinned_config(when=())) == plain
+
+    def revision(*conditions):
+        return recovery.configuration_revision(_pinned_config(when=conditions))
+
+    on_param = dag.Condition(
+        source=dag.WHEN_PARAM, name="mode", op="equals", values=("full",)
+    )
+    on_xcom = dag.Condition(
+        source=dag.WHEN_XCOM, name="extract", key="rows", op="notIn",
+        values=("0", ""),
+    )
+    assert revision(on_param) != plain
+    # each part of a comparison is in the digest
+    seen = {plain, revision(on_param), revision(on_xcom), revision(on_param, on_xcom)}
+    for changed in (
+        dataclasses.replace(on_param, name="other"),
+        dataclasses.replace(on_param, op="notEquals"),
+        dataclasses.replace(on_param, values=("inc",)),
+        dataclasses.replace(on_param, values=(True,)),
+        dataclasses.replace(on_xcom, key="count"),
+        dataclasses.replace(on_xcom, values=("0",)),
+    ):
+        digest = revision(changed)
+        assert digest not in seen
+        seen.add(digest)
+
+
+async def _failed_condition(dag_cron, tmp_path, mode, published=b"12\n"):
+    """The `cond` workflow of test_state_dag_run with the branch that `mode`
+    selects failing until `ready` exists, so the source run ends failed with
+    the other branch skipped by its condition."""
+    from tests.test_state_dag_run import _when_cron, _set_cmd
+
+    cron = await _when_cron(dag_cron, tmp_path, published)
+    ready = tmp_path / "ready"
+    _set_cmd(cron, "cond", "full" if mode == "full" else "incremental", [
+        sys.executable, "-c",
+        f"from pathlib import Path; assert Path({str(ready)!r}).exists()",
+    ])
+    started = await cron._dag.trigger("cond", params={"mode": mode})
+    source = await _drive(cron, "cond", started["runKey"])
+    assert source["state"] == "failed"
+    return cron, started["runKey"], source, ready
+
+
+async def test_recovery_keeps_a_branch_a_condition_skipped(dag_cron, tmp_path):
+    cron, key, source, ready = await _failed_condition(dag_cron, tmp_path, "full")
+    reason = {
+        "kind": "condition",
+        "detail": "param mode notEquals full: the value is full",
+    }
+    assert source["tasks"]["incremental"]["skipReason"] == reason
+    preview = await cron._dag.recover("cond", key)
+    assert preview["tasks"] == ["full", "publish"]
+    assert preview["preserved"] == ["extract", "incremental"]
+    assert preview["preservedSkipped"] == {"incremental": reason}
+    assert preview["params"] == {"mode": "full"}
+    ready.touch()
+    result = await cron._dag.recover("cond", key, plan_token=preview["planToken"])
+    finished = await _drive(cron, "cond", result["runKey"])
+    assert finished["state"] == "success"
+    assert finished["engine"] == dag.BRANCHING_PARAMS_ENGINE_LEVEL
+    assert {k: v["state"] for k, v in finished["tasks"].items()} == {
+        "extract": "success",
+        "full": "success",
+        "incremental": "skipped",
+        "publish": "success",
+    }
+    kept = finished["tasks"]["incremental"]
+    assert kept["reusedFrom"] == key and kept["skipReason"] == reason
+    # the reset task got a fresh entry, so its condition was read again
+    assert "reusedFrom" not in finished["tasks"]["full"]
+    assert finished["tasks"]["full"]["whenMet"] is True
+
+
+async def test_a_reset_task_reads_the_value_a_preserved_task_published(dag_cron, tmp_path):
+    # `incremental` compares what `extract` published. `extract` is reused,
+    # so the comparison reads the copy of its value in the recovery run.
+    cron, key, source, ready = await _failed_condition(dag_cron, tmp_path, "incremental")
+    assert source["tasks"]["incremental"]["whenMet"] is True
+    preview = await cron._dag.recover("cond", key)
+    assert preview["tasks"] == ["incremental", "publish"]
+    assert preview["preserved"] == ["extract", "full"]
+    assert [a["name"] for a in preview["artifacts"]] == ["extract/row_count"]
+    ready.touch()
+    result = await cron._dag.recover("cond", key, plan_token=preview["planToken"])
+    finished = await _drive(cron, "cond", result["runKey"])
+    assert finished["state"] == "success"
+    assert finished["tasks"]["incremental"]["state"] == "success"
+    assert finished["tasks"]["incremental"]["whenMet"] is True
+    assert finished["tasks"]["extract"]["reusedFrom"] == key
+
+
+async def test_recovery_from_the_publisher_reads_the_condition_again(dag_cron, tmp_path):
+    from tests.test_state_dag_run import _when_cron
+
+    # the source run published 0 rows, so the incremental load was skipped
+    cron = await _when_cron(dag_cron, tmp_path, b"0\n")
+    started = await cron._dag.trigger("cond", params={"mode": "incremental"})
+    key = started["runKey"]
+    source = await _drive(cron, "cond", key)
+    assert source["state"] == "success"
+    assert source["tasks"]["incremental"]["skipReason"]["detail"] == (
+        "xcom extract/row_count notIn 0: the value is 0"
+    )
+    assert source["tasks"]["publish"]["state"] == "skipped"
+    # the same command now publishes 12 rows
+    (tmp_path / "row_count").write_bytes(b"12\n")
+    preview = await cron._dag.recover("cond", key, mode="from", tasks=["extract"])
+    # the publisher is upstream of the task that compares its value, so the
+    # conditional task is reset with it
+    assert preview["tasks"] == ["extract", "full", "incremental", "publish"]
+    assert preview["preserved"] == [] and "preservedSkipped" not in preview
+    assert not preview["configurationChanged"]
+    result = await cron._dag.recover(
+        "cond", key, mode="from", tasks=["extract"], plan_token=preview["planToken"],
+    )
+    finished = await _drive(cron, "cond", result["runKey"])
+    assert finished["state"] == "success"
+    assert {k: v["state"] for k, v in finished["tasks"].items()} == {
+        "extract": "success",
+        "full": "skipped",
+        "incremental": "success",
+        "publish": "success",
+    }
+    assert await cron._dag.get_run("cond", key) == source

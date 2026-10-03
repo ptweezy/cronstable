@@ -37,6 +37,7 @@ from cronstable.config import (
     _resolve_secret,
     schedule_object_to_crontab,
 )
+from cronstable.params import ENV_PREFIX as PARAM_ENV_PREFIX
 from cronstable.redact import redact_lines
 from cronstable.resources import ResourceMonitor, ResourceUsage
 from cronstable.statsd import StatsdJobMetricWriter
@@ -103,6 +104,21 @@ def fixup_pyinstaller_env(env: dict[str, str]) -> None:
     # refuse to start: "parent process has different executable". Stripped
     # before the config overlay, so an explicit `environment:` entry wins.
     for key in [k for k in env if k.startswith("_PYI_")]:
+        del env[key]
+
+
+def drop_inherited_params(env: dict[str, str], owns_params: bool) -> None:
+    """Remove the run-parameter variables ``env`` inherited from the
+    daemon, for a run that has parameters of its own: a workflow task, or a
+    job that declares ``params``. Any other job's ``env`` is left as it is.
+
+    Such a run reads the parameters it stores, which the caller applies
+    afterward. Without this, a parameter the run does not store would read
+    as whatever the daemon's environment happened to hold.
+    """
+    if not owns_params:
+        return
+    for key in [k for k in env if k.startswith(PARAM_ENV_PREFIX)]:
         del env[key]
 
 
@@ -2202,6 +2218,15 @@ class RunningJob:
         self.extra_env = extra_env or {}
         self.state_token = state_token
         self.run_id = run_id
+        # the run parameter values of a job that declares `params`, set by
+        # the launcher and recorded with the run; None for every other run
+        # (a DAG task's values live in its run document).
+        self.params: dict[str, Any] | None = None
+        # whether this run has parameters of its own (see
+        # drop_inherited_params)
+        self.owns_params = dag_ref is not None or bool(
+            getattr(config, "params", None)
+        )
         self.proc: asyncio.subprocess.Process | None = None
         self.retcode: int | None = None
         # wall-clock instant this run started, for the web UI's run history;
@@ -2246,6 +2271,9 @@ class RunningJob:
         # `replaced` it is not reported or retried, but unlike `replaced` it is
         # recorded in the run history (shown as "cancelled" in the dashboard).
         self.cancelled = False
+        # exit codes with which the command skips this run: a DAG task's
+        # skipExitCodes, set by the DAG scheduler at launch. See `skipped`.
+        self.skip_exit_codes: tuple[int, ...] = ()
 
         statsd_config = self.config.statsd
         if statsd_config is not None:
@@ -2374,6 +2402,7 @@ class RunningJob:
         if custom_env or pyinstaller_env_leaks():
             env = dict(os.environ)
             fixup_pyinstaller_env(env)
+            drop_inherited_params(env, self.owns_params)
             for envvar in config.environment:
                 env[envvar["key"]] = envvar["value"]
             # The daemon-injected control-channel vars go last, so a job's own
@@ -2602,7 +2631,12 @@ class RunningJob:
         await self._read_job_streams(close_output=self.config.verify is None)
         try:
             if self.config.verify is not None and not self._terminated:
-                if self.failed:
+                if self.skipped:
+                    self.verification = {
+                        "outcome": "skipped",
+                        "fail_reason": "command skipped the task",
+                    }
+                elif self.failed:
                     self.verification = {
                         "outcome": "skipped",
                         "fail_reason": "command failed",
@@ -2750,7 +2784,24 @@ class RunningJob:
         return self.fail_reason is not None
 
     @property
+    def skipped(self) -> bool:
+        """Whether the command exited with one of ``skip_exit_codes``.
+
+        Only a command that started and exited by itself can skip its run.
+        A timeout, a cancel, and a failed launch never do.
+        """
+        return (
+            bool(self.skip_exit_codes)
+            and self.retcode in self.skip_exit_codes
+            and not self._terminated
+            and not self.start_failed
+        )
+
+    @property
     def fail_reason(self) -> str | None:
+        if self.skip_exit_codes and self.skipped:
+            # a skip is decided ahead of failsWhen and is never a failure
+            return None
         if self.verification and self.verification["outcome"] == "failure":
             return "verification failed: {}".format(
                 self.verification.get("fail_reason") or "check failed"

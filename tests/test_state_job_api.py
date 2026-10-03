@@ -1429,3 +1429,53 @@ async def test_error_mw_maps_unportable_value_to_400():
     resp = await mw(object(), handler)
     assert resp.status == 400
     assert b"bad-nan-value" in resp.body
+
+
+# --------------------------------------------------------------------------
+# Run parameters (a workflow run's stored map)
+# --------------------------------------------------------------------------
+
+
+async def test_param_http(job_api):
+    import dataclasses
+
+    api, s = job_api.api, job_api.session
+    stored = {"target": "prod", "batch_size": 500, "dry": False, "ratio": 0.5}
+    api.register_run(dataclasses.replace(_ctx(), params=stored))
+    # each value keeps its JSON type
+    for name, value in stored.items():
+        r = await s.get(api.base_url + "/v1/param/get?name=" + name)
+        assert r.status == 200
+        assert (await r.json()) == {"value": value}
+    r = await s.get(api.base_url + "/v1/param/list")
+    assert (await r.json()) == {"params": stored}
+    r = await s.get(api.base_url + "/v1/param/get?name=nope")
+    assert r.status == 404
+    assert (await r.json())["error"] == "this run has no parameter 'nope'"
+    r = await s.get(api.base_url + "/v1/param/get")
+    assert r.status == 400
+
+
+async def test_param_is_run_scoped_and_empty_for_a_plain_job(job_api):
+    import dataclasses
+
+    api = job_api.api
+    api.register_run(
+        dataclasses.replace(_ctx(token="a"), params={"target": "prod"})
+    )
+    api.register_run(_ctx(token="b"))
+    async with aiohttp.ClientSession() as s:
+        r = await s.get(
+            api.base_url + "/v1/param/get?name=target", headers=_auth("a")
+        )
+        assert (await r.json())["value"] == "prod"
+        # a run with no parameters: nothing to get, an empty map to list
+        r = await s.get(
+            api.base_url + "/v1/param/get?name=target", headers=_auth("b")
+        )
+        assert r.status == 404
+        r = await s.get(api.base_url + "/v1/param/list", headers=_auth("b"))
+        assert (await r.json()) == {"params": {}}
+        # the routes sit behind the run token like every /v1/ route
+        r = await s.get(api.base_url + "/v1/param/list")
+        assert r.status == 401

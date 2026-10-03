@@ -803,8 +803,9 @@ forever. The store cleans up after itself, conservatively, anchored on
 
 * Every node records a **manifest** (stream `manifests/<host>`): its host,
   job-set ID, the job names of its loaded config, plus the shared artifact
-  scopes and dag names that config can write. The node writes it on backend
-  start and every 6 hours.
+  scopes and dag names that config can write. It also carries the build's
+  [run engine level](Orchestration-and-DAGs#run-engine-levels) as
+  `dagEngine`. The node writes it on backend start and every 6 hours.
 * A **GC pass** runs every 24 hours per process, plus on demand with
   [`cronstable state gc`](#administering-the-store). It deletes a job's
   streams (runs, logs, catch-up, retries, reboot markers, in-flight records,
@@ -914,6 +915,13 @@ strings; an unknown scheduled time is the empty string):
 The commands read these; you rarely touch them directly. Set
 `state.jobApi.enabled: false` to keep the durable scheduler features while
 injecting nothing and running no endpoint.
+
+A [workflow](Orchestration-and-DAGs) task also sees the `CRONSTABLE_DAG_*`
+variables that identify its run, and one `CRONSTABLE_PARAM_<NAME>` variable
+for each [run parameter](Orchestration-and-DAGs#run-parameters) of that run.
+A run of a job that declares [`params`](Commands-and-Environment#params) sees the same variables for the
+values it takes. `cronstable param get|list|dump` reads the same parameter
+values over the endpoint.
 
 ### Scopes
 

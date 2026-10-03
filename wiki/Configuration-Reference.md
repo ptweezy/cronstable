@@ -85,7 +85,7 @@ push: { ... }       # optional: E2E-encrypted push alerts (relay + device regist
 | `headers` | `MapPattern(Str, Str)` | none | Extra HTTP response headers applied to all endpoints. A `Content-Type` entry (in any spelling) is ignored: every endpoint owns its own content type. |
 | `allowedOrigins` | `Seq(Str)` | `[]` | Extra exact-match browser `Origin`s allowed to call the **mutating** endpoints: every mutating (non-GET/HEAD/OPTIONS) route except `/mcp`, such as job start/cancel/pause/resume, DAG trigger/backfill/recover, task decisions, `/push/devices`, and `/shutdown`. Cross-site browser requests to them are refused `403` as a CSRF/DNS-rebinding defense. Same-origin requests (the served dashboard) and clients that send no `Origin` (curl, monitoring) always pass. `/mcp` keeps enforcing its own `mcp.allowedOrigins`. A `headers` entry of `Access-Control-Allow-Origin: <origin>` allow-lists that origin implicitly. `Access-Control-Allow-Origin: "*"` disables the check (logged loudly). |
 | `authToken` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | none | Opt-in bearer-token auth. When set but resolving empty, cronstable does not start the web API (it logs the error; scheduled jobs keep running). `--validate-config` does not resolve token sources, so it does not catch this. |
-| `authTokens` | `Seq(Map)`, each with the `authToken` source triple, `scopes` (`Seq` of `view`/`control`/`approve`), and an optional `label` | none | Multiple named bearer tokens with per-token scopes (`control` and `approve` imply `view`). `label` identifies a token in logs and lets you revoke it by dropping the entry and reloading. Tokens must resolve nonempty and be distinct from each other and from `authToken`. See [HTTP control API](HTTP-API#authentication). |
+| `authTokens` | `Seq(Map)`, each with the `authToken` source triple, `scopes` (`Seq` of `view`/`control`/`approve`/`params`), and an optional `label` | none | Multiple named bearer tokens with per-token scopes (`control`, `approve`, and `params` imply `view`). `params` lets a token that also holds `control` choose [run parameter](Orchestration-and-DAGs#run-parameters) values. `label` identifies a token in logs and lets you revoke it by dropping the entry and reloading. Tokens must resolve nonempty and be distinct from each other and from `authToken`. See [HTTP control API](HTTP-API#authentication). |
 | `anonymousScopes` | `Seq(Enum)`, accepting only `view` | none | Scopes granted to requests that present no credential at all, so the instance serves a public read-only board (dashboard, run history, log tails, calendar feeds, `/metrics`). The schema rejects `control` and `approve`, so no anonymous path to a mutating route can be configured. `GET /push/devices` is excluded as well, and a presented-but-wrong token is still `401` rather than a downgrade to this grant. Requires at least one `authToken`/`authTokens` entry, because a tokenless daemon already grants every scope to everyone. See [public read-only access](HTTP-API#public-read-only-access-webanonymousscopes). |
 | `socketMode` | `Str` | none | Octal permissions applied to a `unix://` listen socket. It only ever applies to unix sockets, so it is irrelevant on Windows, where `unix://` listeners are unsupported. |
 | `tls.cert` | `EmptyNone() \| Str` | none | Path to the certificate (chain) every `https://` listener serves. Required together with `tls.key`: one without the other is a `ConfigError` at load, as is TLS material with no `https://` address in `listen`, or an `https://` address with no certificate. Whether the files exist is not checked at load (a mounted secret may not exist at first boot); an unloadable certificate keeps the web API down with a logged error and is retried on the next reload. Rotating these files in place restarts the listeners. See [listener TLS](Listener-TLS). |
@@ -437,6 +437,21 @@ Per-DAG keys:
 | `clusterPolicy` | `Leader` / `PreferLeader` / `EveryNode` | `Leader` | Which node schedules the DAG under leader election. |
 | `enabled` | `Bool` | `true` | Disable without deleting. |
 | `retainRuns` | `Int` | `50` | Keep the newest N terminal runs (must be ≥ 1). |
+| `params` | `Seq(Map)` | none | The [run parameters](Orchestration-and-DAGs#run-parameters) a caller can supply when it starts a run. At most 32. |
+
+Per-parameter keys, under `params`:
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `Str` | required | Starts with a letter and holds at most 64 letters, digits, and underscores. Unique within the DAG, ignoring case. A name that reads as a secret, such as one that contains `password` or `token`, is a `ConfigError`. |
+| `type` | `string` / `integer` / `number` / `boolean` | `string` | The JSON type of a supplied value. |
+| `default` | a value of `type` | none | The value a run stores when the caller supplies none. Every parameter sets `default` or `required: true`. |
+| `required` | `Bool` | `false` | The caller supplies the value on every run. A `ConfigError` together with `default`, and on a DAG that has a `schedule`. |
+| `allowed` | `Seq` of values of `type` | none | The complete list of accepted values. A `ConfigError` on a `boolean`. |
+| `minimum` / `maximum` | `Int`/`Float` | none | Inclusive bounds, for `integer` and `number`. |
+| `pattern` | `Str` | none | A regular expression in Python syntax that the whole value has to match, for `string`. |
+| `maxLength` | `Int` | none | The longest accepted value in characters, from `1` to `4096`, for `string`. |
+| `description` | `Str` | none | Text the dashboard shows under the field. |
 
 Per-task keys:
 
@@ -446,7 +461,9 @@ Per-task keys:
 | `command` | `Str` or `Seq(Str)` | required (not for `approval`) | The command to run. |
 | `type` | `task` / `sensor` / `approval` | `task` | Node kind. |
 | `dependsOn` | `Seq(Str)` | `[]` | Upstream task ids. |
-| `triggerRule` | `all_success` / `all_done` | `all_success` | When the task becomes ready. |
+| `triggerRule` | `all_success` / `all_done` / `none_failed` / `none_failed_min_one_success` / `all_done_min_one_failed` | `all_success` | When the task becomes ready, read from its upstreams once all of them are terminal. See the [rule table](Orchestration-and-DAGs#tasks-and-dependencies). |
+| `skipExitCodes` | `Seq(Int)` | none | Exit codes, each from `1` to `255`, with which the task's command ends the task `skipped`. A `ConfigError` on an `approval` task. See [conditional branching](Orchestration-and-DAGs#conditional-branching). |
+| `when` | `Seq(Map)` | none | Comparisons that all have to hold for the task to run. A task whose condition does not hold ends `skipped`, and its command never starts. The entry keys follow this table. See [conditions](Orchestration-and-DAGs#conditions-on-parameters-and-xcom-values). |
 | `retries` | `Int` | `0` | Per-task retry attempts (DAG-owned). Must be `>= 0`: the job-level `-1` retry-forever sentinel is a `ConfigError` here. |
 | `retryDelaySeconds` | `Int`/`Float` | `0` | Delay between attempts. |
 | `expand` | `Map{fromTask, key}` | none | Dynamic mapping: fan out over an upstream's XCom (cross-communication) list (a direct, non-mapped dependency). |
@@ -454,6 +471,23 @@ Per-task keys:
 | `pokeTimeoutSeconds` | `Int`/`Float` | `3600` | Sensor: give up after this long. |
 | `pokeJitterSeconds` | `Int`/`Float` | `0` | Sensor: jitter added to each poke. |
 | `onReject` | `fail` / `skip` | `fail` | Approval gate: what a rejection does. |
+
+Each `when` entry sets one source (`param` or `xcom`) and one operator
+(`equals`, `notEquals`, `in`, or `notIn`):
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `param` | `Str` | The name of a parameter the DAG declares under `params`. |
+| `xcom` | `Map{task, key}` | A task upstream of this one that is not mapped, and the XCom key it published. |
+| `equals` | `Str` | Holds when the source equals the value. |
+| `notEquals` | `Str` | Holds when the source does not equal the value. |
+| `in` | `Seq(Str)` | Holds when the source equals one of the values. |
+| `notIn` | `Seq(Str)` | Holds when the source equals none of the values. |
+
+A comparison value is written as text. For `param`, cronstable converts the
+text to the parameter's declared type and checks it against the parameter's
+constraints. For `xcom`, the text is compared as it is and holds at most
+4096 bytes.
 
 Plus the shared launch fields a job takes: `shell`, `environment`,
 `captureStdout` / `captureStderr`, `monitorResources`, `saveLimit`,
@@ -468,7 +502,10 @@ attempts come from the node's `retries` field listed earlier). Where a task's
 
 The graph is validated at load: unknown/duplicate ids, a cycle, a self-edge, or
 an `expand.fromTask` that is not a direct non-mapped dependency are config
-errors.
+errors. So is a `params` entry whose `default` or `allowed` values fail the
+entry's own type and constraints, and a `when` entry that names an undeclared
+parameter, a value the parameter cannot hold, or an `xcom.task` that is
+mapped or is not upstream of the task.
 
 ### `logging`
 
@@ -758,6 +795,7 @@ in-memory history alone (the gate then resets on restart). See
 | `env_file` | `Str` | none | Path to a `KEY=VALUE` file; blank lines and `#` comments are ignored. Variables in `environment` override file values. A read error or a line without `=` raises a `ConfigError`. |
 | `workingDirectory` | `Str` or null | none | Directory the job's process starts in, the equivalent of the "Start in" box on a Task Scheduler action. Unset inherits cronstable's own working directory; under a `defaults:` block that sets it, a bare `workingDirectory:` on a job opts that one job back out to inheriting. The daemon expands `~` and `${VAR}` and makes the result absolute at load, so a relative value settles against cronstable's working directory once rather than per run. It deliberately does not check that the directory exists at load, because a load also happens on hosts that are not the target. The OS checks at spawn, and a missing directory records the run as a launch failure (exit `127`) whose log line names it. Not part of the [job-set ID](Job-Set-ID). See [commands and environment](Commands-and-Environment#workingdirectory) and [running on Windows](Running-on-Windows#working-directory). |
 | `secrets` | `Seq(Map({"name": Str, "value"/"fromFile"/"fromEnvVar": Str}))` | `[]` | Run-scoped secrets staged for the job over the [job-facing state endpoint](Durable-State#run-scoped-secrets) rather than placed in the environment, so they never show in `/proc/<pid>/environ`. Each needs a `name` and at least one source; when several are set, `value` wins over `fromFile`, which wins over `fromEnvVar` (a nameless or sourceless entry is a `ConfigError`; a same-named entry merges last-wins, like `environment`). A job reads one with `cronstable secret get NAME`. Requires a `state` section with `jobApi` enabled, else load fails naming the offending job(s). |
+| `params` | `Seq(Map)` | none | The [run parameters](Commands-and-Environment#params) a manual start can supply, with the keys a DAG's `params` entry takes. Every parameter needs a `default`. At most 32. A job key, so a `defaults:` block cannot set it. |
 | `stateAllowedScopes` | `Seq(Str)` | `[]` | Extra scope names (besides the job's own name and `global`) this job's `cronstable state\|cursor\|lock\|artifact` calls may explicitly name through `--scope`. Naming any other scope (most dangerously another job's own name, which IS that job's private scope) is refused (`403`). See [scopes](Durable-State#scopes). |
 
 ```yaml

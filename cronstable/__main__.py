@@ -534,6 +534,7 @@ def main_loop(loop=None):
         "artifact",
         "idempotent",
         "secret",
+        "param",
         "xcom",
     ):
         from cronstable import jobcli

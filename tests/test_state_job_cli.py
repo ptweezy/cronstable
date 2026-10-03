@@ -1016,3 +1016,72 @@ def test_unknown_xcom_action_raises(monkeypatch):
     monkeypatch.setenv(jobcli.ENV_DAG_XCOM_SCOPE, "dag:x/1")
     with pytest.raises(jobcli._CliError, match="unknown xcom action"):
         jobcli._cmd_xcom(argparse.Namespace(xcom_command="bogus"))
+
+
+# --------------------------------------------------------------------------
+# param
+# --------------------------------------------------------------------------
+
+_PARAMS = {"target": "prod", "batch_size": 500, "dry": False}
+
+
+@pytest.mark.parametrize(
+    "value,printed",
+    [
+        ("prod", "prod\n"),
+        ("", "\n"),
+        (500, "500\n"),
+        (0.5, "0.5\n"),
+        (True, "true\n"),
+        (False, "false\n"),
+    ],
+)
+def test_param_get_prints_the_value_as_the_variable_holds_it(
+    job_cli, capsys, value, printed
+):
+    http = _FakeHTTP({"/v1/param/get": (200, {"value": value})})
+    assert job_cli(["param", "get", "target"], http) == 0
+    assert capsys.readouterr().out == printed
+    assert http.calls[0]["query"] == {"name": "target"}
+    assert http.calls[0]["method"] == "GET"
+
+
+def test_param_get_missing_exit_4(job_cli, capsys):
+    http = _FakeHTTP({"/v1/param/get": (404, {})})
+    assert job_cli(["param", "get", "nope"], http) == 4
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "this run has no parameter: nope" in captured.err
+
+
+def test_param_list_prints_sorted_names(job_cli, capsys):
+    http = _FakeHTTP({"/v1/param/list": (200, {"params": _PARAMS})})
+    assert job_cli(["param", "list"], http) == 0
+    assert capsys.readouterr().out == "batch_size\ndry\ntarget\n"
+
+
+def test_param_dump_prints_one_json_object(job_cli, capsys):
+    http = _FakeHTTP({"/v1/param/list": (200, {"params": _PARAMS})})
+    assert job_cli(["param", "dump"], http) == 0
+    assert json.loads(capsys.readouterr().out) == _PARAMS
+    # a run with no parameters dumps an empty object and lists nothing
+    http = _FakeHTTP({"/v1/param/list": (200, {"params": {}})})
+    assert job_cli(["param", "dump"], http) == 0
+    assert capsys.readouterr().out == "{}\n"
+    assert job_cli(["param", "list"], http) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_param_without_an_action_and_endpoint_errors(job_cli, capsys):
+    assert job_cli(["param"]) == 2
+    assert "no action given" in capsys.readouterr().err
+    http = _FakeHTTP({"/v1/param/list": (500, {"error": "boom"})})
+    assert job_cli(["param", "dump"], http) == 1
+    assert "boom" in capsys.readouterr().err
+
+
+def test_unknown_param_action_raises(monkeypatch):
+    monkeypatch.setenv("CRONSTABLE_STATE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("CRONSTABLE_STATE_TOKEN", "tok")
+    with pytest.raises(jobcli._CliError, match="unknown param action"):
+        jobcli._cmd_param(argparse.Namespace(param_command="bogus"))

@@ -436,6 +436,29 @@ def _cmd_secret(args: argparse.Namespace) -> int:
     raise _CliError("unknown secret action {!r}".format(args.secret_command))
 
 
+def _cmd_param(args: argparse.Namespace) -> int:
+    if args.param_command == "get":
+        status, data = _json("GET", "/v1/param/get", query={"name": args.name})
+        if status == 404:
+            print(
+                "this run has no parameter: {}".format(args.name),
+                file=sys.stderr,
+            )
+            return EXIT_NOT_FOUND
+        _emit(_ok(status, data).get("value"))
+        return 0
+    if args.param_command not in ("list", "dump"):
+        raise _CliError("unknown param action {!r}".format(args.param_command))
+    status, data = _json("GET", "/v1/param/list")
+    params = _ok(status, data).get("params") or {}
+    if args.param_command == "dump":
+        sys.stdout.write(json.dumps(params) + "\n")
+        return 0
+    for name in sorted(params):
+        sys.stdout.write(str(name) + "\n")
+    return 0
+
+
 def _cmd_artifact(args: argparse.Namespace) -> int:
     scope = _scope_of(args)
     if args.artifact_command == "put":
@@ -681,6 +704,7 @@ _DISPATCH = {
     "artifact": _cmd_artifact,
     "idempotent": _cmd_idempotent,
     "secret": _cmd_secret,
+    "param": _cmd_param,
     "xcom": _cmd_xcom,
 }
 
@@ -698,6 +722,7 @@ def dispatch(args: argparse.Namespace) -> int:
         "lock": "lock_command",
         "artifact": "artifact_command",
         "secret": "secret_command",
+        "param": "param_command",
         "xcom": "xcom_command",
     }.get(args.command)
     if action_attr is not None and getattr(args, action_attr, None) is None:

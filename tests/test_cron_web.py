@@ -2717,7 +2717,7 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
             Req(match={"name": "d"}, body={"from": 1, "to": 2})
         )
 
-    async def bad_backfill(name, start, end):
+    async def bad_backfill(name, start, end, **kwargs):
         return {"ok": False, "reason": "nope"}
 
     monkeypatch.setattr(cron._dag, "backfill", bad_backfill)
@@ -2729,7 +2729,7 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
             )
         )
 
-    async def ok_backfill(name, start, end):
+    async def ok_backfill(name, start, end, **kwargs):
         return {"ok": True, "runs": 2}
 
     monkeypatch.setattr(cron._dag, "backfill", ok_backfill)

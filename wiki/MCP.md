@@ -104,7 +104,33 @@ on a gate, report `destructiveHint: true` and `openWorldHint: true`, so a
 client that asks before risky calls asks before these. `cron_backfill_dag`
 defaults to `dry_run: true`. The default dry run confirms the workflow exists
 and echoes the range; the range itself is validated only when `dry_run: false`
-and `confirm: true` execute it.
+and `confirm: true` execute it. An executed backfill returns the runs it
+created (`created`, `runKeys`) and the dates that already had a run
+(`existing`, `existingRunKeys`).
+
+For a job that declares [run parameters](Commands-and-Environment#params), `cron_list_jobs` returns the
+declaration under `params`, and `cron_run_job` takes a `params` object. The
+result lists the values the run takes. A refused value returns an error that
+names it, and nothing starts.
+
+For a workflow that declares
+[run parameters](Orchestration-and-DAGs#run-parameters), `cron_list_dags`
+returns the declaration under `params`, and both tools take a `params`
+object of values:
+
+- `cron_trigger_dag` also takes `logical_date` and `request_id`. A call that
+  repeats a `request_id` returns the first run with `created: false`, so an
+  agent that retries a call starts one run. The result carries the values
+  the run stores under `params`.
+- `cron_backfill_dag` checks `params` in the dry run too, and the dry run
+  returns the values the created runs would store.
+- Refused values come back as an error result that names each parameter and
+  its reason, so the model can correct the call.
+- With scoped web tokens, a non-empty `params` object needs the `params`
+  scope in addition to `control`, as on the REST routes. Without it, both
+  tools start runs with the declared defaults.
+- A run that a tool call created records the token's label under
+  `triggeredBy` (`mcp` on a listener without tokens).
 
 `cron_pause_job` takes `name` plus an optional `durationSeconds` and `note`,
 and holds the job's scheduled fires for the window (one hour when

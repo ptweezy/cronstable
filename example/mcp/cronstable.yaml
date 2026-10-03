@@ -74,6 +74,16 @@ jobs:
     schedule: "*/5 * * * *"
 
   # Never scheduled: an agent starts it with cron_run_job (confirm=true).
+  # `params` declares the values a start can choose; cron_list_jobs lists
+  # them, and the command reads each one as CRONSTABLE_PARAM_<NAME>:
+  #   cron_run_job {"name": "on-demand-sync", "params": {"target": "eu"}}
   - name: on-demand-sync
-    command: echo "manual sync ran at $(date -u +%T) UTC"
+    command: echo "manual sync of $CRONSTABLE_PARAM_TARGET ran at $(date -u +%T) UTC"
     schedule: "0 0 31 2 *"    # 31 Feb: never fires on its own
+    params:
+      - name: target
+        default: all
+        allowed:
+          - all
+          - eu
+          - us

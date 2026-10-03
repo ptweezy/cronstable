@@ -70,7 +70,7 @@ section. `listen` is required; the rest are optional (strictyaml `Opt(...)`).
 | `headers` | map of string→string | (none) | Extra HTTP headers added to every `200` success response except `POST /mcp` (all routes, including `/cluster` and `/job-set-id`) and to the `409` conflict body, but not the `404` or `401`. |
 | `allowedOrigins` | sequence of strings | `[]` | Extra exact-match browser `Origin`s allowed to call the mutating `POST` endpoints (see [cross-site request defense](#cross-site-request-defense)). |
 | `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes as an all-scopes token (see [authentication](#authentication)). |
-| `authTokens` | sequence of maps (`value`/`fromFile`/`fromEnvVar` + `scopes` + optional `label`) | `[]` | Additional per-device scoped bearer tokens (`view`/`control`/`approve`). To revoke one, drop its entry and reload (see [scoped tokens](#scoped-tokens-webauthtokens)). |
+| `authTokens` | sequence of maps (`value`/`fromFile`/`fromEnvVar` + `scopes` + optional `label`) | `[]` | Additional per-device scoped bearer tokens (`view`/`control`/`approve`/`params`). To revoke one, drop its entry and reload (see [scoped tokens](#scoped-tokens-webauthtokens)). |
 | `anonymousScopes` | sequence of strings (`view` only) | `[]` | Scopes granted to requests presenting no credential, turning the instance into a public read-only board. Requires at least one configured token, and the schema refuses mutating scopes (see [public read-only access](#public-read-only-access-webanonymousscopes)). |
 | `socketMode` | string (octal) | (none) | File mode applied with `chmod` to `unix://` listen sockets (see [Unix socket permissions](#unix-socket-permissions)). It applies only to `unix://` sockets, so it does nothing on Windows, where the daemon skips unix-socket listeners with a warning. |
 | `tls` | map (`cert`/`key`/`clientCa`) | (none) | Certificate and key served by every `https://` listen address, plus an optional CA that makes those listeners require a client certificate (mutual TLS). `cert` and `key` are required together. The config loader validates the block and the `https://` addresses against each other at load. See [listener TLS](Listener-TLS). |
@@ -570,6 +570,25 @@ The `409` for a disabled job is deliberate: a disabled job behaves as if it is
 not there, so the API refuses to launch it manually rather than overriding the
 config.
 
+The body is optional. For a job that declares
+[run parameters](Commands-and-Environment#params), `{"params": {...}}` supplies values, each in its
+declared JSON type, and the answer lists the values the run takes:
+
+```json
+{"started": "reindex", "params": {"index": "orders", "full": false}}
+```
+
+- A start without values takes the defaults, and the answer lists them too.
+- Refused values answer `400` with the reason for each name under
+  `paramErrors`, and nothing starts. A job that declares no parameters
+  refuses any value.
+- A non-empty `params` object needs the `params` scope in addition to
+  `control`, and a token without it gets `403`.
+- A body that is not a JSON object, or a JSON object without `params`,
+  starts the job with its defaults.
+- The `202` of a pooled job carries `params` as well, and the queue entry
+  keeps the values until the pool admits the run.
+
 Manual launch goes through `maybe_launch_job`, so the job's `concurrencyPolicy`
 applies. If an instance is already running, `Allow` starts another, `Forbid` does
 not start a new one (the `200` still returns), and `Replace` cancels the running
@@ -642,6 +661,7 @@ the endpoint the [web dashboard](Web-Dashboard) polls.
 | `scheduled_in` | Seconds until the next scheduled run (a float), or `null` when not applicable (disabled, running, or a one-off `@reboot` schedule). |
 | `never_fires` | `true` when the job is enabled but its crontab has no future occurrence (a fixed past year, an impossible date), distinguishing the dead-schedule `scheduled_in: null` from the running/disabled ones. See [schedule linting](Schedule-Linting). |
 | `schedule_findings` | The [schedule linter's](Schedule-Linting) advisory findings for this crontab, each `{code, level, message}` (empty for a clean schedule). Computed once at config load, in the job's own time zone. |
+| `params` | The [run parameters](Commands-and-Environment#params) the job declares, in the shape `GET /dags` uses for a DAG's declaration. Present only on a job that declares them. `last_run` and each run of `GET /jobs/{name}/runs` carry the values that run took under `params`. |
 | `schedule_resolved` | Present only for [`H` hashed schedules](Hashed-Schedules): the plain expression the `H` items resolved to for this job, so clients can compute previews while displaying the `H` the user wrote. |
 | `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`, `skip_reason`, `resources`, and `ranAt` on a run that was not `skipped`), or `null` if the job has not run yet. One exception: a run in progress when this host crashed is reported here as `unknown` even though it never finished. It stands at the instant it started, so a run that finished while it was still going can carry a later `finished_at`. The crash stays visible instead of hidden behind whatever outlived it. |
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`, whose ordering note covers this tail too. |
@@ -897,9 +917,56 @@ The configured DAGs and their tasks:
 
 ```json
 [{"name": "nightly-etl", "enabled": true, "scheduled": true,
-  "tasks": [{"id": "extract", "type": "task", "dependsOn": []},
-            {"id": "load", "type": "task", "dependsOn": ["extract"]}]}]
+  "tasks": [{"id": "extract", "type": "task", "dependsOn": [],
+             "triggerRule": "all_success", "retries": 0, "mapped": false},
+            {"id": "load", "type": "task", "dependsOn": ["extract"],
+             "triggerRule": "all_success", "retries": 0, "mapped": false,
+             "skipExitCodes": [99]}]}]
 ```
+
+Each task carries its
+[`triggerRule`](Orchestration-and-DAGs#tasks-and-dependencies), one of
+`all_success`, `all_done`, `none_failed`, `none_failed_min_one_success`, and
+`all_done_min_one_failed`. A client treats the value as an open string and
+displays one it does not know by name. A task that sets
+[`skipExitCodes`](Orchestration-and-DAGs#conditional-branching) carries the
+sorted list, and every other task has no `skipExitCodes` key.
+
+A task that sets [`when:`](Orchestration-and-DAGs#conditions-on-parameters-and-xcom-values) carries `when`, its comparisons in the shape
+the configuration writes them:
+
+```json
+{"id": "incremental-load", "when": [
+  {"param": "mode", "notEquals": "full"},
+  {"xcom": {"task": "extract", "key": "row_count"}, "notIn": ["0"]}]}
+```
+
+`equals` and `notEquals` carry one value, and `in` and `notIn` carry a list.
+A comparison on a parameter carries values in the parameter's declared type,
+and a comparison on an XCom value carries strings.
+
+An entry for a DAG that declares
+[run parameters](Orchestration-and-DAGs#run-parameters) carries `params`, the
+declaration in order:
+
+```json
+{"name": "deploy", "params": [
+  {"name": "target", "type": "string", "default": "staging",
+   "allowed": ["staging", "prod"], "description": "Environment to deploy to"},
+  {"name": "batch_size", "type": "integer", "default": 500,
+   "minimum": 1, "maximum": 10000},
+  {"name": "ticket", "type": "string", "required": true,
+   "pattern": "OPS-[0-9]+", "maxLength": 32}]}
+```
+
+Each parameter has `name` and `type`, then `default` or `required: true`,
+then the constraints its declaration sets. A client sends `params` on a
+trigger or a backfill only for a DAG whose entry has this key.
+
+An entry carries `fleetWarnings`, a list of strings, while another live host
+on the shared store runs a build below the
+[run engine level](Orchestration-and-DAGs#run-engine-levels) the DAG needs.
+Each string names one host.
 
 #### `GET /dags/{name}/runs`
 
@@ -922,23 +989,119 @@ durable store; the `error` says which.
 #### `GET /dags/{name}/runs/{run_key}`
 
 One run's full durable document: every task's state, attempt, timing, XCom
-(cross-communication) expansion (`mapped`), and approval decisions. `404` if
-the run is unknown, with the same split between an unknown DAG and a missing
-`state:` store.
+(cross-communication) expansion (`mapped`), and approval decisions. The
+document has an `engine` field when the DAG needs a
+[run engine level](Orchestration-and-DAGs#run-engine-levels) above 1. A task
+entry in the `skipped` state carries a `skipReason` object that says why:
+
+```json
+{"tasks": {"incremental-load": {
+  "state": "skipped", "exitCode": 99,
+  "skipReason": {"kind": "exit_code", "detail": "exit code 99"}}}}
+```
+
+`kind` is `exit_code`, `upstream`, `trigger_rule`, `approval`, or `condition`
+(see [the task state machine](Orchestration-and-DAGs#the-task-state-machine)).
+A client treats the value as an open string and shows `detail` for a kind it
+does not know. A task entry carries `whenMet: true` once the task's
+[`when:`](Orchestration-and-DAGs#conditions-on-parameters-and-xcom-values) comparisons held. A
+run can end `success` with `skipped` tasks. `skipReason` is optional: a run
+document from a build that records no reason has `skipped` entries without
+it.
+
+A run of a DAG that declares parameters carries `params`, the values the run
+stores, written at creation. A run that a trigger or a backfill request
+created carries `triggeredBy`, the label of the requesting token:
+
+```json
+{"engine": 2,
+ "params": {"target": "prod", "batch_size": 500, "ticket": "OPS-4412"},
+ "triggeredBy": "ops-laptop"}
+```
+
+Every reader with the `view` scope sees these values.
+
+`404` if the run is unknown, with the same split between an unknown DAG and a
+missing `state:` store.
 
 #### `POST /dags/{name}/trigger`
 
-Create and start a manual run now. Returns `{"dag": …, "name": …, "runKey":
-…}` (`name` duplicates `dag`, the generic subject key the job routes use).
-`404` if the DAG is not configured. A run that could not be durably recorded
-(the state backend is unavailable) surfaces as a `500` error rather than a
-`runKey` for a run that does not exist.
+Create and start a manual run now. Every body field is optional, and a
+request with no body starts a run with the declared parameter defaults.
+
+```json
+{"params": {"target": "prod", "ticket": "OPS-4412"},
+ "logicalDate": "2026-10-01T00:00:00+00:00",
+ "requestId": "0b6c2f0e-6f0f-4d7a-9a55-3d1e2c9f7a11"}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `params` | Values for the [run parameters](Orchestration-and-DAGs#run-parameters) the DAG declares, each in its declared JSON type. A non-empty object needs the `params` scope. |
+| `logicalDate` | An ISO 8601 instant that the run records as its logical date, stored in UTC. A value without an offset is read as UTC. |
+| `requestId` | A string of 1 to 200 characters that makes the request repeatable. The run key is derived from it, so a repeated request returns the first run while that run is retained. |
+
+```json
+{"dag": "deploy", "name": "deploy", "runKey": "manual-3fa1c2d4e5f6",
+ "created": true,
+ "params": {"target": "prod", "batch_size": 500, "ticket": "OPS-4412"}}
+```
+
+`name` duplicates `dag`, the generic subject key the job routes use.
+`created` is `false` when `requestId` named a run that an earlier request
+created. `params` holds the values the run stores, with defaults applied,
+and is present for a DAG that declares parameters.
+
+| Status | When |
+| --- | --- |
+| `200` | The run exists. `created` says whether this request created it. |
+| `400` | Invalid JSON, an unknown body field, an unusable `logicalDate` or `requestId`, or refused parameters. |
+| `403` | The token lacks `control`, or the body has a non-empty `params` object and the token lacks `params`. |
+| `404` | The DAG is not configured. |
+| `409` | `requestId` names a run that has other parameters or another logical date. |
+| `500` | The run could not be durably recorded, because the state backend is unavailable. The response carries no `runKey` for a run that does not exist. |
+
+A `400` for refused parameters adds `paramErrors` to the error envelope, with
+the reason for each name. The request creates no run:
+
+```json
+{"error": "invalid parameters for workflow 'deploy'",
+ "paramErrors": {"batch_size": "must be at most 10000",
+                 "colour": "is not a declared parameter",
+                 "ticket": "is required"}}
+```
 
 #### `POST /dags/{name}/backfill`
 
 Replay a scheduled DAG across a historical range. Body:
-`{"from": "<ISO>", "to": "<ISO>"}`. Idempotent (create-if-absent per date) and
-bounded. Returns `{"ok": true, "created": <N>}`; `400` on a bad range.
+`{"from": "<ISO>", "to": "<ISO>"}`. Each scheduled date in the range gets a
+run unless one already exists, so repeating a backfill creates no duplicate.
+One request covers at most 100 dates.
+
+The body accepts `from`, `to`, and `params`, and any other field answers
+`400`, so a misspelled key never starts a backfill.
+
+For a DAG that declares
+[run parameters](Orchestration-and-DAGs#run-parameters), the body also takes
+`params`, checked once before any run is created. The values apply to the
+runs this request creates. A date that already has a run keeps that run's
+values, and `existingRunKeys` names it. A non-empty `params` object needs the
+`params` scope.
+
+```json
+{"ok": true, "created": 3, "existing": 4,
+ "runKeys": ["2026-01-05T02:00:00_00:00", "…"],
+ "existingRunKeys": ["2026-01-01T02:00:00_00:00", "…"]}
+```
+
+`created` counts the runs this request created, and `runKeys` lists them.
+`existing` counts the dates that already had a run, listed in
+`existingRunKeys`. Those runs are unchanged. `400` on a bad range, on a DAG
+that is unknown or has no schedule, on an unknown body field, and on refused
+parameters, which add
+`paramErrors` as the trigger route does. `403` when the body has a non-empty
+`params` object and the token lacks `params`. A backfill that cannot be
+durably recorded (the state backend is unavailable) is a `500`.
 
 #### `POST /dags/{name}/runs/{run_key}/tasks/{taskkey}/decision`
 
@@ -1314,7 +1477,7 @@ $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/status
 ### Scoped tokens (`web.authTokens`)
 
 The scalar `web.authToken` described earlier is an all-scopes token: it can
-read, control, and approve. To hand out a narrower credential (a phone that
+read, control, approve, and choose run parameters. To hand out a narrower credential (a phone that
 should never carry the all-scopes token, a wallboard that only reads, a CI job
 that only triggers), add `web.authTokens`, a list of per-device tokens each
 carrying a `scopes` list and an optional `label`:
@@ -1353,17 +1516,33 @@ compared). Two tokens resolving to the same secret are refused at startup
 entry's scopes could ever apply, and a scoped entry repeating the all-scopes
 `authToken` would otherwise silently downgrade it.
 
-There are three scopes:
+There are four scopes:
 
 | Scope | Grants |
 | --- | --- |
 | `view` | Every read-only `GET`: jobs, runs, DAGs, cluster/fleet, schedule intelligence, the state inspector, the SSE log tail, the calendar feeds, and `/metrics`. Also the MCP endpoint (`POST /mcp`) and its read tools. |
 | `control` | The mutating actions: `POST` start / cancel / pause / resume, DAG trigger / backfill, and the MCP tools that take them, plus `cron_preview_recovery`. |
 | `approve` | Only the DAG approval-gate decision (`POST …/decision`). |
+| `params` | Choosing [run parameter](Orchestration-and-DAGs#run-parameters) values on a job start, a DAG trigger, or a DAG backfill. Those routes also need `control`. |
 
-`control` and `approve` each **imply** `view` (an action UI has to read state
-first), so a `[control]` token can also call every `GET`. `approve` does
-**not** imply `control`.
+`control`, `approve`, and `params` each **imply** `view` (an action UI has to
+read state first), so a `[control]` token can also call every `GET`.
+`approve` does **not** imply `control`, and neither does `params`.
+
+A `[control]` token starts workflow runs with the declared parameter
+defaults. To let a token choose values, grant it both scopes:
+
+```yaml
+web:
+  listen:
+    - http://0.0.0.0:8080
+  authTokens:
+    - label: ops-laptop
+      scopes:
+        - control
+        - params
+      fromEnvVar: OPS_TOKEN
+```
 
 The required scope for a route is the safe-method default
 (`GET`/`HEAD`/`OPTIONS` → `view`, everything else → `control`) with two
@@ -1374,6 +1553,11 @@ requires the scope of the REST route it mirrors, so a `[view]` token opens a
 read-only MCP session, the mutating tools and `cron_preview_recovery` need `control`, and
 `cron_decide_gate` needs `approve`. No token takes through `/mcp` an action
 this table denies it over REST.
+
+No route requires `params` by itself. The trigger and backfill handlers
+check it when the request body carries a non-empty `params` object, and so
+do `cron_trigger_dag` and `cron_backfill_dag`. A daemon with no token
+configured accepts parameter values, as it accepts every action.
 
 The two failure modes are distinct:
 
@@ -1452,7 +1636,7 @@ Five limits are fixed in the code, and no setting relaxes them:
 | Caller | Response |
 | --- | --- |
 | Matched token | `{"authenticated": true, "label": "operator", "scopes": [...], "allScopes": …}` |
-| No auth configured | `{"authenticated": false, "label": null, "scopes": ["approve","control","view"], "allScopes": true}` |
+| No auth configured | `{"authenticated": false, "label": null, "scopes": ["approve","control","params","view"], "allScopes": true}` |
 | Anonymous grant | `{"authenticated": false, "label": "anonymous", "scopes": ["view"], "allScopes": false}` |
 
 `anonymous` is a reserved label; do not name a real token with it. The bundled
@@ -1744,6 +1928,8 @@ All routes are under `/v1/` and registered in `JobStateAPI._routes`:
 | `POST` | `/v1/lock/release` | `{token}` | `{released}` |
 | `GET` | `/v1/secret/get` | `?name=` | `{value}`, or `404` |
 | `GET` | `/v1/secret/list` | -- | `{names: [...]}` |
+| `GET` | `/v1/param/get` | `?name=` | `{value}` in the declared JSON type, or `404` |
+| `GET` | `/v1/param/list` | -- | `{params: {...}}`, the [run parameters](Orchestration-and-DAGs#run-parameters) of the calling run, empty for a run without parameters |
 
 `cursor/advance` is monotonic by default: the stored value only ever moves to
 `max(current, value)`, so a replayed or out-of-order batch cannot walk a

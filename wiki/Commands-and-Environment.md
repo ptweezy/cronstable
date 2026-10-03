@@ -134,9 +134,12 @@ With a `state:` section configured, the daemon injects `CRONSTABLE_STATE_URL`,
 `CRONSTABLE_ATTEMPT`, `CRONSTABLE_SCHEDULED_AT`, and `CRONSTABLE_HOST` into
 every run (`state.jobApi.enabled` defaults to `true`). A
 [workflow](Orchestration-and-DAGs) task receives its `CRONSTABLE_DAG_*`
-variables the same way. Because they are applied last, these variables
-override a job's own values for the same names. See
-[durable state](Durable-State).
+variables the same way, and one `CRONSTABLE_PARAM_<NAME>` variable for each
+[run parameter](Orchestration-and-DAGs#run-parameters) of its run. A job that
+declares [`params`](#params) receives one `CRONSTABLE_PARAM_<NAME>` variable
+for each value its run takes, with or without a `state:` section. Because
+they are applied last, these variables override a job's own values for the
+same names. See [durable state](Durable-State).
 
 If `environment` is empty (the default), there is no `env_file`, and none of
 the other cases applies, no `env` is passed to the subprocess, so it inherits
@@ -253,6 +256,67 @@ then job, job winning) < daemon-injected `CRONSTABLE_*` run variables (with a
 `state:` section). See
 [includes, defaults, and multi-file config](Includes-and-Defaults) for how
 `defaults` and includes are merged overall.
+
+## params
+
+A job can declare run parameters: values that a manual start can choose and
+that the command reads from its environment. The declaration takes the keys
+a [workflow's declaration](Orchestration-and-DAGs#declaring-parameters)
+takes, and every parameter has a `default`, because every job has a schedule
+and a scheduled run uses the defaults.
+
+```yaml
+jobs:
+  - name: reindex
+    command: ./reindex.sh "$CRONSTABLE_PARAM_INDEX"
+    schedule: "0 3 * * *"
+    params:
+      - name: index
+        default: products
+        allowed:
+          - products
+          - orders
+      - name: full
+        type: boolean
+        default: false
+```
+
+How a run gets its values:
+
+- A manual start supplies values through `POST /jobs/{name}/start` with a
+  body such as `{"params": {"index": "orders"}}`, the dashboard's **Run**
+  dialog, the terminal dashboard's run row, or the MCP tool `cron_run_job`.
+  cronstable checks each value against the declaration and coerces nothing,
+  and a refused request starts nothing. With
+  [scoped tokens](HTTP-API#scoped-tokens-webauthtokens), supplying values
+  needs the `params` scope in addition to `control`.
+- A start without values, a scheduled run, a catch-up run, and a retry take
+  the defaults of the current declaration.
+- A start that supplies values is a single attempt. It stays out of the
+  job's retry ladder, whose retries take the defaults.
+- A job in a [resource pool](Resource-Pools) carries the values in its queue
+  entry, so the run takes them when the pool admits it. A change to the
+  declaration cancels an entry that is still queued.
+
+How the command reads them:
+
+- Each value is a `CRONSTABLE_PARAM_<NAME>` environment variable, with the
+  name in upper case. A boolean reads `true` or `false`, and a number reads
+  as its JSON text. A value is never substituted into the command.
+- With a `state:` section, `cronstable param get|list|dump` reads the same
+  values over the job-facing endpoint (see the
+  [CLI reference](CLI-Reference#param-getlistdump-run-parameters)).
+- A run of a job that declares `params` sees only its own values. A
+  `CRONSTABLE_PARAM_*` variable in the daemon's own environment is dropped.
+
+The run history records the values each run took under `params`, and so does
+the durable run ledger. Every reader with the `view` scope sees them, so a
+parameter name that reads as a secret is a configuration error. Keep a
+secret in the job's [`secrets`](Durable-State#run-scoped-secrets) block. A
+parameter can carry the secret's name.
+
+`params` is a job key, so a `defaults:` block cannot set it. A change to the
+declaration changes the job's [job-set ID](Job-Set-ID).
 
 ## workingDirectory
 

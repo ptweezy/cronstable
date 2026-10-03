@@ -42,6 +42,7 @@ if TYPE_CHECKING:  # the loopback job-state API is imported lazily at runtime
 
     from cronstable.jobapi import JobStateAPI
 
+import cronstable.dag
 import cronstable.version
 from cronstable import (
     _gzip,
@@ -52,6 +53,7 @@ from cronstable import (
     statsd,
     tlsutil,
 )
+from cronstable import params as run_params
 from cronstable._gzip import gzip_body as _gzip_body
 from cronstable.config import (
     WEB_TOKEN_SCOPES,
@@ -82,7 +84,12 @@ from cronstable.croninfo import (
     suggest_slot,
     why_no_run,
 )
-from cronstable.dagrun import DAG_CATCHUP_STREAM_PREFIX, DagScheduler
+from cronstable.dagrun import (
+    DAG_CATCHUP_STREAM_PREFIX,
+    DagScheduler,
+    TriggerConflict,
+    TriggerInputError,
+)
 from cronstable.fingerprint import job_digest_cached, job_set_id
 from cronstable.ical import CalendarEntry, render_calendar
 from cronstable.job import (
@@ -101,6 +108,7 @@ from cronstable.job import (
     schedule_string,
 )
 from cronstable.leadership import LeadershipBackend, make_backend
+from cronstable.params import ParamError
 from cronstable.pools import PoolError, PoolScheduler, Ticket
 from cronstable.prometheus import (
     CONTENT_TYPE_OPENMETRICS,
@@ -264,6 +272,10 @@ MANIFEST_HOSTS_CAP = 2000
 # Manifest re-record and GC cadences. Loop-clock gated, per process.
 STATE_MANIFEST_INTERVAL = 21600.0
 STATE_GC_INTERVAL = 86400.0
+# A host whose newest manifest is older than this is not running: a live
+# node re-records every STATE_MANIFEST_INTERVAL. Bounds how long a stopped
+# or decommissioned host counts toward the DAG fleet warning.
+MANIFEST_LIVE_SECONDS = 2 * STATE_MANIFEST_INTERVAL
 # Store-hit cadence for the paused/ refresh and foreign-retry claim scans
 # (single-flight only stops overlap). Just under a minute so a pass landing
 # a hair early still sweeps instead of halving the cadence.
@@ -340,9 +352,15 @@ WEB_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # mcp.allowedOrigins); gating here too would 403 an allow-listed client.
 WEB_ORIGIN_EXEMPT_PATHS = frozenset({"/mcp"})
 
-# What the scalar web.authToken grants; `control` and `approve` imply
-# `view`, expanded by _effective_web_scopes at token-resolution time.
+# What the scalar web.authToken grants; `control`, `approve`, and `params`
+# imply `view`, expanded by _effective_web_scopes at token-resolution time.
 _WEB_ALL_SCOPES = frozenset(WEB_TOKEN_SCOPES)
+
+# The scope a caller holds, on top of the route's own, to choose run
+# parameter values on a trigger or a backfill. No route requires it by
+# itself: the handlers check it (Cron._web_run_params), and so do the MCP
+# twins of those routes.
+WEB_PARAMS_SCOPE = "params"
 
 # Routes whose required scope differs from the method default (safe method
 # -> `view`, else `control`), keyed by canonical path. Unlisted routes use
@@ -462,10 +480,10 @@ WEB_ROUTES: "tuple[tuple[str, str, str, str | None], ...]" = (
 
 
 def _effective_web_scopes(scopes: Iterable[str]) -> "frozenset[str]":
-    """Expand declared token scopes: ``control`` and ``approve`` imply
-    ``view`` (an action UI must read state first)."""
+    """Expand declared token scopes: ``control``, ``approve``, and
+    ``params`` imply ``view`` (an action UI must read state first)."""
     effective = set(scopes)
-    if effective & {"control", "approve"}:
+    if effective & {"control", "approve", WEB_PARAMS_SCOPE}:
         effective.add("view")
     return frozenset(effective)
 
@@ -835,6 +853,9 @@ class JobRunInfo:
     verification: dict[str, Any] | None = None
     # why a synthetic "skipped" row exists ("paused"); None for real runs.
     skip_reason: str | None = None
+    # the run parameter values of a job that declares `params`; None for a
+    # job that declares none.
+    params: dict[str, Any] | None = None
     # Elapsed seconds, derived once at construction (both operands are
     # immutable). compare=False keeps equality over the recorded fields.
     duration: float | None = field(default=None, init=False, compare=False)
@@ -886,6 +907,8 @@ class JobRunInfo:
             data["ranAt"] = finished
         if self.verification is not None:
             data["verification"] = self.verification
+        if self.params is not None:
+            data["params"] = self.params
         return data
 
 
@@ -1335,6 +1358,9 @@ def _job_run_info_from_dict(
         resource_usage=ResourceUsage.from_dict(rec.get("resources")),
         verification=rec.get("verification")
         if isinstance(rec.get("verification"), dict)
+        else None,
+        params=rec.get("params")
+        if isinstance(rec.get("params"), dict)
         else None,
     )
 
@@ -4555,6 +4581,36 @@ class Cron:
         )
 
     async def start_job_by_name(self, name: str) -> str | None:
+        """Launch a job now with its default parameters.
+
+        :meth:`start_job` without values: returns the pool queue ID of a
+        job in a pool, and ``None`` for a job that started at once.
+        """
+        queued: str | None = (await self.start_job(name))["queued"]
+        return queued
+
+    @staticmethod
+    def _job_run_params(
+        job: JobConfig, supplied: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        """The parameter values a run of ``job`` takes.
+
+        ``supplied`` checked against the job's ``params`` declaration, with
+        the defaults filled in. ``None`` for a job that declares none and is
+        given none. Raises :class:`~cronstable.params.ParamError` for values
+        the declaration refuses, which includes any value for a job that
+        declares no parameters.
+        """
+        declared = getattr(job, "params", ())
+        if not declared and not supplied:
+            return None
+        return run_params.resolve(
+            declared, supplied or {}, "job {!r}".format(job.name)
+        )
+
+    async def start_job(
+        self, name: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Launch a job now (`POST /jobs/{name}/start`, MCP `cron_run_job`).
 
         Raises :class:`ApiActionError` for an unknown (404) or disabled (409)
@@ -4563,6 +4619,17 @@ class Cron:
         skips scheduled fires only, and the operator asking by hand is the
         operator overriding their own pause (unlike `enabled: false`, which
         is config the API must not silently override).
+
+        ``params`` supplies values for the run parameters the job declares.
+        They are checked before anything else happens, and refused values
+        raise :class:`~cronstable.params.ParamError` and start nothing. A
+        start that supplies values is one attempt: it stays outside the
+        job's retry ladder, whose retries run with the defaults like the
+        scheduled runs they repeat.
+
+        Returns ``queued``, the pool queue ID or ``None`` for a job that
+        started at once, and ``params``, the values the run takes or
+        ``None`` for a job that declares none.
         """
         try:
             job = self.cron_jobs[name]
@@ -4576,6 +4643,10 @@ class Cron:
             raise ApiActionError(
                 "job {!r} is disabled".format(name), status=409
             )
+        resolved = self._job_run_params(job, params)
+        # a start with no values runs as a scheduled run would, so only
+        # supplied values travel with the launch
+        chosen = resolved if params else None
         # A manual start of a job still pending as a deferred @reboot
         # one-shot IS its boot run: retire the pending entry and record the
         # run with the cluster, or _process_pending_reboots would run the
@@ -4614,17 +4685,21 @@ class Cron:
                 await self._reboot_boot_gate(job)
         if getattr(job, "pool", None) is not None:
             try:
-                entry = await self._pools.enqueue_job(job, manual=True)
-                return str(entry["id"])
+                entry = await self._pools.enqueue_job(
+                    job, manual=True, params=chosen
+                )
+                return {"queued": str(entry["id"]), "params": resolved}
             except PoolError as ex:
                 raise ApiActionError(str(ex), status=409) from ex
             except (OSError, asyncio.TimeoutError) as ex:
                 raise ApiActionError(
                     "pool state is unavailable", status=503
                 ) from ex
-        else:
+        elif chosen is None:
             await self.maybe_launch_job(job)
-        return None
+        else:
+            await self.maybe_launch_job(job, with_retries=False, params=chosen)
+        return {"queued": None, "params": resolved}
 
     async def cancel_job_by_name(self, name: str) -> int:
         """Cancel a job's running instances; return how many were signalled.
@@ -5347,20 +5422,41 @@ class Cron:
     @_maps_action_errors
     async def _web_start_job(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
-        queued = await self.start_job_by_name(name)
-        if queued is not None:
+        supplied: dict[str, Any] | None = None
+        if request.can_read_body:
+            # The body is optional. A JSON object can carry `params`; any
+            # other body starts the job with its defaults, as a request
+            # with no body does.
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001 - a body this route ignores
+                body = None
+            if isinstance(body, dict):
+                supplied = self._web_run_params(request, body)
+        try:
+            started = await self.start_job(name, supplied)
+        except ParamError as ex:
+            return self._web_param_error(ex)
+        # the values the run takes, for a job that declares parameters
+        values = (
+            {} if started["params"] is None else {"params": started["params"]}
+        )
+        if started["queued"] is not None:
             return _json_response(
                 {
                     "queued": name,
-                    "queueId": queued,
+                    "queueId": started["queued"],
                     "pool": self.cron_jobs[name].pool,
+                    **values,
                 },
                 status=202,
                 headers=self._web_headers(),
             )
         # a minimal JSON ack in the MCP cron_run_job shape; this route once
         # returned an empty 200 while every sibling action returned JSON.
-        return _json_response({"started": name}, headers=self._web_headers())
+        return _json_response(
+            {"started": name, **values}, headers=self._web_headers()
+        )
 
     @_maps_action_errors
     async def _web_cancel_job(self, request: web.Request) -> web.Response:
@@ -5702,6 +5798,10 @@ class Cron:
                 "slots": job.poolSlots,
                 "priority": job.queuePriority,
             }
+        if job.params:
+            # the declaration a client builds its start form from, present
+            # only on a job that declares parameters
+            result["params"] = run_params.declaration(job.params)
         if job.schedule_resolved_or_none is not None:
             # the H hash form: also ship the plain-dialect spelling it
             # resolved to, so the dashboards display the H the user wrote
@@ -6184,15 +6284,94 @@ class Cron:
         )
         return _json_response(payload, headers=self._web_headers())
 
+    def _web_run_params(
+        self, request: web.Request, payload: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """The ``params`` map of a trigger or backfill body, or ``None``.
+
+        Choosing values needs the ``params`` scope on top of the route's
+        ``control``: a token without it answers ``403`` to a non-empty map
+        and starts runs with the declared defaults. A listener with no
+        token configured accepts values, as it accepts every action.
+        """
+        supplied = payload.get("params")
+        if supplied is None:
+            return None
+        if not isinstance(supplied, dict):
+            raise _api_error(
+                web.HTTPBadRequest, "params must be a JSON object"
+            )
+        matched = request.get(WEB_TOKEN_REQUEST_KEY)
+        if (
+            supplied
+            and matched is not None
+            and WEB_PARAMS_SCOPE not in matched.scopes
+        ):
+            raise _api_error(
+                web.HTTPForbidden,
+                "token {!r} does not grant the {!r} permission required to "
+                "supply run parameters".format(
+                    matched.label, WEB_PARAMS_SCOPE
+                ),
+            )
+        return supplied
+
+    def _web_param_error(self, ex: ParamError) -> web.Response:
+        """The ``400`` for refused parameters: the error envelope plus
+        ``paramErrors``, the reason for each offending name."""
+        return _json_response(
+            {"error": str(ex), "paramErrors": ex.errors},
+            status=400,
+            headers=self._web_headers(),
+        )
+
     async def _web_dag_trigger(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
-        run_key = await self._dag.trigger_run(name)
-        if run_key is None:
+        payload = await self._web_json_body(request)
+        unknown = sorted(set(payload) - {"params", "logicalDate", "requestId"})
+        if unknown:
+            raise _api_error(
+                web.HTTPBadRequest,
+                "unknown trigger field {}; the body accepts params, "
+                "logicalDate, and requestId".format(
+                    ", ".join(json.dumps(key)[:80] for key in unknown[:5])
+                ),
+            )
+        logical = payload.get("logicalDate")
+        if logical is not None and not isinstance(logical, str):
+            raise _api_error(
+                web.HTTPBadRequest, "logicalDate must be an ISO 8601 string"
+            )
+        request_id = payload.get("requestId")
+        if request_id is not None and not (
+            isinstance(request_id, str) and 1 <= len(request_id) <= 200
+        ):
+            raise _api_error(
+                web.HTTPBadRequest,
+                "requestId must be a string of 1 to 200 characters",
+            )
+        params = self._web_run_params(request, payload)
+        matched = request.get(WEB_TOKEN_REQUEST_KEY)
+        try:
+            result = await self._dag.trigger(
+                name,
+                params=params,
+                logical_date=logical,
+                request_id=request_id,
+                triggered_by=None if matched is None else matched.label,
+            )
+        except ParamError as ex:
+            return self._web_param_error(ex)
+        except TriggerInputError as ex:
+            raise _api_error(web.HTTPBadRequest, str(ex)) from ex
+        except TriggerConflict as ex:
+            raise _api_error(web.HTTPConflict, str(ex)) from ex
+        if result is None:
             raise _api_error(
                 web.HTTPNotFound, ("workflow {!r} not found").format(name)
             )
         return _json_response(
-            {"dag": name, "name": name, "runKey": run_key},
+            {"dag": name, "name": name, **result},
             headers=self._web_headers(),
         )
 
@@ -6309,7 +6488,29 @@ class Cron:
                 web.HTTPBadRequest,
                 "backfill needs string `from` and `to` ISO dates",
             )
-        result = await self._dag.backfill(name, start, end)
+        # A misspelled `params` would otherwise create every run with the
+        # defaults, and those dates then keep them.
+        unknown = sorted(set(payload) - {"from", "to", "params"})
+        if unknown:
+            raise _api_error(
+                web.HTTPBadRequest,
+                "unknown backfill field {}; the body accepts from, to, and "
+                "params".format(
+                    ", ".join(json.dumps(key)[:80] for key in unknown[:5])
+                ),
+            )
+        params = self._web_run_params(request, payload)
+        matched = request.get(WEB_TOKEN_REQUEST_KEY)
+        try:
+            result = await self._dag.backfill(
+                name,
+                start,
+                end,
+                params=params,
+                triggered_by=None if matched is None else matched.label,
+            )
+        except ParamError as ex:
+            return self._web_param_error(ex)
         if not result.get("ok"):
             raise _api_error(web.HTTPBadRequest, str(result.get("reason")))
         return _json_response(result, headers=self._web_headers())
@@ -8160,6 +8361,9 @@ class Cron:
             # (see _collect_state_garbage).
             "scopes": sorted(self._artifact_scope_names()),
             "dags": sorted(self.cron_dags),
+            # The highest run engine level this build advances; peers read
+            # it for the DAG fleet warning (see _peer_dag_engines).
+            "dagEngine": cronstable.dag.ENGINE_LEVEL,
             "at": get_now(datetime.timezone.utc).isoformat(),
         }
         stream = self._manifest_stream()
@@ -8170,6 +8374,52 @@ class Cron:
         except Exception as ex:  # noqa: BLE001 - best-effort; log, survive
             self.metrics.state_write_dropped("manifest")
             logger.warning("state: failed to record the job manifest: %s", ex)
+
+    async def _peer_dag_engines(self) -> dict[str, int] | None:
+        """The run engine level each other live host's manifest advertises.
+
+        Reads the newest record of every other host's manifest stream. A
+        manifest with no ``dagEngine`` key is at the base level, and a host
+        whose newest manifest is older than ``MANIFEST_LIVE_SECONDS`` is left
+        out. ``None`` when the store cannot answer.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return None
+        own = self._manifest_stream()
+        now = get_now(datetime.timezone.utc)
+        base = cronstable.dag.BASE_ENGINE_LEVEL
+        peers: dict[str, int] = {}
+        try:
+            streams = await asyncio.wait_for(
+                backend.list_stream_names(MANIFEST_STREAM_PREFIX),
+                timeout=STATE_OP_TIMEOUT,
+            )
+            for stream in sorted(streams)[:MANIFEST_HOSTS_CAP]:
+                if stream == own:
+                    continue
+                records = await asyncio.wait_for(
+                    backend.list_records(stream, limit=1, newest_first=True),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+                if not records:
+                    continue
+                record = records[0]
+                at = _parse_iso_utc(record.get("at"))
+                if (
+                    at is None
+                    or (now - at).total_seconds() > MANIFEST_LIVE_SECONDS
+                ):
+                    continue
+                host = record.get("host")
+                if not isinstance(host, str) or not host:
+                    host = stream[len(MANIFEST_STREAM_PREFIX) :]
+                level = record.get("dagEngine", base)
+                peers[host] = level if type(level) is int else base
+        except Exception as ex:  # noqa: BLE001 - advisory; retried later
+            logger.debug("state: cannot read the peer manifests: %s", ex)
+            return None
+        return peers
 
     async def _live_pause_keep(
         self, backend: StateBackend, names: set[str], now: datetime.datetime
@@ -10808,12 +11058,15 @@ class Cron:
         with_retries: bool = True,
         pool_ticket: Ticket | None = None,
         catchup_after: datetime.datetime | None = None,
+        params: dict[str, Any] | None = None,
     ) -> bool:
         """Accept a job into its pool queue or launch it immediately.
 
         Return True when accepted or launched. Concurrency rules apply at
         launch under a per-job lock. with_retries=False keeps catch-up
-        work independent of the job's retry ladder.
+        work independent of the job's retry ladder. ``params`` carries the
+        run parameter values a manual start supplied, already checked; a
+        launch without them uses the job's defaults (see _launch_params).
         """
         if job.pool is not None and pool_ticket is None:
             await self._pools.enqueue_job(
@@ -10836,14 +11089,40 @@ class Cron:
                     return True  # receipt resolved; do not requeue it
                 return False
             return await self._launch_job_locked(
-                job, with_retries, pool_ticket
+                job, with_retries, pool_ticket, params
             )
+
+    @staticmethod
+    def _launch_params(
+        job: JobConfig,
+        pool_ticket: Ticket | None,
+        params: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """The parameter values one launch of ``job`` runs with.
+
+        ``None`` for a job that declares no parameters. The values a manual
+        start supplied arrive as ``params``, or in the pool entry that
+        carried them through the queue. Every other launch (a scheduled
+        fire, a catch-up run, a retry) takes the defaults of the current
+        declaration.
+        """
+        declared = getattr(job, "params", ())
+        if not declared:
+            return None
+        if pool_ticket is not None:
+            queued = pool_ticket.payload.get("params")
+            if isinstance(queued, dict):
+                params = queued
+        if params is not None:
+            return params
+        return run_params.resolve(declared, {}, "job {!r}".format(job.name))
 
     async def _launch_job_locked(
         self,
         job: JobConfig,
         with_retries: bool,
         pool_ticket: Ticket | None = None,
+        params: dict[str, Any] | None = None,
     ) -> bool:
         """The body of :meth:`maybe_launch_job`, under its per-job lock."""
         retry_current = True
@@ -10913,6 +11192,17 @@ class Cron:
                 retry_state.count = saved["count"]
                 retry_state.pool_retry = pool_ticket.payload.get("retryGuard")
                 self.retry_state[job.name] = retry_state
+        values = self._launch_params(job, pool_ticket, params)
+        # passed only when set, so a launch with neither calls
+        # _prepare_job_api_run exactly as it always has
+        optional: dict[str, Any] = {
+            key: value
+            for key, value in (
+                ("pool_ticket", pool_ticket),
+                ("params", values),
+            )
+            if value is not None
+        }
         run_token: str | None = None
         try:
             # register with the loopback state API BEFORE the child
@@ -10923,13 +11213,7 @@ class Cron:
             # spawn. Cancellation cannot strand a registered token: the
             # await in _prepare_job_api_run precedes register_run.
             run_token, extra_env = await self._prepare_job_api_run(
-                job,
-                retry_state,
-                **(
-                    {"pool_ticket": pool_ticket}
-                    if pool_ticket is not None
-                    else {}
-                ),
+                job, retry_state, **optional
             )
             running_job = RunningJob(
                 job,
@@ -10938,6 +11222,7 @@ class Cron:
                 state_token=run_token,
                 run_id=extra_env.get("CRONSTABLE_RUN_ID"),
             )
+            running_job.params = values
             running_job.pool_ticket = pool_ticket
             if pool_ticket is not None:
                 pool_ticket.running = running_job
@@ -10998,16 +11283,23 @@ class Cron:
         retry_state: JobRetryState | None,
         *,
         pool_ticket: Ticket | None = None,
+        params: dict[str, Any] | None = None,
     ) -> tuple[str | None, dict[str, str]]:
         """Register this run with the loopback state API; return its env.
 
         Mints the run id + token, stages the job's secrets, registers the
-        RunContext, and returns (token, injected_env). (None, {}) when no
-        job API is running. Secret staging lives in jobapi.stage_secrets.
+        RunContext, and returns (token, injected_env). Secret staging lives
+        in jobapi.stage_secrets.
+
+        ``params`` is the run's parameter values. The injected env carries
+        one ``CRONSTABLE_PARAM_<NAME>`` variable for each, and the
+        RunContext serves them to ``cronstable param``. With no job API
+        running the token is None and the env holds those variables alone.
         """
+        param_env = run_params.environment(params) if params else {}
         api = self._job_api
         if api is None or api.base_url is None:
-            return None, {}
+            return None, param_env
         from cronstable.jobapi import (
             RunContext,
             run_environment,
@@ -11032,9 +11324,12 @@ class Cron:
             default_scope=job.name,
             allowed_scopes=set(job.stateAllowedScopes),
             secrets=secrets,
+            params=params or {},
         )
         api.register_run(ctx)
-        return ctx.token, run_environment(ctx, api.base_url, api.cacert)
+        env = run_environment(ctx, api.base_url, api.cacert)
+        env.update(param_env)
+        return ctx.token, env
 
     @staticmethod
     def _slot_name(name: str) -> str:
@@ -11607,6 +11902,11 @@ class Cron:
             "startedAt": get_now(datetime.timezone.utc).isoformat(),
             "jobDigest": job_digest_cached(job),
         }
+        values = getattr(running_job, "params", None)
+        if values is not None:
+            # so a run that a crash interrupts is recorded with its values
+            # (see _reconcile_open_record)
+            record["params"] = values
         stream = self._inflight_stream(job.name)
         try:
             # Bounded: a wedged mount must not hang this tracked task and
@@ -11911,6 +12211,11 @@ class Cron:
             "duration": None,
             "fail_reason": fail_reason,
         }
+        values = rec.get("params")
+        if not isinstance(values, dict):
+            values = None
+        if values is not None:
+            data["params"] = values
         if job is None or job.onMissed == "skip":
             data["finished_at"] = started_iso
             # the run-instant mirror the durable superseded-by-run guard
@@ -11942,6 +12247,7 @@ class Cron:
             finished_at=finished,
             fail_reason=fail_reason,
             output=output,
+            params=values,
         )
         # Whose crash this was decides whether the row outranks a newer
         # completion. THIS host's interrupted run is the latest news about
@@ -13173,6 +13479,7 @@ class Cron:
                     fail_reason="cancelled via web UI",
                     output=job.output,
                     resource_usage=getattr(job, "resource_usage", None),
+                    params=getattr(job, "params", None),
                 ),
             )
             await self.cancel_job_retries(job.config.name, settle="cancelled")
@@ -13207,6 +13514,7 @@ class Cron:
                 output=job.output,
                 resource_usage=getattr(job, "resource_usage", None),
                 verification=getattr(job, "verification", None),
+                params=getattr(job, "params", None),
             ),
         )
         self._queue_job_completion(job, failed=fail_reason is not None)
@@ -13267,9 +13575,16 @@ class Cron:
         # so a report can never delay it. No retry arming and no
         # onPermanentFailure: a task's attempts are graph-driven.
         # Cancelled/replaced runs are not failures; shutdown skips
-        # reporting. The enabled-probe keeps the unconfigured case at
-        # dict lookups (a mapped fan-out lands many completions at once).
-        if not (job.cancelled or job.replaced or self._stop_event.is_set()):
+        # reporting. A run its command skipped (skipExitCodes) is neither a
+        # failure nor a success, so it fires no hook. The enabled-probe
+        # keeps the unconfigured case at dict lookups (a mapped fan-out
+        # lands many completions at once).
+        if not (
+            job.cancelled
+            or job.replaced
+            or job.skipped
+            or self._stop_event.is_set()
+        ):
             failed = job.fail_reason is not None
             hook = job.config.onFailure if failed else job.config.onSuccess
             if report_config_enabled(hook["report"]):

@@ -2953,7 +2953,7 @@ async def test_whoami_with_and_without_token():
     body = json.loads((await cron._web_whoami(_Req())).body)
     assert body["authenticated"] is False
     assert body["allScopes"] is True
-    assert body["scopes"] == sorted(["view", "control", "approve"])
+    assert body["scopes"] == sorted(["view", "control", "approve", "params"])
     # every shape advertises the sealable suites (the app
     # picks its pairing suite from this list)
     assert body["sealableSuites"] == _sealable_now()
@@ -2995,11 +2995,19 @@ async def test_whoami_pair_link_base_follows_the_relay_origin():
 async def test_all_scopes_token_reports_all_scopes():
     cron = _cron()
     token = _WebToken(
-        b"t", frozenset({"view", "control", "approve"}), "authToken"
+        b"t",
+        frozenset({"view", "control", "approve", "params"}),
+        "authToken",
     )
     body = json.loads((await cron._web_whoami(_Req(token=token))).body)
     assert body["allScopes"] is True
     assert body["sealableSuites"] == _sealable_now()
+    # a token issued with the three earlier scopes lacks `params`
+    token = _WebToken(
+        b"t", frozenset({"view", "control", "approve"}), "three-scopes"
+    )
+    body = json.loads((await cron._web_whoami(_Req(token=token))).body)
+    assert body["allScopes"] is False
 
 
 # --------------------------------------------------- scope enforcement
