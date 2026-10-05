@@ -19,7 +19,7 @@
 
 / kraahn-stuh-bl /
 
-cronstable is a fun little job scheduler for anything from a single machine to a cluster,
+cronstable is a feature-rich job scheduler and workflow orchestrator for anything from a single machine to a cluster,
 built with efficiency, security, and stability in mind. It runs your commands
 on a schedule, defined in YAML or loaded from an existing crontab, and adds
 retries, alerts, saved run history, workflows, and dashboards for the web, the
@@ -493,6 +493,28 @@ screen to connect to a live sample fleet.
 
 The app is optional. The web and terminal dashboards, the API, and every other
 reporter work without it.
+
+### Pair from the terminal
+
+To pair on a server that runs the API without the dashboard page
+(`web.ui: false`), or from a shell with no browser, run `cronstable pair`. It
+prints the same QR code in the terminal:
+
+```shell
+export CRONSTABLE_WEB_TOKEN=phone-token-value          # the token the phone gets
+cronstable pair                                        # local daemon on port 8080
+cronstable pair --public-url https://cron.example.net  # the address the phone uses
+```
+
+The code contains the token that the command presents, so give the command the
+phone's [scoped token](https://github.com/ptweezy/cronstable/wiki/HTTP-API#scoped-tokens-webauthtokens).
+When `--url` is a loopback address, the command puts the host's LAN address in
+the code if the daemon answers there. Pass `--public-url` when the phone uses
+another address, such as a reverse proxy's. In the
+[terminal dashboard](#terminal-dashboard), **Pair a device (QR)** in the
+command palette shows the same code. For the options and the terminal size the
+code needs, see
+[pairing from the terminal](https://github.com/ptweezy/cronstable/wiki/Terminal-Pairing).
 
 ## Tutorials
 
