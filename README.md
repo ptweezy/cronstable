@@ -19,7 +19,7 @@
 
 / kraahn-stuh-bl /
 
-cronstable is a feature-rich job scheduler and workflow orchestrator for anything from a single machine to a cluster,
+cronstable is a feature-rich job scheduler and simple workflow orchestrator for anything from a single machine to a cluster,
 built with efficiency, security, and stability in mind. It runs your commands
 on a schedule, defined in YAML or loaded from an existing crontab, and adds
 retries, alerts, saved run history, workflows, and dashboards for the web, the
