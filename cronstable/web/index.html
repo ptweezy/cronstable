@@ -341,6 +341,9 @@
 
   a { color: var(--accent); }
   button, input, select { font-family: inherit; font-size: inherit; color: inherit; }
+  /* Placeholder text in every field uses the theme's faint ink. opacity: 1
+     overrides the dimming that Firefox applies to placeholders. */
+  ::placeholder { color: var(--fg-faint); opacity: 1; }
 
   /* keyboard focus: a themed ring instead of the faint UA default. The
      settings switches visually hide their checkbox (opacity 0), so their
@@ -369,6 +372,11 @@
     backdrop-filter: blur(3px);
     border-bottom: 1px solid var(--border);
     user-select: none;
+    /* The header is a size container for the container queries below. If
+       its content still doesn't fit, it wraps, and flex-end aligns the
+       wrapped row to the right. */
+    container: hdr / inline-size;
+    flex-wrap: wrap; row-gap: 6px; justify-content: flex-end;
   }
   .brand { display: flex; align-items: baseline; gap: 9px; white-space: nowrap; }
   /* the mark is the wordmark's l: a live cart-and-double-pendulum simulation
@@ -421,8 +429,10 @@
   .dot.cancelled { background: var(--cancelled); }
   .dot.unknown { background: var(--unknown); }
   .dot.paused { background: var(--paused); }
-  .dot.live { background: #5cff97; filter: drop-shadow(0 0 4px rgba(92, 255, 151, .9)); }
-  html[data-theme$="-light"] .dot.live { background: var(--ok); filter: drop-shadow(0 0 3px color-mix(in srgb, var(--ok) 60%, transparent)); }
+  /* Uses the --ok token so that the color vision setting remaps this dot
+     along with every other ok indicator. */
+  .dot.live { background: var(--ok); filter: drop-shadow(0 0 4px color-mix(in srgb, var(--ok) 90%, transparent)); }
+  html[data-theme$="-light"] .dot.live { filter: drop-shadow(0 0 3px color-mix(in srgb, var(--ok) 60%, transparent)); }
   .dot.dead { background: var(--fail); }
   .dot.run, .dot.live { box-shadow: 0 0 0 0 currentColor; animation: pulse 1.8s infinite; color: var(--run); }
   .dot.live { color: var(--ok); }
@@ -430,6 +440,27 @@
     0% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent); }
     70% { box-shadow: 0 0 0 5px transparent; } 100% { box-shadow: 0 0 0 0 transparent; }
   }
+
+  /* The header is one row. At full width it needs about 1,380px, which is
+     wider than most laptop windows, and the page clips horizontal overflow,
+     so you can't scroll to an item that doesn't fit. As the header narrows,
+     these rules hide readouts in order, least essential first: the job-set
+     hash, the meter bars (the percentages stay), the clock, the version and
+     the node meter, the status pills, and then the text labels. The buttons
+     on the right always stay. The rules are container queries because the UI
+     scale setting zooms the page, which narrows the header without changing
+     the viewport width. Content that the rules can't predict, such as a long
+     version string or four-digit counts, wraps to a second row. */
+  @container hdr (max-width: 1379px) { #jobset { display: none; } }
+  @container hdr (max-width: 1299px) { .nodemeter .bar { display: none; } }
+  @container hdr (max-width: 1209px) { .clock { display: none; } }
+  @container hdr (max-width: 1109px) { .nodemeter, .brand .ver { display: none; } }
+  @container hdr (max-width: 949px) { .summary .pill.opt { display: none; } }
+  @container hdr (max-width: 519px) { .summary, #authLabel { display: none; } }
+  @container hdr (max-width: 339px) { #connTxt { display: none; } }
+  /* A container query can't style its own container, so the narrower gap
+     on phones is a media query. */
+  @media (max-width: 560px) { header { gap: 8px; } }
 
   /* Inherited visibility must change with the panel, so its controls are
      focusable immediately. Animate appearance without delaying Tab access. */
@@ -452,7 +483,7 @@
   .ghostbtn.ro { color: var(--pending); border-color: var(--pending); opacity: .85; }
   @keyframes spin { to { transform: rotate(360deg); } }
   kbd {
-    font-family: var(--mono); font-size: 10px; padding: 1px 5px; border-radius: 3px;
+    font-family: var(--mono); font-size: 10px; padding: 1px 5px; border-radius: var(--radius);
     background: var(--bg2); border: 1px solid var(--border2); color: var(--fg-dim);
   }
 
@@ -473,7 +504,6 @@
   .search:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--selbg); }
   .search .prompt { color: var(--fg-dim); }
   .search input { border: 0; outline: 0; background: transparent; width: 100%; }
-  .search input::placeholder { color: var(--fg-faint); }
 
   .segs { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
   .segs button {
@@ -581,7 +611,7 @@
   #clusterTable.show-load .col-load { display: table-cell; }
   #clusterTable .col-load b { color: var(--fg); font-weight: 700; }
   #clusterTable .col-load.warn b { color: var(--fail); }
-  .exit { font-size: 10.5px; padding: 0 5px; border-radius: 3px; margin-left: 6px; white-space: nowrap; }
+  .exit { font-size: 10.5px; padding: 0 5px; border-radius: var(--radius); margin-left: 6px; white-space: nowrap; }
   .exit.zero { color: var(--ok); background: color-mix(in srgb, var(--ok) 16%, transparent); }
   .exit.nonzero { color: var(--fail); background: color-mix(in srgb, var(--fail) 16%, transparent); }
   /* success-rate column (share of ok runs in the recent-history tail) */
@@ -629,6 +659,15 @@
   .btn.cancel { color: var(--fail); border-color: color-mix(in srgb, var(--fail) 30%, var(--border)); }
   .btn.pause, .btn.resume { color: var(--paused); border-color: color-mix(in srgb, var(--paused) 30%, var(--border)); }
   .btn.primary { background: var(--selbg); color: var(--fg); border-color: var(--border2); }
+  /* Pressed state: tint the control's background with its own text color,
+     so Run and Stop each press in their status color in every theme. The
+     tint appears without a transition and fades when you release. The
+     control doesn't move: a control that shifts under the pointer can lose
+     a click that lands on its edge. */
+  .btn:active:not(:disabled), .iconbtn:active:not(:disabled), .ghostbtn:active:not(:disabled),
+  .segs button:active:not(:disabled), .res-chip:active:not(:disabled) {
+    background: color-mix(in srgb, currentColor 18%, var(--panel)); transition-duration: 0s;
+  }
 
   .empty { padding: 48px 24px; text-align: center; color: var(--fg-dim); }
   .empty .big { font-size: 26px; color: var(--fg-faint); margin-bottom: 8px; }
@@ -645,6 +684,9 @@
     z-index: 50; display: flex; flex-direction: column;
   }
   .drawer.open { visibility: visible; transition-delay: 0s; transform: translateX(0); box-shadow: var(--shadow-lg); }
+  /* With reduced motion, the drawer appears in place without sliding in. */
+  @media (prefers-reduced-motion: reduce) { .drawer, .drawer.open { transition: none; } }
+  body.reduce-motion .drawer, body.reduce-motion .drawer.open { transition: none; }
   .drawer-head { padding: 12px 16px; border-bottom: 1px solid var(--border); }
   .drawer-head .row1 { display: flex; align-items: center; gap: 9px; }
   .drawer-head h2 { margin: 0; font-size: 15px; font-weight: 700; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -691,8 +733,10 @@
   .term .ln { display: block; }
   .term .ln.verify\.stderr, .term .ln.stderr { color: var(--fail); }
   .term .ln.sys { color: var(--fg-faint); font-style: italic; }
-  .term .ln .gut { color: var(--fg-faint); user-select: none; display: inline-block; min-width: 3.5ch; margin-right: 10px; text-align: right; opacity: .6; }
-  .term .ln .ts { color: var(--fg-faint); user-select: none; margin-right: 8px; opacity: .7; }
+  /* --fg-faint is the lowest-contrast ink the log panes use (4.9:1 on the
+     palest theme), so line numbers and timestamps use it at full opacity. */
+  .term .ln .gut { color: var(--fg-faint); user-select: none; display: inline-block; min-width: 3.5ch; margin-right: 10px; text-align: right; }
+  .term .ln .ts { color: var(--fg-faint); user-select: none; margin-right: 8px; }
   .term mark { background: var(--accent); color: #000; border-radius: 2px; }
   .term mark.cur { outline: 1px solid #fff; }
   /* paper accents are dark inks — flip the highlight text/outline */
@@ -768,6 +812,10 @@
   .runtable th { text-align: left; color: var(--fg-faint); font-weight: 600; padding: 5px 8px; border-bottom: 1px solid var(--border); text-transform: uppercase; font-size: 10px; letter-spacing: .5px; }
   .runtable td { padding: 5px 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent); white-space: nowrap; }
   .runtable td.reason { white-space: normal; color: var(--fg-faint); }
+  /* A table's first and last cells use the card label's 12px side padding,
+     so the content of stacked cards lines up on both edges. */
+  .card .runtable th:first-child, .card .runtable td:first-child { padding-left: 12px; }
+  .card .runtable th:last-child, .card .runtable td:last-child { padding-right: 12px; }
 
   /* schedule pane */
   .sched-desc { font-size: 16px; color: var(--accent); margin: 0 0 4px; }
@@ -830,7 +878,7 @@
   /* the QR itself is deliberately theme-independent: dark modules on a
      light tile scan reliably whatever the dashboard theme */
   .pair-qr { display: flex; justify-content: center; margin: 2px 0 12px; }
-  .pair-qr svg { display: block; border-radius: 4px; }
+  .pair-qr svg { display: block; border-radius: var(--radius); }
   .pair-payload {
     font-family: var(--mono); font-size: 11px; color: var(--fg-dim);
     background: var(--bg2); border: 1px solid var(--border2); border-radius: var(--radius);
@@ -857,8 +905,6 @@
     table.show-trend .col-trend, table.show-policy .col-policy, table.show-tz .col-tz,
     table.show-nextat .col-nextat, table.show-rate .col-rate,
     table.show-owner .col-owner { display: none; }
-    .summary .pill.opt { display: none; }
-    .clock, .brand .ver { display: none; }
   }
   /* cluster panel */
   .cdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: middle; background: var(--fg-faint); }
@@ -927,7 +973,7 @@
   .wk-day.today .wk-lane { border-color: var(--border2); }
   /* one hue per job (--jh, hashed from the name) as a translucent wash, so
      chips separate without fighting the theme in either light or dark */
-  .wk-ev { position: absolute; height: 15px; padding: 0 4px; font-size: 10px; line-height: 15px; border-radius: 3px;
+  .wk-ev { position: absolute; height: 15px; padding: 0 4px; font-size: 10px; line-height: 15px; border-radius: var(--radius);
     background: hsl(var(--jh) 45% 50% / .22); border-left: 2px solid hsl(var(--jh) 55% 52% / .9);
     color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; box-sizing: border-box; }
   .wk-ev:hover { background: hsl(var(--jh) 45% 50% / .4); color: var(--fg); z-index: 3; }
@@ -1290,7 +1336,7 @@
   /* ---------- run ledger: degraded chip + settings ---------- */
   .slow-chip {
     display: inline-flex; align-items: center; gap: 4px; margin-left: 7px;
-    font-size: 10px; padding: 0 6px; border-radius: 3px; white-space: nowrap;
+    font-size: 10px; padding: 0 6px; border-radius: var(--radius); white-space: nowrap;
     color: var(--pending); background: color-mix(in srgb, var(--pending) 15%, transparent);
     border: 1px solid color-mix(in srgb, var(--pending) 35%, var(--border));
   }
@@ -1353,7 +1399,7 @@
   /* HA chips on job rows: durable-retry / cluster slot / @reboot pending.
      Same visual grammar as .slow-chip, one hue per concern. */
   .ha-chip { display: inline-flex; align-items: center; gap: 4px; margin-left: 7px;
-    font-size: 10px; padding: 0 6px; border-radius: 3px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    font-size: 10px; padding: 0 6px; border-radius: var(--radius); white-space: nowrap; font-variant-numeric: tabular-nums; }
   .ha-chip.retry  { color: var(--pending); background: color-mix(in srgb, var(--pending) 15%, transparent);
     border: 1px solid color-mix(in srgb, var(--pending) 35%, var(--border)); }
   .ha-chip.slot   { color: var(--run); background: color-mix(in srgb, var(--run) 14%, transparent);
@@ -1378,8 +1424,8 @@
   .dst-running        { color: var(--run); }
   .dst-verifying      { color: var(--run); }
   .dst-queued         { color: var(--pending); }
-  #poolBody details > summary { padding: 12px 16px; cursor: pointer; }
-  #poolBody details > p { margin: 0; padding: 0 16px 12px; }
+  #poolBody details > summary { padding: 12px; cursor: pointer; }
+  #poolBody details > p { margin: 0; padding: 0 12px 12px; }
   .poolchip { margin-left: 8px; }
   #dgRecovery, #dgRecoveryResults { max-height: 38vh; overflow: auto; }
   .dst-up_for_retry   { color: var(--pending); }
@@ -1392,13 +1438,13 @@
 
   /* run-state pill (a DAG run is running | success | failed) */
   .rpill { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; padding: 1px 8px;
-    border-radius: 999px; white-space: nowrap; border: 1px solid var(--border); background: var(--bg2); color: var(--fg-dim); }
+    border-radius: var(--radius); white-space: nowrap; border: 1px solid var(--border); background: var(--bg2); color: var(--fg-dim); }
   .rpill.running { color: var(--run); border-color: color-mix(in srgb, var(--run) 40%, var(--border)); }
   .rpill.success { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
   .rpill.failed  { color: var(--fail); border-color: color-mix(in srgb, var(--fail) 40%, var(--border)); }
 
   /* run "kind" provenance badge (scheduled/catchup/manual/backfill) */
-  .kbadge { font-size: 9.5px; text-transform: uppercase; letter-spacing: .5px; padding: 0 5px; border-radius: 3px;
+  .kbadge { font-size: 9.5px; text-transform: uppercase; letter-spacing: .5px; padding: 0 5px; border-radius: var(--radius);
     color: var(--fg-faint); background: color-mix(in srgb, var(--fg-faint) 12%, transparent); border: 1px solid var(--border); }
 
   /* per-run task-state histogram bar */
@@ -1450,6 +1496,15 @@
   .poke { color: var(--run); font-size: 10.5px; }
   .approw { display: inline-flex; gap: 6px; align-items: center; }
   .approw .btn { padding: 1px 8px; }
+  /* Backfill range fields match the token dialog's input, at this row's
+     font size. The row wraps so that both fields fit in a phone-width
+     drawer. */
+  #dgBackfill { flex-wrap: wrap; }
+  #dgBackfill input[type=text] {
+    max-width: 100%; padding: 2px 8px; font-size: 11.5px; border-radius: var(--radius);
+    border: 1px solid var(--border2); background: var(--bg2); color: var(--fg);
+  }
+  #dgBackfill input[type=text]:focus { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 2px var(--selbg); }
   .apprv { color: var(--ok); } .aprej { color: var(--fail); }
 
   /* inline task-graph (SVG, laid out client-side in the swimlane idiom) */
@@ -1463,27 +1518,32 @@
 
   /* XCom viewer */
   .xcomval { font-family: var(--mono); font-size: 11px; color: var(--fg-dim); white-space: pre-wrap;
-    max-height: 160px; overflow: auto; background: var(--bg2); border: 1px solid var(--border); border-radius: 3px; padding: 6px 8px; }
+    max-height: 160px; overflow: auto; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; }
 
   /* ==================================================================
      durable state inspector card
      ================================================================== */
   #stateCard .sthead { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  #stateCard .sttabs { display: flex; gap: 4px; margin: 10px 0 8px; flex-wrap: wrap; }
+  #stateCard .sttabs { display: flex; gap: 4px; margin: 10px 0 8px; padding: 0 12px; flex-wrap: wrap; }
   #stateCard .sttabs button { background: var(--bg2); border: 1px solid var(--border); color: var(--fg-dim);
-    font: inherit; font-size: 11px; padding: 2px 9px; border-radius: 999px; cursor: pointer; }
-  #stateCard .sttabs button:hover { color: var(--fg-dim); border-color: var(--border2); }
+    font: inherit; font-size: 11px; padding: 2px 9px; border-radius: var(--radius); cursor: pointer; }
+  #stateCard .sttabs button:hover { color: var(--fg); border-color: var(--border2); }
+  #stateCard .sttabs button:active { background: color-mix(in srgb, currentColor 18%, var(--panel)); }
   #stateCard .sttabs button.active { color: var(--fg); background: var(--selbg); border-color: var(--border2); }
   #stateCard .sttabs button .n { color: var(--fg-faint); margin-left: 5px; font-variant-numeric: tabular-nums; }
   #stateCard .statebody { max-height: 46vh; overflow: auto; }
+  /* The summary list and the notes use the same 12px side padding. Tables
+     get theirs from the .card .runtable rule. */
+  #stateCard .statebody > .kv, #stateCard .statebody > .faint, #stateDetail > .faint { padding: 0 12px; }
   .redacted { color: var(--fg-faint); font-style: italic; }
-  .src-chip { font-size: 10px; padding: 0 6px; border-radius: 3px; color: var(--fg-faint);
+  .src-chip { font-size: 10px; padding: 0 6px; border-radius: var(--radius); color: var(--fg-faint);
     background: color-mix(in srgb, var(--fg-faint) 12%, transparent); border: 1px solid var(--border); }
   .src-chip.durable { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent);
     border-color: color-mix(in srgb, var(--ok) 30%, var(--border)); }
 
   /* cluster lease block (filesystem/kubernetes/etcd backends) */
   #clusterLease td { padding: 4px 8px; font-size: 11.5px; }
+  #clusterLease td:first-child { padding-left: 12px; }
   #clusterLease td.k { color: var(--fg-faint); width: 130px; }
   .fleet-leader { color: var(--pending); }
 </style>
@@ -1654,7 +1714,7 @@
   </div>
 
   <div class="card" id="poolCard" style="display:none">
-    <div class="card-label"><span>Resource pools</span><span class="grow"></span><span class="faint" id="poolMeta"></span></div>
+    <div class="card-label"><span>┌─ resource pools</span><span class="grow"></span><span class="faint" id="poolMeta"></span></div>
     <div id="poolBody"></div>
   </div>
 
@@ -1706,7 +1766,7 @@
     <!-- logs -->
     <section class="pane active" data-pane="logs">
       <div class="drawer-tools">
-        <button class="btn run" id="dRun"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg> Run</button>
+        <button class="btn run" id="dRun"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg><span id="dRunLabel">Run</span></button>
         <button class="btn cancel" id="dCancel"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="1"/></svg> Cancel</button>
         <button class="btn pause" id="dPause"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg> Pause</button>
         <span class="logsearch"><span class="faint">/</span><input id="logSearch" type="text" placeholder="search logs" autocomplete="off" spellcheck="false"><span class="count" id="logCount"></span></span>
@@ -1757,7 +1817,7 @@
       <input type="text" id="dgBfFrom" placeholder="from ISO (2026-07-01T00:00:00)" style="width:220px" autocomplete="off" spellcheck="false">
       <input type="text" id="dgBfTo" placeholder="to ISO" style="width:220px" autocomplete="off" spellcheck="false">
       <button class="btn primary" id="dgBfGo">run backfill</button>
-      <label><input type="checkbox" id="dgBfFailed"> Failed dates only</label>
+      <label class="toggle"><input type="checkbox" id="dgBfFailed"> Failed dates only</label>
     </div>
     <section id="dgRecoveryResults" style="display:none; margin-top:12px" aria-live="polite"></section>
     <section id="dgRecovery" style="display:none; margin-top:12px" aria-live="polite"></section>
@@ -8259,7 +8319,7 @@ var qrcode = function() {
     for (const id of ["dRun", "dCancel", "dPause"])
       $(id).style.display = ctl ? "" : "none";
     $("dRun").disabled = !job.enabled || job.running;
-    $("dRun").textContent = queuedEntries(job).length ? "Queue another run" : "Run";
+    $("dRunLabel").textContent = queuedEntries(job).length ? "Queue another run" : "Run";
     $("dCancel").title = "Cancel running instances";
     $("dCancel").disabled = !job.running;
     // the pause button doubles as resume; a manual Run stays allowed while paused

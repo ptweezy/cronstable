@@ -47,6 +47,26 @@
 - Configuration checks read a loopback or wildcard address in every form that
   the socket layer reads, such as `127.1`, so `state.jobApi.listen:
   http://127.1:9000` counts as a loopback bind.
+- The web dashboard's header keeps its buttons in view at any window width.
+  As the window narrows, the header hides readouts, least essential first:
+  the job-set ID chip, the node meter's bars, the clock, the version and the
+  node meter, and then the summary pills. On a phone-width screen, the token
+  button shows only its lock icon. A larger UI scale narrows the header in
+  the same way. Content that still doesn't fit, such as a long version
+  string, wraps to a second row.
+- In the web dashboard's log panes, line numbers and timestamps have a
+  contrast ratio of at least 4.5:1 in all ten themes. Placeholder text in
+  every field uses the theme's faint ink.
+- In the web dashboard, the workflows, resource pools, and saved state cards
+  align their content to the same 12px gutter as the jobs table. Workflow run
+  states and the saved state card's tabs have the square corners of the other
+  chips and buttons. The workflow drawer's backfill fields match the token
+  dialog's input, and the row wraps in a narrow drawer.
+- Web dashboard buttons tint in their own text color while you press them.
+  The job drawer's Run button shows a play icon, as Cancel and Pause show
+  theirs. The connection indicator's dot uses the ok status color, so the
+  color vision setting remaps it. With Reduce motion on, a drawer opens in
+  place without sliding. The demo dashboard includes all of these changes.
 
 ## 1.2.62
 
