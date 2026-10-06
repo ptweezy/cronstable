@@ -20,7 +20,7 @@ import urllib.request
 
 import pytest
 
-from cronstable import jobcli
+from cronstable import jobcli, webclient
 
 
 class _FakeHTTP:
@@ -684,21 +684,18 @@ def test_opener_with_cacert_verifies_against_it(monkeypatch, tmp_path):
 
 
 def test_opener_with_unloadable_cacert_is_a_clean_error(monkeypatch, tmp_path):
-    # a CA path that does not resolve is the job environment's problem. Left
-    # to propagate, the OSError would be caught by _http's OSError arm and
-    # reported as "cannot reach the state endpoint", blaming a daemon that is
-    # listening and answering.
+    # a CA path that does not resolve is the job environment's problem, and
+    # the message names the bundle.
     monkeypatch.setenv(jobcli.ENV_CACERT, str(tmp_path / "no-such-ca.pem"))
     with pytest.raises(jobcli._CliError, match="cannot load the CA bundle"):
         jobcli._opener()
 
 
 def test_tls_verification_failure_has_its_own_message(monkeypatch):
-    # a certificate that does not verify reaches _http WRAPPED (urllib turns
-    # the OSError the handshake raised into a URLError), so it used to land
-    # in the generic arm and report as "cannot reach the state endpoint" for
-    # an endpoint that answered fine. It gets its own message, naming the
-    # env var whose value is the thing actually in question.
+    # a certificate that does not verify reaches the transport WRAPPED
+    # (urllib turns the OSError the handshake raised into a URLError). The
+    # endpoint answered, so the message leaves out "cannot reach" and names
+    # the env var whose value is in question.
     monkeypatch.delenv(jobcli.ENV_CACERT, raising=False)
     err = urllib.error.URLError(
         ssl.SSLCertVerificationError(
@@ -708,9 +705,45 @@ def test_tls_verification_failure_has_its_own_message(monkeypatch):
     with pytest.raises(jobcli._CliError) as ei:
         _post(monkeypatch, err)
     message = str(ei.value)
-    assert "TLS handshake" in message
+    assert "TLS verification failed" in message
     assert jobcli.ENV_CACERT in message
     assert "cannot reach" not in message
+    # the transport's advice names flags that the job commands lack
+    assert "--cacert" not in message and "--insecure" not in message
+
+
+def test_http_refuses_a_redirect(monkeypatch):
+    # urllib resends every header to a redirect's target, the run token
+    # included, so the reply is an error and nothing follows it
+    moved = _FakeResponse(
+        307, b"", {"Location": "http://203.0.113.9/v1/kv/set"}
+    )
+    with pytest.raises(jobcli._CliError) as ei:
+        _post(monkeypatch, moved)
+    message = str(ei.value)
+    assert "the cronstable state endpoint at http://127.0.0.1:1" in message
+    assert "redirects to 'http://203.0.113.9/v1/kv/set'" in message
+    assert "--url" not in message
+
+
+def test_shared_opener_follows_no_redirect():
+    assert jobcli._OPENER is webclient.OPENER
+    assert any(
+        isinstance(h, webclient.NoRedirect) for h in jobcli._OPENER.handlers
+    )
+
+
+def test_http_reply_that_is_not_http_is_a_clean_error(monkeypatch):
+    import http.client
+
+    with pytest.raises(jobcli._CliError, match="no HTTP reply from"):
+        _post(monkeypatch, http.client.BadStatusLine("SSH-2.0-OpenSSH"))
+
+
+def test_http_sends_the_given_method(monkeypatch):
+    # an empty body still goes out as the POST that the caller named
+    _result, opener = _post(monkeypatch, _FakeResponse(200, b"{}"), data=b"")
+    assert opener.request.get_method() == "POST"
 
 
 def test_parse_body_wraps_non_object_json():

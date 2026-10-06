@@ -32,6 +32,8 @@ def test_building_cli_does_not_import_tui(monkeypatch):
         "cronstable.jobcli",
         "cronstable.winservice",
         "cronstable.taskxml",
+        "cronstable.paircli",
+        "cronstable.webclient",
     )
     for name in heavy:
         monkeypatch.delitem(sys.modules, name, raising=False)
@@ -93,7 +95,54 @@ def test_entry_point_module_does_not_import_heavy_surfaces():
         "import sys, cronstable.__main__; "
         "print(sorted(m for m in sys.modules if m in ("
         "'cronstable.tui', 'cronstable.mcpcli', 'cronstable.jobcli', "
-        "'cronstable.winservice', 'cronstable.taskxml')))"
+        "'cronstable.winservice', 'cronstable.taskxml', "
+        "'cronstable.paircli', 'cronstable.webclient')))"
+    )
+    assert _probe(probe) == "[]"
+
+
+def test_pair_command_stays_off_the_daemon_graph():
+    """`cronstable pair` is a standard-library client like the MCP bridge:
+    its modules must not pull in aiohttp, the YAML parser, the scheduler, or
+    the terminal dashboard, whose pair panel shares the same two leaves. It
+    takes its transport from cronstable.webclient, not from the bridge.
+    """
+    probe = (
+        "import sys, cronstable.paircli; "
+        "print(sorted(m for m in sys.modules if m in ("
+        "'aiohttp', 'strictyaml', 'asyncio', 'cronstable.cron', "
+        "'cronstable.config', 'cronstable.tui', 'cronstable.mcpcli')))"
+    )
+    assert _probe(probe) == "[]"
+
+
+def test_webclient_imports_the_standard_library_and_cliargs():
+    """cronstable.webclient is the transport of `cronstable mcp`,
+    `cronstable pair`, and the terminal dashboard's pair panel. ssl and
+    cronstable.tlsutil load only when a request needs them.
+    """
+    probe = (
+        "import sys, cronstable.webclient; "
+        "print(sorted(m for m in sys.modules "
+        "if (m.startswith('cronstable') and m not in "
+        "('cronstable', 'cronstable._cliargs', 'cronstable.webclient')) "
+        "or m in ('asyncio', 'aiohttp')))"
+    )
+    assert _probe(probe) == "[]"
+
+
+def test_pairing_leaves_import_only_the_standard_library():
+    """cronstable.qr and cronstable.pairlink are imported by the pair
+    command and, on demand, by the terminal dashboard. cronstable.pairlink
+    reads addresses through cronstable.netutil, which the daemon imports
+    too.
+    """
+    probe = (
+        "import sys, cronstable.qr, cronstable.pairlink; "
+        "print(sorted(m for m in sys.modules "
+        "if m.startswith('cronstable') and m not in "
+        "('cronstable', 'cronstable.qr', 'cronstable.pairlink', "
+        "'cronstable.netutil')))"
     )
     assert _probe(probe) == "[]"
 

@@ -11,8 +11,9 @@ The advert describes one listener a LAN peer can dial: the first bound
 `https://` listen entry reachable from another machine, or the first such
 `http://` one when no https listener qualifies. Loopback and Unix listeners
 are never advertised (their ports are unreachable from any other machine),
-and a listener bound to one specific IPv6 address cannot be advertised (the
-advert's address record is IPv4-only). The advert carries:
+and a listener bound to an IPv6 address cannot be advertised (the advert's
+address record is IPv4-only). That includes `[::]`, whose socket accepts
+IPv6 connections only. The advert carries:
 
 - The **instance name**: the node's hostname by default, or the map form's
   `name:` override (dots are replaced with hyphens; the label is truncated

@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 from aiohttp import web
 
-from cronstable import _json, jobstate, tlsutil
+from cronstable import _json, jobstate, netutil, tlsutil
 from cronstable.config import ConfigError, _is_wildcard_host, _resolve_secret
 from cronstable.jobstate import GLOBAL_SCOPE, JobStateError
 from cronstable.state import Lease, StateBackend, _DocumentUnreadable
@@ -99,17 +99,6 @@ def _json_response(
     return web.Response(
         body=body, status=status, content_type="application/json"
     )
-
-
-def _bracket_host(host: str) -> str:
-    """A host formatted for a URL authority (IPv6 literals bracketed).
-
-    The bound address comes back from getsockname() bare (``::1``), but the
-    base URL built from it is injected into every job as CRONSTABLE_STATE_URL
-    -- and ``http://::1:8080`` is unparseable (no way to tell which colon
-    splits the port).
-    """
-    return "[{}]".format(host) if ":" in host else host
 
 
 # Environment variables injected into every job when the endpoint is enabled.
@@ -613,8 +602,11 @@ class JobStateAPI:
         advertise = bound_host
         if self._config.get("listen") and not _is_wildcard_host(host):
             advertise = host
-        self._base_url = "{}://{}:{}".format(
-            scheme, _bracket_host(advertise), bound_port
+        # getsockname() gives an IPv6 address bare (``::1``), and every job
+        # gets this URL as CRONSTABLE_STATE_URL, where ``http://::1:8080``
+        # does not parse.
+        self._base_url = "{}://{}".format(
+            scheme, netutil.netloc(advertise, bound_port)
         )
         self._runner = runner
         logger.info("state job API listening on %s", self._base_url)

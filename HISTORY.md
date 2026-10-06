@@ -1,5 +1,53 @@
 # History
 
+## 1.2.63
+
+- `cronstable pair` prints the iOS app's pairing QR code in the terminal, for
+  a server that runs the HTTP API without the dashboard page
+  (`web.ui: false`) or a shell with no browser. It is the code that the web
+  dashboard's Pair a device panel shows, and it contains the token that the
+  command presents. When `--url` is a loopback address, the command puts
+  another address of the host in the code: the LAN address, or the address of
+  a listener on another interface, such as a VPN's. The daemon must report a
+  listener there, and the address must answer with the daemon's instance ID.
+  The command sends the token only to `--url`, and `--public-url` sets the
+  address that the phone dials. `--format link` and `--format json` print the
+  pairing link and the pairing JSON as text. The terminal dashboard's command
+  palette opens the same code with "Pair a device (QR)".
+- `GET /whoami` reports `instance`, an ID that the daemon draws at random
+  when it starts, and `listeners`, the addresses of its bound TCP sockets.
+  The reply to an anonymous request under `web.anonymousScopes` has no
+  `listeners`. Every response, including a `401`, carries the ID in the
+  `Cronstable-Instance` header, so a client can tell one daemon from another
+  without presenting a token.
+- `cronstable mcp` reports an HTTP redirect as a transport error that names
+  the redirect's target, and the `--url` value to pass when the redirect
+  leads to the `/mcp` endpoint at another address. The bridge does not follow
+  redirects, because each request carries the bearer token. A reply that is
+  not HTTP and a `--url` that is not a valid URL get a transport error too.
+- `cronstable mcp`, `cronstable pair`, and `cronstable tui` refuse a bearer
+  token that contains a line break or another character that an HTTP header
+  cannot carry, such as the line ending of a file that the variable was read
+  from. The message names the flag or the environment variable and leaves
+  the token out.
+- `cronstable mcp` and `cronstable pair` send the bearer token as UTF-8, the
+  form that the daemon compares, so a token with characters outside ASCII
+  authenticates.
+- The job state commands (`cronstable state`, `cursor`, `lock`, `artifact`,
+  `idempotent`, `secret`, and `xcom`) report an HTTP redirect from the state
+  endpoint as an error that names the redirect's target. They do not follow
+  redirects, because each request carries the run's token. A reply that is
+  not HTTP gets a one-line error.
+- Every subcommand ends with one line on stderr and status 1 when the reader
+  of its output closes the pipe, as `head` does after its last line.
+- In the terminal dashboard, `Esc` closes the panel or drawer that is on
+  top.
+- The Bonjour advert skips a listener bound to `[::]`. That socket accepts
+  IPv6 connections only, and the advert's address record is IPv4.
+- Configuration checks read a loopback or wildcard address in every form that
+  the socket layer reads, such as `127.1`, so `state.jobApi.listen:
+  http://127.1:9000` counts as a loopback bind.
+
 ## 1.2.62
 
 - The Windows setup window shows a cronstable icon in its title bar and on

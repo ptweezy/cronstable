@@ -801,6 +801,55 @@ def _install_windows_console_handler(  # pragma: no cover (windows)
     return remove
 
 
+# --- Console ---------------------------------------------------------------
+def enable_console_vt() -> None:
+    """Turn on ANSI escape processing for a Windows console (idempotent).
+
+    Other platforms' terminals process the escapes already.
+    """
+    if IS_WINDOWS:  # pragma: no cover (windows) - Windows-only path
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        for std in (-11, -12):  # stdout, stderr
+            handle = kernel32.GetStdHandle(std)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                # 0x0004 = ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+
+
+def stdout_reader_gone() -> bool:
+    """Whether stdout is a pipe that no reader holds open.
+
+    A write to such a pipe fails with an error that other failures share:
+    ``EINVAL`` on Windows, and on POSIX the ``EPIPE`` of every pipe and
+    socket. On Windows, a write of no bytes fails on that pipe and changes
+    nothing on any other stream. On POSIX, a poll reports the pipe's error
+    or hangup and writes nothing.
+    """
+    try:
+        fd = sys.stdout.fileno()
+        if sys.platform == "win32":  # pragma: no cover (windows)
+            import _winapi
+
+            try:
+                _winapi.WriteFile(msvcrt.get_osfhandle(fd), b"")
+            except BrokenPipeError:
+                return True
+        else:  # pragma: no cover (posix) - poll exists nowhere else
+            import select
+
+            poller = select.poll()
+            poller.register(fd, select.POLLOUT)
+            gone = select.POLLERR | select.POLLHUP
+            return any(event & gone for _fd, event in poller.poll(0))
+    except (AttributeError, OSError, ValueError):
+        # No stdout, or one with no file descriptor.
+        pass
+    return False
+
+
 # --- OS boot identity ------------------------------------------------------
 def os_boot_id() -> str | None:
     """A stable, unique identifier of the current OS boot, or ``None``.

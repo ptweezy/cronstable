@@ -1553,9 +1553,9 @@ web:
 
 Clients send the token in an `Authorization: Bearer <token>` header. The
 dashboard page loads without a token, then prompts for one and keeps it only in
-that browser tab. `cronstable tui` and `cronstable mcp` read it from the
-`CRONSTABLE_WEB_TOKEN` environment variable. For narrower credentials, such as
-a view-only token for a wallboard, add
+that browser tab. `cronstable tui`, `cronstable mcp`, and `cronstable pair`
+read it from the `CRONSTABLE_WEB_TOKEN` environment variable. For narrower
+credentials, such as a view-only token for a wallboard, add
 [scoped tokens](https://github.com/ptweezy/cronstable/wiki/HTTP-API#scoped-tokens-webauthtokens).
 
 To turn the dashboard into a public read-only board, add `view` to
@@ -1597,10 +1597,10 @@ web:
 
 To require mutual TLS, which authenticates clients as well as encrypting
 connections, set `clientCa`. Web certificates rotate in place without a daemon
-restart. The `cronstable tui` and `cronstable mcp` clients take matching
-`--cacert`, `--client-cert`, `--client-key`, and `--insecure` flags. For how
-to issue the certificates, the mTLS trust model and how it combines with
-`web.authToken`, and how rotation works, see
+restart. The `cronstable tui`, `cronstable mcp`, and `cronstable pair` clients
+take matching `--cacert`, `--client-cert`, `--client-key`, and `--insecure`
+flags. For how to issue the certificates, the mTLS trust model and how it
+combines with `web.authToken`, and how rotation works, see
 [listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS) in the
 wiki.
 

@@ -669,7 +669,8 @@ Either form hands the app the daemon's address and bearer token in one scan. The
 panel checks the stored token against [`GET /whoami`](HTTP-API#get-whoami) and
 warns when it holds every scope; give a phone a scoped `web.authTokens` entry
 instead. For the pairing flow this feeds, see
-[push notifications](Push-Notifications).
+[push notifications](Push-Notifications). For the same code without the
+dashboard page, see [pairing from the terminal](Terminal-Pairing).
 
 | Carolina | Amber |
 | :---: | :---: |

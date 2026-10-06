@@ -184,6 +184,34 @@ def test_supports_unix_sockets_matches_platform():
     assert platform.supports_unix_sockets() == (not platform.IS_WINDOWS)
 
 
+def test_enable_console_vt_is_safe_without_a_console():
+    # stdout is a pipe under pytest: the call finds no console and returns
+    platform.enable_console_vt()
+
+
+def test_stdout_reader_gone_for_a_pipe_whose_reader_exited(monkeypatch):
+    read_end, write_end = os.pipe()
+    with open(write_end, "w", encoding="utf-8") as stream:
+        monkeypatch.setattr(sys, "stdout", stream)
+        # a reader holds the pipe open, and the question writes nothing
+        assert platform.stdout_reader_gone() is False
+        os.close(read_end)
+        assert platform.stdout_reader_gone() is True
+
+
+def test_stdout_reader_gone_false_for_a_file(monkeypatch, tmp_path):
+    with open(tmp_path / "out.txt", "w", encoding="utf-8") as stream:
+        monkeypatch.setattr(sys, "stdout", stream)
+        assert platform.stdout_reader_gone() is False
+
+
+@pytest.mark.parametrize("stream", [None, object()])
+def test_stdout_reader_gone_false_without_a_stream_to_ask(monkeypatch, stream):
+    # a windowless interpreter has no stdout, and a stand-in has no handle
+    monkeypatch.setattr(sys, "stdout", stream)
+    assert platform.stdout_reader_gone() is False
+
+
 def test_new_process_group_kwargs_matches_platform():
     kwargs = platform.new_process_group_kwargs()
     if platform.IS_WINDOWS:

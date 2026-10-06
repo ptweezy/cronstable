@@ -197,6 +197,10 @@ The panel warns when the token it would embed is the all-scopes one. Give a
 phone a scoped [`web.authTokens`](HTTP-API#scoped-tokens-webauthtokens)
 entry instead.
 
+To pair without the dashboard page, see
+[pairing from the terminal](Terminal-Pairing): `cronstable pair` and the
+terminal dashboard draw the same code.
+
 [![The Pair a device panel: a QR code deep-linking the connection payload into the companion app, the payload as a copyable JSON string, and the all-scopes token warning](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-pair.png)
 
 Pairing is also one API call (`control` scope):

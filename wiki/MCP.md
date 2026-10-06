@@ -237,8 +237,15 @@ Base64-encodes a name that is not plain ASCII. Other frames carry the version
 `initialize` negotiated. The daemon's JSON-RPC errors reach the client as the
 daemon sent them, so a client can pick a version from a `-32022` error. When
 the bridge cannot reach the daemon, it replies with its own error, code
-`-31000`. The bridge drops JSON-RPC responses a client writes, because the
-daemon sends no requests. Flags:
+`-31000`. The bridge does not follow redirects, because each request carries
+the bearer token, so a redirect gets the same error, which names the
+redirect's target. When the redirect leads to the `/mcp` endpoint at another
+address, the error also names the `--url` value to pass. A `--url` that is
+not a valid URL gets the same error for each request. The bridge exits with
+status 1 before it reads a request when the token contains a line break or
+another character that an HTTP header cannot carry. The bridge drops
+JSON-RPC responses a client writes, because the daemon sends no requests.
+Flags:
 
 - `--url` (default `http://127.0.0.1:8080`): the daemon's web base URL
 - `--token` / `--token-env`: the bearer token (defaults to the

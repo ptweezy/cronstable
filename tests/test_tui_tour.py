@@ -593,6 +593,7 @@ async def test_tour_state_heat_radar_node(tmp_path):
         assert "upcoming runs" in screen
         assert "upcoming" in screen
         h.keys.send("esc")
+        await _wait_for(lambda: not app.is_open("radar"))
 
         # ---- node resources + history sparkline ----
         app._toggle("node")

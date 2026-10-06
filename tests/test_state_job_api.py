@@ -35,7 +35,6 @@ from cronstable.jobapi import (
     JobLockManager,
     JobStateAPI,
     RunContext,
-    _bracket_host,
     run_environment,
 )
 from cronstable.jobstate import JobStateError
@@ -732,13 +731,6 @@ def test_run_context_precomputes_its_token_bytes():
     assert ctx.token_bytes == b"tok"
 
 
-def test_bracket_host_formats_ipv6_authority():
-    # the bound host goes into CRONSTABLE_STATE_URL: an IPv6 literal must be
-    # bracketed or "http://::1:8080" is unparseable to every consumer.
-    assert _bracket_host("127.0.0.1") == "127.0.0.1"
-    assert _bracket_host("localhost") == "localhost"
-    assert _bracket_host("::1") == "[::1]"
-    assert _bracket_host("fe80::1%eth0") == "[fe80::1%eth0]"
 
 
 async def test_idempotency_claim_non_numeric_ttl_400(job_api):

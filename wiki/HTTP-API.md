@@ -1005,6 +1005,17 @@ seal under. `sealableSuites` is `["x25519"]` on a daemon without
 `cryptography` and adds `xwing` with it; a daemon that omits the field
 seals `x25519` only. A client picks a fresh pairing's suite from it.
 
+The reply also carries `instance` and `listeners`, which describe the
+daemon. `instance` is an ID that the daemon draws at random when it starts
+and keeps until it exits. `listeners`
+holds the address of each TCP socket that the `web.listen` entries bound, in
+the form of a `web.listen` entry, such as `http://0.0.0.0:8080`. Every
+response from the daemon, including a `401`, carries the instance ID in the
+`Cronstable-Instance` header, so a client can recognize a daemon without
+presenting a token.
+[`cronstable pair`](Terminal-Pairing#the-address-in-the-code) reads both
+fields to check whether another address reaches the same daemon.
+
 A companion app uses it to show what it may do. The dashboard uses it to warn
 when its pairing QR would hand a phone the all-scopes token (see
 [push notifications](Push-Notifications)). Requires the `view` scope.
@@ -1018,7 +1029,9 @@ A credential-less request served through
 third shape: `authenticated` is `false`, `label` is `"anonymous"` (a
 reserved label config load refuses for real tokens), `scopes` lists the
 granted set, and `allScopes` is `false`. Branch on `allScopes`, because the
-open daemon described earlier shares `authenticated: false`.
+open daemon described earlier shares `authenticated: false`. This shape has
+no `listeners` field, so the addresses that the daemon binds go only to a
+caller with a token or with full access.
 
 ### `GET /push/devices`
 
@@ -1499,9 +1512,9 @@ raises a `ConfigError` without `web.authToken`, and `web.tls.clientCa` on an
 
 `web.authToken` and `web.tls.clientCa` are enforced independently, so a request
 over an mTLS listener still carries the bearer token when one is configured.
-cronstable's own clients (`cronstable tui`, `cronstable mcp`) present a
-certificate with `--client-cert`/`--client-key`. See
-[listener TLS](Listener-TLS).
+cronstable's own clients (`cronstable tui`, `cronstable mcp`,
+`cronstable pair`) present a certificate with `--client-cert`/`--client-key`.
+See [listener TLS](Listener-TLS).
 
 ### Cross-site request defense
 

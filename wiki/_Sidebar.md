@@ -36,6 +36,7 @@
 - **Integrations**
   - [Reporting (Mail, Sentry, Shell, Webhook, Push, Event Log)](Reporting)
   - [Push Notifications](Push-Notifications)
+  - [Pairing from the Terminal](Terminal-Pairing)
   - [Windows Event Log](Windows-Event-Log)
   - [Metrics with Prometheus](Metrics-with-Prometheus)
   - [Metrics with statsd](Metrics-with-Statsd)

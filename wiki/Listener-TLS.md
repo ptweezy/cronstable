@@ -324,9 +324,9 @@ secrets.
 
 ## Client configuration
 
-The TUI and the MCP bridge take the same four options, flag first and
-environment variable second, so one exported set of variables serves every
-client in a shell:
+The TUI, the MCP bridge, and `cronstable pair` take the same four options,
+flag first and environment variable second, so one exported set of variables
+serves every client in a shell:
 
 | Flag | Environment variable | Meaning |
 | --- | --- | --- |
@@ -337,7 +337,8 @@ client in a shell:
 
 Who takes what:
 
-* **`cronstable tui`** and **`cronstable mcp`**: all four, identically named.
+* **`cronstable tui`**, **`cronstable mcp`**, and **`cronstable pair`**: all
+  four, identically named.
 * **A publicly trusted certificate** needs none of them. With no option set, a
   client verifies against the system trust store and presents no certificate.
 * **The in-job CLI takes none of them.** It reads `CRONSTABLE_STATE_CACERT` from

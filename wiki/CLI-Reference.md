@@ -3,11 +3,11 @@
 This page documents the `cronstable` command and every argument it accepts, the
 `cronstable state` administration subcommands, the job-facing state commands a
 running job uses (`state get|set|delete|keys`, `cursor`, `lock`, `artifact`,
-`idempotent`, `secret`, `xcom`), the `mcp` and `tui` client subcommands, the
-runtime model (foreground execution, signal handling, exit codes), and common
-invocations. Behavior is taken from `cronstable/__main__.py`,
-`cronstable/state_admin.py`, `cronstable/jobcli.py`, `cronstable/mcpcli.py`, and
-`cronstable/tui.py`.
+`idempotent`, `secret`, `xcom`), the `mcp`, `tui`, and `pair` client
+subcommands, the runtime model (foreground execution, signal handling, exit
+codes), and common invocations. Behavior is taken from
+`cronstable/__main__.py`, `cronstable/state_admin.py`, `cronstable/jobcli.py`,
+`cronstable/mcpcli.py`, `cronstable/tui.py`, and `cronstable/paircli.py`.
 
 ## Synopsis
 
@@ -24,6 +24,9 @@ cronstable mcp [--url URL] [--token TOKEN] [--token-env VAR] [--cacert PATH]
                [--client-cert PATH --client-key PATH] [--insecure] [--check]
 cronstable tui [--url URL] [--token TOKEN] [--token-env VAR] [--cacert PATH]
                [--client-cert PATH --client-key PATH] [--insecure] [options]
+cronstable pair [--url URL] [--token TOKEN] [--token-env VAR] [--cacert PATH]
+                [--client-cert PATH --client-key PATH] [--insecure]
+                [--public-url URL] [--name NAME] [--format qr|link|json]
 cronstable service install|remove|start|stop|reload|status|run [options]
 cronstable import-taskscheduler PATH... [-o FILE] [--timezone NAME]
 ```
@@ -384,7 +387,9 @@ These thin clients of the
 [loopback state endpoint](HTTP-API#job-facing-state-endpoints-loopback) read
 the injected `CRONSTABLE_STATE_URL` / `CRONSTABLE_STATE_TOKEN` and speak HTTP
 over the standard library (no aiohttp, no event loop), so they start instantly
-and need no configuration file. Behavior comes from `cronstable/jobcli.py`.
+and need no configuration file. They use no proxy and follow no redirect,
+because each request carries the run's token. Behavior comes from
+`cronstable/jobcli.py`.
 
 The `state` job actions share the `cronstable state` name with the
 [admin actions](#the-state-subcommand); the action name selects the handler,
@@ -537,6 +542,25 @@ an interactive terminal. The [terminal dashboard](Terminal-Dashboard) page
 documents every option, key, and panel. See
 [listener TLS](Listener-TLS#client-configuration) for the TLS flags.
 
+## The `pair` subcommand
+
+```
+cronstable pair [--url URL] [--token TOKEN] [--token-env VAR]
+                [--cacert PATH] [--client-cert PATH --client-key PATH]
+                [--insecure] [--public-url URL] [--name NAME]
+                [--format qr|link|json]
+```
+
+`cronstable pair` prints the QR code that pairs the iOS app with a running
+daemon (`--url`, default `http://127.0.0.1:8080`), for a server without the
+dashboard page or a shell without a browser. It is a standard-library client
+like `cronstable mcp`: it needs no configuration file and never imports the
+daemon graph. The code contains the token that the command presents, and
+`--public-url` sets the address that the phone dials. The
+[pairing from the terminal](Terminal-Pairing) page documents every option, how
+the command chooses the address, and the terminal dashboard's panel. See
+[listener TLS](Listener-TLS#client-configuration) for the TLS flags.
+
 ## The `import-taskscheduler` subcommand
 
 ```
@@ -658,7 +682,7 @@ See [running on Windows](Running-on-Windows).
 | Code | Condition |
 | --- | --- |
 | `0` | Setup guidance for a bare invocation with no default configuration; `--version`, `--third-party-licenses`, or `--sealable-suites` printed; `--validate-config` succeeded; `--job-set-id` printed; `--help`; a `state` action succeeded; or normal shutdown after a signal. |
-| `1` | Configuration error (parse/schema/validation failure or unreadable configuration); a missing default path when arguments request configuration loading; an `init` refusal; or a `state` action failed (see [`state` exit codes](#state-exit-codes)). |
+| `1` | Configuration error (parse/schema/validation failure or unreadable configuration); a missing default path when arguments request configuration loading; an `init` refusal; a `state` action failed (see [`state` exit codes](#state-exit-codes)); or the reader of a command's output closed the pipe, as `head` does, which also prints `cronstable: cannot write the output` to stderr. |
 | `2` | Usage error (argparse builtin): unknown option or missing required option (such as `state backup` without `-o`); an invalid `--log-level` value; `cronstable state` invoked with no action; or a `--` separator in any invocation other than `lock run` (see [`lock`](#lock-acquirereleaserun-distributed-mutexsemaphore)). |
 
 ## Examples

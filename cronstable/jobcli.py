@@ -4,8 +4,10 @@ Jobs use these commands to access durable key-value storage, processing
 cursors, distributed locks, artifacts, idempotency keys, and run-scoped
 secrets. Each command reads ``CRONSTABLE_STATE_URL`` and
 ``CRONSTABLE_STATE_TOKEN`` from the job's environment and calls the
-loopback API (:mod:`cronstable.jobapi`) through the standard library's
-``urllib`` module. The client needs neither aiohttp nor an event loop.
+loopback API (:mod:`cronstable.jobapi`) through
+:mod:`cronstable.webclient`, the standard-library transport of
+``cronstable mcp`` and ``cronstable pair``. The client needs neither
+aiohttp nor an event loop.
 
 These commands use a running daemon. The ``cronstable state`` admin
 commands, such as ``backup``, ``restore``, ``gc``, and ``check``, operate
@@ -22,10 +24,11 @@ import json
 import os
 import ssl
 import sys
-import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
+
+from cronstable import webclient
 
 # The env vars the daemon injects (see cronstable.jobapi); the job CLI is the
 # consumer.  Hardcoded here rather than imported so the CLI never pulls aiohttp
@@ -65,11 +68,12 @@ class _CliError(Exception):
     """A user-facing failure: printed to stderr, exits non-zero."""
 
 
-# Loopback control traffic must never be proxied: the default urllib opener
-# honors http_proxy/HTTP_PROXY, which would route every state call -- bearer
-# run token included -- to an external proxy that cannot reach the daemon's
-# 127.0.0.1 endpoint anyway (CPython's bypass logic does not exempt loopback).
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# The shared opener, which uses no proxy and follows no redirect.  The
+# default urllib opener honors http_proxy/HTTP_PROXY, which would route every
+# state call, bearer run token included, to an external proxy that cannot
+# reach the daemon's 127.0.0.1 endpoint anyway (CPython's bypass logic does
+# not exempt loopback).  It also resends that token to a redirect's target.
+_OPENER = webclient.OPENER
 
 # Every request gets a deadline so a wedged daemon (state store on a dead
 # mount) cannot hang the calling job forever.  Every verb but a blocking lock
@@ -108,16 +112,14 @@ _TLS_OPENERS: dict[str, urllib.request.OpenerDirector] = {}
 def _opener() -> urllib.request.OpenerDirector:
     """The opener this request goes through: verifying, or the plain one.
 
-    With ENV_CACERT unset this is _OPENER itself, so the plaintext loopback
-    path is exactly what it was before the endpoint could speak TLS.  With it
-    set, the same no-proxy posture is paired with an HTTPSHandler pinned to
-    that CA.
+    With ENV_CACERT unset this is _OPENER itself.  With it set,
+    :func:`cronstable.webclient.build_opener` pairs the same no-proxy,
+    no-redirect handlers with an HTTPSHandler pinned to that CA.
 
     ``ssl`` is imported at module scope rather than deferred into here
     because deferring it would buy nothing: ``urllib.request`` already pulls
     it in transitively (through ``http.client``), so it is resident before
-    this module's first line runs, and the TLS diagnostic arm in _http needs
-    the name as well.
+    this module's first line runs.
     """
     cacert = os.environ.get(ENV_CACERT)
     if not cacert:
@@ -129,18 +131,13 @@ def _opener() -> urllib.request.OpenerDirector:
         ctx = ssl.create_default_context(cafile=cacert)
     except (OSError, ssl.SSLError) as ex:
         # A missing or malformed CA file is the job environment's problem and
-        # must read as one.  Allowed to propagate it would be caught by the
-        # OSError arm in _http and reported as "cannot reach the state
-        # endpoint", blaming a daemon that is answering perfectly well.
+        # must read as one.
         raise _CliError(
             "cannot load the CA bundle {} points at ({}): {}".format(
                 ENV_CACERT, cacert, ex
             )
         ) from ex
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}),
-        urllib.request.HTTPSHandler(context=ctx),
-    )
+    opener = webclient.build_opener(ctx)
     _TLS_OPENERS[cacert] = opener
     return opener
 
@@ -188,48 +185,30 @@ def _http(
     elif data is not None:
         body = data
         headers["Content-Type"] = "application/octet-stream"
-    req = urllib.request.Request(
-        full, data=body, method=method, headers=headers
-    )
     if timeout is None:
         timeout = _DEFAULT_TIMEOUT
     try:
-        with _opener().open(req, timeout=timeout) as resp:
-            return resp.status, dict(resp.headers), resp.read()
-    except urllib.error.HTTPError as ex:
-        # HTTPError holds the response. Close it to release the connection.
-        with ex:
-            return ex.code, dict(ex.headers or {}), ex.read()
-    except urllib.error.URLError as ex:
-        # A handshake failure arrives here WRAPPED: urllib turns the OSError
-        # the TLS layer raised into a URLError, so this cannot be a separate
-        # `except ssl.SSLError` clause ahead of this one.  It has to be told
-        # apart before the generic message below claims the endpoint is
-        # unreachable, which sends the reader after a daemon that is
-        # listening and answering; what is wrong is the trust between them.
-        if isinstance(ex.reason, ssl.SSLError):
-            raise _CliError(
-                "TLS handshake with the cronstable state endpoint at {} "
-                "failed: {} (does {} point at the CA that signed the "
-                "daemon's certificate?)".format(url, ex.reason, ENV_CACERT)
-            ) from ex
+        status, reply, payload = webclient.send(
+            full,
+            _opener(),
+            timeout,
+            "the cronstable state endpoint at {}".format(url),
+            headers=headers,
+            data=body,
+            method=method,
+        )
+    except webclient.TLSError as ex:
+        # The endpoint answered and its certificate did not verify, so the
+        # message names the variable that sets the CA.  ``detail`` leaves
+        # out the transport's advice, which names flags that this client
+        # lacks.
         raise _CliError(
-            "cannot reach the cronstable state endpoint at {}: {}".format(
-                url, ex.reason
-            )
+            "{} (does {} point at the CA that signed the daemon's "
+            "certificate?)".format(ex.detail, ENV_CACERT)
         ) from ex
-    except (TimeoutError, OSError) as ex:
-        # urllib wraps only errors from SENDING the request in URLError; a
-        # deadline that fires while waiting for or reading the response
-        # escapes as a raw TimeoutError (an OSError that is NOT a URLError
-        # subclass).  Same transport failure, same clean error.  Ordered
-        # after HTTPError/URLError on purpose: both subclass OSError, and
-        # an HTTP error response must keep its status semantics.
-        raise _CliError(
-            "cannot reach the cronstable state endpoint at {}: {}".format(
-                url, ex
-            )
-        ) from ex
+    except webclient.ClientError as ex:
+        raise _CliError(ex.detail) from ex
+    return status, dict(reply), payload
 
 
 def _parse_body(body: bytes) -> dict[str, Any]:

@@ -1,7 +1,9 @@
 import argparse
+import errno
 import logging
 import os
 import sys
+from collections.abc import Callable
 from typing import Any
 
 import cronstable.version
@@ -106,9 +108,10 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     # lock/artifact/idempotent/secret) are their own top-level commands. Both
     # are thin clients of the daemon's loopback endpoint.
     #
-    # These (and `mcp` / `tui`) all register from cronstable._cliargs, a
-    # stdlib-only leaf, NOT by importing cronstable.jobcli / cronstable.mcpcli
-    # / cronstable.tui. Importing tui alone runs its ~7000-line module body
+    # These (and `mcp` / `tui` / `pair`) all register from
+    # cronstable._cliargs, a stdlib-only leaf, NOT by importing
+    # cronstable.jobcli / cronstable.mcpcli / cronstable.tui /
+    # cronstable.paircli. Importing tui alone runs its ~7000-line module body
     # and pulls unicodedata's C table plus dozens of other modules (~50ms),
     # and jobcli drags urllib.request/ssl/email in for ~27ms; every
     # job-spawned thin client (`state get`, `lock`, `xcom pull`) builds this
@@ -121,6 +124,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     _cliargs.add_job_commands(sub)
     _cliargs.add_mcp_command(sub)
     _cliargs.add_tui_command(sub)
+    _cliargs.add_pair_command(sub)
     _cliargs.add_service_command(sub)
     _cliargs.add_import_taskscheduler_command(sub)
     _add_init_command(sub)
@@ -556,6 +560,13 @@ def main_loop(loop=None):
 
         sys.exit(tui.dispatch(args))
 
+    if command == "pair":
+        # the pairing QR code: another stdlib client of the running daemon,
+        # so it never imports Cron/aiohttp either.
+        from cronstable import paircli
+
+        sys.exit(paircli.dispatch(args))
+
     if command == "init":
         sys.exit(_run_init(args))
 
@@ -817,8 +828,87 @@ def _new_event_loop():  # pragma: no cover
     return asyncio.new_event_loop()
 
 
+def _flush_stdout() -> None:
+    """Flush stdout, when the process has one that is open."""
+    out = sys.stdout
+    if out is not None and not getattr(out, "closed", False):
+        out.flush()
+
+
+# The errors of a write to a pipe with no reader: ``EPIPE``, or ``EINVAL``
+# on Windows.
+_NO_READER = (errno.EPIPE, errno.EINVAL)
+
+
+def _stdout_refused(ex: OSError) -> bool:
+    """Whether ``ex`` is a write that stdout refused.
+
+    A refused write leaves its text in the buffer, so the flush fails again
+    with the same error. A single write larger than the buffer leaves none
+    there. Its error is the one that every pipe with no reader gives, so
+    stdout's own pipe says whether a reader is left.
+    """
+    try:
+        _flush_stdout()
+    except OSError as again:
+        return again.errno == ex.errno
+    return ex.errno in _NO_READER and platform.stdout_reader_gone()
+
+
+def _discard(stream: Any) -> None:
+    """Point ``stream`` at the null device after a write to it failed.
+
+    The interpreter flushes stdout and stderr when it exits. A flush that
+    fails on the text still in the buffer replaces the exit status, and
+    for stdout it prints a traceback.
+    """
+    try:
+        null = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null, stream.fileno())
+        finally:
+            os.close(null)
+    except (OSError, ValueError):
+        # A stream with no file descriptor has no buffer to flush at exit.
+        pass
+
+
+def _exit_status(run: Callable[[], Any]) -> Any:
+    """Run a command; return the status to exit with.
+
+    A reader that closes stdout early, as ``head`` does, ends the command
+    with one line on stderr and status 1. That holds for every subcommand,
+    whether the write fails while the command runs or in the flush here.
+    The line is lost when stderr goes to the same pipe.
+    """
+    status: Any = 1
+    try:
+        try:
+            run()
+            status = 0
+        except SystemExit as ex:
+            status = ex.code
+        # A short output is still in the buffer, so this flush is what
+        # fails.
+        _flush_stdout()
+    except OSError as ex:
+        if not _stdout_refused(ex):
+            raise
+        _discard(sys.stdout)
+        try:
+            print(
+                "cronstable: cannot write the output: {}".format(ex),
+                file=sys.stderr,
+            )
+        except OSError:
+            # stderr goes to the same pipe, as under ``2>&1``.
+            _discard(sys.stderr)
+        return status or 1
+    return status
+
+
 def main():  # pragma: no cover
-    main_loop()
+    sys.exit(_exit_status(main_loop))
 
 
 if __name__ == "__main__":  # pragma: no cover

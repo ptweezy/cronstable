@@ -18,6 +18,7 @@ import json
 import logging
 import logging.config
 import os
+import secrets
 import socket
 import ssl
 import time
@@ -47,6 +48,8 @@ from cronstable import (
     _gzip,
     _json,
     discovery,
+    netutil,
+    pairlink,
     platform,
     push,
     statsd,
@@ -372,7 +375,7 @@ _WEB_ANONYMOUS_EXCLUDED = {
 # Fallback base for the dashboard's pairing deep link while no push section
 # is applied. With one, /whoami derives the base from push.relay.url's
 # origin, so a self-hosted relay keeps camera pairing on its own domain.
-WEB_PAIR_LINK_FALLBACK = "https://relay.cronstable.com/pair"
+WEB_PAIR_LINK_FALLBACK = pairlink.PAIR_LINK_FALLBACK
 
 # The web API's complete route table: (method, path, handler, gate).
 # `handler` names a Cron method except "mcp"-gated rows (MCPHandler);
@@ -1983,8 +1986,7 @@ def _held_site_class() -> type:
 
             @property
             def name(self) -> str:
-                host = "[%s]" % self._host if ":" in self._host else self._host
-                return "http://%s:%d" % (host, self._port)
+                return "http://" + netutil.netloc(self._host, self._port)
 
             async def start(self) -> None:
                 await super().start()
@@ -2012,6 +2014,13 @@ def _held_listen_keys(listen: Iterable[str]) -> set[tuple[str, int]]:
         if parsed.scheme == "http" and parsed.hostname and port is not None:
             keys.add((parsed.hostname, port))
     return keys
+
+
+def _listener_url(scheme: str, sockname: Any) -> str:
+    """A bound TCP socket's address in the form of a ``web.listen`` entry."""
+    return "{}://{}".format(
+        scheme, netutil.netloc(str(sockname[0]), int(sockname[1]))
+    )
 
 
 def web_site_from_url(
@@ -2350,6 +2359,9 @@ class Cron:
         # address from ONE listener, unreconstructable after the fact
         # (runner.addresses has no schemes and skips failed binds).
         self._web_tcp_bound: list[tuple[str, Any]] = []
+        # Names this process on every web reply, so a pairing client can
+        # tell this daemon from another one without presenting its token.
+        self._web_instance = secrets.token_urlsafe(16)
         # fingerprint of the web.tls files as the RUNNING listener loaded
         # them (an in-place rotation is otherwise invisible); cleared on
         # every teardown. See _web_tls_files_changed.
@@ -3666,11 +3678,15 @@ class Cron:
         ``allScopes`` false, the discriminator clients key on. Every
         shape carries ``pairLinkBase``, the pairing QR's deep-link base,
         and ``sealableSuites``, the suites this daemon can seal alerts
-        to (the app picks its pairing suite from that list).
+        to (the app picks its pairing suite from that list). Every shape
+        also carries ``instance``, and every shape but the anonymous one
+        carries ``listeners``. A terminal pairing client reads both to
+        check whether another address reaches this daemon.
         """
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
-        anon = request.get(WEB_ANON_REQUEST_KEY)
-        if matched is None and anon is not None:
+        # The anonymous grant that serves this request, when no token does.
+        anon = request.get(WEB_ANON_REQUEST_KEY) if matched is None else None
+        if anon is not None:
             payload: dict[str, Any] = {
                 "authenticated": False,
                 "label": "anonymous",
@@ -3693,7 +3709,21 @@ class Cron:
             }
         payload["pairLinkBase"] = self._web_pair_link_base()
         payload["sealableSuites"] = await push.sealable_suites_async()
+        payload["instance"] = self._web_instance
+        if anon is None:
+            # The bind addresses describe the host's network, so an
+            # anonymous caller does not get them.
+            payload["listeners"] = [
+                _listener_url(scheme, sockname)
+                for scheme, sockname in self._web_tcp_bound
+            ]
         return _json_response(payload, headers=self._web_headers())
+
+    async def _web_stamp_instance(
+        self, request: web.Request, response: web.StreamResponse
+    ) -> None:
+        """Name this process on a reply, including a 401."""
+        response.headers[pairlink.INSTANCE_HEADER] = self._web_instance
 
     def _web_pair_link_base(self) -> str:
         """Origin of push.relay.url plus /pair; the hosted fallback while
@@ -7227,6 +7257,7 @@ class Cron:
             # otherwise stall), and on_cleanup forgets the generation.
             app.on_shutdown.append(self._web_on_shutdown)
             app.on_cleanup.append(self._web_on_cleanup)
+            app.on_response_prepare.append(self._web_stamp_instance)
             # The MCP server (POST /mcp) rides these same listeners and the
             # auth middleware above: /mcp is NEVER added to `public`, so it
             # inherits the bearer-token gate. Built here (not in __init__) so a
@@ -7405,8 +7436,9 @@ class Cron:
         listener a LAN peer can reach, else the first such http one.
         A loopback-bound listener is never advertised (its port is
         unreachable from any other machine), and a listener bound to
-        one specific IPv6 address is skipped because the advert's A
-        record is IPv4-only.
+        an IPv6 address is skipped because the advert's A record is
+        IPv4-only. That includes ``::``, whose socket takes no IPv4
+        connection.
 
         The address element is the listener's own IP for a specific
         IPv4 bind (the outbound-route probe could name a different
@@ -7417,19 +7449,20 @@ class Cron:
         skipped_v6 = False
         for scheme, sockname in self._web_tcp_bound:
             host, port = str(sockname[0]), int(sockname[1])
-            if host.startswith("127.") or host == "::1":
+            bound = netutil.ip_literal(host)
+            if bound is None or bound.is_loopback:
                 continue
-            if host in ("0.0.0.0", "::"):
-                candidates.append((scheme, port, None))
-            elif ":" in host:
+            if bound.version == 6:
                 skipped_v6 = True
+            elif bound.is_unspecified:
+                candidates.append((scheme, port, None))
             else:
                 candidates.append((scheme, port, host))
         if not candidates:
             if skipped_v6:
                 logger.warning(
                     "bonjour: the only LAN-reachable web listeners are "
-                    "bound to specific IPv6 addresses and the advert's "
+                    "bound to IPv6 addresses and the advert's "
                     "address record is IPv4-only; skipping the advert"
                 )
             else:

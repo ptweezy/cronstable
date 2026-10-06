@@ -270,6 +270,29 @@ def test_is_self_listed_loopback_edge_cases():
     assert _is_self_listed("10.0.0.1:8443", "0.0.0.0:8443", "node-a") is False
 
 
+def test_is_self_listed_reads_a_wildcard_listen_in_any_spelling():
+    from cronstable.config import _is_self_listed, _likely_self_fqdn
+
+    # the wildcard host is read as the socket layer reads it, like the
+    # loopback peer beside it
+    assert _is_self_listed("127.1:7946", "0:7946", "node-a") is True
+    assert _is_self_listed("[::1]:7946", "[::0]:7946", "node-a") is True
+    assert _is_self_listed("node-a:7946", "0:7946", "node-a") is True
+    assert _is_self_listed("node-a:7946", "[::0]:7946", "node-a") is True
+    # "*" and an empty host bind both families
+    assert _is_self_listed("127.0.0.1:7946", "*:7946", "node-a") is True
+    assert _is_self_listed("[::1]:7946", ":7946", "node-a") is True
+    # the family still has to match
+    assert _is_self_listed("[::1]:7946", "0:7946", "node-a") is False
+    assert _is_self_listed("127.1:7946", "[::0]:7946", "node-a") is False
+    # any other address is no wildcard
+    assert _is_self_listed("node-a:7946", "0.0.0.1:7946", "node-a") is False
+    assert _likely_self_fqdn("node-a.internal:7946", "0:7946", "node-a")
+    assert not _likely_self_fqdn(
+        "node-a.internal:7946", "10.0.0.5:7946", "node-a"
+    )
+
+
 # --------------------------------------------------------------------------
 # ClusterView state machine (pure, no network)
 # --------------------------------------------------------------------------

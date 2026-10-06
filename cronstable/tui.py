@@ -45,11 +45,11 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import unicodedata
 from collections.abc import Callable, Coroutine
 from typing import (
-    TYPE_CHECKING,
     Any,
     cast,
 )
@@ -69,41 +69,23 @@ from cronstable.croninfo import (
     schedule_pressure,
     suggest_slot,
 )
-from cronstable.platform import IS_WINDOWS
+from cronstable.platform import IS_WINDOWS, enable_console_vt
 
 if sys.platform == "win32":  # pragma: no cover (windows)
-    import ctypes
     import msvcrt
-    import threading
 else:  # pragma: no cover (posix) - termios/tty live nowhere else
     import fcntl  # noqa: F401  (re-exported guard parity; unused directly)
     import signal
     import termios
     import tty
 
-if TYPE_CHECKING:  # pragma: no cover - typing only, no import cost
-    # Only _resolve_tls' return annotation needs the name.  Importing ssl
-    # for real would pull it (and socket underneath) into every `cronstable
-    # tui` start, including the overwhelmingly common http:// one, for the
-    # same reason aiohttp is imported lazily; the context itself is built
-    # inside cronstable.tlsutil, imported at the call site.
-    import ssl
-
 logger = logging.getLogger("tui")
 
-#: Client-side conventions shared with the web dashboard (same values),
-#: owned by cronstable._cliargs (the argparse leaf __main__ registers the
-#: `tui` subcommand from) and re-exported under their original names.
-#: The TLS material for an https:// listener is resolved flag-then-env
-#: exactly like the token; the names are identical in every cronstable
-#: client, so one exported set of variables serves the TUI, the MCP
-#: bridge and the thin CLIs at once.
+#: The default daemon address, owned by cronstable._cliargs (the argparse
+#: leaf __main__ registers the `tui` subcommand from) and re-exported here.
+#: cronstable.webclient resolves the token and the TLS material for the
+#: session, as it does for the MCP bridge and `cronstable pair`.
 DEFAULT_URL = _cliargs.WEB_DEFAULT_URL
-ENV_TOKEN = _cliargs.WEB_ENV_TOKEN
-ENV_CACERT = _cliargs.WEB_ENV_CACERT
-ENV_CLIENT_CERT = _cliargs.WEB_ENV_CLIENT_CERT
-ENV_CLIENT_KEY = _cliargs.WEB_ENV_CLIENT_KEY
-ENV_INSECURE = _cliargs.WEB_ENV_INSECURE
 
 #: Poll cadence choices (ms), mirroring the web settings sheet; 0 = paused.
 POLL_CHOICES = [1000, 2000, 3000, 5000, 10000, 0]
@@ -2009,18 +1991,6 @@ if sys.platform == "win32":  # pragma: no cover (windows)
             self._stop = True
 
 
-def _enable_vt_windows() -> None:  # pragma: no cover (windows) - Windows only
-    """Turn on ANSI/VT processing for the console (idempotent)."""
-    if sys.platform == "win32":
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        for std in (-11, -12):  # stdout, stderr
-            handle = kernel32.GetStdHandle(std)
-            mode = ctypes.c_uint32()
-            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-                # 0x0004 = ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
-
-
 class Term:
     """The live terminal: raw mode, alternate screen, diffed painting.
 
@@ -2038,7 +2008,7 @@ class Term:
     # ---- lifecycle ---------------------------------------------------
     def enter(self) -> None:
         if sys.platform == "win32":  # pragma: no cover (windows)
-            _enable_vt_windows()
+            enable_console_vt()
         else:  # pragma: no cover (posix) - raw mode via termios
             fd = sys.stdin.fileno()
             self._saved = termios.tcgetattr(fd)
@@ -2219,9 +2189,9 @@ class Api:
     docstring.  A missing/wrong token surfaces as :class:`Unauthorized`
     exactly where the web page would pop its token modal.
 
-    ``ssl_context`` (from :func:`_resolve_tls`) is applied once, to the
-    session's connector; ``None`` leaves aiohttp's default transport in
-    place, which is what every http:// daemon wants.
+    ``ssl_context`` (from :func:`cronstable.webclient.resolve_tls`) is
+    applied once, to the session's connector; ``None`` leaves aiohttp's
+    default transport in place, which is what every http:// daemon wants.
     """
 
     def __init__(
@@ -2232,7 +2202,7 @@ class Api:
     ) -> None:
         self.url = url.rstrip("/")
         self.token = token
-        self._ssl = ssl_context
+        self.ssl_context = ssl_context
         self._session: Any = None
 
     async def _ensure(self) -> Any:
@@ -2244,7 +2214,7 @@ class Api:
             kwargs: dict[str, Any] = {
                 "timeout": aiohttp.ClientTimeout(total=None)
             }
-            if self._ssl is not None:
+            if self.ssl_context is not None:
                 # Connector level, not per request: aiohttp's per-request
                 # ssl= would have to be repeated on get_json, get_text,
                 # post AND stream, and the easiest one to forget is
@@ -2253,7 +2223,9 @@ class Api:
                 # connector means a new request method cannot be born
                 # unverified.  The session owns the connector and closes
                 # it in close(), so no extra teardown is needed.
-                kwargs["connector"] = aiohttp.TCPConnector(ssl=self._ssl)
+                kwargs["connector"] = aiohttp.TCPConnector(
+                    ssl=self.ssl_context
+                )
             self._session = aiohttp.ClientSession(**kwargs)
         return self._session
 
@@ -2380,6 +2352,39 @@ class Api:
         if self._session is not None:
             await self._session.close()
             self._session = None
+
+
+async def in_daemon_thread(func: Callable[..., Any], *args: Any) -> Any:
+    """Await blocking ``func(*args)`` on a thread that exit leaves behind.
+
+    The loop joins every ``asyncio.to_thread`` worker when it shuts down,
+    so a stalled socket there holds the terminal after the operator quits.
+    Cancelling this call returns at once, and the thread ends by itself.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+
+    def deliver(result: Any, error: BaseException | None) -> None:
+        if future.done():  # the caller was cancelled
+            return
+        if error is None:
+            future.set_result(result)
+        else:
+            future.set_exception(error)
+
+    def work() -> None:
+        result: Any = None
+        error: BaseException | None = None
+        try:
+            result = func(*args)
+        except BaseException as exc:  # noqa: BLE001 - raised by the caller
+            error = exc
+        # The loop is closed when the app exited first.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(deliver, result, error)
+
+    threading.Thread(target=work, name="tui-blocking", daemon=True).start()
+    return await future
 
 
 class LogTail:
@@ -2781,6 +2786,67 @@ def panel_frame(
     return rows
 
 
+def pair_layout(
+    pair: dict[str, Any], cols: int, lines: int
+) -> tuple[int, list[str], list[tuple[str, str]], str]:
+    """The Pair a device panel for a window size, before theme colors.
+
+    Returns the panel width, the symbol's rows in their own colors, the
+    text rows as ``(text, style)``, and the hint row. In a short window
+    the caption gives way to the code, and a window too small for the code
+    says what it needs.
+    """
+    # Imported here: only this panel needs the encoder.
+    from cronstable import pairlink, qr
+
+    width = min(64, cols - 4)
+    inner = max(20, width - 4)
+    message = pair.get("error")
+    if message is None:
+        matrix, notes = pair["matrix"], pair["notes"]
+        keys = "c copy payload · esc close"
+        label = pairlink.label(pair["name"], pair["url"])
+        text = [("", "fg"), (truncate(label, inner), "bright")]
+        caption = " ".join(filter(None, [*pair["hint"], pair.get("lan_note")]))
+        text += [(segment, "dim") for segment in textwrap.wrap(caption, inner)]
+        for _short, note in notes:
+            text += [
+                (segment, "warn") for segment in textwrap.wrap(note, inner)
+            ]
+        # 4 cells of frame beside the body, 4 rows of frame around it.
+        frame = (8, 4)
+        room = (cols - frame[0], lines - frame[1])
+        code = qr.fit_half_blocks(matrix, room[0], room[1] - len(text))
+        shorts = ""
+        if code is None:
+            # The caption gives way to the code, and the notes move to
+            # the hint row in their short form.
+            text = []
+            code = qr.fit_half_blocks(matrix, *room)
+            if notes:
+                shorts = "⚠ " + " · ".join(short for short, _note in notes)
+        if code is not None:
+            width = max(width, len(code[0]) + 4)
+            footer = keys
+            if shorts:
+                # The panel widens for the notes while the window has
+                # room. In a narrower one the notes are cut, and the keys
+                # stay whole.
+                joined = "%s · %s" % (shorts, keys)
+                width = max(width, min(cols - 4, text_width(joined) + 4))
+                spare = width - 4 - text_width(keys) - 3
+                if spare >= 8:
+                    footer = "%s · %s" % (truncate(shorts, spare), keys)
+            left = " " * ((width - 4 - len(code[0])) // 2)
+            rows = [left + qr.INK_ON_PAPER + row + RESET for row in code]
+            return width, rows, text, footer
+        message = qr.too_small(matrix, cols, lines, frame)
+    text = [
+        (segment, "warn") for segment in textwrap.wrap(str(message), inner)
+    ]
+    return width, [], text, "esc close"
+
+
 def scroll_window(total: int, visible: int, cursor: int, offset: int) -> int:
     """Keep ``cursor`` inside the ``visible`` window; returns new offset."""
     if total <= visible:
@@ -2796,34 +2862,6 @@ def scroll_window(total: int, visible: int, cursor: int, offset: int) -> int:
 # ===================================================================
 #  the application
 # ===================================================================
-#: Overlay identifiers, in the web page's Esc close-priority order:
-#: the FIRST open surface in this list is the one Esc closes.
-ESC_PRIORITY = [
-    "token",
-    "settings",
-    "help",
-    "mitigate",
-    "sandbox",
-    "timeline",
-    "tail",
-    "dag",
-    "drawer",
-    # the card-panels (web cards adapted to overlay screens) close
-    # after the drawers: a drawer opened FROM a panel (the DAGs index
-    # -> a DAG's drawer) stacks on top of it, so Esc must peel the
-    # drawer first, exactly like the web page's close order does for
-    # its own surfaces
-    "dags",
-    "state",
-    "cluster",
-    "fleet",
-    "heat",
-    "press",
-    "week",
-    "radar",
-    "node",
-]
-
 #: Text inputs and the overlay each belongs to (focus routing).
 INPUT_HOMES = {
     "filter": None,
@@ -2964,6 +3002,12 @@ class App:
 
         # ---- palette ----
         self.palette_sel = 0
+
+        # ---- pair a device ----
+        # None while the panel loads. Dropped on close: the payload and
+        # the symbol carry the access token.
+        self.pair: dict[str, Any] | None = None
+        self._pair_seq = 0
 
         # ---- timeline / mitigate ----
         self.timeline_fail_only = False
@@ -3131,8 +3175,14 @@ class App:
         return name in self.open_overlays
 
     def open(self, name: str) -> None:
-        if name not in self.open_overlays:
-            self.open_overlays.append(name)
+        """Put overlay ``name`` on top, raising it when it is open already.
+
+        The top overlay is the one drawn, the one that takes keys, and the
+        one that Esc closes.
+        """
+        if name in self.open_overlays:
+            self.open_overlays.remove(name)
+        self.open_overlays.append(name)
         self.panel_scroll = 0
         self.mark()
 
@@ -3149,6 +3199,9 @@ class App:
             for tail in self.tails:
                 tail.stop()
             self.tails = []
+        if name == "pair":
+            self.pair = None
+            self._pair_seq += 1
         self.mark()
 
     def selected_job(self) -> dict[str, Any] | None:
@@ -4454,6 +4507,7 @@ class AppPalette(AppActions):
             ("⚙", "Open settings", lambda: self.open("settings")),
             ("?", "Keyboard shortcuts", lambda: self.open("help")),
             ("⚿", "Set access token", self._open_token),
+            ("▦", "Pair a device (QR)", self._open_pair),
             ("⧉", "Toggle workflows", self._toggle_dags),
             ("⛁", "Toggle state inspector", lambda: self._toggle("state")),
             ("⌕", "Focus filter", self._focus_filter),
@@ -4671,6 +4725,66 @@ class AppPalette(AppActions):
         self.open("token")
         self.focus = "token"
 
+    # ---- pair a device (the page's QR panel) -------------------------
+    def _open_pair(self) -> None:
+        self.open("pair")
+        self._build_pair()
+
+    def _build_pair(self) -> None:
+        """Start a build of the panel's code, in place of the one shown.
+
+        The overlay stack keeps its order, so an overlay over the panel
+        stays on top.
+        """
+        self.pair = None
+        self._pair_seq += 1
+        self._spawn(self._load_pair(self._pair_seq))
+        self.mark()
+
+    async def _load_pair(self, seq: int) -> None:
+        """Build the pairing code for the open panel.
+
+        ``seq`` drops an answer that lands after the panel closed or
+        reloaded, like the page's ``pairSeq``.
+        """
+        # Imported here: only this panel needs the encoder and the
+        # address check.
+        from cronstable import pairlink, pairprobe, qr
+
+        built: dict[str, Any]
+        try:
+            whoami = await self.api.get_json("/whoami")
+            base = pairlink.base_url(self.api.url)
+            # The check sends blocking requests.
+            url = await in_daemon_thread(
+                pairprobe.phone_url, base, whoami, self.api.ssl_context
+            )
+            pairing = pairlink.pairing(
+                whoami, url, self.api.token, cluster=self.cluster
+            )
+            built = dict(
+                pairing._asdict(),
+                matrix=qr.encode_for_screen(pairing.link),
+                lan_note=pairlink.lan_note(base, url),
+            )
+        except Unauthorized:
+            built = {
+                "error": "The server needs a valid access token. Select "
+                "Set access token in the command palette, and the panel "
+                "builds the code."
+            }
+            if seq == self._pair_seq:
+                self._open_token()
+        except pairprobe.Unreachable as exc:
+            built = {"error": "%s %s" % (oneline(exc), exc.advice("tui"))}
+        except Exception as exc:  # noqa: BLE001 - shown in the panel
+            # A timeout has no message of its own.
+            reason = oneline(exc) or exc.__class__.__name__
+            built = {"error": "Could not build the pairing code: %s" % reason}
+        if seq == self._pair_seq:
+            self.pair = built
+            self.mark()
+
     def _focus_filter(self) -> None:
         self.focus = "filter"
 
@@ -4682,9 +4796,10 @@ class AppKeys(AppPalette):
     async def handle_key(self, key: str) -> None:
         """One key press.  Structure and guards mirror the web page's
         single keydown handler: palette submode first, then the palette
-        chord (global, even over the wallboard), Esc close-priority,
-        focused-field editing, ``w``/``a`` (list or wallboard, never in
-        overlays), overlay-local keys, and finally the list keys."""
+        chord (global, even over the wallboard), Esc (closes the top
+        overlay), focused-field editing, ``w``/``a`` (list or wallboard,
+        never in overlays), overlay-local keys, and finally the list
+        keys."""
         if key == "ctrl+c":
             self.quit = True
             return
@@ -4734,10 +4849,12 @@ class AppKeys(AppPalette):
             self.focus = None
             self.mark()
             return
-        for name in ESC_PRIORITY:
-            if self.is_open(name):
-                self.close(name)
-                return
+        top = self.top_overlay()
+        if top is not None:
+            # the overlay on screen: a drawer opened from a panel peels
+            # off first, and the panel beneath it on the next Esc
+            self.close(top)
+            return
         if self.focus is not None:
             self.focus = None
             self.mark()
@@ -4792,6 +4909,9 @@ class AppKeys(AppPalette):
             self.focus = None
             self.toast("ok", "⚿ token %s" % ("set" if value else "cleared"))
             self.refresh_now()
+            if self.is_open("pair"):
+                # the code embeds the token: rebuild it, as the page does
+                self._build_pair()
         elif name == "logsearch":
             # release the input so n/N/f/t/w/d act on the drawer again,
             # and land on the current (first) match, not the second
@@ -4975,6 +5095,12 @@ class AppKeys(AppPalette):
         # all typing routes through the focused-input path; nothing else
         self.focus = "token"
         await self._input_key("token", key)
+
+    async def _key_pair(self, key: str) -> None:
+        if key == "c" and self.pair and "payload" in self.pair:
+            # the page's Copy button: the JSON the app takes as pasted text
+            copy_to_clipboard(self.term, self.pair["payload"])
+            self.toast("ok", "❏ copied pairing payload")
 
     async def _key_timeline(self, key: str) -> None:
         entries = self._timeline_cached()
@@ -6325,6 +6451,32 @@ class AppOverlays(AppRender):
         return panel_frame(
             paint, "access token", body, width, "enter save · esc cancel"
         )
+
+    # ---- pair a device -----------------------------------------------
+    def render_pair(self, paint: Painter, cols: int, lines: int) -> list[str]:
+        """The page's Pair a device panel: the QR code over its caption.
+
+        The symbol keeps its own black on white on every theme, as the
+        page's does. In a short window the caption gives way to the code,
+        and a window too small for the code says what it needs.
+        """
+        title = "pair a device"
+        pair = self.pair
+        if pair is None:
+            body = [paint.style("Building the pairing code…", "dim")]
+            return panel_frame(
+                paint, title, body, min(64, cols - 4), "esc close"
+            )
+        # The layout lives in the pair state, so closing the panel drops
+        # it with the token-bearing code.
+        cached = pair.get("_layout")
+        if cached is None or cached[0] != (cols, lines):
+            cached = ((cols, lines), pair_layout(pair, cols, lines))
+            pair["_layout"] = cached
+        width, code, text, footer = cached[1]
+        body = [paint.bg + row + paint.bg for row in code]
+        body += [paint.style(segment, style) for segment, style in text]
+        return panel_frame(paint, title, body, width, footer)
 
     # ---- incident timeline ------------------------------------------
     def timeline_entries(
@@ -8706,82 +8858,6 @@ async def _race_skip(
 add_tui_command = _cliargs.add_tui_command
 
 
-def _resolve_token(args: Any) -> str | None:
-    if getattr(args, "token", None):
-        return str(args.token)
-    env_name = getattr(args, "token_env", ENV_TOKEN) or ENV_TOKEN
-    value = os.environ.get(env_name, "")
-    return value or None
-
-
-def _resolve_tls(args: Any) -> "ssl.SSLContext | None":
-    """Flag then environment, like :func:`_resolve_token`, into a client
-    SSL context (or ``None`` to leave the default transport alone).
-
-    tlsutil is imported here rather than at module scope so an http://
-    session never pays for ssl; it is a stdlib-only leaf, so this cannot
-    reach back into the daemon's import graph.
-
-    Raises :exc:`OSError` on an unreadable path or malformed PEM, named
-    with the material in play; the caller turns that into a one-line CLI
-    error.
-    """
-    from cronstable import tlsutil
-
-    ca = getattr(args, "cacert", None) or os.environ.get(ENV_CACERT) or None
-    cert = (
-        getattr(args, "client_cert", None)
-        or os.environ.get(ENV_CLIENT_CERT)
-        or None
-    )
-    key = (
-        getattr(args, "client_key", None)
-        or os.environ.get(ENV_CLIENT_KEY)
-        or None
-    )
-    insecure = bool(getattr(args, "insecure", False)) or (
-        os.environ.get(ENV_INSECURE, "").lower() in ("1", "true", "yes")
-    )
-    if insecure:
-        # Never silent: verification is off but the Authorization header
-        # is not, so the bearer token is handed to whatever answers the
-        # connection, including whatever is impersonating the daemon.
-        # stderr keeps it out of anything piping the TUI's stdout.
-        print(
-            "warning: --insecure disables TLS certificate verification; "
-            "this can expose the bearer token to an untrusted server",
-            file=sys.stderr,
-        )
-    try:
-        return tlsutil.build_verifying_client_ssl_context(
-            ca=ca, cert=cert, key=key, insecure=insecure
-        )
-    except (OSError, ValueError) as err:
-        # OSError is a missing/unreadable file or a malformed PEM
-        # (ssl.SSLError subclasses it); ValueError is --client-key with no
-        # --client-cert, which tlsutil refuses rather than ignore.
-        #
-        # The stdlib throws the offending path away: a mistyped cafile
-        # arrives as a bare "[Errno 2] No such file or directory" with
-        # err.filename None, which across three separate paths (two of
-        # which may have come from the environment, not the command line)
-        # tells the operator nothing.  Name them.
-        material = ", ".join(
-            "%s=%s" % (flag, value)
-            for flag, value in (
-                ("--cacert", ca),
-                ("--client-cert", cert),
-                ("--client-key", key),
-            )
-            if value
-        )
-        if not material:
-            raise
-        # Re-raised as OSError either way: dispatch's caller reports it as a
-        # transport-material problem, and the ValueError case is one too.
-        raise OSError("%s (%s)" % (err, material)) from err
-
-
 def dispatch(args: Any) -> int:
     """Run the TUI; returns a process exit code."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -8791,14 +8867,18 @@ def dispatch(args: Any) -> int:
             file=sys.stderr,
         )
         return 2
+    # Imported here, like aiohttp: only a session that runs pays for the
+    # transport that the MCP bridge and `cronstable pair` share.
+    from cronstable import webclient
+
     try:
-        ssl_context = _resolve_tls(args)
-    except OSError as err:
-        # A missing/unreadable file or a malformed PEM; ssl.SSLError is an
-        # OSError subclass, so the one clause covers both.  Resolved here,
-        # before the terminal is put into raw mode, so the operator reads a
-        # plain line on an intact screen instead of a traceback painted
-        # over a half-drawn dashboard.
+        token = webclient.resolve_token(args)
+        ssl_context = webclient.resolve_tls(args)
+    except webclient.ClientError as err:
+        # A token that no header can carry, an unreadable file, or a
+        # malformed PEM. Resolved here, before the terminal is put into
+        # raw mode, so the operator reads a plain line on an intact screen
+        # instead of a traceback painted over a half-drawn dashboard.
         print("cronstable tui: %s" % err, file=sys.stderr)
         return 2
     prefs = load_prefs()
@@ -8824,7 +8904,7 @@ def dispatch(args: Any) -> int:
         else:  # pragma: no cover (posix) - PosixKeyReader
             keys = PosixKeyReader(loop, sys.stdin.fileno())
         app = TuiApp(
-            Api(str(args.url), _resolve_token(args), ssl_context),
+            Api(str(args.url), token, ssl_context),
             Term(),
             keys,
             prefs,
