@@ -1826,13 +1826,10 @@ The [performance benchmarks](https://github.com/ptweezy/cronstable/wiki/Performa
 compare speed and memory use against the latest release on every commit to
 catch regressions before release.
 
-The project uses AI openly: it's the realistic future of software development,
-and it helps make cronstable the best it can be. cronstable is maintained to be
-production ready for every kind of user and for jobs of any type or importance.
-Opinions on AI vary, but for a product at that level, AI review and input are
-expected. Because AI agents make thorough review and testing cheap, every change
-gets more scrutiny and the project's standards are higher. Putting others down
-for using AI isn't tolerated here (see
+cronstable's development relies on AI agents. The maintainer reviews
+every change before it merges, and each change must pass the test suite and its
+coverage floor. The project judges each contribution by the work itself,
+whatever tools produced it (see
 [AI use](https://github.com/ptweezy/cronstable/blob/main/CONTRIBUTING.md#ai-use)).
 
 Report security vulnerabilities privately, not in a public issue.
