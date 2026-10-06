@@ -52,6 +52,7 @@ from urllib.parse import quote
 
 import aiohttp
 
+from cronstable import netutil
 from cronstable.backends import TRANSPORT_LIBRARY, select_transport
 from cronstable.backends._common import (
     _UNKNOWN_HOLDER,
@@ -99,9 +100,7 @@ def _join_host_port(host: str, port: str) -> str:
     works). Bracket a host that contains a ``:`` and is not already bracketed,
     matching client-go's in-cluster loader.
     """
-    if ":" in host and not host.startswith("["):
-        host = "[{}]".format(host)
-    return "{}:{}".format(host, port)
+    return netutil.netloc(host, port)
 
 
 def display_holder(raw: str | None) -> str | None:

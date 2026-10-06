@@ -6,14 +6,15 @@ to a running daemon's ``POST /mcp`` endpoint through ``urllib`` and writes
 the reply to stdout. :mod:`cronstable.mcp` implements the tools in the
 daemon, so the bridge requires a reachable daemon.
 
-The bridge uses the standard library and :mod:`cronstable._cliargs`.
+The bridge uses the standard library, :mod:`cronstable._cliargs`, and
+:mod:`cronstable.webclient`, the transport it shares with ``cronstable pair``.
 It avoids importing aiohttp, strictyaml, or the scheduler at startup.
 
 For HTTPS listeners with publicly trusted certificates, no extra flags are
 needed. Use ``--cacert`` for a private CA and ``--client-cert`` with
 ``--client-key`` when the listener requires a client certificate through
 ``web.tls.clientCa``. ``--insecure`` disables certificate verification.
-:func:`_resolve_tls` imports :mod:`cronstable.tlsutil` to build the contexts.
+:func:`cronstable.webclient.resolve_tls` builds the contexts.
 
 Stdout contains only JSON-RPC messages; diagnostics go to stderr. The
 bridge forwards each request and writes the one reply it gets back.
@@ -28,37 +29,20 @@ carries the version the ``initialize`` reply negotiated.
 
 import argparse
 import base64
-import io
 import json
-import os
 import sys
-import urllib.error
-import urllib.request
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from cronstable import _cliargs
-
-if TYPE_CHECKING:  # pragma: no cover - annotations only
-    # ssl is imported inside the two functions that name it at runtime, so the
-    # module-level import block stays exactly what the header promises.
-    import ssl
+from cronstable import _cliargs, webclient
 
 # Owned by cronstable._cliargs (which registers the `mcp` subcommand for
 # __main__ without importing this module); re-exported here under their
 # original names.  DEFAULT_PROTOCOL_VERSION is only the wire default sent
 # before initialize completes; the real negotiated version is learned from
-# the initialize reply and used thereafter.  ENV_TOKEN is the env var
-# cronstable's own docs use for the web bearer token, consulted as a
-# convenience when neither --token nor --token-env is given, and the other
-# ENV_* names are the env fallbacks for the client TLS flags.
+# the initialize reply and used thereafter.
 DEFAULT_PROTOCOL_VERSION = _cliargs.MCP_DEFAULT_PROTOCOL_VERSION
 DEFAULT_URL = _cliargs.WEB_DEFAULT_URL
 DEFAULT_TIMEOUT = _cliargs.MCP_DEFAULT_TIMEOUT
-ENV_TOKEN = _cliargs.WEB_ENV_TOKEN
-ENV_CACERT = _cliargs.WEB_ENV_CACERT
-ENV_CLIENT_CERT = _cliargs.WEB_ENV_CLIENT_CERT
-ENV_CLIENT_KEY = _cliargs.WEB_ENV_CLIENT_KEY
-ENV_INSECURE = _cliargs.WEB_ENV_INSECURE
 
 # JSON-RPC codes used when the bridge itself must synthesize an error reply.
 # MCP asks for errors local to an implementation to use codes outside the
@@ -79,105 +63,6 @@ _MCP_NAME_SOURCE = {
 _B64_PREFIX = "=?base64?"
 _B64_SUFFIX = "?="
 
-# Loopback/control traffic must never be proxied (the daemon's endpoint is
-# usually 127.0.0.1, which an external proxy cannot reach), matching jobcli.
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-
-def _build_opener(
-    ctx: "ssl.SSLContext | None",
-) -> urllib.request.OpenerDirector:
-    """The opener this invocation posts through: the shared one, or a TLS one.
-
-    A ``None`` context (no TLS options given, the overwhelmingly common case)
-    returns the module-level ``_OPENER`` UNCHANGED rather than an equivalent
-    copy: that global is the no-TLS default and the seam the tests monkeypatch
-    by name, and handing back a copy would silently detach both.
-
-    With a context, the same proxy-free handler is paired with an HTTPSHandler
-    bound to it, so only the HTTPS transport changes; ``build_opener`` fills in
-    the rest of its stock handlers exactly as it does above.
-    """
-    if ctx is None:
-        return _OPENER
-    return urllib.request.build_opener(
-        urllib.request.ProxyHandler({}),
-        urllib.request.HTTPSHandler(context=ctx),
-    )
-
-
-class _BridgeError(Exception):
-    """A transport failure reaching the daemon's ``/mcp`` endpoint."""
-
-
-def _resolve_token(args: argparse.Namespace) -> str | None:
-    if args.token:
-        return str(args.token)
-    env_name = args.token_env or ENV_TOKEN
-    value = os.environ.get(env_name)
-    return value or None
-
-
-def _resolve_tls(args: argparse.Namespace) -> "ssl.SSLContext | None":
-    """The client TLS posture for this invocation, or ``None`` for the default.
-
-    Flag then env, the same precedence as :func:`_resolve_token`, so a shell
-    that already exports the bearer token can export its trust material beside
-    it.  ``None`` comes back when nothing is set, which leaves the opener (and
-    therefore every plaintext ``http://`` bridge that existed before TLS) on
-    exactly the transport it had.
-    """
-    # Imported at the point of use, not at module load: this bridge's header
-    # promises a standard-library-only import block, and tlsutil is the one
-    # cronstable module it needs. tlsutil is itself a stdlib-only leaf, so this
-    # pulls in nothing further.
-    from cronstable import tlsutil
-
-    ca = args.cacert or os.environ.get(ENV_CACERT) or None
-    cert = args.client_cert or os.environ.get(ENV_CLIENT_CERT) or None
-    key = args.client_key or os.environ.get(ENV_CLIENT_KEY) or None
-    insecure = bool(args.insecure) or (
-        os.environ.get(ENV_INSECURE, "").lower() in ("1", "true", "yes")
-    )
-    if insecure:
-        # Deliberately never silent. Verification is off but the Authorization
-        # header is still sent, so the token goes to whoever answers the
-        # connection, which is precisely what an interception would want.
-        print(
-            "warning: --insecure disables TLS certificate verification; "
-            "this can expose the bearer token to an untrusted server",
-            file=sys.stderr,
-        )
-    try:
-        return tlsutil.build_verifying_client_ssl_context(
-            ca=ca, cert=cert, key=key, insecure=insecure
-        )
-    except (OSError, ValueError) as ex:
-        # OSError is a missing/unreadable file or malformed PEM (ssl.SSLError
-        # subclasses it); ValueError is --client-key with no --client-cert,
-        # which tlsutil refuses rather than ignore. Without this arm an
-        # operator's typo in a path exits with a traceback instead of the
-        # clean error every other failure in this bridge produces.
-        #
-        # The paths are echoed because ssl does NOT name them: a missing file
-        # surfaces as a bare "[Errno 2] No such file or directory", which
-        # leaves an operator who fat-fingered one of three paths with nothing
-        # to look at.
-        given = ", ".join(
-            "{}={}".format(flag, path)
-            for flag, path in (
-                ("--cacert", ca),
-                ("--client-cert", cert),
-                ("--client-key", key),
-            )
-            if path
-        )
-        raise _BridgeError(
-            "cannot use the given TLS material{}: {}".format(
-                " ({})".format(given) if given else "", ex
-            )
-        ) from ex
-
 
 def _post(
     url: str,
@@ -190,10 +75,9 @@ def _post(
 ) -> tuple[int, bytes]:
     """POST one JSON-RPC frame to ``<url>/mcp``; return ``(status, body)``.
 
-    ``opener`` trails the original signature and defaults to ``None`` so a
-    five-argument call still goes through the module-level ``_OPENER``.  That
-    global is read here at call time rather than captured as the parameter
-    default, which is what keeps it monkeypatchable by name.
+    ``opener`` defaults to ``None``, which sends through
+    ``webclient.OPENER``.  That global is read here at call time, so a test
+    can replace it by name.
 
     ``headers`` are a modern frame's request headers (:func:`_modern_headers`),
     which replace ``protocol_version``.
@@ -209,76 +93,16 @@ def _post(
         request_headers.update(headers)
     if token:
         request_headers["Authorization"] = "Bearer " + token
-    req = urllib.request.Request(
-        endpoint, data=frame, method="POST", headers=request_headers
+    status, _headers, body = webclient.send(
+        endpoint,
+        opener or webclient.OPENER,
+        timeout,
+        "the cronstable MCP endpoint at {}".format(endpoint),
+        "/mcp",
+        headers=request_headers,
+        data=frame,
     )
-    via = opener or _OPENER
-    try:
-        with via.open(req, timeout=timeout) as resp:
-            return resp.status, resp.read()
-    except urllib.error.HTTPError as ex:
-        # HTTPError holds the response. Close it to release the connection.
-        with ex:
-            return ex.code, ex.read()
-    except urllib.error.URLError as ex:
-        # urllib wraps a failed handshake as URLError(reason=ssl.SSLError),
-        # which the generic arm below would report as "cannot reach": that
-        # sends the operator hunting a firewall or a wrong port when the
-        # socket connected fine and only verification failed. Imported here
-        # for the same reason as the tlsutil import in _resolve_tls.
-        import ssl
-
-        if isinstance(ex.reason, ssl.SSLError):
-            raise _BridgeError(
-                "TLS verification failed for the cronstable MCP endpoint at "
-                "{}: {} (pass --cacert with the CA that signed the "
-                "listener's certificate, or --insecure to skip verification "
-                "entirely)".format(endpoint, ex.reason)
-            ) from ex
-        raise _BridgeError(
-            "cannot reach the cronstable MCP endpoint at {}: {}".format(
-                endpoint, ex.reason
-            )
-        ) from ex
-    except (TimeoutError, OSError) as ex:
-        raise _BridgeError(
-            "cannot reach the cronstable MCP endpoint at {}: {}".format(
-                endpoint, ex
-            )
-        ) from ex
-
-
-def _utf8_stream(stream: Any) -> Any:
-    """``stream`` as UTF-8 text, wrapping its binary buffer when it has one.
-
-    MCP mandates UTF-8 JSON-RPC and the daemon replies in raw UTF-8, but a
-    piped stdio pair on Windows defaults to the ANSI codepage (cp1252): an
-    emoji or box-drawing char in a tool result then raises
-    UnicodeEncodeError on write and kills the bridge mid-session, and
-    inbound non-ASCII arrives mojibake.  Wrapping the underlying binary
-    buffer pins the bridge to UTF-8 on every platform.  ``newline=""``
-    keeps frames byte-exact in both directions: no CRLF translation on
-    write (a frame ends with a bare LF) and untranslated line endings on
-    read (the loop strips them anyway).
-
-    A stream without a binary buffer (a test's StringIO, a captured or
-    already-detached stream) is reconfigured in place when it supports
-    that, and otherwise handed back as-is, so the bridge still runs over
-    whatever the harness supplied.
-    """
-    buffer = getattr(stream, "buffer", None)
-    if buffer is not None:
-        try:
-            return io.TextIOWrapper(
-                buffer, encoding="utf-8", newline="", write_through=True
-            )
-        except (OSError, ValueError):
-            pass
-    try:
-        stream.reconfigure(encoding="utf-8")
-    except (AttributeError, OSError, ValueError):
-        pass
-    return stream
+    return status, body
 
 
 def _bridge_stdio() -> tuple[Any, Any]:
@@ -287,30 +111,10 @@ def _bridge_stdio() -> tuple[Any, Any]:
     Resolved once at bridge start and used only by the frame loop, so help
     text and error messages elsewhere keep the console's own encoding.
     """
-    return _utf8_stream(sys.stdin), _utf8_stream(sys.stdout)
-
-
-def _release_stream(wrapped: Any, original: Any) -> None:
-    """Detach a wrapper made by :func:`_utf8_stream`, leaving ``original``
-    usable.
-
-    A dropped TextIOWrapper CLOSES its buffer, and that buffer belongs to
-    the real stdin/stdout, which whatever runs after the bridge (the
-    interpreter's own shutdown, a test harness) still owns.  Flush what the
-    wrapper holds, then detach it so nothing is closed underneath the
-    original stream.  A stream that was passed through as-is (the
-    no-buffer fallback) has nothing to release.
-    """
-    if wrapped is original:
-        return
-    try:
-        wrapped.flush()
-    except (OSError, ValueError):
-        pass
-    try:
-        wrapped.detach()
-    except (OSError, ValueError):
-        pass
+    return (
+        webclient.utf8_stream(sys.stdin),
+        webclient.utf8_stream(sys.stdout),
+    )
 
 
 def _emit(out: Any, obj: Any) -> None:
@@ -323,7 +127,7 @@ def _write_reply(out: Any, body: bytes) -> None:
     """Write a daemon reply body to ``out`` as one newline-terminated frame.
 
     The daemon's body is raw UTF-8 JSON; decoding here and writing through
-    the UTF-8 stream from :func:`_utf8_stream` re-emits those bytes exactly,
+    the UTF-8 stream from :func:`_bridge_stdio` re-emits those bytes exactly,
     with a single trailing LF as the frame delimiter.
     """
     out.write(body.decode("utf-8").rstrip("\n") + "\n")
@@ -342,19 +146,20 @@ def _error_frame(out: Any, msg_id: Any, code: int, message: str) -> None:
 
 
 def _run_bridge(args: argparse.Namespace) -> int:
-    token = _resolve_token(args)
     try:
         # Built once, before the read loop rather than per frame: an SSL
         # context parses the CA and the client key off disk, which has no
         # business on a path walked once per JSON-RPC message. Unusable
         # material is fatal here instead of an error frame per request,
-        # because nothing about a bad path improves mid-session.
-        opener = _build_opener(_resolve_tls(args))
-    except _BridgeError as ex:
+        # because nothing about a bad path improves mid-session. The same
+        # goes for a token that no header can carry.
+        token = webclient.resolve_token(args)
+        opener = webclient.build_opener(webclient.resolve_tls(args))
+    except webclient.ClientError as ex:
         print(str(ex), file=sys.stderr)
         return 1
     protocol_version = args.protocol_version or DEFAULT_PROTOCOL_VERSION
-    # UTF-8 stdio for the frame loop only (see _utf8_stream): resolved here,
+    # UTF-8 stdio for the frame loop only (see _bridge_stdio), resolved here,
     # after the fatal-error path above, so a bridge that never starts its
     # loop leaves the process streams untouched.
     stdin, stdout = _bridge_stdio()
@@ -384,7 +189,7 @@ def _run_bridge(args: argparse.Namespace) -> int:
                     opener=opener,
                     headers=modern,
                 )
-            except _BridgeError as ex:
+            except webclient.ClientError as ex:
                 if is_request:
                     _error_frame(stdout, msg_id, _TRANSPORT_ERROR, str(ex))
                 else:
@@ -420,8 +225,8 @@ def _run_bridge(args: argparse.Namespace) -> int:
                     _http_error_message(status, body),
                 )
     finally:
-        _release_stream(stdin, sys.stdin)
-        _release_stream(stdout, sys.stdout)
+        webclient.release_stream(stdin, sys.stdin)
+        webclient.release_stream(stdout, sys.stdout)
     return 0
 
 
@@ -527,13 +332,13 @@ def _check(args: argparse.Namespace) -> int:
     Probes with ``server/discover`` first and falls back to ``initialize``
     when the daemon does not answer it, then counts ``tools/list``.
     """
-    token = _resolve_token(args)
     try:
         # Same one-shot build as the bridge, and the same reasoning: a --check
-        # that cannot even assemble its TLS material has failed, so say so
-        # once here rather than twice through the round-trips below.
-        opener = _build_opener(_resolve_tls(args))
-    except _BridgeError as ex:
+        # that cannot even assemble its token or TLS material has failed, so
+        # say so once here rather than twice through the later round-trips.
+        token = webclient.resolve_token(args)
+        opener = webclient.build_opener(webclient.resolve_tls(args))
+    except webclient.ClientError as ex:
         print("mcp check: {}".format(ex), file=sys.stderr)
         return 1
 
@@ -590,7 +395,7 @@ def _check(args: argparse.Namespace) -> int:
             negotiated = _sniff_protocol_version(body) or pv
             era = "legacy"
             tools_params = {}
-    except _BridgeError as ex:
+    except webclient.ClientError as ex:
         print("mcp check: {}".format(ex), file=sys.stderr)
         return 1
     listing = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
@@ -599,7 +404,7 @@ def _check(args: argparse.Namespace) -> int:
     try:
         _s, body2 = post(listing, negotiated)
         tools = json.loads(body2).get("result", {}).get("tools", [])
-    except (_BridgeError, ValueError, AttributeError):
+    except (webclient.ClientError, ValueError, AttributeError):
         tools = []
     print(
         "mcp check: ok - protocol {} ({}), {} tool(s) at {}".format(

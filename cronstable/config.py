@@ -1,7 +1,6 @@
 import copy
 import datetime
 import hashlib
-import ipaddress
 import logging
 import math
 import os
@@ -33,7 +32,7 @@ from strictyaml import (
 from strictyaml import Optional as Opt
 from strictyaml.ruamel.error import YAMLError
 
-from cronstable import crontabs, platform
+from cronstable import crontabs, netutil, platform
 from cronstable.cronexpr import LOCAL_ZONE, CronTab
 from cronstable.croninfo import Finding, lint_schedule
 
@@ -2973,33 +2972,35 @@ def parse_environment_file(path: str) -> dict[str, str]:
     return environ
 
 
-# Hosts that mean "all interfaces" in a `listen` address. A peer entry can't be
-# string-matched against these, so a node self-listed by hostname behind a
-# wildcard listen needs the nodeName-based recognition in _is_self_listed.
-_WILDCARD_LISTEN_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*", ""})
+def _wildcard_listen_versions(host: str) -> frozenset[int]:
+    """The IP versions on which a `listen` host binds every interface.
 
-# The same, split by address family: a wildcard bind holds the port on every
-# interface OF ITS FAMILY, which is what makes a same-family literal loopback
-# peer entry unambiguously self (see _is_self_listed). "*" and "" bind
-# everything, so they belong to both.
-_V4_WILDCARD_LISTEN_HOSTS = frozenset({"0.0.0.0", "*", ""})
-_V6_WILDCARD_LISTEN_HOSTS = frozenset({"::", "[::]", "*", ""})
+    ``*`` and an empty host bind both.  An unspecified address binds its
+    own, in any form :func:`cronstable.netutil.ip_literal` reads
+    (``0.0.0.0``, ``0``, ``::``, ``[::0]``).  Any other host binds none.
+
+    A wildcard bind holds the port on every interface of its family, which
+    makes a same-family literal loopback peer entry unambiguously self (see
+    :func:`_is_self_listed`).
+    """
+    if host in ("", "*"):
+        return frozenset({4, 6})
+    ip = netutil.ip_literal(host)
+    if ip is None or not ip.is_unspecified:
+        return frozenset()
+    return frozenset({ip.version})
 
 
 def _loopback_ip_version(host: str) -> int | None:
     """The IP version (4 or 6) of a literal loopback host, else ``None``.
 
     Accepts the bracketed IPv6 form peer entries use (``[::1]``).  Pure
-    literal parsing via :mod:`ipaddress`: a hostname -- even ``localhost`` --
-    never parses, so no DNS resolution happens and nothing is guessed.
+    literal parsing with :func:`cronstable.netutil.ip_literal`: a hostname
+    never parses, ``localhost`` included, so no DNS resolution happens and
+    nothing is guessed.
     """
-    if host.startswith("[") and host.endswith("]"):
-        host = host[1:-1]
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return None
-    return ip.version if ip.is_loopback else None
+    ip = netutil.ip_literal(host)
+    return ip.version if ip is not None and ip.is_loopback else None
 
 
 def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
@@ -3036,7 +3037,8 @@ def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
     if peer_host == listen:
         return True
     listen_host, _, listen_port = listen.rpartition(":")
-    if listen_host not in _WILDCARD_LISTEN_HOSTS:
+    versions = _wildcard_listen_versions(listen_host)
+    if not versions:
         return False
     peer_h, _, peer_port = peer_host.rpartition(":")
     if peer_port != listen_port:
@@ -3047,10 +3049,7 @@ def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
     # port: unambiguously this node (see the docstring). The family must
     # match -- a "::"-only bind does not necessarily accept v4, so 127.0.0.1
     # there could in principle be a different colocated process.
-    version = _loopback_ip_version(peer_h)
-    if version == 4 and listen_host in _V4_WILDCARD_LISTEN_HOSTS:
-        return True
-    return version == 6 and listen_host in _V6_WILDCARD_LISTEN_HOSTS
+    return _loopback_ip_version(peer_h) in versions
 
 
 def _likely_self_fqdn(peer_host: str, listen: str, node_name: str) -> bool:
@@ -3066,7 +3065,7 @@ def _likely_self_fqdn(peer_host: str, listen: str, node_name: str) -> bool:
     if _is_self_listed(peer_host, listen, node_name):
         return False
     listen_host, _, listen_port = listen.rpartition(":")
-    if listen_host not in _WILDCARD_LISTEN_HOSTS:
+    if not _wildcard_listen_versions(listen_host):
         return False
     peer_h, _, peer_port = peer_host.rpartition(":")
     if peer_port != listen_port:
@@ -3326,12 +3325,10 @@ def _is_wildcard_host(host: str) -> bool:
     text = host.strip().strip("[]")
     if not text:
         return True
-    try:
-        return ipaddress.ip_address(text).is_unspecified
-    except ValueError:
-        # a name, not a literal: a job can resolve it, and a certificate SAN
-        # can cover it
-        return False
+    ip = netutil.ip_literal(text)
+    # a name, not a literal: a job can resolve it, and a certificate SAN
+    # can cover it
+    return ip is not None and ip.is_unspecified
 
 
 def _validate_job_api_tls(job_api: dict[str, Any], listen: Any) -> None:
@@ -4291,10 +4288,8 @@ def _is_local_listener(addr: str) -> bool:
     host = (parsed.hostname or "").lower()
     if host == "localhost":
         return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+    ip = netutil.ip_literal(host)
+    return ip is not None and ip.is_loopback
 
 
 def _web_has_any_token(web: dict) -> bool:

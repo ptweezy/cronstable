@@ -2,10 +2,10 @@
 
 Every cronstable invocation builds the full parser, including ``--version``
 and commands launched by jobs, such as ``state get``. Keeping parser
-registration here avoids importing the terminal dashboard, MCP bridge, and
-job client until their commands run. ``cronstable.__main__.main_loop``
-imports each implementation in its dispatch branch.
-``tests/test_cli_stubs.py`` verifies this behavior.
+registration here avoids importing the terminal dashboard, MCP bridge,
+pair command, and job client until their commands run.
+``cronstable.__main__.main_loop`` imports each implementation in its
+dispatch branch. ``tests/test_cli_stubs.py`` verifies this behavior.
 
 This module imports only the standard library and has no dependencies on
 other cronstable modules. The ``mcpcli`` and ``tui`` modules re-export their
@@ -302,11 +302,11 @@ def _add_web_client_flags(
     url_help: str,
     token_env_default: str | None = None,
 ) -> None:
-    """Add shared connection flags for the MCP and TUI clients.
+    """Add shared connection flags for the MCP, TUI, and pair clients.
 
-    Both clients use the same destinations, actions, and runtime defaults.
+    The clients use the same destinations, actions, and runtime defaults.
     Only the URL help and the displayed ``--token-env`` default vary.
-    Both clients fall back to ``WEB_ENV_TOKEN`` at runtime.
+    Each client falls back to ``WEB_ENV_TOKEN`` at runtime.
     """
     parser.add_argument(
         "--url",
@@ -393,6 +393,48 @@ def add_mcp_command(sub: Any) -> None:
         action="store_true",
         help="check the connection with server/discover (or initialize) "
         "and tools/list, then exit",
+    )
+
+
+def add_pair_command(sub: Any) -> None:
+    """Register the ``cronstable pair`` subcommand on the subparsers."""
+    parser = sub.add_parser(
+        "pair",
+        help="show the QR code that pairs the mobile app with a running "
+        "cronstable server",
+        description=(
+            "Print the pairing QR code that the web dashboard's Pair a "
+            "device panel shows, for a server that runs the HTTP API "
+            "without the dashboard or a shell with no browser. The code "
+            "contains the server address and the access token given here, "
+            "so use a token scoped for the phone and pair over HTTPS or a "
+            "trusted network."
+        ),
+    )
+    _add_web_client_flags(
+        parser,
+        url_help="cronstable server URL (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--public-url",
+        default=None,
+        metavar="URL",
+        help="address the phone uses to reach the server (default: --url, "
+        "or this host's LAN address when --url is a loopback address)",
+    )
+    parser.add_argument(
+        "--name",
+        default=None,
+        metavar="NAME",
+        help="server name the app shows (default: the cluster node name, "
+        "or the address's host and port)",
+    )
+    parser.add_argument(
+        "--format",
+        default="qr",
+        choices=["qr", "link", "json"],
+        help="print the QR code, the pairing link as text, or the pairing "
+        "JSON that the app accepts as pasted text (default: %(default)s)",
     )
 
 

@@ -1,6 +1,8 @@
 import asyncio
+import io
 import logging
 import os
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -87,6 +89,196 @@ def test_version_prints_and_exits(monkeypatch, capsys):
         main.main_loop(_loop())
     assert exc.value.code == 0
     assert capsys.readouterr().out.strip() == cronstable.version.version
+
+
+# ---------------------------------------------------------------------------
+# a reader that closes stdout early, as `cronstable ... | head` does
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        (lambda: None, 0),
+        (lambda: sys.exit(0), 0),
+        (lambda: sys.exit(3), 3),
+        (lambda: sys.exit(), None),
+        (lambda: sys.exit("usage"), "usage"),
+    ],
+)
+def test_exit_status_is_the_commands(capsys, command, expected):
+    assert main._exit_status(command) == expected
+    assert capsys.readouterr().err == ""
+
+
+def test_exit_status_flushes_what_the_command_printed(monkeypatch):
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(io.BufferedWriter(raw), encoding="utf-8")
+    monkeypatch.setattr(sys, "stdout", stream)
+    assert main._exit_status(lambda: print("1.2.3")) == 0
+    assert raw.getvalue().splitlines() == [b"1.2.3"]
+
+
+def _to_a_closed_pipe(monkeypatch, name, buffering=-1):
+    """Point ``sys.<name>`` at a pipe whose reader has exited."""
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    stream = open(write_end, "w", buffering=buffering, encoding="utf-8")
+    close_at_test_end(stream.close)
+    monkeypatch.setattr(sys, name, stream)
+
+
+@pytest.mark.parametrize(
+    "size, status",
+    [
+        # a short text stays in the buffer until the flush at exit
+        (6, 0),
+        (6, 2),
+        # a long one fails in the command's own write
+        (1 << 20, 0),
+    ],
+)
+def test_closed_stdout_is_one_line_and_a_failing_status(
+    monkeypatch, capsys, size, status
+):
+    _to_a_closed_pipe(monkeypatch, "stdout")
+
+    def command():
+        sys.stdout.write("x" * size)
+        sys.exit(status)
+
+    assert main._exit_status(command) == (status or 1)
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("cronstable: cannot write the output: ")
+    # stdout takes the buffered text now, so the interpreter's own flush
+    # at exit is quiet
+    sys.stdout.flush()
+
+
+def test_closed_stdout_that_stderr_shares_is_a_failing_status(monkeypatch):
+    # `2>&1 | head`: the line on stderr has no reader either
+    _to_a_closed_pipe(monkeypatch, "stdout")
+    # line-buffered, as the interpreter's own stderr is
+    _to_a_closed_pipe(monkeypatch, "stderr", buffering=1)
+    assert main._exit_status(lambda: print("1.2.3")) == 1
+    # both streams take their buffered text now, so the interpreter's own
+    # flush at exit is quiet
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+
+def test_closed_stdout_is_reported_for_a_stream_with_no_descriptor(
+    monkeypatch, capsys
+):
+    def refuse():
+        raise BrokenPipeError(32, "Broken pipe")
+
+    stream = io.StringIO()
+    monkeypatch.setattr(stream, "flush", refuse, raising=False)
+    monkeypatch.setattr(sys, "stdout", stream)
+    assert main._exit_status(lambda: print("1.2.3")) == 1
+    assert capsys.readouterr().err == (
+        "cronstable: cannot write the output: [Errno 32] Broken pipe\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError(2, "No such file or directory", "state.db"),
+        # a write that another pipe or a socket refused
+        BrokenPipeError(32, "Broken pipe"),
+    ],
+)
+def test_another_oserror_is_not_reported_as_closed_stdout(capsys, failure):
+    def command():
+        print("partial")
+        raise failure
+
+    with pytest.raises(type(failure)):
+        main._exit_status(command)
+    assert "cannot write the output" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("written", ["", "partial"])
+def test_another_oserror_beside_a_closed_stdout_is_still_raised(
+    monkeypatch, capsys, written
+):
+    _to_a_closed_pipe(monkeypatch, "stdout")
+
+    def command():
+        sys.stdout.write(written)
+        raise FileNotFoundError(2, "No such file or directory", "state.db")
+
+    with pytest.raises(FileNotFoundError):
+        main._exit_status(command)
+    assert "cannot write the output" not in capsys.readouterr().err
+    # the buffered text has no reader when the stream closes
+    main._discard(sys.stdout)
+
+
+@pytest.mark.parametrize("stream", [None, io.StringIO()])
+def test_exit_status_without_a_stdout_to_flush(monkeypatch, stream):
+    # a windowless interpreter has none, and a closed one takes no flush
+    if stream is not None:
+        stream.close()
+    monkeypatch.setattr(sys, "stdout", stream)
+    assert main._exit_status(lambda: sys.exit(0)) == 0
+
+
+VERSION_TO_STDOUT = "sys.argv = ['cronstable', '--version']; main.main()"
+
+
+def _run_into_a_closed_pipe(run, stderr=subprocess.PIPE):
+    """Run ``run`` in an interpreter whose stdout reader has exited.
+
+    Returns the exit status and the lines on stderr. The pipe is a real
+    one, so the interpreter flushes its streams again when it exits.
+    """
+    script = (
+        "import sys\n"
+        "import cronstable.__main__ as main\n"
+        "sys.stdin.readline()\n" + run + "\n"
+    )
+    with subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=stderr,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ) as child:
+        # the reader exits before the command writes
+        child.stdout.close()
+        child.stdin.write(b"\n")
+        child.stdin.close()
+        errors = child.stderr.read() if child.stderr else b""
+    return child.returncode, errors.decode().splitlines()
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        # buffered text that the flush at exit cannot deliver
+        VERSION_TO_STDOUT,
+        # the pair command's code, which goes to stdout as UTF-8
+        "from cronstable import paircli\n"
+        "sys.exit(main._exit_status(lambda: paircli._emit('code\\n')))",
+    ],
+)
+def test_a_closed_pipe_leaves_one_line_on_stderr(run):
+    status, lines = _run_into_a_closed_pipe(run)
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("cronstable: cannot write the output: ")
+    assert status == 1
+
+
+def test_a_closed_pipe_that_stderr_shares_ends_with_status_1():
+    # `2>&1 | head`: the flush of stderr at exit has no reader either
+    status, lines = _run_into_a_closed_pipe(
+        VERSION_TO_STDOUT, stderr=subprocess.STDOUT
+    )
+    assert (status, lines) == (1, [])
 
 
 def test_third_party_licenses_prints_and_exits(monkeypatch, capsys):
@@ -257,6 +449,40 @@ def test_tui_routes_to_tui(monkeypatch):
         main.main_loop(_loop())
     assert exc.value.code == 0
     assert seen["command"] == "tui"
+
+
+def test_pair_routes_to_paircli(monkeypatch):
+    seen = {}
+
+    def fake_dispatch(args):
+        seen.update(vars(args))
+        return 0
+
+    monkeypatch.setattr("cronstable.paircli.dispatch", fake_dispatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cronstable", "pair", "--public-url", "https://cron.example.net"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop(_loop())
+    assert exc.value.code == 0
+    assert seen["command"] == "pair"
+    assert seen["public_url"] == "https://cron.example.net"
+    # the connection flags and defaults every web client shares
+    assert seen["url"] == "http://127.0.0.1:8080"
+    assert seen["token"] is None and seen["insecure"] is False
+    assert (seen["name"], seen["format"]) == (None, "qr")
+
+
+def test_pair_rejects_an_unknown_format(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys, "argv", ["cronstable", "pair", "--format", "png"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop(_loop())
+    assert exc.value.code == 2
+    assert "--format" in capsys.readouterr().err
 
 
 def test_first_run_without_arguments_shows_setup(

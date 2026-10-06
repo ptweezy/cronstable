@@ -18,6 +18,8 @@ import re
 import socket
 from typing import Any
 
+from cronstable import netutil
+
 logger = logging.getLogger("cronstable")
 
 #: python-zeroconf's two entry points, bound by :func:`_probe_zeroconf` on the
@@ -102,34 +104,6 @@ _MDNS_OP_TIMEOUT = 10.0
 #: Bound the address probe: the gethostbyname fallback can hang on a
 #: broken resolver, and it runs every housekeeping pass.
 _ADDR_TIMEOUT = 5.0
-
-
-def primary_address() -> str | None:
-    """This host's primary outbound IPv4 address, or ``None``.
-
-    The connected-UDP trick: connecting a datagram socket selects the
-    route (and thus the source address) without sending a packet.  The
-    target is TEST-NET-1, never actually reached.  Falls back to the
-    hostname's A record, then gives up (the caller skips the advert
-    with a warning rather than advertising loopback).
-    """
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        probe.connect(("192.0.2.1", 9))
-        address = str(probe.getsockname()[0])
-    except OSError:
-        address = None
-    finally:
-        probe.close()
-    if address and not address.startswith("127."):
-        return address
-    try:
-        address = socket.gethostbyname(socket.gethostname())
-    except OSError:
-        return None
-    if address.startswith("127."):
-        return None
-    return address
 
 
 def _instance_name(name: str) -> str:
@@ -287,7 +261,7 @@ class BonjourAdvertiser:
         )
 
     async def _resolve_address(self) -> str | None:
-        """:func:`primary_address` off-loop, bounded.
+        """:func:`cronstable.netutil.lan_address` off-loop, bounded.
 
         The gethostbyname fallback inside it is a blocking resolver
         call; on a broken DNS setup it can stall for seconds, and this
@@ -297,7 +271,7 @@ class BonjourAdvertiser:
         loop = asyncio.get_running_loop()
         try:
             return await asyncio.wait_for(
-                loop.run_in_executor(None, primary_address),
+                loop.run_in_executor(None, netutil.lan_address),
                 timeout=_ADDR_TIMEOUT,
             )
         except asyncio.TimeoutError:

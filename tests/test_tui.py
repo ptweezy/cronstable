@@ -26,7 +26,7 @@ from typing import Any, Optional
 import pytest
 from aiohttp import web
 
-from cronstable import tui
+from cronstable import _cliargs, pairlink, tui, webclient
 from cronstable.tui import (
     Api,
     HeadlessTerm,
@@ -841,11 +841,24 @@ class FakeDaemon:
             "points": [],
         }
         self.job_resources: dict[str, dict[str, Any]] = {}
+        # GET /whoami for a token-less daemon, the feature-off shape
+        self.whoami: dict[str, Any] = {
+            "authenticated": False,
+            "label": None,
+            "scopes": ["approve", "control", "view"],
+            "allScopes": True,
+            "pairLinkBase": "https://relay.cronstable.com/pair",
+            "sealableSuites": ["x25519"],
+        }
+        # the ID on every reply, which the pair panel's address check reads
+        self.instance = "fake-daemon-instance"
         self.runner: Optional[web.AppRunner] = None
         self.url = ""
 
     async def start(self) -> None:
         app = web.Application(middlewares=[self._auth])
+        app.on_response_prepare.append(self._stamp)
+        app.router.add_get("/whoami", self._whoami)
         app.router.add_get("/version", self._version)
         app.router.add_get("/job-set-id", self._job_set_id)
         app.router.add_get("/jobs", self._jobs)
@@ -889,8 +902,20 @@ class FakeDaemon:
         if self.token is not None:
             got = request.headers.get("Authorization", "")
             if got != "Bearer %s" % self.token:
-                return web.Response(status=401)
+                return web.Response(
+                    status=401,
+                    headers={"WWW-Authenticate": 'Bearer realm="cronstable"'},
+                )
         return await handler(request)
+
+    async def _stamp(self, request, response):
+        response.headers[pairlink.INSTANCE_HEADER] = self.instance
+
+    async def _whoami(self, request):
+        # the listener is the loopback one the fake binds; a test that
+        # needs another gives ``whoami`` its own ``listeners``
+        identity = {"instance": self.instance, "listeners": [self.url]}
+        return web.json_response({**identity, **self.whoami})
 
     async def _version(self, request):
         return web.Response(text="9.9-test")
@@ -1715,7 +1740,7 @@ def test_dispatch_refuses_without_a_tty(monkeypatch):
     class Args:
         url = tui.DEFAULT_URL
         token = None
-        token_env = tui.ENV_TOKEN
+        token_env = _cliargs.WEB_ENV_TOKEN
 
     assert tui.dispatch(Args()) == 2
 
@@ -2394,10 +2419,11 @@ class _TlsArgs:
 
 def _clear_tls_env(monkeypatch) -> None:
     for var in (
-        tui.ENV_CACERT,
-        tui.ENV_CLIENT_CERT,
-        tui.ENV_CLIENT_KEY,
-        tui.ENV_INSECURE,
+        _cliargs.WEB_ENV_TOKEN,
+        _cliargs.WEB_ENV_CACERT,
+        _cliargs.WEB_ENV_CLIENT_CERT,
+        _cliargs.WEB_ENV_CLIENT_KEY,
+        _cliargs.WEB_ENV_INSECURE,
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -2429,66 +2455,55 @@ async def test_api_builds_a_connector_only_for_a_tls_context(monkeypatch):
     assert seen[-1]["connector"].kwargs == {"ssl": ctx}
 
 
-def test_resolve_tls_is_none_until_something_is_set(monkeypatch):
-    """No flags and no env means no context at all, so the session stays
-    on aiohttp's default transport (and its system trust store)."""
-    _clear_tls_env(monkeypatch)
-    assert tui._resolve_tls(_TlsArgs()) is None
+def test_dispatch_takes_the_token_and_tls_from_the_shared_client(monkeypatch):
+    """The session's credential comes from cronstable.webclient, which
+    resolves it for the MCP bridge and cronstable pair too, so the three
+    clients read one set of flags and variables."""
 
+    class Tty:
+        def isatty(self):
+            return True
 
-def test_resolve_tls_prefers_the_flag_over_the_env(monkeypatch):
-    """Flag-then-env, per field, exactly like _resolve_token."""
-    from cronstable import tlsutil
+        def fileno(self):
+            return 0
 
+    monkeypatch.setattr("sys.stdin", Tty())
+    monkeypatch.setattr("sys.stdout", Tty())
     seen: dict[str, Any] = {}
 
-    def _record(**kwargs):
-        seen.update(kwargs)
-        return "context"
+    class FakeApp:
+        def __init__(self, api, *a, **k):
+            seen["api"] = api
 
-    monkeypatch.setattr(tlsutil, "build_verifying_client_ssl_context", _record)
+        async def run(self):
+            pass
+
+    monkeypatch.setattr(tui, "TuiApp", FakeApp)
+    monkeypatch.setattr(tui, "Term", lambda *a, **k: object())
+    monkeypatch.setattr(tui, "PosixKeyReader", lambda *a, **k: object())
+    context = object()
+    asked = []
+
+    def resolve_tls(args):
+        asked.append(args)
+        return context
+
+    monkeypatch.setattr(webclient, "resolve_tls", resolve_tls)
     _clear_tls_env(monkeypatch)
-    monkeypatch.setenv(tui.ENV_CACERT, "/env/ca.pem")
-    monkeypatch.setenv(tui.ENV_CLIENT_CERT, "/env/client.pem")
-    monkeypatch.setenv(tui.ENV_CLIENT_KEY, "/env/client.key")
+    monkeypatch.setenv("CS_TUI_TOK", "fromenv")
 
     class Args(_TlsArgs):
-        cacert = "/flag/ca.pem"
+        url = "https://cron.example.test:8443/"
+        token = None
+        token_env = "CS_TUI_TOK"
 
-    assert tui._resolve_tls(Args()) == "context"
-    # the flag wins where one was given; the env fills the rest in
-    assert seen == {
-        "ca": "/flag/ca.pem",
-        "cert": "/env/client.pem",
-        "key": "/env/client.key",
-        "insecure": False,
-    }
-
-
-def test_insecure_warns_that_the_token_still_travels(monkeypatch, capsys):
-    """--insecure must never be silent: verification is off but the
-    Authorization header is not, so the token goes to whoever answers."""
-    from cronstable import tlsutil
-
-    monkeypatch.setattr(
-        tlsutil,
-        "build_verifying_client_ssl_context",
-        lambda **kwargs: "context",
-    )
-    _clear_tls_env(monkeypatch)
-
-    class Args(_TlsArgs):
-        insecure = True
-
-    assert tui._resolve_tls(Args()) == "context"
-    err = capsys.readouterr().err
-    assert "--insecure" in err
-    assert "token" in err
-
-    # the env form is the same switch, and warns just as loudly
-    monkeypatch.setenv(tui.ENV_INSECURE, "YES")
-    assert tui._resolve_tls(_TlsArgs()) == "context"
-    assert "token" in capsys.readouterr().err
+    args = Args()
+    assert tui.dispatch(args) == 0
+    assert asked == [args]
+    api = seen["api"]
+    assert api.url == "https://cron.example.test:8443"
+    assert api.token == "fromenv"
+    assert api.ssl_context is context
 
 
 def test_dispatch_reports_a_bad_ca_path_without_a_traceback(
@@ -2509,11 +2524,40 @@ def test_dispatch_reports_a_bad_ca_path_without_a_traceback(
     class Args(_TlsArgs):
         url = tui.DEFAULT_URL
         token = None
-        token_env = tui.ENV_TOKEN
+        token_env = _cliargs.WEB_ENV_TOKEN
         cacert = str(missing)
 
     assert tui.dispatch(Args()) == 2
-    assert "absent-ca.pem" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert err.startswith("cronstable tui: cannot use the given TLS material")
+    assert "absent-ca.pem" in err
+
+
+def test_dispatch_reports_a_token_no_header_can_carry(monkeypatch, capsys):
+    """A token with a line break, such as one read from a CRLF file, gets
+    one line on an intact screen, and the line leaves the token out."""
+
+    class IsATty:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr("sys.stdin", IsATty())
+    monkeypatch.setattr("sys.stdout", IsATty())
+    _clear_tls_env(monkeypatch)
+    monkeypatch.setenv("CS_TUI_TOK", "s3cr3t-value\r")
+
+    class Args(_TlsArgs):
+        url = tui.DEFAULT_URL
+        token = None
+        token_env = "CS_TUI_TOK"
+
+    assert tui.dispatch(Args()) == 2
+    err = capsys.readouterr().err
+    assert err.startswith(
+        "cronstable tui: the access token from the CS_TUI_TOK environment "
+        "variable"
+    )
+    assert "s3cr3t" not in err
 
 
 #  Pure helpers, plumbing, and the CLI entry point
@@ -2817,28 +2861,6 @@ def test_add_tui_command_registers_all_flags():
     assert args.theme == "amber" and args.job == "j"
 
 
-def test_resolve_token_sources(monkeypatch):
-    class WithToken:
-        token = "explicit"
-        token_env = "SOME_VAR"
-
-    assert tui._resolve_token(WithToken) == "explicit"
-
-    class FromEnv:
-        token = None
-        token_env = "CS_TUI_TOK"
-
-    monkeypatch.setenv("CS_TUI_TOK", "fromenv")
-    assert tui._resolve_token(FromEnv) == "fromenv"
-    monkeypatch.delenv("CS_TUI_TOK", raising=False)
-
-    class Missing:
-        token = None
-        token_env = "CS_TUI_TOK"
-
-    assert tui._resolve_token(Missing) is None
-
-
 def test_dispatch_runs_amain(monkeypatch):
     class Tty:
         def isatty(self):
@@ -2862,10 +2884,10 @@ def test_dispatch_runs_amain(monkeypatch):
     monkeypatch.setattr(tui, "Term", lambda *a, **k: object())
     monkeypatch.setattr(tui, "PosixKeyReader", lambda *a, **k: object())
 
-    class Args:
+    class Args(_TlsArgs):
         url = tui.DEFAULT_URL
         token = None
-        token_env = tui.ENV_TOKEN
+        token_env = _cliargs.WEB_ENV_TOKEN
         theme = "amber-light"
         tv = True
         job = "watched"

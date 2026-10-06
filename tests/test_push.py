@@ -38,6 +38,7 @@ from aiohttp import web
 import cronstable.config as config
 import cronstable.cron as cron_mod
 import cronstable.discovery as discovery
+import cronstable.netutil as netutil
 import cronstable.push as push
 from cronstable.config import ConfigError, parse_config_string
 from cronstable.cron import (
@@ -2949,6 +2950,10 @@ async def test_whoami_with_and_without_token():
         "allScopes": False,
         "pairLinkBase": "https://relay.cronstable.com/pair",
         "sealableSuites": _sealable_now(),
+        # what a terminal pairing client checks another address against;
+        # no web app runs here, so no listener is bound
+        "instance": cron._web_instance,
+        "listeners": [],
     }
     body = json.loads((await cron._web_whoami(_Req())).body)
     assert body["authenticated"] is False
@@ -2975,7 +2980,39 @@ async def test_whoami_reports_an_anonymous_grant():
         "allScopes": False,
         "pairLinkBase": "https://relay.cronstable.com/pair",
         "sealableSuites": _sealable_now(),
+        # and no listeners: the grant leaves the bind addresses out
+        "instance": cron._web_instance,
     }
+
+
+async def test_whoami_names_the_instance_and_its_bound_listeners():
+    cron = _cron()
+    # as start_stop_web_app files them: http on loopback, https on every
+    # IPv4 and IPv6 address
+    cron._web_tcp_bound = [
+        ("http", ("127.0.0.1", 8080)),
+        ("https", ("0.0.0.0", 8443)),
+        ("https", ("::", 8443, 0, 0)),
+    ]
+    listeners = [
+        "http://127.0.0.1:8080",
+        "https://0.0.0.0:8443",
+        "https://[::]:8443",
+    ]
+    token = _WebToken(b"t", frozenset({"view"}), "wallboard")
+    for request in (_Req(token=token), _Req()):
+        body = json.loads((await cron._web_whoami(request)).body)
+        assert body["listeners"] == listeners
+        assert body["instance"] == cron._web_instance
+    # an anonymous grant names the daemon and keeps its addresses
+    anonymous = _Req(anon=frozenset({"view"}))
+    body = json.loads((await cron._web_whoami(anonymous)).body)
+    assert "listeners" not in body
+    assert body["instance"] == cron._web_instance
+    # the ID names one process: long enough to be unguessable, the same
+    # for the daemon's life, and another daemon's differs
+    assert len(cron._web_instance) >= 16
+    assert _cron()._web_instance != cron._web_instance
 
 
 async def test_whoami_pair_link_base_follows_the_relay_origin():
@@ -3227,7 +3264,7 @@ def fake_zeroconf(monkeypatch):
     monkeypatch.setattr(
         discovery, "ServiceInfo", _FakeServiceInfo, raising=False
     )
-    monkeypatch.setattr(discovery, "primary_address", lambda: "192.0.2.7")
+    monkeypatch.setattr(netutil, "lan_address", lambda: "192.0.2.7")
     return _FakeAsyncZeroconf
 
 
@@ -3284,9 +3321,7 @@ async def test_bonjour_reregisters_when_the_address_changes(
     fake_zeroconf, monkeypatch
 ):
     addresses = iter(["192.0.2.7", "192.0.2.7", "198.51.100.9"])
-    monkeypatch.setattr(
-        discovery, "primary_address", lambda: next(addresses)
-    )
+    monkeypatch.setattr(netutil, "lan_address", lambda: next(addresses))
     advertiser = discovery.BonjourAdvertiser()
     advert = {"name": "attic", "port": 8080, "properties": {}}
     await advertiser.start_stop(advert)
@@ -3338,7 +3373,7 @@ async def test_bonjour_advert_address_skips_the_probe(
     def _no_probe():
         raise AssertionError("the probe must not run for a specific bind")
 
-    monkeypatch.setattr(discovery, "primary_address", _no_probe)
+    monkeypatch.setattr(netutil, "lan_address", _no_probe)
     advertiser = discovery.BonjourAdvertiser()
     await advertiser.start_stop(
         {
@@ -3415,6 +3450,26 @@ def test_bonjour_advert_skips_undialable_listeners(caplog):
     cron = _advert_cron([("https", ("fd00::5", 8443, 0, 0))])
     assert cron._bonjour_advert({"bonjour": True}) is None
     assert any("IPv4-only" in r.message for r in caplog.records)
+    caplog.clear()
+    # every IPv6 address: that socket takes no IPv4 connection, so the
+    # advert's A record would send a peer to a port that refuses it
+    cron = _advert_cron([("https", ("::", 8443, 0, 0))])
+    assert cron._bonjour_advert({"bonjour": True}) is None
+    assert any("IPv4-only" in r.message for r in caplog.records)
+
+
+def test_bonjour_advert_takes_the_ipv4_wildcard_beside_an_ipv6_one():
+    # the natural dual-stack shape: one socket per family on one port
+    cron = _advert_cron(
+        [
+            ("https", ("::", 8443, 0, 0)),
+            ("https", ("0.0.0.0", 8443)),
+        ]
+    )
+    advert = cron._bonjour_advert({"bonjour": True})
+    assert advert is not None
+    assert (advert["port"], advert["properties"]["scheme"]) == (8443, "https")
+    assert "address" not in advert
 
 
 async def test_web_app_records_bound_tcp_listeners():
@@ -3453,7 +3508,7 @@ async def test_bonjour_real_serviceinfo_accepts_our_construction(
     )
     monkeypatch.setattr(discovery, "HAVE_ZEROCONF", True)
     monkeypatch.setattr(discovery, "AsyncZeroconf", _FakeAsyncZeroconf)
-    monkeypatch.setattr(discovery, "primary_address", lambda: "192.0.2.7")
+    monkeypatch.setattr(netutil, "lan_address", lambda: "192.0.2.7")
     advertiser = discovery.BonjourAdvertiser()
     await advertiser.start_stop(
         {

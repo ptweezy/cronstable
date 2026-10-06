@@ -146,6 +146,10 @@ The TUI includes:
   [schedule linter's](Schedule-Linting) advisory findings inline. A
   job's schedule drawer shows the same findings in the job's own time
   zone, so DST notes carry real dates.
+- The **Pair a device** panel (`Ctrl-K` → "Pair a device (QR)"): the
+  QR code that pairs the iOS app with the server, drawn in the terminal.
+  `c` copies the pairing JSON. See
+  [pairing from the terminal](Terminal-Pairing).
 - The **wallboard** (`w`) with worst-first tiles, the tally foot, a
   `NO SIGNAL` banner when data goes stale, and the zen screensaver on an
   idle board (nothing failing or running, data fresh).
@@ -303,4 +307,6 @@ reconnect throttle).
   and the `p` key.
 - [Late-Run Detection](Late-Run-Detection): the `sla:` monitor behind
   the **OVERDUE** suffix.
+- [Pairing from the Terminal](Terminal-Pairing): the Pair a device panel
+  and the `cronstable pair` command.
 - [MCP](MCP): access for AI agents.

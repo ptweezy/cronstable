@@ -1212,10 +1212,16 @@ paths:
         (`label: "anonymous"`, `allScopes` false). See the `WhoAmI` schema
         for all three shapes. Every shape carries `pairLinkBase`, the base
         URL of the pairing QR's deep link, and `sealableSuites`, the
-        suites this daemon can seal push alerts under.
+        suites this daemon can seal push alerts under. Every shape also
+        carries `instance`, which identifies the daemon. `listeners`, the
+        daemon's bound TCP listeners, is in every shape except the
+        `web.anonymousScopes` one.
       responses:
         "200":
           description: The matched token's identity.
+          headers:
+            Cronstable-Instance:
+              $ref: "#/components/headers/CronstableInstance"
           content:
             application/json:
               schema: { $ref: "#/components/schemas/WhoAmI" }
@@ -1759,6 +1765,13 @@ components:
     ETag:
       description: A content hash for conditional `If-None-Match` requests.
       schema: { type: string }
+    CronstableInstance:
+      description: >-
+        The daemon's instance ID, which it draws at random when it starts.
+        Every response carries it, including a 401, and `GET /whoami`
+        reports the same value as `instance`, so a client can tell one
+        daemon from another without presenting a token.
+      schema: { type: string }
 
   responses:
     Unauthorized:
@@ -1773,6 +1786,9 @@ components:
         this narrows to "credentials were presented and are invalid": a
         request carrying nothing at all is served, or refused with a
         reasoned 403 naming the scope it lacked.
+      headers:
+        Cronstable-Instance:
+          $ref: "#/components/headers/CronstableInstance"
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -1894,6 +1910,21 @@ components:
             a daemon that omits it seals `x25519` only, so generated
             clients decode it as optional and read absence as
             `["x25519"]`.
+        instance:
+          type: string
+          description: >-
+            An ID that the daemon draws at random when it starts and keeps
+            until it exits. Every response carries the same value in the
+            `Cronstable-Instance` header.
+        listeners:
+          type: array
+          items: { type: string }
+          description: >-
+            The address of each TCP socket that the `web.listen` entries
+            bound, in the form of a `web.listen` entry, such as
+            `http://0.0.0.0:8080`. The list has no entry for a unix socket.
+            The reply to a credential-less request served through
+            `web.anonymousScopes` omits the field.
       required: [authenticated, scopes, allScopes, pairLinkBase]
 
     PushDevice:

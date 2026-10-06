@@ -22,14 +22,10 @@ in [SECURITY.md](SECURITY.md).
 
 ## AI use
 
-cronstable uses AI tools openly in its development. AI-assisted development is
-the realistic future of software, and the project uses it to make cronstable
-the best it can be.
-
-The project is maintained to be production ready for every kind of user and for
-jobs of any type or importance. AI agents raise the project's standards. They
-make thorough review and testing cheap, so every change gets more scrutiny
-than it would without them.
+cronstable's development relies on AI agents, both to help write code and to
+review and test it. Every change goes through the same checks, whether a person
+or an AI tool wrote it: the test suite and its coverage floor, the performance
+benchmarks, automated code scanning, and the maintainer's review.
 
 Contributions written with AI help are welcome and held to the same standards
 as any other change. You don't need to say whether or how you used AI. You're
@@ -38,8 +34,9 @@ before you open a pull request. The
 [sign-off](#signing-off-your-commits-dco) on each commit certifies that you
 have the right to submit it, and that applies to code an AI tool wrote.
 
-The project doesn't tolerate putting others down for using AI. Judge a
-contribution by the work itself, whatever tools produced it.
+Judge a contribution by the work itself, whatever tools produced it. Keep
+review discussion focused on the change, and treat every contributor with
+respect.
 
 ## Before you start
 

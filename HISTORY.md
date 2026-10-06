@@ -2,149 +2,71 @@
 
 ## 1.2.63
 
-- Workflows take run parameters. A workflow declares them under `params:`
-  with a name, a type (`string`, `integer`, `number`, or `boolean`), a
-  `default` or `required: true`, and optional `allowed`, `minimum`,
-  `maximum`, `pattern`, `maxLength`, and `description`. A caller supplies
-  values when it starts a run, cronstable checks each value against the
-  declaration without coercing it, and a refused request creates no run. An
-  undeclared name is refused. A scheduled run and a catch-up run store the
-  defaults.
-- `POST /dags/{name}/trigger` accepts an optional JSON body with `params`,
-  `logicalDate`, and `requestId`, and its response adds `created` and the
-  stored `params`. `requestId` makes a trigger repeatable: the run key is
-  derived from it, so a repeated request returns the first run with
-  `created: false`, and the same `requestId` with other values answers
-  `409`. Refused parameters answer `400` with the reason for each name under
-  `paramErrors`. An unknown body field or invalid JSON also answers `400`.
-- `POST /dags/{name}/backfill` accepts `params` and applies it to the runs it
-  creates. A date that already has a run keeps that run's values. The route
-  answers `400` for a body field other than `from`, `to`, and `params`, so a
-  misspelled key starts no backfill. It used to ignore unknown fields.
-- A date that ends in `Z` is accepted on every supported Python version in
-  a backfill range and in a trigger's `logicalDate`. Python 3.10 used to
-  refuse it.
-- A task reads each parameter as a `CRONSTABLE_PARAM_<NAME>` environment
-  variable, and the new `cronstable param get`, `param list`, and
-  `param dump` commands read the same values over the loopback endpoint
-  (`GET /v1/param/get` and `GET /v1/param/list`). A value is never
-  substituted into a command.
-- A run document stores the checked values under `params`, written once at
-  creation, and a run started by a trigger or a backfill request records the
-  requesting token's label under `triggeredBy`. Every reader with the `view`
-  scope sees the values, so a parameter name that reads as a secret, such as
-  one that contains `password` or `token`, is a configuration error.
-- The new `params` token scope governs who chooses parameter values. A token
-  needs `params` in addition to `control` to send a non-empty `params`
-  object, and answers `403` without it. A token with `control` alone starts
-  runs with the declared defaults, the scalar `web.authToken` holds every
-  scope, and `GET /whoami` lists `params`. A `web.authTokens` entry that
-  lists `view`, `control`, and `approve` lacks the new scope, so
-  `GET /whoami` reports `allScopes: false` for it.
-- `GET /dags` lists a workflow's declaration under `params`. The dashboard
-  opens a parameter dialog for the trigger and the backfill of such a
-  workflow and shows a run's values in the drawer. The terminal dashboard
-  takes `name=value` pairs after `t` and on the backfill row. The MCP tools
-  `cron_trigger_dag` and `cron_backfill_dag` take `params`, and
-  `cron_trigger_dag` takes `logical_date` and `request_id`.
-- Recovery reuses the source run's parameters and lists them in the preview.
-  The declaration is part of the configuration revision of a workflow that
-  declares parameters, and a source whose values do not fit the current
-  declaration answers `409`.
-- A job takes run parameters too. It declares them under `params:` with the
-  keys a workflow uses, and every parameter has a `default`, because a
-  scheduled run uses the defaults. `POST /jobs/{name}/start` accepts
-  `{"params": {...}}`, checks the values against the declaration, answers
-  `400` with `paramErrors` for refused values, and lists the values the run
-  takes under `params` in its `200` and `202` answers. A non-empty `params`
-  object needs the `params` scope. A job that declares no parameters refuses
-  any value, and any other body starts a job with its defaults.
-- A job run reads its values as `CRONSTABLE_PARAM_<NAME>` variables, with or
-  without a `state:` section, and through `cronstable param` when the
-  job-facing endpoint is on. A start without values, a scheduled run, a
-  catch-up run, and a retry take the defaults. A start that supplies values
-  is one attempt outside the retry ladder. A pooled job's queue entry
-  carries the values until the pool admits the run.
-- A job run records its values under `params` in the run history, the
-  durable run ledger, and the in-flight record, so a run that a crash
-  interrupts keeps them. `GET /jobs` lists a job's declaration under
-  `params`. The dashboard's **Run** opens the parameter dialog for such a
-  job, the terminal dashboard's `r` opens a `name=value` row, and the MCP
-  tool `cron_run_job` takes `params`. The declaration is part of the job's
-  digest, so declaring parameters changes the job-set ID and cancels a pool
-  entry queued under the earlier declaration.
-- A workflow task can set `when:`, a list of comparisons that all have to
-  hold for the task to run. Each comparison reads a run parameter (`param`)
-  or a value that an upstream task published (`xcom`, with `task` and `key`)
-  and applies `equals`, `notEquals`, `in`, or `notIn`. The scheduler decides
-  when the task becomes ready. A task whose condition does not hold ends
-  `skipped` with a `skipReason` of kind `condition`, and its command never
-  starts. A met condition is recorded on the task entry as `whenMet` and is
-  not read again.
-- The loader checks each `when:` entry: a parameter comparison names a
-  declared parameter and values that parameter can hold, and an XCom
-  comparison names a task that is upstream and not mapped. An XCom value is
-  read once its task has finished, as UTF-8 text of at most 4096 bytes with
-  one trailing newline removed. A source with no value fails `equals` and
-  `in` and passes `notEquals` and `notIn`. If the store cannot answer, the
-  task stays `pending` and the read is retried after five seconds.
-- `GET /dags` lists `when` on each task that sets it. The dashboard marks
-  such a task with a `when` badge on the Tasks tab and a diamond on its
-  graph node, and the terminal dashboard names the comparisons on the task's
-  first graph edge.
-- Workflows can branch. A task skips itself when its command exits with a
-  code listed in the task's new `skipExitCodes`, and three new `triggerRule`
-  values join the branches: `none_failed`, `none_failed_min_one_success`,
-  and `all_done_min_one_failed`. Like `all_success` and `all_done`, each
-  rule waits until every upstream is terminal. `none_failed_min_one_success`
-  runs a join after the branch that ran. `all_done_min_one_failed` runs a
-  failure handler when an upstream failed and skips it otherwise. A run
-  whose handler succeeds still ends `failed`.
-- A skip decided by an exit code runs no `verify` step, fires neither
-  `onFailure` nor `onSuccess`, and uses no retry attempt. A timeout or a
-  cancel is never a skip. A sensor poke that exits with a listed code ends
-  the sensor `skipped`.
-- A skipped task entry records why in `skipReason`, with a `kind` of
-  `exit_code`, `upstream`, `trigger_rule`, `approval`, or `condition` and a
-  `detail` string. The dashboard and the terminal dashboard show the reason, and both
-  mark a task whose `triggerRule` is not `all_success`.
-- At load, cronstable warns about an `all_success` task that joins two or
-  more upstreams that can end `skipped`, because that task is skipped
-  whenever one of them is.
-- Recovery reuses a skipped branch as skipped and resets a join or a failure
-  handler below the failure. The recovery preview lists the reused skipped
-  tasks under `preservedSkipped`. A task that recovery resets reads its
-  `when:` condition again.
-- `GET /dags` lists `skipExitCodes` on each task that sets them.
-- Workflow runs have a run engine level, so nodes on different cronstable
-  versions can share a store during an upgrade. A run document records the
-  level its workflow needs in `engine`, and the field is absent at level 1.
-  This release supports level 2. A workflow needs it when it uses
-  `skipExitCodes`, `when:`, `params:`, or one of the new rules. A node
-  adopts, advances, and recovers only runs at or below its own level and
-  leaves a higher run for an upgraded node. Each node's manifest carries its
-  level as `dagEngine`, and `GET /dags` lists `fleetWarnings` for a workflow
-  that needs a level above a live peer's.
-- On a store that several nodes share, upgrade every node before a
-  configuration uses `params:`, `when:`, `skipExitCodes`, or one of the new
-  rules. A node older than this release has no level check. It refuses a
-  configuration that uses the keys. If it still runs an older configuration,
-  it treats a listed exit code as a failure, hands a task no parameters, and
-  runs a task whatever its `when:` condition says.
-- A workflow backfill reports the runs it created separately from the dates
-  that already had a run. In the response of `POST /dags/{name}/backfill` and
-  `cron_backfill_dag`, `created` counts the created runs, `existing` counts
-  the dates left alone, and `runKeys` and `existingRunKeys` list both sets.
-  `created` used to count every scheduled date in the range, so a repeated
-  backfill reported the same number and created nothing. The dashboard and
-  the terminal dashboard show both counts. A backfill answers `500` when the
-  state backend is unavailable.
-- The recovery configuration revision reads a fixed list of task fields, so a
-  release that adds a task field leaves stored revisions unchanged.
-  `skipExitCodes` and `when` enter the revision only for a task that sets
-  them.
-- The `dag.join_verdict_2k` benchmark times the new rules over skipped
-  branches.
+- `cronstable pair` prints the iOS app's pairing QR code in the terminal, for
+  a server that runs the HTTP API without the dashboard page
+  (`web.ui: false`) or a shell with no browser. It is the code that the web
+  dashboard's Pair a device panel shows, and it contains the token that the
+  command presents. When `--url` is a loopback address, the command puts
+  another address of the host in the code: the LAN address, or the address of
+  a listener on another interface, such as a VPN's. The daemon must report a
+  listener there, and the address must answer with the daemon's instance ID.
+  The command sends the token only to `--url`, and `--public-url` sets the
+  address that the phone dials. `--format link` and `--format json` print the
+  pairing link and the pairing JSON as text. The terminal dashboard's command
+  palette opens the same code with "Pair a device (QR)".
+- `GET /whoami` reports `instance`, an ID that the daemon draws at random
+  when it starts, and `listeners`, the addresses of its bound TCP sockets.
+  The reply to an anonymous request under `web.anonymousScopes` has no
+  `listeners`. Every response, including a `401`, carries the ID in the
+  `Cronstable-Instance` header, so a client can tell one daemon from another
+  without presenting a token.
+- `cronstable mcp` reports an HTTP redirect as a transport error that names
+  the redirect's target, and the `--url` value to pass when the redirect
+  leads to the `/mcp` endpoint at another address. The bridge does not follow
+  redirects, because each request carries the bearer token. A reply that is
+  not HTTP and a `--url` that is not a valid URL get a transport error too.
+- `cronstable mcp`, `cronstable pair`, and `cronstable tui` refuse a bearer
+  token that contains a line break or another character that an HTTP header
+  cannot carry, such as the line ending of a file that the variable was read
+  from. The message names the flag or the environment variable and leaves
+  the token out.
+- `cronstable mcp` and `cronstable pair` send the bearer token as UTF-8, the
+  form that the daemon compares, so a token with characters outside ASCII
+  authenticates.
+- The job state commands (`cronstable state`, `cursor`, `lock`, `artifact`,
+  `idempotent`, `secret`, and `xcom`) report an HTTP redirect from the state
+  endpoint as an error that names the redirect's target. They do not follow
+  redirects, because each request carries the run's token. A reply that is
+  not HTTP gets a one-line error.
+- Every subcommand ends with one line on stderr and status 1 when the reader
+  of its output closes the pipe, as `head` does after its last line.
+- In the terminal dashboard, `Esc` closes the panel or drawer that is on
+  top.
+- The Bonjour advert skips a listener bound to `[::]`. That socket accepts
+  IPv6 connections only, and the advert's address record is IPv4.
+- Configuration checks read a loopback or wildcard address in every form that
+  the socket layer reads, such as `127.1`, so `state.jobApi.listen:
+  http://127.1:9000` counts as a loopback bind.
+- The web dashboard's header keeps its buttons in view at any window width.
+  As the window narrows, the header hides readouts, least essential first:
+  the job-set ID chip, the node meter's bars, the clock, the version and the
+  node meter, and then the summary pills. On a phone-width screen, the token
+  button shows only its lock icon. A larger UI scale narrows the header in
+  the same way. Content that still doesn't fit, such as a long version
+  string, wraps to a second row.
+- In the web dashboard's log panes, line numbers and timestamps have a
+  contrast ratio of at least 4.5:1 in all ten themes. Placeholder text in
+  every field uses the theme's faint ink.
+- In the web dashboard, the workflows, resource pools, and saved state cards
+  align their content to the same 12px gutter as the jobs table. Workflow run
+  states and the saved state card's tabs have the square corners of the other
+  chips and buttons. The workflow drawer's backfill fields match the token
+  dialog's input, and the row wraps in a narrow drawer.
+- Web dashboard buttons tint in their own text color while you press them.
+  The job drawer's Run button shows a play icon, as Cancel and Pause show
+  theirs. The connection indicator's dot uses the ok status color, so the
+  color vision setting remaps it. With Reduce motion on, a drawer opens in
+  place without sliding. The demo dashboard includes all of these changes.
 
 ## 1.2.62
 

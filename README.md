@@ -6,7 +6,6 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ptweezy/cronstable/blob/main/LICENSE)
 
 [![PyPI status](https://img.shields.io/pypi/status/cronstable.svg?color=2ea44f)](https://pypi.org/project/cronstable/)
-[![CI](https://github.com/ptweezy/cronstable/actions/workflows/release.yml/badge.svg)](https://github.com/ptweezy/cronstable/actions/workflows/release.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/ptweezy/cronstable?logo=codecov&logoColor=white&color=f01f7a)](https://codecov.io/gh/ptweezy/cronstable)
 
 [![Release downloads](https://img.shields.io/github/downloads/ptweezy/cronstable/total?logo=github&label=binary%20downloads&color=fb8c00)](https://github.com/ptweezy/cronstable/releases)
@@ -19,7 +18,7 @@
 
 / kraahn-stuh-bl /
 
-cronstable is a fun little job scheduler for anything from a single machine to a cluster,
+cronstable is a feature-rich job scheduler and simple workflow orchestrator for anything from a single machine to a cluster,
 built with efficiency, security, and stability in mind. It runs your commands
 on a schedule, defined in YAML or loaded from an existing crontab, and adds
 retries, alerts, saved run history, workflows, and dashboards for the web, the
@@ -494,6 +493,28 @@ screen to connect to a live sample fleet.
 
 The app is optional. The web and terminal dashboards, the API, and every other
 reporter work without it.
+
+### Pair from the terminal
+
+To pair on a server that runs the API without the dashboard page
+(`web.ui: false`), or from a shell with no browser, run `cronstable pair`. It
+prints the same QR code in the terminal:
+
+```shell
+export CRONSTABLE_WEB_TOKEN=phone-token-value          # the token the phone gets
+cronstable pair                                        # local daemon on port 8080
+cronstable pair --public-url https://cron.example.net  # the address the phone uses
+```
+
+The code contains the token that the command presents, so give the command the
+phone's [scoped token](https://github.com/ptweezy/cronstable/wiki/HTTP-API#scoped-tokens-webauthtokens).
+When `--url` is a loopback address, the command puts the host's LAN address in
+the code if the daemon answers there. Pass `--public-url` when the phone uses
+another address, such as a reverse proxy's. In the
+[terminal dashboard](#terminal-dashboard), **Pair a device (QR)** in the
+command palette shows the same code. For the options and the terminal size the
+code needs, see
+[pairing from the terminal](https://github.com/ptweezy/cronstable/wiki/Terminal-Pairing).
 
 ## Tutorials
 
@@ -1541,9 +1562,9 @@ web:
 
 Clients send the token in an `Authorization: Bearer <token>` header. The
 dashboard page loads without a token, then prompts for one and keeps it only in
-that browser tab. `cronstable tui` and `cronstable mcp` read it from the
-`CRONSTABLE_WEB_TOKEN` environment variable. For narrower credentials, such as
-a view-only token for a wallboard, add
+that browser tab. `cronstable tui`, `cronstable mcp`, and `cronstable pair`
+read it from the `CRONSTABLE_WEB_TOKEN` environment variable. For narrower
+credentials, such as a view-only token for a wallboard, add
 [scoped tokens](https://github.com/ptweezy/cronstable/wiki/HTTP-API#scoped-tokens-webauthtokens).
 
 To turn the dashboard into a public read-only board, add `view` to
@@ -1585,10 +1606,10 @@ web:
 
 To require mutual TLS, which authenticates clients as well as encrypting
 connections, set `clientCa`. Web certificates rotate in place without a daemon
-restart. The `cronstable tui` and `cronstable mcp` clients take matching
-`--cacert`, `--client-cert`, `--client-key`, and `--insecure` flags. For how
-to issue the certificates, the mTLS trust model and how it combines with
-`web.authToken`, and how rotation works, see
+restart. The `cronstable tui`, `cronstable mcp`, and `cronstable pair` clients
+take matching `--cacert`, `--client-cert`, `--client-key`, and `--insecure`
+flags. For how to issue the certificates, the mTLS trust model and how it
+combines with `web.authToken`, and how rotation works, see
 [listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS) in the
 wiki.
 
@@ -1813,13 +1834,10 @@ The [performance benchmarks](https://github.com/ptweezy/cronstable/wiki/Performa
 compare speed and memory use against the latest release on every commit to
 catch regressions before release.
 
-The project uses AI openly: it's the realistic future of software development,
-and it helps make cronstable the best it can be. cronstable is maintained to be
-production ready for every kind of user and for jobs of any type or importance.
-Opinions on AI vary, but for a product at that level, AI review and input are
-expected. Because AI agents make thorough review and testing cheap, every change
-gets more scrutiny and the project's standards are higher. Putting others down
-for using AI isn't tolerated here (see
+cronstable's development relies on AI agents. The maintainer reviews
+every change before it merges, and each change must pass the test suite and its
+coverage floor. The project judges each contribution by the work itself,
+whatever tools produced it (see
 [AI use](https://github.com/ptweezy/cronstable/blob/main/CONTRIBUTING.md#ai-use)).
 
 Report security vulnerabilities privately, not in a public issue.

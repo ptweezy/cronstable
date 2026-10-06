@@ -18,6 +18,7 @@ import pytest
 
 pytest.importorskip("playwright.sync_api")
 
+from cronstable import pairlink  # noqa: E402
 from tests import _web_e2e as e2e  # noqa: E402
 
 
@@ -1439,6 +1440,12 @@ def test_pair_qr_encodes_the_link_for_a_non_ascii_node(browser, tmp_path):
             assert "+" not in fragment and "/" not in fragment
             assert _unb64url(fragment) == payload
             link = "https://relay.cronstable.com/pair#" + fragment
+            # the terminal clients (cronstable pair, the TUI's panel)
+            # write the same bytes for the same server
+            assert payload == pairlink.payload(
+                node, daemon.url.rstrip("/"), e2e.VIEW_TOKEN
+            )
+            assert link == pairlink.link(payload, pairlink.PAIR_LINK_FALLBACK)
             # the rendered code is exactly the code for that link
             assert _rendered_qr(page) == page.evaluate(_QR_PATH_FOR, link)
             assert _rendered_qr(page) != page.evaluate(

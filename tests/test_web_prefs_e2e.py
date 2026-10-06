@@ -12,6 +12,8 @@ Use the dashboard served by ``tests/_web_e2e.py`` to check these behaviors:
 * UI scale, font, density, and color vision settings apply and persist.
 * Preferences survive reloads. Invalid stored values fall back to defaults.
 * Panels fit the viewport at widths of 390 and 820 pixels.
+* The header keeps its controls inside the window at widths from 340 to
+  1,440 pixels, and at the largest UI scale.
 """
 
 import json
@@ -901,3 +903,62 @@ def test_no_sideways_overflow_on_narrow_viewports(
             _click(page, "#tvBtn")
             page.wait_for_selector("#wbGrid .wb-tile")
             _assert_fits(page, "wallboard", "#wallboard")
+
+
+# Find header children that extend past the window. The page clips sideways
+# overflow, so the user can't scroll to them.
+_HEADER_STRAYS = """
+() => {
+  const vw = document.documentElement.getBoundingClientRect().width;
+  return [...document.querySelector('header').children]
+    .filter((e) => e.getClientRects().length)
+    .filter((e) => {
+      const b = e.getBoundingClientRect();
+      return b.right > vw + 1 || b.left < -1;
+    })
+    .map((e) => e.id || e.className);
+}
+"""
+
+
+@pytest.mark.parametrize(
+    "width,scale",
+    [
+        (340, 100),
+        (390, 100),
+        (820, 100),
+        (1024, 100),
+        (1180, 100),
+        (1280, 100),
+        (1440, 100),
+        (1440, 140),
+    ],
+)
+def test_header_keeps_its_controls_inside_the_window(
+    browser, tmp_path, width, scale
+):
+    with e2e.Daemon(tmp_path, jobs=e2e.default_jobs()) as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            prefs={"scale": scale},
+            viewport={"width": width, "height": 900},
+        ) as page:
+            # Wait for attached, not visible, because the narrow header
+            # hides both elements.
+            page.wait_for_selector("#summary .pill", state="attached")
+            page.wait_for_function(
+                "document.getElementById('ver').textContent"
+            )
+            assert page.evaluate(_HEADER_STRAYS) == []
+            for control in (
+                "#paletteBtn",
+                "#refreshBtn",
+                "#settingsBtn",
+                "#authBtn",
+            ):
+                assert page.is_visible(control), control
+            # A narrow header hides readouts and keeps its controls.
+            if width <= 390:
+                assert not page.is_visible("#summary")
+                assert not page.is_visible("#clock")

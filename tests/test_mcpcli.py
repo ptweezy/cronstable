@@ -1,13 +1,14 @@
 """Tests for the ``cronstable mcp`` stdio bridge (:mod:`cronstable.mcpcli`).
 
 The bridge is a synchronous line proxy over two seams: ``_post`` (one HTTP
-round-trip via the module-level ``_OPENER``) and stdin/stdout.  ``_post``
+round-trip via ``webclient.OPENER``) and stdin/stdout.  ``_post``
 itself is tested against a fake opener; everything above it monkeypatches
 ``_post`` with a scripted recorder, in the same single-seam style as
 ``test_state_job_cli.py``.  Import isolation lives in ``test_mcp.py``.
 """
 
 import argparse
+import http.client
 import io
 import json
 import ssl
@@ -16,7 +17,7 @@ import urllib.error
 
 import pytest
 
-from cronstable import mcpcli
+from cronstable import _cliargs, mcpcli, webclient
 
 
 def _args(**overrides):
@@ -43,24 +44,24 @@ def _args(**overrides):
 
 
 def test_resolve_token_prefers_flag(monkeypatch):
-    monkeypatch.setenv(mcpcli.ENV_TOKEN, "from-env")
-    assert mcpcli._resolve_token(_args(token="flag")) == "flag"
+    monkeypatch.setenv(_cliargs.WEB_ENV_TOKEN, "from-env")
+    assert webclient.resolve_token(_args(token="flag")) == "flag"
 
 
 def test_resolve_token_default_env(monkeypatch):
-    monkeypatch.setenv(mcpcli.ENV_TOKEN, "from-env")
-    assert mcpcli._resolve_token(_args()) == "from-env"
+    monkeypatch.setenv(_cliargs.WEB_ENV_TOKEN, "from-env")
+    assert webclient.resolve_token(_args()) == "from-env"
 
 
 def test_resolve_token_custom_env(monkeypatch):
-    monkeypatch.delenv(mcpcli.ENV_TOKEN, raising=False)
+    monkeypatch.delenv(_cliargs.WEB_ENV_TOKEN, raising=False)
     monkeypatch.setenv("OTHER_TOKEN", "other")
-    assert mcpcli._resolve_token(_args(token_env="OTHER_TOKEN")) == "other"
+    assert webclient.resolve_token(_args(token_env="OTHER_TOKEN")) == "other"
 
 
 def test_resolve_token_absent(monkeypatch):
-    monkeypatch.delenv(mcpcli.ENV_TOKEN, raising=False)
-    assert mcpcli._resolve_token(_args()) is None
+    monkeypatch.delenv(_cliargs.WEB_ENV_TOKEN, raising=False)
+    assert webclient.resolve_token(_args()) is None
 
 
 # ---------------------------------------------------------------------------
@@ -78,10 +79,10 @@ def _no_tls_env(monkeypatch):
     monkeypatch it returns.
     """
     for name in (
-        mcpcli.ENV_CACERT,
-        mcpcli.ENV_CLIENT_CERT,
-        mcpcli.ENV_CLIENT_KEY,
-        mcpcli.ENV_INSECURE,
+        _cliargs.WEB_ENV_CACERT,
+        _cliargs.WEB_ENV_CLIENT_CERT,
+        _cliargs.WEB_ENV_CLIENT_KEY,
+        _cliargs.WEB_ENV_INSECURE,
     ):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
@@ -90,11 +91,11 @@ def _no_tls_env(monkeypatch):
 def test_resolve_tls_none_without_flags(_no_tls_env):
     # the plaintext default: no context at all, so the bridge keeps the
     # transport it had before TLS existed.
-    assert mcpcli._resolve_tls(_args()) is None
+    assert webclient.resolve_tls(_args()) is None
 
 
 def test_resolve_tls_insecure_warns_on_stderr(_no_tls_env, capsys):
-    ctx = mcpcli._resolve_tls(_args(insecure=True))
+    ctx = webclient.resolve_tls(_args(insecure=True))
     assert ctx is not None
     assert ctx.verify_mode == ssl.CERT_NONE
     # the warning is the point: verification is off while the token still
@@ -105,44 +106,56 @@ def test_resolve_tls_insecure_warns_on_stderr(_no_tls_env, capsys):
 
 
 def test_resolve_tls_insecure_via_env_also_warns(_no_tls_env, capsys):
-    _no_tls_env.setenv(mcpcli.ENV_INSECURE, "yes")
-    assert mcpcli._resolve_tls(_args()).verify_mode == ssl.CERT_NONE
+    _no_tls_env.setenv(_cliargs.WEB_ENV_INSECURE, "yes")
+    assert webclient.resolve_tls(_args()).verify_mode == ssl.CERT_NONE
     assert "--insecure" in capsys.readouterr().err
 
 
 def test_resolve_tls_cacert_flag_beats_env(_no_tls_env, tmp_path):
     # flag-then-env precedence, asserted through the error: the flag's path is
     # the one that gets opened.
-    _no_tls_env.setenv(mcpcli.ENV_CACERT, str(tmp_path / "from-env.pem"))
-    with pytest.raises(mcpcli._BridgeError) as caught:
-        mcpcli._resolve_tls(_args(cacert=str(tmp_path / "from-flag.pem")))
+    _no_tls_env.setenv(_cliargs.WEB_ENV_CACERT, str(tmp_path / "from-env.pem"))
+    with pytest.raises(webclient.ClientError) as caught:
+        webclient.resolve_tls(_args(cacert=str(tmp_path / "from-flag.pem")))
     assert "from-flag.pem" in str(caught.value)
 
 
 def test_resolve_tls_bad_path_is_a_clean_error(_no_tls_env, tmp_path):
     # an unreadable CA must not exit with a traceback out of ssl.
-    with pytest.raises(mcpcli._BridgeError, match="TLS material"):
-        mcpcli._resolve_tls(_args(cacert=str(tmp_path / "absent.pem")))
+    with pytest.raises(webclient.ClientError, match="TLS material"):
+        webclient.resolve_tls(_args(cacert=str(tmp_path / "absent.pem")))
 
 
 def test_build_opener_without_context_is_the_shared_global():
-    # identity, not equality: _OPENER is the monkeypatch seam, so the no-TLS
+    # identity, not equality: OPENER is the monkeypatch seam, so the no-TLS
     # path must hand back that very object.
-    assert mcpcli._build_opener(None) is mcpcli._OPENER
+    assert webclient.build_opener(None) is webclient.OPENER
 
 
 def test_build_opener_with_context_is_a_separate_opener():
-    opener = mcpcli._build_opener(ssl.create_default_context())
-    assert opener is not mcpcli._OPENER
+    opener = webclient.build_opener(ssl.create_default_context())
+    assert opener is not webclient.OPENER
     handlers = [type(h).__name__ for h in opener.handlers]
     assert "HTTPSHandler" in handlers
     # an empty ProxyHandler evicts urllib's default one and installs no
     # *_open method of its own, so proxy support ends up absent entirely:
-    # the same shape _OPENER has, which is the point of passing it along.
+    # the same shape OPENER has, which is the point of passing it along.
     assert "ProxyHandler" not in handlers
     assert "ProxyHandler" not in [
-        type(h).__name__ for h in mcpcli._OPENER.handlers
+        type(h).__name__ for h in webclient.OPENER.handlers
     ]
+
+
+def test_openers_follow_no_redirect():
+    # urllib would resend the Authorization header to a redirect's target,
+    # so neither opener keeps the stock handler that follows one.
+    for opener in (
+        webclient.OPENER,
+        webclient.build_opener(ssl.create_default_context()),
+    ):
+        handlers = [type(h).__name__ for h in opener.handlers]
+        assert "NoRedirect" in handlers
+        assert "HTTPRedirectHandler" not in handlers
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +166,7 @@ def test_build_opener_with_context_is_a_separate_opener():
 class _FakeResponse:
     def __init__(self, status, body):
         self.status = status
+        self.headers = {}
         self._body = body
 
     def read(self):
@@ -183,7 +197,7 @@ class _FakeOpener:
 
 def test_post_success_builds_request(monkeypatch):
     opener = _FakeOpener(_FakeResponse(200, b'{"ok": 1}'))
-    monkeypatch.setattr(mcpcli, "_OPENER", opener)
+    monkeypatch.setattr(webclient, "OPENER", opener)
     status, body = mcpcli._post(
         "http://127.0.0.1:9/", b'{"a":1}', "sekret", "2025-11-25", 3.0
     )
@@ -198,7 +212,7 @@ def test_post_success_builds_request(monkeypatch):
 
 def test_post_without_token_sends_no_auth_header(monkeypatch):
     opener = _FakeOpener(_FakeResponse(200, b"{}"))
-    monkeypatch.setattr(mcpcli, "_OPENER", opener)
+    monkeypatch.setattr(webclient, "OPENER", opener)
     mcpcli._post("http://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0)
     assert opener.request.get_header("Authorization") is None
 
@@ -207,7 +221,7 @@ def test_post_http_error_returns_status_and_body(monkeypatch):
     err = urllib.error.HTTPError(
         "http://x/mcp", 401, "unauthorized", {}, io.BytesIO(b'{"error":"no"}')
     )
-    monkeypatch.setattr(mcpcli, "_OPENER", _FakeOpener(err))
+    monkeypatch.setattr(webclient, "OPENER", _FakeOpener(err))
     status, body = mcpcli._post(
         "http://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0
     )
@@ -224,23 +238,23 @@ def test_post_http_error_returns_status_and_body(monkeypatch):
     ],
 )
 def test_post_transport_failures_raise_bridge_error(monkeypatch, raised):
-    monkeypatch.setattr(mcpcli, "_OPENER", _FakeOpener(raised))
-    with pytest.raises(mcpcli._BridgeError, match="cannot reach"):
+    monkeypatch.setattr(webclient, "OPENER", _FakeOpener(raised))
+    with pytest.raises(webclient.ClientError, match="cannot reach"):
         mcpcli._post("http://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0)
 
 
 def test_post_without_opener_uses_the_module_global(monkeypatch):
     # the five-argument call is the pre-TLS signature; it must still go
-    # through _OPENER, read at call time so the monkeypatch takes.
+    # through webclient.OPENER, read at call time so the monkeypatch takes.
     opener = _FakeOpener(_FakeResponse(200, b"{}"))
-    monkeypatch.setattr(mcpcli, "_OPENER", opener)
+    monkeypatch.setattr(webclient, "OPENER", opener)
     mcpcli._post("http://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0)
     assert opener.request is not None
 
 
 def test_post_uses_the_supplied_opener(monkeypatch):
     unused = _FakeOpener(_FakeResponse(500, b"nope"))
-    monkeypatch.setattr(mcpcli, "_OPENER", unused)
+    monkeypatch.setattr(webclient, "OPENER", unused)
     chosen = _FakeOpener(_FakeResponse(200, b'{"ok": 1}'))
     status, _body = mcpcli._post(
         "http://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0, opener=chosen
@@ -256,13 +270,134 @@ def test_post_tls_failure_names_cacert_not_unreachable(monkeypatch):
     failure = urllib.error.URLError(
         ssl.SSLCertVerificationError(1, "certificate verify failed")
     )
-    monkeypatch.setattr(mcpcli, "_OPENER", _FakeOpener(failure))
-    with pytest.raises(mcpcli._BridgeError) as caught:
+    monkeypatch.setattr(webclient, "OPENER", _FakeOpener(failure))
+    with pytest.raises(webclient.ClientError) as caught:
         mcpcli._post("https://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0)
     message = str(caught.value)
     assert "TLS verification failed" in message
     assert "--cacert" in message
     assert "cannot reach" not in message
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        # something other than an HTTP server answered
+        http.client.BadStatusLine("SSH-2.0-OpenSSH_9.6\r\n"),
+        http.client.IncompleteRead(b"{", 40),
+    ],
+)
+def test_post_reply_that_is_not_http_raises_bridge_error(monkeypatch, raised):
+    monkeypatch.setattr(webclient, "OPENER", _FakeOpener(raised))
+    with pytest.raises(webclient.ClientError) as caught:
+        mcpcli._post("http://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0)
+    message = str(caught.value)
+    assert message.startswith("no HTTP reply from the cronstable MCP endpoint")
+    # the peer's bytes arrive escaped
+    assert repr(raised) in message
+    assert "\r" not in message
+
+
+def test_post_error_body_cut_short_raises_bridge_error(monkeypatch):
+    class _CutShort(io.BytesIO):
+        def read(self, *args):
+            raise http.client.IncompleteRead(b"{", 40)
+
+    err = urllib.error.HTTPError("http://x/mcp", 500, "error", {}, _CutShort())
+    monkeypatch.setattr(webclient, "OPENER", _FakeOpener(err))
+    with pytest.raises(webclient.ClientError, match="IncompleteRead"):
+        mcpcli._post("http://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0)
+
+
+def test_post_reports_a_redirect_instead_of_following_it(monkeypatch):
+    # what the redirect-free opener raises for a 3xx
+    err = urllib.error.HTTPError(
+        "http://x/mcp",
+        307,
+        "redirect",
+        {"Location": "https://elsewhere.test/mcp\x1b[2J"},
+        io.BytesIO(b""),
+    )
+    monkeypatch.setattr(webclient, "OPENER", _FakeOpener(err))
+    with pytest.raises(webclient.ClientError) as caught:
+        mcpcli._post("http://127.0.0.1:9", b"{}", "sekret", "2025-11-25", 1.0)
+    message = str(caught.value)
+    assert "redirects to 'https://elsewhere.test/mcp\\x1b[2J'" in message
+    assert "\x1b" not in message
+
+
+def test_post_redirect_to_the_endpoint_elsewhere_names_the_base(monkeypatch):
+    # --url takes the base, and the bridge appends /mcp to it
+    err = urllib.error.HTTPError(
+        "http://x/mcp",
+        301,
+        "moved",
+        {"Location": "https://nas.example.test/mcp"},
+        io.BytesIO(b""),
+    )
+    monkeypatch.setattr(webclient, "OPENER", _FakeOpener(err))
+    with pytest.raises(webclient.ClientError) as caught:
+        mcpcli._post("http://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0)
+    message = str(caught.value)
+    assert "redirects to 'https://nas.example.test/mcp'" in message
+    assert "(pass --url 'https://nas.example.test' instead)" in message
+
+
+@pytest.mark.parametrize("path", ["/x y", "/café"])
+def test_post_to_an_address_that_is_not_a_url_raises_bridge_error(path):
+    # the unpatched opener: http.client refuses the address before it
+    # opens a connection
+    with pytest.raises(webclient.ClientError) as caught:
+        mcpcli._post(
+            "http://127.0.0.1:9" + path, b"{}", None, "2025-11-25", 1.0
+        )
+    message = str(caught.value)
+    assert message.startswith(
+        "cannot send a request to the cronstable MCP endpoint at "
+    )
+    assert "the address is not a valid URL" in message
+    assert "no HTTP reply" not in message
+
+
+@pytest.mark.parametrize("url", ["localhost", "http://[::1"])
+def test_post_to_an_address_that_no_request_can_name_raises_bridge_error(
+    monkeypatch, url
+):
+    # no scheme, or a host cut short: the request is never built
+    opener = _FakeOpener(_FakeResponse(200, b"{}"))
+    monkeypatch.setattr(webclient, "OPENER", opener)
+    with pytest.raises(webclient.ClientError) as caught:
+        mcpcli._post(url, b"{}", "sekret", "2025-11-25", 1.0)
+    message = str(caught.value)
+    assert message.startswith(
+        "cannot send a request to the cronstable MCP endpoint at "
+        "{}/mcp: the address is not a valid URL".format(url)
+    )
+    assert opener.request is None
+
+
+def test_post_refuses_a_header_that_http_cannot_carry(monkeypatch):
+    opener = _FakeOpener(_FakeResponse(200, b"{}"))
+    monkeypatch.setattr(webclient, "OPENER", opener)
+    with pytest.raises(webclient.ClientError) as caught:
+        mcpcli._post(
+            "http://127.0.0.1:9", b"{}", None, "2025-06-18\r\nX-Extra: 1", 1.0
+        )
+    assert "the MCP-Protocol-Version header holds a character" in str(
+        caught.value
+    )
+    assert opener.request is None
+
+
+def test_post_returns_a_3xx_that_names_no_target(monkeypatch):
+    err = urllib.error.HTTPError(
+        "http://x/mcp", 304, "not modified", {}, io.BytesIO(b"")
+    )
+    monkeypatch.setattr(webclient, "OPENER", _FakeOpener(err))
+    status, _body = mcpcli._post(
+        "http://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0
+    )
+    assert status == 304
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +582,7 @@ def test_bridge_transport_error_on_request_emits_error_frame(
     code, _ = _run(
         monkeypatch,
         '{"jsonrpc": "2.0", "id": 5, "method": "ping"}\n',
-        [mcpcli._BridgeError("cannot reach the cronstable MCP endpoint")],
+        [webclient.ClientError("cannot reach the cronstable MCP endpoint")],
     )
     assert code == 0
     captured = capsys.readouterr()
@@ -463,7 +598,7 @@ def test_bridge_transport_error_on_notification_goes_to_stderr(
     code, _ = _run(
         monkeypatch,
         '{"jsonrpc": "2.0", "method": "notifications/initialized"}\n',
-        [mcpcli._BridgeError("daemon is down")],
+        [webclient.ClientError("daemon is down")],
     )
     assert code == 0
     captured = capsys.readouterr()
@@ -492,7 +627,7 @@ def test_bridge_threads_the_default_opener_into_post(monkeypatch, capsys):
         '{"jsonrpc": "2.0", "id": 1, "method": "ping"}\n',
         [(200, b'{"id": 1}')],
     )
-    assert recorder.calls[0]["opener"] is mcpcli._OPENER
+    assert recorder.calls[0]["opener"] is webclient.OPENER
 
 
 def test_bridge_reports_bad_tls_material_and_exits_nonzero(
@@ -508,6 +643,80 @@ def test_bridge_reports_bad_tls_material_and_exits_nonzero(
     assert captured.out == ""  # stdout carries JSON-RPC frames only
     assert "TLS material" in captured.err
     assert recorder.calls == []
+
+
+def test_bridge_reports_a_token_no_header_can_carry_and_exits_nonzero(
+    monkeypatch, capsys
+):
+    # a variable read from a file with a CRLF line ending, for example
+    recorder = _PostRecorder([])
+    monkeypatch.setattr(mcpcli, "_post", recorder)
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"id": 1}\n'))
+    monkeypatch.setenv("BRIDGE_TOKEN", "s3cr3t-value\r")
+    assert mcpcli._run_bridge(_args(token_env="BRIDGE_TOKEN")) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert (
+        "the access token from the BRIDGE_TOKEN environment variable"
+        in captured.err
+    )
+    assert "s3cr3t" not in captured.err
+    assert recorder.calls == []
+
+
+def test_bridge_answers_a_url_without_a_scheme_with_a_transport_error(
+    monkeypatch, capsys
+):
+    # --url localhost: every frame gets the error, and the bridge stays up
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            '{"jsonrpc": "2.0", "id": 7, "method": "ping"}\n'
+            '{"jsonrpc": "2.0", "method": "notifications/initialized"}\n'
+        ),
+    )
+    assert mcpcli._run_bridge(_args(url="localhost")) == 0
+    captured = capsys.readouterr()
+    [frame] = _frames(captured.out)
+    assert frame["id"] == 7
+    assert frame["error"]["code"] == -31000
+    assert "the address is not a valid URL" in frame["error"]["message"]
+    # the notification has no reply frame, so its failure goes to stderr
+    assert "the address is not a valid URL" in captured.err
+
+
+def test_bridge_refuses_a_negotiated_version_no_header_can_carry(
+    monkeypatch, capsys
+):
+    # the daemon's initialize reply names the version later requests carry
+    init_reply = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"protocolVersion": "2025-06-18\r\nX-Injected: 1"},
+        }
+    ).encode()
+    opener = _FakeOpener(_FakeResponse(200, init_reply))
+    monkeypatch.setattr(webclient, "OPENER", opener)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            '{"jsonrpc": "2.0", "id": 1, "method": "initialize"}\n'
+            '{"jsonrpc": "2.0", "id": 2, "method": "ping"}\n'
+        ),
+    )
+    assert mcpcli._run_bridge(_args()) == 0
+    first, second = _frames(capsys.readouterr().out)
+    assert first["id"] == 1 and "result" in first
+    assert second["id"] == 2
+    assert second["error"]["code"] == -31000
+    assert "MCP-Protocol-Version header" in second["error"]["message"]
+    # only the initialize request went out
+    assert opener.request.data == (
+        b'{"jsonrpc": "2.0", "id": 1, "method": "initialize"}'
+    )
 
 
 def test_bridge_empty_200_body_becomes_error_frame(monkeypatch, capsys):
@@ -557,8 +766,8 @@ def test_bridge_stdio_helpers_round_trip_non_ascii(monkeypatch):
         assert json.loads(line)["result"]["text"] == "état ✓ 🚀"
         mcpcli._write_reply(writer, line.encode("utf-8"))
     finally:
-        mcpcli._release_stream(reader, fake_stdin)
-        mcpcli._release_stream(writer, fake_stdout)
+        webclient.release_stream(reader, fake_stdin)
+        webclient.release_stream(writer, fake_stdout)
     assert stdout_raw.getvalue() == (frame + "\n").encode("utf-8")
 
 
@@ -601,8 +810,8 @@ def test_bridge_stdio_falls_back_to_bufferless_streams(monkeypatch):
         assert fake_stdout.getvalue() == "ok\n"
     finally:
         # releasing a passed-through stream must not close or detach it
-        mcpcli._release_stream(reader, fake_stdin)
-        mcpcli._release_stream(writer, fake_stdout)
+        webclient.release_stream(reader, fake_stdin)
+        webclient.release_stream(writer, fake_stdout)
     assert not fake_stdin.closed
     assert not fake_stdout.closed
 
@@ -691,7 +900,7 @@ def test_check_threads_the_default_opener_into_post(monkeypatch, capsys):
         [_LEGACY_PROBE, (200, b'{"result": {}}'), (200, b'{"result": {}}')],
     )
     assert code == 0
-    assert [c["opener"] for c in recorder.calls] == [mcpcli._OPENER] * 3
+    assert [c["opener"] for c in recorder.calls] == [webclient.OPENER] * 3
 
 
 def test_check_bad_tls_material_fails_before_any_request(
@@ -703,8 +912,20 @@ def test_check_bad_tls_material_fails_before_any_request(
     assert recorder.calls == []
 
 
+def test_check_token_no_header_can_carry_fails_before_any_request(
+    monkeypatch, capsys
+):
+    code, recorder = _check(monkeypatch, [], token="s3cr3t\nvalue")
+    assert code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("mcp check: the access token from --token holds")
+    assert "s3cr3t" not in err
+    assert recorder.calls == []
+
+
 def test_check_unreachable_daemon(monkeypatch, capsys):
-    code, _ = _check(monkeypatch, [mcpcli._BridgeError("connection refused")])
+    refused = webclient.ClientError("connection refused")
+    code, _ = _check(monkeypatch, [refused])
     assert code == 1
     assert "connection refused" in capsys.readouterr().err
 
@@ -726,7 +947,7 @@ def test_check_tools_list_failure_still_ok(monkeypatch, capsys):
         [
             _LEGACY_PROBE,
             (200, b'{"result": {"protocolVersion": "2025-11-25"}}'),
-            mcpcli._BridgeError("flaky"),
+            webclient.ClientError("flaky"),
         ],
     )
     assert code == 0
@@ -839,7 +1060,7 @@ def test_modern_headers_leave_out_what_cannot_be_a_header():
 
 def test_post_modern_headers_replace_the_pinned_version(monkeypatch):
     opener = _FakeOpener(_FakeResponse(200, b"{}"))
-    monkeypatch.setattr(mcpcli, "_OPENER", opener)
+    monkeypatch.setattr(webclient, "OPENER", opener)
     mcpcli._post(
         "http://127.0.0.1:9",
         b"{}",

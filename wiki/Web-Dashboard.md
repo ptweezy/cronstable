@@ -52,6 +52,13 @@ the full id; click either chip to copy the value. The connection indicator reads
 `live` when the server is responding and `no signal` when polls are failing;
 hover it to see how long ago the last successful response arrived.
 
+In a narrow window, the header hides readouts so that its buttons stay in view.
+It hides the least essential ones first: the job-set ID chip, the node meter's
+bars, the clock, the version and the node meter, and then the summary pills. On
+a phone-width screen, the token button shows only its lock icon. Raising the
+[UI scale](#settings-themes-and-notifications) has the same effect as narrowing
+the window.
+
 The **node meter** shows this node's live CPU and memory bars, polled from
 [`GET /node`](HTTP-API#get-node). It stays hidden when the host can't be read.
 Clicking it toggles a **node resources** card charting the node's retained CPU
@@ -702,7 +709,8 @@ Either form hands the app the daemon's address and bearer token in one scan. The
 panel checks the stored token against [`GET /whoami`](HTTP-API#get-whoami) and
 warns when it holds every scope; give a phone a scoped `web.authTokens` entry
 instead. For the pairing flow this feeds, see
-[push notifications](Push-Notifications).
+[push notifications](Push-Notifications). For the same code without the
+dashboard page, see [pairing from the terminal](Terminal-Pairing).
 
 | Carolina | Amber |
 | :---: | :---: |

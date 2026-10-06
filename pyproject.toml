@@ -348,7 +348,3 @@ pytest_add_cli_args = ["-p", "no:randomly", "-p", "no:cacheprovider"]
 
 [tool.bandit]
 exclude_dirs = ["tests"]
-# B104 hits only the "0.0.0.0"/"::" literals in config.py's wildcard-listen
-# match-sets (such as _WILDCARD_LISTEN_HOSTS), which recognize a wildcard
-# address and never bind one.
-skips = ["B104"]

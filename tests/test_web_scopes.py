@@ -33,6 +33,7 @@ from cronstable.cron import (
     _required_web_scope,
     _WebToken,
 )
+from cronstable.pairlink import INSTANCE_HEADER
 from tests._configs import DISABLED_JOB as _DISABLED_JOB
 
 # --------------------------------------------------------------------------
@@ -770,10 +771,16 @@ async def test_anonymous_view_end_to_end(caplog):
                     # what this box can seal to; tests/test_push.py pins
                     # the list's content against the library probe
                     "sealableSuites": cronstable.push.sealable_suites(),
+                    # this process, and no listeners: the grant leaves
+                    # the bind addresses out
+                    "instance": cron._web_instance,
                 }
+                assert resp.headers[INSTANCE_HEADER] == cron._web_instance
             # ...but cannot act, on any of the three mutating gates
             async with session.post(base + "/jobs/test/start") as resp:
                 assert resp.status == 403
+                # a refusal names the daemon too
+                assert resp.headers[INSTANCE_HEADER] == cron._web_instance
             async with session.post(
                 base + "/dags/d/runs/r/tasks/t/decision",
                 json={"decision": "approve"},
@@ -798,6 +805,16 @@ async def test_anonymous_view_end_to_end(caplog):
                 base + "/status", headers=_bearer("bogus")
             ) as resp:
                 assert resp.status == 401
+                # the 401 names the daemon beside its challenge, which is
+                # how a pairing client recognizes it without a token
+                assert resp.headers[INSTANCE_HEADER] == cron._web_instance
+                assert "WWW-Authenticate" in resp.headers
+            # an unmatched route is the daemon's reply as well
+            async with session.get(
+                base + "/no-such-route", headers=_bearer("viewtok")
+            ) as resp:
+                assert resp.status == 404
+                assert resp.headers[INSTANCE_HEADER] == cron._web_instance
             # tokens behave exactly as they do without the anonymous grant
             async with session.get(
                 base + "/whoami", headers=_bearer("viewtok")
@@ -805,6 +822,8 @@ async def test_anonymous_view_end_to_end(caplog):
                 body = await resp.json()
                 assert body["authenticated"] is True
                 assert body["label"] == "phone"
+                # a token sees the socket the listen entry bound
+                assert body["listeners"] == [base]
             async with session.post(
                 base + "/jobs/test/start", headers=_bearer("ctltok")
             ) as resp:
@@ -813,6 +832,81 @@ async def test_anonymous_view_end_to_end(caplog):
                 base + "/jobs/test/start", headers=_bearer("viewtok")
             ) as resp:
                 assert resp.status == 403
+    finally:
+        await cron.start_stop_web_app(None)
+        await asyncio.sleep(0.25)
+
+
+async def test_pairing_address_check_against_a_real_daemon(monkeypatch):
+    """The terminal pairing clients find the daemon at a second address by
+    the listener it reports and the instance ID on its 401, and tell it
+    from another daemon that holds the same token."""
+    from cronstable import netutil, paircli, pairprobe, webclient
+
+    web_config = {
+        "listen": ["http://127.0.0.1:0"],
+        "authTokens": [
+            {"value": "phonetok", "scopes": ["view"], "label": "phone"}
+        ],
+    }
+    cron = cronstable.cron.Cron(None, config_yaml=_DISABLED_JOB)
+    twin = cronstable.cron.Cron(None, config_yaml=_DISABLED_JOB)
+    await cron.start_stop_web_app(web_config)
+    await twin.start_stop_web_app(web_config)
+    try:
+        port = cron.web_runner.addresses[0][1]
+        # 127.0.0.1 stands in for the LAN address too: it is where the
+        # one listener is bound
+        bound = "http://127.0.0.1:{}".format(port)
+        monkeypatch.setattr(netutil, "lan_address", lambda: "127.0.0.1")
+
+        def check(whoami=None):
+            if whoami is None:
+                whoami = paircli._whoami(bound, "phonetok", webclient.OPENER)
+            return whoami, pairprobe.phone_url(bound, whoami)
+
+        whoami, url = await asyncio.to_thread(check)
+        assert whoami["instance"] == cron._web_instance
+        assert whoami["listeners"] == [bound]
+        assert url == bound
+        # the twin gives the token the same label and scopes, and is
+        # another instance all the same
+        theirs = dict(whoami, instance=twin._web_instance)
+        with pytest.raises(pairprobe.Unreachable, match="a different"):
+            await asyncio.to_thread(check, theirs)
+    finally:
+        await cron.start_stop_web_app(None)
+        await twin.start_stop_web_app(None)
+        await asyncio.sleep(0.25)
+
+
+async def test_token_outside_ascii_authenticates_every_terminal_client():
+    """The daemon compares a token's UTF-8 bytes. The standard-library
+    clients and the terminal dashboard's aiohttp session both present
+    them, and one rule decides which tokens the clients accept."""
+    from cronstable import paircli, tui, webclient
+
+    token = "tøk-✓-🔑"
+    web_config = {
+        "listen": ["http://127.0.0.1:0"],
+        "authTokens": [{"value": token, "scopes": ["view"], "label": "phone"}],
+    }
+    cron = cronstable.cron.Cron(None, config_yaml=_DISABLED_JOB)
+    await cron.start_stop_web_app(web_config)
+    try:
+        port = cron.web_runner.addresses[0][1]
+        bound = "http://127.0.0.1:{}".format(port)
+        args = SimpleNamespace(token=token, token_env=None)
+        assert webclient.resolve_token(args) == token
+        whoami = await asyncio.to_thread(
+            paircli._whoami, bound, token, webclient.OPENER
+        )
+        assert (whoami["authenticated"], whoami["label"]) == (True, "phone")
+        api = tui.Api(bound, token)
+        try:
+            assert (await api.get_json("/whoami"))["label"] == "phone"
+        finally:
+            await api.close()
     finally:
         await cron.start_stop_web_app(None)
         await asyncio.sleep(0.25)
