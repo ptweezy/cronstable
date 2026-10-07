@@ -662,6 +662,182 @@ def test_parse_config_dir_cache_validates_content_not_mtime(tmp_path):
     assert str(second.jobs[0].schedule) == "0 5 * * *"  # not the stale 0 3
 
 
+def _write_one_job_files(directory, count, prefix="job", hour=3):
+    directory.mkdir(exist_ok=True)
+    for i in range(count):
+        name = "{}-{:03d}".format(prefix, i)
+        (directory / (name + ".yaml")).write_text(
+            "jobs:\n"
+            "  - name: {}\n"
+            "    command: echo x\n"
+            '    schedule: "0 {} * * *"\n'.format(name, hour)
+        )
+
+
+def _small_dir_file_cache(monkeypatch, floor=4):
+    """An empty per-file cache with a floor small enough to cross cheaply."""
+    from collections import OrderedDict
+
+    cache = OrderedDict()
+    monkeypatch.setattr(config, "_DIR_FILE_CACHE", cache)
+    monkeypatch.setattr(config, "_DIR_FILE_CACHE_MAX", floor)
+    return cache
+
+
+def _record_file_parses(monkeypatch):
+    parsed = []
+    real = config.parse_config_file
+
+    def recording(path, *args, **kwargs):
+        parsed.append(os.path.basename(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(config, "parse_config_file", recording)
+    return parsed
+
+
+def test_warm_dir_pass_reparses_nothing_past_the_cache_floor(
+    tmp_path, monkeypatch
+):
+    # The per-file cache holds every file of the configuration being
+    # loaded, however many there are. _DIR_FILE_CACHE_MAX bounds the
+    # entries that configuration does not use.
+    cache = _small_dir_file_cache(monkeypatch)
+    _write_one_job_files(tmp_path, 7)
+    first = config.parse_config_with_sources(str(tmp_path))[0]
+    assert len(first.jobs) == 7
+    assert len(cache) == 7
+
+    parsed = _record_file_parses(monkeypatch)
+    second = config.parse_config_with_sources(str(tmp_path))[0]
+    assert parsed == []
+    assert [j.name for j in second.jobs] == [j.name for j in first.jobs]
+
+    # an edit reparses the edited file and no other
+    _write_one_job_files(tmp_path, 1, prefix="job", hour=5)
+    third = config.parse_config_with_sources(str(tmp_path))[0]
+    assert parsed == ["job-000.yaml"]
+    assert str(third.jobs[0].schedule) == "0 5 * * *"
+    assert len(cache) == 7
+
+
+def test_warm_include_tree_reparses_only_the_entry_past_the_cache_floor(
+    tmp_path, monkeypatch
+):
+    # An include tree goes through the same cache. The entry file is the
+    # one member parsed on every load.
+    _small_dir_file_cache(monkeypatch)
+    _write_one_job_files(tmp_path / "parts", 7)
+    entry = tmp_path / "entry.yaml"
+    entry.write_text(
+        "include:\n"
+        + "".join("  - parts/job-{:03d}.yaml\n".format(i) for i in range(7))
+    )
+    first = config.parse_config_with_sources(str(entry))[0]
+    assert len(first.jobs) == 7
+
+    parsed = _record_file_parses(monkeypatch)
+    second = config.parse_config_with_sources(str(entry))[0]
+    assert parsed == ["entry.yaml"]
+    assert len(second.jobs) == 7
+
+
+def test_warm_nested_include_tree_keeps_the_files_a_cached_parent_includes(
+    tmp_path, monkeypatch
+):
+    # A cached file is served without a visit to the files it includes, so
+    # those stay cached with it: editing a parent later reparses the parent
+    # and none of its unchanged children.
+    cache = _small_dir_file_cache(monkeypatch, floor=2)
+    _write_one_job_files(tmp_path / "leaves", 3)
+    for i in range(3):
+        (tmp_path / "mid-{}.yaml".format(i)).write_text(
+            "include:\n  - leaves/job-{:03d}.yaml\n".format(i)
+        )
+    entry = tmp_path / "entry.yaml"
+    entry.write_text(
+        "include:\n" + "".join("  - mid-{}.yaml\n".format(i) for i in range(3))
+    )
+    assert len(config.parse_config(str(entry)).jobs) == 3
+    assert len(cache) == 6
+
+    parsed = _record_file_parses(monkeypatch)
+    config.parse_config(str(entry))
+    assert parsed == ["entry.yaml"]
+    assert len(cache) == 6
+
+    del parsed[:]
+    (tmp_path / "mid-1.yaml").write_text(
+        "include:\n  - leaves/job-001.yaml\n# edited\n"
+    )
+    assert len(config.parse_config(str(entry)).jobs) == 3
+    assert parsed == ["entry.yaml", "mid-1.yaml"]
+
+
+def test_dir_file_cache_stays_bounded_as_the_config_shrinks_or_moves(
+    tmp_path, monkeypatch
+):
+    cache = _small_dir_file_cache(monkeypatch)
+
+    def cached_names():
+        return sorted(os.path.basename(path) for path in cache)
+
+    big = tmp_path / "big"
+    _write_one_job_files(big, 9)
+    config.parse_config(str(big))
+    assert len(cache) == 9
+
+    # the directory shrinks: its two files stay, and the entries of the
+    # deleted ones fall back under the floor
+    for i in range(2, 9):
+        (big / "job-{:03d}.yaml".format(i)).unlink()
+    config.parse_config(str(big))
+    assert len(cache) == 4
+    assert {"job-000.yaml", "job-001.yaml"} <= set(cached_names())
+
+    # a different configuration: its files are cached, the total stays
+    # at the floor
+    other = tmp_path / "other"
+    _write_one_job_files(other, 3, prefix="other")
+    config.parse_config(str(other))
+    assert len(cache) == 4
+    assert {"other-000.yaml", "other-001.yaml", "other-002.yaml"} <= set(
+        cached_names()
+    )
+
+    # a configuration larger than the floor is cached whole, alone
+    wide = tmp_path / "wide"
+    _write_one_job_files(wide, 6, prefix="wide")
+    config.parse_config(str(wide))
+    assert cached_names() == ["wide-{:03d}.yaml".format(i) for i in range(6)]
+
+
+def test_failed_load_keeps_the_unbroken_files_cached(tmp_path, monkeypatch):
+    cache = _small_dir_file_cache(monkeypatch)
+    _write_one_job_files(tmp_path, 6)
+    config.parse_config(str(tmp_path))
+
+    broken = tmp_path / "job-002.yaml"
+    good = broken.read_text()
+    broken.write_text("jobs:\n  - name: job-002\n    bogus: 1\n")
+    parsed = _record_file_parses(monkeypatch)
+    with pytest.raises(ConfigError):
+        config.parse_config(str(tmp_path))
+    assert parsed == ["job-002.yaml"]
+    # the five files that parsed stay; the broken file's superseded entry
+    # is the one this load did not use
+    assert sorted(os.path.basename(path) for path in cache) == [
+        "job-{:03d}.yaml".format(i) for i in (0, 1, 3, 4, 5)
+    ]
+
+    del parsed[:]
+    broken.write_text(good)
+    conf = config.parse_config(str(tmp_path))
+    assert parsed == ["job-002.yaml"]
+    assert len(conf.jobs) == 6
+    assert len(cache) == 6
+
+
 @pytest.mark.parametrize(
     "snippet, message",
     [
@@ -812,6 +988,72 @@ jobs:
     )
     environment = {e["key"]: e["value"] for e in conf.jobs[0].environment}
     assert environment["GREETING"] == "héllo"
+
+
+def test_env_file_is_read_once_per_document_dag_tasks_included(
+    tmp_path, monkeypatch
+):
+    # A DAG task builds its launch template through JobConfig, as a job
+    # does, so the jobs and tasks of one document share one read of an
+    # env_file they name or inherit from `defaults:`.
+    env = tmp_path / "vars.env"
+    env.write_text("SHARED=file\nLEVEL=file\n", encoding="utf-8")
+    reads = []
+    real = config.parse_environment_file
+
+    def counting(path):
+        reads.append(path)
+        return real(path)
+
+    monkeypatch.setattr(config, "parse_environment_file", counting)
+    conf = config.parse_config_string(
+        f"""
+defaults:
+  env_file: {env}
+jobs:
+  - name: job-a
+    command: foo
+    schedule: "* * * * *"
+dags:
+  - name: etl
+    tasks:
+      - id: extract
+        command: foo
+        environment:
+          - key: LEVEL
+            value: task
+      - id: transform
+        command: foo
+        env_file: {env}
+        dependsOn:
+          - extract
+      - id: load
+        command: foo
+        dependsOn:
+          - transform
+""",
+        "",
+    )
+    assert len(reads) == 1, reads
+
+    def environment(job):
+        return {e["key"]: e["value"] for e in job.environment}
+
+    templates = conf.dags[0].task_templates
+    assert environment(conf.jobs[0]) == {"SHARED": "file", "LEVEL": "file"}
+    # one task's own variable overrides the file for that task alone
+    assert environment(templates["extract"]) == {
+        "SHARED": "file",
+        "LEVEL": "task",
+    }
+    assert environment(templates["transform"]) == {
+        "SHARED": "file",
+        "LEVEL": "file",
+    }
+    assert environment(templates["load"]) == {
+        "SHARED": "file",
+        "LEVEL": "file",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1395,64 @@ def test_monitor_resources_defaults_off():
     # the sampling knobs still normalize so consumers never branch on shape
     assert job.monitorResourcesInterval == config.SAMPLE_INTERVAL
     assert job.monitorResourcesHistory == config.MONITOR_HISTORY_DEFAULT
+
+
+def test_monitor_sampling_defaults_match_the_resource_monitor():
+    # config spells the two defaults out so that building a job does not
+    # import cronstable.resources; this holds the two definitions equal.
+    from cronstable import resources
+
+    assert (config.SAMPLE_INTERVAL, config.MONITOR_HISTORY_DEFAULT) == (
+        resources.SAMPLE_INTERVAL,
+        resources.MONITOR_HISTORY_DEFAULT,
+    )
+    assert type(config.SAMPLE_INTERVAL) is type(resources.SAMPLE_INTERVAL)
+    assert type(config.MONITOR_HISTORY_DEFAULT) is type(
+        resources.MONITOR_HISTORY_DEFAULT
+    )
+
+
+def test_validating_a_config_loads_no_asyncio(tmp_path):
+    # --validate-config and --job-set-id parse and exit. asyncio is the
+    # largest import the daemon makes and neither of them runs a loop.
+    import subprocess
+    import textwrap
+
+    path = tmp_path / "one.yaml"
+    path.write_text(
+        "jobs:\n"
+        "  - name: a\n"
+        "    command: echo a\n"
+        '    schedule: "0 * * * *"\n'
+        "    monitorResources: true\n"
+    )
+    code = textwrap.dedent(
+        """
+        import sys
+
+        sys.argv = ["cronstable", "-c", sys.argv[1], sys.argv[2]]
+        import cronstable.__main__ as main
+
+        try:
+            main.main_loop()
+        except SystemExit as stop:
+            print("EXIT", stop.code)
+        print(sorted(
+            m for m in sys.modules
+            if m in ("asyncio", "aiohttp", "psutil", "cronstable.resources")
+        ))
+        """
+    )
+    for flag in ("--validate-config", "--job-set-id"):
+        done = subprocess.run(
+            [sys.executable, "-c", code, str(path), flag],
+            capture_output=True,
+            text=True,
+        )
+        assert done.returncode == 0, done.stderr
+        lines = done.stdout.strip().splitlines()
+        assert lines[-2] == "EXIT 0", done.stdout + done.stderr
+        assert lines[-1] == "[]", flag
 
 
 def test_monitor_resources_bool_form():

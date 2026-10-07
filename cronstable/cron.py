@@ -56,6 +56,7 @@ from cronstable import (
     tlsutil,
 )
 from cronstable._gzip import gzip_body as _gzip_body
+from cronstable._gzip import gzip_static as _gzip_static
 from cronstable.config import (
     WEB_TOKEN_SCOPES,
     ClusterConfig,
@@ -1386,10 +1387,14 @@ def _index_document() -> tuple[bytes, str]:
 def _index_gzip() -> bytes:
     """The dashboard pre-compressed once, for clients that accept gzip.
 
+    Compressed with the standard library's ``zlib`` at level 9, whichever
+    backend compresses the JSON responses: every dashboard load transfers
+    these bytes, and the CPU is paid once per process.
+
     Both this cache and ``_index_document`` must be cleared by a test that
     swaps out the bundled page.
     """
-    return _gzip_body(_index_document()[0])
+    return _gzip_static(_index_document()[0])
 
 
 def schedule_str(job: JobConfig) -> str:
@@ -5522,7 +5527,7 @@ class Cron:
         headers["Vary"] = "Accept-Encoding"
         if request.headers.get("If-None-Match") == etag:
             # the document is immutable for the process lifetime, so a repeat
-            # load revalidates into an empty 304 instead of resending 573 KB.
+            # load revalidates into an empty 304 and the page is not resent.
             return web.Response(status=304, headers=headers)
         if _accepts_gzip(request.headers.get("Accept-Encoding")):
             headers["Content-Encoding"] = "gzip"
@@ -5858,13 +5863,25 @@ class Cron:
         return result
 
     def jobs_payload(self) -> list[dict[str, Any]]:
-        """Full per-job dicts for ``GET /jobs`` and MCP ``cron_list_jobs``."""
+        """Full per-job dicts for ``GET /jobs``."""
         # one clock read for the whole pass; see _scheduled_in's `now`
         now = get_now(datetime.timezone.utc)
         return [
             self._job_to_dict(name, job, now)
             for name, job in self.cron_jobs.items()
         ]
+
+    def jobs_payload_for(self, names: Iterable[str]) -> list[dict[str, Any]]:
+        """The :meth:`jobs_payload` dicts of ``names``, in the given order.
+
+        For a caller that serves part of the job set: MCP
+        ``cron_list_jobs`` builds one page.  Every name must be a
+        configured job.
+        """
+        # one clock read for the whole pass; see _scheduled_in's `now`
+        now = get_now(datetime.timezone.utc)
+        jobs = self.cron_jobs
+        return [self._job_to_dict(name, jobs[name], now) for name in names]
 
     def job_detail_payload(self, name: str) -> dict[str, Any] | None:
         """One job's full dict, or ``None`` when there is no such job."""
@@ -6448,33 +6465,57 @@ class Cron:
             payload["runs"] = payload["runs"][-limit:]  # newest retained
         return _json_response(payload, headers=self._web_headers())
 
-    def _activity_snapshot(self) -> dict[str, list[JobRunInfo]]:
+    def _activity_snapshot(
+        self, names: Iterable[str] | None = None
+    ) -> dict[str, list[JobRunInfo]]:
         """Per-job pointer copies of the run histories, for ``/activity``.
 
         List copies of the deques, taken on the loop: an executor thread
         must never iterate a live history deque (a reaper append mid-walk
         raises "deque mutated during iteration").  Every configured job is
         present (``[]`` for one with no history) so a client can tell "no
-        runs" from "unknown job".
+        runs" from "unknown job".  ``names`` narrows the snapshot to those
+        jobs, in that order.
         """
         return {
             # .get, never a subscript: run_history is a defaultdict and a
             # read must not grow it one empty deque per never-run job
             name: list(self.run_history.get(name) or ())
-            for name in self.cron_jobs
+            for name in (self.cron_jobs if names is None else names)
         }
 
+    def _activity_job_names(
+        self, jobs: int, sort: str | None = None
+    ) -> list[str] | None:
+        """The jobs a ``jobs``-capped ``/activity`` response carries.
+
+        The first ``jobs`` names in configuration order (the order
+        ``GET /jobs`` lists them), or in ascending name order under
+        ``sort="name"``.  ``None`` when the cap covers every job: that
+        response is the default one.
+        """
+        if jobs >= len(self.cron_jobs):
+            return None
+        if sort == "name":
+            # the smallest names in ascending order, without sorting the
+            # whole fleet for a short head
+            return heapq.nsmallest(jobs, self.cron_jobs)
+        return list(itertools.islice(self.cron_jobs, jobs))
+
     def activity_payload(
-        self, limit: int = RUN_HISTORY_LIMIT
+        self,
+        limit: int = RUN_HISTORY_LIMIT,
+        names: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         """Every job's retained runs, cut down to what the heatmap plots.
 
         Behind ``GET /activity``: ``jobs`` maps each job name to its
         newest ``limit`` retained runs oldest first, each row exactly
         ``{started_at, finished_at, outcome}``.  The default serves the
-        whole retained window.
+        whole retained window for every job; ``names`` serves those jobs
+        only (see :meth:`_activity_job_names`).
         """
-        return _activity_jobs(self._activity_snapshot(), limit)
+        return _activity_jobs(self._activity_snapshot(names), limit)
 
     async def _web_get_activity(self, request: web.Request) -> web.Response:
         """Batched recent run outcomes for every job (the heatmap's feed).
@@ -6483,12 +6524,23 @@ class Cron:
         ``GET /jobs/{name}/runs`` per job per refresh, reduced to the three
         fields the overlay plots, on the same memo, ETag and gzip scaffold
         as the other poll legs, busted by the same local events.
+
+        ``jobs`` caps how many jobs the response carries and ``sort``
+        picks which (see :meth:`_activity_job_names`): a dashboard draws
+        a bounded number of rows, and the full feed grows with the fleet.
         """
+        headers = self._web_headers()
+        # Validated whether or not a `jobs` cap rides along, and answered
+        # from the requested value like /schedule/suggest's `period`.
+        sort = request.query.get("sort") or None
+        if sort not in (None, "name"):
+            return _json_response(
+                {"error": "sort must be 'name', got {!r}".format(sort)},
+                status=400,
+                headers=headers,
+            )
         # the same clamped `limit` (rows per job, newest retained) the
-        # other capped listings take; the default full-window response is
-        # the memo-shared one, and an explicit narrower cut is built per
-        # request (neither dashboard sends one, and a memo would otherwise
-        # need a slot per distinct limit).
+        # other capped listings take
         limit = self._web_int_query(
             request,
             "limit",
@@ -6496,15 +6548,24 @@ class Cron:
             lo=1,
             hi=RUN_HISTORY_LIMIT,
         )
-        if limit != RUN_HISTORY_LIMIT:
-            etag, body, gz = await self._build_activity_product(limit)
+        total = len(self.cron_jobs)
+        jobs = self._web_int_query(
+            request, "jobs", default=total, lo=1, hi=max(1, total)
+        )
+        names = self._activity_job_names(jobs, sort)
+        # The default response (every job, the whole retained window) is
+        # the memo-shared one.  A narrower `limit`, or a `jobs` cap that
+        # leaves jobs out, is built per request: a memo would need a slot
+        # per distinct combination.
+        if limit != RUN_HISTORY_LIMIT or names is not None:
+            etag, body, gz = await self._build_activity_product(limit, names)
             return _conditional_response(
                 etag,
                 body,
                 gz,
                 if_none_match=request.headers.get("If-None-Match"),
                 gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
-                headers=self._web_headers(),
+                headers=headers,
             )
         return await self._memoized_conditional_response(
             request,
@@ -6514,7 +6575,9 @@ class Cron:
         )
 
     async def _build_activity_product(
-        self, limit: int = RUN_HISTORY_LIMIT
+        self,
+        limit: int = RUN_HISTORY_LIMIT,
+        names: list[str] | None = None,
     ) -> tuple[str, bytes, bytes | None]:
         # Past the /jobs offload gate, the row projection (jobs x runs of
         # dict builds and isoformat calls, the expensive half at fleet
@@ -6522,16 +6585,18 @@ class Cron:
         # over a loop-taken snapshot (see _activity_snapshot for why); the
         # rows' three plotted fields are frozen at construction, so the
         # worker reads immutable data.  Below the gate the whole build is
-        # cheaper than the thread hop.
-        if len(self.cron_jobs) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
-            histories = self._activity_snapshot()
+        # cheaper than the thread hop.  The gate counts the jobs this
+        # product carries: every job, or the ``names`` of a capped one.
+        carried = len(self.cron_jobs) if names is None else len(names)
+        if carried >= _JOBS_SERIALIZE_OFFLOAD_MIN:
+            histories = self._activity_snapshot(names)
             return await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: _cachable_json_product(
                     _activity_jobs(histories, limit)
                 ),
             )
-        return _cachable_json_product(self.activity_payload(limit))
+        return _cachable_json_product(self.activity_payload(limit, names))
 
     async def _web_job_resources(self, request: web.Request) -> web.Response:
         """Chart-grade CPU/RSS series for one job (monitorResources jobs).
@@ -12144,6 +12209,12 @@ class Cron:
                         # a later job's exception would strand their
                         # dag_run entries as RUNNING indefinitely.
                         await self._dag.flush_completions()
+                    # A parked coroutine keeps its locals alive. The reaper
+                    # parks until the next launch or completion, so it
+                    # drops the handled batch first.
+                    if done_jobs:
+                        del job, task
+                    del done_jobs
                 except Exception:  # pragma: no cover
                     logger.exception("please report this as a bug (3)")
                     await asyncio.sleep(1)

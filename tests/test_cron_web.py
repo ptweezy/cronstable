@@ -1532,7 +1532,7 @@ async def test_web_index_security_headers_overridable():
 
 async def test_web_index_revalidates_with_304():
     # the dashboard is static package data, so a client that echoes the ETag
-    # gets an empty 304 instead of another ~573 KB body.
+    # gets an empty 304 and the page is not resent.
     cron = _cron(TWO_JOBS)
     _raw, etag = cronstable.cron._index_document()
 
@@ -1570,6 +1570,57 @@ async def test_web_index_serves_gzip_when_accepted():
     assert "Content-Encoding" not in plain.headers
     assert plain.headers["Vary"] == "Accept-Encoding"
     assert plain.body == raw
+
+
+def test_index_page_takes_the_strongest_gzip_level_and_json_level_one(
+    monkeypatch,
+):
+    # The page is compressed once per process and sent on every dashboard
+    # load, so it takes zlib at level 9 whatever the response backend is;
+    # every JSON product is rebuilt per memo window, so it takes that
+    # backend at level 1.  The stand-in backend stops at level 3, as
+    # ISA-L does.
+    import zlib
+
+    from cronstable import _gzip
+
+    class Recording:
+        DEFLATED = zlib.DEFLATED
+
+        def __init__(self, best):
+            self.Z_BEST_COMPRESSION = best
+            self.levels = []
+
+        def compressobj(self, level, *args):
+            self.levels.append(level)
+            return zlib.compressobj(level, *args)
+
+    isal = Recording(3)
+    stdlib = Recording(zlib.Z_BEST_COMPRESSION)
+    monkeypatch.setattr(_gzip, "backend", lambda: isal)
+    monkeypatch.setattr(_gzip, "zlib", stdlib)
+    cronstable.cron._index_gzip.cache_clear()
+    try:
+        page = cronstable.cron._index_gzip()
+        cronstable.cron._index_gzip()
+        assert stdlib.levels == [9]  # zlib level 9, and cached: once
+        assert isal.levels == []
+        raw = cronstable.cron._index_document()[0]
+        assert zlib.decompress(page, wbits=31) == raw
+        assert len(page) < len(_gzip.gzip_body(raw))
+        del isal.levels[:]
+        payload = [
+            {"name": "job%03d" % i, "running": False} for i in range(80)
+        ]
+        assert cronstable.cron._cachable_json_product(payload)[2]
+        assert cronstable.cron._jobs_response_product(payload, {})[2]
+        assert cronstable.cron._metrics_response_product(
+            lambda families, openmetrics: "x 1\n" * 400, [], False
+        )[1]
+        assert isal.levels == [1, 1, 1]
+        assert stdlib.levels == [9]
+    finally:
+        cronstable.cron._index_gzip.cache_clear()
 
 
 async def test_auth_middleware_public_path():

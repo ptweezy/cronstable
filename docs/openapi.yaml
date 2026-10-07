@@ -238,8 +238,8 @@ paths:
         `GET /jobs/{name}/runs`, for every job at once, without the per-job
         fan-out. `jobs` maps each job name to its retained runs, oldest
         first, each reduced to the three plotted fields; a job that has
-        never run maps to an empty array. Supports `ETag` / `If-None-Match`
-        (304).
+        never run maps to an empty array. The response carries every job
+        unless `jobs` caps it. Supports `ETag` / `If-None-Match` (304).
       parameters:
         - $ref: "#/components/parameters/IfNoneMatch"
         - name: limit
@@ -248,6 +248,21 @@ paths:
             Max runs per job, newest kept (clamped to the retained
             history; default serves the whole retained window).
           schema: { type: integer }
+        - name: jobs
+          in: query
+          description: >-
+            Max jobs to return (at least 1; a lower value counts as 1).
+            The default returns every job. A capped response keeps the
+            first `jobs` jobs in configuration order, the order `GET /jobs`
+            lists them, unless `sort` selects another order.
+          schema: { type: integer }
+        - name: sort
+          in: query
+          description: >-
+            The order a `jobs` cap selects in. `name` keeps the first
+            `jobs` job names in ascending code point order. It has no
+            effect without a `jobs` cap.
+          schema: { type: string, enum: [name] }
       responses:
         "200":
           description: Recent run outcomes, per job.
@@ -264,6 +279,11 @@ paths:
                       type: array
                       items: { $ref: "#/components/schemas/ActivityRun" }
         "304": { description: Not modified (matching `If-None-Match`). }
+        "400":
+          description: An unknown `sort` value.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /jobs/{name}/trends:

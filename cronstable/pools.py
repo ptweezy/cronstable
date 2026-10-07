@@ -481,6 +481,9 @@ class PoolScheduler:
     ):
         if ticket is None:
             return
+        # The run this ticket admitted is over. A renewal that finds the
+        # entry closed has no process to cancel.
+        ticket.running = None
 
         def finish(body, now):
             entry = body["entries"].get(ticket.key)
@@ -495,7 +498,6 @@ class PoolScheduler:
         except Exception:
             logger.exception("pool completion could not be recorded")
             # Retry the completion on the next heartbeat.
-            ticket.running = None
             ticket.completion = (state, reason)
             return
         self.held.pop((ticket.pool, ticket.key), None)
@@ -602,12 +604,15 @@ class PoolScheduler:
             ticket.deadline = started + LEASE_SECONDS
         else:
             ticket.valid = False
-            if ticket.running is not None:
+            running = ticket.running
+            # A run that has ended keeps its result; only a live one is
+            # cancelled.
+            if running is not None and not running.stopped:
                 logger.error(
                     "pool lease lost for %s; cancelling its process",
                     ticket.key,
                 )
-                await ticket.running.cancel()
+                await running.cancel()
 
     async def tick(self):
         await asyncio.gather(
@@ -626,6 +631,14 @@ class PoolScheduler:
         body = await self._change(pool, _read_body)
         if await self._retire_tasks(pool, body):
             body = await self._change(pool, _read_body)
+        # Slots the snapshot leaves unclaimed, kept current as this tick
+        # admits work. acquire() rules on every claim; this count only
+        # spares it the entries that cannot fit.
+        free = body["slots"] - sum(
+            e["slots"]
+            for e in body["entries"].values()
+            if e["state"] == "running"
+        )
         for entry in _waiting(body, limit=32):
             payload = entry["payload"]
             if payload.get("kind") != "job":
@@ -657,9 +670,20 @@ class PoolScheduler:
                 and self.cron.running_jobs.get(job.name)
             ):
                 continue
+            retry = payload.get("retry")
+            superseded = (
+                retry
+                and retry["count"] > 0
+                and not self._retry_current(body, payload)
+            )
+            # acquire() cancels a superseded retry at any capacity, so that
+            # entry goes to it even when it cannot fit.
+            if entry["slots"] > free and not superseded:
+                continue
             ticket = await self.acquire(pool, entry["id"])
             if ticket is None:
                 continue
+            free -= entry["slots"]
             try:
                 launched = await self.cron.maybe_launch_job(
                     job,
@@ -673,6 +697,9 @@ class PoolScheduler:
             except BaseException:
                 await self.finish(ticket, "queued", "launch interrupted")
                 raise
+            if (pool, entry["id"]) not in self.held:
+                # A ticket the launch gave back returns its slots.
+                free += entry["slots"]
 
     async def _retire_tasks(self, pool, body):
         """Retire orphaned claims, including failures nobody can observe.

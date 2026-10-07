@@ -534,8 +534,13 @@
   }
   table { width: 100%; border-collapse: collapse; }
   /* horizontal-scroll fallback for the jobs table when the enabled columns
-     outgrow even the widened page (the .card's own overflow stays hidden) */
-  .twrap { overflow-x: auto; }
+     outgrow even the widened page (the .card's own overflow stays hidden).
+     isolation makes the wrapper a stacking context, which lets the browser
+     keep the table's recorded painting while the table is unchanged: a frame
+     that repaints something else (the logo sways on every frame) skips the
+     rows. The wrapper clips its overflow, so nothing inside it stacks
+     against the rest of the page. */
+  .twrap { overflow-x: auto; isolation: isolate; }
   thead th {
     text-align: left; font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
     color: var(--fg-faint); padding: 8px 12px; border-bottom: 1px solid var(--border); white-space: nowrap;
@@ -1157,7 +1162,9 @@
   #fleetPanel { border-top: 1px solid var(--border); padding: 8px 12px; }
   #fleetPanel .fleetbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; font-size: 11px; color: var(--fg-dim); }
   #fleetPanel .fleetbar .warn { color: var(--fail); }
-  #fleetPanel .fleetwrap { overflow: auto; max-height: 48vh; }
+  /* isolated for the same reason as .twrap: an unchanged matrix keeps its
+     recorded painting through frames that repaint something else */
+  #fleetPanel .fleetwrap { overflow: auto; max-height: 48vh; isolation: isolate; }
   #fleetPanel table { border-collapse: collapse; min-width: 100%; }
   #fleetPanel th, #fleetPanel td { padding: 3px 12px; white-space: nowrap; font-size: 12px; text-align: left; border-bottom: 1px solid var(--border); }
   #fleetPanel thead th { position: sticky; top: 0; background: var(--panel); z-index: 2; vertical-align: bottom; }
@@ -5407,6 +5414,12 @@ var qrcode = function() {
   // ===================================================================
   const state = {
     jobs: [], byName: {}, fetchedAt: 0, fetchedWallAt: 0,
+    // fetchedAt and fetchedWallAt anchor the countdowns: the arrival of the
+    // /jobs body state.jobs came from, on the monotonic and the wall clock.
+    // respondedAt is the latest /jobs answer of either kind (a body or a
+    // 304), which the connection and staleness readouts measure from.
+    respondedAt: 0,
+    jobsEtag: null,            // validator of the /jobs body state.jobs came from
     filter: "", statusFilter: "all", sort: "name", sortDir: 1,
     view: [],                  // jobs after filter+sort (drives j/k nav)
     selected: null,            // selected job name (keyboard cursor)
@@ -6696,6 +6709,13 @@ var qrcode = function() {
     });
   }
 
+  // Compare before writing, in every readout the per-second pass keeps
+  // current: most relative strings ("5m ago") change once a minute or slower,
+  // yet an unconditional assignment replaces the text node and dirties layout
+  // every second for every cell (1000+ writes/s on a large fleet, forever).
+  // An equal string skips the write and the browser does nothing at all.
+  const put = (e, s) => { if (e.textContent !== s) e.textContent = s; };
+
   // per-second tick for relative cells (no full rerender)
   function tick() {
     // Hidden tab (backgrounded window, or a wallboard on a screen that's been
@@ -6708,12 +6728,6 @@ var qrcode = function() {
     if (document.hidden) return;
     updateTitle();   // countdown / elapsed readouts in the tab title tick
                      // with the page (write-on-change, so usually a no-op)
-    // Compare before writing, in every sweep below: most relative strings
-    // ("5m ago") change once a minute or slower, yet an unconditional
-    // assignment replaces the text node and dirties layout every second
-    // for every cell (1000+ writes/s on a large fleet, forever). An equal
-    // string skips the write and the browser does nothing at all.
-    const put = (e, s) => { if (e.textContent !== s) e.textContent = s; };
     document.querySelectorAll("[data-ago]").forEach((e) => { put(e, fmtAgo(e.getAttribute("data-ago"))); });
     // fleet matrix ages (compact "5m" form): kept live here so renderFleet can
     // skip its full nodes x jobs rebuild when the payload is otherwise unchanged
@@ -6737,19 +6751,19 @@ var qrcode = function() {
       if (job.running || !job.enabled || job.paused) { put(e, "—"); return; }
       put(e, wbStale ? "stale" : fmtIn(nextRunSeconds(job)));
     });
-    $("clock").textContent = utcClock();
+    put($("clock"), utcClock());
     if (prefs.radar) renderRadar();
     if (prefs.week) renderWeek();   // cheap: only the now-line moves per tick
-    if (state.timeline.open) $("tlNow").textContent = utcClock();
+    if (state.timeline.open) put($("tlNow"), utcClock());
     if (state.wallboard) {
-      const wc = $("wbClock"); if (wc) wc.textContent = utcClock();
+      const wc = $("wbClock"); if (wc) put(wc, utcClock());
       // running tiles: live elapsed + running-long tint. Scoped to the grid --
       // [data-run-since] exists nowhere else.
       $("wbGrid").querySelectorAll("[data-run-since]").forEach((e) => {
         const name = e.getAttribute("data-run-since"), t0 = state.runSince[name], job = state.byName[name];
         if (!t0 || !job) return;
         const secs = (Date.now() - t0) / 1000;
-        e.textContent = "▶ " + fmtDuration(secs);
+        put(e, "▶ " + fmtDuration(secs));
         e.classList.toggle("long", runLong(job, secs));
       });
       wallboardSignalTick();       // NO SIGNAL banner + dimming when polls stop landing
@@ -6945,16 +6959,17 @@ var qrcode = function() {
     } else {
       $("radarFeed").querySelectorAll("li[data-job]").forEach((li) => {
         const x = byName[li.getAttribute("data-job")], cd = li.querySelector(".cd");
-        if (x && cd) cd.textContent = fmtCountdown((x.t - now) / 1000);
+        if (x && cd) put(cd, fmtCountdown((x.t - now) / 1000));
       });
       $("radarTrack").querySelectorAll(".rt-mk").forEach((mk) => {
         const x = byName[mk.getAttribute("data-job")];
         if (!x) return;
         mk.style.left = (((x.t - now) / RADAR_HORIZON) * 100).toFixed(2) + "%";
-        mk.title = x.name + " · " + fmtCountdown((x.t - now) / 1000);
+        const tip = x.name + " · " + fmtCountdown((x.t - now) / 1000);
+        if (mk.title !== tip) mk.title = tip;
       });
     }
-    $("radarMeta").textContent = upcoming.length + " upcoming";
+    put($("radarMeta"), upcoming.length + " upcoming");
   }
   function setRadar(v) { prefs.radar = v; savePref("radar"); $("radarBtn").classList.toggle("on", v); if (v) computeRadar(); renderRadar(); }
 
@@ -7140,8 +7155,8 @@ var qrcode = function() {
   const WB_STALE_AFTER = 15000;              // floor; scales with slow poll intervals
   function wallboardStale() {
     if (!state.connected) return true;
-    if (!state.fetchedAt) return true;       // no data received yet
-    const age = performance.now() - state.fetchedAt;
+    if (!state.respondedAt) return true;     // no data received yet
+    const age = performance.now() - state.respondedAt;
     return age > Math.max(WB_STALE_AFTER, (prefs.pollMs || 0) * 3);
   }
   // Per-second reflection of that gate onto the TV surface: toggle the
@@ -7164,8 +7179,8 @@ var qrcode = function() {
     const verdict = $("wbNoSignalMsg");
     if (verdict.textContent !== msg) verdict.textContent = msg;
     $("wbNoSignalAge").textContent =
-      state.fetchedAt
-        ? " · last update " + agoWords((performance.now() - state.fetchedAt) / 1000)
+      state.respondedAt
+        ? " · last update " + agoWords((performance.now() - state.respondedAt) / 1000)
         : " · no data received yet";
   }
   function setWallboard(on) {
@@ -7480,13 +7495,15 @@ var qrcode = function() {
     } finally { state.heat.loading = false; }
   }
   // The whole punchcard in one request, served from the daemon's shared
-  // response memo. false only on 404 (an older daemon: fan out per job);
-  // any other failure keeps the cells already drawn. The tri-state
+  // response memo. jobs=N asks for the first N jobs in configuration order,
+  // the rows renderHeatmap draws; a daemon that ignores the parameter
+  // answers with every job. false only on 404 (an older daemon: fan out per
+  // job); any other failure keeps the cells already drawn. The tri-state
   // preserves the old unauthorized behavior exactly (null: abort without
   // rendering, the token modal is up).
   async function loadHeatmapBatch() {
     try {
-      const r = await apiFetch("/activity");
+      const r = await apiFetch("/activity?jobs=" + HEAT_MAX_JOBS);
       if (r.status === 404) return false;
       if (r.ok) {
         const d = await r.json();
@@ -7917,7 +7934,14 @@ var qrcode = function() {
     const data = prefs.fleet ? state.fleet.data : null;
     // Reset the dirty-check signature whenever the panel is hidden so re-opening
     // (or a fresh payload) always renders rather than matching a stale sig.
-    if (!data) { box.style.display = "none"; state.fleet.lastSig = null; return; }
+    // A hidden panel holds no cells: tick() sweeps every [data-ago-short] in
+    // the document, hidden or not.
+    if (!data) {
+      box.style.display = "none";
+      if (box.firstChild) box.textContent = "";
+      state.fleet.lastSig = null;
+      return;
+    }
     box.style.display = "";
     const nodes = data.nodes || [];
     const spread = !!data.elect_leader && data.distribution === "spread";
@@ -8053,14 +8077,32 @@ var qrcode = function() {
     refreshing = true;
     $("refreshBtn").classList.add("spin");
     try {
-      const res = await apiFetch("/jobs");
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const jobs = await res.json();
-      state.jobs = jobs;
-      state.byName = {};
-      jobs.forEach((j) => { state.byName[j.name] = j; });
-      state.fetchedAt = performance.now();
-      state.fetchedWallAt = Date.now();
+      // The page revalidates /jobs itself and keeps the request out of the
+      // HTTP cache. The daemon's ETag covers every field except the relative
+      // scheduled_in, so a 304 means state.jobs is still its answer, and the
+      // countdowns stay anchored to the response that carried them. A body
+      // replayed from the cache would bring countdowns measured at an
+      // earlier poll.
+      const res = await apiFetch("/jobs", {
+        cache: "no-store",
+        headers: state.jobsEtag ? { "If-None-Match": state.jobsEtag } : {},
+      });
+      if (res.status !== 304) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        state.jobs = await res.json();
+        state.byName = {};
+        state.jobs.forEach((j) => { state.byName[j.name] = j; });
+        state.fetchedAt = performance.now();
+        state.fetchedWallAt = Date.now();
+        state.jobsEtag = res.headers.get("ETag");
+      } else {
+        // The wall anchor stays, so every fire instant stays. The monotonic
+        // anchor takes the same age, which keeps the two in step across a
+        // suspend that stops the monotonic clock.
+        state.fetchedAt = performance.now() - (Date.now() - state.fetchedWallAt);
+      }
+      const jobs = state.jobs;
+      state.respondedAt = performance.now();
       setConnected(true);
       const first = !state.seenFirst;
       maybeNotify(jobs);
@@ -8146,11 +8188,13 @@ var qrcode = function() {
   function updateConnTooltip() {
     const conn = $("conn");
     if (!conn) return;
-    if (!state.fetchedAt) { conn.title = "Waiting for the first response from the cronstable server…"; return; }
-    const ago = agoWords((performance.now() - state.fetchedAt) / 1000);
-    conn.title = state.connected
-      ? "Connected to the cronstable server — last response " + ago + "."
-      : "No response from the cronstable server — last successful response " + ago + ".";
+    const ago = state.respondedAt ? agoWords((performance.now() - state.respondedAt) / 1000) : null;
+    const tip = ago === null ? "Waiting for the first response from the cronstable server…"
+      : state.connected
+        ? "Connected to the cronstable server — last response " + ago + "."
+        : "No response from the cronstable server — last successful response " + ago + ".";
+    // tick() calls this every second; the title is written when it changes
+    if (conn.title !== tip) conn.title = tip;
   }
 
   function maybeNotify(jobs) {
@@ -11526,7 +11570,7 @@ var qrcode = function() {
     } else {
       state.fleet.data = null;
       $("fleetBtn").style.display = "none";
-      $("fleetPanel").style.display = "none";
+      renderFleet();
     }
     const lease = data.lease || {};
     const labels = { holder: "held by", expiry: "expires", fence: "fence", electionName: "election", identity: "node identity", path: "store path" };
@@ -11584,7 +11628,7 @@ var qrcode = function() {
           $("swimPanel").style.display = "none";
           state.fleet.data = null;
           $("fleetBtn").style.display = "none";
-          $("fleetPanel").style.display = "none";
+          renderFleet();
           return;
         }
         card.style.display = "";
@@ -12018,9 +12062,13 @@ var qrcode = function() {
     renderTimeline();
     focusFirst($("timelineWrap"));
   }
+  // The rows leave the document once the overlay's .12s fade is over, so a
+  // closed timeline holds no [data-ago] cells for tick() to sweep.
+  const TL_CLEAR_MS = 200;
   function closeTimeline() {
     if (!closeOverlay("timelineWrap")) return;
     state.timeline.open = false;
+    setTimeout(() => { if (!state.timeline.open) $("tlBody").textContent = ""; }, TL_CLEAR_MS);
   }
   function renderTimeline() {
     if (!state.timeline.open) return;
@@ -12733,6 +12781,7 @@ var qrcode = function() {
         const jobs = Array.from({ length: n }, (_, i) => _pjob(i));
         state.jobs = jobs; state.byName = {};
         state.fetchedAt = performance.now(); state.fetchedWallAt = Date.now();
+        state.respondedAt = state.fetchedAt; state.jobsEtag = null;
         jobs.forEach((j) => { state.byName[j.name] = j; });
       },
       renderRows() { state.lastRowSig = null; renderRows(); },
@@ -12810,6 +12859,22 @@ var qrcode = function() {
       computeWeek() { _clearWalks(); computeWeek(); },
       computeRadar() { _clearWalks(); computeRadar(); },
       tick() { tick(); },
+      // the cluster swimlane: n gossip snapshots of `peers` peers, three
+      // seconds apart, with an outage per peer so each lane has segments to
+      // coalesce. seedSwim(0, 0) closes the panel. Nothing is persisted.
+      seedSwim(n, peers) {
+        const t0 = Date.now() - n * 3000;
+        state.swim.key = "perf";
+        state.swim.buf = Array.from({ length: n }, (_, i) => ({
+          t: t0 + i * 3000, leader: "node" + Math.floor(i / 97), quorate: i % 150 > 5,
+          peers: Array.from({ length: peers }, (_, p) => ({
+            h: "node" + p + ".example.internal:8443",
+            s: (i + p * 13) % 60 < 3 ? "unreachable" : "agreed", e: null,
+          })),
+        }));
+        prefs.swim = n > 0;
+      },
+      renderSwim() { renderSwim(); },
     };
   }
 })();

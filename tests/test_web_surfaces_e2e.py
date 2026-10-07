@@ -708,6 +708,10 @@ def test_activity_heatmap_from_real_runs(browser, tmp_path):
             _click(page, "#heatBtn")
             page.wait_for_selector("#heatBody [data-job]")
             assert len(page.faults.sent("GET", "/activity")) == 1
+            # the request names the row cap the panel draws
+            assert page.faults.sent("GET", "/activity")[0]["query"] == (
+                "jobs=80"
+            )
             rows = page.evaluate(
                 "[...document.querySelectorAll('#heatBody [data-job]')]"
                 ".map((r) => r.getAttribute('data-job'))"

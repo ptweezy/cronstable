@@ -46,6 +46,8 @@ logger = logging.getLogger("cronstable")
 # cost of more wakeups; total CPU is cumulative and re-read every sample, so it
 # converges regardless of the interval as long as the run outlives one tick.
 # Per-job override: monitorResources.interval (cronstable.config).
+# cronstable.config repeats this value and MONITOR_HISTORY_DEFAULT in
+# _MONITOR_SAMPLING_DEFAULTS, and tests/test_config.py holds them equal.
 SAMPLE_INTERVAL = 1.0
 
 # Default cap on the per-run CPU/RSS series retained for charts (points, not

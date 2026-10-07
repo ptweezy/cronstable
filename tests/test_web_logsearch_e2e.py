@@ -23,6 +23,7 @@ is a separate download CI fetches in one matrix cell, so this self-skips
 everywhere else.
 """
 
+import os
 import pathlib
 
 import pytest
@@ -113,7 +114,9 @@ def _visible(page):
 
 def _open_drawer_with_lines(p):
     try:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(
+            channel=os.environ.get("CRONSTABLE_TEST_BROWSER_CHANNEL")
+        )
     except Exception as exc:  # no chromium provisioned
         pytest.skip("playwright chromium unavailable: {}".format(exc))
     page = browser.new_page()

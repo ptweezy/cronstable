@@ -96,6 +96,17 @@ the text to the model still see the data. `cron_get_status`,
 does not accept returns an error result that names the argument and lists the
 accepted ones, so the model can correct the call.
 
+`cron_get_status` and `cron_list_jobs` return one page per call. `limit` sets
+the page size, up to [`mcp.maxRows`](Configuration-Reference#mcp), and
+`offset` sets where the page starts. Without `limit`, a page holds
+`mcp.maxRows` rows. The result's `page` object reports `offset`, `limit`,
+`total`, `returned`, and `nextOffset`, which is `null` on the last page.
+`cron_list_jobs` also takes `filter`, a case-insensitive substring of the job
+name, and `state`: `running`, `disabled`, or `scheduled` (enabled and not
+running). The tool applies both before it pages, so `total` counts the
+matching jobs, and it builds full job rows for the returned page. On a large
+job set, a small `limit` or a `filter` keeps the result small.
+
 Mutating tools require an explicit `confirm: true` argument and re-check the
 same authorization as the REST API. The tools that launch configured commands
 (`cron_run_job`, `cron_trigger_dag`, `cron_backfill_dag`, and

@@ -704,6 +704,29 @@ def compute_view(
     return view
 
 
+def _filter_admits(job: dict[str, Any], needle: str) -> bool:
+    """Whether ``job`` passes :func:`compute_view`'s text filter.
+
+    ``needle`` is the filter text, stripped and lowercased.
+    """
+    return not needle or (
+        needle in job.get("name", "").lower()
+        or needle in job.get("command", "").lower()
+    )
+
+
+def _edit_text(text: str, key: str) -> str | None:
+    """``text`` after ``key`` edits it, or ``None`` when ``key`` is no
+    editing key."""
+    if key == "backspace":
+        return text[:-1]
+    if key == "ctrl+u":
+        return ""
+    if len(key) == 1 and key >= " ":
+        return text + key
+    return None
+
+
 # ===================================================================
 #  cron schedule intelligence: describe_cron / next_fires / the linter
 #  moved to cronstable.croninfo (imported and re-exported above), so
@@ -1904,6 +1927,14 @@ class KeyDecoder:
         return (True, None)
 
 
+def _queued_key(queue: "asyncio.Queue[str]") -> str | None:
+    """The next key in ``queue`` when one is waiting, else ``None``."""
+    try:
+        return queue.get_nowait()
+    except asyncio.QueueEmpty:
+        return None
+
+
 class PosixKeyReader:
     """stdin -> key-name queue on POSIX, via ``loop.add_reader``."""
 
@@ -1934,6 +1965,9 @@ class PosixKeyReader:
 
     async def get(self) -> str:
         return await self._queue.get()
+
+    def get_nowait(self) -> str | None:
+        return _queued_key(self._queue)
 
     def close(self) -> None:
         with contextlib.suppress(Exception):
@@ -1986,6 +2020,9 @@ if sys.platform == "win32":  # pragma: no cover (windows)
 
         async def get(self) -> str:
             return await self._queue.get()
+
+        def get_nowait(self) -> str | None:
+            return _queued_key(self._queue)
 
         def close(self) -> None:
             self._stop = True
@@ -2131,6 +2168,9 @@ class ScriptedKeys:
 
     async def get(self) -> str:
         return await self.queue.get()
+
+    def get_nowait(self) -> str | None:
+        return _queued_key(self.queue)
 
     def close(self) -> None:
         pass
@@ -2940,6 +2980,25 @@ class App:
         self.status_filter = "all"
         self.sort_key = "name"
         self.sort_dir = 1
+        # filter edits the input loop holds for one view rebuild (see
+        # _input_loop): the editing keys in order, and the filter text
+        # before the first of them
+        self._filter_hold = False
+        self._filter_typed: list[str] = []
+        self._filter_base = ""
+        # what self.view was built from: the job list, status segment,
+        # sort key, sort direction and filter text, then the view itself
+        self._view_built: (
+            tuple[
+                list[dict[str, Any]],
+                str,
+                str,
+                int,
+                str,
+                list[dict[str, Any]],
+            ]
+            | None
+        ) = None
 
         # ---- surfaces ----
         self.open_overlays: list[str] = []  # stack, last = topmost
@@ -3220,23 +3279,104 @@ class App:
         # the aggregates fold rides along: every path that swaps or
         # reshapes the job data ends in a recompute_view
         self._refresh_job_aggregates()
-        keep = None
-        current = self.selected_job()
-        if current is not None:
-            keep = current.get("name")
-        self.view = compute_view(
+        typed, self._filter_typed = self._filter_typed, []
+        if typed:
+            self.view, self.sel = self._retype_filter(typed)
+        else:
+            self.view, self.sel = self._filter_step(
+                self.view, None, self.sel, self.filter_text
+            )
+        self._view_built = (
             self.jobs,
-            self.filter_text,
             self.status_filter,
             self.sort_key,
             self.sort_dir,
+            self.filter_text,
+            self.view,
         )
+
+    def _filter_step(
+        self,
+        view: list[dict[str, Any]],
+        needle: str | None,
+        sel: int,
+        text: str,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """The view for filter ``text`` and the row selected in it, given
+        the ``view`` and the row ``sel`` before the change.
+
+        The selection follows its job by name and keeps its row number
+        when the job leaves the view. ``needle`` is the lowercased filter
+        text whose matches ``view`` holds under the current jobs, sort
+        and status segment, or ``None``. A text that contains ``needle``
+        filters ``view`` and skips the sort.
+        """
+        current = view[min(sel, len(view) - 1)] if view else None
+        keep = current.get("name") if current is not None else None
+        want = text.strip().lower()
+        if needle is not None and needle in want:
+            view = [job for job in view if _filter_admits(job, want)]
+        else:
+            view = compute_view(
+                self.jobs,
+                text,
+                self.status_filter,
+                self.sort_key,
+                self.sort_dir,
+            )
         if keep is not None:
-            for idx, job in enumerate(self.view):
+            for idx, job in enumerate(view):
                 if job.get("name") == keep:
-                    self.sel = idx
+                    sel = idx
                     break
-        self.sel = max(0, min(self.sel, max(0, len(self.view) - 1)))
+        return view, max(0, min(sel, max(0, len(view) - 1)))
+
+    def _retype_filter(
+        self, typed: list[str]
+    ) -> tuple[list[dict[str, Any]], int]:
+        """The view and the selected row after the editing keys ``typed``
+        that the input loop held, as one rebuild per key leaves them.
+
+        The selected row depends on every intermediate filter (see
+        :meth:`_filter_step`), so the edits are taken in order. An edit
+        whose filter still admits the selected job builds no view until a
+        later edit drops the job or the run ends.
+        """
+        built = self._view_built
+        view, sel = self.view, self.sel
+        needle = None
+        if (
+            built is not None
+            and built[0] is self.jobs
+            and built[1:4]
+            == (self.status_filter, self.sort_key, self.sort_dir)
+            and built[5] is view
+        ):
+            needle = built[4].strip().lower()
+        text = self._filter_base
+        owed: str | None = None
+        for key in typed:
+            text = _edit_text(text, key) or ""
+            if needle is not None and view:
+                job = view[min(sel, len(view) - 1)]
+                if job.get("name") is not None and _filter_admits(
+                    job, text.strip().lower()
+                ):
+                    owed = text
+                    continue
+            if owed is not None:
+                view, sel = self._filter_step(view, needle, sel, owed)
+                needle, owed = owed.strip().lower(), None
+            view, sel = self._filter_step(view, needle, sel, text)
+            needle = text.strip().lower()
+        if owed is not None:
+            view, sel = self._filter_step(view, needle, sel, owed)
+        return view, sel
+
+    def _settle_view(self) -> None:
+        """Rebuild the view for the filter edits the input loop holds."""
+        if self._filter_typed:
+            self.recompute_view()
 
     def stale(self) -> bool:
         """Wallboard NO-SIGNAL rule: data older than max(15s, 2 polls)."""
@@ -3599,14 +3739,39 @@ class App:
 
     async def _input_loop(self) -> None:
         while not self.quit:
-            key = await self.keys.get()
-            self.last_key_mono = time.monotonic()
-            if self.zen_on:  # any key wakes zen without acting
-                self.zen_on = False
+            key: str | None = await self.keys.get()
+            # Keys that are queued together, as a paste is, are handled
+            # in one pass. The filter edits among them share one view
+            # rebuild: it runs before any other key acts and before the
+            # pass ends, so every other key, the next frame and the next
+            # poll read the view for the text typed so far.
+            while key is not None and not self.quit:
+                self.last_key_mono = time.monotonic()
+                if self.zen_on:  # any key wakes zen without acting
+                    self.zen_on = False
+                elif self._edits_filter(key):
+                    self._filter_hold = True
+                    try:
+                        await self.handle_key(key)
+                    finally:
+                        self._filter_hold = False
+                else:
+                    self._settle_view()
+                    await self.handle_key(key)
                 self.mark()
-                continue
-            await self.handle_key(key)
-            self.mark()
+                take = getattr(self.keys, "get_nowait", None)
+                key = take() if take is not None else None
+            self._settle_view()
+
+    def _edits_filter(self, key: str) -> bool:
+        """Whether :meth:`handle_key` takes ``key`` as an edit of the
+        filter box and nothing else."""
+        return (
+            self.focus == "filter"
+            and not self.booting
+            and not self.is_open("palette")
+            and _edit_text("", key) is not None
+        )
 
     async def _paint_loop(self) -> None:
         while not self.quit:
@@ -3648,7 +3813,11 @@ class App:
         # launches a 40-request burst; the stale card just survives until
         # the next window.
         try:
-            data = await self.api.get_json("/activity")
+            # jobs and sort ask for the rows render_heat draws: the
+            # first HEAT_MAX_JOBS by name
+            data = await self.api.get_json(
+                "/activity?jobs=%d&sort=name" % HEAT_MAX_JOBS
+            )
         except ApiError as exc:
             return exc.status != 404
         except Exception:  # noqa: BLE001 - transient; keep the stale card
@@ -3658,11 +3827,11 @@ class App:
             # wholesale replacement, so the fan-out path's prune of
             # removed names is implicit here and _heat_parsed's orphan
             # sweep covers the shrinkage. Capped like the fan-out and the
-            # web card: /activity is uncapped in JOBS, so a fleet-scale
-            # daemon would otherwise hand every refresh a row list per
-            # job, all but HEAT_MAX_JOBS of them never drawn. Selected in
-            # the order render_heat draws, so the retained set is the set
-            # the user can actually reach.
+            # web card: a daemon that predates the jobs parameter ignores
+            # it and answers with a row list for every job, all but
+            # HEAT_MAX_JOBS of them never drawn. Selected in the order
+            # render_heat draws, so the retained set is the set the user
+            # can actually reach.
             names = sorted(str(name) for name in jobs)[:HEAT_MAX_JOBS]
             self.heat_data = {
                 name: (jobs[name] if isinstance(jobs.get(name), list) else [])
@@ -4947,19 +5116,20 @@ class AppKeys(AppPalette):
         return None
 
     def _edit_input(self, name: str, key: str) -> None:
-        buf = self.inputs[name]
-        if key == "backspace":
-            buf = buf[:-1]
-        elif key == "ctrl+u":
-            buf = ""
-        elif len(key) == 1 and key >= " ":
-            buf += key
-        else:
+        before = self.inputs[name]
+        buf = _edit_text(before, key)
+        if buf is None:
             return
         self.inputs[name] = buf
         if name == "filter":
             self.filter_text = buf
-            self.recompute_view()
+            if self._filter_hold:
+                # the input loop rebuilds the view for the whole run
+                if not self._filter_typed:
+                    self._filter_base = before
+                self._filter_typed.append(key)
+            else:
+                self.recompute_view()
         if name == "logsearch":
             self._log_search_recompute(reset=True)
         self.mark()

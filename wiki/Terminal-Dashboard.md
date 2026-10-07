@@ -87,7 +87,9 @@ The TUI includes:
 - The **jobs board**: status glyphs, next-fire countdowns, last-run
   ages, duration sparklines, live CPU/memory chips for monitored jobs,
   the owner column under a spread cluster, filtering, sorting, and the
-  status segments. A [paused](Pausing-Jobs) job shows the `⏸` glyph
+  status segments. The filter matches job names and commands, and text
+  pasted into it rebuilds the board once. A [paused](Pausing-Jobs) job
+  shows the `⏸` glyph
   (`p` in `--ascii` mode) with `⏸ til HH:MM` in the next-fire column,
   and `p` toggles pause/resume (also in the palette). A job
   [late on a service level agreement (SLA) check](Late-Run-Detection)
@@ -239,7 +241,9 @@ the refresh interval (1s–10s or paused, default 3s), with `/cluster`
 and `/node` riding each successful poll. `/fleet`, `/state`,
 and the heatmap's one-request `/activity` batch are polled only while
 their panels are open, with the per-job `/jobs/{name}/runs` fan-out kept
-as the fallback against a daemon without that batch.
+as the fallback against a daemon without that batch. The heatmap
+request is `GET /activity?jobs=80&sort=name`: the 80 jobs the panel
+draws, first by name.
 `GET /jobs/{name}/logs` is an SSE stream while a **Logs** tab or
 multi-tail pane is attached (replay-then-follow, with the page's same
 reconnect throttle).

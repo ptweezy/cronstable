@@ -759,6 +759,21 @@ it (with `ETag` / `If-None-Match` and gzip, like `GET /jobs`). An optional
 `?limit=` query caps the runs per job (newest kept, clamped to the retained
 window; the default serves the whole window).
 
+The response carries every job by default, so its size grows with the fleet.
+Two optional query parameters cap the job set for a client that draws a
+bounded number of rows:
+
+| Parameter | Meaning |
+| --- | --- |
+| `jobs=N` | Return at most `N` jobs. `N` is an integer of at least 1; a lower value counts as 1, and a value that is not an integer returns every job. |
+| `sort=name` | Select the `N` jobs in ascending job-name order (code point order). Without `sort`, the selection is the first `N` jobs in configuration order, the order [`GET /jobs`](#get-jobs) lists them. Any other `sort` value returns `400 Bad Request`. |
+
+`sort` selects jobs for a `jobs` cap and has no effect without one. A capped
+response carries its own `ETag` and supports `If-None-Match` and gzip. The
+daemon builds a capped response for each request; a `jobs` value that covers
+every job returns the shared default response. For example,
+`GET /activity?jobs=80&sort=name` returns the first 80 jobs by name.
+
 ### `GET /jobs/{name}/resources`
 
 Chart-grade CPU/RSS time series for one job: the heavyweight sibling of the

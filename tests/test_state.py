@@ -2096,6 +2096,284 @@ async def test_prune_latest_by_swallows_unlink_race(fs_backend, monkeypatch):
     assert backend._prune_latest_by_sync("s", "name") == 0
 
 
+def _prune_pass_sizes(monkeypatch, backend):
+    """Record the stream's size at every name-keyed prune pass."""
+    sizes = []
+    real = backend._prune_latest_by_sync
+
+    def _sized(stream, field, **kwargs):
+        sizes.append(len(os.listdir(backend._stream_dir(stream))))
+        return real(stream, field, **kwargs)
+
+    monkeypatch.setattr(backend, "_prune_latest_by_sync", _sized)
+    return sizes
+
+
+async def test_name_keyed_prune_waits_for_the_stream_to_double(
+    fs_backend, monkeypatch
+):
+    # Every name is distinct, so no pass can delete anything.  Each one runs
+    # once the stream has grown by what the pass before it kept, which
+    # keeps the record reads per append constant however many names exist.
+    backend = fs_backend
+    sizes = _prune_pass_sizes(monkeypatch, backend)
+    for i in range(200):
+        await backend.append_record(
+            "s", {"name": "n%d" % i}, prune_latest_by="name"
+        )
+    assert sizes == [1, 9, 18, 36, 72, 144]
+
+
+async def test_name_keyed_prune_keeps_its_cadence_on_a_small_stream(
+    fs_backend, monkeypatch
+):
+    from cronstable.state import _PRUNE_EVERY_APPENDS
+
+    backend = fs_backend
+    sizes = _prune_pass_sizes(monkeypatch, backend)
+    appends = 5 * _PRUNE_EVERY_APPENDS
+    for i in range(appends):
+        await backend.append_record(
+            "s", {"name": "n%d" % (i % 3), "v": i}, prune_latest_by="name"
+        )
+    # three names never outgrow the cadence: a pass every eighth append
+    assert len(sizes) == 5
+    recs = await backend.list_records("s")
+    assert len(recs) <= 3 + _PRUNE_EVERY_APPENDS - 1
+    # paired with a newest-N bound, the cadence stays the bound's own
+    del sizes[:]
+    for i in range(appends):
+        await backend.append_record(
+            "t",
+            {"name": "n%d" % i},
+            prune_keep=1000,
+            prune_latest_by="name",
+        )
+    assert len(sizes) == 5
+
+
+# --- newest record by field (the artifact store's lookup) ------------------
+
+
+def _count_record_reads(monkeypatch, backend):
+    """Record the name of every record file ``backend`` reads."""
+    reads = []
+    real = backend._read_record
+
+    def _counted(stream_dir, name, **kwargs):
+        reads.append(name)
+        return real(stream_dir, name, **kwargs)
+
+    monkeypatch.setattr(backend, "_read_record", _counted)
+    return reads
+
+
+def _hold_records(monkeypatch, paths):
+    """Make the record files in ``paths`` transiently unreadable."""
+    held = {os.path.normpath(p) for p in paths}
+    real_open = open
+
+    def _flaky_open(path, *args, **kwargs):
+        if os.path.normpath(str(path)) in held:
+            raise PermissionError(13, "transient hold", str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(state, "open", _flaky_open, raising=False)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_newest_record_with_returns_the_newest_match(fs_backend, strict):
+    backend = fs_backend
+    # a stream nobody wrote holds no match
+    assert await backend.newest_record_with("s", "name", "a") is None
+    await backend.append_record("s", {"name": "a", "v": 1})
+    await backend.append_record("s", {"name": "b", "v": 2})
+    await backend.append_record("s", {"name": "a", "v": 3})
+    await backend.append_record("s", {"name": 7, "v": 4})
+    await backend.append_record("s", {"v": 5})
+    for _ in range(2):  # the second round answers from what the first read
+        got = await backend.newest_record_with("s", "name", "a", strict=strict)
+        assert got == {"name": "a", "v": 3}
+        got = await backend.newest_record_with("s", "name", "b", strict=strict)
+        assert got == {"name": "b", "v": 2}
+        assert (
+            await backend.newest_record_with("s", "name", "zz", strict=strict)
+            is None
+        )
+    # another field of the same stream is its own lookup
+    got = await backend.newest_record_with("s", "v", "x", strict=strict)
+    assert got is None
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_newest_record_with_reads_each_record_once(
+    fs_backend, monkeypatch, strict
+):
+    backend = fs_backend
+    for i in range(40):
+        await backend.append_record("s", {"name": "n%d" % i})
+    reads = _count_record_reads(monkeypatch, backend)
+
+    async def lookup(value):
+        del reads[:]
+        return await backend.newest_record_with(
+            "s", "name", value, strict=strict
+        )
+
+    # the first lookup of the oldest name reads every record
+    assert (await lookup("n0")) == {"name": "n0"}
+    assert len(reads) == 40
+    # from then on a lookup reads its match and nothing else
+    assert (await lookup("n0")) == {"name": "n0"}
+    assert len(reads) == 1
+    assert (await lookup("n17")) == {"name": "n17"}
+    assert len(reads) == 1
+    assert await lookup("missing") is None
+    assert reads == []
+    # a record appended since is read once, then known
+    await backend.append_record("s", {"name": "n40"})
+    assert (await lookup("n0")) == {"name": "n0"}
+    assert len(reads) == 2
+    assert (await lookup("n0")) == {"name": "n0"}
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_newest_record_with_follows_another_nodes_writes(
+    fs_backend_factory, strict
+):
+    # Two backends on one directory: two nodes sharing a mount.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+
+    async def newest():
+        return await ours.newest_record_with("s", "name", "a", strict=strict)
+
+    await ours.append_record("s", {"name": "a", "v": 1})
+    await ours.append_record("s", {"name": "b", "v": 1})
+    assert (await newest())["v"] == 1
+    # the peer republishes the name: the next lookup returns its record
+    await theirs.append_record("s", {"name": "a", "v": 2})
+    assert (await newest())["v"] == 2
+    # the peer prunes the superseded record
+    assert theirs._prune_latest_by_sync("s", "name") == 1
+    assert (await newest())["v"] == 2
+    # the peer deletes the stream: nothing is answered from memory
+    await theirs.prune_records("s", keep=0)
+    assert await newest() is None
+    # and a stream written afresh under the same name starts clean
+    await theirs.append_record("s", {"name": "a", "v": 3})
+    assert (await newest())["v"] == 3
+
+
+async def test_newest_record_with_strict_fails_closed_on_an_unread_record(
+    fs_backend, monkeypatch
+):
+    backend = fs_backend
+    await backend.append_record("s", {"name": "a"})
+    await backend.append_record("s", {"name": "b"})
+    stream_dir = backend._stream_dir("s")
+    older, newer = sorted(os.listdir(stream_dir))
+    _hold_records(monkeypatch, [os.path.join(stream_dir, newer)])
+    # The newer record has never been read, so it could be a publish of
+    # "a": strict raises, best-effort skips it.
+    with pytest.raises(OSError):
+        await backend.newest_record_with("s", "name", "a", strict=True)
+    got = await backend.newest_record_with("s", "name", "a")
+    assert got == {"name": "a"}
+    monkeypatch.undo()
+    # Once read, it is known to hold another name, and being unreadable
+    # later cannot hide a publish of "a".
+    got = await backend.newest_record_with("s", "name", "b", strict=True)
+    assert got == {"name": "b"}
+    _hold_records(monkeypatch, [os.path.join(stream_dir, newer)])
+    got = await backend.newest_record_with("s", "name", "a", strict=True)
+    assert got == {"name": "a"}
+    # The match itself always comes from the store.
+    with pytest.raises(OSError):
+        await backend.newest_record_with("s", "name", "b", strict=True)
+    assert await backend.newest_record_with("s", "name", "b") is None
+    monkeypatch.undo()
+    _hold_records(monkeypatch, [os.path.join(stream_dir, older)])
+    with pytest.raises(OSError):
+        await backend.newest_record_with("s", "name", "a", strict=True)
+
+
+async def test_newest_record_index_stays_within_its_budget(
+    fs_backend, monkeypatch
+):
+    monkeypatch.setattr(state, "_FIELD_INDEX_MAX_ENTRIES", 6)
+    backend = fs_backend
+    streams = ["s1", "s2", "s3"]
+    for stream in streams:
+        for i in range(4):
+            await backend.append_record(stream, {"name": "n%d" % i})
+        got = await backend.newest_record_with(stream, "name", "n0")
+        assert got == {"name": "n0"}
+    # the least recently used stream made room for the others
+    held = backend._field_index
+    assert sum(len(facts) for facts in held.values()) <= 6
+    assert backend._field_index_entries == sum(
+        len(facts) for facts in held.values()
+    )
+    assert (state._fs_safe("s3"), "name") in held
+    assert (state._fs_safe("s1"), "name") not in held
+    # dropped or kept, every stream still answers
+    for stream in streams:
+        got = await backend.newest_record_with(stream, "name", "n3")
+        assert got == {"name": "n3"}
+    # a stream with more records than the budget is scanned, never held
+    for i in range(8):
+        await backend.append_record("big", {"name": "b%d" % i})
+    for _ in range(2):
+        got = await backend.newest_record_with("big", "name", "b0")
+        assert got == {"name": "b0"}
+    assert (state._fs_safe("big"), "name") not in backend._field_index
+    assert backend._field_index_entries <= 6
+
+
+async def test_newest_record_index_drops_records_that_left_the_stream(
+    fs_backend,
+):
+    backend = fs_backend
+    for i in range(100):
+        await backend.append_record("s", {"name": "n%d" % i})
+    await backend.newest_record_with("s", "name", "n0")
+    key = (state._fs_safe("s"), "name")
+    assert len(backend._field_index[key]) == 100
+    await backend.prune_records("s", keep=10)
+    await backend.append_record("s", {"name": "fresh"})
+    assert await backend.newest_record_with("s", "name", "n0") is None
+    got = await backend.newest_record_with("s", "name", "fresh")
+    assert got == {"name": "fresh"}
+    # the facts about the pruned records went with them
+    assert len(backend._field_index[key]) == 11
+    assert backend._field_index_entries == 11
+
+
+async def test_newest_record_with_base_default_scans_list_records():
+    class _Scanning(_MinimalBackend):
+        async def list_records(
+            self,
+            stream,
+            *,
+            limit=None,
+            newest_first=False,
+            strict=False,
+            predicate=None,
+            max_matches=None,
+        ):
+            self.asked = (stream, newest_first, strict, max_matches)
+            rows = [{"name": "a", "v": 2}, {"name": "b", "v": 1}]
+            return [row for row in rows if predicate(row)][:max_matches]
+
+    backend = _Scanning()
+    got = await backend.newest_record_with("s", "name", "b", strict=True)
+    assert got == {"name": "b", "v": 1}
+    assert backend.asked == ("s", True, True, 1)
+    assert await backend.newest_record_with("s", "name", "zz") is None
+
+
 # --- append-side prune failure is swallowed -------------------------------
 
 

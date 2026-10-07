@@ -1,4 +1,10 @@
-"""Behavior and work counts for dashboard sorting and chart formatting."""
+"""Behavior and work counts for the dashboard's sorting, chart formatting,
+polls, per-second tick, and panels.
+
+The count tests open the page with ``?perf=1`` and drive it through
+``window.__perf`` and its own controls. Each one pins the work a steady
+state does, such as the rows a poll rebuilds or the DOM writes a tick makes.
+"""
 
 import pytest
 
@@ -10,6 +16,12 @@ from tests import _web_e2e as e2e  # noqa: E402
 @pytest.fixture(scope="module")
 def browser():
     with e2e.browser_session() as instance:
+        yield instance
+
+
+@pytest.fixture(scope="module")
+def daemon(tmp_path_factory):
+    with e2e.Daemon(tmp_path_factory.mktemp("perf")) as instance:
         yield instance
 
 
@@ -130,3 +142,404 @@ def test_chart_axes_and_hover_share_one_local_time_formatter(
         assert result["afterRedraw"] == 2
     finally:
         page.close()
+
+
+def _refresh(page):
+    page.evaluate("document.getElementById('refreshBtn').click()")
+    page.wait_for_function(
+        "!document.getElementById('refreshBtn').classList.contains('spin')"
+    )
+
+
+_ANCHOR = """() => {
+  const state = window.__perf.state();
+  return {
+    // the age of the held jobs on the monotonic and on the wall clock
+    ages: [performance.now() - state.fetchedAt,
+      Date.now() - state.fetchedWallAt],
+    targets: state.jobs.map(
+      (j) => state.fetchedWallAt + j.scheduled_in * 1000),
+    kept: [...document.querySelectorAll('#rows tr[data-job]')]
+      .filter((tr) => tr.__kept).length,
+    conn: document.getElementById('conn').title,
+  };
+}"""
+
+
+def test_a_revalidated_poll_keeps_the_countdown_anchor(browser, tmp_path):
+    """The daemon answers an unchanged ``/jobs`` with 304. Each countdown
+    belongs to the response that carried it, so the fire instants and the
+    rows stay as they were, and the connection readout still counts the
+    poll as a response. The countdowns age by the wall clock from poll to
+    poll, including across a suspend that stops the monotonic clock."""
+    jobs = [e2e.job("job%d" % i, schedule="%d 3 1 1 *" % i) for i in range(6)]
+    with e2e.Daemon(tmp_path, jobs=jobs) as daemon:
+        with e2e.open_page(
+            browser, daemon.url + "?perf=1", prefs={"pollMs": 0}
+        ) as page:
+            statuses = []
+            page.on(
+                "response",
+                lambda response: (
+                    response.url.endswith("/jobs")
+                    and statuses.append(response.status)
+                ),
+            )
+            page.evaluate(
+                "document.querySelectorAll('#rows tr[data-job]')"
+                ".forEach((tr) => { tr.__kept = true; })"
+            )
+            before = page.evaluate(_ANCHOR)
+            assert before["kept"] == len(jobs)
+            # A minute on the page's clock: a countdown stamped again at
+            # this instant would name the next minute in every row.
+            page.clock.install()
+            page.clock.fast_forward(61000)
+            _refresh(page)
+            after = page.evaluate(_ANCHOR)
+            assert statuses == [304]
+            assert after["targets"] == before["targets"]
+            assert after["ages"][1] >= 61000
+            assert abs(after["ages"][0] - after["ages"][1]) < 5
+            assert after["kept"] == len(jobs)
+            assert "minute" not in after["conn"]
+
+            # An hour passes on the wall clock alone, as it does while a
+            # suspended machine holds the monotonic clock still.
+            page.evaluate(
+                """() => {
+                  const monotonic = performance.now.bind(performance);
+                  performance.now = () => monotonic() - 3600000;
+                }"""
+            )
+            page.clock.fast_forward(3600000)
+            _refresh(page)
+            woken = page.evaluate(_ANCHOR)
+            assert statuses == [304, 304]
+            assert woken["targets"] == before["targets"]
+            assert woken["ages"][1] >= 3661000
+            assert abs(woken["ages"][0] - woken["ages"][1]) < 5
+            assert woken["kept"] == len(jobs)
+
+
+def test_a_revalidated_poll_carries_the_token(browser, tmp_path):
+    """The conditional request authenticates like any other. A token the
+    daemon refuses opens the token dialog, and the next accepted poll
+    revalidates the rows the page still holds."""
+    with e2e.Daemon(tmp_path, auth="full") as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url + "?perf=1",
+            token=e2e.FULL_TOKEN,
+            prefs={"pollMs": 0},
+        ) as page:
+            page.faults.record()
+            statuses = []
+            page.on(
+                "response",
+                lambda response: (
+                    response.url.endswith("/jobs")
+                    and statuses.append(response.status)
+                ),
+            )
+            names = e2e.row_names(page)
+            page.evaluate(
+                "document.querySelectorAll('#rows tr[data-job]')"
+                ".forEach((tr) => { tr.__kept = true; })"
+            )
+            _refresh(page)
+            sent = page.faults.sent("GET", "/jobs")[-1]["headers"]
+            assert sent["authorization"] == "Bearer " + e2e.FULL_TOKEN
+            assert sent["if-none-match"]
+
+            page.evaluate("sessionStorage.setItem('cronstable_token', 'no')")
+            page.evaluate("document.getElementById('refreshBtn').click()")
+            page.wait_for_selector("#modalWrap.open")
+            assert e2e.row_names(page) == names
+
+            page.fill("#tokenInput", e2e.FULL_TOKEN)
+            page.click("#tokenSave")
+            page.wait_for_function(
+                "!document.getElementById('modalWrap').classList"
+                ".contains('open')"
+            )
+            page.wait_for_function(
+                "!document.getElementById('refreshBtn').classList"
+                ".contains('spin')"
+            )
+            assert statuses == [304, 401, 304]
+            assert page.evaluate(_ANCHOR)["kept"] == len(names)
+
+
+def _freeze(page):
+    """Install the page clock and stop it, before navigation."""
+    page.clock.install(time="2026-01-01T12:00:00Z")
+    page.clock.pause_at("2026-01-01T12:01:00Z")
+
+
+def test_a_tick_with_a_frozen_clock_writes_nothing(browser, daemon):
+    """Every readout ``tick`` keeps current is written when its text
+    changes, so a tick at an unchanged instant leaves the document alone."""
+    with e2e.open_page(
+        browser,
+        daemon.url + "?perf=1",
+        prefs={"pollMs": 0, "radar": True, "week": True},
+        before_goto=_freeze,
+    ) as page:
+        records = page.evaluate(
+            """() => {
+              const perf = window.__perf;
+              perf.seedJobs(40);
+              perf.varySchedules();
+              perf.renderRows();
+              perf.seedFleet(3, 40);
+              perf.renderFleet();
+              perf.computeRadar();
+              perf.computeWeek();
+              // the first tick paints the seeded panels
+              perf.tick();
+              const seen = [];
+              const observer = new MutationObserver(
+                (list) => seen.push(...list));
+              observer.observe(document, {
+                subtree: true, childList: true, characterData: true,
+                attributes: true,
+              });
+              perf.tick();
+              perf.tick();
+              seen.push(...observer.takeRecords());
+              observer.disconnect();
+              return {
+                swept: document.querySelectorAll(
+                  '[data-ago], [data-ago-short], [data-next]').length,
+                marks: document.querySelectorAll('#radarTrack .rt-mk').length,
+                seen: seen.map((m) => [
+                  m.type, m.target.id || m.target.nodeName,
+                  m.attributeName]),
+              };
+            }"""
+        )
+        assert records["swept"] > 100
+        assert records["marks"] > 0
+        assert records["seen"] == []
+
+
+_SWEPT = (
+    "document.querySelectorAll('[data-ago], [data-ago-short],"
+    " [data-ago-epoch], [data-until-epoch], [data-until-iso],"
+    " [data-next]').length"
+)
+
+
+def test_closed_panels_leave_nothing_for_the_tick_to_sweep(browser, daemon):
+    """``tick`` sweeps every relative-time cell in the document, so a
+    closed fleet panel and a closed timeline hold none, and each renders
+    again in full when it reopens."""
+    with e2e.open_page(
+        browser, daemon.url + "?perf=1", prefs={"pollMs": 0}
+    ) as page:
+        page.evaluate(
+            "() => { window.__perf.seedJobs(40); window.__perf.renderRows(); }"
+        )
+        table = page.evaluate(_SWEPT)
+        assert table > 40
+
+        page.evaluate(
+            "() => { window.__perf.seedFleet(3, 40);"
+            " window.__perf.renderFleet(); }"
+        )
+        opened = page.evaluate(_SWEPT)
+        assert opened > table + 40
+        page.evaluate("document.getElementById('fleetBtn').click()")
+        assert page.evaluate(_SWEPT) == table
+        assert (
+            page.evaluate(
+                "document.getElementById('fleetPanel').childNodes.length"
+            )
+            == 0
+        )
+        page.evaluate("document.getElementById('fleetBtn').click()")
+        assert page.evaluate(_SWEPT) == opened
+        page.evaluate("document.getElementById('fleetBtn').click()")
+
+        page.keyboard.press("i")
+        page.wait_for_selector("#timelineWrap.open #tlBody .tlrow")
+        assert page.evaluate(_SWEPT) == table + 40
+        page.click("#tlClose")
+        page.wait_for_function("!document.getElementById('tlBody').firstChild")
+        assert page.evaluate(_SWEPT) == table
+        page.keyboard.press("i")
+        page.wait_for_selector("#timelineWrap.open #tlBody .tlrow")
+        assert page.evaluate(_SWEPT) == table + 40
+
+
+_POLLS = """(count) => {
+  const perf = window.__perf, state = perf.state();
+  let touch = window.__touch || 1;
+  for (let poll = 0; poll < count; poll++) {
+    for (let k = 0; k < 10; k++) perf.touchJob(touch++ * 53);
+    // a poll delivers new objects for every job, changed or not
+    const jobs = JSON.parse(JSON.stringify(state.jobs));
+    state.jobs = jobs;
+    state.byName = {};
+    jobs.forEach((j) => { state.byName[j.name] = j; });
+    perf.renderRowsDiff();
+    perf.tick();
+  }
+  window.__touch = touch;
+}"""
+
+
+def _live_counts(page):
+    session = page.context.new_cdp_session(page)
+    try:
+        session.send("Performance.enable")
+        session.send("HeapProfiler.collectGarbage")
+        metrics = {
+            entry["name"]: entry["value"]
+            for entry in session.send("Performance.getMetrics")["metrics"]
+        }
+    finally:
+        session.detach()
+    return metrics["Nodes"], metrics["JSEventListeners"]
+
+
+def test_polls_leave_node_and_listener_counts_flat(browser, daemon):
+    """A thousand polls that each move ten rows end with the node and
+    listener counts they started with."""
+    with e2e.open_page(
+        browser,
+        daemon.url + "?perf=1",
+        prefs={"pollMs": 0, "motion": True},
+    ) as page:
+        page.evaluate(
+            "() => { window.__perf.seedJobs(200);"
+            " window.__perf.renderRows(); }"
+        )
+        # the first polls settle one-time growth such as cached row nodes
+        page.evaluate(_POLLS, 20)
+        before = _live_counts(page)
+        page.evaluate(_POLLS, 1000)
+        assert _live_counts(page) == before
+
+
+def test_a_steady_wallboard_poll_writes_nothing_to_the_grid(browser, daemon):
+    """The wallboard rebuilds its tiles when the fleet signature moves. A
+    poll that brings the same jobs leaves every tile node alone."""
+    with e2e.open_page(
+        browser, daemon.url + "?perf=1", prefs={"pollMs": 0}
+    ) as page:
+        page.evaluate("document.getElementById('tvBtn').click()")
+        page.wait_for_selector("#wbGrid .wb-tile")
+        page.evaluate(
+            """() => {
+              window.__gridWrites = [];
+              new MutationObserver(
+                (list) => window.__gridWrites.push(...list)
+              ).observe(document.getElementById('wbGrid'), {
+                subtree: true, childList: true, characterData: true,
+                attributes: true,
+              });
+            }"""
+        )
+        _refresh(page)
+        _refresh(page)
+        assert (
+            page.evaluate(
+                "window.__gridWrites.map((m) => [m.type, m.attributeName])"
+            )
+            == []
+        )
+        tiles = page.evaluate(
+            "document.querySelectorAll('#wbGrid .wb-tile').length"
+        )
+        assert tiles == len(daemon.config["jobs"])
+
+
+def test_ledger_analysis_reads_only_the_named_jobs(browser, daemon):
+    """A poll hands ``ledgerAnalyze`` the jobs that finished a run. It
+    reads the windows of those jobs and replaces only their statistics."""
+    with e2e.open_page(
+        browser, daemon.url + "?perf=1", prefs={"pollMs": 0}
+    ) as page:
+        result = page.evaluate(
+            """() => {
+              const perf = window.__perf, ledger = perf.state().ledger;
+              perf.seedLedger(12, 30);
+              perf.ledgerAnalyze();
+              const before = Object.assign({}, ledger.stats);
+              const runs = ledger.runs, read = new Set();
+              ledger.runs = new Proxy(runs, {
+                get(target, key, receiver) {
+                  if (typeof key === 'string') read.add(key);
+                  return Reflect.get(target, key, receiver);
+                },
+              });
+              try {
+                perf.ledgerAnalyze(['job3', 'job7']);
+              } finally {
+                ledger.runs = runs;
+              }
+              return {
+                jobs: Object.keys(before).length,
+                read: [...read].sort(),
+                replaced: Object.keys(ledger.stats)
+                  .filter((name) => ledger.stats[name] !== before[name])
+                  .sort(),
+              };
+            }"""
+        )
+        assert result["jobs"] == 12
+        assert result["read"] == ["job3", "job7"]
+        assert result["replaced"] == ["job3", "job7"]
+
+
+_LOGO_WRITES = """async (frames) => {
+  const svg = document.querySelector('#mark svg');
+  let writes = 0;
+  const observer = new MutationObserver((list) => { writes += list.length; });
+  observer.observe(svg, {
+    subtree: true, childList: true, attributes: true,
+  });
+  for (let i = 0; i < frames; i++) {
+    await new Promise((done) => requestAnimationFrame(done));
+  }
+  writes += observer.takeRecords().length;
+  observer.disconnect();
+  return writes;
+}"""
+
+
+def test_a_parked_logo_writes_nothing(browser, daemon):
+    """The balanced mark sways on every frame. Reduce motion parks it: the
+    animation loop stops, and no frame writes to its drawing."""
+    with e2e.open_page(
+        browser, daemon.url + "?perf=1", prefs={"motion": True}
+    ) as page:
+        assert page.evaluate(_LOGO_WRITES, 30) == 0
+        page.evaluate(
+            """() => {
+              const motion = document.getElementById('setMotion');
+              motion.checked = false;
+              motion.dispatchEvent(new Event('change'));
+            }"""
+        )
+        assert page.evaluate(_LOGO_WRITES, 30) > 0
+
+
+def test_the_large_tables_keep_their_own_paint_record(browser, daemon):
+    """The jobs table and the fleet matrix are isolated stacking contexts,
+    so a frame that repaints the swaying logo skips their rows."""
+    with e2e.open_page(
+        browser, daemon.url + "?perf=1", prefs={"pollMs": 0}
+    ) as page:
+        isolated = page.evaluate(
+            """() => {
+              window.__perf.seedFleet(2, 5);
+              window.__perf.renderFleet();
+              const read = (selector) => getComputedStyle(
+                document.querySelector(selector)).isolation;
+              return [read('.twrap'), read('#fleetPanel .fleetwrap')];
+            }"""
+        )
+        assert isolated == ["isolate", "isolate"]

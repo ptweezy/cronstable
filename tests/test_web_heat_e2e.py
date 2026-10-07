@@ -18,6 +18,7 @@ is a separate download CI fetches in one matrix cell, so this self-skips
 everywhere else.
 """
 
+import os
 import pathlib
 import re
 
@@ -33,9 +34,11 @@ DEMO = pathlib.Path(__file__).parent.parent / "docs" / "demo" / "index.html"
 _RECORD_FETCH = """
 () => {
   window.__paths = [];
+  window.__urls = [];
   const orig = window.fetch;
   window.fetch = function (url, opts) {
     window.__paths.push(String(url).split("?")[0]);
+    window.__urls.push(String(url));
     return orig.call(this, url, opts);
   };
 }
@@ -63,7 +66,10 @@ _RECORD_FETCH_NO_ACTIVITY = """
 
 def _open_demo(p):
     try:
-        browser = p.chromium.launch()
+        # the channel variable every dashboard browser test honors
+        browser = p.chromium.launch(
+            channel=os.environ.get("CRONSTABLE_TEST_BROWSER_CHANNEL")
+        )
     except Exception as exc:  # no chromium provisioned
         pytest.skip("playwright chromium unavailable: {}".format(exc))
     page = browser.new_page()
@@ -83,9 +89,12 @@ def test_demo_heatmap_fills_from_one_activity_fetch():
         page.evaluate("document.getElementById('heatBtn').click()")
         page.wait_for_selector(".heat-cell.act")
         paths = page.evaluate("window.__paths")
+        urls = page.evaluate("window.__urls")
         browser.close()
     assert not errors, errors
     assert paths.count("/activity") == 1
+    # the request names the row cap, and the demo backend answers it
+    assert "/activity?jobs=80" in urls
     runs = [x for x in paths if re.match(r"^/jobs/.+/runs$", x)]
     assert runs == [], (
         "the batched feed was served, yet the page still fanned out "

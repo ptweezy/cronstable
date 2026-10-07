@@ -3316,6 +3316,33 @@ def test_render_heat_bucket_edges(tmp_path):
     assert "activity heatmap" in _txt(app.render_heat(paint, 110, 30))
 
 
+#: the punchcard's one request: the first HEAT_MAX_JOBS jobs by name
+_HEAT_PATH = "/activity?jobs=%d&sort=name" % tui.HEAT_MAX_JOBS
+
+
+async def test_load_heat_asks_for_the_rows_the_card_draws(tmp_path):
+    """The request names the card's own cap and order, so the daemon
+    sends the 80 jobs ``render_heat`` draws and no others."""
+    assert _HEAT_PATH == "/activity?jobs=80&sort=name"
+    app = _bare_app(tmp_path)
+    names = ["j%03d" % i for i in range(tui.HEAT_MAX_JOBS)]
+    row = {"outcome": "success", "finished_at": _iso_ago(60)}
+    calls = []
+
+    class FakeApi:
+        async def get_json(self, path):
+            calls.append(path)
+            return {"jobs": {name: [row] for name in names}}
+
+    app.api = FakeApi()
+    app._heat_busy = True
+    await app._load_heat()
+    assert calls == ["/activity?jobs=80&sort=name"]
+    assert sorted(app.heat_data) == names
+    shown = _txt(app.render_heat(_paint(app), 110, 200))
+    assert all(name in shown for name in names)
+
+
 async def test_load_heat_overlaps_bounded_and_prunes_dead_names(tmp_path):
     # The heat load used to await its per-job /runs fetches strictly one at
     # a time INSIDE the poll loop, freezing every poll surface for the sum
@@ -3329,7 +3356,7 @@ async def test_load_heat_overlaps_bounded_and_prunes_dead_names(tmp_path):
 
     class FakeApi:
         async def get_json(self, path):
-            if path == "/activity":
+            if path == _HEAT_PATH:
                 # an old daemon: the batch probe 404s (uncounted), and
                 # the per-job fan-out below is the path under test
                 raise tui.ApiError(404)
@@ -3364,13 +3391,13 @@ async def test_load_heat_prefers_the_batched_endpoint(tmp_path):
     class FakeApi:
         async def get_json(self, path):
             calls.append(path)
-            assert path == "/activity", "unexpected fan-out to %s" % path
+            assert path == _HEAT_PATH, "unexpected fan-out to %s" % path
             return {"jobs": {"j00": [row], "j01": []}}
 
     app.api = FakeApi()
     app._heat_busy = True  # exactly as _fanout sets it before spawning
     await app._load_heat()
-    assert calls == ["/activity"]
+    assert calls == [_HEAT_PATH]
     assert "gone" not in app.heat_data
     assert app.heat_data["j00"] == [row]
     assert app.heat_data["j01"] == []
@@ -3388,14 +3415,14 @@ async def test_load_heat_falls_back_per_job_on_404(tmp_path):
     class FakeApi:
         async def get_json(self, path):
             calls.append(path)
-            if path == "/activity":
+            if path == _HEAT_PATH:
                 raise tui.ApiError(404)
             return {"runs": [{"outcome": "success"}]}
 
     app.api = FakeApi()
     app._heat_busy = True
     await app._load_heat()
-    assert calls[0] == "/activity"
+    assert calls[0] == _HEAT_PATH
     assert len(calls) == 13  # the probe plus one /runs per job
     assert app.heat_data["j00"] == [{"outcome": "success"}]
     assert app._heat_busy is False
@@ -3416,7 +3443,7 @@ async def test_load_heat_batched_caps_like_the_fanout(tmp_path):
 
     class FakeApi:
         async def get_json(self, path):
-            assert path == "/activity"
+            assert path == _HEAT_PATH
             return {"jobs": {j["name"]: [row] for j in app.jobs}}
 
     app.api = FakeApi()
@@ -3448,7 +3475,7 @@ async def test_load_heat_transient_batch_failure_keeps_stale_data(tmp_path):
     app.api = FakeApi()
     app._heat_busy = True
     await app._load_heat()
-    assert calls == ["/activity"]  # no per-job fan-out
+    assert calls == [_HEAT_PATH]  # no per-job fan-out
     assert app.heat_data["j00"] == stale
     assert app._heat_busy is False
 
@@ -4763,6 +4790,11 @@ async def test_posix_key_reader_via_pipe():
         # a lone Esc resolves through the quiet-gap flush
         os.write(w, b"\x1b")
         assert await asyncio.wait_for(reader.get(), 2) == "esc"
+        # keys that one read delivers together wait in the queue
+        os.write(w, b"jk")
+        assert await asyncio.wait_for(reader.get(), 2) == "j"
+        assert reader.get_nowait() == "k"
+        assert reader.get_nowait() is None
     finally:
         reader.close()
         os.close(w)
@@ -5203,3 +5235,442 @@ def test_drawer_schedule_local_frame_uses_the_host_zone(tmp_path, monkeypatch):
     app.drawer_job = "ny"
     app._drawer_schedule(paint, 70, 24)
     assert str(zones[1]) == "America/New_York"
+
+
+# ===================================================================
+#  Queued filter keystrokes share one view rebuild
+# ===================================================================
+def _filter_fleet(nameless=False):
+    """Jobs whose names and commands overlap, so typed filters narrow,
+    widen and empty the view. Two jobs share a name, and ``nameless``
+    adds one that has none: the selection follows a job by name, and
+    both cases bend that rule."""
+    jobs = [
+        _job("north-beacon", outcome="success", command="bin/one"),
+        _job(
+            "south-beacon",
+            outcome="failure",
+            exit_code=2,
+            command="bin/one --hot",
+            finished_ago=5,
+            duration=9,
+        ),
+        _job(
+            "pulse-check",
+            running=True,
+            scheduled_in=None,
+            command="bin/none",
+        ),
+        _job(
+            "etl-1",
+            outcome="success",
+            command="echo one",
+            finished_ago=600,
+            duration=3,
+            scheduled_in=5,
+        ),
+        _job("etl-10", enabled=False, command="echo bone"),
+        _job("Etl-11", outcome="cancelled", command="echo no"),
+        _job("beacon", outcome="success", command="bin/eon", duration=0.5),
+        _job("bone", outcome="success", command="bin/one b"),
+        _job("bone", outcome="failure", command="echo eb", scheduled_in=None),
+        _job("one-b", outcome="success", command="hub", scheduled_in=900),
+        _job("hub", command="one"),
+        _job("u-boot", outcome="unknown", command="-1"),
+    ]
+    if nameless:
+        job = _job("x", command="bone 1")
+        del job["name"]
+        jobs.append(job)
+    return jobs
+
+
+def _filter_rig(tmp_path, jobs):
+    """A bare app over ``jobs`` whose view-reading actions record the
+    job they acted on and reach no daemon."""
+    app = _bare_app(tmp_path)
+    app.jobs = jobs
+    app.by_name = {job.get("name", ""): job for job in jobs}
+    app.recompute_view()
+    acted = []
+
+    async def run_job(name):
+        acted.append(("run", name))
+
+    app.open_drawer = lambda name, tab="logs": acted.append(("open", name))
+    app.copy_command = lambda job: acted.append(("copy", job.get("name")))
+    app.run_job = run_job
+    return app, acted
+
+
+def _view_state(app):
+    return (
+        [id(job) for job in app.view],
+        app.sel,
+        app.filter_text,
+        app.inputs["filter"],
+        app.focus,
+        app.sort_key,
+        app.sort_dir,
+        app.status_filter,
+    )
+
+
+class _InputLoop:
+    """The real input loop over a scripted queue, one burst at a time."""
+
+    def __init__(self, app):
+        self.app = app
+        self.task = None
+
+    async def __aenter__(self):
+        loop = asyncio.get_running_loop()
+        self.task = loop.create_task(self.app._input_loop())
+        await asyncio.sleep(0)
+        return self
+
+    async def burst(self, *keys):
+        """Queue ``keys`` together and return once the loop handled them
+        all and is waiting for the next key. The loop takes a queued run
+        without yielding, so one turn of the event loop drains it."""
+        self.app.keys.send(*keys)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert self.app.keys.queue.empty(), keys
+        assert not self.task.done(), self.task
+
+    async def __aexit__(self, *exc):
+        self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+
+
+def _count_rebuilds(app):
+    """Count ``recompute_view`` calls on ``app`` from here on."""
+    calls = []
+    real = app.recompute_view
+
+    def counted():
+        calls.append(app.filter_text)
+        real()
+
+    app.recompute_view = counted
+    return calls
+
+
+async def test_queued_filter_keys_share_one_view_rebuild(tmp_path):
+    """A paste lands in the key queue whole. Its characters rebuild the
+    view once, and the result is the view that one rebuild per character
+    leaves."""
+    jobs = _filter_fleet()
+    app, _ = _filter_rig(tmp_path, jobs)
+    ref, _ = _filter_rig(tmp_path, jobs)
+    text = "bin/one --hot and then some more that matches nothing"
+    for key in ["/", *text]:
+        await ref.handle_key(key)
+    calls = _count_rebuilds(app)
+    async with _InputLoop(app) as loop:
+        await loop.burst("/", *text)
+    assert calls == [text]
+    assert _view_state(app) == _view_state(ref)
+    assert app.view == [] and app.sel == 0
+    # keys that arrive one at a time rebuild one at a time
+    async with _InputLoop(app) as loop:
+        for _ in text:
+            await loop.burst("backspace")
+    assert len(calls) == 1 + len(text)
+    assert len(app.view) == len(jobs)
+
+
+async def test_queued_filter_keys_track_the_selection_edit_by_edit(tmp_path):
+    """The selection follows its job through every intermediate filter
+    and keeps its row number when the job drops out, so the row a burst
+    ends on depends on every edit in it."""
+    jobs = [
+        _job("a"),
+        _job("b"),
+        _job("c", command="zz1"),
+        _job("d", command="zz"),
+        _job("e", command="zz1"),
+        _job("f", command="zz1"),
+    ]
+    app, _ = _filter_rig(tmp_path, jobs)
+    app.sel = 3
+    assert app.selected_job()["name"] == "d"
+    calls = _count_rebuilds(app)
+    async with _InputLoop(app) as loop:
+        await loop.burst("/", "z", "z", "1")
+    # "zz" keeps d as row 1 of c d e f; "zz1" drops it, so row 1 of
+    # c e f is selected. One rebuild from the unfiltered view would
+    # clamp row 3 to f.
+    assert [job["name"] for job in app.view] == ["c", "e", "f"]
+    assert app.selected_job()["name"] == "e"
+    assert calls == ["zz1"]
+    # widening edits keep the job by name without a view between them
+    async with _InputLoop(app) as loop:
+        await loop.burst("backspace", "backspace", "backspace")
+    assert app.selected_job()["name"] == "e" and app.sel == 4
+    assert calls == ["zz1", ""]
+
+
+async def test_keys_after_queued_filter_edits_act_on_the_filtered_view(
+    tmp_path,
+):
+    """Every key that is no filter edit sees the view its preceding
+    edits produce, in the same queue pass."""
+    jobs = _filter_fleet(nameless=True)
+    app, acted = _filter_rig(tmp_path, jobs)
+    ref, ref_acted = _filter_rig(tmp_path, jobs)
+    keys = [
+        *"/bon",  # filter to the four bone jobs
+        "enter",  # blur: the list keys act again
+        "j",
+        "enter",  # open the second filtered row
+        "r",
+        "c",
+        "end",
+        "c",
+        "s",  # sort by status
+        "c",
+        *"/e",  # narrow again, mid-burst
+        "esc",
+        "home",
+        "enter",
+        "/",
+        "ctrl+u",
+        "tab",
+        "f",  # status segment: ok
+        "k",
+        "enter",
+    ]
+    for key in keys:
+        await ref.handle_key(key)
+    calls = _count_rebuilds(app)
+    async with _InputLoop(app) as loop:
+        await loop.burst(*keys)
+    assert acted == ref_acted
+    assert acted == [
+        ("open", "bone"),
+        ("run", "bone"),
+        ("copy", "bone"),
+        ("copy", "etl-10"),
+        ("copy", "etl-10"),
+        ("open", "bone"),
+        ("open", "beacon"),
+    ]
+    assert _view_state(app) == _view_state(ref)
+    # one rebuild per run of edits, one per sort or segment key
+    assert calls == ["bon", "bon", "bone", "", ""]
+
+
+async def test_queued_keys_leave_the_view_that_single_keys_leave(tmp_path):
+    """Random key sequences, queued in random bursts through the input
+    loop, against the same keys handled one at a time."""
+    import random
+
+    typed = list("beno1- uhZ")
+    edits = ["backspace", "backspace", "ctrl+u"]
+    other = [
+        *["/"] * 5,
+        "enter",
+        "esc",
+        "tab",
+        "j",
+        "k",
+        "pgdn",
+        "pgup",
+        "home",
+        "end",
+        "s",
+        "S",
+        "f",
+        "c",
+        "r",
+    ]
+    pool = typed * 4 + edits * 3 + other
+    # Enter and r read the selected job's name, which the nameless job
+    # lacks, so the fleet that has it runs without those two keys
+    fleets = {
+        False: (_filter_fleet(), pool),
+        True: (
+            _filter_fleet(nameless=True),
+            [key for key in pool if key not in ("enter", "r")],
+        ),
+    }
+    for seed in range(200):
+        rng = random.Random(seed)
+        jobs, keyset = fleets[seed % 2 == 1]
+        app, acted = _filter_rig(tmp_path, jobs)
+        ref, ref_acted = _filter_rig(tmp_path, jobs)
+        app.sel = ref.sel = rng.randrange(len(jobs))
+        keys = [rng.choice(keyset) for _ in range(70)]
+        done = 0
+        async with _InputLoop(app) as loop:
+            while done < len(keys):
+                chunk = keys[done : done + rng.randint(1, 14)]
+                done += len(chunk)
+                for key in chunk:
+                    await ref.handle_key(key)
+                await loop.burst(*chunk)
+                where = (seed, keys[:done])
+                assert _view_state(app) == _view_state(ref), where
+                assert acted == ref_acted, where
+                assert app._filter_typed == [], where
+
+
+async def test_queued_filter_keys_over_a_view_built_elsewhere(tmp_path):
+    """A view that no rebuild produced is no shortcut for the next one:
+    the queued edits still land where single keys land."""
+    jobs = _filter_fleet(nameless=True)
+    runs = ["/o", "/on", "/one", [*"/one", "backspace", *"e b"]]
+    for swap in ("view", "jobs", "sort"):
+        for keys in runs:
+            app, _ = _filter_rig(tmp_path, jobs)
+            ref, _ = _filter_rig(tmp_path, jobs)
+            for each in (app, ref):
+                if swap == "view":
+                    each.view = [jobs[7], jobs[2], jobs[0]]
+                    each.sel = 1
+                elif swap == "jobs":
+                    each.jobs = jobs[3:]
+                else:
+                    each.sort_key = "duration"
+            for key in keys:
+                await ref.handle_key(key)
+            async with _InputLoop(app) as loop:
+                await loop.burst(*keys)
+            assert _view_state(app) == _view_state(ref), (swap, keys)
+
+
+async def test_filter_edit_routing_matches_the_key_dispatch(tmp_path):
+    """``_edits_filter`` holds exactly for the keys that ``handle_key``
+    turns into a filter edit, whatever else is open or focused."""
+    keys = [
+        "x",
+        " ",
+        "/",
+        "backspace",
+        "ctrl+u",
+        "enter",
+        "esc",
+        "tab",
+        "up",
+        "ctrl+k",
+        "ctrl+c",
+        "w",
+    ]
+    setups = {
+        "list": lambda app: None,
+        "filter": lambda app: setattr(app, "focus", "filter"),
+        "booting": lambda app: (
+            setattr(app, "focus", "filter"),
+            setattr(app, "booting", True),
+        ),
+        "palette": lambda app: (
+            app.open("palette"),
+            setattr(app, "focus", "palette"),
+        ),
+        "token": lambda app: (
+            app.open("token"),
+            setattr(app, "focus", "token"),
+        ),
+    }
+    for label, setup in setups.items():
+        for key in keys:
+            app, _ = _filter_rig(tmp_path, _filter_fleet())
+            setup(app)
+            edits = []
+            real = app._edit_input
+
+            def recording(name, key, real=real, edits=edits, app=app):
+                before = app.inputs[name]
+                real(name, key)
+                if name == "filter" and app.inputs[name] != before:
+                    edits.append(key)
+
+            app._edit_input = recording
+            app.inputs["filter"] = "seed"
+            claimed = app._edits_filter(key)
+            await app.handle_key(key)
+            assert claimed == (edits == [key]), (label, key)
+
+
+async def test_key_source_without_a_queue_peek_rebuilds_per_key(tmp_path):
+    """A key source that offers only ``get`` still drives the loop: each
+    key is its own pass."""
+
+    class OnlyGet:
+        def __init__(self):
+            self.queue = asyncio.Queue()
+
+        def send(self, *keys):
+            for key in keys:
+                self.queue.put_nowait(key)
+
+        async def get(self):
+            return await self.queue.get()
+
+    app, _ = _filter_rig(tmp_path, _filter_fleet(nameless=True))
+    app.keys = OnlyGet()
+    calls = _count_rebuilds(app)
+    async with _InputLoop(app) as loop:
+        await loop.burst(*"/bon")
+    assert calls == ["b", "bo", "bon"]
+    assert [job.get("name") for job in app.view] == [
+        None,
+        "bone",
+        "bone",
+        "etl-10",
+    ]
+
+
+def test_scripted_keys_hand_out_queued_keys_without_waiting():
+    keys = ScriptedKeys()
+    assert keys.get_nowait() is None
+    keys.send("a", "b")
+    assert [keys.get_nowait(), keys.get_nowait()] == ["a", "b"]
+    assert keys.get_nowait() is None
+
+
+def test_filter_admits_is_the_view_text_filter():
+    """The per-job test the narrowing shortcut applies is the one
+    ``compute_view`` applies to the whole list."""
+    jobs = _filter_fleet(nameless=True)
+    for text in ("", "  ", "bon", "BONE", " one ", "bin/one b", "zz", "-1"):
+        needle = text.strip().lower()
+        admitted = [job for job in jobs if tui._filter_admits(job, needle)]
+        viewed = compute_view(jobs, text, "all", "name", 1)
+        assert sorted(map(id, admitted)) == sorted(map(id, viewed)), text
+
+
+async def test_paint_and_poll_follow_a_filter_burst(tmp_path):
+    """The frame and the poll after a burst both read the filtered
+    view: the frame shows it, and the poll keeps its selection."""
+    h = Harness()
+    h.daemon.jobs = [
+        _job("north-beacon"),
+        _job("south-beacon"),
+        _job("pulse-check"),
+    ]
+    try:
+        app = await h.start(tmp_path)
+        await _wait_for(lambda: len(app.jobs) == 3)
+        polled = app.jobs
+        h.keys.send("j", "j", "/", *"beacon", "enter")
+        await _wait_for(lambda: app.focus is None and app.filter_text)
+        assert [j["name"] for j in app.view] == [
+            "north-beacon",
+            "south-beacon",
+        ]
+        # south-beacon was row 2 of three and is row 1 of two
+        assert app.selected_job()["name"] == "south-beacon"
+        await h.settle()
+        screen = h.term.screen()
+        assert "south-beacon" in screen and "pulse-check" not in screen
+        await _wait_for(lambda: app.jobs is not polled)
+        assert [j["name"] for j in app.view] == [
+            "north-beacon",
+            "south-beacon",
+        ]
+        assert app.selected_job()["name"] == "south-beacon"
+    finally:
+        await h.stop()

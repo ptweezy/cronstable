@@ -47,9 +47,71 @@ def test_gzip_body_is_a_standard_gzip_stream():
     assert gzip.decompress(_gzip.gzip_body(_SAMPLE)) == _SAMPLE
 
 
+def _zlib_level_nine(body):
+    packer = zlib.compressobj(9, zlib.DEFLATED, 31)
+    return packer.compress(body) + packer.flush()
+
+
+def test_gzip_static_is_the_zlib_level_nine_stream():
+    packed = _gzip.gzip_static(_SAMPLE)
+    assert gzip.decompress(packed) == _SAMPLE
+    assert packed == _zlib_level_nine(_SAMPLE)
+
+
+class _RecordingZlib:
+    """A zlib-compatible stand-in that records each compressor's level."""
+
+    DEFLATED = zlib.DEFLATED
+
+    def __init__(self, best):
+        self.Z_BEST_COMPRESSION = best
+        self.levels = []
+
+    def compressobj(self, level, *args):
+        self.levels.append(level)
+        return zlib.compressobj(level, *args)
+
+
+@pytest.fixture
+def stand_in_isal(monkeypatch):
+    """(response backend, the module's zlib), both recording.
+
+    The backend's strongest level is 3, as ISA-L's is.
+    """
+    isal = _RecordingZlib(3)
+    stdlib = _RecordingZlib(zlib.Z_BEST_COMPRESSION)
+    monkeypatch.setattr(_gzip, "backend", lambda: isal)
+    monkeypatch.setattr(_gzip, "zlib", stdlib)
+    return isal, stdlib
+
+
+def test_responses_take_the_backend_and_static_takes_zlib_level_nine(
+    stand_in_isal,
+):
+    # a per-response body pays the CPU on every build, so it takes the
+    # backend at its fastest level; a document compressed once pays it
+    # once, so it takes zlib's best ratio whatever the backend is
+    isal, stdlib = stand_in_isal
+    fast = _gzip.gzip_body(_SAMPLE)
+    strong = _gzip.gzip_static(_SAMPLE)
+    assert isal.levels == [1]
+    assert stdlib.levels == [9]
+    assert strong == _zlib_level_nine(_SAMPLE)
+    assert len(strong) <= len(fast)
+
+
 def test_falls_back_to_stdlib_zlib_without_isal(without_isal):
     assert _gzip.backend() is zlib
     assert gzip.decompress(_gzip.gzip_body(_SAMPLE)) == _SAMPLE
+    assert _gzip.gzip_static(_SAMPLE) == _zlib_level_nine(_SAMPLE)
+
+
+@requires_isal
+def test_gzip_static_takes_zlib_with_isal_installed(fresh_backend):
+    from isal import isal_zlib
+
+    assert _gzip.backend() is isal_zlib
+    assert _gzip.gzip_static(_SAMPLE) == _zlib_level_nine(_SAMPLE)
 
 
 @requires_isal

@@ -213,3 +213,78 @@ def test_configuration_revision_hashes_environment_names_only(tmp_path, monkeypa
     assert revision("orange77") == revision("correct-horse")
     added = "          - key: MODE\n            value: full\n"
     assert revision("orange77", added) != revision("orange77")
+
+
+def _chain_config(count, extra=""):
+    from cronstable.config import parse_config_string
+
+    lines = ["dags:", "  - name: chain", "    tasks:"]
+    for i in range(count):
+        lines += ["      - id: t%d" % i, "        command: ignored"]
+        if i:
+            lines += ["        dependsOn:", "          - t%d" % (i - 1)]
+    text = "\n".join(lines) + "\n" + extra
+    return parse_config_string(text, "").dags[0]
+
+
+def _finished_source(config):
+    body = dag.new_run_body(
+        dag=config.name,
+        run_key="source",
+        run_id="source-id",
+        logical_date=None,
+        kind="manual",
+        now=1.0,
+        spec=config.spec,
+    )
+    for entry in body["tasks"].values():
+        entry["state"] = dag.SUCCESS
+    body["state"] = dag.SUCCESS
+    return body
+
+
+def test_rerun_from_task_selects_everything_downstream_and_nothing_else():
+    config = _chain_config(
+        6,
+        "      - id: side\n        command: ignored\n"
+        "      - id: join\n        command: ignored\n"
+        "        dependsOn:\n          - t5\n          - side\n",
+    )
+    source = _finished_source(config)
+    plan = recovery.plan(config, source, mode="from", tasks=("t3",))
+    assert plan["tasks"] == ["join", "t3", "t4", "t5"]
+    assert plan["preserved"] == ["side", "t0", "t1", "t2"]
+    plan = recovery.plan(config, source, mode="from", tasks=("side", "t5"))
+    assert plan["tasks"] == ["join", "side", "t5"]
+
+
+def test_rerun_from_task_walks_the_graph_a_fixed_number_of_times():
+    # Planning runs on the event loop.  The downstream closure follows each
+    # edge once, so a deep chain costs as many walks of the task list as a
+    # shallow one.
+    import types
+
+    class _CountedTasks(tuple):
+        def __iter__(self):
+            self.walks += 1
+            return super().__iter__()
+
+    def walks(depth):
+        config = _chain_config(depth)
+        counted = _CountedTasks(config.spec.tasks)
+        counted.walks = 0
+        spec = types.SimpleNamespace(
+            by_id=config.spec.by_id,
+            mapped_tasks=config.spec.mapped_tasks,
+            tasks=counted,
+        )
+        stand_in = types.SimpleNamespace(
+            name=config.name, tasks=config.tasks, spec=spec
+        )
+        plan = recovery.plan(
+            stand_in, _finished_source(config), mode="from", tasks=("t0",)
+        )
+        assert len(plan["tasks"]) == depth
+        return counted.walks
+
+    assert walks(6) == walks(40)

@@ -375,9 +375,10 @@ async def artifact_put(
     newest record per name is ever read back, so the append carries
     ``prune_latest_by="name"``: superseded older records of the same name are
     amortised away (and their now-orphan blobs reclaimed by the next sweep),
-    bounding the stream to the number of distinct names rather than the number
-    of publishes.  The scope's whole artifact stream is still reclaimed
-    together when the job is garbage collected.
+    bounding the stream by the number of distinct names (about twice that
+    many records at most), whatever the number of publishes.  The scope's
+    whole artifact stream is still reclaimed together when the job is
+    garbage collected.
     """
     if max_bytes and max_bytes > 0 and len(data) > max_bytes:
         raise JobStateError(
@@ -418,34 +419,25 @@ async def artifact_get_record(
     tell "nothing published" from "could not read" and retry the latter.
 
     Strictness spans every record from the newest down to the returned
-    match, not just the records carrying ``name``: until a record has been
-    read there is no telling which name it holds, and the unreadable one
-    could be the newest publish of exactly this one.  Records OLDER than
-    the newest readable match need no such guarantee -- they could only
-    hold superseded versions, which cannot change the answer.  (A record
-    with *bad content* is skipped even under ``strict``: it is
-    unrecoverable, and failing closed on it forever would wedge the caller
-    permanently.)
+    match whose name the backend has yet to read, whatever name it turns
+    out to carry: until a record has been read there is no telling which
+    name it holds, and the unreadable one could be the newest publish of
+    exactly this one.  Records OLDER than the newest readable match need no
+    such guarantee: they could only hold superseded versions, which cannot
+    change the answer.  (A record with *bad content* is skipped even under
+    ``strict``: it is unrecoverable, and failing closed on it forever would
+    wedge the caller permanently.)
     """
     scope = _require_scope(scope)
-    stream = ARTIFACT_STREAM_PREFIX + scope
-    # Newest-first early-stopping scan: a stream accumulates one immutable
-    # record per publish (newest last, so newest_first reads the current
-    # version first), and the wanted name is usually the newest record. The
-    # predicate + max_matches=1 makes the backend stop parsing at the first
-    # record carrying ``name`` -- one parse in the common case -- instead of
-    # materialising a whole page and iterating it here. A miss still scans the
-    # stream (no record matched), exactly as the full read did; strictness
-    # still spans every record from the newest down to the match, since each
-    # is read before the predicate sees it.
-    matches = await backend.list_records(
-        stream,
-        newest_first=True,
-        strict=strict,
-        predicate=lambda record: record.get("name") == name,
-        max_matches=1,
+    # A stream accumulates one immutable record per publish, and a scope
+    # that takes one name per task instance (XCom) holds as many records as
+    # the run has instances.  The backend lists the stream on every call,
+    # reads each record it has not read before (so a peer's publish is seen
+    # at once) plus the match itself, and skips the records it already
+    # knows to carry another name.
+    return await backend.newest_record_with(
+        ARTIFACT_STREAM_PREFIX + scope, "name", name, strict=strict
     )
-    return matches[0] if matches else None
 
 
 async def artifact_get(

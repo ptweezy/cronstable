@@ -1257,23 +1257,29 @@ class MCPHandler:
         return _result({"status": page, "page": meta}, summary)
 
     async def _t_list_jobs(self, args: dict[str, Any]) -> dict[str, Any]:
-        rows = self._cron.jobs_payload()
+        cron = self._cron
+        jobs = cron.cron_jobs
+        running = cron.running_jobs
+        # The filters read what a row reports as `name`, `enabled` and
+        # `running`, straight from the job set, so selection walks names
+        # and the full rows are built for the returned page.
+        names = list(jobs)
         flt = args.get("filter")
         if isinstance(flt, str) and flt:
             low = flt.lower()
-            rows = [r for r in rows if low in r["name"].lower()]
+            names = [n for n in names if low in n.lower()]
         state = args.get("state")
         if state == "running":
-            rows = [r for r in rows if r.get("running")]
+            names = [n for n in names if running.get(n)]
         elif state == "disabled":
-            rows = [r for r in rows if not r.get("enabled")]
+            names = [n for n in names if not jobs[n].enabled]
         elif state == "scheduled":
-            rows = [
-                r for r in rows if r.get("enabled") and not r.get("running")
+            names = [
+                n for n in names if jobs[n].enabled and not running.get(n)
             ]
-        page, meta = self._page(rows, args.get("offset"), args.get("limit"))
+        page, meta = self._page(names, args.get("offset"), args.get("limit"))
         return _result(
-            {"jobs": page, "page": meta},
+            {"jobs": cron.jobs_payload_for(page), "page": meta},
             "{} matching job(s); {} returned".format(
                 meta["total"], meta["returned"]
             ),

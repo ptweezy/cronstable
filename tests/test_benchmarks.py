@@ -167,6 +167,7 @@ def test_bench_smoke_produces_results(tmp_path):
     # per-benchmark wall clock (how the CI timeout ceiling gets triaged).
     assert isinstance(doc["orjson"], bool)
     assert isinstance(doc["uvloop"], bool)
+    assert isinstance(doc["isal"], bool)
     for r in doc["results"]:
         assert r.get("elapsed_seconds", -1.0) >= 0.0, r["name"]
     assert "slowest benchmarks" in proc.stdout
@@ -189,15 +190,19 @@ def test_bench_smoke_produces_results(tmp_path):
     # the release comparison requires is a metric --smoke must run.
     # Excused, each for an environment reason the release runner does not
     # share: the webui.* browser metrics (smoke must not launch Chromium),
-    # the POSIX-only RSS metrics on Windows, push.seal_500 where PyNaCl is
-    # absent (the tox and WSL envs), and json.roundtrip_orjson_3k where
-    # orjson is absent (the tox envs).
+    # the POSIX-only RSS metrics on Windows, push.seal_500 and
+    # push.fanout_8x100 where PyNaCl is absent (the tox and WSL envs),
+    # push.seal_xwing_500 where cryptography is absent, and
+    # json.roundtrip_orjson_3k where orjson is absent (the tox envs).
+    needs_nacl = ("push.seal_500", "push.fanout_8x100")
     for name in _expected_gated_names():
         if name.startswith("webui."):
             continue
         if name.startswith("mem.rss_") and os.name == "nt":
             continue
-        if name == "push.seal_500" and not _importable("nacl"):
+        if name in needs_nacl and not _importable("nacl"):
+            continue
+        if name == "push.seal_xwing_500" and not _importable("cryptography"):
             continue
         if name == "json.roundtrip_orjson_3k" and not _importable("orjson"):
             continue

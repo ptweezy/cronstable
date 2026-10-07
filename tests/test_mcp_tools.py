@@ -388,6 +388,142 @@ async def test_list_jobs_filter_and_states():
     assert result["structuredContent"]["jobs"] == []
 
 
+async def test_list_jobs_builds_rows_for_the_returned_page_only(monkeypatch):
+    # a full row is the expensive part of a listing and a page shows a few
+    # of them, so the tool selects by name and state first and builds rows
+    # for the page it returns. The total still counts every match.
+    h = _handler()
+    cron = h._cron
+    built = []
+    real_row = cron._job_to_dict
+
+    def counting_row(name, job, now=None):
+        built.append(name)
+        return real_row(name, job, now)
+
+    monkeypatch.setattr(cron, "_job_to_dict", counting_row)
+    result = await _call(h, "cron_list_jobs", {"offset": 1, "limit": 1})
+    body = result["structuredContent"]
+    assert [r["name"] for r in body["jobs"]] == ["nightly"]
+    assert body["page"] == {
+        "offset": 1,
+        "limit": 1,
+        "total": 3,
+        "returned": 1,
+        "nextOffset": 2,
+    }
+    assert built == ["nightly"]
+    # a filter that matches nothing builds nothing
+    built.clear()
+    result = await _call(h, "cron_list_jobs", {"filter": "no-such-job"})
+    assert result["structuredContent"]["jobs"] == []
+    assert built == []
+
+
+_LISTING_YAML = """
+jobs:
+  - name: alpha-backup
+    command: echo a
+    schedule: "* * * * *"
+  - name: Beta-Backup
+    command: echo b
+    schedule: "*/5 * * * *"
+    enabled: false
+  - name: gamma
+    command: echo c
+    schedule: "0 3 * * *"
+  - name: delta-backup
+    command: echo d
+    schedule: "15 4 * * 1"
+  - name: epsilon
+    command: echo e
+    schedule: "@reboot"
+    enabled: false
+  - name: zeta-backup
+    command: echo f
+    schedule: "30 * * * *"
+  - name: eta
+    command: echo g
+    schedule: "45 2 1 * *"
+"""
+
+
+class _ListedRunning:
+    """A live instance as the job row builder reads it."""
+
+    proc = None
+    verification = None
+
+    def live_resources(self):
+        return None
+
+
+def _list_jobs_from_all_rows(handler, args):
+    """``cron_list_jobs`` derived from the full row set: filter the rows,
+    then page them. The reference the paged tool must equal."""
+    rows = handler._cron.jobs_payload()
+    flt = args.get("filter")
+    if isinstance(flt, str) and flt:
+        rows = [r for r in rows if flt.lower() in r["name"].lower()]
+    state = args.get("state")
+    if state == "running":
+        rows = [r for r in rows if r["running"]]
+    elif state == "disabled":
+        rows = [r for r in rows if not r["enabled"]]
+    elif state == "scheduled":
+        rows = [r for r in rows if r["enabled"] and not r["running"]]
+    page, meta = handler._page(rows, args.get("offset"), args.get("limit"))
+    return {"jobs": page, "page": meta}
+
+
+async def test_list_jobs_page_equals_filtering_the_full_row_set(monkeypatch):
+    # every argument combination returns the rows, the order and the page
+    # metadata that filtering and slicing the whole job set gives.
+    frozen = datetime.datetime(2026, 3, 15, 12, 30, 45, tzinfo=_UTC)
+    monkeypatch.setattr("cronstable.cron.get_now", lambda tz: frozen)
+    h = _handler({"maxRows": 4}, yaml=_LISTING_YAML)
+    cron = h._cron
+    cron.running_jobs["alpha-backup"] = [_ListedRunning()]
+    cron.running_jobs["Beta-Backup"] = [_ListedRunning(), _ListedRunning()]
+    cron.running_jobs["zeta-backup"] = []
+    unset = object()
+    checked = 0
+    for flt in (unset, "", "backup", "BACK", "a", "no-such-job", 7):
+        for state in (unset, "running", "disabled", "scheduled", "other"):
+            for offset in (unset, 0, 2, 6, 50, -3):
+                for limit in (unset, 1, 3, 4, 100, 0):
+                    args = {
+                        key: value
+                        for key, value in (
+                            ("filter", flt),
+                            ("state", state),
+                            ("offset", offset),
+                            ("limit", limit),
+                        )
+                        if value is not unset
+                    }
+                    result = await _call(h, "cron_list_jobs", args)
+                    expected = _list_jobs_from_all_rows(h, args)
+                    assert result["structuredContent"] == expected, args
+                    assert result["content"][0]["text"] == (
+                        "{} matching job(s); {} returned".format(
+                            expected["page"]["total"],
+                            expected["page"]["returned"],
+                        )
+                    ), args
+                    checked += 1
+    assert checked == 7 * 5 * 6 * 6
+    # the fixture exercises every branch: each state selects something
+    for state, names in (
+        ("running", ["alpha-backup", "Beta-Backup"]),
+        ("disabled", ["Beta-Backup", "epsilon"]),
+        ("scheduled", ["gamma", "delta-backup", "zeta-backup", "eta"]),
+    ):
+        result = await _call(h, "cron_list_jobs", {"state": state})
+        got = [r["name"] for r in result["structuredContent"]["jobs"]]
+        assert got == names, state
+
+
 async def test_get_job_detail_and_not_found():
     h = _handler()
     result = await _call(h, "cron_get_job", {"name": "hello"})

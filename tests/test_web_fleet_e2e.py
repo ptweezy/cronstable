@@ -16,6 +16,7 @@ everywhere else.
 """
 
 import json
+import os
 import pathlib
 
 import pytest
@@ -125,7 +126,9 @@ def _cells(page):
 
 def _open_fleet(p):
     try:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(
+            channel=os.environ.get("CRONSTABLE_TEST_BROWSER_CHANNEL")
+        )
     except Exception as exc:  # no chromium provisioned
         pytest.skip("playwright chromium unavailable: {}".format(exc))
     page = browser.new_page()

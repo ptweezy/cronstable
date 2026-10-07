@@ -28,17 +28,35 @@ def backend() -> ModuleType:
     return lib
 
 
+def _pack(lib: ModuleType, body: bytes, level: int) -> bytes:
+    """``body`` as one gzip stream at ``level``.
+
+    ``wbits=31`` wraps the deflate stream in a gzip container.
+    """
+    packer = lib.compressobj(level, lib.DEFLATED, 31)
+    packed: bytes = packer.compress(body) + packer.flush()
+    return packed
+
+
 def gzip_body(body: bytes) -> bytes:
     """``body`` as a gzip stream, level 1.
 
     Level 1 on purpose: the payloads are highly repetitive JSON, and
-    higher levels cost multiples of the CPU for little gain. ``wbits=31``
-    wraps the deflate stream in a gzip container.
+    higher levels cost multiples of the CPU for little gain.
     """
-    lib = backend()
-    packer = lib.compressobj(1, lib.DEFLATED, 31)
-    packed: bytes = packer.compress(body) + packer.flush()
-    return packed
+    return _pack(backend(), body, 1)
+
+
+def gzip_static(body: bytes) -> bytes:
+    """``body`` as a gzip stream from the standard library's ``zlib``,
+    level 9.
+
+    For a document compressed once and served for the life of the
+    process: the CPU is paid one time and the size on every transfer.
+    ``zlib`` whatever :func:`backend` returns: ISA-L trades ratio for
+    speed, and its levels stop at 3.
+    """
+    return _pack(zlib, body, zlib.Z_BEST_COMPRESSION)
 
 
 def use_for_aiohttp() -> None:

@@ -16,7 +16,7 @@
 #
 # Ids are kept in sorted order so an addition has one obvious home and a
 # duplicate is visible in review.  Every id bench.py registers belongs here
-# except the six at the bottom, each with the reason it cannot be gated.
+# except those at the bottom, each with the reason it cannot be gated.
 #
 # The in-repo smoke net (tests/test_benchmarks.py) is the companion guard:
 # it derives its never-skip set from THIS file (minus documented
@@ -25,16 +25,23 @@
 # copy of this list is how webapi.sse_frame_20k died unnoticed: it was
 # listed here but not there, so deleting its seam kept every test green.
 
+cluster.derive_cold_50
 cluster.fleet_view_15x400
 cluster.job_owner_2k
 cluster.parse_summaries_6k
+cluster.peer_bytes_512
+cluster.peer_serve_400
+cluster.poll_round_15x400
 config.interp_2k
 config.jobconfig_3k
 config.parse_crontab_1k
+config.parse_dir_cold_200
 config.parse_yaml_300
 config.parse_yaml_3k
+config.parse_yaml_rich_20
 config.reload_gc_100k
 config.reload_warm_50
+config.reload_warm_dir_1k
 config.reload_warm_include_50
 cronexpr.next_complex
 cronexpr.next_dst_2k
@@ -46,52 +53,101 @@ cronexpr.test_match_200k
 dag.adopt_scan_500
 dag.advance_quiescent_1k
 dag.advance_quiescent_chain
+dag.advance_waiting_mapped_1k
 dag.build_chain_10k
 dag.build_layered_10k
-dag.finish_fanin_1k
-dag.list_dags_warm
+dag.fanin_barrier_1k
+dag.finish_fanin_20x1k
+dag.full_sweep_50x200
+dag.gc_excess_60
+dag.list_dags_warm_x300
 dag.list_runs_warm
+dag.mapped_doc_bytes_1k
 dag.mapped_drain_256
 dag.plan_claim_10k
+dag.recover_plan_from_1k
+dag.run_chain_100
+dag.run_doc_bytes_1k
+dag.run_wide_500
 fingerprint.job_set_id_10k
+fingerprint.job_set_id_rich_2k
 ical.render_500x7d
+job.launch_fail_retry_2k
+job.launch_reap_2k
 job.report_noop_100k
 job.stream_capture_120k
+job.stream_passthrough_240k
+jobapi.read_path_10k
+jobapi.sem_denied_64x10
+json.loads_wide_int_2k
 json.roundtrip_3k
 json.roundtrip_orjson_3k
 loop.idle_wake_rate
+loop.sla_pass_5k_x10
 loop.stall_completions_500
+mcp.fleet_15x400
+mcp.fleet_bytes_15x400
 mcp.handle_200
+mcp.list_jobs_500
+mcp.list_jobs_bytes_500
+mcp.list_jobs_page_500
+mcp.query_metrics_500
+mcp.tools_list_bytes
+mem.cluster_view_50x400
 mem.crontab_10k
+mem.gc_manifest_scan_128x2k
 mem.gc_pause_100k
 mem.jobconfig_2k
+mem.jobconfig_envfile_2k
+mem.launch_reap_steady_20x55
+mem.parse_peak_rich_20
 mem.retired_output_1k
+mem.rss_daemon_10k
 mem.rss_daemon_import
+mem.rss_daemon_web_100
 mem.rss_version
+mem.run_history_series_5
+mem.tui_state_5k
+pools.admit_cycle_1k
+pools.enqueue_burst_200
+prometheus.counter_snapshot_2k
+prometheus.counter_snapshot_bytes_2k
+prometheus.exposition_bytes_500
+prometheus.first_scrape_after_reload_500
 prometheus.render_500
+push.fanout_8x100
 push.seal_500
+push.seal_xwing_500
 redact.adversarial_10k
 redact.clean_20k
 redact.secrets_5k
 resources.monitor_stop_100
+resources.usage_from_dict_500
 schedule.cold_build_100k
 schedule.due_pass_100k
 schedule.duplicates_20k
-schedule.lint_250_zoned
+schedule.lint_2500_zoned
 schedule.next_fires_2k
 schedule.pressure_20k_48h
 schedule.reseed_100k
 schedule.reseed_local_20k
-schedule.suggest_slot_5k
+schedule.suggest_slot_5k_x20
+startup.daemon_first_pass_2k
 startup.import_config
 startup.import_cronexpr
 startup.import_daemon
+startup.import_tui
 startup.job_set_id_100
+startup.jobcli_state_get
+startup.mcp_bridge
 startup.validate_config_100
 startup.version
 state.append_1k
+state.append_pruned_1k
 state.artifact_get_newest
-state.artifact_list_churn
+state.artifact_get_oldest_2k
+state.artifact_list_churn_x500
+state.artifact_put_distinct_2k
 state.boot_rehydrate_populated
 state.depends_on_past_gate
 state.derive_max_cold
@@ -107,42 +163,78 @@ state.mutate_document_1k
 statsd.emit_2k
 tui.dag_graph_paint_2k
 tui.drawer_paint_5k
+tui.fleet_paint_15x400
+tui.frame_bytes_5k
 tui.log_restyle_5k
 tui.log_search_20k
+tui.mark_idle_300
+tui.palette_type_5k
+tui.poll_absorb_5k
+tui.table_paint_5k
+tui.tail_ingest_30k
+tui.view_sort_5k
+tui.wallboard_paint_5k
+tui.week_rows_500
+webapi.activity_build_500
+webapi.activity_bytes_500
 webapi.auth_scope_20k
+webapi.dag_run_poll_1k
+webapi.dags_poll_1k
+webapi.fleet_bytes_15x400
 webapi.gzip_body_500
+webapi.index_bytes
+webapi.index_gzip_bytes
 webapi.jobs_bytes_500
 webapi.jobs_gzip_500
 webapi.jobs_payload_500
+webapi.pools_poll_4x130
+webapi.resources_poll_20x240
 webapi.sse_burst_20k
+webapi.sse_tail_pump_4x20k
+webapi.summary_status_500
+webapi.trends_build_5k
+webui.append_line_5k
+webui.dag_tasks_2k
+webui.filter_keys_500
+webui.ledger_analyze_500x600
 webui.log_count_5k
+webui.logo_recovery
+webui.palette_keys_500
+webui.radar_walk_500x150
 webui.render_fleet_15x400
 webui.render_rows_500
 webui.render_term_5k
+webui.rows_diff_500
+webui.rows_layout_200
+webui.select_move_500
+webui.sort_500
+webui.tail_term_2k
+webui.tick_500
+webui.timeline_500
+webui.wallboard_poll_500
+webui.week_walk_500x20
 
-# The six benchmarks deliberately NOT listed above, and why.
+# The benchmarks deliberately NOT listed above, and why.
 #
-# startup.python_baseline, loop.stall_jobs_500 and loop.stall_metrics_2000
-# all ship info=True, so bench.py records gate_pct as None and compare.py
-# never counts them as compared (_declared_gate_pct returns None, so
-# _gate_coverage skips the metric before it can land in compared_names).
-# Listing one would fail every run rather than guard anything, however
-# cleanly both sides measure it.  startup.python_baseline is the subprocess
-# tier's own noise floor, the quantity every other startup.* delta is
-# measured AGAINST; the two loop.* gauges report a max scheduling gap,
-# the noisiest shape in the suite, and each is meant to be observed for a
-# release before being armed.  Arm one by dropping info=True in bench.py
-# and adding its id above in the same commit.
+# startup.python_baseline, the four loop.stall_* gauges,
+# state.inventory_2k_streams, webui.boot_rows_500 and
+# webui.dirty_frame_rows_500 all ship info=True, so bench.py records
+# gate_pct as None and compare.py never counts them as compared
+# (_declared_gate_pct returns None, so _gate_coverage skips the metric
+# before it can land in compared_names).  Listing one would fail every run
+# rather than guard anything, however cleanly both sides measure it.
+# startup.python_baseline is the subprocess tier's own noise floor, the
+# quantity every other startup.* delta is measured AGAINST; the loop.stall_*
+# gauges report a max scheduling gap, the noisiest shape in the suite;
+# state.inventory_2k_streams times directory enumeration, which mostly
+# measures the runner's filesystem; webui.boot_rows_500 times a page load,
+# which spans several browser processes and swings by a factor of two under
+# the harness's one-CPU pin; and webui.dirty_frame_rows_500 reads a
+# per-frame task duration over a wall-clock window.  Arm one by dropping
+# info=True in bench.py and adding its id above in the same commit.
 #
-# webui.append_line_5k drives the __perf.appendLine hook, which lands in
-# this release.  Run against the 1.2.32 baseline tree it skips with "page
-# lacks the __perf.appendLine hook", so the pairing has nothing to compare.
-# Add it once a release carrying the hook is the baseline.  Its sibling
-# webui.render_term_5k needs no such wait: it drives the page's own
-# 'matches only' checkbox rather than a hook, and it does compare on 1.2.32.
-#
-# webui.week_walk_500 and webui.radar_walk_500 drive the __perf.computeWeek
-# and __perf.computeRadar hooks, which land in 1.2.49.  Run against an
-# earlier baseline tree each skips with "page lacks the ... hook", so the
-# pairing has nothing to compare.  Add both once a release carrying the
-# hooks is the baseline.
+# pair.qr_encode_14 measures cronstable.qr, webapi.activity_capped_bytes_500
+# measures the jobs parameter of GET /activity, and webui.swim_400x49 drives
+# the __perf.seedSwim hook.  All three land in 1.2.63.  Run against the
+# 1.2.62 baseline tree each one skips, so the pairing has nothing to compare.
+# Add them once a release that carries them is the baseline.

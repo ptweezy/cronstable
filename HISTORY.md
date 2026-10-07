@@ -67,6 +67,81 @@
   theirs. The connection indicator's dot uses the ok status color, so the
   color vision setting remaps it. With Reduce motion on, a drawer opens in
   place without sliding. The demo dashboard includes all of these changes.
+- A pooled run that finishes while the pool scheduler renews its lease keeps
+  its result. The scheduler logs `pool lease lost` and cancels a process only
+  for a run that is still going.
+- The pool scheduler tries to admit a waiting entry only when the pool's
+  free slots can hold it. A pass over a full pool reads the pool's queue
+  once, whatever its length.
+- The job reaper holds no finished run while it waits for the next one. A
+  run's captured output and process handles are freed once the run is
+  recorded.
+- A workflow whose configuration lists a task before its upstreams settles a
+  failure in one scheduler pass. When a task fails or is skipped, every task
+  downstream ends `upstream_failed` or `skipped` in that pass, and an
+  `all_done` task that the cascade unblocks starts in it.
+- The workflow retention pass lists a workflow's runs once, however many
+  runs it deletes. Under each run's lease it reads the recovery runs and the
+  recovery batches, so it keeps a run that a recovery in preparation or an
+  open recovery batch references.
+- An artifact or XCom lookup reads the records that the daemon has not read
+  before and the record that it returns, at any number of names in the
+  scope. A strict lookup raises for an unreadable record that it has not
+  read, and for the record that it returns.
+- Publishing an artifact or an XCom value costs the same at any number of
+  names in the scope. The cleanup of superseded versions waits for a scope
+  to double, so a scope of more than eight names holds up to about twice as
+  many records as names.
+- Planning a workflow rerun from a task follows each dependency once.
+- A configuration directory or include tree of more than 1,024 files
+  reloads by reparsing only the files that changed. The per-file parse cache
+  holds every file of the loaded configuration, and at least 1,024 files.
+- Configuration parse time grows in proportion to the number of keys in a
+  mapping. A `pools` or `web.headers` block with 2,000 entries loads in
+  under a second.
+- The jobs and workflow tasks of one configuration file share one read of an
+  `env_file` that they name or inherit from `defaults`.
+- `cronstable --validate-config` and `cronstable --job-set-id` exit without
+  loading asyncio or psutil.
+- `GET /activity` takes two optional query parameters that cap the jobs in
+  the response. `jobs=N` returns at most `N` jobs: the first `N` in
+  configuration order, the order `GET /jobs` lists them, or the first `N` by
+  name with `sort=name`. Any other `sort` value returns `400`. Without
+  `jobs`, the response carries every job. Each dashboard draws at most 80
+  heatmap rows and sends that cap: the web dashboard requests `jobs=80`, and
+  the terminal dashboard requests `jobs=80&sort=name`.
+- The daemon compresses the dashboard page with zlib at level 9, once per
+  process, whichever gzip backend is installed. A browser that accepts gzip
+  downloads about 180 KB. JSON responses keep level 1 on the installed
+  backend.
+- The MCP `cron_list_jobs` tool builds full job rows for the page that it
+  returns. It applies `filter` and `state` to each job's name, enabled flag,
+  and running state before it builds a row, so the cost of a call follows
+  the page size.
+- In the terminal dashboard, text pasted into the filter rebuilds the jobs
+  table once. Keystrokes that reach the dashboard together share one
+  rebuild, and the table and the selected row end up where typing the same
+  keys one at a time leaves them.
+- In the web dashboard, a job's countdown and its **Next at** time stay tied
+  to the `/jobs` response that delivered them. Each poll sends the previous
+  response's `ETag` in `If-None-Match` and bypasses the browser's HTTP
+  cache. When the daemon answers `304 Not Modified`, the dashboard keeps the
+  jobs it holds, and their countdowns run on.
+- The web dashboard's jobs table and fleet matrix keep their painted rows
+  through a frame that repaints something else, such as each frame of the
+  swaying logo.
+- Closing the web dashboard's fleet view or incident timeline removes its
+  rows from the page, so the once-per-second update of relative times covers
+  only open panels. The header clock, the connection tooltip, and the
+  upcoming-runs countdowns are written when their text changes.
+- The performance suite registers 199 benchmarks. Its coverage includes job
+  launch and reaping, pool admission, workflow runs and retention, the HTTP,
+  MCP, and gossip response paths, the terminal dashboard's frames, and the
+  web dashboard's poll, tick, and keystroke paths. `benchmarks/bench.py`
+  names the cronstable package that it measures, and
+  `benchmarks/compare.py` refuses a pairing whose two sides differ in the
+  `isal` gzip backend. The count checks that pair with these metrics are in
+  `tests/test_perf_invariants.py`.
 
 ## 1.2.62
 

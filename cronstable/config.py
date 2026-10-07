@@ -7,6 +7,7 @@ import os
 import re
 import socket
 import sys
+import threading
 import types
 from collections import Counter, OrderedDict
 from collections.abc import Mapping
@@ -177,6 +178,62 @@ def _patch_strictyaml_pointer_copy() -> None:
 
 
 _patch_strictyaml_pointer_copy()
+
+
+#: ``direct`` is true on a thread while parse_config_string runs strictyaml
+#: over CONFIG_SCHEMA: the one load whose mapping hops the lookup installed
+#: by _patch_strictyaml_key_lookup answers from the hash table.
+_STRICTYAML_KEY_LOOKUP = threading.local()
+
+
+def _patch_strictyaml_key_lookup() -> None:
+    """Answer strictyaml's mapping hops from the mapping's hash table.
+
+    ``YAMLPointer._individual_get`` resolves a mapping hop by scanning the
+    mapping's items, which makes a parse quadratic in the keys of each
+    mapping.  The rebinding returns the hash-table hit when there is one
+    and runs upstream's scan for everything else.  The two agree wherever
+    every key validator returns the key's text unchanged, as ``Str()``
+    does, so the lookup is active only while parse_config_string loads
+    CONFIG_SCHEMA, whose keys are all ``Str()``
+    (``_STRICTYAML_KEY_LOOKUP``).  Like the two shims above, it stands
+    down unless upstream's method has the scanning shape.
+    """
+    try:
+        from strictyaml.ruamel.comments import CommentedMap
+        from strictyaml.yamlpointer import YAMLPointer
+
+        scan = YAMLPointer._individual_get
+        code = scan.__code__
+        scans = code.co_argcount == 5 and {"items", "text"} <= set(
+            code.co_names
+        )
+    except Exception:  # noqa: BLE001  # pragma: no cover - vendored layout changed
+        return
+    if not scans:
+        return
+
+    lookup = dict.__getitem__
+    load = _STRICTYAML_KEY_LOOKUP
+
+    def _individual_get(
+        self: Any, segment: Any, index_type: Any, index: Any, strictdoc: Any
+    ) -> Any:
+        if (
+            index_type == "val"
+            and type(segment) is CommentedMap
+            and getattr(load, "direct", False)
+        ):
+            try:
+                return lookup(segment, index[0])
+            except (KeyError, TypeError):
+                pass
+        return scan(self, segment, index_type, index, strictdoc)
+
+    YAMLPointer._individual_get = _individual_get
+
+
+_patch_strictyaml_key_lookup()
 
 logger = logging.getLogger("cronstable.config")
 WebConfig = NewType("WebConfig", dict[str, Any])
@@ -1405,35 +1462,25 @@ CONFIG_SCHEMA = EmptyDict() | Map(
 )
 
 
-_MONITOR_SAMPLING_DEFAULTS: tuple[float, int] | None = None
+#: ``(interval, history)`` defaults of the monitorResources block.  Literal
+#: copies of ``SAMPLE_INTERVAL`` and ``MONITOR_HISTORY_DEFAULT`` in
+#: cronstable.resources, whose import loads asyncio and psutil.
+#: tests/test_config.py holds the two definitions equal.
+_MONITOR_SAMPLING_DEFAULTS: tuple[float, int] = (1.0, 240)
 
 
 def _monitor_sampling_defaults() -> tuple[float, int]:
-    """``(interval, history)`` defaults for the monitorResources block.
-
-    Imported lazily: ``cronstable.resources`` owns the two literals but
-    drags asyncio and psutil into every importer of this module, so the cost
-    is deferred to the first job actually built and the constants keep their
-    single definition.
-    """
-    global _MONITOR_SAMPLING_DEFAULTS
-    if _MONITOR_SAMPLING_DEFAULTS is None:
-        from cronstable.resources import (
-            MONITOR_HISTORY_DEFAULT,
-            SAMPLE_INTERVAL,
-        )
-
-        _MONITOR_SAMPLING_DEFAULTS = (SAMPLE_INTERVAL, MONITOR_HISTORY_DEFAULT)
+    """``(interval, history)`` defaults for the monitorResources block."""
     return _MONITOR_SAMPLING_DEFAULTS
 
 
 def __getattr__(name: str) -> float | int:
-    """Serve the two resources constants without importing them eagerly.
+    """Serve the two sampling defaults under the resources module's names.
 
     Callers read ``SAMPLE_INTERVAL`` / ``MONITOR_HISTORY_DEFAULT`` as module
-    attributes; PEP 562 keeps that spelling while the import stays deferred.
-    The return annotation is deliberately narrow rather than ``Any``, so a
-    typo'd attribute still fails to type-check where its value is used.
+    attributes, the spelling cronstable.resources gives them.  The return
+    annotation is deliberately narrow rather than ``Any``, so a typo'd
+    attribute still fails to type-check where its value is used.
     """
     if name == "SAMPLE_INTERVAL":
         return _monitor_sampling_defaults()[0]
@@ -2343,6 +2390,7 @@ class DagTaskConfig:
         dag_name: str,
         raw_task: dict,
         defaults: dict[str, Any] | None = None,
+        env_cache: dict[str, dict[str, str]] | None = None,
     ) -> None:
         # Imported at the point of use: only a config with a dags: section
         # needs the DAG state machine, and this module is on the
@@ -2403,7 +2451,9 @@ class DagTaskConfig:
         # so this placeholder schedule is only there to satisfy JobConfig.
         job_dict["schedule"] = "@reboot"
         try:
-            self.job_template = JobConfig(job_dict)
+            # `env_cache` is the document's env_file memo, shared with its
+            # jobs (see JobConfig._merge_env_file).
+            self.job_template = JobConfig(job_dict, env_cache=env_cache)
         except ConfigError as ex:
             raise ConfigError(
                 "dag {!r}: task {!r}: {}".format(dag_name, self.id, ex)
@@ -2455,7 +2505,10 @@ class DagConfig:
     )
 
     def __init__(
-        self, raw_dag: dict, defaults: dict[str, Any] | None = None
+        self,
+        raw_dag: dict,
+        defaults: dict[str, Any] | None = None,
+        env_cache: dict[str, dict[str, str]] | None = None,
     ) -> None:
         # deferred for the reason DagTaskConfig gives
         from cronstable import dag
@@ -2473,7 +2526,9 @@ class DagConfig:
             raise ConfigError(
                 "dag {!r}: needs at least one task".format(self.name)
             )
-        self.tasks = [DagTaskConfig(self.name, t, defaults) for t in tasks_raw]
+        self.tasks = [
+            DagTaskConfig(self.name, t, defaults, env_cache) for t in tasks_raw
+        ]
         self.task_templates: dict[str, JobConfig] = {
             t.id: t.job_template for t in self.tasks
         }
@@ -4477,6 +4532,11 @@ def parse_config_string(
     _seen: set | None = None,
     _sources: set | None = None,
 ) -> CronstableConfig:
+    # CONFIG_SCHEMA validates every mapping key with Str(), which is what
+    # lets this load resolve mapping hops by hash lookup (see
+    # _patch_strictyaml_key_lookup).
+    direct = getattr(_STRICTYAML_KEY_LOOKUP, "direct", False)
+    _STRICTYAML_KEY_LOOKUP.direct = True
     try:
         doc = strictyaml.load(data, CONFIG_SCHEMA, label=path).data
     except YAMLError as ex:
@@ -4488,6 +4548,8 @@ def parse_config_string(
         # parsing must only ever raise ConfigError: without this, one bad
         # file aborts a whole config-directory load with a raw traceback.
         raise ConfigError("{}: {}".format(path, ex)) from ex
+    finally:
+        _STRICTYAML_KEY_LOOKUP.direct = direct
     # Expand ${VAR} references over the validated doc before building the
     # config (an unset-variable ConfigError propagates as-is). Runs per file,
     # so each included file expands against its own ${VAR}s.
@@ -4662,8 +4724,8 @@ def _config_from_doc(
             pushconf = inc_config.push_config
     defaults = mergedicts(DEFAULT_CONFIG, inc_defaults_merged)
     defaults = mergedicts(defaults, doc.get("defaults", {}))
-    # One env_file is frequently shared by many jobs in a doc; a per-doc
-    # cache reads and parses each such file once instead of once per job.
+    # One env_file is frequently shared by many jobs and DAG tasks in a doc;
+    # a per-doc cache reads and parses each such file once for all of them.
     env_cache: dict[str, dict[str, str]] = {}
     # Likewise for the advisory schedule lint, which a fleet's jobs repeat far
     # more often than they repeat env_files (see JobConfig._lint_schedule).
@@ -4678,7 +4740,7 @@ def _config_from_doc(
     # synthetic schedule-trigger job stays on DEFAULT_CONFIG (see DagConfig)
     # so a global reporter does not fire on every DAG tick.
     for config_dag in doc.get("dags", []):
-        dags.append(DagConfig(config_dag, defaults))
+        dags.append(DagConfig(config_dag, defaults, env_cache))
     return CronstableConfig(
         jobs=jobs,
         web_config=webconf,
@@ -4878,17 +4940,30 @@ def _validate_dags(config: CronstableConfig) -> None:
 def parse_config(
     config_arg: str, _sources: set | None = None
 ) -> CronstableConfig:
-    if os.path.isdir(config_arg):
-        config = _parse_config_dir(config_arg, _sources)
-    else:
-        try:
-            config = parse_config_file(config_arg, _sources=_sources)
-        except OSError as ex:
-            # surface a clean ConfigError (e.g. file not found) rather than a
-            # bare OSError, so callers (__main__) handle it uniformly.
-            raise ConfigError(str(ex)) from ex
-    _validate_cross_sections(config)
-    return config
+    # One call is one load of a whole configuration. The per-file parse
+    # cache keeps every file this load uses (see _DIR_FILE_CACHE), so the
+    # load records them here and trims the cache when it returns.
+    outermost = getattr(_DIR_FILE_CACHE_LOAD, "used", None) is None
+    if outermost:
+        _DIR_FILE_CACHE_LOAD.used = set()
+    try:
+        if os.path.isdir(config_arg):
+            config = _parse_config_dir(config_arg, _sources)
+        else:
+            try:
+                config = parse_config_file(config_arg, _sources=_sources)
+            except OSError as ex:
+                # surface a clean ConfigError (e.g. file not found) rather
+                # than a bare OSError, so callers (__main__) handle it
+                # uniformly.
+                raise ConfigError(str(ex)) from ex
+        _validate_cross_sections(config)
+        return config
+    finally:
+        if outermost:
+            used = _DIR_FILE_CACHE_LOAD.used
+            _DIR_FILE_CACHE_LOAD.used = None
+            _trim_dir_file_cache(used)
 
 
 def parse_config_with_sources(
@@ -4943,8 +5018,36 @@ class _CachedDirFile(NamedTuple):
 #: include tree re-runs strictyaml only for that file.  A cache hit is
 #: byte-exact with a full reparse, never merely mtime-close.  Bounded LRU;
 #: a stale or evicted entry only costs a reparse, never correctness.
+#:
+#: The bound is ``_DIR_FILE_CACHE_MAX`` entries, or the number of files the
+#: configuration being loaded uses when that is larger: a load never evicts
+#: its own files, so a directory or include tree of any size stays cached
+#: whole from one load to the next (see _trim_dir_file_cache).
 _DIR_FILE_CACHE: "OrderedDict[str, _CachedDirFile]" = OrderedDict()
 _DIR_FILE_CACHE_MAX = 1024
+
+#: ``used`` is the set of cache keys the parse_config call running on this
+#: thread has read or stored, and None (or absent) outside such a call.
+#: Per thread, because the daemon reloads on an executor thread.
+_DIR_FILE_CACHE_LOAD = threading.local()
+
+
+def _trim_dir_file_cache(used: "set[str] | frozenset[str]") -> None:
+    """Evict least-recently-used entries until the cache is within bounds.
+
+    ``used`` holds the keys the current load depends on, which are never
+    evicted.  The cache may hold ``max(_DIR_FILE_CACHE_MAX, len(used))``
+    entries, so entries of files that left the configuration (a directory
+    that shrank, a different ``-c``) survive only inside the fixed bound.
+    """
+    limit = max(_DIR_FILE_CACHE_MAX, len(used))
+    if len(_DIR_FILE_CACHE) <= limit:
+        return
+    for key in list(_DIR_FILE_CACHE):
+        if len(_DIR_FILE_CACHE) <= limit:
+            break
+        if key not in used:
+            _DIR_FILE_CACHE.pop(key, None)
 
 
 def _dir_file_content_sig(
@@ -4984,8 +5087,14 @@ def _parse_file_cached(
     from the remembered ``included`` set on a cache hit, and a hit is
     declined outright when the two overlap, because that overlap IS the
     cycle and the uncached path words the error.
+
+    Inside parse_config the file joins that load's ``used`` set and the
+    load trims the cache when it returns.  A direct parse_config_file or
+    parse_config_string call that reaches an include has no such set, so
+    the store below trims to the fixed bound itself.
     """
     abspath = os.path.abspath(path)
+    used: set[str] | None = getattr(_DIR_FILE_CACHE_LOAD, "used", None)
     cached = _DIR_FILE_CACHE.get(abspath)
     if (
         cached is not None
@@ -4993,6 +5102,10 @@ def _parse_file_cached(
         and _dir_file_content_sig(cached.sources) == cached.sig
     ):
         _DIR_FILE_CACHE.move_to_end(abspath)
+        if used is not None:
+            # the files this one includes are served with it, unvisited
+            used.add(abspath)
+            used.update(cached.included)
         if _seen is not None:
             _seen.update(cached.included)
         return cached.config, cached.sources, cached.included
@@ -5019,8 +5132,10 @@ def _parse_file_cached(
         frozen, file_included, _dir_file_content_sig(frozen), config
     )
     _DIR_FILE_CACHE.move_to_end(abspath)
-    while len(_DIR_FILE_CACHE) > _DIR_FILE_CACHE_MAX:
-        _DIR_FILE_CACHE.popitem(last=False)
+    if used is not None:
+        used.add(abspath)
+    else:
+        _trim_dir_file_cache(frozenset((abspath,)))
     return config, frozen, file_included
 
 

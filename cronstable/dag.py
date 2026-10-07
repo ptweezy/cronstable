@@ -481,6 +481,10 @@ class AdvanceResult:
     # claims hit MAX_CLAIMS_PER_PASS: more instances are claimable right now,
     # so the driver should re-service promptly rather than wait for a wake.
     deferred: bool = False
+    # a task entry reached a terminal state during the current walk, which
+    # can unblock a dependent listed before it (see _propagate_and_claim).
+    # Working state of the pass, so it stays out of the repr and equality.
+    ended: bool = field(default=False, repr=False, compare=False)
 
 
 @dataclass
@@ -918,6 +922,109 @@ def _propagate_and_claim(
     host: str,
     result: AdvanceResult,
 ) -> None:
+    """Propagate upstream outcomes and claim every ready instance.
+
+    One walk in declaration order, which is also claim order, settles a
+    spec that lists each task after its upstreams.  Under any other listing
+    a task can still be pending after an upstream listed later ended in the
+    same walk, so :func:`_settle_dependents` carries the verdicts through
+    the graph upstream-first and one more walk claims what that made ready.
+    """
+    result.ended = False
+    _walk_and_claim(spec, body, now, proc, host, result)
+    if not result.ended:
+        return
+    order = _upstream_first(spec)
+    while order is not None and result.ended:
+        _settle_dependents(spec, order, body, now, result)
+        result.ended = False
+        _walk_and_claim(spec, body, now, proc, host, result)
+
+
+def _upstream_first(spec: DagSpec) -> list[TaskSpec] | None:
+    """The spec's tasks ordered so each one follows its upstreams.
+
+    ``None`` when ``spec.tasks`` already lists them that way.  Computed
+    only by a pass in which a task ended.  An undefined dependency
+    constrains nothing and a task on a cycle is left out;
+    :func:`validate_graph` rejects both at load.
+    """
+    listed: set[str] = set()
+    for task in spec.tasks:
+        if not listed.issuperset(task.depends_on):
+            break
+        listed.add(task.id)
+    else:
+        return None
+    by_id = spec.by_id
+    waiting: dict[str, int] = {}
+    dependents: dict[str, list[TaskSpec]] = {}
+    order: list[TaskSpec] = []
+    for task in spec.tasks:
+        deps = {dep for dep in task.depends_on if dep in by_id}
+        if not deps:
+            order.append(task)
+            continue
+        waiting[task.id] = len(deps)
+        for dep in deps:
+            dependents.setdefault(dep, []).append(task)
+    # ``order`` doubles as the work queue: a task joins it once every one of
+    # its upstreams is ahead of it.
+    placed = 0
+    while placed < len(order):
+        for down in dependents.get(order[placed].id, ()):
+            waiting[down.id] -= 1
+            if not waiting[down.id]:
+                order.append(down)
+        placed += 1
+    return order
+
+
+def _settle_dependents(
+    spec: DagSpec,
+    order: list[TaskSpec],
+    body: dict[str, Any],
+    now: float,
+    result: AdvanceResult,
+) -> None:
+    """End every pending entry whose upstreams failed or were skipped.
+
+    ``order`` is upstream-first, so one sweep settles a cascade of any
+    depth.  Only the propagation arms of :func:`_advance_task` run here; a
+    task the cascade makes ready stays pending for the declaration-order
+    walk, which owns claiming and its quota.
+    """
+    tasks = body["tasks"]
+    mapped_all: Any = body.get("mapped")
+    for task in order:
+        expanded = bool(mapped_all) and task.id in mapped_all
+        if task.expand is not None and not expanded:
+            _propagate_placeholder(spec, body, task, now, result)
+            continue
+        verdict: str | None = None
+        for taskkey, _map_index, _item in _instances_of(spec, body, task):
+            entry = tasks.get(taskkey)
+            if entry is None or entry.get("state") != PENDING:
+                continue
+            if verdict is None:
+                verdict = _deps_verdict(spec, body, task)
+            if verdict == "fail":
+                _terminalise_task(entry, UPSTREAM_FAILED, now, result)
+            elif verdict == "skip":
+                _terminalise_task(entry, SKIPPED, now, result)
+            else:
+                break  # wait or ready: nothing to propagate to this task
+
+
+def _walk_and_claim(
+    spec: DagSpec,
+    body: dict[str, Any],
+    now: float,
+    proc: str,
+    host: str,
+    result: AdvanceResult,
+) -> None:
+    """Advance every task instance once, in declaration order."""
     # Hoisted out of the loops: both were re-resolved once per TASK, and
     # body["tasks"] again once per INSTANCE, so a wide DAG or a large fan-out
     # repeated the same two lookups thousands of times per pass.  Both are
@@ -1365,6 +1472,7 @@ def _terminalise_task(entry, state, now, result) -> None:
     entry["pid"] = None
     entry["updatedAt"] = now
     result.changed = True
+    result.ended = True
 
 
 def _maybe_terminalise(spec, body, now, result) -> None:

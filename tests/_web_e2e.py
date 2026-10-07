@@ -935,21 +935,35 @@ class Faults:
 
         Simulate a compromised server, a different server version, or a cluster
         peer supplying data that has not passed local configuration validation.
+
+        The daemon never sees the page's ``If-None-Match`` and the page never
+        sees the daemon's ``ETag``, so every request gets a full body for
+        ``fn``. The daemon's validator describes the body the daemon sent,
+        which the rewritten body differs from.
         """
 
         def handler(route):
-            response = route.fetch()
+            response = route.fetch(
+                headers={
+                    name: value
+                    for name, value in route.request.headers.items()
+                    if name.lower() != "if-none-match"
+                }
+            )
             try:
                 body = json.loads(response.text())
             except ValueError:
                 return route.fulfill(response=response)
+            headers = {
+                name: value
+                for name, value in response.headers.items()
+                if name.lower() != "etag"
+            }
+            headers["content-type"] = "application/json"
             return route.fulfill(
                 response=response,
                 body=json.dumps(fn(body)),
-                headers={
-                    **response.headers,
-                    "content-type": "application/json",
-                },
+                headers=headers,
             )
 
         installed = quiet_route(handler)

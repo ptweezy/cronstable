@@ -2746,6 +2746,16 @@ class RunningJob:
                 pipe.set_protocol(None)
 
     @property
+    def stopped(self) -> bool:
+        """Whether this run has ended.
+
+        True once :meth:`wait` has collected the process and its output, or
+        :meth:`cancel` has terminated it. A run whose process never started
+        stays False.
+        """
+        return self._stopped
+
+    @property
     def failed(self) -> bool:
         return self.fail_reason is not None
 

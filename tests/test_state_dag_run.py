@@ -5013,6 +5013,194 @@ async def test_gc_removed_dags_nonstr_runkey_and_cancel(
         await cron._dag.gc_removed_dags(cron.state_backend, {"lin"}, grace=0.0)
 
 
+async def _seed_terminal_runs(backend, name, count, first=0):
+    """Write ``count`` finished run documents of dag ``name``; their keys."""
+    keys = []
+    for i in range(first, first + count):
+        key = "r%03d" % i
+        body = {
+            "dag": name,
+            "runKey": key,
+            "runId": "id%03d" % i,
+            "state": dag.SUCCESS,
+            "kind": "scheduled",
+            "createdAt": 1000.0 + i,
+            "updatedAt": 1000.0 + i,
+            "tasks": {},
+            "mapped": {},
+        }
+        await backend.mutate_document(
+            "dagrun/" + name, key, lambda _cur, b=body: (b, None)
+        )
+        keys.append(key)
+    return keys
+
+
+def _count_full_listings(monkeypatch, backend):
+    """Count ``list_documents`` calls per namespace on ``backend``."""
+    calls = {}
+    real = backend.list_documents
+
+    async def _counted(namespace):
+        calls[namespace] = calls.get(namespace, 0) + 1
+        return await real(namespace)
+
+    monkeypatch.setattr(backend, "list_documents", _counted)
+    return calls
+
+
+@pytest.mark.parametrize("excess", [2, 7])
+async def test_gc_pass_lists_the_namespace_once_however_many_runs_go(
+    excess, monkeypatch, dag_cron
+):
+    cron = await dag_cron(_RETAIN_ONE)  # retainRuns 1
+    backend = cron.state_backend
+    keys = await _seed_terminal_runs(backend, "rt", 1 + excess)
+    calls = _count_full_listings(monkeypatch, backend)
+    await cron._dag._gc_one_dag(backend, "rt", cron.cron_dags["rt"])
+    assert await backend.list_document_keys("dagrun/rt") == [keys[-1]]
+    # one listing of the runs and one of the recovery batches, for the
+    # whole pass
+    assert calls == {"dagrun/rt": 1, "recoverybatch/rt": 1}
+
+
+async def test_gc_removed_dag_lists_its_namespace_once(monkeypatch, dag_cron):
+    cron = await dag_cron(_LINEAR)
+    backend = cron.state_backend
+    await _seed_terminal_runs(backend, "lin", 5)
+    del cron.cron_dags["lin"]  # gone from every live config
+    calls = _count_full_listings(monkeypatch, backend)
+    await cron._dag.gc_removed_dags(backend, {"lin"}, grace=0.0)
+    assert await backend.list_document_keys("dagrun/lin") == []
+    assert calls == {"dagrun/lin": 1}
+
+
+def _preparing_recovery(name, source_key, status="preparing"):
+    """A recovery run document of dag ``name`` that replays ``source_key``."""
+    return {
+        "dag": name,
+        "runKey": "recovery-abc",
+        "runId": "abc",
+        "state": dag.RUNNING,
+        "kind": "recovery",
+        "createdAt": 5000.0,
+        "updatedAt": 5000.0,
+        "tasks": {},
+        "mapped": {},
+        "recovery": {"status": status, "sourceRunKey": source_key},
+    }
+
+
+async def test_delete_run_spares_the_source_of_a_preparing_recovery(dag_cron):
+    cron = await dag_cron(_LINEAR)
+    backend = cron.state_backend
+    (source,) = await _seed_terminal_runs(backend, "lin", 1)
+
+    async def _write(status):
+        body = _preparing_recovery("lin", source, status)
+        await backend.mutate_document(
+            "dagrun/lin", body["runKey"], lambda _cur: (body, None)
+        )
+
+    await _write("preparing")
+    await cron._dag._delete_run(backend, "lin", source, "id000")
+    assert await cron._dag._read("lin", source) is not None
+    # a recovery of ANOTHER run does not hold this one
+    other = _preparing_recovery("lin", "someone-else")
+    other["runKey"] = "recovery-def"
+    await backend.mutate_document(
+        "dagrun/lin", other["runKey"], lambda _cur: (other, None)
+    )
+    await _write("ready")
+    await cron._dag._delete_run(backend, "lin", source, "id000")
+    assert await cron._dag._read("lin", source) is None
+
+
+@pytest.mark.parametrize(
+    "batch, kept",
+    [
+        pytest.param({"complete": False}, True, id="open"),
+        pytest.param({"complete": True}, False, id="complete"),
+        pytest.param(
+            {"complete": False, "expiresAt": 1.0}, False, id="expired"
+        ),
+        pytest.param(
+            {"complete": False, "plans": [{"sourceRunKey": "x"}]},
+            False,
+            id="other-source",
+        ),
+    ],
+)
+async def test_delete_run_spares_the_sources_of_an_open_recovery_batch(
+    batch, kept, dag_cron
+):
+    cron = await dag_cron(_LINEAR)
+    backend = cron.state_backend
+    (source,) = await _seed_terminal_runs(backend, "lin", 1)
+    body = {
+        "planToken": "tok",
+        "plans": [{"sourceRunKey": source}],
+        "results": {},
+        "expiresAt": dagrun._now() + 3600.0,
+        **batch,
+    }
+    await backend.mutate_document(
+        "recoverybatch/lin", "tok", lambda _cur: (body, None)
+    )
+    await cron._dag._delete_run(backend, "lin", source, "id000")
+    assert (await cron._dag._read("lin", source) is not None) is kept
+
+
+@pytest.mark.parametrize("keys_listable", [True, False])
+@pytest.mark.parametrize("kind", ["recovery", "batch"])
+async def test_gc_spares_a_run_referenced_after_the_first_listing(
+    kind, keys_listable, monkeypatch, dag_cron
+):
+    # The reference lands between the pass's listing and the delete, as a
+    # recovery accepted on another node would.  The check under each run's
+    # lease still sees it, with or without a keys-only listing.
+    cron = await dag_cron(_RETAIN_ONE)  # retainRuns 1
+    backend = cron.state_backend
+    keys = await _seed_terminal_runs(backend, "rt", 4)
+    held = keys[1]
+    real = backend.list_documents
+    listed = []
+
+    async def _then_reference(namespace):
+        docs = await real(namespace)
+        listed.append(namespace)
+        if listed == ["dagrun/rt", "recoverybatch/rt"]:
+            if kind == "recovery":
+                body = _preparing_recovery("rt", held)
+                await backend.mutate_document(
+                    "dagrun/rt", body["runKey"], lambda _cur: (body, None)
+                )
+            else:
+                body = {
+                    "planToken": "tok",
+                    "plans": [{"sourceRunKey": held}],
+                    "results": {},
+                    "complete": False,
+                    "expiresAt": dagrun._now() + 3600.0,
+                }
+                await backend.mutate_document(
+                    "recoverybatch/rt", "tok", lambda _cur: (body, None)
+                )
+        return docs
+
+    monkeypatch.setattr(backend, "list_documents", _then_reference)
+    if not keys_listable:
+
+        async def _no_keys(namespace):
+            return None
+
+        monkeypatch.setattr(backend, "list_document_keys", _no_keys)
+    await cron._dag._gc_one_dag(backend, "rt", cron.cron_dags["rt"])
+    monkeypatch.undo()
+    left = set(await backend.list_document_keys("dagrun/rt"))
+    assert left - {"recovery-abc"} == {held, keys[-1]}
+
+
 # ===========================================================================
 # Lifecycle teardown: shutdown / forget cancel a live service task; _parse_iso.
 # ===========================================================================

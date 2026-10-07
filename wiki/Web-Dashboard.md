@@ -554,9 +554,10 @@ adds a grid: one row per job (the first 80), 24 time buckets across a **6h / 24h
 7d** window, each cell colored by the worst outcome in that bucket and shaded
 by run volume. Hover a cell for the bucket's tally (such as `3 ok / 1 fail`);
 click a cell or a job name to open that job. The dashboard fills the card with
-one batched [`GET /activity`](HTTP-API#get-activity) fetch, falling back to
-per-job [run history](HTTP-API#get-jobsnameruns) fetches against an older
-daemon, so the card's horizon is bounded by the daemon's in-memory history.
+one batched [`GET /activity?jobs=80`](HTTP-API#get-activity) fetch, which asks
+for the 80 jobs the card draws, and falls back to per-job
+[run history](HTTP-API#get-jobsnameruns) fetches against an older daemon.
+Both read the daemon's in-memory history, which bounds the card's horizon.
 
 ## Schedule load
 
@@ -768,13 +769,13 @@ re-probes `/whoami` and redraws.
 
 The dashboard is a thin client over the [HTTP control API](HTTP-API):
 
-- it polls `GET /jobs` on the refresh interval for the overview (each job carries a compact tail of recent runs for the sparkline);
+- it polls `GET /jobs` on the refresh interval for the overview (each job carries a compact tail of recent runs for the sparkline). Each poll sends the previous response's `ETag` in `If-None-Match`. When only the countdowns have moved, the daemon answers `304 Not Modified`, and the dashboard keeps the jobs it holds and continues each countdown from the response that carried it;
 - it polls `GET /cluster` on the same interval for the [cluster panel](#cluster-panel) (the panel stays hidden unless a cluster section is configured);
 - `GET /node` (the header's [node meter](#the-job-overview)), `GET /dags` (the [workflows card](#dag-orchestration)), and `GET /pools` (the resource pools card) ride the same poll;
 - while the [fleet view](#fleet-view-every-nodes-runs-in-one-pane) is open, `GET /fleet` rides the same poll (the daemon answers it from gossip state it already holds);
 - the [state inspector](#durable-state-inspector) probes `GET /state` once at load (to decide whether to offer its button), polls it only while the card is open, and drills into scopes with `GET /state/documents` / `GET /state/records`;
 - the **node resources** card refetches `GET /node/history` while it is open;
-- opening a job's **History** tab fetches `GET /jobs/{name}/runs` (full retained history plus aggregate stats); the [activity heatmap](#activity-heatmap) fills from one batched [`GET /activity`](HTTP-API#get-activity) fetch and keeps the capped per-job loop as a fallback against an older daemon;
+- opening a job's **History** tab fetches `GET /jobs/{name}/runs` (full retained history plus aggregate stats); the [activity heatmap](#activity-heatmap) fills from one batched [`GET /activity?jobs=80`](HTTP-API#get-activity) fetch and keeps the capped per-job loop as a fallback against an older daemon;
 - opening a job's **Resources** tab fetches `GET /jobs/{name}/resources` lazily, never on the poll loop, and refetches it at the live view's selectable pace while the tab stays open;
 - opening the **Logs** tab opens the `GET /jobs/{name}/logs` SSE stream;
 - the [live logs panel](#live-logs) opens up to four of those SSE streams at once (one per tailed job) and re-attaches them as runs come and go;

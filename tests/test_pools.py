@@ -214,6 +214,7 @@ async def test_lease_loss_prevents_launch_and_cancels_running_work(dag_cron, mon
     entry = await cron._pools.enqueue(cron.cron_jobs["one"])
     ticket = await cron._pools.acquire("database", entry["id"])
     running = AsyncMock()
+    running.stopped = False
     ticket.running = running
     async def unavailable(*args, **kwargs):
         raise OSError("offline")
@@ -222,6 +223,63 @@ async def test_lease_loss_prevents_launch_and_cancels_running_work(dag_cron, mon
     running.cancel.assert_awaited_once()
     with pytest.raises(PoolError, match="lost"):
         cron._pools.check_ticket(ticket)
+
+
+async def test_renewal_racing_a_completion_leaves_the_run_alone(
+    dag_cron, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    cron = await make(dag_cron, monkeypatch)
+    entry = await cron._pools.enqueue(cron.cron_jobs["one"])
+    ticket = await cron._pools.acquire("database", entry["id"])
+    running = AsyncMock()
+    running.stopped = False
+    ticket.running = running
+    change = cron._pools._change
+    completed = asyncio.Event()
+
+    async def renew_after_completion(pool, action, **kwargs):
+        # hold the renewal's read until the completion has been written
+        if action.__name__ == "renew":
+            await completed.wait()
+        return await change(pool, action, **kwargs)
+
+    monkeypatch.setattr(cron._pools, "_change", renew_after_completion)
+    renewal = asyncio.create_task(cron._pools._renew(ticket))
+    await asyncio.sleep(0)
+    await cron._pools.finish(ticket)
+    completed.set()
+    await renewal
+    running.cancel.assert_not_awaited()
+    entries = (await cron._pools.snapshot())[0]["entries"]
+    assert [e["state"] for e in entries] == ["finished"]
+
+
+async def test_lost_lease_leaves_an_ended_run_alone(dag_cron, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    cron = await make(dag_cron, monkeypatch)
+    await cron.maybe_launch_job(cron.cron_jobs["one"])
+    await cron._pools.tick()
+    (running,) = cron.running_jobs["one"]
+    ticket = running.pool_ticket
+    assert ticket.running is running and not running.stopped
+    await running.wait()
+    assert running.stopped
+
+    async def unavailable(*args, **kwargs):
+        raise OSError("offline")
+
+    cancel = AsyncMock()
+    with monkeypatch.context() as patch:
+        patch.setattr(cron._pools, "_change", unavailable)
+        patch.setattr(running, "cancel", cancel)
+        await cron._pools._renew(ticket)
+    cancel.assert_not_awaited()
+    assert not ticket.valid
+    await cron._handle_finished_job(running)
+    assert not cron._pools.held
 
 
 async def test_queued_retry_retains_position_after_restart(dag_cron, monkeypatch):
@@ -249,3 +307,147 @@ async def test_capacity_change_drains_existing_queue(dag_cron, monkeypatch):
     await cron._pools.finish(ticket)
     await cron._pools.enqueue(cron.cron_jobs["two"])
     assert (await cron._pools.snapshot())[0]["slots"] == 1
+
+
+async def _fill_pool(cron):
+    """Hold both slots of the two-slot pool; return the tickets."""
+    tickets = []
+    for _ in range(2):
+        entry = await cron._pools.enqueue(cron.cron_jobs["one"])
+        tickets.append(await cron._pools.acquire("database", entry["id"]))
+    assert all(tickets)
+    return tickets
+
+
+def _count_admission_attempts(cron, monkeypatch):
+    attempts = []
+    acquire = cron._pools.acquire
+
+    async def counting(pool, key):
+        attempts.append(key)
+        return await acquire(pool, key)
+
+    monkeypatch.setattr(cron._pools, "acquire", counting)
+    return attempts
+
+
+async def test_full_pool_tick_makes_no_admission_attempt(
+    dag_cron, monkeypatch
+):
+    cron = await make(dag_cron, monkeypatch)
+    one, two = cron.cron_jobs.values()
+    tickets = await _fill_pool(cron)
+    for job in (one, two, two):
+        await cron.maybe_launch_job(job)
+    attempts = _count_admission_attempts(cron, monkeypatch)
+    await cron._pools._tick_pool("database")
+    assert attempts == []
+    assert not cron.running_jobs
+    assert (await cron._pools.snapshot())[0]["queued"] == 3
+    for ticket in tickets:
+        await cron._pools.finish(ticket)
+
+
+async def test_tick_stops_trying_when_the_last_slot_is_taken(
+    dag_cron, monkeypatch
+):
+    cron = await make(dag_cron, monkeypatch)
+    one, two = cron.cron_jobs.values()
+    for job in (one, two, one):
+        await cron.maybe_launch_job(job)
+    waiting = (await cron._pools.snapshot())[0]["entries"]
+    attempts = _count_admission_attempts(cron, monkeypatch)
+    await cron._pools._tick_pool("database")
+    assert attempts == [e["id"] for e in waiting[:2]]
+    assert {k: len(v) for k, v in cron.running_jobs.items()} == {
+        "one": 1,
+        "two": 1,
+    }
+    await _reap_running(cron)
+    # the entry left waiting is admitted once capacity frees
+    await cron._pools._tick_pool("database")
+    assert attempts[2:] == [waiting[2]["id"]]
+    assert len(cron.running_jobs["one"]) == 1
+    await _reap_running(cron)
+
+
+async def test_tick_still_tries_an_entry_that_fits_behind_one_that_does_not(
+    dag_cron, monkeypatch
+):
+    cron = await make(dag_cron, monkeypatch)
+    one, two = cron.cron_jobs.values()
+    held = await cron._pools.acquire(
+        "database", (await cron._pools.enqueue(one))["id"]
+    )
+    two.poolSlots = 2
+    await cron.maybe_launch_job(two)
+    await cron.maybe_launch_job(one)
+    wide, narrow = (await cron._pools.snapshot())[0]["entries"][1:]
+    assert (wide["slots"], narrow["slots"]) == (2, 1)
+    attempts = _count_admission_attempts(cron, monkeypatch)
+    await cron._pools._tick_pool("database")
+    # one slot is free: the two-slot entry cannot fit, the one-slot entry
+    # can, and admission order still belongs to acquire()
+    assert attempts == [narrow["id"]]
+    assert not cron.running_jobs
+    await cron._pools.finish(held)
+    await cron._pools._tick_pool("database")
+    assert set(cron.running_jobs) == {"two"}
+    await _reap_running(cron)
+    await cron._pools._tick_pool("database")
+    await _reap_running(cron)
+
+
+async def test_declined_launch_returns_its_slots_to_the_tick(
+    dag_cron, monkeypatch
+):
+    cron = await make(dag_cron, monkeypatch)
+    one, two = cron.cron_jobs.values()
+    held = await cron._pools.acquire(
+        "database", (await cron._pools.enqueue(one))["id"]
+    )
+    await cron.maybe_launch_job(one)
+    await cron.maybe_launch_job(two)
+    first, second = (await cron._pools.snapshot())[0]["entries"][1:]
+    attempts = _count_admission_attempts(cron, monkeypatch)
+
+    async def decline(job, **kwargs):
+        return False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cron, "maybe_launch_job", decline)
+        await cron._pools._tick_pool("database")
+    assert attempts == [first["id"], second["id"]]
+    assert (await cron._pools.snapshot())[0]["queued"] == 2
+    await cron._pools.finish(held)
+    for key in (first["id"], second["id"]):
+        await cron._pools.cancel("database", key)
+
+
+async def test_full_pool_tick_still_retires_dead_entries(
+    dag_cron, monkeypatch
+):
+    cron = await make(dag_cron, monkeypatch)
+    one, two = cron.cron_jobs.values()
+    tickets = await _fill_pool(cron)
+    state = JobRetryState(5, 2, 60)
+    state.next_delay()
+    state.pool_retry = {
+        "pool": "database",
+        "scope": cron._pools._retry_scope("one", None),
+        "generation": "an older ladder",
+    }
+    cron.retry_state["one"] = state
+    await cron.maybe_launch_job(one)
+    await cron.maybe_launch_job(two)
+    two.enabled = False
+    await cron._pools._tick_pool("database")
+    entries = (await cron._pools.snapshot())[0]["entries"]
+    reasons = {e["job"]: e.get("reason") for e in entries[2:]}
+    assert reasons == {
+        "one": "retry superseded",
+        "two": "job removed, disabled, or configuration changed",
+    }
+    assert {e["state"] for e in entries[2:]} == {"cancelled"}
+    for ticket in tickets:
+        await cron._pools.finish(ticket)

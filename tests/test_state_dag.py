@@ -14,6 +14,7 @@ argument everywhere).  Backend + cron wiring lives in test_state_dag_run.py.
 import asyncio
 import copy
 import json
+import random
 import sys
 
 import pytest
@@ -312,6 +313,189 @@ def test_diamond_fan_in():
     assert ex.launched[0] == "root"
     assert ex.launched[-1] == "join"
     assert set(ex.launched[1:3]) == {"left", "right"}
+
+
+# --------------------------------------------------------------------------
+# Declaration order (a config may list a task before its upstreams)
+# --------------------------------------------------------------------------
+
+
+def _chain(n, **first):
+    """An ``n``-task chain ``t0 <- t1 <- ...``, listed upstream-first."""
+    tasks = [TaskSpec("t0", **first)]
+    for i in range(1, n):
+        tasks.append(TaskSpec("t%d" % i, depends_on=("t%d" % (i - 1),)))
+    return tasks
+
+
+def _one_advance(spec, body, now=5.0):
+    """One combined reconcile+claim pass, as the driver runs it."""
+    transform = dag.reconcile_and_plan(
+        spec, now, "proc-A", "host-A", lambda _pid: True
+    )
+    body, result = _apply(transform, body)
+    return body, result.advance
+
+
+@pytest.mark.parametrize("ended", [dag.FAILED, dag.SKIPPED])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_cascade_settles_in_one_advance_in_any_declaration_order(
+    ended, reverse
+):
+    tasks = _chain(8)
+    spec = _spec(*(reversed(tasks) if reverse else tasks))
+    dag.validate_graph(spec)
+    body = _body(spec)
+    body["tasks"]["t0"]["state"] = ended
+    body, result = _one_advance(spec, body)
+    expected = dag.UPSTREAM_FAILED if ended == dag.FAILED else dag.SKIPPED
+    assert [_state(body, "t%d" % i) for i in range(1, 8)] == [expected] * 7
+    assert result.run_terminal
+    assert result.launches == []
+    # a skipped chain is a successful run; a failed one is not
+    assert body["state"] == (
+        dag.FAILED if ended == dag.FAILED else dag.SUCCESS
+    )
+
+
+def test_cascade_claims_an_all_done_task_listed_before_its_upstream():
+    # `cleanup` waits for `b`, which the cascade from `a` ends in this pass.
+    spec = _spec(
+        TaskSpec("cleanup", depends_on=("b",), trigger_rule=dag.ALL_DONE),
+        TaskSpec("b", depends_on=("a",)),
+        TaskSpec("a"),
+    )
+    dag.validate_graph(spec)
+    body = _body(spec)
+    body["tasks"]["a"]["state"] = dag.FAILED
+    body, result = _one_advance(spec, body)
+    assert _state(body, "b") == dag.UPSTREAM_FAILED
+    assert _state(body, "cleanup") == dag.RUNNING
+    assert [li.taskkey for li in result.launches] == ["cleanup"]
+    assert not result.run_terminal
+
+
+def test_cascade_keeps_declaration_order_among_claims():
+    # r1 and r2 are ready when the walk reaches them; `cleanup` becomes
+    # ready only once the cascade ends `b`, so its claim follows theirs.
+    spec = _spec(
+        TaskSpec("cleanup", depends_on=("b",), trigger_rule=dag.ALL_DONE),
+        TaskSpec("r1"),
+        TaskSpec("b", depends_on=("a",)),
+        TaskSpec("r2"),
+        TaskSpec("a"),
+    )
+    body = _body(spec)
+    body["tasks"]["a"]["state"] = dag.FAILED
+    body, result = _one_advance(spec, body)
+    assert [li.taskkey for li in result.launches] == ["r1", "r2", "cleanup"]
+
+
+def test_cascade_through_a_mapped_task_listed_after_its_dependent():
+    spec = _spec(
+        TaskSpec("sink", depends_on=("work",)),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+        TaskSpec("gen"),
+    )
+    dag.validate_graph(spec)
+    # the source failed before `work` could expand
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.FAILED
+    body, result = _one_advance(spec, body)
+    assert _state(body, "work") == dag.UPSTREAM_FAILED
+    assert _state(body, "sink") == dag.UPSTREAM_FAILED
+    assert result.run_terminal
+    # an expanded fan-out whose instances all end in this pass
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    body, _ = _apply(
+        dag.plan_and_claim(spec, 1.0, "proc-A", "host-A", {"work": [1, 2]}),
+        body,
+    )
+    for key in ("work#0", "work#1"):
+        body["tasks"][key].update(state=dag.FAILED, proc=None, pid=None)
+    body, result = _one_advance(spec, body)
+    assert _state(body, "sink") == dag.UPSTREAM_FAILED
+    assert result.run_terminal
+
+
+def test_cascade_from_a_sensor_timeout_listed_after_its_dependent():
+    spec = _spec(
+        TaskSpec("after", depends_on=("wait",)),
+        TaskSpec("wait", type=dag.SENSOR, poke_timeout=10.0),
+    )
+    body = _body(spec)
+    body["tasks"]["wait"].update(
+        state=dag.RUNNING, firstPokeAt=0.0, nextPokeAt=1.0, pokeCount=3
+    )
+    body, result = _one_advance(spec, body, now=50.0)
+    assert _state(body, "wait") == dag.FAILED
+    assert _state(body, "after") == dag.UPSTREAM_FAILED
+    assert result.run_terminal
+
+
+def test_cascade_respects_the_claim_quota():
+    width = dag.MAX_CLAIMS_PER_PASS + 5
+    cleanups = [
+        TaskSpec("c%d" % i, depends_on=("b",), trigger_rule=dag.ALL_DONE)
+        for i in range(width)
+    ]
+    spec = _spec(*cleanups, TaskSpec("b", depends_on=("a",)), TaskSpec("a"))
+    body = _body(spec)
+    body["tasks"]["a"]["state"] = dag.FAILED
+    body, result = _one_advance(spec, body)
+    assert [li.taskkey for li in result.launches] == [
+        "c%d" % i for i in range(dag.MAX_CLAIMS_PER_PASS)
+    ]
+    assert result.deferred
+    assert _state(body, "c%d" % (width - 1)) == dag.PENDING
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_one_advance_is_independent_of_declaration_order(seed):
+    # A random graph below three ended roots, advanced once under the
+    # upstream-first listing and under a shuffled one.  The quota is out
+    # of reach, so both passes must leave identical task states.
+    rng = random.Random(seed)
+    tasks = [TaskSpec("t%d" % i) for i in range(3)]
+    for i in range(3, 24):
+        deps = {"t%d" % rng.randrange(i) for _ in range(rng.randrange(1, 4))}
+        rule = dag.ALL_DONE if rng.random() < 0.25 else dag.ALL_SUCCESS
+        tasks.append(
+            TaskSpec(
+                "t%d" % i, depends_on=tuple(sorted(deps)), trigger_rule=rule
+            )
+        )
+    shuffled = list(tasks)
+    rng.shuffle(shuffled)
+    ended = {
+        "t%d" % i: rng.choice([dag.FAILED, dag.SKIPPED, dag.SUCCESS])
+        for i in range(3)
+    }
+    outcomes = []
+    for listing in (tasks, shuffled):
+        spec = _spec(*listing)
+        dag.validate_graph(spec)
+        body = _body(spec)
+        for key, state in ended.items():
+            body["tasks"][key]["state"] = state
+        body, result = _one_advance(spec, body)
+        assert not result.deferred
+        outcomes.append(
+            (
+                {key: entry["state"] for key, entry in body["tasks"].items()},
+                body["state"],
+                sorted(li.taskkey for li in result.launches),
+            )
+        )
+        # a second pass finds nothing left to propagate or claim
+        again, result = _one_advance(spec, body, now=6.0)
+        assert again is body and not result.changed
+    assert outcomes[0] == outcomes[1]
 
 
 # --------------------------------------------------------------------------

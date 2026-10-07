@@ -15,6 +15,7 @@ is a separate download CI fetches in one matrix cell, so this self-skips
 everywhere else.
 """
 
+import os
 import pathlib
 import re
 
@@ -102,7 +103,9 @@ _FORCE_RECOVERY = """
 
 def _open_demo(p, query=""):
     try:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(
+            channel=os.environ.get("CRONSTABLE_TEST_BROWSER_CHANNEL")
+        )
     except Exception as exc:  # no chromium provisioned
         pytest.skip("playwright chromium unavailable: {}".format(exc))
     page = browser.new_page()

@@ -96,10 +96,17 @@ def _load(paths):
 # produced under the same conditions.  These are the doc-level fields that
 # change what a metric measures rather than how the code performs: a
 # different interpreter, platform, run mode, or optional-backend state
-# (orjson swaps the whole JSON hot path, uvloop the event loop) on one side
-# turns a backend difference into a fake code regression.  bench.py stamps
-# all of them into every result document.
-_COMPARABILITY_KEYS = ("mode", "python", "platform", "orjson", "uvloop")
+# (orjson swaps the whole JSON hot path, uvloop the event loop, isal the
+# gzip backend) on one side turns a backend difference into a fake code
+# regression.  bench.py stamps all of them into every result document.
+_COMPARABILITY_KEYS = (
+    "mode",
+    "python",
+    "platform",
+    "orjson",
+    "uvloop",
+    "isal",
+)
 
 
 def _comparability_failures(baseline_docs, current_docs):

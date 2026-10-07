@@ -2142,3 +2142,142 @@ async def test_web_activity_projection_runs_off_loop_past_the_gate(
     assert resp.status == 200
     assert idents and idents[-1] != threading.get_ident()  # executor thread
     assert json.loads(resp.body) == cron.activity_payload()
+
+
+# configuration order differs from name order, so the two `jobs` selections
+# pick different jobs
+_ACTIVITY_ORDER_NAMES = ("zeta", "alpha", "mid", "beta")
+_ACTIVITY_ORDER_YAML = "jobs:\n" + "".join(
+    "  - name: %s\n    command: echo hi\n    schedule: '*/5 * * * *'\n" % name
+    for name in _ACTIVITY_ORDER_NAMES
+)
+
+
+async def test_web_activity_jobs_caps_the_job_set():
+    # `jobs` keeps the first N jobs in configuration order, the order
+    # GET /jobs lists them; `sort=name` keeps the first N by name.
+    import gzip
+
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    for name in _ACTIVITY_ORDER_NAMES:
+        for i in range(10):
+            cron.run_history[name].append(_heat_run("success", 60 * i + 60))
+    full = cron.activity_payload()["jobs"]
+    assert list(full) == list(_ACTIVITY_ORDER_NAMES)
+    capped = await cron._web_get_activity(Req({"jobs": "2"}))
+    assert capped.status == 200
+    jobs = json.loads(capped.body)["jobs"]
+    assert list(jobs) == ["zeta", "alpha"]
+    assert jobs == {name: full[name] for name in ("zeta", "alpha")}
+    by_name = await cron._web_get_activity(Req({"jobs": "2", "sort": "name"}))
+    assert list(json.loads(by_name.body)["jobs"]) == ["alpha", "beta"]
+    # composes with `limit` (rows per job)
+    both = await cron._web_get_activity(Req({"jobs": "1", "limit": "3"}))
+    assert json.loads(both.body)["jobs"] == {"zeta": full["zeta"][-3:]}
+    # a capped response tags, varies, 304s and gzips like the default one
+    assert capped.headers["Vary"] == "Accept-Encoding"
+    etag = capped.headers["ETag"]
+    assert etag != by_name.headers["ETag"]
+    revalidated = await cron._web_get_activity(
+        Req({"jobs": "2"}, headers={"If-None-Match": etag})
+    )
+    assert revalidated.status == 304
+    zipped = await cron._web_get_activity(
+        Req({"jobs": "2"}, headers={"Accept-Encoding": "gzip"})
+    )
+    assert zipped.headers["Content-Encoding"] == "gzip"
+    assert gzip.decompress(zipped.body) == capped.body
+
+
+async def test_web_activity_jobs_clamps_and_tolerates_garbage():
+    # the _web_int_query contract: under the minimum clamps to one job,
+    # and an unparseable value falls back to every job
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    cron.run_history["zeta"].append(_heat_run("success", 60))
+    default = await cron._web_get_activity(Req())
+    for raw in ("0", "-3"):
+        resp = await cron._web_get_activity(Req({"jobs": raw}))
+        assert list(json.loads(resp.body)["jobs"]) == ["zeta"]
+    for query in ({"jobs": "many"}, {"jobs": ""}, {"sort": ""}):
+        resp = await cron._web_get_activity(Req(query))
+        assert resp.status == 200
+        assert resp.body == default.body
+
+
+async def test_web_activity_uncapped_requests_share_the_default_product(
+    monkeypatch,
+):
+    # Without `jobs`, and with a `jobs` value that covers every job, the
+    # response is the default one byte for byte, from the shared memo: a
+    # fleet smaller than a dashboard's cap costs one build per window
+    # however many viewers send ?jobs=80.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    cron.run_history["mid"].append(_heat_run("failure", 60))
+    builds = []
+    real_payload = cron.activity_payload
+
+    def counting_payload(*args, **kwargs):
+        builds.append(1)
+        return real_payload(*args, **kwargs)
+
+    monkeypatch.setattr(cron, "activity_payload", counting_payload)
+    default = await cron._web_get_activity(Req())
+    for query in (
+        {"jobs": "4"},
+        {"jobs": "80"},
+        {"sort": "name"},
+        {"jobs": "80", "sort": "name"},
+    ):
+        resp = await cron._web_get_activity(Req(query))
+        assert resp.body == default.body
+        assert resp.headers["ETag"] == default.headers["ETag"]
+    assert len(builds) == 1
+    # a cap that bites is built for its caller and leaves the memo alone
+    stored = cron._activity_response_memo.cached
+    capped = await cron._web_get_activity(Req({"jobs": "3"}))
+    assert len(json.loads(capped.body)["jobs"]) == 3
+    assert len(builds) == 2
+    assert cron._activity_response_memo.cached is stored
+
+
+async def test_web_activity_unknown_sort_is_a_400():
+    # the one enumerated parameter is refused like /schedule/suggest's
+    # `period`: a 400 carrying the error envelope, with or without `jobs`
+    cron = _cron(_ACTIVITY_YAML)
+    for query in ({"sort": "recent"}, {"sort": "NAME", "jobs": "1"}):
+        resp = await cron._web_get_activity(Req(query))
+        assert resp.status == 400
+        assert json.loads(resp.body) == {
+            "error": "sort must be 'name', got {!r}".format(query["sort"])
+        }
+
+
+async def test_web_activity_offload_follows_the_selected_job_count(
+    monkeypatch,
+):
+    # the executor hop is decided by how many jobs the response carries,
+    # so a capped build of a large fleet stays inline
+    import threading
+
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_JOBS_SERIALIZE_OFFLOAD_MIN", 3)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    cron.run_history["zeta"].append(_heat_run("failure", 60))
+    seen = []
+    real_jobs = cronstable.cron._activity_jobs
+
+    def recording_jobs(histories, limit):
+        seen.append((len(histories), threading.get_ident()))
+        return real_jobs(histories, limit)
+
+    monkeypatch.setattr(cronstable.cron, "_activity_jobs", recording_jobs)
+    loop_thread = threading.get_ident()
+    await cron._web_get_activity(Req({"jobs": "3"}))
+    await cron._web_get_activity(Req({"jobs": "2"}))
+    assert [count for count, _ in seen] == [3, 2]
+    assert seen[0][1] != loop_thread  # at the gate: a worker thread
+    assert seen[1][1] == loop_thread  # under it: inline

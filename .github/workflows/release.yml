@@ -3127,7 +3127,7 @@ jobs:
     continue-on-error: ${{ needs.version.outputs.perf == 'ignore' }}
     # A runtime budget; bench.py logs its ten slowest benchmarks for triage.
     # A timeout here is NOT a perf regression.
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -3152,8 +3152,11 @@ jobs:
           # delta. Hard: compare.py refuses a pairing whose sides differ in
           # orjson.
           uv pip install --python .venv-new/bin/python orjson isal
-          # pynacl on BOTH sides, hard: push.seal_500 skips without it.
-          uv pip install --python .venv-new/bin/python pynacl
+          # pynacl and cryptography on BOTH sides, hard: push.seal_500 and
+          # push.fanout_8x100 skip without the first, push.seal_xwing_500
+          # without the second.
+          uv pip install --python .venv-new/bin/python pynacl \
+            "cryptography>=50.0.1,<51"
           # Playwright for webui.* on BOTH sides: a metric that skips on one
           # side is ungated. Best-effort, but then the webui ids in
           # benchmarks/expected_gated.txt fail a release; for a transient
@@ -3172,7 +3175,8 @@ jobs:
             SETUPTOOLS_SCM_PRETEND_VERSION="$prev" \
               uv pip install --python .venv-old/bin/python /tmp/perf-baseline
             # Hard, like the current-side installs above.
-            uv pip install --python .venv-old/bin/python orjson isal pynacl
+            uv pip install --python .venv-old/bin/python orjson isal pynacl \
+              "cryptography>=50.0.1,<51"
             # The Chromium download above is shared, so this adds only the
             # Python package.
             uv pip install --python .venv-old/bin/python playwright || true

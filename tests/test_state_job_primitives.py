@@ -635,6 +635,41 @@ async def test_artifact_prune_keeps_every_live_name(fs_backend):
         await backend.stop()
 
 
+@pytest.mark.parametrize("names", [30, 120])
+async def test_artifact_get_reads_one_record_however_many_names(
+    fs_backend, monkeypatch, names
+):
+    # XCom publishes one name per task instance, so a scope holds as many
+    # names as the run has instances.  Looking up the OLDEST of them reads
+    # the stream once; after that it costs one record read at any size.
+    backend = fs_backend
+    for i in range(names):
+        await jobstate.artifact_put(backend, "s", "n%d" % i, b"v")
+    first = await jobstate.artifact_get_record(backend, "s", "n0")
+    assert first["name"] == "n0"
+    reads = []
+    real = backend._read_record
+
+    def _counted(stream_dir, name, **kwargs):
+        reads.append(name)
+        return real(stream_dir, name, **kwargs)
+
+    monkeypatch.setattr(backend, "_read_record", _counted)
+    for strict in (False, True):
+        del reads[:]
+        rec = await jobstate.artifact_get_record(
+            backend, "s", "n0", strict=strict
+        )
+        assert rec == first
+        assert len(reads) == 1
+        del reads[:]
+        missing = await jobstate.artifact_get_record(
+            backend, "s", "never-published", strict=strict
+        )
+        assert missing is None
+        assert reads == []
+
+
 async def test_artifact_missing_returns_none(fs_backend):
     backend = fs_backend
     assert await jobstate.artifact_get(backend, "s", "nope") is None

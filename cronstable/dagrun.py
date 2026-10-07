@@ -3398,8 +3398,13 @@ class DagScheduler:
         if lease is None:
             return
         try:
-            references = await asyncio.wait_for(
-                backend.list_documents(self._ns(name)), STATE_OP_TIMEOUT
+            # Checked under the run's lease, which recover() also holds
+            # while it creates a recovery run, so a recovery accepted at any
+            # moment before this point is visible here.  Only a recovery
+            # run's own document can be "preparing", and its key carries
+            # the "recovery-" prefix.
+            references = await self._documents_keyed(
+                backend, self._ns(name), "recovery-"
             )
             if any(
                 (b.get("recovery") or {}).get("status") == "preparing"
@@ -3407,9 +3412,8 @@ class DagScheduler:
                 for b in references
             ):
                 return
-            batches = await asyncio.wait_for(
-                backend.list_documents("recoverybatch/" + name),
-                STATE_OP_TIMEOUT,
+            batches = await self._documents_keyed(
+                backend, "recoverybatch/" + name
             )
             if any(
                 not batch.get("complete")
@@ -3426,6 +3430,36 @@ class DagScheduler:
             await asyncio.wait_for(
                 backend.release_lease(lease), STATE_OP_TIMEOUT
             )
+
+    @staticmethod
+    async def _documents_keyed(
+        backend: StateBackend, namespace: str, prefix: str = ""
+    ) -> list[dict[str, Any]]:
+        """The documents of ``namespace`` whose key starts with ``prefix``.
+
+        One keys-only listing, then one read per matching key, so a
+        namespace that holds no such document costs a directory listing
+        and no parse.  A backend that cannot list keys answers with every
+        document of the namespace, a superset the caller's own test
+        narrows.
+        """
+        keys = await asyncio.wait_for(
+            backend.list_document_keys(namespace), STATE_OP_TIMEOUT
+        )
+        if keys is None:
+            return await asyncio.wait_for(
+                backend.list_documents(namespace), STATE_OP_TIMEOUT
+            )
+        bodies = []
+        for key in keys:
+            if not key.startswith(prefix):
+                continue
+            body = await asyncio.wait_for(
+                backend.read_document(namespace, key), STATE_OP_TIMEOUT
+            )
+            if body is not None:
+                bodies.append(body)
+        return bodies
 
     async def _delete_run_locked(
         self,
