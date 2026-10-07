@@ -36,7 +36,7 @@ async def failed_flow(factory, tmp_path):
     templates["upload"].command = [
         sys.executable, "-c", f"from pathlib import Path; assert Path({str(marker)!r}).exists()",
     ]
-    key = await cron._dag.trigger_run("flow")
+    key = (await cron._dag.trigger("flow"))["runKey"]
     body = await _drive(cron, "flow", key)
     assert body["state"] == "failed"
     return cron, key, body, marker
@@ -111,7 +111,7 @@ async def test_mapped_recovery_preserves_successful_instances(dag_cron, tmp_path
     _set_cmd(cron, "fan", "gen", [sys.executable, "-m", "cronstable", "xcom", "push", "--key", "items", str(items)])
     _set_cmd(cron, "fan", "work", [sys.executable, "-c",
         f"import os; from pathlib import Path; assert os.environ['CRONSTABLE_DAG_MAP_INDEX'] == '0' or Path({str(ready)!r}).exists()"])
-    key = await cron._dag.trigger_run("fan")
+    key = (await cron._dag.trigger("fan"))["runKey"]
     source = await _drive(cron, "fan", key)
     assert source["tasks"]["work#0"]["state"] == "success"
     assert source["tasks"]["work#1"]["state"] == "failed"
@@ -367,7 +367,7 @@ async def _failed_branch(dag_cron, tmp_path):
         f"from pathlib import Path; assert Path({str(ready)!r}).exists()",
     ])
     _set_cmd(cron, "load", "incremental", _exit(99))
-    key = await cron._dag.trigger_run("load")
+    key = (await cron._dag.trigger("load"))["runKey"]
     source = await _drive(cron, "load", key)
     assert source["state"] == "failed"
     assert source["tasks"]["incremental"]["state"] == "skipped"

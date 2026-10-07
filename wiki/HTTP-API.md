@@ -570,7 +570,8 @@ The `409` for a disabled job is deliberate: a disabled job behaves as if it is
 not there, so the API refuses to launch it manually rather than overriding the
 config.
 
-The body is optional. For a job that declares
+The body is optional. When present, it is a JSON object, and `params` is the
+only field it takes. For a job that declares
 [run parameters](Commands-and-Environment#params), `{"params": {...}}` supplies values, each in its
 declared JSON type, and the answer lists the values the run takes:
 
@@ -584,15 +585,20 @@ declared JSON type, and the answer lists the values the run takes:
   refuses any value.
 - A non-empty `params` object needs the `params` scope in addition to
   `control`, and a token without it gets `403`.
-- A body that is not a JSON object, or a JSON object without `params`,
-  starts the job with its defaults.
+- A body that is not a JSON object, and one that holds any other field,
+  answers `400` and starts nothing. A request that misspells `params` is
+  refused, so the job does not run with its defaults in place of the values
+  the request meant to send.
 - The `202` of a pooled job carries `params` as well, and the queue entry
   keeps the values until the pool admits the run.
 
 Manual launch goes through `maybe_launch_job`, so the job's `concurrencyPolicy`
-applies. If an instance is already running, `Allow` starts another, `Forbid` does
-not start a new one (the `200` still returns), and `Replace` cancels the running
-instance(s) first. See [concurrency and timeouts](Concurrency-and-Timeouts).
+applies. If an instance is already running, `Allow` starts another and
+`Replace` cancels the running instance(s) first. `Forbid` starts nothing and
+answers `409` with the reason, and so does a
+[cluster concurrency slot](Concurrency-and-Timeouts#concurrency-across-a-cluster)
+that another node holds. A `200` means that a run started. See
+[concurrency and timeouts](Concurrency-and-Timeouts).
 
 ### `POST /jobs/{name}/cancel`
 
@@ -1180,8 +1186,10 @@ presenting a token.
 fields to check whether another address reaches the same daemon.
 
 A companion app uses it to show what it may do. The dashboard uses it to warn
-when its pairing QR would hand a phone the all-scopes token (see
-[push notifications](Push-Notifications)). Requires the `view` scope.
+when its pairing QR would hand a phone a token that passes every route's
+check: one that holds `view`, `control`, and `approve`, with or without
+`params` (see [push notifications](Push-Notifications)). Requires the `view`
+scope.
 
 When no token is configured there is no auth middleware and no token to
 describe: `authenticated` is `false`, `label` is `null`, `scopes` lists every

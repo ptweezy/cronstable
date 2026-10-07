@@ -546,6 +546,15 @@ def test_declaration_rejections(body, match):
         _specs(_one_param(body))
 
 
+def test_a_secret_word_earlier_in_a_name_loads():
+    # the name the secret-name error itself suggests, and a common counter
+    for name in ("secret_name", "max_tokens"):
+        (spec,) = _specs(
+            _one_param("      - name: {}\n        default: a\n".format(name))
+        )
+        assert spec.name == name
+
+
 def test_a_scheduled_workflow_cannot_require_a_parameter():
     body = "      - name: v\n        required: true\n"
     # a manual-only workflow can
@@ -655,7 +664,7 @@ async def test_trigger_refuses_values_and_creates_no_run(dag_cron):
     }
     # the required parameter has no default, so a bare trigger is refused too
     with pytest.raises(params.ParamError, match="invalid parameters"):
-        await cron._dag.trigger_run("deploy")
+        await cron._dag.trigger("deploy")
     assert await cron._dag.list_runs("deploy") == []
     assert await cron._dag.trigger("ghost", params={"x": 1}) is None
 
@@ -700,6 +709,20 @@ async def test_trigger_logical_date_is_stored_in_utc(dag_cron):
     assert dagrun._parse_iso("2026-10-01T00:00:00z") == dagrun._parse_iso(
         "2026-10-01T00:00:00+00:00"
     )
+
+
+async def test_trigger_checks_the_arguments_a_request_carried(dag_cron):
+    cron = await dag_cron(_PLAIN)
+    for bad in (5, ["2026-10-01"]):
+        with pytest.raises(dagrun.TriggerInputError, match="ISO 8601"):
+            await cron._dag.trigger("plain", logical_date=bad)
+    for bad in ("", "x" * 201, 7):
+        with pytest.raises(
+            dagrun.TriggerInputError, match="1 to 200 characters"
+        ):
+            await cron._dag.trigger("plain", request_id=bad)
+    assert await cron._dag.list_runs("plain") == []
+    assert (await cron._dag.trigger("plain", request_id="x" * 200))["created"]
 
 
 async def test_trigger_request_id_returns_the_first_run(dag_cron):
@@ -1192,36 +1215,76 @@ async def test_http_params_scope(dag_cron):
 
 
 def test_params_scope_model():
-    assert WEB_PARAMS_SCOPE == "params"
+    assert WEB_PARAMS_SCOPE == params.SCOPE == "params"
     assert WEB_PARAMS_SCOPE in _WEB_ALL_SCOPES
     # like `control` and `approve`, it implies `view` and nothing else
     assert _effective_web_scopes(["params"]) == {"params", "view"}
-    # a token issued with the three earlier scopes gains nothing
+    # a token that lists the other three scopes does not hold it
     assert "params" not in _effective_web_scopes(
         ["view", "control", "approve"]
     )
 
 
-async def test_web_run_params_reads_the_matched_token(dag_cron):
-    cron = await dag_cron(_NIGHTLY, web=True)
+def test_for_run_checks_the_callers_scopes_before_it_reads_the_values():
+    specs = _specs(_NIGHTLY)
+    subject = "workflow 'nightly'"
+    defaults = {"mode": "incremental", "limit": 10}
+    # no token restricts the caller: every action is open, this one included
+    assert params.for_run(specs, {"limit": 3}, subject) == {
+        **defaults,
+        "limit": 3,
+    }
+    # a token without the scope starts runs with the defaults
+    control = _effective_web_scopes(["control"])
+    assert params.for_run(specs, None, subject, control) == defaults
+    assert params.for_run(specs, {}, subject, control) == defaults
+    # and is refused before a value is read, so an undeclared name answers
+    # like a declared one
+    for supplied in ({"limit": 3}, {"x": 1}):
+        with pytest.raises(params.ParamScopeError) as err:
+            params.for_run(specs, supplied, subject, control)
+        assert "'params' scope" in str(err.value) and not err.value.errors
+    both = _effective_web_scopes(["control", "params"])
+    assert params.for_run(specs, {"limit": 3}, subject, both)["limit"] == 3
+    # a `params` member that is not an object is refused for every caller
+    for scopes in (None, control, both):
+        with pytest.raises(params.ParamError, match="must be an object"):
+            params.for_run(specs, ["a"], subject, scopes)
+    # nothing declared and nothing supplied stores no map
+    assert params.for_run((), None, "job 'plain'") is None
+    assert params.for_run((), {}, "job 'plain'", control) is None
 
-    def request(scopes):
-        token = _WebToken(b"t", _effective_web_scopes(scopes), "lbl")
-        return Req(storage={WEB_TOKEN_REQUEST_KEY: token})
 
-    assert cron._web_run_params(Req(), {}) is None
-    # no auth middleware: every action is open, this one included
-    assert cron._web_run_params(Req(), {"params": {"a": 1}}) == {"a": 1}
-    assert cron._web_run_params(request(["control"]), {"params": {}}) == {}
-    assert cron._web_run_params(
-        request(["control", "params"]), {"params": {"a": 1}}
-    ) == {"a": 1}
+async def test_web_param_error_answers_403_for_the_scope_and_400_otherwise(
+    dag_cron,
+):
     from aiohttp import web
 
-    with pytest.raises(web.HTTPForbidden):
-        cron._web_run_params(request(["control"]), {"params": {"a": 1}})
-    with pytest.raises(web.HTTPBadRequest):
-        cron._web_run_params(request(["control", "params"]), {"params": 1})
+    cron = await dag_cron(_NIGHTLY, web=True)
+    token = _WebToken(b"t", _effective_web_scopes(["control"]), "ci")
+    request = Req(storage={WEB_TOKEN_REQUEST_KEY: token})
+    assert cron._web_scopes(request) == {"control", "view"}
+    assert cron._web_scopes(Req()) is None
+    with pytest.raises(web.HTTPForbidden) as err:
+        cron._web_param_error(request, params.ParamScopeError("refused"))
+    assert json.loads(err.value.text)["error"] == (
+        "token 'ci' does not grant the 'params' permission required to "
+        "supply run parameters"
+    )
+    refused = params.ParamError("invalid", {"limit": "must be an integer"})
+    response = cron._web_param_error(request, refused)
+    assert response.status == 400
+    assert json.loads(response.body) == {
+        "error": "invalid",
+        "paramErrors": {"limit": "must be an integer"},
+    }
+    with pytest.raises(web.HTTPBadRequest) as bad:
+        cron._web_known_fields(
+            {"parmas": {}, "to": 1}, "backfill", "from", "to"
+        )
+    assert json.loads(bad.value.text)["error"] == (
+        'unknown backfill field "parmas"; the body accepts from, to'
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1310,7 +1373,7 @@ def test_configuration_revision_reads_the_declaration():
         "        default: 10\n        description: Rows per batch\n",
     )
     assert revision(described) == base
-    # a workflow that declares nothing digests the bare task list, as before
+    # a workflow that declares nothing digests the bare task list
     # parameters existed
     without = _NIGHTLY[: _NIGHTLY.index("    params:")] + (
         "    tasks:\n      - id: load\n        command: 'x'\n"

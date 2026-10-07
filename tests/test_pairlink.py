@@ -499,6 +499,23 @@ def test_notes_flag_an_all_scopes_token():
     ]
 
 
+def test_notes_flag_a_token_that_passes_every_route_without_params():
+    # `params` adds only the choice of run parameter values, so a token
+    # that lacks it still reaches every route
+    routes = dict(ADMIN, allScopes=False)
+    assert [short for short, _ in pairlink.notes(routes)] == [
+        "full-access token"
+    ]
+    every = dict(ADMIN, scopes=["approve", "control", "params", "view"])
+    assert [short for short, _ in pairlink.notes(every)] == [
+        "full-access token"
+    ]
+    # one route scope short is a scoped token
+    assert pairlink.notes(dict(PHONE, scopes=["approve", "control"])) == []
+    # a damaged scope list reads as one too
+    assert pairlink.notes(dict(PHONE, scopes=[["approve"], "control"])) == []
+
+
 def test_notes_flag_an_unauthenticated_connection():
     [(short, sentence)] = pairlink.notes(OPEN)
     assert short == "no access token"

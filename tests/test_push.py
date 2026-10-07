@@ -3039,7 +3039,7 @@ async def test_all_scopes_token_reports_all_scopes():
     body = json.loads((await cron._web_whoami(_Req(token=token))).body)
     assert body["allScopes"] is True
     assert body["sealableSuites"] == _sealable_now()
-    # a token issued with the three earlier scopes lacks `params`
+    # a token that lists the other three scopes lacks `params`
     token = _WebToken(
         b"t", frozenset({"view", "control", "approve"}), "three-scopes"
     )

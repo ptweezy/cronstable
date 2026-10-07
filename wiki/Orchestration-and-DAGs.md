@@ -78,6 +78,11 @@ upstream reaches a terminal state, then reads those states:
 | `none_failed_min_one_success` | no upstream failed and at least one succeeded | an upstream failure makes it `upstream_failed`, and it is `skipped` when every upstream was skipped |
 | `all_done_min_one_failed` | at least one upstream failed | it is `skipped` |
 
+`none_failed_min_one_success` and `all_done_min_one_failed` count upstream
+outcomes, so a task that uses either needs at least one `dependsOn` entry. A
+task with one of these rules and no `dependsOn` is a configuration error at
+load.
+
 [Conditional branching](#conditional-branching) shows the last three rules
 in use.
 
@@ -655,9 +660,11 @@ different credential, pass the secret's name as a parameter and let the task
 resolve it.
 
 A parameter name that reads as a secret is a configuration error. That is a
-name that contains one of these words, in any letter case and with or
+name that ends with one of these words, in any letter case and with or
 without the underscore: `password`, `passwd`, `pwd`, `secret`, `token`,
-`credential`, `api_key`, `access_key`, `private_key`, or `rediscli_auth`.
+`credential`, `api_key`, `access_key`, `secret_key`, `private_key`, or
+`rediscli_auth`. A name that only starts with or contains one of them, such
+as `secret_name` or `max_tokens`, describes its value and loads.
 
 A workflow that declares `params:` needs run engine level 2 (see
 [run engine levels](#run-engine-levels)).

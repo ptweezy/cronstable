@@ -25,7 +25,7 @@ from tests.conftest import Req, _cron
 
 # ===================================================================
 # Job start/pause/resume, SLA, and the cross-node retry claim machinery
-# (start_job_by_name, pause/resume, pause-store refresh, SLA banking/
+# (start_job, pause/resume, pause-store refresh, SLA banking/
 # observations/report, and the cross-node retry claim/consume machinery)
 # ===================================================================
 
@@ -67,13 +67,13 @@ def _retryclaim_foreign(cron, job, host="node-a", secs_stale=120):
     }
 
 
-# --- start_job_by_name ----------------------------------------------------
+# --- start_job ------------------------------------------------------------
 
 
 async def test_retryclaim_start_job_unknown_raises_404():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     with pytest.raises(cronstable.cron.ApiActionError) as ei:
-        await cron.start_job_by_name("ghost")
+        await cron.start_job("ghost")
     assert ei.value.status == 404
 
 
@@ -91,10 +91,13 @@ async def test_retryclaim_start_job_counts_as_pause_deferred_boot_run(monkeypatc
 
     monkeypatch.setattr(cron, "_reboot_boot_gate", _gate)
     launched = []
-    monkeypatch.setattr(
-        cron, "maybe_launch_job", lambda j: launched.append(j.name) or _noop()
-    )
-    await cron.start_job_by_name("alpha")
+
+    async def _launch(job, **kwargs):
+        launched.append(job.name)
+        return True
+
+    monkeypatch.setattr(cron, "maybe_launch_job", _launch)
+    await cron.start_job("alpha")
     assert "alpha" not in cron._paused_reboot_jobs
     assert gated == ["alpha"]
     assert launched == ["alpha"]

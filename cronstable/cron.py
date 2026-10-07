@@ -24,7 +24,13 @@ import ssl
 import time
 import zlib
 from collections import defaultdict, deque
-from collections.abc import Awaitable, Callable, Coroutine, Iterable
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Iterable,
+)
 from dataclasses import dataclass, field
 from functools import lru_cache, partial, wraps
 from typing import (
@@ -111,7 +117,7 @@ from cronstable.job import (
     schedule_string,
 )
 from cronstable.leadership import LeadershipBackend, make_backend
-from cronstable.params import ParamError
+from cronstable.params import ParamError, ParamScopeError
 from cronstable.pools import PoolError, PoolScheduler, Ticket
 from cronstable.prometheus import (
     CONTENT_TYPE_OPENMETRICS,
@@ -360,10 +366,9 @@ WEB_ORIGIN_EXEMPT_PATHS = frozenset({"/mcp"})
 _WEB_ALL_SCOPES = frozenset(WEB_TOKEN_SCOPES)
 
 # The scope a caller holds, on top of the route's own, to choose run
-# parameter values on a trigger or a backfill. No route requires it by
-# itself: the handlers check it (Cron._web_run_params), and so do the MCP
-# twins of those routes.
-WEB_PARAMS_SCOPE = "params"
+# parameter values. No route requires it by itself: the methods that start
+# runs check it where they resolve the values (cronstable.params.for_run).
+WEB_PARAMS_SCOPE = run_params.SCOPE
 
 # Routes whose required scope differs from the method default (safe method
 # -> `view`, else `control`), keyed by canonical path. Unlisted routes use
@@ -3695,10 +3700,11 @@ class Cron:
 
         Label and scopes of the matched token (filed by the auth
         middleware), so the dashboard can warn when its pairing QR would
-        hand a phone the all-scopes token, and a companion app can show
-        what it is allowed to do. With no auth middleware installed
-        there is no token to describe: ``authenticated`` is false and
-        every scope is effectively granted. A request served through
+        hand a phone a token that passes every route's check, and a
+        companion app can show what it is allowed to do. With no auth
+        middleware installed there is no token to describe:
+        ``authenticated`` is false and every scope is effectively
+        granted. A request served through
         web.anonymousScopes is also unauthenticated, but reports the
         granted scope set under the reserved label ``anonymous`` with
         ``allScopes`` false, the discriminator clients key on. Every
@@ -4610,51 +4616,30 @@ class Cron:
             request.match_info["name"], request
         )
 
-    async def start_job_by_name(self, name: str) -> str | None:
-        """Launch a job now with its default parameters.
-
-        :meth:`start_job` without values: returns the pool queue ID of a
-        job in a pool, and ``None`` for a job that started at once.
-        """
-        queued: str | None = (await self.start_job(name))["queued"]
-        return queued
-
-    @staticmethod
-    def _job_run_params(
-        job: JobConfig, supplied: dict[str, Any] | None = None
-    ) -> dict[str, Any] | None:
-        """The parameter values a run of ``job`` takes.
-
-        ``supplied`` checked against the job's ``params`` declaration, with
-        the defaults filled in. ``None`` for a job that declares none and is
-        given none. Raises :class:`~cronstable.params.ParamError` for values
-        the declaration refuses, which includes any value for a job that
-        declares no parameters.
-        """
-        declared = getattr(job, "params", ())
-        if not declared and not supplied:
-            return None
-        return run_params.resolve(
-            declared, supplied or {}, "job {!r}".format(job.name)
-        )
-
     async def start_job(
-        self, name: str, params: dict[str, Any] | None = None
+        self,
+        name: str,
+        params: Any = None,
+        *,
+        scopes: Collection[str] | None = None,
     ) -> dict[str, Any]:
         """Launch a job now (`POST /jobs/{name}/start`, MCP `cron_run_job`).
 
         Raises :class:`ApiActionError` for an unknown (404) or disabled (409)
         job; otherwise honors the job's concurrencyPolicy exactly as the
-        scheduler would.  A PAUSED job may still be started manually: a pause
+        scheduler would, and raises one (409) when that policy admits no
+        run.  A PAUSED job may still be started manually: a pause
         skips scheduled fires only, and the operator asking by hand is the
         operator overriding their own pause (unlike `enabled: false`, which
         is config the API must not silently override).
 
-        ``params`` supplies values for the run parameters the job declares.
-        They are checked before anything else happens, and refused values
-        raise :class:`~cronstable.params.ParamError` and start nothing. A
-        start that supplies values is one attempt: it stays outside the
-        job's retry ladder, whose retries run with the defaults like the
+        ``params`` supplies values for the run parameters the job declares,
+        and ``scopes`` are the scopes of the caller's token (see
+        :func:`cronstable.params.for_run`). The values are checked before
+        anything else happens, and refused values raise
+        :class:`~cronstable.params.ParamError` and start nothing. A start
+        that supplies values is one attempt: it stays outside the job's
+        retry ladder, whose retries run with the defaults like the
         scheduled runs they repeat.
 
         Returns ``queued``, the pool queue ID or ``None`` for a job that
@@ -4673,7 +4658,9 @@ class Cron:
             raise ApiActionError(
                 "job {!r} is disabled".format(name), status=409
             )
-        resolved = self._job_run_params(job, params)
+        resolved = run_params.for_run(
+            getattr(job, "params", ()), params, "job {!r}".format(name), scopes
+        )
         # a start with no values runs as a scheduled run would, so only
         # supplied values travel with the launch
         chosen = resolved if params else None
@@ -4725,10 +4712,14 @@ class Cron:
                 raise ApiActionError(
                     "pool state is unavailable", status=503
                 ) from ex
-        elif chosen is None:
-            await self.maybe_launch_job(job)
-        else:
-            await self.maybe_launch_job(job, with_retries=False, params=chosen)
+        if not await self.maybe_launch_job(
+            job, with_retries=chosen is None, params=chosen
+        ):
+            raise ApiActionError(
+                "job {!r} was not started: its concurrencyPolicy ({}) "
+                "admitted no new run".format(name, job.concurrencyPolicy),
+                status=409,
+            )
         return {"queued": None, "params": resolved}
 
     async def cancel_job_by_name(self, name: str) -> int:
@@ -5452,21 +5443,15 @@ class Cron:
     @_maps_action_errors
     async def _web_start_job(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
-        supplied: dict[str, Any] | None = None
-        if request.can_read_body:
-            # The body is optional. A JSON object can carry `params`; any
-            # other body starts the job with its defaults, as a request
-            # with no body does.
-            try:
-                body = await request.json()
-            except Exception:  # noqa: BLE001 - a body this route ignores
-                body = None
-            if isinstance(body, dict):
-                supplied = self._web_run_params(request, body)
+        # The body is optional, and a JSON object when present.
+        payload = await self._web_json_body(request)
+        self._web_known_fields(payload, "start", "params")
         try:
-            started = await self.start_job(name, supplied)
+            started = await self.start_job(
+                name, payload.get("params"), scopes=self._web_scopes(request)
+            )
         except ParamError as ex:
-            return self._web_param_error(ex)
+            return self._web_param_error(request, ex)
         # the values the run takes, for a job that declares parameters
         values = (
             {} if started["params"] is None else {"params": started["params"]}
@@ -6314,41 +6299,54 @@ class Cron:
         )
         return _json_response(payload, headers=self._web_headers())
 
-    def _web_run_params(
-        self, request: web.Request, payload: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        """The ``params`` map of a trigger or backfill body, or ``None``.
+    @staticmethod
+    def _web_scopes(request: web.Request) -> frozenset[str] | None:
+        """The scopes of the token that authenticated ``request``.
 
-        Choosing values needs the ``params`` scope on top of the route's
-        ``control``: a token without it answers ``403`` to a non-empty map
-        and starts runs with the declared defaults. A listener with no
-        token configured accepts values, as it accepts every action.
+        ``None`` on a listener with no token configured, which accepts
+        every action.
         """
-        supplied = payload.get("params")
-        if supplied is None:
-            return None
-        if not isinstance(supplied, dict):
-            raise _api_error(
-                web.HTTPBadRequest, "params must be a JSON object"
-            )
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
-        if (
-            supplied
-            and matched is not None
-            and WEB_PARAMS_SCOPE not in matched.scopes
-        ):
+        return None if matched is None else matched.scopes
+
+    @staticmethod
+    def _web_known_fields(
+        payload: dict[str, Any], action: str, *known: str
+    ) -> None:
+        """Refuse a body that holds a field ``action`` does not take.
+
+        A misspelled ``params`` would otherwise be dropped, and the run
+        would start with the defaults.
+        """
+        unknown = sorted(set(payload) - set(known))
+        if unknown:
+            raise _api_error(
+                web.HTTPBadRequest,
+                "unknown {} field {}; the body accepts {}".format(
+                    action,
+                    ", ".join(json.dumps(key)[:80] for key in unknown[:5]),
+                    ", ".join(known),
+                ),
+            )
+
+    def _web_param_error(
+        self, request: web.Request, ex: ParamError
+    ) -> web.Response:
+        """Answer refused parameters.
+
+        Raises the ``403`` for a token that may not choose values.
+        Otherwise returns the ``400``: the error envelope plus
+        ``paramErrors``, the reason for each offending name.
+        """
+        matched = request.get(WEB_TOKEN_REQUEST_KEY)
+        if isinstance(ex, ParamScopeError) and matched is not None:
             raise _api_error(
                 web.HTTPForbidden,
                 "token {!r} does not grant the {!r} permission required to "
                 "supply run parameters".format(
                     matched.label, WEB_PARAMS_SCOPE
                 ),
-            )
-        return supplied
-
-    def _web_param_error(self, ex: ParamError) -> web.Response:
-        """The ``400`` for refused parameters: the error envelope plus
-        ``paramErrors``, the reason for each offending name."""
+            ) from ex
         return _json_response(
             {"error": str(ex), "paramErrors": ex.errors},
             status=400,
@@ -6358,40 +6356,21 @@ class Cron:
     async def _web_dag_trigger(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
         payload = await self._web_json_body(request)
-        unknown = sorted(set(payload) - {"params", "logicalDate", "requestId"})
-        if unknown:
-            raise _api_error(
-                web.HTTPBadRequest,
-                "unknown trigger field {}; the body accepts params, "
-                "logicalDate, and requestId".format(
-                    ", ".join(json.dumps(key)[:80] for key in unknown[:5])
-                ),
-            )
-        logical = payload.get("logicalDate")
-        if logical is not None and not isinstance(logical, str):
-            raise _api_error(
-                web.HTTPBadRequest, "logicalDate must be an ISO 8601 string"
-            )
-        request_id = payload.get("requestId")
-        if request_id is not None and not (
-            isinstance(request_id, str) and 1 <= len(request_id) <= 200
-        ):
-            raise _api_error(
-                web.HTTPBadRequest,
-                "requestId must be a string of 1 to 200 characters",
-            )
-        params = self._web_run_params(request, payload)
+        self._web_known_fields(
+            payload, "trigger", "params", "logicalDate", "requestId"
+        )
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         try:
             result = await self._dag.trigger(
                 name,
-                params=params,
-                logical_date=logical,
-                request_id=request_id,
+                params=payload.get("params"),
+                logical_date=payload.get("logicalDate"),
+                request_id=payload.get("requestId"),
                 triggered_by=None if matched is None else matched.label,
+                scopes=self._web_scopes(request),
             )
         except ParamError as ex:
-            return self._web_param_error(ex)
+            return self._web_param_error(request, ex)
         except TriggerInputError as ex:
             raise _api_error(web.HTTPBadRequest, str(ex)) from ex
         except TriggerConflict as ex:
@@ -6518,29 +6497,21 @@ class Cron:
                 web.HTTPBadRequest,
                 "backfill needs string `from` and `to` ISO dates",
             )
-        # A misspelled `params` would otherwise create every run with the
-        # defaults, and those dates then keep them.
-        unknown = sorted(set(payload) - {"from", "to", "params"})
-        if unknown:
-            raise _api_error(
-                web.HTTPBadRequest,
-                "unknown backfill field {}; the body accepts from, to, and "
-                "params".format(
-                    ", ".join(json.dumps(key)[:80] for key in unknown[:5])
-                ),
-            )
-        params = self._web_run_params(request, payload)
+        # A dropped `params` would create every run with the defaults, and
+        # those dates then keep them.
+        self._web_known_fields(payload, "backfill", "from", "to", "params")
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         try:
             result = await self._dag.backfill(
                 name,
                 start,
                 end,
-                params=params,
+                params=payload.get("params"),
                 triggered_by=None if matched is None else matched.label,
+                scopes=self._web_scopes(request),
             )
         except ParamError as ex:
-            return self._web_param_error(ex)
+            return self._web_param_error(request, ex)
         if not result.get("ok"):
             raise _api_error(web.HTTPBadRequest, str(result.get("reason")))
         return _json_response(result, headers=self._web_headers())
@@ -8428,27 +8399,41 @@ class Cron:
                 backend.list_stream_names(MANIFEST_STREAM_PREFIX),
                 timeout=STATE_OP_TIMEOUT,
             )
-            for stream in sorted(streams)[:MANIFEST_HOSTS_CAP]:
-                if stream == own:
-                    continue
-                records = await asyncio.wait_for(
-                    backend.list_records(stream, limit=1, newest_first=True),
-                    timeout=STATE_OP_TIMEOUT,
+            names = [
+                stream
+                for stream in sorted(streams)[:MANIFEST_HOSTS_CAP]
+                if stream != own
+            ]
+            # a batch at a time, so a large fleet costs a few store round
+            # trips and a hung mount about one STATE_OP_TIMEOUT per batch
+            for start in range(0, len(names), _REHYDRATE_CONCURRENCY):
+                batch = names[start : start + _REHYDRATE_CONCURRENCY]
+                newest = await asyncio.gather(
+                    *(
+                        asyncio.wait_for(
+                            backend.list_records(
+                                stream, limit=1, newest_first=True
+                            ),
+                            timeout=STATE_OP_TIMEOUT,
+                        )
+                        for stream in batch
+                    )
                 )
-                if not records:
-                    continue
-                record = records[0]
-                at = _parse_iso_utc(record.get("at"))
-                if (
-                    at is None
-                    or (now - at).total_seconds() > MANIFEST_LIVE_SECONDS
-                ):
-                    continue
-                host = record.get("host")
-                if not isinstance(host, str) or not host:
-                    host = stream[len(MANIFEST_STREAM_PREFIX) :]
-                level = record.get("dagEngine", base)
-                peers[host] = level if type(level) is int else base
+                for stream, records in zip(batch, newest, strict=True):
+                    if not records:
+                        continue
+                    record = records[0]
+                    at = _parse_iso_utc(record.get("at"))
+                    if (
+                        at is None
+                        or (now - at).total_seconds() > MANIFEST_LIVE_SECONDS
+                    ):
+                        continue
+                    host = record.get("host")
+                    if not isinstance(host, str) or not host:
+                        host = stream[len(MANIFEST_STREAM_PREFIX) :]
+                    level = record.get("dagEngine", base)
+                    peers[host] = level if type(level) is int else base
         except Exception as ex:  # noqa: BLE001 - advisory; retried later
             logger.debug("state: cannot read the peer manifests: %s", ex)
             return None
@@ -11103,7 +11088,10 @@ class Cron:
         """
         if job.pool is not None and pool_ticket is None:
             await self._pools.enqueue_job(
-                job, with_retries=with_retries, catchup_after=catchup_after
+                job,
+                with_retries=with_retries,
+                catchup_after=catchup_after,
+                params=params,
             )
             return True
         async with self._launch_locks[job.name]:
@@ -11130,8 +11118,9 @@ class Cron:
         job: JobConfig,
         pool_ticket: Ticket | None,
         params: dict[str, Any] | None,
-    ) -> dict[str, Any] | None:
-        """The parameter values one launch of ``job`` runs with.
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """The parameter values one launch of ``job`` runs with, and
+        whether a manual start supplied them.
 
         ``None`` for a job that declares no parameters. The values a manual
         start supplied arrive as ``params``, or in the pool entry that
@@ -11141,14 +11130,17 @@ class Cron:
         """
         declared = getattr(job, "params", ())
         if not declared:
-            return None
+            return None, False
         if pool_ticket is not None:
             queued = pool_ticket.payload.get("params")
             if isinstance(queued, dict):
                 params = queued
         if params is not None:
-            return params
-        return run_params.resolve(declared, {}, "job {!r}".format(job.name))
+            return params, True
+        defaults = run_params.resolve(
+            declared, {}, "job {!r}".format(job.name)
+        )
+        return defaults, False
 
     async def _launch_job_locked(
         self,
@@ -11225,17 +11217,7 @@ class Cron:
                 retry_state.count = saved["count"]
                 retry_state.pool_retry = pool_ticket.payload.get("retryGuard")
                 self.retry_state[job.name] = retry_state
-        values = self._launch_params(job, pool_ticket, params)
-        # passed only when set, so a launch with neither calls
-        # _prepare_job_api_run exactly as it always has
-        optional: dict[str, Any] = {
-            key: value
-            for key, value in (
-                ("pool_ticket", pool_ticket),
-                ("params", values),
-            )
-            if value is not None
-        }
+        values, supplied = self._launch_params(job, pool_ticket, params)
         run_token: str | None = None
         try:
             # register with the loopback state API BEFORE the child
@@ -11246,7 +11228,7 @@ class Cron:
             # spawn. Cancellation cannot strand a registered token: the
             # await in _prepare_job_api_run precedes register_run.
             run_token, extra_env = await self._prepare_job_api_run(
-                job, retry_state, **optional
+                job, retry_state, pool_ticket=pool_ticket, params=values
             )
             running_job = RunningJob(
                 job,
@@ -11256,6 +11238,7 @@ class Cron:
                 run_id=extra_env.get("CRONSTABLE_RUN_ID"),
             )
             running_job.params = values
+            running_job.supplied_params = supplied
             running_job.pool_ticket = pool_ticket
             if pool_ticket is not None:
                 pool_ticket.running = running_job
@@ -14746,7 +14729,10 @@ class Cron:
         )
 
     async def handle_job_success(self, job: RunningJob) -> None:
-        await self.cancel_job_retries(job.config.name, settle="succeeded")
+        # a run with supplied values says nothing about the default-valued
+        # run a pending retry repeats, so it leaves the ladder as it is
+        if not getattr(job, "supplied_params", False):
+            await self.cancel_job_retries(job.config.name, settle="succeeded")
         await job.report_success()
 
     @staticmethod

@@ -20,6 +20,7 @@ import pytest
 from cronstable import fingerprint, params
 from cronstable.config import ConfigError, parse_config_string
 from cronstable.cron import (
+    ApiActionError,
     Cron,
     JobRunInfo,
     _job_run_info_from_dict,
@@ -228,9 +229,6 @@ async def test_a_start_with_no_values_uses_the_defaults(dag_cron):
             "CRONSTABLE_PARAM_REGION": "eu",
             "CRONSTABLE_PARAM_ROWS": "100",
         }
-    # the wrapper the scheduler-side callers use
-    assert await cron.start_job_by_name("report") is None
-    await _finish(cron)
     assert cron.last_run["report"].params == _DEFAULTS
 
 
@@ -276,7 +274,7 @@ async def test_a_job_with_no_declaration_takes_no_values(dag_cron):
     assert str(err.value) == "job 'plain' declares no parameters"
     assert err.value.errors == {"region": "is not a declared parameter"}
     assert not cron.running_jobs
-    # with none, it starts as it always has and records no values
+    # with none, it starts and records no values
     assert await cron.start_job("plain", {}) == {"queued": None, "params": None}
     (running,) = cron.running_jobs["plain"]
     assert running.params is None
@@ -291,7 +289,7 @@ async def test_a_start_with_values_stays_outside_the_retry_ladder(dag_cron):
     ladder = JobRetryState(1.0, 2.0, 60.0)
     ladder.count = 1
     cron.retry_state["report"] = ladder
-    # no values: the run is one more attempt of the ladder, as before
+    # no values: the run is one more attempt of the ladder
     await cron.start_job("report")
     (running,) = cron.running_jobs["report"]
     assert running.retry_state is ladder and running.params == _DEFAULTS
@@ -306,6 +304,53 @@ async def test_a_start_with_values_stays_outside_the_retry_ladder(dag_cron):
     cron.running_jobs["report"].remove(running)
     assert cron.retry_state["report"] is ladder and ladder.count == 1
     cron.retry_state.pop("report")
+
+
+async def test_a_successful_start_with_values_leaves_the_retry_ladder(
+    dag_cron,
+):
+    cron = await _cron(dag_cron)
+    ladder = JobRetryState(1.0, 2.0, 60.0)
+    ladder.count = 1
+    cron.retry_state["report"] = ladder
+    # other values succeed: the default-valued run the ladder repeats is
+    # still owed its retry
+    await cron.start_job("report", {"region": "us"})
+    (running,) = cron.running_jobs["report"]
+    assert running.supplied_params
+    await _finish(cron)
+    await cron._drain_completions()
+    assert cron.last_run["report"].outcome == "success"
+    assert cron.retry_state["report"] is ladder and not ladder.cancelled
+    # the defaults succeed: the retry has nothing left to repeat
+    await cron.start_job("report")
+    (running,) = cron.running_jobs["report"]
+    assert not running.supplied_params
+    await _finish(cron)
+    await cron._drain_completions()
+    await _drain_pending(cron)
+    assert "report" not in cron.retry_state and ladder.cancelled
+
+
+async def test_a_start_the_concurrency_policy_refuses_says_so(dag_cron):
+    cron = await _cron(
+        dag_cron, command=[_PY, "-c", "import time; time.sleep(30)"]
+    )
+    cron.cron_jobs["report"].concurrencyPolicy = "Forbid"
+    await cron.start_job("report")
+    # the second start launches nothing, so it answers no values either
+    with pytest.raises(ApiActionError) as err:
+        await cron.start_job("report", {"region": "us"})
+    assert err.value.status == 409
+    assert err.value.message == (
+        "job 'report' was not started: its concurrencyPolicy (Forbid) "
+        "admitted no new run"
+    )
+    (running,) = cron.running_jobs["report"]
+    assert running.params == _DEFAULTS
+    running.cancelled = True
+    await running.cancel()
+    await _finish(cron)
 
 
 async def test_a_job_reads_its_values_with_the_param_command(dag_cron, tmp_path):
@@ -484,14 +529,30 @@ async def test_the_pool_entry_carries_the_values_through_the_queue(
     await cron._pools.tick()
     (running,) = cron.running_jobs["report"]
     assert running.params == started["params"]
-    assert running.retry_state is None
+    assert running.retry_state is None and running.supplied_params
     await _finish(cron)
     assert _printed(cron, "report")["CRONSTABLE_PARAM_REGION"] == "us"
     await cron._pools.tick()
     (running,) = cron.running_jobs["report"]
-    assert running.params == _DEFAULTS
+    assert running.params == _DEFAULTS and not running.supplied_params
     await _finish(cron)
     assert _printed(cron, "report")["CRONSTABLE_PARAM_REGION"] == "eu"
+
+
+async def test_a_pooled_launch_queues_the_values_it_is_given(
+    dag_cron, monkeypatch
+):
+    # the launch path every caller shares, not only a manual start
+    cron = await _cron(dag_cron, _POOLED)
+    monkeypatch.setattr(cron._pools, "service", lambda: None)
+    values = {**_DEFAULTS, "rows": 4}
+    assert await cron.maybe_launch_job(
+        cron.cron_jobs["report"], with_retries=False, params=values
+    )
+    pool = await cron.state_backend.read_document(POOL_NAMESPACE, "database")
+    (entry,) = pool["entries"].values()
+    assert entry["payload"]["params"] == values
+    await cron._pools.cancel("database", entry["id"], "test over")
 
 
 async def test_refused_values_queue_nothing(dag_cron, monkeypatch):
@@ -537,15 +598,9 @@ async def test_http_start_with_params(dag_cron):
                 }
             await _finish(cron)
             assert _printed(cron, "report")["CRONSTABLE_PARAM_REGION"] == "us"
-            # no body, an empty map, a body that is not JSON, and a JSON
-            # body with other keys all start the job with its defaults
-            for kwargs in (
-                {},
-                {"json": {"params": {}}},
-                {"data": b"not json"},
-                {"json": {"other": 1}},
-                {"json": [1, 2]},
-            ):
+            # no body, an empty object, and an empty map start the job
+            # with its defaults
+            for kwargs in ({}, {"json": {}}, {"json": {"params": {}}}):
                 async with s.post(url, **kwargs) as r:
                     assert r.status == 200, kwargs
                     assert await r.json() == {
@@ -553,6 +608,21 @@ async def test_http_start_with_params(dag_cron):
                         "params": _DEFAULTS,
                     }
                 await _finish(cron)
+            # a body that is not a JSON object, and one that holds another
+            # field, start nothing: a misspelled `params` is not dropped
+            for kwargs in (
+                {"data": b"not json"},
+                {"json": [1, 2]},
+                {"json": {"param": {"region": "us"}}},
+            ):
+                async with s.post(url, **kwargs) as r:
+                    assert r.status == 400, kwargs
+                    assert (await r.json())["error"]
+            async with s.post(url, json={"param": {}, "params": {}}) as r:
+                assert (await r.json())["error"] == (
+                    'unknown start field "param"; the body accepts params'
+                )
+            assert not cron.running_jobs
             # refused values start nothing and say why
             async with s.post(url, json={"params": {"rows": "5", "x": 1}}) as r:
                 assert r.status == 400

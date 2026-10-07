@@ -56,7 +56,6 @@ from cronstable import version as _version
 from cronstable.cron import (
     PAUSE_BY_MAX,
     WEB_ANON_REQUEST_KEY,
-    WEB_PARAMS_SCOPE,
     WEB_TOKEN_REQUEST_KEY,
     ApiActionError,
     _load_index_bytes,
@@ -1669,7 +1668,9 @@ class MCPHandler:
         name = _req_str(args, "name")
         _require_confirm(args, "running")
         try:
-            started = await self._cron.start_job(name, _run_params(args))
+            started = await self._cron.start_job(
+                name, args.get("params"), scopes=_scopes()
+            )
         except ParamError as ex:
             return _tool_error(_param_error_text(ex))
         # the values the run takes, for a job that declares parameters
@@ -1822,24 +1823,14 @@ class MCPHandler:
     async def _t_trigger_dag(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")
         _require_confirm(args, "triggering")
-        logical = args.get("logical_date")
-        if logical is not None and not isinstance(logical, str):
-            raise _ToolInputError("logical_date must be an ISO 8601 string")
-        request_id = args.get("request_id")
-        if request_id is not None and not (
-            isinstance(request_id, str) and 1 <= len(request_id) <= 200
-        ):
-            raise _ToolInputError(
-                "request_id must be a string of 1 to 200 characters"
-            )
-        params = _run_params(args)
         try:
             result = await self._cron._dag.trigger(
                 dag,
-                params=params,
-                logical_date=logical,
-                request_id=request_id,
+                params=args.get("params"),
+                logical_date=args.get("logical_date"),
+                request_id=args.get("request_id"),
                 triggered_by=_attribution(None),
+                scopes=_scopes(),
             )
         except ParamError as ex:
             return _tool_error(_param_error_text(ex))
@@ -1862,12 +1853,12 @@ class MCPHandler:
         end = _req_str(args, "to")
         if dag not in self._cron.cron_dags:
             return _tool_error("dag not found: {!r}".format(dag))
-        params = _run_params(args)
+        params = args.get("params")
         try:
             # checked before the preview, so a dry run reports the values a
             # real run would refuse
             resolved = DagScheduler._resolve_params(
-                self._cron.cron_dags[dag], params
+                self._cron.cron_dags[dag], params, _scopes()
             )
         except ParamError as ex:
             return _tool_error(_param_error_text(ex))
@@ -1900,6 +1891,7 @@ class MCPHandler:
                 end,
                 params=params,
                 triggered_by=_attribution(None),
+                scopes=_scopes(),
             )
         except ParamError as ex:
             return _tool_error(_param_error_text(ex))
@@ -2826,30 +2818,12 @@ def _require_confirm(args: dict[str, Any], gerund: str) -> None:
         )
 
 
-def _run_params(args: dict[str, Any]) -> dict[str, Any] | None:
-    """The ``params`` argument of a call that starts runs, or ``None``.
-
-    Applies the check the REST twins apply: a caller whose token lacks the
-    ``params`` scope cannot supply values.
-    """
-    supplied = args.get("params")
-    if supplied is None:
-        return None
-    if not isinstance(supplied, dict):
-        raise _ToolInputError("params must be an object")
+def _scopes() -> "frozenset[str] | None":
+    """The scopes of the current caller's token, or ``None`` when no token
+    auth applies. A tool that starts runs passes them on, so its REST twin
+    and the tool apply one check to a ``params`` argument."""
     caller = _caller.get()
-    if (
-        supplied
-        and caller is not None
-        and WEB_PARAMS_SCOPE not in caller.scopes
-    ):
-        raise _ToolInputError(
-            "the presented web token lacks the {!r} scope that supplying "
-            "run parameters requires (the REST route for the same action "
-            "is gated identically); call again without params to use the "
-            "defaults".format(WEB_PARAMS_SCOPE)
-        )
-    return supplied
+    return None if caller is None else caller.scopes
 
 
 def _param_error_text(ex: ParamError) -> str:

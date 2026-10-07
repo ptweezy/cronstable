@@ -1922,9 +1922,10 @@ def reboot_cron(monkeypatch):
             cron.web_config = {}
         launched = []
 
-        def capture(job):
+        async def capture(job, **kwargs):
             launched.append(job.name if record == "name" else job)
-            return _noop()
+            # maybe_launch_job answers whether it launched
+            return True if launch == "maybe_launch_job" else None
 
         monkeypatch.setattr(cron, launch, capture)
         return cron, launched

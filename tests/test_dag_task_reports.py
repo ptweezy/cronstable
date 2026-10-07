@@ -249,7 +249,7 @@ async def test_launch_failed_task_reports_failure(tmp_path):
         try:
             tmpl = cron.cron_dags["d"].task_templates["t1"]
             tmpl.command = [str(tmp_path / "no-such-binary")]
-            run_key = await cron._dag.trigger_run("d")
+            run_key = (await cron._dag.trigger("d"))["runKey"]
             body = await _drive(cron, "d", run_key)
             assert body["state"] == dag.FAILED
             assert body["tasks"]["t1"]["exitCode"] == 127

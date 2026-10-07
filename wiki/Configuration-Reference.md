@@ -443,7 +443,7 @@ Per-parameter keys, under `params`:
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `name` | `Str` | required | Starts with a letter and holds at most 64 letters, digits, and underscores. Unique within the DAG, ignoring case. A name that reads as a secret, such as one that contains `password` or `token`, is a `ConfigError`. |
+| `name` | `Str` | required | Starts with a letter and holds at most 64 letters, digits, and underscores. Unique within the DAG, ignoring case. A name that reads as a secret, such as one that ends with `password` or `token`, is a `ConfigError`. |
 | `type` | `string` / `integer` / `number` / `boolean` | `string` | The JSON type of a supplied value. |
 | `default` | a value of `type` | none | The value a run stores when the caller supplies none. Every parameter sets `default` or `required: true`. |
 | `required` | `Bool` | `false` | The caller supplies the value on every run. A `ConfigError` together with `default`, and on a DAG that has a `schedule`. |
@@ -461,7 +461,7 @@ Per-task keys:
 | `command` | `Str` or `Seq(Str)` | required (not for `approval`) | The command to run. |
 | `type` | `task` / `sensor` / `approval` | `task` | Node kind. |
 | `dependsOn` | `Seq(Str)` | `[]` | Upstream task ids. |
-| `triggerRule` | `all_success` / `all_done` / `none_failed` / `none_failed_min_one_success` / `all_done_min_one_failed` | `all_success` | When the task becomes ready, read from its upstreams once all of them are terminal. See the [rule table](Orchestration-and-DAGs#tasks-and-dependencies). |
+| `triggerRule` | `all_success` / `all_done` / `none_failed` / `none_failed_min_one_success` / `all_done_min_one_failed` | `all_success` | When the task becomes ready, read from its upstreams once all of them are terminal. The last two rules need at least one `dependsOn` entry. See the [rule table](Orchestration-and-DAGs#tasks-and-dependencies). |
 | `skipExitCodes` | `Seq(Int)` | none | Exit codes, each from `1` to `255`, with which the task's command ends the task `skipped`. A `ConfigError` on an `approval` task. See [conditional branching](Orchestration-and-DAGs#conditional-branching). |
 | `when` | `Seq(Map)` | none | Comparisons that all have to hold for the task to run. A task whose condition does not hold ends `skipped`, and its command never starts. The entry keys follow this table. See [conditions](Orchestration-and-DAGs#conditions-on-parameters-and-xcom-values). |
 | `retries` | `Int` | `0` | Per-task retry attempts (DAG-owned). Must be `>= 0`: the job-level `-1` retry-forever sentinel is a `ConfigError` here. |

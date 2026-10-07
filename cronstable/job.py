@@ -2222,6 +2222,10 @@ class RunningJob:
         # the launcher and recorded with the run; None for every other run
         # (a DAG task's values live in its run document).
         self.params: dict[str, Any] | None = None
+        # whether a manual start supplied those values. Such a run is one
+        # attempt outside the job's retry ladder: its failure arms no
+        # retry, and its success settles none.
+        self.supplied_params = False
         # whether this run has parameters of its own (see
         # drop_inherited_params)
         self.owns_params = dag_ref is not None or bool(
@@ -2671,6 +2675,9 @@ class RunningJob:
             output=self.output,
             output_prefix="verify.",
         )
+        # the check reads the run's parameters and no others, like the
+        # command it follows
+        check.owns_params = self.owns_params
         self._verifier = check
         self.verification = {"outcome": "running"}
 

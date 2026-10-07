@@ -967,7 +967,7 @@ async def test_perf_wake_is_o_due_not_o_all(monkeypatch, capsys):
 def _launch_recorder(monkeypatch, cron):
     launched = []
 
-    async def fake(job, *, with_retries=True):
+    async def fake(job, **kwargs):
         launched.append(job.name)
         return True
 
@@ -1039,7 +1039,7 @@ async def test_manual_start_allowed_while_paused(monkeypatch):
     await cron.pause_job_by_name("p")
     # a pause skips SCHEDULED fires only: the operator asking by hand is the
     # operator overriding their own pause (unlike the disabled 409).
-    await cron.start_job_by_name("p")
+    await cron.start_job("p")
     assert launched == ["p"]
 
 

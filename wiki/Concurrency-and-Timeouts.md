@@ -501,7 +501,8 @@ including the no-console case where the graceful step cannot be delivered.
 - **Manual starts.** Launches through the [HTTP control API](HTTP-API)
   (`POST /jobs/{name}/start`) take the same `maybe_launch_job` path and so
   honor `concurrencyPolicy`, including the cluster slot gate for
-  `concurrencyScope: cluster` jobs.
+  `concurrencyScope: cluster` jobs. A start that the policy refuses answers
+  `409` and names the policy.
 - **Node first, cluster second.** `concurrencyScope: cluster` never changes
   the per-node behavior documented earlier. The local check runs first, and
   the [cluster gate](#concurrency-across-a-cluster) is an additional gate

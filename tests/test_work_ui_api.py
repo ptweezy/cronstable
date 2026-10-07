@@ -70,7 +70,7 @@ dags:
         published.set()
 
     monkeypatch.setattr(cron._dag, "on_task_verifying", observe)
-    key = await cron._dag.trigger_run("flow")
+    key = (await cron._dag.trigger("flow"))["runKey"]
     result = await _drive(cron, "flow", key)
     assert published.is_set()
     assert result["tasks"]["export"]["verification"]["outcome"] == "success"

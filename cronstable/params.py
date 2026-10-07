@@ -13,7 +13,7 @@ clients all share it.
 import json
 import math
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +39,10 @@ MAX_PARAMS_BYTES = 16 * 1024
 #: A task reads parameter ``name`` as ``CRONSTABLE_PARAM_<NAME>``.
 ENV_PREFIX = "CRONSTABLE_PARAM_"
 
+#: The token scope a caller holds, on top of the action's own, to choose
+#: values. A caller without it starts runs with the declared defaults.
+SCOPE = "params"
+
 #: A parameter name, matched whole. Every character is valid in an
 #: environment variable name, so the exported name needs no escaping.
 _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
@@ -46,7 +50,7 @@ _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
 #: The characters a string value cannot hold: the C0 and C1 control ranges,
 #: DEL, and the Unicode line and paragraph separators. A value reaches
 #: shells, logs, and line-based tools, where each of these can end a line.
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 _INTEGER_TEXT = re.compile(r"[+-]?[0-9]+")
 _NUMBER_TEXT = re.compile(
@@ -84,7 +88,7 @@ class ParamSpec:
 
 
 class ParamError(Exception):
-    """Supplied values that a declaration refuses.
+    """Supplied values that a run cannot take.
 
     ``errors`` maps each offending parameter name to the reason, phrased to
     follow the name ("must be at most 10000"). It is empty when the fault
@@ -96,6 +100,10 @@ class ParamError(Exception):
     ) -> None:
         super().__init__(message)
         self.errors: dict[str, str] = dict(errors or {})
+
+
+class ParamScopeError(ParamError):
+    """Values from a caller whose token does not grant :data:`SCOPE`."""
 
 
 def _echo(name: str) -> str:
@@ -157,7 +165,7 @@ def check_value(spec: ParamSpec, value: Any) -> str | None:
             return "must be valid Unicode text"
         if size > MAX_STRING_BYTES:
             return "must be at most {} bytes".format(MAX_STRING_BYTES)
-        if _CONTROL.search(value) is not None:
+        if CONTROL_CHARACTERS.search(value) is not None:
             return "must not contain control or line-separator characters"
         if spec.max_length is not None and len(value) > spec.max_length:
             return "must be at most {} characters".format(spec.max_length)
@@ -261,6 +269,39 @@ def resolve(
             )
         )
     return resolved
+
+
+def for_run(
+    specs: Iterable[ParamSpec],
+    supplied: Any,
+    subject: str,
+    scopes: Collection[str] | None = None,
+) -> dict[str, Any] | None:
+    """The map a new run stores, from the ``params`` a request carries.
+
+    ``None`` when ``specs`` declares nothing and the request supplies
+    nothing, and otherwise what :func:`resolve` returns. ``scopes`` are the
+    scopes of the caller's token, or ``None`` for a caller that no token
+    restricts.
+
+    Raises :class:`ParamError` when ``supplied`` is not an object or
+    :func:`resolve` refuses it, and :class:`ParamScopeError` when it holds
+    values and ``scopes`` lacks :data:`SCOPE`. The scope is checked before
+    the values are read, so a caller without it learns nothing about the
+    declaration.
+    """
+    if supplied is not None and not isinstance(supplied, Mapping):
+        raise ParamError("params must be an object")
+    if supplied and scopes is not None and SCOPE not in scopes:
+        raise ParamScopeError(
+            "the token lacks the {!r} scope that supplying run parameters "
+            "requires; call again without params to use the "
+            "defaults".format(SCOPE)
+        )
+    specs = tuple(specs)
+    if not specs and not supplied:
+        return None
+    return resolve(specs, supplied or {}, subject)
 
 
 def check_stored(

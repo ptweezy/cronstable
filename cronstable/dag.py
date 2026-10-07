@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cronstable import _json
-from cronstable.params import ParamSpec, env_text
+from cronstable.params import CONTROL_CHARACTERS, ParamSpec, env_text
 
 # --------------------------------------------------------------------------
 # Durable namespaces (under the backend's docs/ and records/ trees)
@@ -127,6 +127,11 @@ TRIGGER_RULES = (
 #: The rules every build evaluates. A DAG that uses any other rule needs
 #: :data:`BRANCHING_PARAMS_ENGINE_LEVEL`.
 _BASE_TRIGGER_RULES = frozenset({ALL_SUCCESS, ALL_DONE})
+#: The rules that count upstream outcomes. A task with no upstream can never
+#: meet one, so :func:`validate_graph` refuses the pairing.
+_COUNTING_TRIGGER_RULES = frozenset(
+    {NONE_FAILED_MIN_ONE_SUCCESS, ALL_DONE_MIN_ONE_FAILED}
+)
 
 #: ``skipReason.kind`` values: why a task entry is ``skipped``.
 SKIP_EXIT_CODE = "exit_code"  # its command exited with a skipExitCodes code
@@ -341,7 +346,8 @@ def validate_graph(spec: DagSpec) -> None:
     """Raise :class:`DagValidationError` on an unusable graph.
 
     Checks unknown/duplicate ids, a safe id charset, that every ``dependsOn``
-    resolves, that an ``expand.fromTask`` is a *direct*, non-mapped dependency,
+    resolves, that a rule which counts upstream outcomes has an upstream to
+    count, that an ``expand.fromTask`` is a *direct*, non-mapped dependency,
     that mapped tasks are plain ``task`` nodes, that a ``when:`` comparison
     reads XCom from a non-mapped task upstream of its own, and that the
     dependency graph is acyclic (a cycle would never advance).  Called from
@@ -385,6 +391,16 @@ def validate_graph(spec: DagSpec) -> None:
                 raise DagValidationError(
                     "task {!r} dependsOn itself".format(task.id)
                 )
+        if (
+            not task.depends_on
+            and task.trigger_rule in _COUNTING_TRIGGER_RULES
+        ):
+            raise DagValidationError(
+                "task {!r}: triggerRule {} counts upstream outcomes, so the "
+                "task needs a dependsOn entry".format(
+                    task.id, task.trigger_rule
+                )
+            )
         if task.expand is not None:
             _validate_expand(task, seen)
     _check_acyclic(spec)
@@ -897,12 +913,14 @@ def _deps_verdict(spec: DagSpec, body: dict[str, Any], task: TaskSpec) -> str:
       and ``all_success`` skips.
 
     An upstream with no entry in the run is left out. A rule string this
-    build does not know reads as ``all_success``.
+    build does not know reads as ``all_success``. A task with no upstream
+    is ready: :func:`validate_graph` refuses the rules that count upstream
+    outcomes on such a task.
     """
     if not task.depends_on:
-        # a root task is ready under either trigger rule (no upstream can be
-        # non-terminal, failed or skipped); this is the common shape in a wide
-        # DAG and it skips the whole reduction below.
+        # a root task has no upstream to wait for, and the rules that count
+        # one never reach here; this is the common shape in a wide DAG and it
+        # skips the whole reduction below.
         return "ready"
     # ``or {}`` rather than a ``.get`` default: the default is built on every
     # call, key present or not, and this resolves once per task per pass.
@@ -1132,17 +1150,15 @@ def _same_value(left: Any, right: Any) -> bool:
     return (type(left) is bool) == (type(right) is bool) and left == right
 
 
-#: The characters a ``skipReason`` detail shows escaped: the C0 and C1 control
-#: ranges, DEL, and the Unicode line and paragraph separators. An XCom value
-#: can hold any of them, and a detail reaches terminals and logs as one line.
-_DETAIL_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
-
-
 def _one_line(text: str) -> str:
-    """``text`` with each control character as its backslash escape."""
+    """``text`` with each control character as its backslash escape.
+
+    A ``skipReason`` detail reaches terminals and logs as one line, and an
+    XCom value can hold any of these characters.
+    """
     if text.isprintable():
         return text
-    return _DETAIL_CONTROL.sub(
+    return CONTROL_CHARACTERS.sub(
         lambda m: m.group().encode("unicode_escape").decode("ascii"), text
     )
 

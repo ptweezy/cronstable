@@ -293,7 +293,8 @@ How a run gets its values:
 - A start without values, a scheduled run, a catch-up run, and a retry take
   the defaults of the current declaration.
 - A start that supplies values is a single attempt. It stays out of the
-  job's retry ladder, whose retries take the defaults.
+  job's retry ladder, whose retries take the defaults: its failure arms no
+  retry, and its success leaves a pending retry in place.
 - A job in a [resource pool](Resource-Pools) carries the values in its queue
   entry, so the run takes them when the pool admits it. A change to the
   declaration cancels an entry that is still queued.
@@ -311,9 +312,10 @@ How the command reads them:
 
 The run history records the values each run took under `params`, and so does
 the durable run ledger. Every reader with the `view` scope sees them, so a
-parameter name that reads as a secret is a configuration error. Keep a
-secret in the job's [`secrets`](Durable-State#run-scoped-secrets) block. A
-parameter can carry the secret's name.
+parameter name that reads as a secret, such as one that ends with `password`
+or `token`, is a configuration error. Keep a secret in the job's
+[`secrets`](Durable-State#run-scoped-secrets) block. A parameter can carry
+the secret's name, as in `secret_name`.
 
 `params` is a job key, so a `defaults:` block cannot set it. A change to the
 declaration changes the job's [job-set ID](Job-Set-ID).

@@ -370,7 +370,9 @@ class DemoGateway:
                 raise error(
                     web.HTTPBadRequest, "Request body must be an object."
                 )
-            safe_body = {"by": "demo visitor"}
+            # Start and trigger take run parameters alone, and the daemon
+            # refuses a field it does not take.
+            safe_body = {} if starting else {"by": "demo visitor"}
             if route.endswith("/decision"):
                 if body.get("decision") not in ("approve", "reject"):
                     raise error(

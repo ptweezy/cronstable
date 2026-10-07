@@ -355,6 +355,12 @@ async def test_public_actions_cannot_publish_arbitrary_notes(demo_http):
         "decision": "reject",
         "by": "demo visitor",
     }
+    # start and trigger take run parameters alone, and the daemon refuses
+    # a field it does not take, so they forward an empty object
+    for path in ("/jobs/sample/start", "/dags/pipeline/trigger"):
+        now[0] += 10
+        response = await client.post(path, json={"by": "untrusted name"})
+        assert (await response.json())["body"] == {}
 
 
 @pytest.mark.parametrize(
@@ -545,7 +551,7 @@ async def test_gateway_uses_real_unmodified_daemon_listener(monkeypatch):
     cron = Cron(None, config_yaml=CONFIG)
     started = []
 
-    async def start(name, params=None):
+    async def start(name, params=None, scopes=None):
         started.append(name)
         return {"queued": None, "params": None}
 

@@ -248,6 +248,18 @@ def test_validate_ok_linear():
             "is not a task",
             id="expand-from-task-not-a-task",
         ),
+        # a rule that counts upstream outcomes has none to count on a root
+        pytest.param(
+            (TaskSpec("alert", trigger_rule=dag.ALL_DONE_MIN_ONE_FAILED),),
+            "task 'alert': triggerRule all_done_min_one_failed counts "
+            "upstream outcomes, so the task needs a dependsOn entry",
+            id="min-one-failed-on-a-root",
+        ),
+        pytest.param(
+            (TaskSpec("j", trigger_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS),),
+            "triggerRule none_failed_min_one_success counts upstream",
+            id="min-one-success-on-a-root",
+        ),
     ],
 )
 def test_validate_graph_rejects(tasks, match):
@@ -2992,10 +3004,23 @@ def test_trigger_rule_constants_cover_the_config_values():
     for rule in dag.TRIGGER_RULES:
         cfg = _dagcfg(
             "dags:\n  - name: d\n    tasks:\n"
+            "      - id: up\n        command: 'e'\n"
             "      - id: a\n        command: 'e'\n"
+            "        dependsOn:\n          - up\n"
             "        triggerRule: {}\n".format(rule)
         )
         assert cfg.dags[0].spec.by_id["a"].trigger_rule == rule
+        # the rules that only read upstream states also load on a root
+        root = (
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: a\n        command: 'e'\n"
+            "        triggerRule: {}\n".format(rule)
+        )
+        if rule in dag._COUNTING_TRIGGER_RULES:
+            with pytest.raises(ConfigError, match="needs a dependsOn entry"):
+                _dagcfg(root)
+        else:
+            assert _dagcfg(root).dags[0].spec.by_id["a"].trigger_rule == rule
     assert set(dag.TRIGGER_RULES) == set(_RULE_VERDICTS) - {
         "a_rule_from_a_newer_build"
     }

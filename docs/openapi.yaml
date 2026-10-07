@@ -367,8 +367,10 @@ paths:
         The body is optional. `params` supplies values for the run parameters
         the job declares, and a request without it starts the run with the
         declared defaults. A body that is not a JSON object, and any other
-        key in one, is ignored. Supplying a non-empty `params` map needs the
-        `params` scope in addition to `control`.
+        key in one, is refused with `400`. Supplying a non-empty `params` map
+        needs the `params` scope in addition to `control`. A `200` means a
+        run started: a `concurrencyPolicy` that admits no new run answers
+        `409`.
       x-required-scope: control
       parameters:
         - $ref: "#/components/parameters/JobName"
@@ -378,6 +380,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               properties:
                 params: { $ref: "#/components/schemas/DagRunParams" }
       responses:
@@ -415,9 +418,11 @@ paths:
                       Present for a job that declares parameters.
         "400":
           description: >-
-            Refused parameters: `params` is not an object, a name the job
-            does not declare, a wrong type, or a failed constraint. The
-            error envelope adds `paramErrors`, and nothing starts.
+            The request starts nothing. The body is not a JSON object, it
+            holds an unknown field, or its parameters are refused: `params`
+            is not an object, a name the job does not declare, a wrong type,
+            or a failed constraint. For refused parameters the error
+            envelope adds `paramErrors`.
           content:
             application/json:
               schema:
@@ -434,7 +439,9 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: The job is disabled (JSON error envelope).
+          description: >-
+            The job is disabled, or its `concurrencyPolicy` admitted no new
+            run, so the request starts nothing (JSON error envelope).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

@@ -69,7 +69,8 @@ The preview lists them under `params`.
   or when the source has one the declaration dropped. Create a full run for
   that workflow instead.
 - To run the same date with other values, trigger a manual run with
-  `logicalDate` and `params`.
+  `logicalDate` and `params`. That run becomes the date's latest run for
+  [failed dates](#failed-dates) recovery.
 
 ## API
 
@@ -114,6 +115,19 @@ The dashboard's backfill form has a **Failed dates only** option. It previews
 recovery for the latest retained run at each logical date in the requested
 range. Successful dates and dates whose latest run is still active are
 excluded. Dates without retained runs are excluded too.
+
+The latest run of a date is the newest one of any kind, whatever parameters
+it stores. A manual run that was triggered with that `logicalDate` therefore
+stands in for the date's scheduled run:
+
+- When the manual run succeeded, the date is excluded, including when the
+  scheduled run failed with other parameter values.
+- When the manual run failed, the preview recovers it with the values it
+  stores.
+
+The preview lists each source run and its `params`, so check them before
+you execute. To recover a run that a newer one stands in for, recover it by
+run key.
 
 Use `POST /dags/{name}/recover` with `from`, `to`, and `dryRun: true` for the
 same preview. At most 100 failed dates are accepted per batch. Execute with

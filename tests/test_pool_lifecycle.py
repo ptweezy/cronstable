@@ -240,7 +240,7 @@ async def test_timed_out_sensor_releases_queue_and_backlog(
     cron = await make(dag_cron, monkeypatch, SENSOR)
     entry = await cron._pools.enqueue(cron.cron_jobs["one"])
     held = await cron._pools.acquire("database", entry["id"])
-    key = await cron._dag.trigger_run("flow")
+    key = (await cron._dag.trigger("flow"))["runKey"]
     await _drain_pending(cron)
     body = await cron._dag.get_run("flow", key)
     assert body["tasks"]["task"]["queued"]
@@ -292,7 +292,7 @@ async def test_capacity_change_keeps_existing_task_admission(
     ].command
     entry = await cron._pools.enqueue(cron.cron_jobs["one"])
     held = await cron._pools.acquire("database", entry["id"])
-    key = await cron._dag.trigger_run("flow")
+    key = (await cron._dag.trigger("flow"))["runKey"]
     await _drain_pending(cron)
     cron.pool_config["database"]["slots"] = 3
     await cron._dag.advance_one(("flow", key))
@@ -528,7 +528,7 @@ async def test_unavailable_task_document_does_not_retire_live_work(
     cron = await make(dag_cron, monkeypatch, SENSOR)
     entry = await cron._pools.enqueue(cron.cron_jobs["one"])
     held = await cron._pools.acquire("database", entry["id"])
-    await cron._dag.trigger_run("flow")
+    await cron._dag.trigger("flow")
     await _drain_pending(cron)
     with monkeypatch.context() as patch:
         patch.setattr(

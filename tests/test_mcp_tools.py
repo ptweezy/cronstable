@@ -638,7 +638,7 @@ async def test_run_job_success_and_confirm_gate(monkeypatch):
     h = _handler()
     launched = []
 
-    async def fake_start(name, params=None):
+    async def fake_start(name, params=None, scopes=None):
         launched.append(name)
         return {"queued": None, "params": None}
 
@@ -2294,7 +2294,7 @@ async def test_run_job_tool_takes_params():
     assert "declares no parameters" in result["content"][0]["text"]
     assert not cron.running_jobs.get("report")
     assert not cron.running_jobs.get("plain")
-    # a job that declares none answers as it always has
+    # a job that declares none answers with no values
     result = await _call(h, "cron_run_job", {"name": "plain", "confirm": True})
     assert result["structuredContent"] == {"started": "plain"}
     await _reap_jobs(cron)

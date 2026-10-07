@@ -4174,14 +4174,13 @@ class AppActions(App):
         """POST the start; ``params`` are sent only when given. Returns
         whether the job started or was queued."""
         path = "/jobs/%s/start" % _quote(name)
-        payload: Any = None
         try:
             if params:
                 status, payload = await self.api.post(
                     path, body={"params": params}
                 )
             else:
-                status, _ = await self.api.post(path)
+                status, payload = await self.api.post(path)
         except Unauthorized:
             self.open("token")
             self.focus = "token"
@@ -4196,7 +4195,12 @@ class AppActions(App):
             self.refresh_now()
             return True
         if status == 409:
-            self.toast("warn", "%s is disabled" % name)
+            # a disabled job, or a concurrencyPolicy that admitted no run:
+            # the daemon's reason says which
+            self.toast(
+                "warn",
+                "%s did not start%s" % (name, _error_detail(payload)),
+            )
         elif status == 404:
             self.toast("fail", "no such job: %s" % name)
         else:
@@ -4219,6 +4223,8 @@ class AppActions(App):
             return
         if self.drawer_job != name or not self.is_open("drawer"):
             self.open_drawer(name)
+        elif self.top_overlay() != "drawer":
+            self.open("drawer")  # beneath another overlay: raise the row
         self.inputs["jobparams"] = ""
         self.focus = "jobparams"
         self.mark()
@@ -4574,6 +4580,8 @@ class AppActions(App):
             return
         if self.dag_name != name or not self.is_open("dag"):
             self.open_dag(name)
+        elif self.top_overlay() != "dag":
+            self.open("dag")  # beneath another overlay: raise the row
         self.inputs["params"] = ""
         self.focus = "params"
         self.mark()

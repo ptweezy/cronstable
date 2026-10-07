@@ -111,7 +111,8 @@ created (`created`, `runKeys`) and the dates that already had a run
 For a job that declares [run parameters](Commands-and-Environment#params), `cron_list_jobs` returns the
 declaration under `params`, and `cron_run_job` takes a `params` object. The
 result lists the values the run takes. A refused value returns an error that
-names it, and nothing starts.
+names it, and nothing starts. A start that the job's `concurrencyPolicy`
+refuses returns an error too.
 
 For a workflow that declares
 [run parameters](Orchestration-and-DAGs#run-parameters), `cron_list_dags`

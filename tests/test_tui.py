@@ -2956,11 +2956,15 @@ async def test_job_action_error_and_status_paths(tmp_path):
         await action("j")
         assert _msgs(app)  # an exception surfaces as a toast
 
-    # run_job status ladder: 409 disabled, 404 missing, other -> HTTP N
+    # run_job status ladder: 409 with the daemon's reason, 404 missing,
+    # other -> HTTP N
     app.toasts = []
-    app.api.post = _post_status(409)
+    app.api.post = _post_status(409, {"error": "job 'j' is disabled"})
     await app.run_job("j")
-    assert any("disabled" in m for m in _msgs(app))
+    assert "j did not start — job 'j' is disabled" in _msgs(app)
+    app.api.post = _post_status(409)  # a daemon that sends no reason
+    await app.run_job("j")
+    assert _msgs(app)[-1] == "j did not start"
     app.api.post = _post_status(404)
     await app.run_job("j")
     assert any("no such job" in m for m in _msgs(app))
@@ -5740,6 +5744,29 @@ async def test_run_opens_the_parameter_row_for_a_job_that_declares_params(
     await app.run_all_failing()
     assert app.focus is None
     assert all(body is None for _path, body in posted[before:])
+    app.close("drawer")
+    await asyncio.sleep(0.05)
+
+
+async def test_a_parameter_row_raises_its_panel_from_beneath_another(
+    tmp_path,
+):
+    # the row is drawn on the top overlay, so a panel that is open beneath
+    # another one comes to the front, as it is, before the row takes focus
+    app = _job_param_app(tmp_path)
+    app._load_dag_runs = _no_load
+    app.dags = [{"name": "d", "params": _DECLARED}]
+    app.open_drawer("report", "schedule")
+    app.open_dag("d")
+    app.dag_tab = "tasks"
+    assert app.top_overlay() == "dag"
+    await app.run_job_or_prompt("report")
+    assert app.top_overlay() == "drawer" and app.focus == "jobparams"
+    assert (app.drawer_job, app.drawer_tab) == ("report", "schedule")
+    await app.dag_trigger_or_prompt("d")
+    assert app.top_overlay() == "dag" and app.focus == "params"
+    assert (app.dag_name, app.dag_tab) == ("d", "tasks")
+    app.close("dag")
     app.close("drawer")
     await asyncio.sleep(0.05)
 

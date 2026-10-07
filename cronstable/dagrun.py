@@ -34,6 +34,7 @@ import logging
 import os
 import random
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -1021,14 +1022,6 @@ class DagScheduler:
             )
 
     async def _create_run(
-        self, dagcfg: Any, logical_dt: datetime.datetime, kind: str
-    ) -> RunRef | None:
-        ref, _created = await self._create_run_if_absent(
-            dagcfg, logical_dt, kind
-        )
-        return ref
-
-    async def _create_run_if_absent(
         self,
         dagcfg: Any,
         logical_dt: datetime.datetime,
@@ -1080,6 +1073,8 @@ class DagScheduler:
         params: dict[str, Any] | None = None,
         triggered_by: str | None = None,
     ) -> bool:
+        """:meth:`_create_run_doc` for a caller that asks only whether this
+        call created the document."""
         created, _existing = await self._create_run_doc(
             dagcfg,
             run_key,
@@ -1092,20 +1087,22 @@ class DagScheduler:
 
     @staticmethod
     def _resolve_params(
-        dagcfg: Any, supplied: dict[str, Any] | None
+        dagcfg: Any,
+        supplied: Any,
+        scopes: Collection[str] | None = None,
     ) -> dict[str, Any] | None:
         """The parameters a new run of ``dagcfg`` stores.
 
-        ``None`` for a DAG that declares none when nothing is supplied.
-        Raises :class:`cronstable.params.ParamError` for values the
-        declaration refuses, and for any value sent to a DAG with no
-        declaration.
+        :func:`cronstable.params.for_run` for the DAG's declaration:
+        ``None`` for a DAG that declares none when nothing is supplied, and
+        :class:`cronstable.params.ParamError` for values the declaration
+        refuses or the caller's ``scopes`` do not allow.
         """
-        specs = dagcfg.spec.params
-        if not specs and not supplied:
-            return None
-        return run_params.resolve(
-            specs, supplied or {}, "workflow {!r}".format(dagcfg.name)
+        return run_params.for_run(
+            dagcfg.spec.params,
+            supplied,
+            "workflow {!r}".format(dagcfg.name),
+            scopes,
         )
 
     async def _create_run_doc(
@@ -1595,8 +1592,8 @@ class DagScheduler:
         if combined.expansions_needed or combined.conditions_needed:
             # 2. mapped tasks await their upstream lists, or ready tasks
             # compare XCom values: pre-read them from the reconciled body
-            # (outside any document lock, exactly as before), then run the
-            # classic claim RMW as the second step.
+            # (outside any document lock), then run the classic claim RMW
+            # as the second step.
             expansions = await self._read_expansions(dagcfg, run_id, body)
             conditions = await self._read_conditions(dagcfg, run_id, body)
             unread = any(value is None for value in conditions.values())
@@ -3200,25 +3197,15 @@ class DagScheduler:
 
         await self._mutate(ref[0], ref[1], prepared)
 
-    async def trigger_run(
-        self, dag_name: str, *, logical_date: str | None = None
-    ) -> str | None:
-        """Create a manual run of ``dag_name`` now; return its run key.
-
-        :meth:`trigger` with the declared defaults, for a caller that needs
-        the key alone. ``None`` for an unknown dag.
-        """
-        result = await self.trigger(dag_name, logical_date=logical_date)
-        return None if result is None else result["runKey"]
-
     async def trigger(
         self,
         dag_name: str,
         *,
-        params: dict[str, Any] | None = None,
-        logical_date: str | None = None,
-        request_id: str | None = None,
+        params: Any = None,
+        logical_date: Any = None,
+        request_id: Any = None,
         triggered_by: str | None = None,
+        scopes: Collection[str] | None = None,
     ) -> dict[str, Any] | None:
         """Create a manual run of ``dag_name`` now.
 
@@ -3226,16 +3213,18 @@ class DagScheduler:
         parameters, the ``params`` the run stores. ``None`` for an unknown
         dag.
 
-        ``params`` are the caller's values, checked against the declaration
+        ``params`` are the caller's values and ``scopes`` the scopes of the
+        caller's token (see :func:`cronstable.params.for_run`), checked
         before anything is written. ``logical_date`` is an ISO 8601 instant
         the run records as its logical date. ``request_id`` makes the call
         repeatable: the run key is derived from it, so a second call with
-        the same id returns the first run with ``created`` false.
+        the same id returns the first run with ``created`` false. The three
+        arrive as a request carried them, so each is checked here.
 
         Raises :class:`cronstable.params.ParamError` for refused values,
-        :class:`TriggerInputError` for an unreadable ``logical_date``,
-        :class:`TriggerConflict` when ``request_id`` names a run with
-        other parameters or another logical date, and
+        :class:`TriggerInputError` for an unusable ``logical_date`` or
+        ``request_id``, :class:`TriggerConflict` when ``request_id`` names
+        a run with other parameters or another logical date, and
         :class:`RuntimeError` when the run document could not be created
         (no state backend available), so the caller never gets a run key
         for a run that does not exist.
@@ -3243,10 +3232,20 @@ class DagScheduler:
         dagcfg = self._dags().get(dag_name)
         if dagcfg is None:
             return None
-        resolved = self._resolve_params(dagcfg, params)
+        resolved = self._resolve_params(dagcfg, params, scopes)
+        if request_id is not None and not (
+            isinstance(request_id, str) and 1 <= len(request_id) <= 200
+        ):
+            raise TriggerInputError(
+                "requestId must be a string of 1 to 200 characters"
+            )
         logical_iso = None
         if logical_date is not None:
-            logical_dt = _parse_iso(logical_date)
+            logical_dt = (
+                _parse_iso(logical_date)
+                if isinstance(logical_date, str)
+                else None
+            )
             if logical_dt is None:
                 raise TriggerInputError(
                     "logicalDate must be an ISO 8601 date and time"
@@ -3321,8 +3320,9 @@ class DagScheduler:
         start_iso: str,
         end_iso: str,
         *,
-        params: dict[str, Any] | None = None,
+        params: Any = None,
         triggered_by: str | None = None,
+        scopes: Collection[str] | None = None,
     ) -> dict[str, Any]:
         """Create runs for every scheduled instant in ``[start, end]``.
 
@@ -3337,9 +3337,9 @@ class DagScheduler:
         available, like :meth:`trigger`, so an unwritable store never
         reads as a range of existing runs.
 
-        ``params`` are checked once, before any run is created, and stored
-        on every run this call creates. A date that already has a run keeps
-        that run's parameters. Raises
+        ``params`` are checked once under the caller's ``scopes``, before
+        any run is created, and stored on every run this call creates. A
+        date that already has a run keeps that run's parameters. Raises
         :class:`cronstable.params.ParamError` for refused values.
         """
         dagcfg = self._dags().get(dag_name)
@@ -3357,7 +3357,7 @@ class DagScheduler:
         end = _parse_iso(end_iso)
         if start is None or end is None or end < start:
             return {"ok": False, "reason": "bad date range"}
-        resolved = self._resolve_params(dagcfg, params)
+        resolved = self._resolve_params(dagcfg, params, scopes)
         if self._backend() is None:
             raise RuntimeError(
                 "dag {}: the backfill could not be recorded (state backend "
@@ -3376,7 +3376,7 @@ class DagScheduler:
             and nxt <= end
             and len(created) + len(existing) < DAG_MAX_CATCHUP
         ):
-            ref, was_created = await self._create_run_if_absent(
+            ref, was_created = await self._create_run(
                 dagcfg,
                 nxt,
                 "backfill",
@@ -3424,7 +3424,10 @@ class DagScheduler:
             return
         if needs == self._fleet_needs and now < self._next_fleet_check:
             return
+        # both recorded before the read, so a store that cannot answer is
+        # asked again once the interval is over
         self._next_fleet_check = now + FLEET_CHECK_INTERVAL
+        self._fleet_needs = needs
         peers = await self._cron._peer_dag_engines()
         if peers is None:
             return  # the store could not answer: keep the last result

@@ -9745,7 +9745,11 @@ var qrcode = function() {
         renderedBase = w.pairLinkBase;
         renderPairQr(pairLink(payload, renderedBase));
       }
-      if (w.authenticated === true && w.allScopes === true) $("pairWarn").style.display = "";
+      // A token that passes every route's check is full access, with or
+      // without `params`, which adds only the choice of run parameter values.
+      const held = Array.isArray(w.scopes) ? w.scopes : [];
+      const everyRoute = ["view", "control", "approve"].every((s) => held.includes(s));
+      if (w.authenticated === true && (w.allScopes === true || everyRoute)) $("pairWarn").style.display = "";
     }).catch(() => {});
   }
   function closePair() { if (closeOverlay("pairWrap")) pairSeq++; }

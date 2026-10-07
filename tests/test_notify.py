@@ -593,7 +593,7 @@ async def test_do_advance_dispatches_approval_waiting_live(
     )
     cron = await _make_cron(tmp_path, yaml)
     try:
-        run_key = await cron._dag.trigger_run("ap")
+        run_key = (await cron._dag.trigger("ap"))["runKey"]
         body = await _drive(cron, "ap", run_key)
         assert body["tasks"]["gate"]["awaitingApproval"] is True
         await _drain_notify(cron)

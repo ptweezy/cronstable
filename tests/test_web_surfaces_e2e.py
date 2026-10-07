@@ -1504,6 +1504,25 @@ def test_pair_qr_follows_the_daemons_link_base(browser, tmp_path):
             )
 
 
+def test_pair_warns_for_a_token_that_passes_every_route(browser, tmp_path):
+    """`params` gates no route, so the warning does not wait for it."""
+    with e2e.Daemon(tmp_path, auth="full") as daemon:
+        with e2e.open_page(browser, daemon.url, token=e2e.FULL_TOKEN) as page:
+            page.faults.rewrite(
+                r"/whoami",
+                lambda body: dict(
+                    body,
+                    allScopes=False,
+                    scopes=["approve", "control", "view"],
+                ),
+            )
+            _click(page, "#settingsBtn")
+            _click(page, "#openPair")
+            page.wait_for_function(
+                "document.getElementById('pairWarn').style.display === ''"
+            )
+
+
 def test_pair_panel_ignores_a_stale_whoami_answer(browser, tmp_path):
     """Ignore pairing responses from a previously closed panel."""
     with e2e.Daemon(tmp_path) as daemon:

@@ -275,14 +275,17 @@ _STEPS: tuple[
     for (pattern, repl), gate in zip(_PATTERNS, _PATTERN_GATES, strict=True)
 )
 
-_SECRET_NAME = re.compile("(?i)(?:" + "|".join(_KEY_KEYWORDS) + ")")
+_SECRET_NAME = re.compile("(?i)(?:" + "|".join(_KEY_KEYWORDS) + r")\Z")
 
 
 def is_secret_name(name: str) -> bool:
-    """Whether ``name`` holds a keyword the key=value pattern redacts under.
+    """Whether ``name`` ends with a keyword the key=value pattern redacts
+    under.
 
     Decides which names a configuration may not use for a value every
-    reader sees, such as a run parameter.
+    reader sees, such as a run parameter. A keyword earlier in the name
+    describes the value, as in ``secret_name`` and ``max_tokens``, so it
+    passes.
     """
     return _SECRET_NAME.search(name) is not None
 

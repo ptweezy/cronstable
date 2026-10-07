@@ -1088,7 +1088,7 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_start_failure(
 
     cron._job_api = _Api()
 
-    async def _fake_prepare(j, rs):
+    async def _fake_prepare(j, rs, **kwargs):
         return ("tok123", {"CRONSTABLE_RUN_ID": "rid"})
 
     monkeypatch.setattr(cron, "_prepare_job_api_run", _fake_prepare)
@@ -1140,7 +1140,7 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_prepare_cancel(
     cron._job_api = _Api()
     parked = asyncio.Event()
 
-    async def _hung_prepare(j, rs):
+    async def _hung_prepare(j, rs, **kwargs):
         parked.set()
         await asyncio.sleep(3600)
 
@@ -1297,7 +1297,7 @@ async def test_slotlease_maybe_launch_node_scope_start_failure_finishes_run(
 
     cron._job_api = _Api()
 
-    async def _fake_prepare(j, rs):
+    async def _fake_prepare(j, rs, **kwargs):
         return ("tokN", {})
 
     monkeypatch.setattr(cron, "_prepare_job_api_run", _fake_prepare)
@@ -1322,7 +1322,7 @@ async def test_slotlease_maybe_launch_start_failure_without_job_api(
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_NODE_JOB)
     job = cron.cron_jobs["s"]
 
-    async def _fake_prepare(j, rs):
+    async def _fake_prepare(j, rs, **kwargs):
         return (None, {})
 
     monkeypatch.setattr(cron, "_prepare_job_api_run", _fake_prepare)

@@ -170,7 +170,7 @@ dags:
     template.command = [sys.executable, "-c", "pass"]
     entry = await cron._pools.enqueue(cron.cron_jobs["one"])
     held = await cron._pools.acquire("database", entry["id"])
-    key = await cron._dag.trigger_run("flow")
+    key = (await cron._dag.trigger("flow"))["runKey"]
     await _drain_pending(cron)
     body = await cron._dag.get_run("flow", key)
     assert body["tasks"]["task"]["state"] == "pending"
