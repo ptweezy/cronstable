@@ -16,12 +16,13 @@ everywhere else.
 """
 
 import json
-import os
 import pathlib
 
 import pytest
 
-playwright_api = pytest.importorskip("playwright.sync_api")
+pytest.importorskip("playwright.sync_api")
+
+from tests import _web_e2e as e2e  # noqa: E402
 
 DEMO = pathlib.Path(__file__).parent.parent / "docs" / "demo" / "index.html"
 
@@ -124,13 +125,7 @@ def _cells(page):
     return page.evaluate(_CELLS)
 
 
-def _open_fleet(p):
-    try:
-        browser = p.chromium.launch(
-            channel=os.environ.get("CRONSTABLE_TEST_BROWSER_CHANNEL")
-        )
-    except Exception as exc:  # no chromium provisioned
-        pytest.skip("playwright chromium unavailable: {}".format(exc))
+def _open_fleet(browser):
     page = browser.new_page()
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))
@@ -143,12 +138,12 @@ def _open_fleet(p):
     page.evaluate(_SERVE_FLEET, _fleet_body("success"))
     page.evaluate("document.getElementById('fleetBtn').click()")
     page.wait_for_selector("#fleetPanel tbody td.cell")
-    return browser, page, errors
+    return page, errors
 
 
 def test_fleet_grid_survives_an_unchanged_body_and_follows_a_change():
-    with playwright_api.sync_playwright() as p:
-        browser, page, errors = _open_fleet(p)
+    with e2e.browser_session() as browser:
+        page, errors = _open_fleet(browser)
         assert _cells(page) == {
             "alpha": ["cell ok", "cell ok"],
             "beta": ["cell ok", "cell ok"],
@@ -190,6 +185,5 @@ def test_fleet_grid_survives_an_unchanged_body_and_follows_a_change():
             "document.querySelector('#fleetPanel .fleetbar .warn').textContent"
         ) == "1 failing"
 
-        browser.close()
     assert errors == []
 

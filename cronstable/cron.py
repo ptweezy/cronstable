@@ -1473,6 +1473,11 @@ _FLEET_SERIALIZE_OFFLOAD_MIN = 200
 #: the memo, so the TTL is a safety net kept uniform with /jobs.
 _ACTIVITY_RESPONSE_TTL = 1.0
 
+#: How many ``jobs``-capped /activity products are shared at once, one per
+#: ``(jobs, sort)`` pair.  Each dashboard polls one fixed pair, so a few
+#: slots serve every viewer; the least recently used pair makes room.
+_ACTIVITY_CAPPED_MEMOS = 8
+
 
 _ProductT = TypeVar("_ProductT")
 
@@ -2201,6 +2206,12 @@ class Cron:
         self._activity_response_memo: _ResponseMemo[
             tuple[str, bytes, bytes | None]
         ] = _ResponseMemo()
+        # /activity under a `jobs` cap: (jobs, sort) -> memo, least
+        # recently used first (see _activity_capped_memo).
+        self._activity_capped_memos: dict[
+            tuple[int, str | None],
+            _ResponseMemo[tuple[str, bytes, bytes | None]],
+        ] = {}
         # The MCP cron_query_metrics snapshot: the same universe /metrics
         # renders, materialised once per window and filtered per call. It
         # lives here rather than on the handler so _bust_response_memos
@@ -5962,6 +5973,8 @@ class Cron:
             memo.cached = None
         self._fleet_response_memo.cached = None
         self._activity_response_memo.cached = None
+        for capped in self._activity_capped_memos.values():
+            capped.cached = None
         self._metric_samples_memo.cached = None
 
     async def _web_get_job(self, request: web.Request) -> web.Response:
@@ -6552,13 +6565,18 @@ class Cron:
         jobs = self._web_int_query(
             request, "jobs", default=total, lo=1, hi=max(1, total)
         )
-        names = self._activity_job_names(jobs, sort)
-        # The default response (every job, the whole retained window) is
-        # the memo-shared one.  A narrower `limit`, or a `jobs` cap that
-        # leaves jobs out, is built per request: a memo would need a slot
-        # per distinct combination.
-        if limit != RUN_HISTORY_LIMIT or names is not None:
-            etag, body, gz = await self._build_activity_product(limit, names)
+
+        async def build() -> tuple[str, bytes, bytes | None]:
+            # the build selects the jobs, so a request served from the
+            # shared product selects none
+            return await self._build_activity_product(
+                limit, self._activity_job_names(jobs, sort)
+            )
+
+        # A narrower `limit` is built per request: a memo would need a
+        # slot per distinct value.
+        if limit != RUN_HISTORY_LIMIT:
+            etag, body, gz = await build()
             return _conditional_response(
                 etag,
                 body,
@@ -6567,12 +6585,34 @@ class Cron:
                 gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
                 headers=headers,
             )
+        # The whole retained window is memo-shared: the default response
+        # (every job) in one slot, a `jobs` cap that leaves jobs out in the
+        # slot of its (jobs, sort) pair.
         return await self._memoized_conditional_response(
             request,
-            self._activity_response_memo,
+            self._activity_response_memo
+            if jobs >= total
+            else self._activity_capped_memo(jobs, sort),
             _ACTIVITY_RESPONSE_TTL,
-            self._build_activity_product,
+            build,
         )
+
+    def _activity_capped_memo(
+        self, jobs: int, sort: str | None
+    ) -> "_ResponseMemo[tuple[str, bytes, bytes | None]]":
+        """The memo of the ``jobs``-capped ``/activity`` product for a pair.
+
+        At most :data:`_ACTIVITY_CAPPED_MEMOS` pairs hold a slot.  A pair
+        that loses its slot is built again on its next request.
+        """
+        memos = self._activity_capped_memos
+        memo = memos.pop((jobs, sort), None)
+        if memo is None:
+            if len(memos) >= _ACTIVITY_CAPPED_MEMOS:
+                del memos[next(iter(memos))]
+            memo = _ResponseMemo()
+        memos[jobs, sort] = memo  # most recently used last
+        return memo
 
     async def _build_activity_product(
         self,

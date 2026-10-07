@@ -15,12 +15,13 @@ is a separate download CI fetches in one matrix cell, so this self-skips
 everywhere else.
 """
 
-import os
 import pathlib
 
 import pytest
 
-playwright_api = pytest.importorskip("playwright.sync_api")
+pytest.importorskip("playwright.sync_api")
+
+from tests import _web_e2e as e2e  # noqa: E402
 
 DEMO = pathlib.Path(__file__).parent.parent / "docs" / "demo" / "index.html"
 
@@ -40,13 +41,7 @@ _RECORD_FETCH = """
 
 
 def test_row_logs_button_opens_the_logs_tab():
-    with playwright_api.sync_playwright() as p:
-        try:
-            browser = p.chromium.launch(
-                channel=os.environ.get("CRONSTABLE_TEST_BROWSER_CHANNEL")
-            )
-        except Exception as exc:  # no chromium provisioned
-            pytest.skip("playwright chromium unavailable: {}".format(exc))
+    with e2e.browser_session() as browser:
         page = browser.new_page()
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
@@ -77,7 +72,6 @@ def test_row_logs_button_opens_the_logs_tab():
             "window.__paths.some((x) => x.endsWith('/logs'))"
         )
         paths = page.evaluate("window.__paths")
-        browser.close()
     assert not errors, errors
     assert pane_active, "logs pane lost .active: openDrawer got a bad tab"
     assert tab_active == "logs"

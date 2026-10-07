@@ -6540,6 +6540,15 @@ var qrcode = function() {
     const elapsed = (performance.now() - state.fetchedAt) / 1000;
     return job.scheduled_in - elapsed;
   }
+  // Whether the monotonic and the wall clock give the held /jobs body the
+  // same age. A suspend that stops the monotonic clock, or a step of the
+  // wall clock, parts the two anchors, and then neither tells how far the
+  // countdowns have run.
+  const ANCHOR_DRIFT_MS = 1000;
+  function anchorsAgree() {
+    const drift = (performance.now() - state.fetchedAt) - (Date.now() - state.fetchedWallAt);
+    return Math.abs(drift) < ANCHOR_DRIFT_MS;
+  }
   function nextRunAt(job) {
     // Anchor the absolute target once per response. Recombining Date.now()
     // and performance.now() on every render can drift across a minute edge.
@@ -9030,10 +9039,11 @@ var qrcode = function() {
       // scheduled_in, so a 304 means state.jobs is still its answer, and the
       // countdowns stay anchored to the response that carried them. A body
       // replayed from the cache would bring countdowns measured at an
-      // earlier poll.
+      // earlier poll. The request names the ETag only while the anchors
+      // agree (see anchorsAgree); otherwise it takes a body, which sets both.
       const res = await apiFetch("/jobs", {
         cache: "no-store",
-        headers: state.jobsEtag ? { "If-None-Match": state.jobsEtag } : {},
+        headers: state.jobsEtag && anchorsAgree() ? { "If-None-Match": state.jobsEtag } : {},
       });
       if (res.status !== 304) {
         if (!res.ok) throw new Error("HTTP " + res.status);
@@ -9043,11 +9053,6 @@ var qrcode = function() {
         state.fetchedAt = performance.now();
         state.fetchedWallAt = Date.now();
         state.jobsEtag = res.headers.get("ETag");
-      } else {
-        // The wall anchor stays, so every fire instant stays. The monotonic
-        // anchor takes the same age, which keeps the two in step across a
-        // suspend that stops the monotonic clock.
-        state.fetchedAt = performance.now() - (Date.now() - state.fetchedWallAt);
       }
       const jobs = state.jobs;
       state.respondedAt = performance.now();

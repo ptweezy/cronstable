@@ -5050,7 +5050,7 @@ def _count_full_listings(monkeypatch, backend):
 
 
 @pytest.mark.parametrize("excess", [2, 7])
-async def test_gc_pass_lists_the_namespace_once_however_many_runs_go(
+async def test_gc_pass_lists_the_runs_once_however_many_runs_go(
     excess, monkeypatch, dag_cron
 ):
     cron = await dag_cron(_RETAIN_ONE)  # retainRuns 1
@@ -5059,9 +5059,10 @@ async def test_gc_pass_lists_the_namespace_once_however_many_runs_go(
     calls = _count_full_listings(monkeypatch, backend)
     await cron._dag._gc_one_dag(backend, "rt", cron.cron_dags["rt"])
     assert await backend.list_document_keys("dagrun/rt") == [keys[-1]]
-    # one listing of the runs and one of the recovery batches, for the
-    # whole pass
-    assert calls == {"dagrun/rt": 1, "recoverybatch/rt": 1}
+    # One listing of the runs for the whole pass.  The recovery batches
+    # are read in one call for the pass and one under each deleted run's
+    # lease.
+    assert calls == {"dagrun/rt": 1, "recoverybatch/rt": 1 + excess}
 
 
 async def test_gc_removed_dag_lists_its_namespace_once(monkeypatch, dag_cron):
@@ -5072,7 +5073,8 @@ async def test_gc_removed_dag_lists_its_namespace_once(monkeypatch, dag_cron):
     calls = _count_full_listings(monkeypatch, backend)
     await cron._dag.gc_removed_dags(backend, {"lin"}, grace=0.0)
     assert await backend.list_document_keys("dagrun/lin") == []
-    assert calls == {"dagrun/lin": 1}
+    # the recovery batches are read once under each deleted run's lease
+    assert calls == {"dagrun/lin": 1, "recoverybatch/lin": 5}
 
 
 def _preparing_recovery(name, source_key, status="preparing"):
@@ -5149,6 +5151,42 @@ async def test_delete_run_spares_the_sources_of_an_open_recovery_batch(
     )
     await cron._dag._delete_run(backend, "lin", source, "id000")
     assert (await cron._dag._read("lin", source) is not None) is kept
+
+
+async def test_delete_run_reads_the_recovery_batches_in_one_call(
+    monkeypatch, dag_cron
+):
+    # Every batch is read whatever its key, so one listing call covers
+    # them all, however many there are.
+    cron = await dag_cron(_LINEAR)
+    backend = cron.state_backend
+    (source,) = await _seed_terminal_runs(backend, "lin", 1)
+    for i in range(3):
+        body = {
+            "planToken": "tok%d" % i,
+            "plans": [{"sourceRunKey": "someone-else"}],
+            "results": {},
+            "complete": False,
+            "expiresAt": dagrun._now() + 3600.0,
+        }
+        await backend.mutate_document(
+            "recoverybatch/lin",
+            body["planToken"],
+            lambda _cur, b=body: (b, None),
+        )
+    calls = _count_full_listings(monkeypatch, backend)
+    reads = []
+    real_read = backend.read_document
+
+    async def _counted_read(namespace, key):
+        reads.append(namespace)
+        return await real_read(namespace, key)
+
+    monkeypatch.setattr(backend, "read_document", _counted_read)
+    await cron._dag._delete_run(backend, "lin", source, "id000")
+    assert calls == {"recoverybatch/lin": 1}
+    assert "recoverybatch/lin" not in reads
+    assert await cron._dag._read("lin", source) is None
 
 
 @pytest.mark.parametrize("keys_listable", [True, False])

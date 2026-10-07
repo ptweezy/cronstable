@@ -154,6 +154,7 @@ def _refresh(page):
 _ANCHOR = """() => {
   const state = window.__perf.state();
   return {
+    anchor: state.fetchedAt,
     // the age of the held jobs on the monotonic and on the wall clock
     ages: [performance.now() - state.fetchedAt,
       Date.now() - state.fetchedWallAt],
@@ -170,12 +171,18 @@ def test_a_revalidated_poll_keeps_the_countdown_anchor(browser, tmp_path):
     """The daemon answers an unchanged ``/jobs`` with 304. Each countdown
     belongs to the response that carried it, so the fire instants and the
     rows stay as they were, and the connection readout still counts the
-    poll as a response. The countdowns age by the wall clock from poll to
-    poll, including across a suspend that stops the monotonic clock."""
+    poll as a response. When the two clocks disagree on the age of that
+    response, as they do after a suspend that stops the monotonic clock,
+    the page asks for the body again and takes its anchors from it."""
     jobs = [e2e.job("job%d" % i, schedule="%d 3 1 1 *" % i) for i in range(6)]
     with e2e.Daemon(tmp_path, jobs=jobs) as daemon:
+        # the page's clock is installed before the first poll, so both
+        # anchors of that poll are read from it
         with e2e.open_page(
-            browser, daemon.url + "?perf=1", prefs={"pollMs": 0}
+            browser,
+            daemon.url + "?perf=1",
+            prefs={"pollMs": 0},
+            before_goto=lambda page: page.clock.install(),
         ) as page:
             statuses = []
             page.on(
@@ -193,7 +200,6 @@ def test_a_revalidated_poll_keeps_the_countdown_anchor(browser, tmp_path):
             assert before["kept"] == len(jobs)
             # A minute on the page's clock: a countdown stamped again at
             # this instant would name the next minute in every row.
-            page.clock.install()
             page.clock.fast_forward(61000)
             _refresh(page)
             after = page.evaluate(_ANCHOR)
@@ -205,7 +211,9 @@ def test_a_revalidated_poll_keeps_the_countdown_anchor(browser, tmp_path):
             assert "minute" not in after["conn"]
 
             # An hour passes on the wall clock alone, as it does while a
-            # suspended machine holds the monotonic clock still.
+            # suspended machine holds the monotonic clock still, and as a
+            # wall clock set an hour ahead reads.  Neither anchor can say
+            # which, so the poll leaves the validator out.
             page.evaluate(
                 """() => {
                   const monotonic = performance.now.bind(performance);
@@ -213,13 +221,20 @@ def test_a_revalidated_poll_keeps_the_countdown_anchor(browser, tmp_path):
                 }"""
             )
             page.clock.fast_forward(3600000)
+            assert page.evaluate(_ANCHOR)["ages"][0] < 3600000
             _refresh(page)
             woken = page.evaluate(_ANCHOR)
-            assert statuses == [304, 304]
-            assert woken["targets"] == before["targets"]
-            assert woken["ages"][1] >= 3661000
+            assert statuses == [304, 200]
+            assert 0 <= woken["ages"][0] < 60000
             assert abs(woken["ages"][0] - woken["ages"][1]) < 5
-            assert woken["kept"] == len(jobs)
+            # the monotonic anchor is a body's arrival, so the code that
+            # reads a positive one as "a poll has landed" still does
+            assert woken["anchor"] > 0
+
+            # the anchors agree again, and so the next poll revalidates
+            _refresh(page)
+            assert statuses == [304, 200, 304]
+            assert page.evaluate(_ANCHOR)["targets"] == woken["targets"]
 
 
 def test_a_revalidated_poll_carries_the_token(browser, tmp_path):

@@ -769,7 +769,7 @@ re-probes `/whoami` and redraws.
 
 The dashboard is a thin client over the [HTTP control API](HTTP-API):
 
-- it polls `GET /jobs` on the refresh interval for the overview (each job carries a compact tail of recent runs for the sparkline). Each poll sends the previous response's `ETag` in `If-None-Match`. When only the countdowns have moved, the daemon answers `304 Not Modified`, and the dashboard keeps the jobs it holds and continues each countdown from the response that carried it;
+- it polls `GET /jobs` on the refresh interval for the overview (each job carries a compact tail of recent runs for the sparkline). Each poll sends the previous response's `ETag` in `If-None-Match`. When only the countdowns have moved, the daemon answers `304 Not Modified`, and the dashboard keeps the jobs it holds and continues each countdown from the response that carried it. If the browser's wall clock and monotonic clock disagree about the age of that response, as they can after the computer sleeps or its clock is set, the next poll omits `If-None-Match` and takes a full response;
 - it polls `GET /cluster` on the same interval for the [cluster panel](#cluster-panel) (the panel stays hidden unless a cluster section is configured);
 - `GET /node` (the header's [node meter](#the-job-overview)), `GET /dags` (the [workflows card](#dag-orchestration)), and `GET /pools` (the resource pools card) ride the same poll;
 - while the [fleet view](#fleet-view-every-nodes-runs-in-one-pane) is open, `GET /fleet` rides the same poll (the daemon answers it from gossip state it already holds);

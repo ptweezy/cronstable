@@ -375,10 +375,10 @@ async def artifact_put(
     newest record per name is ever read back, so the append carries
     ``prune_latest_by="name"``: superseded older records of the same name are
     amortised away (and their now-orphan blobs reclaimed by the next sweep),
-    bounding the stream by the number of distinct names (about twice that
-    many records at most), whatever the number of publishes.  The scope's
-    whole artifact stream is still reclaimed together when the job is
-    garbage collected.
+    bounding the stream by the number of distinct names, whatever the number
+    of publishes (:meth:`StateBackend.append_record` gives the factor).  The
+    scope's whole artifact stream is still reclaimed together when the job
+    is garbage collected.
     """
     if max_bytes and max_bytes > 0 and len(data) > max_bytes:
         raise JobStateError(

@@ -2235,12 +2235,85 @@ async def test_web_activity_uncapped_requests_share_the_default_product(
         assert resp.body == default.body
         assert resp.headers["ETag"] == default.headers["ETag"]
     assert len(builds) == 1
-    # a cap that bites is built for its caller and leaves the memo alone
+    # a cap that bites has a product of its own and leaves this one alone
     stored = cron._activity_response_memo.cached
     capped = await cron._web_get_activity(Req({"jobs": "3"}))
     assert len(json.loads(capped.body)["jobs"]) == 3
     assert len(builds) == 2
     assert cron._activity_response_memo.cached is stored
+
+
+async def test_web_activity_capped_requests_share_a_product_per_pair(
+    monkeypatch,
+):
+    # Each dashboard polls one (jobs, sort) pair, so every viewer of a
+    # pair gets one build per window, and the name-order selection runs
+    # in that build alone.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    cron.run_history["mid"].append(_heat_run("failure", 60))
+    builds = []
+    real_names = cron._activity_job_names
+
+    def counting_names(jobs, sort=None):
+        builds.append((jobs, sort))
+        return real_names(jobs, sort)
+
+    monkeypatch.setattr(cron, "_activity_job_names", counting_names)
+    web = {"jobs": "2"}
+    tui = {"jobs": "2", "sort": "name"}
+    first = await cron._web_get_activity(Req(web))
+    for _ in range(3):
+        again = await cron._web_get_activity(Req(web))
+        assert again.body == first.body
+        assert again.headers["ETag"] == first.headers["ETag"]
+    by_name = await cron._web_get_activity(Req(tui))
+    await cron._web_get_activity(Req(tui))
+    assert list(json.loads(by_name.body)["jobs"]) == ["alpha", "beta"]
+    assert builds == [(2, None), (2, "name")]
+    # a local change renders on the next poll of either pair
+    cron.run_history["zeta"].append(_heat_run("success", 30))
+    cron._bust_response_memos()
+    fresh = await cron._web_get_activity(Req(web))
+    assert fresh.headers["ETag"] != first.headers["ETag"]
+    await cron._web_get_activity(Req(tui))
+    assert builds[2:] == [(2, None), (2, "name")]
+    # a narrower `limit` is built for its caller, whatever the cap
+    for _ in range(2):
+        await cron._web_get_activity(Req({"jobs": "2", "limit": "1"}))
+    assert builds[4:] == [(2, None), (2, None)]
+
+
+async def test_web_activity_capped_products_are_bounded(monkeypatch):
+    # The least recently used pair makes room, and is built again when it
+    # is next asked for.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_CAPPED_MEMOS", 2)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    builds = []
+    real_names = cron._activity_job_names
+
+    def counting_names(jobs, sort=None):
+        builds.append((jobs, sort))
+        return real_names(jobs, sort)
+
+    monkeypatch.setattr(cron, "_activity_job_names", counting_names)
+
+    async def get(jobs):
+        await cron._web_get_activity(Req({"jobs": str(jobs)}))
+
+    await get(1)
+    await get(2)
+    await get(1)  # shared, which makes it the most recently used
+    await get(3)  # takes the slot of jobs=2
+    assert list(cron._activity_capped_memos) == [(1, None), (3, None)]
+    await get(1)
+    await get(2)
+    assert builds == [(1, None), (2, None), (3, None), (2, None)]
 
 
 async def test_web_activity_unknown_sort_is_a_400():

@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import datetime
 import hashlib
@@ -10,7 +11,7 @@ import sys
 import threading
 import types
 from collections import Counter, OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple, NewType
 from urllib.parse import ParseResult, urlparse
@@ -180,13 +181,7 @@ def _patch_strictyaml_pointer_copy() -> None:
 _patch_strictyaml_pointer_copy()
 
 
-#: ``direct`` is true on a thread while parse_config_string runs strictyaml
-#: over CONFIG_SCHEMA: the one load whose mapping hops the lookup installed
-#: by _patch_strictyaml_key_lookup answers from the hash table.
-_STRICTYAML_KEY_LOOKUP = threading.local()
-
-
-def _patch_strictyaml_key_lookup() -> None:
+def _patch_strictyaml_key_lookup() -> threading.local:
     """Answer strictyaml's mapping hops from the mapping's hash table.
 
     ``YAMLPointer._individual_get`` resolves a mapping hop by scanning the
@@ -198,23 +193,30 @@ def _patch_strictyaml_key_lookup() -> None:
     CONFIG_SCHEMA, whose keys are all ``Str()``
     (``_STRICTYAML_KEY_LOOKUP``).  Like the two shims above, it stands
     down unless upstream's method has the scanning shape.
+
+    Returns the thread-local whose ``direct`` flag switches the lookup on.
+    The installed function carries it as ``load``, so a second import of
+    this module drives the lookup that the first one installed.
     """
+    load = threading.local()
     try:
         from strictyaml.ruamel.comments import CommentedMap
         from strictyaml.yamlpointer import YAMLPointer
 
         scan = YAMLPointer._individual_get
+        installed = getattr(scan, "load", None)
         code = scan.__code__
         scans = code.co_argcount == 5 and {"items", "text"} <= set(
             code.co_names
         )
     except Exception:  # noqa: BLE001  # pragma: no cover - vendored layout changed
-        return
+        return load
+    if isinstance(installed, threading.local):
+        return installed
     if not scans:
-        return
+        return load
 
     lookup = dict.__getitem__
-    load = _STRICTYAML_KEY_LOOKUP
 
     def _individual_get(
         self: Any, segment: Any, index_type: Any, index: Any, strictdoc: Any
@@ -230,10 +232,15 @@ def _patch_strictyaml_key_lookup() -> None:
                 pass
         return scan(self, segment, index_type, index, strictdoc)
 
+    _individual_get.load = load  # type: ignore[attr-defined]
     YAMLPointer._individual_get = _individual_get
+    return load
 
 
-_patch_strictyaml_key_lookup()
+#: ``direct`` is true on a thread while parse_config_string runs strictyaml
+#: over CONFIG_SCHEMA: the one load whose mapping hops the lookup installed
+#: by _patch_strictyaml_key_lookup answers from the hash table.
+_STRICTYAML_KEY_LOOKUP = _patch_strictyaml_key_lookup()
 
 logger = logging.getLogger("cronstable.config")
 WebConfig = NewType("WebConfig", dict[str, Any])
@@ -1462,33 +1469,24 @@ CONFIG_SCHEMA = EmptyDict() | Map(
 )
 
 
-#: ``(interval, history)`` defaults of the monitorResources block.  Literal
-#: copies of ``SAMPLE_INTERVAL`` and ``MONITOR_HISTORY_DEFAULT`` in
-#: cronstable.resources, whose import loads asyncio and psutil.
-#: tests/test_config.py holds the two definitions equal.
-_MONITOR_SAMPLING_DEFAULTS: tuple[float, int] = (1.0, 240)
+# The monitorResources defaults, defined here for cronstable.resources to
+# import: that module loads asyncio and psutil, and building a job must
+# load neither.
+#
+# How often (seconds) the monitor samples the process tree.  Peak RSS is a
+# sampled high-water mark, so a shorter interval catches sharper spikes at the
+# cost of more wakeups; total CPU is cumulative and re-read every sample, so it
+# converges regardless of the interval as long as the run outlives one tick.
+# Per-job override: monitorResources.interval.
+SAMPLE_INTERVAL = 1.0
 
-
-def _monitor_sampling_defaults() -> tuple[float, int]:
-    """``(interval, history)`` defaults for the monitorResources block."""
-    return _MONITOR_SAMPLING_DEFAULTS
-
-
-def __getattr__(name: str) -> float | int:
-    """Serve the two sampling defaults under the resources module's names.
-
-    Callers read ``SAMPLE_INTERVAL`` / ``MONITOR_HISTORY_DEFAULT`` as module
-    attributes, the spelling cronstable.resources gives them.  The return
-    annotation is deliberately narrow rather than ``Any``, so a typo'd
-    attribute still fails to type-check where its value is used.
-    """
-    if name == "SAMPLE_INTERVAL":
-        return _monitor_sampling_defaults()[0]
-    if name == "MONITOR_HISTORY_DEFAULT":
-        return _monitor_sampling_defaults()[1]
-    raise AttributeError(
-        "module {!r} has no attribute {!r}".format(__name__, name)
-    )
+# Default cap on the per-run CPU/RSS series retained for charts (points, not
+# samples: a run longer than the cap is downsampled in place, see
+# cronstable.resources._SeriesRecorder).  Sized so a full series stays a few
+# KB inside the durable run record.  Per-job override:
+# monitorResources.history; 0 disables the series and keeps the summary
+# numbers only.
+MONITOR_HISTORY_DEFAULT = 240
 
 
 def _normalize_monitor_resources(raw: Any) -> tuple[bool, float, int]:
@@ -1499,14 +1497,13 @@ def _normalize_monitor_resources(raw: Any) -> tuple[bool, float, int]:
     turns monitoring on), the bool form takes the sampling defaults.  Range
     checks live with the other numeric checks in ``_validate_numeric_ranges``.
     """
-    interval, history = _monitor_sampling_defaults()
     if isinstance(raw, dict):
         return (
             bool(raw.get("enabled", True)),
-            float(raw.get("interval", interval)),
-            int(raw.get("history", history)),
+            float(raw.get("interval", SAMPLE_INTERVAL)),
+            int(raw.get("history", MONITOR_HISTORY_DEFAULT)),
         )
-    return (bool(raw), interval, history)
+    return (bool(raw), SAMPLE_INTERVAL, MONITOR_HISTORY_DEFAULT)
 
 
 def _merge_lists(key: str, base: list, override: list) -> list:
@@ -4940,13 +4937,9 @@ def _validate_dags(config: CronstableConfig) -> None:
 def parse_config(
     config_arg: str, _sources: set | None = None
 ) -> CronstableConfig:
-    # One call is one load of a whole configuration. The per-file parse
-    # cache keeps every file this load uses (see _DIR_FILE_CACHE), so the
-    # load records them here and trims the cache when it returns.
-    outermost = getattr(_DIR_FILE_CACHE_LOAD, "used", None) is None
-    if outermost:
-        _DIR_FILE_CACHE_LOAD.used = set()
-    try:
+    # One call is one load of a whole configuration, the unit the per-file
+    # parse cache keeps whole (see _dir_file_cache_load).
+    with _dir_file_cache_load():
         if os.path.isdir(config_arg):
             config = _parse_config_dir(config_arg, _sources)
         else:
@@ -4959,11 +4952,6 @@ def parse_config(
                 raise ConfigError(str(ex)) from ex
         _validate_cross_sections(config)
         return config
-    finally:
-        if outermost:
-            used = _DIR_FILE_CACHE_LOAD.used
-            _DIR_FILE_CACHE_LOAD.used = None
-            _trim_dir_file_cache(used)
 
 
 def parse_config_with_sources(
@@ -5031,6 +5019,35 @@ _DIR_FILE_CACHE_MAX = 1024
 #: Per thread, because the daemon reloads on an executor thread.
 _DIR_FILE_CACHE_LOAD = threading.local()
 
+#: The cache keys of the newest parse_config call that returned.  A call
+#: that raises can stop before it reaches every file of the configuration,
+#: so its trim keeps these keys beside its own.
+_DIR_FILE_CACHE_KEPT: frozenset[str] = frozenset()
+
+
+@contextlib.contextmanager
+def _dir_file_cache_load() -> Iterator[None]:
+    """Collect the cache keys one parse_config call uses, then trim.
+
+    A nested call joins the load already running on its thread.
+    """
+    global _DIR_FILE_CACHE_KEPT
+    if getattr(_DIR_FILE_CACHE_LOAD, "used", None) is not None:
+        yield
+        return
+    used: set[str] = set()
+    _DIR_FILE_CACHE_LOAD.used = used
+    try:
+        yield
+    except BaseException:
+        used |= _DIR_FILE_CACHE_KEPT
+        raise
+    else:
+        _DIR_FILE_CACHE_KEPT = frozenset(used)
+    finally:
+        _DIR_FILE_CACHE_LOAD.used = None
+        _trim_dir_file_cache(used)
+
 
 def _trim_dir_file_cache(used: "set[str] | frozenset[str]") -> None:
     """Evict least-recently-used entries until the cache is within bounds.
@@ -5089,7 +5106,7 @@ def _parse_file_cached(
     cycle and the uncached path words the error.
 
     Inside parse_config the file joins that load's ``used`` set and the
-    load trims the cache when it returns.  A direct parse_config_file or
+    load trims the cache when it ends.  A direct parse_config_file or
     parse_config_string call that reaches an include has no such set, so
     the store below trims to the fixed bound itself.
     """

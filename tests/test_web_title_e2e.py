@@ -15,13 +15,14 @@ is a separate download CI fetches in one matrix cell, so this self-skips
 everywhere else.
 """
 
-import os
 import pathlib
 import re
 
 import pytest
 
-playwright_api = pytest.importorskip("playwright.sync_api")
+pytest.importorskip("playwright.sync_api")
+
+from tests import _web_e2e as e2e  # noqa: E402
 
 DEMO = pathlib.Path(__file__).parent.parent / "docs" / "demo" / "index.html"
 
@@ -101,13 +102,7 @@ _FORCE_RECOVERY = """
 """
 
 
-def _open_demo(p, query=""):
-    try:
-        browser = p.chromium.launch(
-            channel=os.environ.get("CRONSTABLE_TEST_BROWSER_CHANNEL")
-        )
-    except Exception as exc:  # no chromium provisioned
-        pytest.skip("playwright chromium unavailable: {}".format(exc))
+def _open_demo(browser, query=""):
     page = browser.new_page()
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))
@@ -115,12 +110,12 @@ def _open_demo(p, query=""):
     # the title refresh rides the poll pipeline, so the first poll must land
     page.wait_for_selector("#rows tr")
     page.wait_for_function(_TITLE_LIVE)
-    return browser, page, errors
+    return page, errors
 
 
 def test_demo_title_walks_the_ladder():
-    with playwright_api.sync_playwright() as p:
-        browser, page, errors = _open_demo(p)
+    with e2e.browser_session() as browser:
+        page, errors = _open_demo(browser)
         title = page.evaluate("document.title")
         assert LADDER.match(title), title
         icon = page.evaluate(
@@ -128,12 +123,11 @@ def test_demo_title_walks_the_ladder():
         )
         assert icon.startswith("data:image/png")
         assert errors == []
-        browser.close()
 
 
 def test_demo_title_escalates_on_failure_and_recovers():
-    with playwright_api.sync_playwright() as p:
-        browser, page, errors = _open_demo(p, "?perf=1")
+    with e2e.browser_session() as browser:
+        page, errors = _open_demo(browser, "?perf=1")
         failed = page.evaluate(_FORCE_FAILURE)
         assert failed["title"] == "{} failing · cronstable demo".format(
             failed["name"]
@@ -141,12 +135,11 @@ def test_demo_title_escalates_on_failure_and_recovers():
         recovered = page.evaluate(_FORCE_RECOVERY)
         assert QUIET.match(recovered["title"]), recovered["title"]
         assert errors == []
-        browser.close()
 
 
 def test_demo_title_rotates_complete_readouts():
-    with playwright_api.sync_playwright() as p:
-        browser, page, errors = _open_demo(p, "?perf=1")
+    with e2e.browser_session() as browser:
+        page, errors = _open_demo(browser, "?perf=1")
         r = page.evaluate(_SAMPLE_FLIP)
         suffix = " · cronstable demo"
         expected = {"2 jobs failing" + suffix}
@@ -155,4 +148,3 @@ def test_demo_title_rotates_complete_readouts():
         assert r["second"] in expected, r["second"]
         assert r["first"] != r["second"]
         assert errors == []
-        browser.close()

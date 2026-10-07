@@ -23,12 +23,13 @@ is a separate download CI fetches in one matrix cell, so this self-skips
 everywhere else.
 """
 
-import os
 import pathlib
 
 import pytest
 
 playwright_api = pytest.importorskip("playwright.sync_api")
+
+from tests import _web_e2e as e2e  # noqa: E402
 
 DEMO = pathlib.Path(__file__).parent.parent / "docs" / "demo" / "index.html"
 
@@ -112,13 +113,7 @@ def _visible(page):
     return page.evaluate(_VISIBLE_ROWS)
 
 
-def _open_drawer_with_lines(p):
-    try:
-        browser = p.chromium.launch(
-            channel=os.environ.get("CRONSTABLE_TEST_BROWSER_CHANNEL")
-        )
-    except Exception as exc:  # no chromium provisioned
-        pytest.skip("playwright chromium unavailable: {}".format(exc))
+def _open_drawer_with_lines(browser):
     page = browser.new_page()
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))
@@ -134,12 +129,12 @@ def _open_drawer_with_lines(p):
         "(n) => document.querySelectorAll('#term .ln').length === n",
         arg=len(LINES),
     )
-    return browser, page, errors
+    return page, errors
 
 
 def test_log_search_counts_hides_and_recompiles():
-    with playwright_api.sync_playwright() as p:
-        browser, page, errors = _open_drawer_with_lines(p)
+    with e2e.browser_session() as browser:
+        page, errors = _open_drawer_with_lines(browser)
         assert _label(page) == ""
 
         # plain query: the uppercase line matches through the lowercased
@@ -192,15 +187,13 @@ def test_log_search_counts_hides_and_recompiles():
         _wait_count(page, "4 matches")
         assert _visible(page)["8"] is False
 
-        browser.close()
     assert errors == []
 
 
 def test_bad_pattern_reads_bad_regex():
-    with playwright_api.sync_playwright() as p:
-        browser, page, errors = _open_drawer_with_lines(p)
+    with e2e.browser_session() as browser:
+        page, errors = _open_drawer_with_lines(browser)
         page.check("#optRegex")
         page.fill("#logSearch", "(")
         _wait_count(page, "bad regex")
-        browser.close()
     assert errors == []

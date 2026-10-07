@@ -1524,10 +1524,10 @@ async def test_chain_task_costs_three_document_rewrites(dag_cron, monkeypatch):
 # --- 2. full listings per GC pass -----------------------------------------
 #
 # The retention pass runs inside the scheduler's single-flight service
-# task.  It lists the run namespace and the recovery batches once, then
-# deletes each excess run under that run's lease.  The check it repeats
-# there reads recovery documents only, so the number of full listings must
-# not depend on how many runs the pass deletes.
+# task.  It lists the run namespace once, then deletes each excess run
+# under that run's lease.  The check it repeats there reads the recovery
+# runs by key and the recovery batches in one call, so the listings of the
+# run namespace must not depend on how many runs the pass deletes.
 
 
 async def test_gc_pass_full_listings_do_not_grow_with_deleted_runs(
@@ -1567,9 +1567,13 @@ async def test_gc_pass_full_listings_do_not_grow_with_deleted_runs(
         await cron._dag._gc_one_dag(backend, "gc", cron.cron_dags["gc"])
         after = len(await backend.list_document_keys("dagrun/gc"))
         assert (before - after, after) == (excess, 2)
-        seen[excess] = sorted(listings)
-    assert seen[3] == seen[12] == ["dagrun/gc", "recoverybatch/gc"], (
-        "a GC pass must list each namespace once however many runs it "
+        seen[excess] = listings.count("dagrun/gc")
+        assert listings.count("recoverybatch/gc") == 1 + excess, (
+            "a GC pass reads the recovery batches once for the pass and "
+            "once under each deleted run's lease; got %r" % (listings,)
+        )
+    assert seen[3] == seen[12] == 1, (
+        "a GC pass must list the run namespace once however many runs it "
         "deletes; got %r" % (seen,)
     )
 
@@ -2268,6 +2272,21 @@ def test_key_lookup_shim_stands_down_on_an_unknown_lookup_shape():
         assert YAMLPointer._individual_get is rebound
     finally:
         YAMLPointer._individual_get = installed
+
+
+def test_a_second_import_of_config_drives_the_installed_key_lookup():
+    # Importing the module runs
+    # `_STRICTYAML_KEY_LOOKUP = _patch_strictyaml_key_lookup()`.  The
+    # installed lookup carries the flag it reads, so that call hands a
+    # second import (importlib.reload, a purged sys.modules) the same flag,
+    # and its parse_config_string switches the lookup on.
+    from cronstable import config
+
+    installed = _configcli_installed_lookup()
+    assert installed.load is config._STRICTYAML_KEY_LOOKUP
+    assert (
+        config._patch_strictyaml_key_lookup() is config._STRICTYAML_KEY_LOOKUP
+    )
 
 
 def test_direct_key_lookup_is_scoped_to_the_config_schema_load(monkeypatch):

@@ -2351,6 +2351,34 @@ async def test_newest_record_index_drops_records_that_left_the_stream(
     assert backend._field_index_entries == 11
 
 
+async def test_newest_record_index_forgets_a_wiped_stream(
+    fs_backend, monkeypatch
+):
+    # A wiped or collected stream leaves no facts behind: they describe
+    # records that are gone and would use up the budget of live streams.
+    backend = fs_backend
+    old = state._now() - 7200.0
+    monkeypatch.setattr(state, "_now", lambda: old)
+    for i in range(5):
+        await backend.append_record("runs/collected", {"name": "n%d" % i})
+    monkeypatch.undo()
+    for stream in ("runs/wiped", "runs/live"):
+        for i in range(5):
+            await backend.append_record(stream, {"name": "n%d" % i})
+    for stream in ("runs/collected", "runs/wiped", "runs/live"):
+        await backend.newest_record_with(stream, "name", "n0")
+    assert backend._field_index_entries == 15
+    await backend.prune_records("runs/wiped", keep=0)
+    assert backend._field_index_entries == 10
+    result = await backend.collect_garbage(keep={"runs/": set()}, grace=3600.0)
+    assert result["removed"] == [state._fs_safe("runs/collected")]
+    live = (state._fs_safe("runs/live"), "name")
+    assert list(backend._field_index) == [live]
+    assert backend._field_index_entries == 5
+    got = await backend.newest_record_with("runs/live", "name", "n4")
+    assert got == {"name": "n4"}
+
+
 async def test_newest_record_with_base_default_scans_list_records():
     class _Scanning(_MinimalBackend):
         async def list_records(

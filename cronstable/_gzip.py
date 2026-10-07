@@ -53,8 +53,8 @@ def gzip_static(body: bytes) -> bytes:
 
     For a document compressed once and served for the life of the
     process: the CPU is paid one time and the size on every transfer.
-    ``zlib`` whatever :func:`backend` returns: ISA-L trades ratio for
-    speed, and its levels stop at 3.
+    It uses ``zlib`` whatever :func:`backend` returns, because ISA-L
+    trades ratio for speed and its levels stop at 3.
     """
     return _pack(zlib, body, zlib.Z_BEST_COMPRESSION)
 

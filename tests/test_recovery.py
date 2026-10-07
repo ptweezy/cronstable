@@ -64,6 +64,34 @@ async def test_recovery_preserves_success_and_copies_only_its_artifacts(dag_cron
     assert repeated["runKey"] == result["runKey"]
 
 
+async def test_recovery_artifact_limit_counts_names(
+    dag_cron, tmp_path, monkeypatch
+):
+    import hashlib
+
+    from cronstable import dagrun
+
+    cron, key, source, _ = await failed_flow(dag_cron, tmp_path)
+    backend = cron.state_backend
+    scope = dag.xcom_scope("flow", source["runId"])
+    names = ["extract/a", "extract/b", "extract/c"]
+    monkeypatch.setattr(dagrun, "RECOVERY_MAX_ARTIFACTS", len(names))
+    # Each name is published twice. The scope holds the superseded records
+    # until its next prune, and they do not count toward the limit.
+    for data in (b"old", b"new"):
+        for name in names:
+            await jobstate.artifact_put(backend, scope, name, data)
+    stream = jobstate.ARTIFACT_STREAM_PREFIX + scope
+    assert len(await backend.list_records(stream)) == 2 * len(names)
+    preview = await cron._dag.recover("flow", key)
+    assert [a["name"] for a in preview["artifacts"]] == names
+    newest = hashlib.sha256(b"new").hexdigest()
+    assert {a["sha256"] for a in preview["artifacts"]} == {newest}
+    await jobstate.artifact_put(backend, scope, "extract/d", b"new")
+    with pytest.raises(recovery.RecoveryError, match="at most 3 artifacts"):
+        await cron._dag.recover("flow", key)
+
+
 async def test_stale_preview_and_changed_configuration_require_review(dag_cron, tmp_path):
     cron, key, _, _ = await failed_flow(dag_cron, tmp_path)
     preview = await cron._dag.recover("flow", key)

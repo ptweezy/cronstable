@@ -698,8 +698,10 @@ class StateBackend(abc.ABC):
         distinct values.  Unlike ``prune_keep`` it never removes the
         current version of any value.  Amortised too: a pass reads every
         record, so the backend may space passes by the number of records
-        the last one kept, which holds the stream under about twice its
-        distinct values and the reads per append constant.
+        the last one kept, which holds the reads per append constant.
+        The spacing counts one process's appends: the stream stays under
+        about twice its distinct values with one process appending, and
+        each further process can add as many again.
         """
 
     @abc.abstractmethod
@@ -1700,9 +1702,10 @@ class FilesystemStateBackend(StateBackend):
         """Space a name-keyed stream's next prune by the records it kept.
 
         A name-keyed pass reads every record, so waiting for ``kept`` more
-        appends keeps the reads per append constant and the stream under
-        about twice its distinct values.  Only lengthens the countdown the
-        pass's gate check set, and never inserts.
+        of this process's appends keeps the reads per append constant.
+        :meth:`StateBackend.append_record` gives the stream size that
+        follows.  Only lengthens the countdown the pass's gate check set,
+        and never inserts.
         """
         with self._prune_gate_lock:
             if self._prune_countdown.get(token, kept) < kept - 1:
@@ -2076,6 +2079,16 @@ class FilesystemStateBackend(StateBackend):
                 _oldest, dropped = self._field_index.popitem(last=False)
                 self._field_index_entries -= len(dropped)
 
+    def _field_index_forget(self, token: str) -> None:
+        """Drop one stream's facts after a wholesale wipe.
+
+        Every record they describe is gone, and they would count against
+        the budget until the least recently used streams made room.
+        """
+        with self._field_index_lock:
+            for key in [k for k in self._field_index if k[0] == token]:
+                self._field_index_entries -= len(self._field_index.pop(key))
+
     async def list_stream_names(self, prefix: str) -> list[str]:
         return await self._call(
             "list-stream-names", self._list_stream_names_sync, prefix
@@ -2353,6 +2366,7 @@ class FilesystemStateBackend(StateBackend):
             # A wholesale wipe: the derive_max memo must not survive it,
             # see _derive_max_invalidate.
             self._derive_max_invalidate(token)
+            self._field_index_forget(token)
         return deleted
 
     def _prune_latest_by_sync(
@@ -3161,6 +3175,7 @@ class FilesystemStateBackend(StateBackend):
             # a wholesale stream wipe: the derive_max memo must not
             # survive it, see _derive_max_invalidate.
             self._derive_max_invalidate(token)
+            self._field_index_forget(token)
             self._prune_countdown_forget(token)
             self._record_name_floor_forget(token)
         # Before the orphan-lock sweep on purpose: an idempotency doc this

@@ -31,6 +31,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
+from cronstable.config import MONITOR_HISTORY_DEFAULT, SAMPLE_INTERVAL
+
 try:
     import psutil
 except ImportError:  # pragma: no cover - psutil is a core dependency
@@ -40,22 +42,6 @@ except ImportError:  # pragma: no cover - psutil is a core dependency
     psutil = None  # type: ignore[assignment]
 
 logger = logging.getLogger("cronstable")
-
-# How often (seconds) the monitor samples the process tree.  Peak RSS is a
-# sampled high-water mark, so a shorter interval catches sharper spikes at the
-# cost of more wakeups; total CPU is cumulative and re-read every sample, so it
-# converges regardless of the interval as long as the run outlives one tick.
-# Per-job override: monitorResources.interval (cronstable.config).
-# cronstable.config repeats this value and MONITOR_HISTORY_DEFAULT in
-# _MONITOR_SAMPLING_DEFAULTS, and tests/test_config.py holds them equal.
-SAMPLE_INTERVAL = 1.0
-
-# Default cap on the per-run CPU/RSS series retained for charts (points, not
-# samples: a run longer than the cap is downsampled in place, see
-# _SeriesRecorder).  Sized so a full series stays a few KB inside the durable
-# run record.  Per-job override: monitorResources.history; 0 disables the
-# series and keeps the summary numbers only.
-MONITOR_HISTORY_DEFAULT = 240
 
 # Hard cap applied when *parsing* a series out of a ledger record
 # (ResourceUsage.from_dict): a foreign or hand-edited record must not be able

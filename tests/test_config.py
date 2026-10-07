@@ -681,6 +681,7 @@ def _small_dir_file_cache(monkeypatch, floor=4):
     cache = OrderedDict()
     monkeypatch.setattr(config, "_DIR_FILE_CACHE", cache)
     monkeypatch.setattr(config, "_DIR_FILE_CACHE_MAX", floor)
+    monkeypatch.setattr(config, "_DIR_FILE_CACHE_KEPT", frozenset())
     return cache
 
 
@@ -824,18 +825,58 @@ def test_failed_load_keeps_the_unbroken_files_cached(tmp_path, monkeypatch):
     with pytest.raises(ConfigError):
         config.parse_config(str(tmp_path))
     assert parsed == ["job-002.yaml"]
-    # the five files that parsed stay; the broken file's superseded entry
-    # is the one this load did not use
-    assert sorted(os.path.basename(path) for path in cache) == [
-        "job-{:03d}.yaml".format(i) for i in (0, 1, 3, 4, 5)
-    ]
+    # a load that raises evicts no file of the last load that returned
+    assert len(cache) == 6
 
+    # the repair is new content, so it is the one file parsed
     del parsed[:]
-    broken.write_text(good)
+    broken.write_text(good.replace('"0 3', '"0 5'))
     conf = config.parse_config(str(tmp_path))
     assert parsed == ["job-002.yaml"]
     assert len(conf.jobs) == 6
     assert len(cache) == 6
+
+
+def test_failed_include_load_keeps_the_files_it_did_not_reach(
+    tmp_path, monkeypatch
+):
+    # An include tree stops at its first broken file, so the load that
+    # raises has used only the files before it.  The rest stay cached.
+    cache = _small_dir_file_cache(monkeypatch)
+    _write_one_job_files(tmp_path / "parts", 12)
+    entry = tmp_path / "entry.yaml"
+    entry.write_text(
+        "include:\n"
+        + "".join("  - parts/job-{:03d}.yaml\n".format(i) for i in range(12))
+    )
+    assert len(config.parse_config(str(entry)).jobs) == 12
+    assert len(cache) == 12
+
+    broken = tmp_path / "parts" / "job-002.yaml"
+    good = broken.read_text()
+    broken.write_text("jobs:\n  - name: job-002\n    bogus: 1\n")
+    with pytest.raises(ConfigError):
+        config.parse_config(str(entry))
+    assert len(cache) == 12
+
+    # the repair is new content: it and the entry are the files parsed
+    broken.write_text(good.replace('"0 3', '"0 5'))
+    parsed = _record_file_parses(monkeypatch)
+    assert len(config.parse_config(str(entry)).jobs) == 12
+    assert parsed == ["entry.yaml", "job-002.yaml"]
+
+    # A load that raises still trims.  It keeps its own files and those of
+    # the last load that returned, so the files of an earlier load that
+    # raised are the ones to go.
+    for prefix in ("one", "two"):
+        other = tmp_path / prefix
+        _write_one_job_files(other, 3, prefix=prefix)
+        (other / (prefix + "-001.yaml")).write_text("jobs:\n  - bogus: 1\n")
+        with pytest.raises(ConfigError):
+            config.parse_config(str(other))
+    assert sorted(os.path.basename(path) for path in cache) == [
+        "job-{:03d}.yaml".format(i) for i in range(12)
+    ] + ["two-000.yaml", "two-002.yaml"]
 
 
 @pytest.mark.parametrize(
@@ -1397,19 +1438,16 @@ def test_monitor_resources_defaults_off():
     assert job.monitorResourcesHistory == config.MONITOR_HISTORY_DEFAULT
 
 
-def test_monitor_sampling_defaults_match_the_resource_monitor():
-    # config spells the two defaults out so that building a job does not
-    # import cronstable.resources; this holds the two definitions equal.
+def test_the_resource_monitor_takes_its_sampling_defaults_from_config():
+    # config defines the two defaults, so building a job does not import
+    # cronstable.resources, and the monitor's own defaults are those values.
+    import inspect
+
     from cronstable import resources
 
-    assert (config.SAMPLE_INTERVAL, config.MONITOR_HISTORY_DEFAULT) == (
-        resources.SAMPLE_INTERVAL,
-        resources.MONITOR_HISTORY_DEFAULT,
-    )
-    assert type(config.SAMPLE_INTERVAL) is type(resources.SAMPLE_INTERVAL)
-    assert type(config.MONITOR_HISTORY_DEFAULT) is type(
-        resources.MONITOR_HISTORY_DEFAULT
-    )
+    params = inspect.signature(resources.ResourceMonitor).parameters
+    assert params["interval"].default is config.SAMPLE_INTERVAL
+    assert params["history"].default is config.MONITOR_HISTORY_DEFAULT
 
 
 def test_validating_a_config_loads_no_asyncio(tmp_path):

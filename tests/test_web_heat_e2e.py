@@ -18,13 +18,14 @@ is a separate download CI fetches in one matrix cell, so this self-skips
 everywhere else.
 """
 
-import os
 import pathlib
 import re
 
 import pytest
 
-playwright_api = pytest.importorskip("playwright.sync_api")
+pytest.importorskip("playwright.sync_api")
+
+from tests import _web_e2e as e2e  # noqa: E402
 
 DEMO = pathlib.Path(__file__).parent.parent / "docs" / "demo" / "index.html"
 
@@ -64,14 +65,7 @@ _RECORD_FETCH_NO_ACTIVITY = """
 """
 
 
-def _open_demo(p):
-    try:
-        # the channel variable every dashboard browser test honors
-        browser = p.chromium.launch(
-            channel=os.environ.get("CRONSTABLE_TEST_BROWSER_CHANNEL")
-        )
-    except Exception as exc:  # no chromium provisioned
-        pytest.skip("playwright chromium unavailable: {}".format(exc))
+def _open_demo(browser):
     page = browser.new_page()
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))
@@ -79,18 +73,17 @@ def _open_demo(p):
     # the heat render iterates the jobs snapshot, so the first poll must
     # have landed before the panel opens
     page.wait_for_selector("#rows tr")
-    return browser, page, errors
+    return page, errors
 
 
 def test_demo_heatmap_fills_from_one_activity_fetch():
-    with playwright_api.sync_playwright() as p:
-        browser, page, errors = _open_demo(p)
+    with e2e.browser_session() as browser:
+        page, errors = _open_demo(browser)
         page.evaluate(_RECORD_FETCH)
         page.evaluate("document.getElementById('heatBtn').click()")
         page.wait_for_selector(".heat-cell.act")
         paths = page.evaluate("window.__paths")
         urls = page.evaluate("window.__urls")
-        browser.close()
     assert not errors, errors
     assert paths.count("/activity") == 1
     # the request names the row cap, and the demo backend answers it
@@ -103,13 +96,12 @@ def test_demo_heatmap_fills_from_one_activity_fetch():
 
 
 def test_demo_heatmap_falls_back_per_job_without_activity():
-    with playwright_api.sync_playwright() as p:
-        browser, page, errors = _open_demo(p)
+    with e2e.browser_session() as browser:
+        page, errors = _open_demo(browser)
         page.evaluate(_RECORD_FETCH_NO_ACTIVITY)
         page.evaluate("document.getElementById('heatBtn').click()")
         page.wait_for_selector(".heat-cell.act")
         paths = page.evaluate("window.__paths")
-        browser.close()
     assert not errors, errors
     assert paths.count("/activity") == 1  # the probe, answered 404
     runs = [x for x in paths if re.match(r"^/jobs/.+/runs$", x)]

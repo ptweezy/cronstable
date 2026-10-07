@@ -91,11 +91,15 @@
 - Publishing an artifact or an XCom value costs the same at any number of
   names in the scope. The cleanup of superseded versions waits for a scope
   to double, so a scope of more than eight names holds up to about twice as
-  many records as names.
+  many records as names, and each further node that publishes to the scope
+  can add as many again. Workflow recovery's limit of 10,000 artifacts counts
+  names, so superseded records do not count toward it.
 - Planning a workflow rerun from a task follows each dependency once.
 - A configuration directory or include tree of more than 1,024 files
   reloads by reparsing only the files that changed. The per-file parse cache
-  holds every file of the loaded configuration, and at least 1,024 files.
+  holds every file of the loaded configuration, and at least 1,024 files. A
+  reload that fails keeps the cached files of the last configuration that
+  loaded.
 - Configuration parse time grows in proportion to the number of keys in a
   mapping. A `pools` or `web.headers` block with 2,000 entries loads in
   under a second.
@@ -109,7 +113,8 @@
   name with `sort=name`. Any other `sort` value returns `400`. Without
   `jobs`, the response carries every job. Each dashboard draws at most 80
   heatmap rows and sends that cap: the web dashboard requests `jobs=80`, and
-  the terminal dashboard requests `jobs=80&sort=name`.
+  the terminal dashboard requests `jobs=80&sort=name`. Viewers that send the
+  same `jobs` and `sort` values share one built response.
 - The daemon compresses the dashboard page with zlib at level 9, once per
   process, whichever gzip backend is installed. A browser that accepts gzip
   downloads about 180 KB. JSON responses keep level 1 on the installed
@@ -126,7 +131,9 @@
   to the `/jobs` response that delivered them. Each poll sends the previous
   response's `ETag` in `If-None-Match` and bypasses the browser's HTTP
   cache. When the daemon answers `304 Not Modified`, the dashboard keeps the
-  jobs it holds, and their countdowns run on.
+  jobs it holds, and their countdowns run on. After the computer sleeps or
+  its clock is set, the next poll takes a full response and restarts the
+  countdowns from it.
 - The web dashboard's jobs table and fleet matrix keep their painted rows
   through a frame that repaints something else, such as each frame of the
   swaying logo.

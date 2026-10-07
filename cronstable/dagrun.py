@@ -78,6 +78,9 @@ ADOPT_FULL_REFRESH = 600.0
 # own) is acted on within a few seconds rather than a full idle re-advance.
 APPROVAL_POLL_INTERVAL = 5.0
 
+# The most artifact names one recovery plans over (see recovery_plan).
+RECOVERY_MAX_ARTIFACTS = 10000
+
 # Hard cap on how many missed occurrences a single catch-up replays, mirroring
 # cron.MAX_CATCHUP_OCCURRENCES so a long outage cannot stampede.
 DAG_MAX_CATCHUP = 100
@@ -2575,29 +2578,42 @@ class DagScheduler:
         backend = self._backend()
         if config is None or source is None or backend is None:
             raise recovery.RecoveryError(("workflow run not found"))
+        # The cap counts artifact names.  A scope's stream holds more
+        # records than names between prunes (see append_record's
+        # ``prune_latest_by``), so the scan passes the newest record of
+        # each name and stops at the first name over the cap.
+        seen = set()
+
+        def newest_of_its_name(record):
+            artifact = record["name"]
+            if artifact in seen:
+                return False
+            seen.add(artifact)
+            return True
+
         records = await asyncio.wait_for(
             backend.list_records(
                 jobstate.ARTIFACT_STREAM_PREFIX
                 + dag.xcom_scope(name, source["runId"]),
                 newest_first=True,
                 strict=True,
-                limit=10001,
+                predicate=newest_of_its_name,
+                max_matches=RECOVERY_MAX_ARTIFACTS + 1,
             ),
             STATE_OP_TIMEOUT,
         )
-        if len(records) > 10000:
+        if len(records) > RECOVERY_MAX_ARTIFACTS:
             raise recovery.RecoveryError(
-                "recovery supports at most 10000 artifact records"
+                "recovery supports at most {} artifacts".format(
+                    RECOVERY_MAX_ARTIFACTS
+                )
             )
-        newest = {}
-        for record in records:
-            newest.setdefault(record["name"], record)
         plan = recovery.plan(
             config,
             source,
             mode=mode,
             tasks=tasks,
-            artifacts=[newest[k] for k in sorted(newest)],
+            artifacts=sorted(records, key=lambda record: record["name"]),
         )
         return plan, source
 
@@ -3412,8 +3428,9 @@ class DagScheduler:
                 for b in references
             ):
                 return
-            batches = await self._documents_keyed(
-                backend, "recoverybatch/" + name
+            batches = await asyncio.wait_for(
+                backend.list_documents("recoverybatch/" + name),
+                STATE_OP_TIMEOUT,
             )
             if any(
                 not batch.get("complete")
@@ -3433,7 +3450,7 @@ class DagScheduler:
 
     @staticmethod
     async def _documents_keyed(
-        backend: StateBackend, namespace: str, prefix: str = ""
+        backend: StateBackend, namespace: str, prefix: str
     ) -> list[dict[str, Any]]:
         """The documents of ``namespace`` whose key starts with ``prefix``.
 

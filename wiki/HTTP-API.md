@@ -769,10 +769,11 @@ bounded number of rows:
 | `sort=name` | Select the `N` jobs in ascending job-name order (code point order). Without `sort`, the selection is the first `N` jobs in configuration order, the order [`GET /jobs`](#get-jobs) lists them. Any other `sort` value returns `400 Bad Request`. |
 
 `sort` selects jobs for a `jobs` cap and has no effect without one. A capped
-response carries its own `ETag` and supports `If-None-Match` and gzip. The
-daemon builds a capped response for each request; a `jobs` value that covers
-every job returns the shared default response. For example,
-`GET /activity?jobs=80&sort=name` returns the first 80 jobs by name.
+response carries its own `ETag` and supports `If-None-Match` and gzip.
+Viewers that send the same `jobs` and `sort` values share one built response,
+and a `jobs` value that covers every job returns the shared default response.
+For example, `GET /activity?jobs=80&sort=name` returns the first 80 jobs by
+name.
 
 ### `GET /jobs/{name}/resources`
 
