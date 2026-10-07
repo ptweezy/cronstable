@@ -688,13 +688,19 @@ class JobStateAPI:
                     content_type="application/json",
                 )
             except JobStateError as ex:
-                return _json_response({"error": str(ex)}, status=ex.status)
+                # ex.message is the sentence the raise site writes for the
+                # caller, and cron.ApiActionError's handler reads the same
+                # field.  str(ex) sends the same text, but CodeQL reports
+                # any caught exception's text in a response body as
+                # py/stack-trace-exposure.  The arm below reads ex.message
+                # for the same reason.
+                return _json_response({"error": ex.message}, status=ex.status)
             except _json.UnsupportedValue as ex:
                 # defense in depth: the value primitives pre-validate via
                 # _check_size, but any handler that writes a client value
                 # without it would otherwise let a non-portable value surface
                 # as a 500.  It is the caller's bad input -> a clean 400.
-                return _json_response({"error": str(ex)}, status=400)
+                return _json_response({"error": ex.message}, status=400)
             except (
                 asyncio.TimeoutError,
                 OSError,

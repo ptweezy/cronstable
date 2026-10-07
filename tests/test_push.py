@@ -634,6 +634,20 @@ def test_validate_pairing_normalizes_and_rejects():
         )
 
 
+def test_validate_pairing_refusals_are_pairing_errors():
+    # Cron._web_push_pair catches PairingError alone and returns its
+    # message, so a refusal that validate_pairing raises itself and one
+    # that a helper raises both have to arrive as that type.
+    with pytest.raises(push.PairingError) as own:
+        push.validate_pairing("not a dict")
+    assert own.value.message == "body must be a JSON object"
+    with pytest.raises(push.PairingError) as helper:
+        push.validate_pairing({"suite": "nope"})
+    assert helper.value.message == str(helper.value)
+    assert helper.value.message.startswith("unknown suite 'nope'")
+    assert type(helper.value.__cause__) is push.PushError
+
+
 # ------------------------------------------------------- suites and budget
 
 

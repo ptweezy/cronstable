@@ -61,10 +61,16 @@ class JobStateError(Exception):
     the CLI just prints the message and exits non-zero.  It is deliberately
     distinct from the backend's own exceptions (a dead store), which are
     *not* the job's fault and surface as 503 upstream.
+
+    ``message`` is the sentence the caller reads, and
+    :mod:`cronstable.jobapi` returns it as the response's ``error``.  Write
+    it for the calling job: name the caller's own input, and keep store
+    paths, errno text, and library wording in the log.
     """
 
     def __init__(self, message: str, *, status: int = 400) -> None:
         super().__init__(message)
+        self.message = message
         self.status = status
 
 

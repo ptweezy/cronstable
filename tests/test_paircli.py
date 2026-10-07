@@ -1293,7 +1293,12 @@ def test_the_token_does_not_follow_a_redirect_to_another_origin(capsys):
         class _Redirect(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(302)
-                self.send_header("Location", target + self.path)
+                # The Location header uses the literal endpoint in place of
+                # self.path.  The command requests /whoami and nothing
+                # else, so the two are identical here.  CodeQL reports a
+                # header built from the request line as
+                # py/http-response-splitting.
+                self.send_header("Location", target + "/whoami")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
