@@ -70,30 +70,52 @@
 - A pooled run that finishes while the pool scheduler renews its lease keeps
   its result. The scheduler logs `pool lease lost` and cancels a process only
   for a run that is still going.
-- The pool scheduler tries to admit a waiting entry only when the pool's
-  free slots can hold it. A pass over a full pool reads the pool's queue
-  once, whatever its length.
+- The pool scheduler tries to admit a waiting entry only when the entry is
+  at the head of the pool's queue and the pool's free slots can hold it. A
+  pass over a pool whose head has to wait reads the pool's queue once,
+  whatever its length. When a concurrency rule declines the entry at the
+  head, the entry stays at the head and the scheduler tries it again on its
+  next pass, one second later. When the entry at the head is cancelled
+  during a pass, that pass goes on to the entry behind it.
 - The job reaper holds no finished run while it waits for the next one. A
-  run's captured output and process handles are freed once the run is
+  run's captured output and process handles are freed after the run is
   recorded.
 - A workflow whose configuration lists a task before its upstreams settles a
   failure in one scheduler pass. When a task fails or is skipped, every task
   downstream ends `upstream_failed` or `skipped` in that pass, and an
   `all_done` task that the cascade unblocks starts in it.
 - The workflow retention pass lists a workflow's runs once, however many
-  runs it deletes. Under each run's lease it reads the recovery runs and the
-  recovery batches, so it keeps a run that a recovery in preparation or an
-  open recovery batch references.
+  runs it deletes. Under each run's lease it reads the recovery runs in one
+  store operation and the recovery batches in another, so it keeps a run
+  that a recovery in preparation or an open recovery batch references. It
+  also keeps the run when it can't read a recovery run or a recovery batch.
+  It then logs one warning that names the document and leaves the
+  workflow's runs for its next pass. A recovery document that stays
+  unreadable holds the runs for seven days after its last write, the
+  lifetime of a recovery batch. After that, the pass skips the document.
 - An artifact or XCom lookup reads the records that the daemon has not read
-  before and the record that it returns, at any number of names in the
-  scope. A strict lookup raises for an unreadable record that it has not
-  read, and for the record that it returns.
+  before and the record that it returns. The daemon remembers the name in
+  each of 16,384 records across all scopes. With more records than that, a
+  lookup reads again the oldest records of the scopes that were used least
+  recently. A lookup or an artifact listing that overlaps a new publish of
+  a name returns the version from before the publish or the one from after
+  it. A strict lookup raises for an unreadable record that it has not read,
+  and for the record that it returns.
 - Publishing an artifact or an XCom value costs the same at any number of
-  names in the scope. The cleanup of superseded versions waits for a scope
-  to double, so a scope of more than eight names holds up to about twice as
-  many records as names, and each further node that publishes to the scope
-  can add as many again. Workflow recovery's limit of 10,000 artifacts counts
-  names, so superseded records do not count toward it.
+  names in the scope. When the daemon publishes a name again, it removes
+  the version that the new one replaces, if the daemon published that
+  version or read it in its last cleanup of the scope. A scope that one
+  node publishes to holds one record for each name, and state garbage
+  collection reclaims the replaced payloads. A version that another node
+  published stays until the scope's next cleanup, which runs after the
+  daemon has published to the scope as many times as the scope has names,
+  and at least eight times. Each further node that publishes to the scope
+  can add as many records as the scope has names. The daemon tracks the
+  newest version of 16,384 names across all scopes, and keeps the names of
+  the scopes that it published to most recently. A scope whose names it no
+  longer tracks holds up to about twice as many records as names. Workflow
+  recovery's limit of 10,000 artifacts counts names, so superseded records
+  do not count toward it.
 - Planning a workflow rerun from a task follows each dependency once.
 - A configuration directory or include tree of more than 1,024 files
   reloads by reparsing only the files that changed. The per-file parse cache
@@ -114,11 +136,15 @@
   `jobs`, the response carries every job. Each dashboard draws at most 80
   heatmap rows and sends that cap: the web dashboard requests `jobs=80`, and
   the terminal dashboard requests `jobs=80&sort=name`. Viewers that send the
-  same `jobs` and `sort` values share one built response.
-- The daemon compresses the dashboard page with zlib at level 9, once per
-  process, whichever gzip backend is installed. A browser that accepts gzip
-  downloads about 180 KB. JSON responses keep level 1 on the installed
-  backend.
+  same `jobs` and `sort` values share one built response. The daemon holds
+  a shared response for up to eight pairs with `jobs` at most 256, and for
+  one pair with a larger cap that leaves jobs out.
+- The daemon compresses the dashboard page with zlib at level 9, whichever
+  gzip backend is installed. It compresses the page on a worker thread for
+  the first browser that accepts gzip and serves the stored result after
+  that. Such a browser downloads about 180 KB. JSON responses keep level 1
+  on the installed backend. The page answers `304 Not Modified` to an
+  `If-None-Match` header that carries its `ETag` in weak form or in a list.
 - The MCP `cron_list_jobs` tool builds full job rows for the page that it
   returns. It applies `filter` and `state` to each job's name, enabled flag,
   and running state before it builds a row, so the cost of a call follows

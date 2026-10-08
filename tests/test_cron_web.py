@@ -1546,6 +1546,37 @@ async def test_web_index_revalidates_with_304():
     assert full.status == 200
     assert full.body
 
+    # a cache or proxy can weaken the validator or send several: the page
+    # takes the same weak comparison as the JSON endpoints
+    for header in ("W/" + etag, '"stale", ' + etag, "*"):
+        resp = await cron._web_index(Req(headers={"If-None-Match": header}))
+        assert resp.status == 304, header
+
+
+async def test_web_index_compresses_the_page_off_the_event_loop():
+    # The first gzip load compresses the page on a worker thread, so the
+    # scheduler's loop keeps running.  Later loads take the cached bytes.
+    import threading
+
+    cron = _cron(TWO_JOBS)
+    threads = []
+    real = cronstable.cron._gzip_static
+
+    def recording(raw):
+        threads.append(threading.get_ident())
+        return real(raw)
+
+    request = Req(headers={"Accept-Encoding": "gzip"})
+    cronstable.cron._index_gzip.cache_clear()
+    try:
+        cronstable.cron._gzip_static = recording
+        first = await cron._web_index(request)
+        again = await cron._web_index(request)
+    finally:
+        cronstable.cron._gzip_static = real
+    assert len(threads) == 1 and threads[0] != threading.get_ident()
+    assert again.body == first.body == cronstable.cron._index_gzip()
+
 
 async def test_web_index_serves_gzip_when_accepted():
     # precompressed once for the life of the process; the compressed body must
@@ -1573,32 +1604,17 @@ async def test_web_index_serves_gzip_when_accepted():
 
 
 def test_index_page_takes_the_strongest_gzip_level_and_json_level_one(
-    monkeypatch,
+    stand_in_isal,
 ):
     # The page is compressed once per process and sent on every dashboard
     # load, so it takes zlib at level 9 whatever the response backend is;
     # every JSON product is rebuilt per memo window, so it takes that
-    # backend at level 1.  The stand-in backend stops at level 3, as
-    # ISA-L does.
+    # backend at level 1.
     import zlib
 
     from cronstable import _gzip
 
-    class Recording:
-        DEFLATED = zlib.DEFLATED
-
-        def __init__(self, best):
-            self.Z_BEST_COMPRESSION = best
-            self.levels = []
-
-        def compressobj(self, level, *args):
-            self.levels.append(level)
-            return zlib.compressobj(level, *args)
-
-    isal = Recording(3)
-    stdlib = Recording(zlib.Z_BEST_COMPRESSION)
-    monkeypatch.setattr(_gzip, "backend", lambda: isal)
-    monkeypatch.setattr(_gzip, "zlib", stdlib)
+    isal, stdlib = stand_in_isal
     cronstable.cron._index_gzip.cache_clear()
     try:
         page = cronstable.cron._index_gzip()

@@ -5542,8 +5542,11 @@ async def test_queued_filter_keys_over_a_view_built_elsewhere(tmp_path):
 
 
 async def test_filter_edit_routing_matches_the_key_dispatch(tmp_path):
-    """``_edits_filter`` holds exactly for the keys that ``handle_key``
-    turns into a filter edit, whatever else is open or focused."""
+    """``_edits_filter`` claims exactly the keys that the dispatch order
+    behind it turns into the same filter edit, whatever else is open or
+    focused. The reference app takes every key through that order, so a
+    key that an earlier arm owns (the palette, its chord, Esc, a commit)
+    cannot become a filter edit unnoticed."""
     keys = [
         "x",
         " ",
@@ -5573,25 +5576,35 @@ async def test_filter_edit_routing_matches_the_key_dispatch(tmp_path):
             app.open("token"),
             setattr(app, "focus", "token"),
         ),
+        "palette over filter": lambda app: (
+            setattr(app, "focus", "filter"),
+            app.open("palette"),
+        ),
     }
+
+    def reached(app):
+        return (
+            _view_state(app),
+            dict(app.inputs),
+            list(app.open_overlays),
+            app.quit,
+            app.wallboard,
+        )
+
     for label, setup in setups.items():
         for key in keys:
-            app, _ = _filter_rig(tmp_path, _filter_fleet())
-            setup(app)
-            edits = []
-            real = app._edit_input
-
-            def recording(name, key, real=real, edits=edits, app=app):
-                before = app.inputs[name]
-                real(name, key)
-                if name == "filter" and app.inputs[name] != before:
-                    edits.append(key)
-
-            app._edit_input = recording
-            app.inputs["filter"] = "seed"
+            jobs = _filter_fleet()
+            app, _ = _filter_rig(tmp_path, jobs)
+            ref, _ = _filter_rig(tmp_path, jobs)
+            ref._edits_filter = lambda key: False
+            for each in (app, ref):
+                setup(each)
+                each.inputs["filter"] = "seed"
             claimed = app._edits_filter(key)
             await app.handle_key(key)
-            assert claimed == (edits == [key]), (label, key)
+            await ref.handle_key(key)
+            assert reached(app) == reached(ref), (label, key)
+            assert claimed == (ref.inputs["filter"] != "seed"), (label, key)
 
 
 async def test_key_source_without_a_queue_peek_rebuilds_per_key(tmp_path):

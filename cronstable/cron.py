@@ -21,6 +21,7 @@ import os
 import secrets
 import socket
 import ssl
+import sys
 import time
 import zlib
 from collections import defaultdict, deque
@@ -1478,6 +1479,11 @@ _ACTIVITY_RESPONSE_TTL = 1.0
 #: slots serve every viewer; the least recently used pair makes room.
 _ACTIVITY_CAPPED_MEMOS = 8
 
+#: The largest ``jobs`` cap whose /activity product takes one of those
+#: slots.  A dashboard draws at most 80 rows.  A product's size grows with
+#: its cap, so the pairs with a larger cap share one further slot.
+_ACTIVITY_CAPPED_MEMO_MAX_JOBS = 256
+
 
 _ProductT = TypeVar("_ProductT")
 
@@ -2207,11 +2213,19 @@ class Cron:
             tuple[str, bytes, bytes | None]
         ] = _ResponseMemo()
         # /activity under a `jobs` cap: (jobs, sort) -> memo, least
-        # recently used first (see _activity_capped_memo).
+        # recently used first (see _activity_capped_memo).  The pairs
+        # above _ACTIVITY_CAPPED_MEMO_MAX_JOBS have their own map.
         self._activity_capped_memos: dict[
             tuple[int, str | None],
             _ResponseMemo[tuple[str, bytes, bytes | None]],
         ] = {}
+        self._activity_large_memos: dict[
+            tuple[int, str | None],
+            _ResponseMemo[tuple[str, bytes, bytes | None]],
+        ] = {}
+        # holds concurrent first loads of the dashboard page to one
+        # compression (see _web_index)
+        self._index_gzip_lock = asyncio.Lock()
         # The MCP cron_query_metrics snapshot: the same universe /metrics
         # renders, materialised once per window and filtered per call. It
         # lives here rather than on the handler so _bust_response_memos
@@ -3385,7 +3399,7 @@ class Cron:
     ) -> web.Response:
         """One conditional GET over a shared memoized (etag, body, gz).
 
-        The common tail of the /jobs, /fleet and /activity handlers:
+        The common tail of the /jobs and /fleet handlers:
         fetch (or join the build of) the shared product, then answer
         304/200 per request. Handlers pass their TTL global per request,
         so a deployment-wide tweak (or a test monkeypatch) takes effect
@@ -5536,12 +5550,20 @@ class Cron:
         # it. Set after the operator's header merge (like GET /jobs) because
         # this is a correctness requirement, not a preference.
         headers["Vary"] = "Accept-Encoding"
-        if request.headers.get("If-None-Match") == etag:
+        if _etag_matches(request.headers.get("If-None-Match"), etag):
             # the document is immutable for the process lifetime, so a repeat
             # load revalidates into an empty 304 and the page is not resent.
             return web.Response(status=304, headers=headers)
         if _accepts_gzip(request.headers.get("Accept-Encoding")):
             headers["Content-Encoding"] = "gzip"
+            if not _index_gzip.cache_info().currsize:
+                # compressing the page takes milliseconds of CPU, and
+                # the scheduler runs on this loop
+                async with self._index_gzip_lock:
+                    if not _index_gzip.cache_info().currsize:
+                        await asyncio.get_running_loop().run_in_executor(
+                            None, _index_gzip
+                        )
             body = _index_gzip()
         else:
             body = raw
@@ -5973,7 +5995,10 @@ class Cron:
             memo.cached = None
         self._fleet_response_memo.cached = None
         self._activity_response_memo.cached = None
-        for capped in self._activity_capped_memos.values():
+        for capped in (
+            *self._activity_capped_memos.values(),
+            *self._activity_large_memos.values(),
+        ):
             capped.cached = None
         self._metric_samples_memo.cached = None
 
@@ -6498,16 +6523,16 @@ class Cron:
         }
 
     def _activity_job_names(
-        self, jobs: int, sort: str | None = None
+        self, jobs: int | None, sort: str | None = None
     ) -> list[str] | None:
         """The jobs a ``jobs``-capped ``/activity`` response carries.
 
         The first ``jobs`` names in configuration order (the order
         ``GET /jobs`` lists them), or in ascending name order under
-        ``sort="name"``.  ``None`` when the cap covers every job: that
-        response is the default one.
+        ``sort="name"``.  ``None`` when there is no cap or the cap covers
+        every job: that response is the default one.
         """
-        if jobs >= len(self.cron_jobs):
+        if jobs is None or jobs >= len(self.cron_jobs):
             return None
         if sort == "name":
             # the smallest names in ascending order, without sorting the
@@ -6561,54 +6586,84 @@ class Cron:
             lo=1,
             hi=RUN_HISTORY_LIMIT,
         )
-        total = len(self.cron_jobs)
-        jobs = self._web_int_query(
-            request, "jobs", default=total, lo=1, hi=max(1, total)
+        # the cap as the client sent it, or None without one
+        cap = (
+            self._web_int_query(
+                request, "jobs", default=0, lo=1, hi=sys.maxsize
+            )
+            or None
+        )
+        etag, body, gz = await self._activity_product(limit, cap, sort)
+        return _conditional_response(
+            etag,
+            body,
+            gz,
+            if_none_match=request.headers.get("If-None-Match"),
+            gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
+            headers=headers,
         )
 
-        async def build() -> tuple[str, bytes, bytes | None]:
-            # the build selects the jobs, so a request served from the
-            # shared product selects none
-            return await self._build_activity_product(
-                limit, self._activity_job_names(jobs, sort)
+    async def _activity_product(
+        self, limit: int, cap: int | None, sort: str | None
+    ) -> tuple[str, bytes, bytes | None]:
+        """The ``/activity`` product for a request's ``limit``, ``jobs``
+        cap and ``sort``.
+
+        The whole retained window is memo-shared: the default response
+        (every job) in one slot, and a cap that leaves jobs out in the slot
+        of its ``(jobs, sort)`` pair (see :meth:`_activity_capped_memo`).
+        A narrower ``limit`` is built per request, because a memo would
+        need a slot per distinct value.
+        """
+        while True:
+            # None for a cap that covers every job: that response is the
+            # default one.
+            jobs = (
+                cap if cap is not None and cap < len(self.cron_jobs) else None
             )
 
-        # A narrower `limit` is built per request: a memo would need a
-        # slot per distinct value.
-        if limit != RUN_HISTORY_LIMIT:
-            etag, body, gz = await build()
-            return _conditional_response(
-                etag,
-                body,
-                gz,
-                if_none_match=request.headers.get("If-None-Match"),
-                gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
-                headers=headers,
+            async def build(
+                jobs: int | None = jobs,
+            ) -> tuple[str, bytes, bytes | None]:
+                # the build selects the jobs, so a request served from the
+                # shared product selects none
+                return await self._build_activity_product(
+                    limit, self._activity_job_names(jobs, sort)
+                )
+
+            if limit != RUN_HISTORY_LIMIT:
+                return await build()
+            product = await self._shared_response_product(
+                self._activity_response_memo
+                if jobs is None
+                else self._activity_capped_memo(jobs, sort),
+                _ACTIVITY_RESPONSE_TTL,
+                build,
             )
-        # The whole retained window is memo-shared: the default response
-        # (every job) in one slot, a `jobs` cap that leaves jobs out in the
-        # slot of its (jobs, sort) pair.
-        return await self._memoized_conditional_response(
-            request,
-            self._activity_response_memo
-            if jobs >= total
-            else self._activity_capped_memo(jobs, sort),
-            _ACTIVITY_RESPONSE_TTL,
-            build,
-        )
+            # The default product carries every job of the set it was
+            # built from.  A reload can grow that set past the cap while
+            # the request waits for the product, so the request starts
+            # over under its cap.
+            if jobs is not None or cap is None or cap >= len(self.cron_jobs):
+                return product
 
     def _activity_capped_memo(
         self, jobs: int, sort: str | None
     ) -> "_ResponseMemo[tuple[str, bytes, bytes | None]]":
         """The memo of the ``jobs``-capped ``/activity`` product for a pair.
 
-        At most :data:`_ACTIVITY_CAPPED_MEMOS` pairs hold a slot.  A pair
-        that loses its slot is built again on its next request.
+        At most :data:`_ACTIVITY_CAPPED_MEMOS` pairs hold a slot, and one
+        pair above :data:`_ACTIVITY_CAPPED_MEMO_MAX_JOBS`, whose product
+        can be as large as the default one.  A pair that loses its slot is
+        built again on its next request.
         """
-        memos = self._activity_capped_memos
+        if jobs > _ACTIVITY_CAPPED_MEMO_MAX_JOBS:
+            memos, slots = self._activity_large_memos, 1
+        else:
+            memos, slots = self._activity_capped_memos, _ACTIVITY_CAPPED_MEMOS
         memo = memos.pop((jobs, sort), None)
         if memo is None:
-            if len(memos) >= _ACTIVITY_CAPPED_MEMOS:
+            if len(memos) >= slots:
                 del memos[next(iter(memos))]
             memo = _ResponseMemo()
         memos[jobs, sort] = memo  # most recently used last
@@ -12170,14 +12225,12 @@ class Cron:
         event_wait: asyncio.Task | None = None
         completion_wait: asyncio.Task | None = None
         try:
+            # The reaper parks until the next launch or completion, and a
+            # parked coroutine keeps its locals alive. The helpers below
+            # own every reference to a run, so none outlives its call.
             while self.running_jobs or not self._stop_event.is_set():
                 try:
-                    for job in list(self._reaper_pending.values()):
-                        if job not in wait_tasks:
-                            task = asyncio.create_task(job.wait())
-                            wait_tasks[job] = task
-                            task.add_done_callback(partial(_on_done, job))
-                        self._reaper_pending.pop(id(job), None)
+                    self._reaper_register(wait_tasks, _on_done)
                     # Registration and clearing share one event-loop turn.
                     # Clear even when empty: a pending job can be removed
                     # before the reaper consumes its launch notification.
@@ -12200,61 +12253,12 @@ class Cron:
                             [event_wait, completion_wait],
                             return_when=asyncio.FIRST_COMPLETED,
                         )
-                    # one batch: every job filed so far. No await between
-                    # the copy and the clear, so nothing slips between
-                    # them; a completion during the batch is filed for
-                    # the next.
-                    done_jobs = finished[:]
-                    finished.clear()
+                    # one batch: every job filed so far. Nothing awaits
+                    # between this clear and the batch's own copy and
+                    # clear, so nothing slips between them; a completion
+                    # during the batch is filed for the next.
                     completed.clear()
-                    try:
-                        for job in done_jobs:
-                            task = wait_tasks.pop(job)
-                            try:
-                                task.result()
-                            except Exception:  # pragma: no cover
-                                logger.exception(
-                                    "Unexpected error while waiting on job "
-                                    "%s; please report this as a bug (2)",
-                                    job.config.name,
-                                )
-                            try:
-                                await self._handle_finished_job(job)
-                            except Exception:
-                                # Per-job, so one job's failure to finish
-                                # does not skip the rest of the batch. No
-                                # pragma: this arm is covered by
-                                # test_reaper_finishes_whole_batch_when_
-                                # one_job_raises.
-                                logger.exception(
-                                    "Unexpected error finishing job %s; "
-                                    "please report this as a bug (6)",
-                                    job.config.name,
-                                )
-                                # A handler can fail before removing the
-                                # instance. Keep it eligible for another
-                                # completion attempt.
-                                if any(
-                                    instance is job
-                                    for instance in self.running_jobs.get(
-                                        job.config.name, ()
-                                    )
-                                ):
-                                    self._reaper_pending[id(job)] = job
-                    finally:
-                        # Flush buffered DAG-task completions in one RMW
-                        # per run. In a finally: the buffer holds
-                        # completions from jobs ALREADY handled, and
-                        # nothing else drains it, so skipping the flush on
-                        # a later job's exception would strand their
-                        # dag_run entries as RUNNING indefinitely.
-                        await self._dag.flush_completions()
-                    # A parked coroutine keeps its locals alive. The reaper
-                    # parks until the next launch or completion, so it
-                    # drops the handled batch first.
-                    if done_jobs:
-                        del job, task
-                    del done_jobs
+                    await self._reap_batch(finished, wait_tasks)
                 except Exception:  # pragma: no cover
                     logger.exception("please report this as a bug (3)")
                     await asyncio.sleep(1)
@@ -12262,6 +12266,67 @@ class Cron:
             for waiter in (event_wait, completion_wait):
                 if waiter is not None and not waiter.done():
                     waiter.cancel()
+
+    def _reaper_register(
+        self,
+        wait_tasks: dict[RunningJob, asyncio.Task],
+        on_done: Callable[[RunningJob, asyncio.Task], None],
+    ) -> None:
+        """Start a wait for every launched job the reaper has yet to watch."""
+        for job in list(self._reaper_pending.values()):
+            if job not in wait_tasks:
+                task = asyncio.create_task(job.wait())
+                wait_tasks[job] = task
+                task.add_done_callback(partial(on_done, job))
+            self._reaper_pending.pop(id(job), None)
+
+    async def _reap_batch(
+        self,
+        finished: list[RunningJob],
+        wait_tasks: dict[RunningJob, asyncio.Task],
+    ) -> None:
+        """Handle every completion in ``finished``, and empty it."""
+        done_jobs = finished[:]
+        finished.clear()
+        try:
+            for job in done_jobs:
+                task = wait_tasks.pop(job)
+                try:
+                    task.result()
+                except Exception:  # pragma: no cover
+                    logger.exception(
+                        "Unexpected error while waiting on job %s; please "
+                        "report this as a bug (2)",
+                        job.config.name,
+                    )
+                try:
+                    await self._handle_finished_job(job)
+                except Exception:
+                    # Per-job, so one job's failure to finish does not
+                    # skip the rest of the batch. No pragma: this arm is
+                    # covered by test_reaper_finishes_whole_batch_when_
+                    # one_job_raises.
+                    logger.exception(
+                        "Unexpected error finishing job %s; please report "
+                        "this as a bug (6)",
+                        job.config.name,
+                    )
+                    # A handler can fail before removing the instance.
+                    # Keep it eligible for another completion attempt.
+                    if any(
+                        instance is job
+                        for instance in self.running_jobs.get(
+                            job.config.name, ()
+                        )
+                    ):
+                        self._reaper_pending[id(job)] = job
+        finally:
+            # Flush buffered DAG-task completions in one RMW per run. In a
+            # finally: the buffer holds completions from jobs ALREADY
+            # handled, and nothing else drains it, so skipping the flush
+            # on a later job's exception would strand their dag_run
+            # entries as RUNNING indefinitely.
+            await self._dag.flush_completions()
 
     def _add_running_instance(self, running_job: RunningJob) -> bool:
         """Register a launched instance and notify the reaper.

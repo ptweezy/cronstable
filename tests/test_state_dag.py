@@ -375,6 +375,32 @@ def test_cascade_claims_an_all_done_task_listed_before_its_upstream():
     assert not result.run_terminal
 
 
+def test_upstream_first_order_is_built_once_for_a_spec(monkeypatch):
+    # The order is a function of the frozen spec, so every pass in which a
+    # task ends shares the one that the first such pass built.
+    tasks = _chain(6)
+    spec = _spec(*reversed(tasks))
+    built = []
+    real = dag._upstream_first
+
+    def counted(spec):
+        built.append(spec.name)
+        return real(spec)
+
+    monkeypatch.setattr(dag, "_upstream_first", counted)
+    for _ in range(3):
+        body = _body(spec)
+        body["tasks"]["t0"]["state"] = dag.FAILED
+        body, result = _one_advance(spec, body)
+        assert result.run_terminal
+    assert built == [spec.name]
+    assert [task.id for task in spec.upstream_first] == [
+        "t%d" % i for i in range(6)
+    ]
+    # a spec already listed upstream-first needs no other order
+    assert _spec(*tasks).upstream_first is None
+
+
 def test_cascade_keeps_declaration_order_among_claims():
     # r1 and r2 are ready when the walk reaches them; `cleanup` becomes
     # ready only once the cascade ends `b`, so its claim follows theirs.

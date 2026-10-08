@@ -1526,8 +1526,8 @@ async def test_chain_task_costs_three_document_rewrites(dag_cron, monkeypatch):
 # The retention pass runs inside the scheduler's single-flight service
 # task.  It lists the run namespace once, then deletes each excess run
 # under that run's lease.  The check it repeats there reads the recovery
-# runs by key and the recovery batches in one call, so the listings of the
-# run namespace must not depend on how many runs the pass deletes.
+# runs in one call and the recovery batches in another, so the listings of
+# the run namespace must not depend on how many runs the pass deletes.
 
 
 async def test_gc_pass_full_listings_do_not_grow_with_deleted_runs(
@@ -1536,13 +1536,20 @@ async def test_gc_pass_full_listings_do_not_grow_with_deleted_runs(
     cron = await dag_cron(_dagstate_chain_yaml("gc", 1, retain=2))
     backend = cron.state_backend
     listings = []
+    keyed = []
     real_list = backend.list_documents
+    real_keyed = backend.list_documents_keyed
 
-    async def counting_list(namespace):
+    async def counting_list(namespace, **kwargs):
         listings.append(namespace)
-        return await real_list(namespace)
+        return await real_list(namespace, **kwargs)
+
+    async def counting_keyed(namespace, key_prefix, **kwargs):
+        keyed.append(namespace)
+        return await real_keyed(namespace, key_prefix, **kwargs)
 
     monkeypatch.setattr(backend, "list_documents", counting_list)
+    monkeypatch.setattr(backend, "list_documents_keyed", counting_keyed)
     seen = {}
     first = 0
     for excess in (3, 12):
@@ -1563,14 +1570,21 @@ async def test_gc_pass_full_listings_do_not_grow_with_deleted_runs(
             )
         first += seeded
         before = len(await backend.list_document_keys("dagrun/gc"))
-        del listings[:]
+        del listings[:], keyed[:]
         await cron._dag._gc_one_dag(backend, "gc", cron.cron_dags["gc"])
         after = len(await backend.list_document_keys("dagrun/gc"))
         assert (before - after, after) == (excess, 2)
         seen[excess] = listings.count("dagrun/gc")
-        assert listings.count("recoverybatch/gc") == 1 + excess, (
-            "a GC pass reads the recovery batches once for the pass and "
-            "once under each deleted run's lease; got %r" % (listings,)
+        assert listings.count("recoverybatch/gc") == 1, (
+            "a GC pass lists the recovery batches once; got %r" % (listings,)
+        )
+        assert (
+            keyed.count("dagrun/gc"),
+            keyed.count("recoverybatch/gc"),
+        ) == (excess, excess), (
+            "under each deleted run's lease a GC pass reads the recovery "
+            "runs in one call and the recovery batches in another; got %r"
+            % (keyed,)
         )
     assert seen[3] == seen[12] == 1, (
         "a GC pass must list the run namespace once however many runs it "
@@ -2716,34 +2730,18 @@ async def test_pool_poll_reads_each_pool_once_and_writes_nothing(
 # --- the dashboard page is compressed once per process ---------------------
 #
 # The page is static package data compressed with zlib at level 9, which
-# costs milliseconds of CPU on the scheduler's loop.  The first gzip-capable
-# request pays it; every later request, and every request that does not
-# take the compressed body, pays nothing.  The count covers both
-# compressors the module can open: its own zlib and the response backend.
+# costs milliseconds of CPU, so a worker thread does it off the scheduler's
+# loop.  The first gzip-capable request pays it, and the requests that
+# arrive with it wait for its result; every later request, and every
+# request that does not take the compressed body, pays nothing.  The count
+# covers both compressors the module can open: its own zlib and the
+# response backend.
 
 
-async def test_dashboard_page_is_compressed_once_per_process(monkeypatch):
-    import zlib
-
-    from cronstable import _gzip
+async def test_dashboard_page_is_compressed_once_per_process(stand_in_isal):
     from cronstable import cron as cron_mod
 
-    opened = []
-
-    class Recording:
-        DEFLATED = zlib.DEFLATED
-        Z_BEST_COMPRESSION = zlib.Z_BEST_COMPRESSION
-
-        def __init__(self, label):
-            self.label = label
-
-        def compressobj(self, level, *args):
-            opened.append((self.label, level))
-            return zlib.compressobj(level, *args)
-
-    backend = Recording("backend")
-    monkeypatch.setattr(_gzip, "backend", lambda: backend)
-    monkeypatch.setattr(_gzip, "zlib", Recording("zlib"))
+    backend, stdlib = stand_in_isal
     cron = Cron(
         None,
         config_yaml=(
@@ -2759,22 +2757,25 @@ async def test_dashboard_page_is_compressed_once_per_process(monkeypatch):
             Req(headers={"If-None-Match": etag, "Accept-Encoding": "gzip"})
         )
         assert plain.status == 200 and revalidated.status == 304
-        assert opened == [], (
+        assert backend.levels == stdlib.levels == [], (
             "the page was compressed for a request that takes no "
             "compressed body"
         )
-        bodies = set()
-        for _ in range(5):
-            resp = await cron._web_index(
-                Req(headers={"Accept-Encoding": "gzip"})
-            )
+
+        def load():
+            return cron._web_index(Req(headers={"Accept-Encoding": "gzip"}))
+
+        # four loads that arrive together, then one more
+        loads = await asyncio.gather(*(load() for _ in range(4)))
+        loads.append(await load())
+        for resp in loads:
             assert resp.headers["Content-Encoding"] == "gzip"
-            bodies.add(bytes(resp.body))
-        assert opened == [("zlib", 9)], (
-            "five page loads opened the compressors %r; the page is "
-            "static and must be compressed once" % (opened,)
+        assert (backend.levels, stdlib.levels) == ([], [9]), (
+            "five page loads opened the compressors at levels %r and %r; "
+            "the page is static and must be compressed once by zlib"
+            % (backend.levels, stdlib.levels)
         )
-        assert len(bodies) == 1
+        assert len({bytes(resp.body) for resp in loads}) == 1
     finally:
         cron_mod._index_gzip.cache_clear()
 
@@ -3622,7 +3623,7 @@ def _tui_cadence_app(tmp_path):
     return app, term
 
 
-async def test_an_idle_second_paints_one_frame_per_tick(tmp_path):
+async def test_an_idle_second_paints_one_frame_per_tick(tmp_path, monkeypatch):
     app, term = _tui_cadence_app(tmp_path)
     ticks = []
     real_ambient = app._mark_ambient
@@ -3632,25 +3633,41 @@ async def test_an_idle_second_paints_one_frame_per_tick(tmp_path):
         real_ambient()
 
     app._mark_ambient = counting_ambient  # the tick calls it once per pass
+    # The tick's one-second sleep waits for the test, so the frames are
+    # counted per tick on a runner of any speed.  Every wait below is a
+    # minimum: a slow runner makes it longer and changes no count.
+    seconds = asyncio.Semaphore(0)
+    real_sleep = asyncio.sleep
+
+    async def stepped_sleep(delay, *args, **kwargs):
+        if delay == 1:
+            await seconds.acquire()
+        else:
+            await real_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", stepped_sleep)
+    past_the_gate = 0.1  # the paint loop holds a frame back 33 ms at most
     loops = [
         asyncio.get_running_loop().create_task(coro)
         for coro in (app._tick_loop(), app._paint_loop())
     ]
     try:
-        await asyncio.sleep(0.2)
+        await real_sleep(past_the_gate)
         assert term.painted == [], (
             "an idle dashboard painted %d frames before its first tick; "
             "nothing had marked it dirty" % len(term.painted)
         )
-        for _ in range(1000):
-            if ticks:
-                break
-            await asyncio.sleep(0.01)
-        assert len(ticks) == 1, "the tick loop never ran"
-        await asyncio.sleep(0.2)
-        assert len(term.painted) == len(ticks) == 1, (
-            "%d tick(s) painted %d frames" % (len(ticks), len(term.painted))
-        )
+        for second in (1, 2, 3):
+            seconds.release()
+            for _ in range(3000):
+                if len(ticks) == second and len(term.painted) == second:
+                    break
+                await real_sleep(0.01)
+            await real_sleep(past_the_gate)
+            assert len(ticks) == second, "the tick loop never ran"
+            assert len(term.painted) == second, (
+                "%d tick(s) painted %d frames" % (second, len(term.painted))
+            )
     finally:
         app.quit = True
         for task in loops:
@@ -3660,7 +3677,6 @@ async def test_an_idle_second_paints_one_frame_per_tick(tmp_path):
 
 async def test_a_burst_of_marks_paints_at_most_once_per_33_ms(tmp_path):
     app, term = _tui_cadence_app(tmp_path)
-    gate = 0.033
     # a timer may fire one clock tick early (asyncio counts a timer due
     # once it is within the clock's resolution), which is 15.6 ms on
     # Windows before Python 3.13
@@ -3676,21 +3692,18 @@ async def test_a_burst_of_marks_paints_at_most_once_per_33_ms(tmp_path):
             % len(term.painted)
         )
 
-        # sustained marking, a mark per loop turn for a quarter second
+        # sustained marking, a mark per loop turn, for as long as four
+        # frames take: a slow runner spreads the frames out and never
+        # brings two closer than the gate
         del term.painted[:]
-        marks = 0
-        started = time.monotonic()
-        while time.monotonic() - started < 0.25:
+        deadline = time.monotonic() + 60.0
+        while len(term.painted) < 4:
+            assert time.monotonic() < deadline, (
+                "sustained marking painted %d frames in a minute"
+                % len(term.painted)
+            )
             app.mark()
-            marks += 1
             await asyncio.sleep(0)
-        window = time.monotonic() - started
-        frames = len(term.painted)
-        assert marks > 10 * frames, (marks, frames)
-        assert 2 <= frames <= window / (gate - slack) + 1, (
-            "%d marks over %.0f ms painted %d frames; the paint loop keeps "
-            "%.0f ms between frames" % (marks, window * 1e3, frames, 33.0)
-        )
         for (_, gate_set), (painted, _) in zip(
             term.painted, term.painted[1:], strict=False
         ):

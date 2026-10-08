@@ -58,33 +58,6 @@ def test_gzip_static_is_the_zlib_level_nine_stream():
     assert packed == _zlib_level_nine(_SAMPLE)
 
 
-class _RecordingZlib:
-    """A zlib-compatible stand-in that records each compressor's level."""
-
-    DEFLATED = zlib.DEFLATED
-
-    def __init__(self, best):
-        self.Z_BEST_COMPRESSION = best
-        self.levels = []
-
-    def compressobj(self, level, *args):
-        self.levels.append(level)
-        return zlib.compressobj(level, *args)
-
-
-@pytest.fixture
-def stand_in_isal(monkeypatch):
-    """(response backend, the module's zlib), both recording.
-
-    The backend's strongest level is 3, as ISA-L's is.
-    """
-    isal = _RecordingZlib(3)
-    stdlib = _RecordingZlib(zlib.Z_BEST_COMPRESSION)
-    monkeypatch.setattr(_gzip, "backend", lambda: isal)
-    monkeypatch.setattr(_gzip, "zlib", stdlib)
-    return isal, stdlib
-
-
 def test_responses_take_the_backend_and_static_takes_zlib_level_nine(
     stand_in_isal,
 ):

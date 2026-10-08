@@ -42,7 +42,12 @@ from cronstable import _json, dag, jobstate, platform
 from cronstable.cronexpr import CronTab
 from cronstable.dag import DagSpec
 from cronstable.job import RunningJob
-from cronstable.state import DOC_KEEP, Lease, StateBackend
+from cronstable.state import (
+    DOC_KEEP,
+    Lease,
+    StateBackend,
+    _DocumentUnreadable,
+)
 
 logger = logging.getLogger("cronstable.dagrun")
 
@@ -80,6 +85,12 @@ APPROVAL_POLL_INTERVAL = 5.0
 
 # The most artifact names one recovery plans over (see recovery_plan).
 RECOVERY_MAX_ARTIFACTS = 10000
+
+# How long a recovery batch stays open (its ``expiresAt``).  Run retention
+# waits as long for a recovery document that it cannot read (see
+# _delete_run): a batch last written longer ago has expired, and a recovery
+# still in preparation by then is abandoned.
+RECOVERY_BATCH_TTL = 7 * 86400.0
 
 # Hard cap on how many missed occurrences a single catch-up replays, mirroring
 # cron.MAX_CATCHUP_OCCURRENCES so a long outage cannot stampede.
@@ -2578,27 +2589,17 @@ class DagScheduler:
         backend = self._backend()
         if config is None or source is None or backend is None:
             raise recovery.RecoveryError(("workflow run not found"))
-        # The cap counts artifact names.  A scope's stream holds more
-        # records than names between prunes (see append_record's
-        # ``prune_latest_by``), so the scan passes the newest record of
-        # each name and stops at the first name over the cap.
-        seen = set()
-
-        def newest_of_its_name(record):
-            artifact = record["name"]
-            if artifact in seen:
-                return False
-            seen.add(artifact)
-            return True
-
+        # The cap counts artifact names.  A scope's stream can hold more
+        # records than names (see append_record's ``prune_latest_by``), so
+        # the listing takes the newest record of each name and stops at
+        # the first name over the cap.
         records = await asyncio.wait_for(
-            backend.list_records(
+            backend.newest_records_by(
                 jobstate.ARTIFACT_STREAM_PREFIX
                 + dag.xcom_scope(name, source["runId"]),
-                newest_first=True,
+                "name",
                 strict=True,
-                predicate=newest_of_its_name,
-                max_matches=RECOVERY_MAX_ARTIFACTS + 1,
+                max_values=RECOVERY_MAX_ARTIFACTS + 1,
             ),
             STATE_OP_TIMEOUT,
         )
@@ -2804,7 +2805,7 @@ class DagScheduler:
                 "plans": plans,
                 "results": {},
                 "createdAt": _now(),
-                "expiresAt": _now() + 7 * 86400,
+                "expiresAt": _now() + RECOVERY_BATCH_TTL,
                 "planToken": token,
                 "complete": not plans,
             }
@@ -3394,7 +3395,35 @@ class DagScheduler:
             run_key = body.get("runKey")
             if not run_key or run_key in protected:
                 continue
-            await self._delete_run(backend, name, run_key, body.get("runId"))
+            if not await self._delete_run_if_unreferenced(
+                backend, name, run_key, body.get("runId")
+            ):
+                return
+
+    async def _delete_run_if_unreferenced(
+        self,
+        backend: StateBackend,
+        name: str,
+        run_key: str,
+        run_id: Any,
+    ) -> bool:
+        """:meth:`_delete_run`, or ``False`` when a recovery document that
+        could reference the run cannot be read.
+
+        That document holds every run of the workflow, so the caller ends
+        its pass over them.
+        """
+        try:
+            await self._delete_run(backend, name, run_key, run_id)
+        except _DocumentUnreadable as ex:
+            logger.warning(
+                "dag %s: run retention waits for a recovery document that "
+                "cannot be read: %s",
+                name,
+                ex,
+            )
+            return False
+        return True
 
     async def _delete_run(
         self,
@@ -3416,11 +3445,21 @@ class DagScheduler:
         try:
             # Checked under the run's lease, which recover() also holds
             # while it creates a recovery run, so a recovery accepted at any
-            # moment before this point is visible here.  Only a recovery
+            # moment before this point is listed here.  Only a recovery
             # run's own document can be "preparing", and its key carries
-            # the "recovery-" prefix.
-            references = await self._documents_keyed(
-                backend, self._ns(name), "recovery-"
+            # the "recovery-" prefix.  A recovery run or a recovery batch
+            # that cannot be read raises, and the run stays for the next
+            # pass, until the document has gone RECOVERY_BATCH_TTL without
+            # a write.  One store call reads each kind, so the check fits
+            # the lease.
+            references = await asyncio.wait_for(
+                backend.list_documents_keyed(
+                    self._ns(name),
+                    "recovery-",
+                    strict=True,
+                    unreadable_ttl=RECOVERY_BATCH_TTL,
+                ),
+                STATE_OP_TIMEOUT,
             )
             if any(
                 (b.get("recovery") or {}).get("status") == "preparing"
@@ -3429,7 +3468,12 @@ class DagScheduler:
             ):
                 return
             batches = await asyncio.wait_for(
-                backend.list_documents("recoverybatch/" + name),
+                backend.list_documents_keyed(
+                    "recoverybatch/" + name,
+                    "",
+                    strict=True,
+                    unreadable_ttl=RECOVERY_BATCH_TTL,
+                ),
                 STATE_OP_TIMEOUT,
             )
             if any(
@@ -3447,36 +3491,6 @@ class DagScheduler:
             await asyncio.wait_for(
                 backend.release_lease(lease), STATE_OP_TIMEOUT
             )
-
-    @staticmethod
-    async def _documents_keyed(
-        backend: StateBackend, namespace: str, prefix: str
-    ) -> list[dict[str, Any]]:
-        """The documents of ``namespace`` whose key starts with ``prefix``.
-
-        One keys-only listing, then one read per matching key, so a
-        namespace that holds no such document costs a directory listing
-        and no parse.  A backend that cannot list keys answers with every
-        document of the namespace, a superset the caller's own test
-        narrows.
-        """
-        keys = await asyncio.wait_for(
-            backend.list_document_keys(namespace), STATE_OP_TIMEOUT
-        )
-        if keys is None:
-            return await asyncio.wait_for(
-                backend.list_documents(namespace), STATE_OP_TIMEOUT
-            )
-        bodies = []
-        for key in keys:
-            if not key.startswith(prefix):
-                continue
-            body = await asyncio.wait_for(
-                backend.read_document(namespace, key), STATE_OP_TIMEOUT
-            )
-            if body is not None:
-                bodies.append(body)
-        return bodies
 
     async def _delete_run_locked(
         self,
@@ -3571,9 +3585,10 @@ class DagScheduler:
                         or now - float(updated) < grace
                     ):
                         continue  # too recent, or undatable: keep
-                    await self._delete_run(
+                    if not await self._delete_run_if_unreferenced(
                         backend, name, run_key, body.get("runId")
-                    )
+                    ):
+                        break
             except Exception:  # noqa: BLE001 - one dag must not stop the pass
                 logger.exception("dag %s: removed-dag run GC failed", name)
 

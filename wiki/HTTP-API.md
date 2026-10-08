@@ -772,8 +772,11 @@ bounded number of rows:
 response carries its own `ETag` and supports `If-None-Match` and gzip.
 Viewers that send the same `jobs` and `sort` values share one built response,
 and a `jobs` value that covers every job returns the shared default response.
-For example, `GET /activity?jobs=80&sort=name` returns the first 80 jobs by
-name.
+The daemon holds a shared response for up to eight pairs with `jobs` at most
+256, and for one pair with a larger cap that leaves jobs out. When more pairs
+are in use, the least recently requested one gives up its place and is built
+again on its next request. For example, `GET /activity?jobs=80&sort=name`
+returns the first 80 jobs by name.
 
 ### `GET /jobs/{name}/resources`
 

@@ -45,7 +45,10 @@ Identical accepted plans use the same recovery run key. Retrying a request
 therefore returns that run while it remains retained. Missing retained
 artifacts prevent execution. If preparation fails after acceptance, the new
 run records the failure before launching tasks. Retention protects a source
-while its recovery copies artifact references.
+while its recovery copies artifact references. When retention can't read a
+recovery run or a recovery batch, it keeps every run of the workflow and logs
+a warning that names the document. A document that stays unreadable holds the
+runs for seven days after its last write.
 
 ## Failed dates
 

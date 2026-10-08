@@ -30,6 +30,7 @@ than re-deriving it from a possibly-changed upstream output.
 import re
 from collections.abc import Collection
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Any
 
 from cronstable import _json
@@ -192,6 +193,16 @@ class DagSpec:
             by_id={t.id: t for t in tasks},
             mapped_tasks=tuple(t for t in tasks if t.expand is not None),
         )
+
+    @cached_property
+    def upstream_first(self) -> "list[TaskSpec] | None":
+        """The tasks ordered so each one follows its upstreams, or ``None``
+        when :attr:`tasks` already lists them that way.
+
+        A function of the frozen spec, built by the first advance pass in
+        which a task ended and shared by the passes after it.
+        """
+        return _upstream_first(self)
 
 
 class DagValidationError(Exception):
@@ -934,7 +945,7 @@ def _propagate_and_claim(
     _walk_and_claim(spec, body, now, proc, host, result)
     if not result.ended:
         return
-    order = _upstream_first(spec)
+    order = spec.upstream_first
     while order is not None and result.ended:
         _settle_dependents(spec, order, body, now, result)
         result.ended = False
@@ -944,9 +955,9 @@ def _propagate_and_claim(
 def _upstream_first(spec: DagSpec) -> list[TaskSpec] | None:
     """The spec's tasks ordered so each one follows its upstreams.
 
-    ``None`` when ``spec.tasks`` already lists them that way.  Computed
-    only by a pass in which a task ended.  An undefined dependency
-    constrains nothing and a task on a cycle is left out;
+    ``None`` when ``spec.tasks`` already lists them that way.  Read through
+    :attr:`DagSpec.upstream_first`, which keeps the answer.  An undefined
+    dependency constrains nothing and a task on a cycle is left out;
     :func:`validate_graph` rejects both at load.
     """
     listed: set[str] = set()
@@ -968,8 +979,8 @@ def _upstream_first(spec: DagSpec) -> list[TaskSpec] | None:
         waiting[task.id] = len(deps)
         for dep in deps:
             dependents.setdefault(dep, []).append(task)
-    # ``order`` doubles as the work queue: a task joins it once every one of
-    # its upstreams is ahead of it.
+    # ``order`` doubles as the work queue: a task joins it after every one
+    # of its upstreams is ahead of it.
     placed = 0
     while placed < len(order):
         for down in dependents.get(order[placed].id, ()):

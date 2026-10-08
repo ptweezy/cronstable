@@ -99,6 +99,12 @@ def _waiting(body, limit=None):
     return sorted(entries, key=_queue_order)
 
 
+def _used_slots(body):
+    return sum(
+        e["slots"] for e in body["entries"].values() if e["state"] == "running"
+    )
+
+
 def _read_body(body, now):
     # a read-only _change action: the transform already works on a private
     # copy of the stored document, so that copy can go to the caller as-is
@@ -353,6 +359,16 @@ class PoolScheduler:
             == guard["generation"]
         )
 
+    def _retry_superseded(self, body, payload):
+        """Whether ``payload`` is a retry whose ladder was cancelled or
+        replaced."""
+        retry = payload.get("retry")
+        return bool(
+            retry
+            and retry["count"] > 0
+            and not self._retry_current(body, payload)
+        )
+
     async def retry_current(self, guard):
         if guard is None:
             return True
@@ -430,23 +446,13 @@ class PoolScheduler:
             target = entry["payload"].get("targetHost")
             if target is not None and target != self.cron._state_host:
                 return False
-            retry = entry["payload"].get("retry")
-            if (
-                retry
-                and retry["count"] > 0
-                and not self._retry_current(body, entry["payload"])
-            ):
+            if self._retry_superseded(body, entry["payload"]):
                 entry.update(
                     state="cancelled",
                     reason="retry superseded",
                     finishedAt=now,
                 )
                 return False
-            used = sum(
-                e["slots"]
-                for e in body["entries"].values()
-                if e["state"] == "running"
-            )
             first = min(
                 (
                     e
@@ -459,7 +465,7 @@ class PoolScheduler:
             if (
                 first is None
                 or first["id"] != key
-                or used + entry["slots"] > body["slots"]
+                or _used_slots(body) + entry["slots"] > body["slots"]
             ):
                 return False
             entry.update(
@@ -477,8 +483,18 @@ class PoolScheduler:
         return ticket
 
     async def finish(
-        self, ticket: Ticket | None, state="finished", reason=None
+        self,
+        ticket: Ticket | None,
+        state="finished",
+        reason=None,
+        *,
+        wake=True,
     ):
+        """Close ``ticket``'s entry as ``state`` and give back its slots.
+
+        ``wake`` runs the next tick at once, for the entries that the
+        freed slots can admit.
+        """
         if ticket is None:
             return
         # The run this ticket admitted is over. A renewal that finds the
@@ -501,7 +517,8 @@ class PoolScheduler:
             ticket.completion = (state, reason)
             return
         self.held.pop((ticket.pool, ticket.key), None)
-        self._wake.set()
+        if wake:
+            self._wake.set()
 
     async def cancel(self, pool, key, reason="cancelled by operator"):
         def cancel(body, now):
@@ -528,9 +545,8 @@ class PoolScheduler:
             entries = list(body["entries"].values())
             waiting = _waiting(body)
             positions = {e["id"]: i + 1 for i, e in enumerate(waiting)}
-            free = body["slots"] - sum(
-                e["slots"] for e in entries if e["state"] == "running"
-            )
+            used = _used_slots(body)
+            free = body["slots"] - used
             visible = []
             for entry in entries:
                 item = {
@@ -554,9 +570,7 @@ class PoolScheduler:
                     **conf,
                     "slots": body["slots"],
                     "configuredSlots": conf["slots"],
-                    "used": sum(
-                        e["slots"] for e in entries if e["state"] == "running"
-                    ),
+                    "used": used,
                     "queued": sum(e["state"] == "queued" for e in entries),
                     "entries": sorted(
                         visible,
@@ -631,75 +645,91 @@ class PoolScheduler:
         body = await self._change(pool, _read_body)
         if await self._retire_tasks(pool, body):
             body = await self._change(pool, _read_body)
-        # Slots the snapshot leaves unclaimed, kept current as this tick
-        # admits work. acquire() rules on every claim; this count only
-        # spares it the entries that cannot fit.
-        free = body["slots"] - sum(
-            e["slots"]
-            for e in body["entries"].values()
-            if e["state"] == "running"
-        )
+        # Slots this tick can still hand out. acquire() admits the queue
+        # head alone, so the entries behind one that stays queued have
+        # none to claim.
+        free = body["slots"] - _used_slots(body)
+        blocked = False
         for entry in _waiting(body, limit=32):
-            payload = entry["payload"]
-            if payload.get("kind") != "job":
-                continue
-            target = payload.get("targetHost")
-            if target is not None and target != self.cron._state_host:
-                continue
-            job = self.cron.cron_jobs.get(entry["job"])
-            if (
-                job is None
-                or not job.enabled
-                or job.pool != pool
-                or job_digest_cached(job) != entry["digest"]
-            ):
-                await self.cancel(
-                    pool,
-                    entry["id"],
-                    "job removed, disabled, or configuration changed",
-                )
-                continue
-            if not payload.get("manual") and not self.cron._cluster_allows(
-                job
-            ):
-                continue
-            if not payload.get("manual") and self.cron._pause_active(job.name):
-                continue
-            if (
-                job.concurrencyPolicy == "Forbid"
-                and self.cron.running_jobs.get(job.name)
-            ):
-                continue
-            retry = payload.get("retry")
-            superseded = (
-                retry
-                and retry["count"] > 0
-                and not self._retry_current(body, payload)
+            taken, queued = await self._admit(
+                pool, body, entry, 0 if blocked else free
             )
-            # acquire() cancels a superseded retry at any capacity, so that
-            # entry goes to it even when it cannot fit.
-            if entry["slots"] > free and not superseded:
-                continue
-            ticket = await self.acquire(pool, entry["id"])
-            if ticket is None:
-                continue
-            free -= entry["slots"]
-            try:
-                launched = await self.cron.maybe_launch_job(
-                    job,
-                    with_retries=payload.get("withRetries", True),
-                    pool_ticket=ticket,
-                )
-                if not launched:
-                    await self.finish(
-                        ticket, "queued", "waiting for concurrency admission"
-                    )
-            except BaseException:
-                await self.finish(ticket, "queued", "launch interrupted")
-                raise
-            if (pool, entry["id"]) not in self.held:
-                # A ticket the launch gave back returns its slots.
-                free += entry["slots"]
+            free -= taken
+            blocked = blocked or queued
+
+    async def _admit(self, pool, body, entry, free):
+        """Admit, retire, or pass over one waiting entry of a tick.
+
+        Return the slots the entry took and whether it is still queued.
+        acquire() rules on every claim. ``free`` only spares it the entries
+        that cannot fit.
+        """
+        payload = entry["payload"]
+        if payload.get("kind") != "job":
+            return 0, True
+        target = payload.get("targetHost")
+        if target is not None and target != self.cron._state_host:
+            return 0, True
+        job = self.cron.cron_jobs.get(entry["job"])
+        if (
+            job is None
+            or not job.enabled
+            or job.pool != pool
+            or job_digest_cached(job) != entry["digest"]
+        ):
+            await self.cancel(
+                pool,
+                entry["id"],
+                "job removed, disabled, or configuration changed",
+            )
+            return 0, False
+        if not payload.get("manual") and not self.cron._cluster_allows(job):
+            return 0, True
+        if not payload.get("manual") and self.cron._pause_active(job.name):
+            return 0, True
+        if job.concurrencyPolicy == "Forbid" and self.cron.running_jobs.get(
+            job.name
+        ):
+            return 0, True
+        superseded = self._retry_superseded(body, payload)
+        # acquire() cancels a superseded retry at any capacity, so that
+        # entry goes to it even when it cannot fit.
+        if entry["slots"] > free and not superseded:
+            return 0, True
+        key = (pool, entry["id"])
+        ticket = await self.acquire(*key)
+        if ticket is None:
+            # acquire() cancelled a superseded retry. Any other refusal
+            # means the queue has moved since the tick read it.
+            return 0, not superseded and await self._queued(*key)
+        try:
+            launched = await self.cron.maybe_launch_job(
+                job,
+                with_retries=payload.get("withRetries", True),
+                pool_ticket=ticket,
+            )
+        except BaseException:
+            await self.finish(
+                ticket, "queued", "launch interrupted", wake=False
+            )
+            raise
+        if key not in self.held:
+            # The launch closed the entry itself.
+            return 0, False
+        if launched:
+            return entry["slots"], False
+        # Declined: the entry goes back to the head. No wake, because the
+        # next tick would decline it again at once.
+        await self.finish(
+            ticket, "queued", "waiting for concurrency admission", wake=False
+        )
+        return 0, True
+
+    async def _queued(self, pool, key):
+        entry = await self._change(
+            pool, lambda body, now: body["entries"].get(key)
+        )
+        return entry is not None and entry["state"] == "queued"
 
     async def _retire_tasks(self, pool, body):
         """Retire orphaned claims, including failures nobody can observe.

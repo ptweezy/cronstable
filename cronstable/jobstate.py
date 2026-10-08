@@ -373,8 +373,8 @@ async def artifact_put(
     size, at, meta}`` is appended to the scope's ``artifacts/`` stream, so a
     later run or a peer node reads the newest version back by name.  Only the
     newest record per name is ever read back, so the append carries
-    ``prune_latest_by="name"``: superseded older records of the same name are
-    amortised away (and their now-orphan blobs reclaimed by the next sweep),
+    ``prune_latest_by="name"``: it removes the record that it supersedes, or
+    a later prune pass does (the next sweep reclaims the now-orphan blob),
     bounding the stream by the number of distinct names, whatever the number
     of publishes (:meth:`StateBackend.append_record` gives the factor).  The
     scope's whole artifact stream is still reclaimed together when the job
@@ -491,15 +491,10 @@ async def artifact_list(
 ) -> list[dict[str, Any]]:
     """The newest record for each distinct artifact name in ``scope``."""
     scope = _require_scope(scope)
-    records = await backend.list_records(
-        ARTIFACT_STREAM_PREFIX + scope, newest_first=True
+    records = await backend.newest_records_by(
+        ARTIFACT_STREAM_PREFIX + scope, "name"
     )
-    seen: dict[str, dict[str, Any]] = {}
-    for record in records:
-        name = record.get("name")
-        if isinstance(name, str) and name not in seen:
-            seen[name] = record
-    return [seen[name] for name in sorted(seen)]
+    return sorted(records, key=lambda record: record["name"])
 
 
 async def referenced_blob_digests(

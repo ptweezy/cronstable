@@ -3142,6 +3142,9 @@ jobs:
         id: envs
         env:
           NEW_VERSION: ${{ needs.version.outputs.new }}
+          # The cryptography release that preflight resolved from the
+          # pyproject.toml requirement.
+          CRYPTOGRAPHY: ${{ needs.preflight.outputs.cryptography }}
         run: |
           set -euo pipefail
           uv venv --python 3.14 .venv-new
@@ -3156,7 +3159,7 @@ jobs:
           # push.fanout_8x100 skip without the first, push.seal_xwing_500
           # without the second.
           uv pip install --python .venv-new/bin/python pynacl \
-            "cryptography>=50.0.1,<51"
+            "cryptography==$CRYPTOGRAPHY"
           # Playwright for webui.* on BOTH sides: a metric that skips on one
           # side is ungated. Best-effort, but then the webui ids in
           # benchmarks/expected_gated.txt fail a release; for a transient
@@ -3176,7 +3179,7 @@ jobs:
               uv pip install --python .venv-old/bin/python /tmp/perf-baseline
             # Hard, like the current-side installs above.
             uv pip install --python .venv-old/bin/python orjson isal pynacl \
-              "cryptography>=50.0.1,<51"
+              "cryptography==$CRYPTOGRAPHY"
             # The Chromium download above is shared, so this adds only the
             # Python package.
             uv pip install --python .venv-old/bin/python playwright || true

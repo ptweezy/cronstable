@@ -77,7 +77,9 @@ async def test_recovery_artifact_limit_counts_names(
     names = ["extract/a", "extract/b", "extract/c"]
     monkeypatch.setattr(dagrun, "RECOVERY_MAX_ARTIFACTS", len(names))
     # Each name is published twice. The scope holds the superseded records
-    # until its next prune, and they do not count toward the limit.
+    # until its next prune, as it holds the versions that another node
+    # published, and they do not count toward the limit.
+    monkeypatch.setattr(backend, "_unlink_superseded", lambda *args: None)
     for data in (b"old", b"new"):
         for name in names:
             await jobstate.artifact_put(backend, scope, name, data)

@@ -27,6 +27,7 @@ import pytest
 
 from tests._helpers import (
     ExitError,
+    RecordingZlib,
     _backend,
     _drain_state_writes,
     _exit,
@@ -456,3 +457,20 @@ class CliRunner:
 @pytest.fixture
 def cli_runner(monkeypatch):
     return CliRunner(monkeypatch)
+
+
+@pytest.fixture
+def stand_in_isal(monkeypatch):
+    """(response backend, the module's zlib), both recording.
+
+    The backend's strongest level is 3, as ISA-L's is.
+    """
+    import zlib
+
+    from cronstable import _gzip
+
+    isal = RecordingZlib(3)
+    stdlib = RecordingZlib(zlib.Z_BEST_COMPRESSION)
+    monkeypatch.setattr(_gzip, "backend", lambda: isal)
+    monkeypatch.setattr(_gzip, "zlib", stdlib)
+    return isal, stdlib

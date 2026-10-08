@@ -51,6 +51,7 @@ import unicodedata
 from collections.abc import Callable, Coroutine
 from typing import (
     Any,
+    NamedTuple,
     cast,
 )
 
@@ -645,6 +646,15 @@ def fuzzy(query: str, label: str) -> int:
     return 1 if qi == len(q) else 0
 
 
+def _filter_admits(job: dict[str, Any], needle: str) -> bool:
+    """Whether ``job`` passes the text filter: its name or its command
+    contains ``needle``, the filter text stripped and lowercased."""
+    return not needle or (
+        needle in job.get("name", "").lower()
+        or needle in job.get("command", "").lower()
+    )
+
+
 def compute_view(
     jobs: list[dict[str, Any]],
     filter_text: str,
@@ -661,10 +671,8 @@ def compute_view(
     needle = filter_text.strip().lower()
     view = []
     for job in jobs:
-        if needle and (
-            needle not in job.get("name", "").lower()
-            and needle not in job.get("command", "").lower()
-        ):
+        # the needle test spares an unfiltered list one call per job
+        if needle and not _filter_admits(job, needle):
             continue
         key = health(job)[0]
         if status_filter != "all" and segment_of(key) != status_filter:
@@ -704,15 +712,15 @@ def compute_view(
     return view
 
 
-def _filter_admits(job: dict[str, Any], needle: str) -> bool:
-    """Whether ``job`` passes :func:`compute_view`'s text filter.
+class _ViewBuilt(NamedTuple):
+    """The inputs that a view was built from, and the view."""
 
-    ``needle`` is the filter text, stripped and lowercased.
-    """
-    return not needle or (
-        needle in job.get("name", "").lower()
-        or needle in job.get("command", "").lower()
-    )
+    jobs: list[dict[str, Any]]
+    status_filter: str
+    sort_key: str
+    sort_dir: int
+    filter_text: str
+    view: list[dict[str, Any]]
 
 
 def _edit_text(text: str, key: str) -> str | None:
@@ -2986,19 +2994,8 @@ class App:
         self._filter_hold = False
         self._filter_typed: list[str] = []
         self._filter_base = ""
-        # what self.view was built from: the job list, status segment,
-        # sort key, sort direction and filter text, then the view itself
-        self._view_built: (
-            tuple[
-                list[dict[str, Any]],
-                str,
-                str,
-                int,
-                str,
-                list[dict[str, Any]],
-            ]
-            | None
-        ) = None
+        # what self.view was built from, by the last recompute_view
+        self._view_built: _ViewBuilt | None = None
 
         # ---- surfaces ----
         self.open_overlays: list[str] = []  # stack, last = topmost
@@ -3286,13 +3283,13 @@ class App:
             self.view, self.sel = self._filter_step(
                 self.view, None, self.sel, self.filter_text
             )
-        self._view_built = (
-            self.jobs,
-            self.status_filter,
-            self.sort_key,
-            self.sort_dir,
-            self.filter_text,
-            self.view,
+        self._view_built = _ViewBuilt(
+            jobs=self.jobs,
+            status_filter=self.status_filter,
+            sort_key=self.sort_key,
+            sort_dir=self.sort_dir,
+            filter_text=self.filter_text,
+            view=self.view,
         )
 
     def _filter_step(
@@ -3347,12 +3344,13 @@ class App:
         needle = None
         if (
             built is not None
-            and built[0] is self.jobs
-            and built[1:4]
-            == (self.status_filter, self.sort_key, self.sort_dir)
-            and built[5] is view
+            and built.jobs is self.jobs
+            and built.status_filter == self.status_filter
+            and built.sort_key == self.sort_key
+            and built.sort_dir == self.sort_dir
+            and built.view is view
         ):
-            needle = built[4].strip().lower()
+            needle = built.filter_text.strip().lower()
         text = self._filter_base
         owed: str | None = None
         for key in typed:
@@ -3742,30 +3740,27 @@ class App:
             key: str | None = await self.keys.get()
             # Keys that are queued together, as a paste is, are handled
             # in one pass. The filter edits among them share one view
-            # rebuild: it runs before any other key acts and before the
-            # pass ends, so every other key, the next frame and the next
-            # poll read the view for the text typed so far.
-            while key is not None and not self.quit:
-                self.last_key_mono = time.monotonic()
-                if self.zen_on:  # any key wakes zen without acting
-                    self.zen_on = False
-                elif self._edits_filter(key):
-                    self._filter_hold = True
-                    try:
+            # rebuild: handle_key runs it before any other key acts, and
+            # the pass ends with it, so every other key, the next frame
+            # and the next poll read the view for the text typed so far.
+            self._filter_hold = True
+            try:
+                while key is not None and not self.quit:
+                    self.last_key_mono = time.monotonic()
+                    if self.zen_on:  # any key wakes zen without acting
+                        self.zen_on = False
+                    else:
                         await self.handle_key(key)
-                    finally:
-                        self._filter_hold = False
-                else:
-                    self._settle_view()
-                    await self.handle_key(key)
-                self.mark()
-                take = getattr(self.keys, "get_nowait", None)
-                key = take() if take is not None else None
+                    self.mark()
+                    take = getattr(self.keys, "get_nowait", None)
+                    key = take() if take is not None else None
+            finally:
+                self._filter_hold = False
             self._settle_view()
 
     def _edits_filter(self, key: str) -> bool:
-        """Whether :meth:`handle_key` takes ``key`` as an edit of the
-        filter box and nothing else."""
+        """Whether ``key`` edits the filter box. :meth:`handle_key` routes
+        on this test, so it is the one definition of a filter edit."""
         return (
             self.focus == "filter"
             and not self.booting
@@ -4963,12 +4958,17 @@ class AppPalette(AppActions):
 # ===================================================================
 class AppKeys(AppPalette):
     async def handle_key(self, key: str) -> None:
-        """One key press.  Structure and guards mirror the web page's
-        single keydown handler: palette submode first, then the palette
-        chord (global, even over the wallboard), Esc (closes the top
-        overlay), focused-field editing, ``w``/``a`` (list or wallboard,
-        never in overlays), overlay-local keys, and finally the list
-        keys."""
+        """One key press.  A filter edit goes to the filter box, and
+        every other key acts on the view for the text typed so far.
+        Structure and guards for those keys mirror the web page's single
+        keydown handler: palette submode first, then the palette chord
+        (global, even over the wallboard), Esc (closes the top overlay),
+        focused-field editing, ``w``/``a`` (list or wallboard, never in
+        overlays), overlay-local keys, and finally the list keys."""
+        if self._edits_filter(key):
+            self._edit_input("filter", key)
+            return
+        self._settle_view()
         if key == "ctrl+c":
             self.quit = True
             return

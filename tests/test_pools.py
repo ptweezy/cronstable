@@ -371,7 +371,7 @@ async def test_tick_stops_trying_when_the_last_slot_is_taken(
     await _reap_running(cron)
 
 
-async def test_tick_still_tries_an_entry_that_fits_behind_one_that_does_not(
+async def test_tick_tries_nothing_behind_a_head_that_does_not_fit(
     dag_cron, monkeypatch
 ):
     cron = await make(dag_cron, monkeypatch)
@@ -386,19 +386,56 @@ async def test_tick_still_tries_an_entry_that_fits_behind_one_that_does_not(
     assert (wide["slots"], narrow["slots"]) == (2, 1)
     attempts = _count_admission_attempts(cron, monkeypatch)
     await cron._pools._tick_pool("database")
-    # one slot is free: the two-slot entry cannot fit, the one-slot entry
-    # can, and admission order still belongs to acquire()
-    assert attempts == [narrow["id"]]
+    # one slot is free and the one-slot entry would fit it, but acquire()
+    # admits the queue head alone, and the two-slot head cannot fit
+    assert attempts == []
     assert not cron.running_jobs
     await cron._pools.finish(held)
     await cron._pools._tick_pool("database")
+    assert attempts == [wide["id"]]
     assert set(cron.running_jobs) == {"two"}
     await _reap_running(cron)
     await cron._pools._tick_pool("database")
+    assert attempts == [wide["id"], narrow["id"]]
     await _reap_running(cron)
 
 
-async def test_declined_launch_returns_its_slots_to_the_tick(
+async def test_tick_still_retires_a_dead_entry_behind_a_waiting_head(
+    dag_cron, monkeypatch
+):
+    cron = await make(dag_cron, monkeypatch)
+    one, two = cron.cron_jobs.values()
+    held = await cron._pools.acquire(
+        "database", (await cron._pools.enqueue(one))["id"]
+    )
+    two.poolSlots = 2
+    await cron.maybe_launch_job(two)
+    state = JobRetryState(5, 2, 60)
+    state.next_delay()
+    state.pool_retry = {
+        "pool": "database",
+        "scope": cron._pools._retry_scope("one", None),
+        "generation": "an older ladder",
+    }
+    cron.retry_state["one"] = state
+    await cron.maybe_launch_job(one)
+    wide, retry = (await cron._pools.snapshot())[0]["entries"][1:]
+    attempts = _count_admission_attempts(cron, monkeypatch)
+    await cron._pools._tick_pool("database")
+    # the head waits for a second slot; the superseded retry behind it
+    # still goes to acquire(), which cancels it
+    assert attempts == [retry["id"]]
+    assert not cron.running_jobs
+    entries = (await cron._pools.snapshot())[0]["entries"]
+    assert {e["id"]: (e["state"], e.get("reason")) for e in entries[1:]} == {
+        wide["id"]: ("queued", None),
+        retry["id"]: ("cancelled", "retry superseded"),
+    }
+    await cron._pools.finish(held)
+    await cron._pools.cancel("database", wide["id"])
+
+
+async def test_declined_launch_closes_the_tick_behind_it(
     dag_cron, monkeypatch
 ):
     cron = await make(dag_cron, monkeypatch)
@@ -417,11 +454,150 @@ async def test_declined_launch_returns_its_slots_to_the_tick(
     with monkeypatch.context() as patch:
         patch.setattr(cron, "maybe_launch_job", decline)
         await cron._pools._tick_pool("database")
-    assert attempts == [first["id"], second["id"]]
+    # the declined entry is queued again at the head, so the entry behind
+    # it has nothing to claim
+    assert attempts == [first["id"]]
     assert (await cron._pools.snapshot())[0]["queued"] == 2
     await cron._pools.finish(held)
     for key in (first["id"], second["id"]):
         await cron._pools.cancel("database", key)
+
+
+async def test_declined_launch_leaves_the_service_asleep(
+    dag_cron, monkeypatch
+):
+    # A declined entry goes back to the head of the queue.  A wake would
+    # run the next tick at once, and that tick would decline it again.
+    cron = await make(dag_cron, monkeypatch)
+    pools = cron._pools
+    one, _two = cron.cron_jobs.values()
+    await cron.maybe_launch_job(one)
+    (entry,) = (await pools.snapshot())[0]["entries"]
+
+    async def decline(job, **kwargs):
+        return False
+
+    async def interrupted(job, **kwargs):
+        raise OSError("spawn failed")
+
+    pools._wake.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(cron, "maybe_launch_job", decline)
+        await pools._tick_pool("database")
+        assert not pools._wake.is_set()
+        patch.setattr(cron, "maybe_launch_job", interrupted)
+        with pytest.raises(OSError):
+            await pools._tick_pool("database")
+        assert not pools._wake.is_set()
+    assert not pools.held
+    assert (await pools.snapshot())[0]["queued"] == 1
+    # a completion frees slots for the queue, so it wakes the service
+    ticket = await pools.acquire("database", entry["id"])
+    await pools.finish(ticket)
+    assert pools._wake.is_set()
+
+
+async def test_service_loop_waits_out_its_interval_on_a_declined_head(
+    dag_cron, monkeypatch
+):
+    # While the head is declined, the service loop ticks once a second.
+    cron = await make(dag_cron, monkeypatch)
+    pools = cron._pools
+    await cron.maybe_launch_job(cron.cron_jobs["one"])
+
+    async def decline(job, **kwargs):
+        return False
+
+    monkeypatch.setattr(cron, "maybe_launch_job", decline)
+    ticks = []
+    tick = pools.tick
+
+    async def counted():
+        ticks.append(1)
+        await tick()
+
+    monkeypatch.setattr(pools, "tick", counted)
+    pools._task = asyncio.create_task(pools._run())
+    try:
+        await asyncio.sleep(0.3)
+    finally:
+        await pools.close()
+    assert len(ticks) == 1
+    assert (await pools.snapshot())[0]["queued"] == 1
+
+
+async def test_tick_goes_on_past_an_entry_that_its_launch_settled(
+    dag_cron, monkeypatch
+):
+    cron = await make(dag_cron, monkeypatch)
+    pools = cron._pools
+    one, two = cron.cron_jobs.values()
+    await cron.maybe_launch_job(one)
+    await cron.maybe_launch_job(two)
+    first, second = (await pools.snapshot())[0]["entries"]
+    attempts = _count_admission_attempts(cron, monkeypatch)
+    launch = cron.maybe_launch_job
+
+    async def settle_first(job, **kwargs):
+        if job is not one:
+            return await launch(job, **kwargs)
+        # what the launch does with a retry that fresher state supersedes
+        await pools.finish(
+            kwargs["pool_ticket"], "cancelled", "retry superseded"
+        )
+        return False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cron, "maybe_launch_job", settle_first)
+        await pools._tick_pool("database")
+    # the head is gone, so the entry behind it is the head and is admitted
+    assert attempts == [first["id"], second["id"]]
+    assert set(cron.running_jobs) == {"two"}
+    entries = (await pools.snapshot())[0]["entries"]
+    assert {e["id"]: (e["state"], e.get("reason")) for e in entries} == {
+        first["id"]: ("cancelled", "retry superseded"),
+        second["id"]: ("running", None),
+    }
+    await _reap_running(cron)
+
+
+async def test_tick_goes_on_past_a_retry_that_the_claim_cancelled(
+    dag_cron, monkeypatch
+):
+    cron = await make(dag_cron, monkeypatch)
+    pools = cron._pools
+    one, two = cron.cron_jobs.values()
+    state = JobRetryState(5, 2, 60)
+    state.next_delay()
+    state.pool_retry = {
+        "pool": "database",
+        "scope": pools._retry_scope("one", None),
+        "generation": "an older ladder",
+    }
+    cron.retry_state["one"] = state
+    await cron.maybe_launch_job(one)
+    await cron.maybe_launch_job(two)
+    retry, behind = (await pools.snapshot())[0]["entries"]
+    attempts = _count_admission_attempts(cron, monkeypatch)
+    real = pools._retry_current
+    asked = []
+
+    def current_when_the_tick_read_it(body, payload):
+        asked.append(payload)
+        return len(asked) == 1 or real(body, payload)
+
+    monkeypatch.setattr(pools, "_retry_current", current_when_the_tick_read_it)
+    await pools._tick_pool("database")
+    # the claim reads fresher state than the tick did and cancels the
+    # retry, which leaves the entry behind it at the head
+    assert attempts == [retry["id"], behind["id"]]
+    assert set(cron.running_jobs) == {"two"}
+    entries = (await pools.snapshot())[0]["entries"]
+    assert {e["id"]: (e["state"], e.get("reason")) for e in entries} == {
+        retry["id"]: ("cancelled", "retry superseded"),
+        behind["id"]: ("running", None),
+    }
+    await _reap_running(cron)
 
 
 async def test_full_pool_tick_still_retires_dead_entries(

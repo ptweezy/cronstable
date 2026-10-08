@@ -18,6 +18,7 @@ import importlib.util
 import json
 import os
 import socket
+import zlib
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -723,3 +724,17 @@ def bare_http_raises(path):
         if helper not in bound:
             offenders.append((filename, 0, "missing helper " + helper))
     return offenders
+
+
+class RecordingZlib:
+    """A zlib-compatible stand-in that records each compressor's level."""
+
+    DEFLATED = zlib.DEFLATED
+
+    def __init__(self, best):
+        self.Z_BEST_COMPRESSION = best
+        self.levels = []
+
+    def compressobj(self, level, *args):
+        self.levels.append(level)
+        return zlib.compressobj(level, *args)

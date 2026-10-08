@@ -677,6 +677,35 @@ async def test_document_read_retries_windows_sharing_violations(
     assert fs_backend._read_doc_file(path, strict=True) == {"v": 1}
 
 
+async def test_strict_document_reads_tell_unreadable_from_absent(fs_backend):
+    # A strict read answers None for a document that is not there and
+    # raises, naming the document, for one that it cannot read.  The
+    # best-effort read takes both for absent.
+    backend = fs_backend
+    await backend.mutate_document("ns", "good", lambda c: ({"v": 1}, None))
+    await backend.mutate_document("ns", "newer", lambda c: ({"v": 2}, None))
+    assert await backend.read_document("ns", "good", strict=True) == {"v": 1}
+    assert await backend.read_document("ns", "absent", strict=True) is None
+    assert await backend.list_documents("absent-ns", strict=True) == []
+    both = await backend.list_documents("ns", strict=True)
+    assert sorted(doc["v"] for doc in both) == [1, 2]
+    _lock, doc_path = backend._doc_paths("ns", "newer")
+    with open(doc_path, "w") as fobj:
+        json.dump({"schemaVersion": "v99", "data": {"v": 2}}, fobj)
+    assert await backend.read_document("ns", "newer") is None
+    assert await backend.list_documents("ns") == [{"v": 1}]
+    with pytest.raises(state._DocumentUnreadable, match="'newer' in 'ns'"):
+        await backend.read_document("ns", "newer", strict=True)
+    with pytest.raises(state._DocumentUnreadable, match="in 'ns'"):
+        await backend.list_documents("ns", strict=True)
+    # a strict read takes no lock, so the lock file's idle clock runs on
+    lock_path, _doc = backend._doc_paths("ns", "good")
+    before = os.stat(lock_path).st_mtime_ns
+    os.utime(lock_path, ns=(before - 10**9, before - 10**9))
+    await backend.read_document("ns", "good", strict=True)
+    assert os.stat(lock_path).st_mtime_ns == before - 10**9
+
+
 # --- corrupt-record quarantine -------------------------------------------
 
 
@@ -2152,6 +2181,192 @@ async def test_name_keyed_prune_keeps_its_cadence_on_a_small_stream(
     assert len(sizes) == 5
 
 
+def _record_files(backend, stream):
+    names = os.listdir(backend._stream_dir(stream))
+    return [n for n in names if n.endswith(".json")]
+
+
+async def test_name_keyed_append_unlinks_the_record_it_supersedes(fs_backend):
+    # Republishing every name of a stream: each append removes the version
+    # it replaces, so the stream holds one record per name after every
+    # append, however far off its next prune pass is.
+    backend = fs_backend
+    names = 40
+    for version in range(3):
+        for i in range(names):
+            await backend.append_record(
+                "s", {"name": "n%d" % i, "v": version}, prune_latest_by="name"
+            )
+            if version:
+                assert len(_record_files(backend, "s")) == names
+    recs = await backend.list_records("s")
+    assert sorted(r["name"] for r in recs) == sorted(
+        "n%d" % i for i in range(names)
+    )
+    assert {r["v"] for r in recs} == {2}
+    # a value that is not a string names no version to supersede
+    for _ in range(2):
+        await backend.append_record("s", {"name": 7}, prune_latest_by="name")
+    assert len(_record_files(backend, "s")) == names + 2
+
+
+async def test_name_keyed_append_supersedes_what_the_first_pass_kept(
+    fs_backend_factory,
+):
+    # A backend that starts on a stream another one filled, as a daemon
+    # does after a restart: the pass its first append carries reads the
+    # stream, and every later append removes the version it replaces.
+    names = 20
+    before = await fs_backend_factory()
+    for i in range(names):
+        await before.append_record(
+            "s", {"name": "n%d" % i, "v": 0}, prune_latest_by="name"
+        )
+    after = await fs_backend_factory()
+    for i in range(names):
+        await after.append_record(
+            "s", {"name": "n%d" % i, "v": 1}, prune_latest_by="name"
+        )
+        assert len(_record_files(after, "s")) == names
+    assert {r["v"] for r in await after.list_records("s")} == {1}
+
+
+async def test_name_keyed_append_leaves_a_record_it_has_not_seen(
+    fs_backend_factory,
+):
+    # Two backends on one directory: two nodes sharing a mount.  A version
+    # that the peer published since this backend's last pass is unknown
+    # here, so it waits for the next pass.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+
+    async def put(backend, version):
+        await backend.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+
+    await put(ours, 1)
+    await put(theirs, 2)  # its first append: the pass removes version 1
+    await put(ours, 3)
+    recs = await ours.list_records("s")
+    assert sorted(r["v"] for r in recs) == [2, 3]
+    assert ours._prune_latest_by_sync("s", "name") == 1
+    assert len(_record_files(ours, "s")) == 1
+
+
+async def test_latest_by_learn_displaces_older_records_only(fs_backend):
+    backend = fs_backend
+    learn = backend._latest_by_learn
+    assert learn("t", "name", {"a": "0002.json"}) == []
+    # a record older than the one known is not the newest of its value
+    assert learn("t", "name", {"a": "0001.json"}) == []
+    assert learn("t", "name", {"a": "0003.json", "b": "0003.json"}) == [
+        "0002.json"
+    ]
+    # another field and another stream hold facts of their own
+    assert learn("t", "other", {"a": "0009.json"}) == []
+    assert learn("u", "name", {"a": "0009.json"}) == []
+    assert backend._latest_by_entries == 4
+    assert learn("t", "name", {}) == []
+    backend._latest_by_forget("t")
+    assert backend._latest_by_entries == 1
+    assert list(backend._latest_by) == ["u"]
+
+
+async def test_latest_by_memo_stays_within_its_budget(fs_backend, monkeypatch):
+    monkeypatch.setattr(state, "_LATEST_BY_MAX_ENTRIES", 4)
+    backend = fs_backend
+
+    async def put(stream, name, version):
+        await backend.append_record(
+            stream, {"name": name, "v": version}, prune_latest_by="name"
+        )
+
+    def facts():
+        return {token: len(held) for token, held in backend._latest_by.items()}
+
+    for i in range(4):
+        await put("s", "n%d" % i, 0)
+    assert backend._latest_by_entries == 4
+    # the fifth fact is one over the budget: the oldest one makes room
+    await put("s", "n4", 0)
+    assert backend._latest_by_entries == 4
+    # a version that the memo has lost stays for the next pass
+    await put("s", "n0", 1)
+    assert len(_record_files(backend, "s")) == 6
+    # and a version that the memo still holds is removed
+    await put("s", "n4", 1)
+    assert len(_record_files(backend, "s")) == 6
+    assert facts() == {"s": 4}
+    # another stream takes its room from the one learned least recently,
+    # whose most recent fact outlasts the others
+    for i in range(3):
+        await put("t", "m%d" % i, 0)
+    assert facts() == {"s": 1, "t": 3}
+    assert list(backend._latest_by["s"]) == [("name", "n4")]
+    await put("t", "m3", 0)
+    assert facts() == {"t": 4}
+    assert backend._latest_by_entries == 4
+    # a wiped stream leaves no facts behind
+    await backend.prune_records("t", keep=0)
+    assert backend._latest_by_entries == 0
+    assert backend._latest_by == {}
+
+
+async def test_latest_by_memo_keeps_the_streams_in_use(fs_backend, monkeypatch):
+    # A stream that is published to again keeps its facts while a stream
+    # that nobody appends to gives its own up.
+    monkeypatch.setattr(state, "_LATEST_BY_MAX_ENTRIES", 4)
+    backend = fs_backend
+
+    async def put(stream, name, version):
+        await backend.append_record(
+            stream, {"name": name, "v": version}, prune_latest_by="name"
+        )
+
+    for name in ("a", "b"):
+        await put("idle", name, 0)
+        await put("busy", name, 0)
+    for version in range(1, 4):
+        await put("fresh%d" % version, "x", 0)
+        for name in ("a", "b"):
+            await put("busy", name, version)
+            assert len(_record_files(backend, "busy")) == 2
+    assert "idle" not in backend._latest_by
+    assert len(backend._latest_by["busy"]) == 2
+
+
+async def test_superseded_record_unlink_rides_out_a_sharing_violation(
+    fs_backend, monkeypatch
+):
+    # On Windows a reader that has the superseded record open makes the
+    # first unlink fail.  The append retries, as every other delete does.
+    backend = fs_backend
+
+    async def put(version):
+        await backend.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+
+    await put(1)
+    monkeypatch.setattr(state, "IS_WINDOWS", True)
+    monkeypatch.setattr(state.time, "sleep", lambda _seconds: None)
+    real_unlink = os.unlink
+    failures = []
+
+    def held_once(path):
+        if not failures:
+            failures.append(path)
+            raise PermissionError("sharing violation")
+        real_unlink(path)
+
+    monkeypatch.setattr(state.os, "unlink", held_once)
+    await put(2)
+    monkeypatch.undo()
+    assert len(failures) == 1
+    assert [r["v"] for r in await backend.list_records("s")] == [2]
+
+
 # --- newest record by field (the artifact store's lookup) ------------------
 
 
@@ -2322,14 +2537,222 @@ async def test_newest_record_index_stays_within_its_budget(
     for stream in streams:
         got = await backend.newest_record_with(stream, "name", "n3")
         assert got == {"name": "n3"}
-    # a stream with more records than the budget is scanned, never held
+    # a stream with more records than the budget holds the facts about
+    # its newest records, so a lookup of a recent name reads its match
+    # and nothing else
     for i in range(8):
         await backend.append_record("big", {"name": "b%d" % i})
     for _ in range(2):
         got = await backend.newest_record_with("big", "name", "b0")
         assert got == {"name": "b0"}
-    assert (state._fs_safe("big"), "name") not in backend._field_index
-    assert backend._field_index_entries <= 6
+    big = backend._field_index[state._fs_safe("big"), "name"]
+    assert sorted(big.values()) == ["b%d" % i for i in range(2, 8)]
+    assert backend._field_index_entries == 6
+    reads = _count_record_reads(monkeypatch, backend)
+    got = await backend.newest_record_with("big", "name", "b7")
+    assert got == {"name": "b7"}
+    assert len(reads) == 1
+
+
+async def test_newest_record_index_sheds_the_oldest_facts_first(
+    fs_backend, monkeypatch
+):
+    # Two streams that together need more facts than the budget holds:
+    # the one used less recently gives up the facts about its oldest
+    # records, and its recent names still cost one read.
+    monkeypatch.setattr(state, "_FIELD_INDEX_MAX_ENTRIES", 12)
+    backend = fs_backend
+    for stream in ("a", "b"):
+        for i in range(10):
+            await backend.append_record(stream, {"name": "n%d" % i})
+        await backend.newest_record_with(stream, "name", "n0")
+    held = backend._field_index
+    assert len(held[state._fs_safe("b"), "name"]) == 10
+    assert sorted(held[state._fs_safe("a"), "name"].values()) == ["n8", "n9"]
+    reads = _count_record_reads(monkeypatch, backend)
+
+    async def lookup(stream, name):
+        del reads[:]
+        got = await backend.newest_record_with(stream, "name", name)
+        assert got == {"name": name}
+        return len(reads)
+
+    assert await lookup("a", "n9") == 1
+    assert await lookup("b", "n0") == 1
+    # an old name of the shed stream reads the records with no fact
+    assert await lookup("a", "n0") == 8
+    assert backend._field_index_entries == 12
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_newest_record_with_follows_a_republish_during_the_lookup(
+    fs_backend_factory, monkeypatch, strict
+):
+    # Two backends on one directory: two nodes sharing a mount.  The peer
+    # republishes between the lookup's listing and its read, which removes
+    # the record that the lookup listed.  The lookup lists the stream
+    # again and returns the version that replaced it.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    versions = iter(range(1, 10))
+
+    def publish():
+        theirs._append_sync(
+            "s", {"name": "a", "v": next(versions)}, None, "name"
+        )
+
+    publish()
+    real = ours._read_record
+    raced = []
+
+    def racing(stream_dir, name, **kwargs):
+        if not raced:
+            raced.append(name)
+            publish()
+        return real(stream_dir, name, **kwargs)
+
+    monkeypatch.setattr(ours, "_read_record", racing)
+    got = await ours.newest_record_with("s", "name", "a", strict=strict)
+    assert got == {"name": "a", "v": 2}
+    # The name-keyed listing meets the same race.  A best-effort read
+    # holds the body of the record it listed, the version current then.
+    del raced[:]
+    listed = await ours.newest_records_by("s", "name", strict=strict)
+    assert listed == [{"name": "a", "v": 3 if strict else 2}]
+    assert len(raced) == 1
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_newest_record_with_rescans_past_an_older_record_of_the_name(
+    fs_backend_factory, monkeypatch, strict
+):
+    # The stream holds two records of the name, as it does after two nodes
+    # publish it.  A third publish removes the newer of the two between
+    # the lookup's listing and its read.  The older record was superseded
+    # before the lookup began, so the lookup lists the stream again and
+    # returns the new version.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    await theirs.append_record("s", {"name": "a", "v": 1})
+    await theirs.append_record("s", {"name": "a", "v": 2})
+    _v1, v2 = sorted(os.listdir(ours._stream_dir("s")))
+    real = ours._read_record
+    raced = []
+
+    def racing(stream_dir, name, **kwargs):
+        if not raced:
+            raced.append(name)
+            theirs._append_sync("s", {"name": "a", "v": 3}, None, None)
+            os.unlink(os.path.join(stream_dir, v2))
+        return real(stream_dir, name, **kwargs)
+
+    monkeypatch.setattr(ours, "_read_record", racing)
+    got = await ours.newest_record_with("s", "name", "a", strict=strict)
+    assert got == {"name": "a", "v": 3}
+    assert raced == [v2]
+
+
+async def test_newest_record_with_gives_up_on_a_stream_that_keeps_moving(
+    fs_backend, monkeypatch
+):
+    # Every scan meets a record that left the stream.  A strict lookup
+    # cannot tell "never published" from "republished again", so it
+    # raises, and a best-effort one answers with no match.
+    backend = fs_backend
+    await backend.append_record("s", {"name": "a"})
+    scans = []
+
+    def gone(stream_dir, name, **kwargs):
+        scans.append(name)  # the stream holds one record: one read a scan
+        return None
+
+    monkeypatch.setattr(backend, "_read_record", gone)
+    monkeypatch.setattr(backend, "_record_superseded", lambda *a: True)
+    assert await backend.newest_record_with("s", "name", "a") is None
+    assert len(scans) == state._SUPERSEDED_RESCANS + 1
+    with pytest.raises(state._DocumentUnreadable):
+        await backend.newest_record_with("s", "name", "a", strict=True)
+    with pytest.raises(state._DocumentUnreadable):
+        await backend.newest_records_by("s", "name", strict=True)
+    assert await backend.newest_records_by("s", "name") == []
+
+
+async def test_newest_record_with_best_effort_keeps_its_last_match(
+    fs_backend, monkeypatch
+):
+    # Every scan meets a record that left the stream ahead of a match.  A
+    # strict lookup raises, and a best-effort one answers with the match.
+    backend = fs_backend
+    await backend.append_record("s", {"name": "a"})
+    await backend.append_record("s", {"name": "b"})
+    _older, newer = sorted(os.listdir(backend._stream_dir("s")))
+    real = backend._read_record
+
+    def gone(stream_dir, name, **kwargs):
+        return None if name == newer else real(stream_dir, name, **kwargs)
+
+    monkeypatch.setattr(backend, "_read_record", gone)
+    monkeypatch.setattr(backend, "_record_superseded", lambda *a: True)
+    got = await backend.newest_record_with("s", "name", "a")
+    assert got == {"name": "a"}
+    with pytest.raises(state._DocumentUnreadable):
+        await backend.newest_record_with("s", "name", "a", strict=True)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_newest_records_by_keeps_one_record_per_value(
+    fs_backend, strict
+):
+    backend = fs_backend
+    assert await backend.newest_records_by("s", "name") == []
+    for name, version in (("a", 1), ("b", 2), ("a", 3), (7, 4), ("c", 5)):
+        await backend.append_record("s", {"name": name, "v": version})
+    got = await backend.newest_records_by("s", "name", strict=strict)
+    # newest first, and a value that is not a string names no record
+    assert got == [
+        {"name": "c", "v": 5},
+        {"name": "a", "v": 3},
+        {"name": "b", "v": 2},
+    ]
+    capped = await backend.newest_records_by(
+        "s", "name", strict=strict, max_values=2
+    )
+    assert capped == got[:2]
+
+
+async def test_newest_records_by_strict_fails_closed_on_an_unread_record(
+    fs_backend, monkeypatch
+):
+    backend = fs_backend
+    await backend.append_record("s", {"name": "a"})
+    await backend.append_record("s", {"name": "b"})
+    stream_dir = backend._stream_dir("s")
+    newer = sorted(os.listdir(stream_dir))[-1]
+    _hold_records(monkeypatch, [os.path.join(stream_dir, newer)])
+    with pytest.raises(OSError):
+        await backend.newest_records_by("s", "name", strict=True)
+    assert await backend.newest_records_by("s", "name") == [{"name": "a"}]
+
+
+async def test_newest_records_by_base_default_scans_list_records():
+    class _Scanning(_MinimalBackend):
+        async def list_records(
+            self, stream, *, limit=None, newest_first=False, strict=False
+        ):
+            self.asked = (stream, newest_first, strict)
+            return [
+                {"name": "a", "v": 3},
+                {"name": "b", "v": 2},
+                {"name": "a", "v": 1},
+                {"v": 0},
+            ]
+
+    backend = _Scanning()
+    got = await backend.newest_records_by("s", "name", strict=True)
+    assert got == [{"name": "a", "v": 3}, {"name": "b", "v": 2}]
+    assert backend.asked == ("s", True, True)
+    capped = await backend.newest_records_by("s", "name", max_values=1)
+    assert capped == [{"name": "a", "v": 3}]
 
 
 async def test_newest_record_index_drops_records_that_left_the_stream(
@@ -2400,6 +2823,39 @@ async def test_newest_record_with_base_default_scans_list_records():
     assert got == {"name": "b", "v": 1}
     assert backend.asked == ("s", True, True, 1)
     assert await backend.newest_record_with("s", "name", "zz") is None
+
+
+async def test_list_documents_keyed_base_default_reads_matching_keys():
+    class _Keyed(_MinimalBackend):
+        keys = ["recovery-a", "run-1", "recovery-b"]
+
+        def __init__(self):
+            super().__init__()
+            self.read = []
+            self.listed = []
+
+        async def list_document_keys(self, namespace):
+            return self.keys
+
+        async def read_document(self, namespace, key, *, strict=False):
+            self.read.append((key, strict))
+            return None if key == "recovery-b" else {"key": key}
+
+        async def list_documents(self, namespace, *, strict=False):
+            self.listed.append(strict)
+            return [{"key": "every"}]
+
+    backend = _Keyed()
+    got = await backend.list_documents_keyed(
+        "ns", "recovery-", strict=True, unreadable_ttl=1.0
+    )
+    assert got == [{"key": "recovery-a"}]
+    assert backend.read == [("recovery-a", True), ("recovery-b", True)]
+    # without a keys-only listing the answer is every document, a superset
+    backend.keys = None
+    got = await backend.list_documents_keyed("ns", "recovery-", strict=True)
+    assert got == [{"key": "every"}]
+    assert backend.listed == [True]
 
 
 # --- append-side prune failure is swallowed -------------------------------
@@ -2563,6 +3019,78 @@ async def test_list_document_keys_surrogate_key_round_trips(fs_backend):
         "ns", key, lambda c: ({"v": 1}, None)
     )
     assert await backend.list_document_keys("ns") == [key]
+
+
+async def test_list_documents_keyed_reads_the_keys_under_a_prefix(
+    fs_backend, monkeypatch
+):
+    backend = fs_backend
+    # "con" is a reserved device name, stored under an escaped first
+    # character
+    for key in ("recovery-a", "recovery-b", "run-1", "con"):
+        await backend.mutate_document(
+            "ns", key, lambda c, k=key: ({"key": k}, None)
+        )
+    read = []
+    real = backend._read_doc_file
+
+    def counting(doc_path, **kwargs):
+        read.append(os.path.basename(doc_path))
+        return real(doc_path, **kwargs)
+
+    monkeypatch.setattr(backend, "_read_doc_file", counting)
+
+    async def keyed(prefix):
+        del read[:]
+        docs = await backend.list_documents_keyed("ns", prefix)
+        return sorted(doc["key"] for doc in docs)
+
+    assert await keyed("recovery-") == ["recovery-a", "recovery-b"]
+    assert len(read) == 2  # the other documents are not read
+    assert await keyed("co") == ["con"]
+    assert await keyed("") == ["con", "recovery-a", "recovery-b", "run-1"]
+    assert await keyed("zz") == []
+    assert read == []
+    assert await backend.list_documents_keyed("absent-ns", "x") == []
+    # a file whose key cannot be recovered is read under any prefix
+    await backend.mutate_document("ns", _LONG, lambda c: ({"key": "x"}, None))
+    with open(os.path.join(backend._doc_dir("ns"), "KEY.doc"), "wb") as fobj:
+        fobj.write(b"{}")
+    assert await keyed("recovery-") == ["recovery-a", "recovery-b", "x"]
+    assert len(read) == 4
+
+
+async def test_list_documents_keyed_strict_waits_out_an_unreadable_document(
+    fs_backend,
+):
+    # A strict listing raises for a document that it cannot read.  With
+    # ``unreadable_ttl`` it skips one whose file has gone that long
+    # without a write.
+    backend = fs_backend
+    await backend.mutate_document("ns", "good", lambda c: ({"v": 1}, None))
+    await backend.mutate_document("ns", "bad", lambda c: ({"v": 2}, None))
+    _lock, doc_path = backend._doc_paths("ns", "bad")
+    with open(doc_path, "w") as fobj:
+        fobj.write("{not json")
+
+    async def strict(prefix="", **kwargs):
+        return await backend.list_documents_keyed(
+            "ns", prefix, strict=True, **kwargs
+        )
+
+    assert await backend.list_documents_keyed("ns", "") == [{"v": 1}]
+    for kwargs in ({}, {"unreadable_ttl": 3600.0}):
+        with pytest.raises(state._DocumentUnreadable, match="in 'ns'"):
+            await strict(**kwargs)
+    # a document outside the prefix fails nothing
+    assert await strict("g") == [{"v": 1}]
+    written = state._now() - 7200.0
+    os.utime(doc_path, (written, written))
+    assert await strict(unreadable_ttl=3600.0) == [{"v": 1}]
+    with pytest.raises(state._DocumentUnreadable):
+        await strict(unreadable_ttl=86400.0)
+    with pytest.raises(state._DocumentUnreadable):
+        await strict()
 
 
 async def test_list_document_namespaces_lists_and_filters(fs_backend):
@@ -3658,7 +4186,7 @@ class _MinimalBackend(state.StateBackend):
     async def prune_records(self, stream, *, keep):
         return 0
 
-    async def read_document(self, namespace, key):
+    async def read_document(self, namespace, key, *, strict=False):
         return None
 
     async def mutate_document(self, namespace, key, transform):
@@ -3667,7 +4195,7 @@ class _MinimalBackend(state.StateBackend):
     async def delete_document(self, namespace, key):
         return False
 
-    async def list_documents(self, namespace):
+    async def list_documents(self, namespace, *, strict=False):
         return []
 
     async def put_blob(self, data):

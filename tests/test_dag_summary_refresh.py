@@ -145,8 +145,8 @@ async def test_new_generation_refresh_keeps_older_reads_out_of_caches(
     read_op = "list_documents" if bulk else "read_document"
     real_read = getattr(backend, read_op)
 
-    async def gated_read(*args):
-        body = await real_read(*args)
+    async def gated_read(*args, **kwargs):
+        body = await real_read(*args, **kwargs)
         if not entered.is_set():
             entered.set()
             await release.wait()
