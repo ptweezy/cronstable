@@ -49,7 +49,7 @@ dependencies = [
     "jinja2>=3.1.6,<4",
     # zoneinfo's tz database, so timezones resolve on minimal/slim images
     # that don't ship the system tzdata.
-    "tzdata>=2026.4",
+    "tzdata>=2026.5",
     # Per-run CPU/memory accounting (opt-in `monitorResources`; see
     # cronstable.resources). The feature is off by default, but the import is
     # unconditional so `cronstable --help` and mypy resolve it everywhere.
@@ -66,6 +66,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Environment :: Console",
     "Framework :: AsyncIO",
     "Operating System :: POSIX :: Linux",
@@ -101,7 +102,11 @@ speedups = [
     # orjson speeds the state-persistence and cluster-gossip JSON paths
     # (cronstable._json falls back to stdlib json). Optional because some
     # targets (riscv64, armv6, musl ppc64le/s390x) have no wheel; Windows
-    # does, so no marker.
+    # does, so no marker. The cp315 glibc wheels require glibc 2.39 or later,
+    # which a marker cannot see, so pip builds from source on an older glibc.
+    # TODO: When orjson's cp315 glibc wheels install on a glibc older than
+    # 2.39, delete the glibc 2.39 notes here, in the dev extra, in
+    # CONTRIBUTING.md, and in wiki/Installation.md.
     "orjson>=3.12.0",
     # isal (ISA-L) gzips web and cluster responses with SIMD deflate
     # (cronstable._gzip falls back to stdlib zlib). The marker lists only
@@ -109,6 +114,11 @@ speedups = [
     # and needs nasm on x86. There is no cp315 wheel yet. Linux stops at
     # x86_64 and aarch64, with the same 32-bit userland caveat as the push
     # extra's cryptography line.
+    # TODO: https://github.com/pycompression/python-isal/issues/247 - When
+    # isal publishes cp315 wheels, drop `python_version < '3.15'` from this
+    # marker and the dev extra's, and regenerate the build files. Then
+    # remove the 3.15 gate in tests/test_dev_deps_parity.py and the isal
+    # notes for Python 3.15 in CONTRIBUTING.md and wiki/Installation.md.
     "isal>=1.8.0; python_version < '3.15' and ((sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64'))",
 ]
 # End-to-end encrypted push alerts (the `push` reporter; see cronstable.push).
@@ -144,9 +154,11 @@ dev = [
     # linux32 caveat; those tests skip where it is absent.
     "cryptography>=50.0.1,<51; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     # orjson is wheel-only here: the marker skips targets that would need a
-    # Rust source build. py314t uses a generated list without it, because no
-    # marker can detect the free-threaded ABI that orjson rejects.
-    "orjson>=3.12.0; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+    # Rust source build. The exception is Python 3.15 on a glibc older than
+    # 2.39, which a marker cannot see (see the speedups extra). py314t and
+    # py315t use a generated list without it, because no marker can detect
+    # the free-threaded ABI that orjson rejects.
+    "orjson>=3.12.0; platform_machine != 'ARM64' or sys_platform != 'win32'",
     # isal reuses the speedups marker; tests/test_gzip.py covers both
     # backends wherever it installs.
     "isal>=1.8.0; python_version < '3.15' and ((sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64'))",
@@ -168,7 +180,7 @@ dev = [
     "crontab>=1.0.5,<2",
     # Property tests generate schedules, configuration, Task XML, and
     # protocol payloads to check invariants (tests/test_properties_*.py).
-    "hypothesis>=6.168.3",
+    "hypothesis>=6.168.5",
     "pytest",
     "pytest-asyncio",
     "pytest-cov",

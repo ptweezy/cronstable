@@ -401,14 +401,17 @@ jobs:
         # macOS runs the POSIX profile: its process, signal, fsync, and pipe
         # behavior differs from Linux, and releases ship macOS binaries.
         os: [ubuntu-26.04, windows-latest, macos-latest]
-        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
         include:
-          # Linux ARM64 on the oldest and newest Python: releases ship ARM64
-          # artifacts, and cryptography and orjson use different wheels there.
+          # Linux ARM64 on the oldest and newest Python, and on 3.14, which
+          # the release binaries bundle: releases ship ARM64 artifacts, and
+          # cryptography and orjson use different wheels there.
           - os: ubuntu-26.04-arm
             python: '3.10'
           - os: ubuntu-26.04-arm
             python: '3.14'
+          - os: ubuntu-26.04-arm
+            python: '3.15'
           # Gating win-arm64 row: the released .exe targets it.
           - os: windows-11-arm
             python: '3.14'
@@ -421,6 +424,8 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python }}
+          # TODO: Remove `allow-prereleases` when actions/python-versions
+          # lists 3.15.0. Until then, the 3.15 and 3.15t cells run 3.15.0rc3.
           allow-prereleases: true
       - run: |-
           pip install tox tox-uv
@@ -440,12 +445,16 @@ jobs:
           python -m playwright install --with-deps chromium
       # Both envs on every runner: the one for the other OS skips (the tox.ini
       # `platform` key), so each cell measures its own OS coverage profile.
-      - if: matrix.python != '3.14t'
+      - if: ${{ !endsWith(matrix.python, 't') }}
         run: |-
           tox -e py-windows,py-posix
+      # The env name is the version without its dot: 3.15t runs py315t-posix.
       - name: Test free-threaded Python with the stdlib JSON fallback
-        if: matrix.python == '3.14t'
-        run: tox -e py314t-posix
+        if: endsWith(matrix.python, 't')
+        shell: bash
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: tox -e "py${PYTHON_VERSION//./}-posix"
 
       # Opt-in by env var because it reads host tasks; one hosted Windows cell
       # runs it and fails if it skips.
@@ -538,8 +547,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-26.04]
-        # 3.14t is the free-threaded build: daemon threads run without the GIL.
-        python: ['3.15', '3.14t']
+        # The free-threaded builds: daemon threads run without the GIL.
+        python: ['3.14t', '3.15t']
     runs-on: ${{ matrix.os }}
     continue-on-error: true
     timeout-minutes: 30
