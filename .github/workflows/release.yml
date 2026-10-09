@@ -628,7 +628,7 @@ jobs:
           docker logs etcd-plain
           exit 1
       - name: Start a kind cluster
-        uses: helm/kind-action@v1.15.0
+        uses: helm/kind-action@v1.15.1
       - name: Run the live backend tests
         env:
           CRONSTABLE_LIVE_REQUIRED: '1'
@@ -2054,7 +2054,7 @@ jobs:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@v7.0.1
       - name: Build binary (FreeBSD ${{ matrix.vmarch }})
-        uses: vmactions/freebsd-vm@v1.5.8
+        uses: vmactions/freebsd-vm@v1.5.9
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
