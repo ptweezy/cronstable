@@ -339,8 +339,25 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
+      # This step runs the actionlint release binary, pinned by digest.
+      # Docker Hub can rate-limit a pull of the image for longer than any
+      # retry lasts, and a failure here skips every test job, because they
+      # all need this job. With shellcheck and pyflakes off, the binary
+      # checks everything that the image checks.
       - name: Validate workflow syntax
-        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -shellcheck='' -pyflakes=''
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          . .github/scripts/retry.sh
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          # Only the download is retried; a digest mismatch is deterministic.
+          retry 5 curl --proto =https --tlsv1.2 -fsSL -o "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "$ACTIONLINT_SHA256  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -shellcheck='' -pyflakes=''
       # The repository is LF-only (.gitattributes). Fail on any tracked blob
       # with CRLF or mixed endings that slipped past `text=auto`.
       - name: Guard against CRLF line endings
@@ -401,14 +418,17 @@ jobs:
         # macOS runs the POSIX profile: its process, signal, fsync, and pipe
         # behavior differs from Linux, and releases ship macOS binaries.
         os: [ubuntu-26.04, windows-latest, macos-latest]
-        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
         include:
-          # Linux ARM64 on the oldest and newest Python: releases ship ARM64
-          # artifacts, and cryptography and orjson use different wheels there.
+          # Linux ARM64 on the oldest and newest Python, and on 3.14, which
+          # the release binaries bundle: releases ship ARM64 artifacts, and
+          # cryptography and orjson use different wheels there.
           - os: ubuntu-26.04-arm
             python: '3.10'
           - os: ubuntu-26.04-arm
             python: '3.14'
+          - os: ubuntu-26.04-arm
+            python: '3.15'
           # Gating win-arm64 row: the released .exe targets it.
           - os: windows-11-arm
             python: '3.14'
@@ -421,6 +441,8 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python }}
+          # TODO: Remove `allow-prereleases` when actions/python-versions
+          # lists 3.15.0. Until then, the 3.15 and 3.15t cells run 3.15.0rc3.
           allow-prereleases: true
       - run: |-
           pip install tox tox-uv
@@ -440,12 +462,16 @@ jobs:
           python -m playwright install --with-deps chromium
       # Both envs on every runner: the one for the other OS skips (the tox.ini
       # `platform` key), so each cell measures its own OS coverage profile.
-      - if: matrix.python != '3.14t'
+      - if: ${{ !endsWith(matrix.python, 't') }}
         run: |-
           tox -e py-windows,py-posix
+      # The env name is the version without its dot: 3.15t runs py315t-posix.
       - name: Test free-threaded Python with the stdlib JSON fallback
-        if: matrix.python == '3.14t'
-        run: tox -e py314t-posix
+        if: endsWith(matrix.python, 't')
+        shell: bash
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: tox -e "py${PYTHON_VERSION//./}-posix"
 
       # Opt-in by env var because it reads host tasks; one hosted Windows cell
       # runs it and fails if it skips.
@@ -538,8 +564,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-26.04]
-        # 3.14t is the free-threaded build: daemon threads run without the GIL.
-        python: ['3.15', '3.14t']
+        # The free-threaded builds: daemon threads run without the GIL.
+        python: ['3.14t', '3.15t']
     runs-on: ${{ matrix.os }}
     continue-on-error: true
     timeout-minutes: 30
@@ -628,7 +654,7 @@ jobs:
           docker logs etcd-plain
           exit 1
       - name: Start a kind cluster
-        uses: helm/kind-action@v1.15.0
+        uses: helm/kind-action@v1.15.1
       - name: Run the live backend tests
         env:
           CRONSTABLE_LIVE_REQUIRED: '1'
@@ -2054,7 +2080,7 @@ jobs:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@v7.0.1
       - name: Build binary (FreeBSD ${{ matrix.vmarch }})
-        uses: vmactions/freebsd-vm@v1.5.8
+        uses: vmactions/freebsd-vm@v1.5.9
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:

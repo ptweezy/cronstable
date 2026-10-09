@@ -339,10 +339,12 @@ def send(
 def utf8_stream(stream: Any) -> Any:
     """``stream`` as UTF-8 text, wrapping its binary buffer when it has one.
 
-    A piped stdio pair on Windows defaults to the ANSI code page (cp1252),
-    which has no emoji, box-drawing, or block characters: writing one raises
-    UnicodeEncodeError, and inbound non-ASCII arrives as mojibake. Wrapping
-    the underlying binary buffer pins the stream to UTF-8 on every platform.
+    A piped stdio pair on Windows defaults to the ANSI code page (cp1252)
+    whenever UTF-8 Mode is off, the default on Python 3.14 and earlier. That
+    code page has no emoji, box-drawing, or block characters: writing one
+    raises UnicodeEncodeError, and inbound non-ASCII arrives as mojibake.
+    Wrapping the underlying binary buffer pins the stream to UTF-8 on every
+    platform and Python version.
     ``newline=""`` keeps the text byte-exact in both directions: no CRLF
     translation on write and untranslated line endings on read.
 

@@ -50,13 +50,13 @@ respect.
 
 ## Development setup
 
-The project targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13, and 3.14 are
-tested) and runs on **Linux, macOS, and Windows**. The test suite runs on all
-three in CI, including Windows ARM64.
+The project targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13, 3.14, and 3.15
+are tested) and runs on **Linux, macOS, and Windows**. The test suite runs on
+all three in CI, including Windows ARM64.
 
 cronstable uses [uv](https://docs.astral.sh/uv/) for local development.
 The `tox-uv` plugin also lets tox use uv to create environments and install
-dependencies. uv can install the Python 3.10–3.14 interpreters used by the
+dependencies. uv can install the Python 3.10–3.15 interpreters used by the
 test matrix.
 
 Install uv and fork
@@ -223,9 +223,15 @@ optional dependency's minimum version, and the binary build jobs choose which
 of them each platform installs.
 
 `requirements/dev-freethreaded.txt` lists the `dev` extra without `orjson`,
-which does not support free-threaded Python. With Python 3.14t installed, run
-`tox -e py314t-posix` to test the standard-library JSON fallback with the
-same test suite and coverage floor.
+which does not support free-threaded Python. With Python 3.14t or 3.15t
+installed, run `tox -e py314t-posix` or `tox -e py315t-posix` to test the
+standard-library JSON fallback with the same test suite and coverage floor.
+
+On Python 3.15, the `dev` extra skips `isal`, which has no wheel for that
+version, so the `isal` half of `tests/test_gzip.py` doesn't run there. The
+`orjson` wheels for Python 3.15 on glibc Linux require glibc 2.39 or later.
+On an older glibc, installing the `dev` extra builds `orjson` from source,
+which requires a Rust toolchain.
 
 ## Running the checks
 
@@ -248,7 +254,7 @@ The rest of this section is reference for running one check or testing a
 specific kind of change. To run everything, or one check at a time:
 
 ```sh
-tox                # all envs: py310-py314 (each with a windows and a posix
+tox                # all envs: py310-py315 (each with a windows and a posix
                    # profile), lint, mypy, bandit, openapi
 tox -e lint        # ruff check + ruff format --check
 tox -e mypy        # mypy

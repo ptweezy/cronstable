@@ -10,7 +10,7 @@ mypy
 openapi-spec-validator
 jsonschema
 crontab>=1.0.5,<2
-hypothesis>=6.168.3
+hypothesis>=6.168.5
 pytest
 pytest-asyncio
 pytest-cov
