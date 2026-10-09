@@ -341,7 +341,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
       # Pull first, with retries: `docker run` pulls a missing image once, and
       # a registry error here skips every test job, because they all need
-      # this one. NOT pull_base: a third-party image; see the binaries job.
+      # this job. NOT pull_base: a third-party image; see the binaries job.
       - name: Validate workflow syntax
         env:
           ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12

@@ -125,6 +125,67 @@ sleep() { echo "DELAY:$1"; }
         assert "still failing after 5 attempts" in result.stderr
 
 
+@pytest.mark.parametrize("failures", [0, 2, 5])
+def test_workflow_lint_retries_its_image_pull_before_running(failures):
+    # Every test job needs tox-static, so a registry error in the lint
+    # image's pull skips the whole suite.
+    shell = shutil.which("bash")
+    if os.name == "nt":
+        shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+    if shell is None or not Path(shell).is_file():
+        pytest.skip("Bash required for the workflow lint harness")
+    step = next(
+        s
+        for s in workflow()["jobs"]["tox-static"]["steps"]
+        if s.get("name") == "Validate workflow syntax"
+    )
+    image = step["env"]["ACTIONLINT_IMAGE"]
+    prelude = """
+attempts=0
+docker() {
+    if [ "$1" = pull ]; then
+        attempts=$((attempts + 1))
+        echo "PULL:$2:$attempts"
+        [ "$attempts" -gt "$FAILURES" ]
+    else
+        echo "RUN:$*"
+    fi
+}
+sleep() { echo "DELAY:$1"; }
+"""
+    result = subprocess.run(
+        [shell, "-c", prelude + step["run"]],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "ACTIONLINT_IMAGE": image,
+            "FAILURES": str(failures),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert (result.returncode == 0) == (failures < 5), (
+        result.stdout + result.stderr
+    )
+    expected_attempts = min(failures + 1, 5)
+    assert result.stdout.count(f"PULL:{image}:") == expected_attempts
+    assert result.stdout.count("DELAY:") == expected_attempts - 1
+    # The linter runs once, on the pulled image, and never after a pull
+    # that used up its retries.
+    runs = [
+        line.split()
+        for line in result.stdout.splitlines()
+        if line.startswith("RUN:")
+    ]
+    if result.returncode:
+        assert runs == []
+        assert "still failing after 5 attempts" in result.stderr
+    else:
+        (run,) = runs
+        assert image in run
+
+
 @pytest.mark.parametrize(
     "name,job,field",
     [
