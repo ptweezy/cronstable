@@ -67,6 +67,13 @@
   theirs. The connection indicator's dot uses the ok status color, so the
   color vision setting remaps it. With Reduce motion on, a drawer opens in
   place without sliding. The demo dashboard includes all of these changes.
+- cronstable supports Python 3.15 for `pip` and `pipx` installs, and the
+  test matrix runs it on Linux, Windows, and macOS. On Python 3.15, the
+  `speedups` extra skips `isal`, which has no wheel for that version, so the
+  daemon compresses responses with the standard library's `zlib`. The
+  `orjson` wheels for Python 3.15 on glibc Linux require glibc 2.39 or
+  later. The release binaries and the Docker images bundle Python 3.14 or an
+  earlier version.
 
 ## 1.2.62
 

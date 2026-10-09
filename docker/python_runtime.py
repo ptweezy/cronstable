@@ -26,6 +26,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# TODO: Move the release binaries and Docker images to CPython 3.15 when
+# Docker Hub publishes final `python:3.15-*` images, isal publishes cp315
+# wheels, and orjson publishes cp315 wheels that keep the binaries' glibc
+# 2.17 floor. The other interpreter pins are in docker/images.toml,
+# pyinstaller/Dockerfile, and the binaries jobs in
+# .github/workflows/release.yml.
 VERSION = "3.14.7"
 SOURCE_SHA = "3b48dac8fb59f62eaa67ac83c1eb12bda1b7a08406dd286e252c11a66be27f81"
 PBS_RELEASE = "20260814"

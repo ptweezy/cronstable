@@ -100,6 +100,19 @@ class PushError(Exception):
     """A push operation failed (bad device material, store trouble)."""
 
 
+class PairingError(PushError):
+    """A pairing body that :func:`validate_pairing` refuses.
+
+    ``message`` is the sentence the caller reads, and the web API returns
+    it in the 400.  A store failure stays a plain :class:`PushError`: its
+    text can name a path or an errno, so it belongs in the log.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
 #: APNs rejects notifications whose final JSON exceeds 4096 bytes.
 APNS_PAYLOAD_MAX = 4096
 
@@ -653,24 +666,33 @@ def _validate_field(payload: dict[str, Any], field: str) -> str:
 def validate_pairing(payload: Any) -> dict[str, str]:
     """Validate a ``POST /push/devices`` body into a clean field dict.
 
-    Raises :class:`PushError` with a message safe to return in a 400.
+    Raises :class:`PairingError`, whose ``message`` is safe to return in a
+    400.
 
     ``suite`` is optional and defaults to :data:`DEFAULT_SUITE`: an app
     that names no suite is registering an X25519 key.
     """
     if not isinstance(payload, dict):
-        raise PushError("body must be a JSON object")
+        raise PairingError("body must be a JSON object")
     suite = payload.get("suite")
     if suite is not None and not isinstance(suite, str):
-        raise PushError("suite must be a string")
-    spec = suite_or_error(suite)
-    return {
-        "name": _validate_field(payload, "name"),
-        "platform": _validate_field(payload, "platform"),
-        "pushToken": _validate_field(payload, "pushToken"),
-        "publicKey": validate_public_key(payload.get("publicKey"), spec.name),
-        "suite": spec.name,
-    }
+        raise PairingError("suite must be a string")
+    try:
+        spec = suite_or_error(suite)
+        return {
+            "name": _validate_field(payload, "name"),
+            "platform": _validate_field(payload, "platform"),
+            "pushToken": _validate_field(payload, "pushToken"),
+            "publicKey": validate_public_key(
+                payload.get("publicKey"), spec.name
+            ),
+            "suite": spec.name,
+        }
+    except PushError as exc:
+        # The helpers raise PushError, the type suite_or_error shares with
+        # the seal path.  Each message they raise is fixed or quotes the
+        # caller's own body, which is what PairingError promises.
+        raise PairingError(str(exc)) from exc
 
 
 def seal_to_device(

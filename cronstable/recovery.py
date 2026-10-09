@@ -10,7 +10,16 @@ from cronstable import params as run_params
 
 
 class RecoveryError(Exception):
-    pass
+    """A recovery request that cannot proceed.
+
+    ``message`` is the sentence the caller reads: the web API and the MCP
+    server return it as the reason.  Write it for that caller, and keep
+    paths, errno text, and library wording in the log.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
 
 
 def digest(value):

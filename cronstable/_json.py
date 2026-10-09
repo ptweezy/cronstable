@@ -154,7 +154,14 @@ class UnsupportedValue(ValueError):
     read back differently (exact int vs. silently narrowed float).
     Rejecting at write time is what keeps a record readable by every node
     regardless of which ones have orjson.
+
+    ``message`` is the sentence that names the offending value.  A handler
+    that returns the reason to a caller reads this field.
     """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
 
 
 def _surrogate_error(found: str) -> "UnsupportedValue":

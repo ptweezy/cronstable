@@ -126,6 +126,165 @@ sleep() { echo "DELAY:$1"; }
 
 
 @pytest.mark.parametrize(
+    "failures,digest_ok",
+    [(0, True), (2, True), (5, True), (0, False)],
+)
+def test_workflow_lint_runs_a_pinned_binary_fetched_with_retries(
+    failures, digest_ok, tmp_path
+):
+    # Every test job needs tox-static, so a download that fails once, or a
+    # registry that rate-limits an image pull, would skip the whole suite.
+    shell = shutil.which("bash")
+    if os.name == "nt":
+        shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+    if shell is None or not Path(shell).is_file():
+        pytest.skip("Bash required for the workflow lint harness")
+    step = next(
+        s
+        for s in workflow()["jobs"]["tox-static"]["steps"]
+        if s.get("name") == "Validate workflow syntax"
+    )
+    assert "docker" not in step["run"]
+    version = step["env"]["ACTIONLINT_VERSION"]
+    digest = step["env"]["ACTIONLINT_SHA256"]
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+    temp = tmp_path.as_posix()
+    # The stubs stand in for the network, the digest check, and the
+    # archive: `tar` leaves a script that reports how the linter is called.
+    prelude = r"""
+attempts=0
+curl() {
+    attempts=$((attempts + 1))
+    for arg in "$@"; do url=$arg; done
+    echo "FETCH:$attempts:$url"
+    [ "$attempts" -gt "$FAILURES" ]
+}
+sha256sum() {
+    read -r line
+    echo "VERIFY:$line"
+    [ "$DIGEST_OK" = 1 ]
+}
+tar() {
+    printf '#!/bin/sh\necho "RUN:$*"\n' > "$RUNNER_TEMP/actionlint"
+    chmod +x "$RUNNER_TEMP/actionlint"
+}
+sleep() { echo "DELAY:$1"; }
+"""
+    result = subprocess.run(
+        [shell, "-c", prelude + step["run"]],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            **step["env"],
+            "RUNNER_TEMP": temp,
+            "FAILURES": str(failures),
+            "DIGEST_OK": str(int(digest_ok)),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    fetched = failures < 5
+    assert (result.returncode == 0) == (fetched and digest_ok), (
+        result.stdout + result.stderr
+    )
+    out = result.stdout.splitlines()
+    url = (
+        "https://github.com/rhysd/actionlint/releases/download/"
+        f"v{version}/actionlint_{version}_linux_amd64.tar.gz"
+    )
+    expected_attempts = min(failures + 1, 5)
+    assert [line for line in out if line.startswith("FETCH:")] == [
+        f"FETCH:{n}:{url}" for n in range(1, expected_attempts + 1)
+    ]
+    assert result.stdout.count("DELAY:") == expected_attempts - 1
+    # The digest check sees the pinned digest and the downloaded archive,
+    # and only a download that succeeded reaches it.
+    assert [line for line in out if line.startswith("VERIFY:")] == (
+        [f"VERIFY:{digest}  {temp}/actionlint.tar.gz"] if fetched else []
+    )
+    # The linter runs once, and never on an archive that failed its
+    # download or its digest check.
+    runs = [line for line in out if line.startswith("RUN:")]
+    assert len(runs) == (1 if fetched and digest_ok else 0)
+    if not fetched:
+        assert "still failing after 5 attempts" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "has_openssl35,version,ok",
+    [
+        (True, "OpenSSL 3.5.8 (stub)", True),
+        (False, "OpenSSL 3.5.9 (stub)", True),
+        (False, "OpenSSL 4.0.1 (stub)", True),
+        (False, "OpenSSL 3.0.22 (stub)", False),
+    ],
+)
+def test_freebsd_installs_the_openssl_35_port_under_either_name(
+    has_openssl35, version, ok
+):
+    # FreeBSD moved security/openssl35 to security/openssl, and each
+    # repository follows on its own schedule. A fixed name fails the
+    # install in one repository or installs OpenSSL 3.0 in another, where
+    # the soft cryptography build would drop ML-KEM without failing.
+    shell = shutil.which("bash")
+    if os.name == "nt":
+        shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+    if shell is None or not Path(shell).is_file():
+        pytest.skip("Bash required for the FreeBSD package setup harness")
+    job = workflow()["jobs"]["binaries-freebsd"]
+    step = next(
+        s
+        for s in job["steps"]
+        if s.get("uses", "").startswith("vmactions/freebsd-vm@")
+    )
+    prelude = """
+pkg() {
+    case "$1" in
+        rquery)
+            [ "$3" = openssl35 ] && [ "$HAS_OPENSSL35" = 1 ] && echo "$3"
+            ;;
+        install)
+            shift
+            echo "INSTALL:$*"
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+}
+openssl() { echo "$OPENSSL_VERSION"; }
+"""
+    for row in job["strategy"]["matrix"]["include"]:
+        assert "openssl" not in row["pkgs"], row
+        prepare = (
+            step["with"]["prepare"]
+            .replace("${{ matrix.pkgs }}", row["pkgs"])
+            .replace("/usr/local/bin/openssl", "openssl")
+        )
+        result = subprocess.run(
+            [shell, "-c", prelude + prepare],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "HAS_OPENSSL35": str(int(has_openssl35)),
+                "OPENSSL_VERSION": version,
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert (result.returncode == 0) == ok, result.stdout + result.stderr
+        name = "openssl35" if has_openssl35 else "openssl"
+        assert result.stdout.splitlines() == [
+            f"INSTALL:-y {row['pkgs']} {name}"
+        ]
+        if not ok:
+            assert "must be 3.5 or later" in result.stderr
+            assert version in result.stderr
+
+
+@pytest.mark.parametrize(
     "name,job,field",
     [
         ("release", "binaries-container", "platform"),

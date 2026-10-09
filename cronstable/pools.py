@@ -23,8 +23,16 @@ TERMINAL = frozenset({"finished", "expired", "cancelled"})
 
 
 class PoolError(Exception):
+    """A pool operation that cannot proceed.
+
+    ``message`` is the sentence the caller reads: the web API and the MCP
+    server return it as the reason.  Write it for that caller, and keep
+    paths, errno text, and library wording in the log.
+    """
+
     def __init__(self, message: str, *, pool=None, key=None) -> None:
         super().__init__(message)
+        self.message = message
         self.pool = pool
         self.key = key
 

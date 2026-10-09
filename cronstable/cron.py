@@ -3831,13 +3831,14 @@ class Cron:
         body = await self._web_json_body(request)
         try:
             fields = push.validate_pairing(body)
-        except push.PushError as exc:
-            # Safe to echo, unlike the store's PushErrors either side of
-            # it: every message validate_pairing can raise is a statically
-            # authored sentence about the caller's own body. No path, no
-            # errno, no library text; its PyNaCl brushes keep their detail
-            # in the log and raise a fixed string.
-            raise _api_error(web.HTTPBadRequest, str(exc)) from None
+        except push.PairingError as exc:
+            # PairingError marks a message that is safe to echo, unlike
+            # the store's PushErrors either side of it: every message
+            # validate_pairing can raise is a statically authored sentence
+            # about the caller's own body. No path, no errno, no library
+            # text; its PyNaCl brushes keep their detail in the log and
+            # raise a fixed string.
+            raise _api_error(web.HTTPBadRequest, exc.message) from None
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         try:
             record, created = await service.pair(
@@ -6388,7 +6389,7 @@ class Cron:
         try:
             payload = await self._pools.snapshot()
         except PoolError as ex:
-            raise _api_error(web.HTTPServiceUnavailable, str(ex)) from ex
+            raise _api_error(web.HTTPServiceUnavailable, ex.message) from ex
         except (OSError, asyncio.TimeoutError) as ex:
             raise _api_error(
                 web.HTTPServiceUnavailable, "pool state is unavailable"
@@ -6401,7 +6402,7 @@ class Cron:
                 request.match_info["name"], request.match_info["key"]
             )
         except PoolError as ex:
-            raise _api_error(web.HTTPConflict, str(ex)) from ex
+            raise _api_error(web.HTTPConflict, ex.message) from ex
         except (OSError, asyncio.TimeoutError) as ex:
             raise _api_error(
                 web.HTTPServiceUnavailable, "pool state is unavailable"
@@ -6441,7 +6442,7 @@ class Cron:
                 allow_config_change=allow_change,
             )
         except RecoveryError as ex:
-            raise _api_error(web.HTTPConflict, str(ex)) from ex
+            raise _api_error(web.HTTPConflict, ex.message) from ex
         except (OSError, asyncio.TimeoutError) as ex:
             raise _api_error(
                 web.HTTPServiceUnavailable, "recovery state is unavailable"
@@ -6480,7 +6481,7 @@ class Cron:
                 allow_config_change=allow_change,
             )
         except RecoveryError as ex:
-            raise _api_error(web.HTTPConflict, str(ex)) from ex
+            raise _api_error(web.HTTPConflict, ex.message) from ex
         except (OSError, asyncio.TimeoutError) as ex:
             raise _api_error(
                 web.HTTPServiceUnavailable, "recovery state is unavailable"
