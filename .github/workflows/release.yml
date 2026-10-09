@@ -2051,14 +2051,13 @@ jobs:
           - arch: amd64
             vmarch: x86_64
             # Host-native, so the orjson Rust build is cheap enough to try.
-            # openssl35: the base OpenSSL 3.0 cannot seal ML-KEM.
-            pkgs: python314 rust gmake pkgconf libsodium openssl35
+            pkgs: python314 rust gmake pkgconf libsodium
             orjson: '1'
             pq: '1'
             cflags: -I/usr/local/include
           - arch: amd64v3
             vmarch: x86_64
-            pkgs: python314 rust gmake pkgconf libsodium openssl35 libffi sqlite3
+            pkgs: python314 rust gmake pkgconf libsodium libffi sqlite3
             orjson: '1'
             pq: '1'
             cflags: -I/usr/local/include
@@ -2068,7 +2067,7 @@ jobs:
             # compile from Rust source, and stdlib json is the fallback.
             # cryptography is built anyway because post-quantum push needs
             # it; a build that fails the X-Wing probe leaves x25519 sealing.
-            pkgs: python314 rust gmake pkgconf libsodium openssl35
+            pkgs: python314 rust gmake pkgconf libsodium
             orjson: '0'
             pq: '1'
             cflags: -I/usr/local/include -include sys/cdefs.h
@@ -2095,7 +2094,28 @@ jobs:
           # Only NAMED host variables cross into the guest.
           envs: 'SETUPTOOLS_SCM_PRETEND_VERSION'
           prepare: |
-            pkg install -y ${{ matrix.pkgs }}
+            set -eu
+            # The base OpenSSL 3.0 cannot seal ML-KEM, so the build links
+            # the OpenSSL 3.5 port. That port is security/openssl35 until a
+            # package repository picks up its 2026-09-30 move to
+            # security/openssl, and each architecture's repository moves on
+            # its own schedule. Install the name that this repository has.
+            # TODO: Install `openssl` alone when the latest and quarterly
+            # repositories of both architectures have made the move.
+            openssl=openssl
+            if [ -n "$(pkg rquery %n openssl35 2>/dev/null)" ]; then
+              openssl=openssl35
+            fi
+            pkg install -y ${{ matrix.pkgs }} "$openssl"
+            # The cryptography build is soft: against an older OpenSSL it
+            # drops ML-KEM and the job still passes. Fail here instead.
+            case "$(/usr/local/bin/openssl version)" in
+              "OpenSSL 3."[5-9]*|"OpenSSL "[4-9]*) ;;
+              *)
+                echo "::error::the OpenSSL port must be 3.5 or later, not $(/usr/local/bin/openssl version)" >&2
+                exit 1
+                ;;
+            esac
           run: |
             set -eu
             . .github/scripts/retry.sh
