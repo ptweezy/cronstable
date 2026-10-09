@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "2d42ea35-57fd-4251-b5ca-eacde1d2a2d9",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/Users/parker/Repos/cronstable/.archify/architecture-cronstable-20261007-230515/candidate.json",
+  "output": "/Users/parker/Repos/cronstable/.archify/architecture-cronstable-20261007-230515/cronstable.html",
+  "specification": {
+    "sha256": "6947c9d42d446c9b8ce45024213a254d9ed6f93bb92ee3044f7bc82f09f46aae",
+    "bytes": 15156
+  },
+  "artifact": {
+    "sha256": "1f8dcf289c2b46e2fa55658688f8b2982f852bd0acb825d297a68adc05fa9bb4",
+    "bytes": 793567
+  }
+}

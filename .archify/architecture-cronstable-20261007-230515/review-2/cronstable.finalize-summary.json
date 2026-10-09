@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "architecture",
+  "quality": "showcase",
+  "specification": {
+    "path": "/Users/parker/Repos/cronstable/.archify/architecture-cronstable-20261007-230515/candidate.json",
+    "sha256": "6947c9d42d446c9b8ce45024213a254d9ed6f93bb92ee3044f7bc82f09f46aae",
+    "bytes": 15156
+  },
+  "artifact": {
+    "path": "/Users/parker/Repos/cronstable/.archify/architecture-cronstable-20261007-230515/cronstable.html",
+    "sha256": "1f8dcf289c2b46e2fa55658688f8b2982f852bd0acb825d297a68adc05fa9bb4",
+    "bytes": 793567
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/Users/parker/Repos/cronstable/.archify/architecture-cronstable-20261007-230515/review-2/cronstable.finalize.json",
+    "summaryReceipt": "/Users/parker/Repos/cronstable/.archify/architecture-cronstable-20261007-230515/review-2/cronstable.finalize-summary.json",
+    "browserCheckReceipt": "/Users/parker/Repos/cronstable/.archify/architecture-cronstable-20261007-230515/review-2/cronstable.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.0.1",
+    "availableVersion": "3.0.1",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-08T03:06:55.714Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 1621
+}

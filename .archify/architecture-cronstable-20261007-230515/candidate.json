@@ -1,0 +1,649 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "cronstable system overview",
+    "output": ".archify/architecture-cronstable-20261007-230515/cronstable.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/ptweezy/cronstable",
+      "revision": "be525d16a2515f3a125d659470a2748dd306af49"
+    }
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [
+      40,
+      40
+    ],
+    "cols": 5,
+    "cellW": 160,
+    "cellH": 64,
+    "gapX": 120,
+    "gapY": 96
+  },
+  "components": [
+    {
+      "id": "dashboards",
+      "type": "frontend",
+      "label": "Dashboards",
+      "sublabel": "web page, cronstable tui",
+      "row": 0,
+      "col": 1,
+      "sources": [
+        {
+          "path": "cronstable/web/index.html",
+          "line": 5513,
+          "end_line": 5527,
+          "label": "apiFetch wrapper"
+        },
+        {
+          "path": "cronstable/cron.py",
+          "line": 5510,
+          "end_line": 5537,
+          "label": "Index page handler"
+        },
+        {
+          "path": "cronstable/tui.py",
+          "line": 2184,
+          "end_line": 2185,
+          "label": "TUI API client"
+        }
+      ]
+    },
+    {
+      "id": "mcpbridge",
+      "type": "frontend",
+      "label": "MCP bridge",
+      "sublabel": "cronstable mcp, stdio",
+      "row": 0,
+      "col": 2,
+      "sources": [
+        {
+          "path": "cronstable/mcpcli.py",
+          "line": 67,
+          "end_line": 101,
+          "label": "POST to /mcp"
+        },
+        {
+          "path": "cronstable/__main__.py",
+          "line": 547,
+          "end_line": 552,
+          "label": "mcp subcommand"
+        }
+      ]
+    },
+    {
+      "id": "iosapp",
+      "type": "frontend",
+      "label": "iOS app",
+      "sublabel": "dashboard and alerts",
+      "row": 0,
+      "col": 3,
+      "sources": [
+        {
+          "path": "README.md",
+          "line": 419,
+          "end_line": 427,
+          "label": "iOS app section"
+        },
+        {
+          "path": "cronstable/pairlink.py",
+          "line": 1,
+          "end_line": 9,
+          "label": "Pairing link contract"
+        },
+        {
+          "path": "docs/relay-protocol.md",
+          "line": 16,
+          "end_line": 18,
+          "label": "App decrypts alerts"
+        }
+      ]
+    },
+    {
+      "id": "relay",
+      "type": "cloud",
+      "label": "Push relay",
+      "sublabel": "forwards to APNs",
+      "row": 0,
+      "col": 4,
+      "sources": [
+        {
+          "path": "docs/relay-protocol.md",
+          "line": 3,
+          "end_line": 10,
+          "label": "Relay contract"
+        },
+        {
+          "path": "cronstable/push.py",
+          "line": 1,
+          "end_line": 10,
+          "label": "Relay sees ciphertext"
+        }
+      ]
+    },
+    {
+      "id": "leadership",
+      "type": "backend",
+      "label": "Leadership backend",
+      "sublabel": "elects who runs jobs",
+      "tag": "opt-in",
+      "row": 1,
+      "col": 1,
+      "sources": [
+        {
+          "path": "cronstable/leadership.py",
+          "line": 509,
+          "end_line": 538,
+          "label": "make_backend"
+        },
+        {
+          "path": "cronstable/cron.py",
+          "line": 10514,
+          "end_line": 10571,
+          "label": "_cluster_allows gate"
+        },
+        {
+          "path": "cronstable/cron.py",
+          "line": 7658,
+          "label": "Backend construction"
+        }
+      ]
+    },
+    {
+      "id": "webapi",
+      "type": "backend",
+      "label": "Web API",
+      "sublabel": "aiohttp, bearer tokens",
+      "row": 1,
+      "col": 2,
+      "sources": [
+        {
+          "path": "cronstable/cron.py",
+          "line": 385,
+          "end_line": 466,
+          "label": "WEB_ROUTES table"
+        },
+        {
+          "path": "cronstable/cron.py",
+          "line": 7283,
+          "end_line": 7298,
+          "label": "Route registration"
+        },
+        {
+          "path": "cronstable/cron.py",
+          "line": 7268,
+          "end_line": 7273,
+          "label": "MCP handler mount"
+        }
+      ]
+    },
+    {
+      "id": "jobproc",
+      "type": "external",
+      "label": "Job command",
+      "sublabel": "shell subprocess",
+      "row": 1,
+      "col": 3,
+      "sources": [
+        {
+          "path": "cronstable/job.py",
+          "line": 153,
+          "end_line": 156,
+          "label": "shell_spawn"
+        },
+        {
+          "path": "cronstable/job.py",
+          "line": 2361,
+          "end_line": 2372,
+          "label": "Subprocess creation"
+        }
+      ]
+    },
+    {
+      "id": "push",
+      "type": "security",
+      "label": "Push service",
+      "sublabel": "seals per device key",
+      "tag": "opt-in",
+      "row": 1,
+      "col": 4,
+      "sources": [
+        {
+          "path": "cronstable/push.py",
+          "line": 1441,
+          "end_line": 1443,
+          "label": "PushService"
+        },
+        {
+          "path": "cronstable/push.py",
+          "line": 1724,
+          "end_line": 1731,
+          "label": "send_report"
+        },
+        {
+          "path": "cronstable/push.py",
+          "line": 1981,
+          "label": "Relay POST"
+        }
+      ]
+    },
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "Operator",
+      "sublabel": "cronstable -c FILE",
+      "row": 2,
+      "col": 0,
+      "sources": [
+        {
+          "path": "README.md",
+          "line": 153,
+          "label": "Quick start command"
+        }
+      ]
+    },
+    {
+      "id": "cli",
+      "type": "backend",
+      "label": "CLI entry point",
+      "sublabel": "cronstable.__main__",
+      "row": 2,
+      "col": 1,
+      "sources": [
+        {
+          "path": "pyproject.toml",
+          "line": 88,
+          "end_line": 89,
+          "label": "Console script"
+        },
+        {
+          "path": "cronstable/__main__.py",
+          "line": 518,
+          "end_line": 568,
+          "label": "Subcommand dispatch"
+        },
+        {
+          "path": "cronstable/__main__.py",
+          "line": 661,
+          "end_line": 669,
+          "label": "Daemon start"
+        }
+      ]
+    },
+    {
+      "id": "scheduler",
+      "type": "backend",
+      "label": "Scheduler loop",
+      "sublabel": "Cron.run on asyncio",
+      "row": 2,
+      "col": 2,
+      "sources": [
+        {
+          "path": "cronstable/cron.py",
+          "line": 2563,
+          "end_line": 2665,
+          "label": "Cron.run loop"
+        },
+        {
+          "path": "cronstable/cron.py",
+          "line": 9922,
+          "end_line": 9947,
+          "label": "_service_slots"
+        },
+        {
+          "path": "cronstable/cron.py",
+          "line": 10071,
+          "end_line": 10111,
+          "label": "_spawn_due_jobs"
+        }
+      ]
+    },
+    {
+      "id": "runner",
+      "type": "backend",
+      "label": "Job runner",
+      "sublabel": "RunningJob",
+      "row": 2,
+      "col": 3,
+      "sources": [
+        {
+          "path": "cronstable/cron.py",
+          "line": 10968,
+          "end_line": 10983,
+          "label": "RunningJob launch"
+        },
+        {
+          "path": "cronstable/job.py",
+          "line": 2347,
+          "end_line": 2372,
+          "label": "RunningJob.start"
+        },
+        {
+          "path": "cronstable/job.py",
+          "line": 2494,
+          "end_line": 2506,
+          "label": "Output readers"
+        }
+      ]
+    },
+    {
+      "id": "reporters",
+      "type": "backend",
+      "label": "Reporters",
+      "sublabel": "fan-out per outcome",
+      "row": 2,
+      "col": 4,
+      "sources": [
+        {
+          "path": "cronstable/job.py",
+          "line": 2091,
+          "end_line": 2117,
+          "label": "_fan_out_reports"
+        },
+        {
+          "path": "cronstable/job.py",
+          "line": 2169,
+          "end_line": 2176,
+          "label": "REPORTERS list"
+        },
+        {
+          "path": "cronstable/job.py",
+          "line": 2852,
+          "end_line": 2882,
+          "label": "Outcome report methods"
+        }
+      ]
+    },
+    {
+      "id": "config",
+      "type": "backend",
+      "label": "Config loader",
+      "sublabel": "YAML and crontab files",
+      "row": 3,
+      "col": 1,
+      "sources": [
+        {
+          "path": "cronstable/cron.py",
+          "line": 2943,
+          "end_line": 2979,
+          "label": "reload_config"
+        },
+        {
+          "path": "cronstable/config.py",
+          "line": 4894,
+          "end_line": 4906,
+          "label": "parse_config_with_sources"
+        },
+        {
+          "path": "cronstable/config.py",
+          "line": 4498,
+          "end_line": 4510,
+          "label": "Crontab parsing"
+        }
+      ]
+    },
+    {
+      "id": "state",
+      "type": "database",
+      "label": "State backend",
+      "sublabel": "files, local or shared",
+      "tag": "opt-in",
+      "row": 3,
+      "col": 2,
+      "sources": [
+        {
+          "path": "cronstable/state.py",
+          "line": 1,
+          "end_line": 12,
+          "label": "Durable state overview"
+        },
+        {
+          "path": "cronstable/state.py",
+          "line": 3647,
+          "end_line": 3663,
+          "label": "make_state_backend"
+        },
+        {
+          "path": "cronstable/cron.py",
+          "line": 12407,
+          "end_line": 12430,
+          "label": "Run record write"
+        }
+      ]
+    },
+    {
+      "id": "dag",
+      "type": "backend",
+      "label": "DAG scheduler",
+      "sublabel": "durable workflow runs",
+      "row": 3,
+      "col": 3,
+      "sources": [
+        {
+          "path": "cronstable/dagrun.py",
+          "line": 230,
+          "label": "DagScheduler"
+        },
+        {
+          "path": "cronstable/dagrun.py",
+          "line": 1961,
+          "end_line": 1968,
+          "label": "Task launch"
+        },
+        {
+          "path": "cronstable/cron.py",
+          "line": 9944,
+          "end_line": 9947,
+          "label": "Service call"
+        }
+      ]
+    },
+    {
+      "id": "sinks",
+      "type": "external",
+      "label": "Alert sinks",
+      "sublabel": "Sentry, email, webhook",
+      "row": 3,
+      "col": 4,
+      "sources": [
+        {
+          "path": "cronstable/job.py",
+          "line": 865,
+          "end_line": 872,
+          "label": "SentryReporter"
+        },
+        {
+          "path": "cronstable/job.py",
+          "line": 938,
+          "end_line": 939,
+          "label": "MailReporter"
+        },
+        {
+          "path": "cronstable/job.py",
+          "line": 1334,
+          "end_line": 1335,
+          "label": "WebhookReporter"
+        }
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "operator-starts-cli",
+      "from": "operator",
+      "to": "cli",
+      "label": "starts daemon",
+      "variant": "emphasis"
+    },
+    {
+      "id": "cli-runs-scheduler",
+      "from": "cli",
+      "to": "scheduler",
+      "label": "Cron.run()",
+      "variant": "emphasis"
+    },
+    {
+      "id": "scheduler-launches-job",
+      "from": "scheduler",
+      "to": "runner",
+      "label": "launch due job",
+      "variant": "emphasis"
+    },
+    {
+      "id": "runner-spawns-command",
+      "from": "runner",
+      "to": "jobproc",
+      "label": "spawn, read output",
+      "variant": "emphasis"
+    },
+    {
+      "id": "runner-reports-outcome",
+      "from": "runner",
+      "to": "reporters",
+      "label": "report outcome"
+    },
+    {
+      "id": "reporters-alert-sinks",
+      "from": "reporters",
+      "to": "sinks",
+      "label": "alerts"
+    },
+    {
+      "id": "reporters-push-report",
+      "from": "reporters",
+      "to": "push",
+      "label": "push report"
+    },
+    {
+      "id": "push-to-relay",
+      "from": "push",
+      "to": "relay",
+      "label": "sealed alert",
+      "variant": "security"
+    },
+    {
+      "id": "relay-to-ios",
+      "from": "relay",
+      "to": "iosapp",
+      "label": "via APNs"
+    },
+    {
+      "id": "dashboards-to-api",
+      "from": "dashboards",
+      "to": "webapi",
+      "label": "JSON and SSE",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "mcp-to-api",
+      "from": "mcpbridge",
+      "to": "webapi",
+      "label": "POST /mcp"
+    },
+    {
+      "id": "ios-to-api",
+      "from": "iosapp",
+      "to": "webapi",
+      "label": "web API calls",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "api-controls-scheduler",
+      "from": "webapi",
+      "to": "scheduler",
+      "label": "start, cancel, pause"
+    },
+    {
+      "id": "scheduler-leader-gate",
+      "from": "scheduler",
+      "to": "leadership",
+      "label": "leader gate",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "scheduler-reloads-config",
+      "from": "scheduler",
+      "to": "config",
+      "label": "reload each minute",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "scheduler-writes-state",
+      "from": "scheduler",
+      "to": "state",
+      "label": "run and retry records"
+    },
+    {
+      "id": "scheduler-services-dag",
+      "from": "scheduler",
+      "to": "dag",
+      "label": "service DAG runs",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "dag-launches-task",
+      "from": "dag",
+      "to": "runner",
+      "label": "task launch"
+    },
+    {
+      "id": "dag-writes-state",
+      "from": "dag",
+      "to": "state",
+      "label": "run documents"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Scheduling",
+      "items": [
+        "Housekeeping reloads the configuration at most once per minute.",
+        "After a failed reload, the daemon keeps running the loaded jobs.",
+        "Shared pools queue jobs and DAG tasks for admission."
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Clients",
+      "items": [
+        "The tui, mcp, pair, and job state subcommands call a running daemon over HTTP.",
+        "MCP requests reach POST /mcp behind the web API's bearer-token gate.",
+        "GET /metrics serves Prometheus and OpenMetrics text."
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Durable state",
+      "items": [
+        "A state section turns on durable storage. Without one, run history stays in memory.",
+        "Run history, retries, and DAG runs persist as files with atomic replacement and advisory locks.",
+        "Job commands reach key-value storage, cursors, locks, artifacts, and secrets through a loopback HTTP API."
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Clustering",
+      "items": [
+        "Clustering is opt-in. A cluster elects through gossip over mutual TLS, a Kubernetes Lease, an etcd lease, or a lease on a shared filesystem.",
+        "When election is configured and no manager runs, the node skips Leader jobs and runs PreferLeader jobs."
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Push alerts",
+      "items": [
+        "A push section turns on the push service.",
+        "The daemon seals each alert to a paired device's public key.",
+        "The relay sees ciphertext, a device token, and a hash."
+      ]
+    }
+  ]
+}
