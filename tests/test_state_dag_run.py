@@ -5090,8 +5090,8 @@ async def test_delete_run_batch_holds_every_lease_through_the_check(
     monkeypatch, dag_cron
 ):
     # The references are read while every run of the batch is leased, and
-    # the leases are released after the deletes.  A run whose lease is
-    # held elsewhere stays.
+    # each lease is released once its own run is deleted.  A run whose
+    # lease is held elsewhere stays.
     cron = await dag_cron(_LINEAR)
     backend = cron.state_backend
     keys = await _seed_terminal_runs(backend, "lin", 3)
@@ -5136,8 +5136,8 @@ async def test_delete_run_batch_holds_every_lease_through_the_check(
         "check",
         "check",
         "delete",
-        "delete",
         "release",
+        "delete",
         "release",
     ]
     assert await backend.list_document_keys("dagrun/lin") == [keys[1]]
@@ -5177,6 +5177,96 @@ async def test_delete_run_batch_stops_deleting_at_half_the_lease_ttl(
         backend, "lin", [(key, None) for key in keys]
     )
     assert await backend.list_document_keys("dagrun/lin") == []
+
+
+def _slow_lease_clock(monkeypatch, backend):
+    """A clock for dagrun that each lease acquire moves on by an eighth
+    of the lease TTL."""
+    from types import SimpleNamespace
+
+    clock = [1000.0]
+    # the module's own clock: the event loop keeps the real one
+    monkeypatch.setattr(
+        dagrun,
+        "time",
+        SimpleNamespace(time=dagrun.time.time, monotonic=lambda: clock[0]),
+    )
+    real_acquire = backend.acquire_lease
+
+    async def slow_acquire(name, holder, ttl):
+        clock[0] += dagrun.GC_LEASE_TTL / 8
+        return await real_acquire(name, holder, ttl)
+
+    monkeypatch.setattr(backend, "acquire_lease", slow_acquire)
+    return clock
+
+
+async def test_delete_run_batch_deletes_on_a_store_slow_to_lease(
+    monkeypatch, dag_cron
+):
+    # Leasing the whole batch would take longer than half the lease TTL.
+    # The batch stops taking leases after a quarter of the TTL and deletes
+    # the runs it holds.  The runs it left go to a later batch.
+    cron = await dag_cron(_LINEAR)
+    backend = cron.state_backend
+    keys = await _seed_terminal_runs(backend, "lin", 5)
+    runs = [(key, None) for key in keys]
+    _slow_lease_clock(monkeypatch, backend)
+    await cron._dag._delete_run_batch(backend, "lin", runs)
+    assert await backend.list_document_keys("dagrun/lin") == keys[2:]
+    await cron._dag._delete_run_batch(backend, "lin", runs[2:])
+    assert await backend.list_document_keys("dagrun/lin") == keys[4:]
+
+
+async def test_delete_run_batch_times_each_delete_from_its_own_lease(
+    monkeypatch, dag_cron
+):
+    # The reference read ends half a lease TTL after the first acquire and
+    # sooner than that after the second.  The second run is deleted inside
+    # its lease, and the first stays for the next pass.
+    cron = await dag_cron(_LINEAR)
+    backend = cron.state_backend
+    keys = await _seed_terminal_runs(backend, "lin", 2)
+    runs = [(key, None) for key in keys]
+    clock = _slow_lease_clock(monkeypatch, backend)
+    real_keyed = backend.list_documents_keyed
+
+    async def slow_keyed(namespace, key_prefix, **kwargs):
+        clock[0] += dagrun.GC_LEASE_TTL / 8
+        return await real_keyed(namespace, key_prefix, **kwargs)
+
+    monkeypatch.setattr(backend, "list_documents_keyed", slow_keyed)
+    await cron._dag._delete_run_batch(backend, "lin", runs)
+    assert await backend.list_document_keys("dagrun/lin") == keys[:1]
+    # its lease went back, so the next batch takes the run
+    monkeypatch.undo()
+    await cron._dag._delete_run_batch(backend, "lin", runs)
+    assert await backend.list_document_keys("dagrun/lin") == []
+
+
+def test_recovery_references_names_the_runs_a_recovery_still_needs():
+    # One rule serves the retention pass's first cut and the check that it
+    # repeats under the leases.
+    runs = [
+        {"recovery": {"status": "preparing", "sourceRunKey": "preparing"}},
+        {"recovery": {"status": "failed", "sourceRunKey": "prepared"}},
+        {"runKey": "plain"},
+    ]
+    batches = [
+        {"plans": [{"sourceRunKey": "open"}], "expiresAt": 200.0},
+        {
+            "plans": [{"sourceRunKey": "complete"}],
+            "expiresAt": 200.0,
+            "complete": True,
+        },
+        {"plans": [{"sourceRunKey": "expired"}], "expiresAt": 50.0},
+        {"plans": [{"sourceRunKey": "undated"}]},
+    ]
+    assert dagrun._recovery_references(runs, batches, 100.0) == {
+        "preparing",
+        "open",
+        "undated",
+    }
 
 
 async def test_gc_removed_dag_lists_its_namespace_once(monkeypatch, dag_cron):

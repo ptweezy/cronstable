@@ -2158,6 +2158,10 @@ class JobRetryState:
         # Durable pool generation: a settled ladder cannot be revived by
         # an already queued attempt, including after a daemon restart.
         self.pool_retry: dict[str, str] | None = None
+        # True from when the scheduled fire that installed this ladder is
+        # dropped until a launch takes the ladder up (see
+        # Cron.handle_job_success).
+        self.unclaimed = False
 
     def next_delay(self) -> float:
         delay = self.delay

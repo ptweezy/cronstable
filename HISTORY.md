@@ -98,9 +98,11 @@
   runs it deletes, and deletes them in batches of up to 32. Under the
   leases of a batch's runs it reads the recovery runs in one store
   operation and the recovery batches in another, so it keeps a run that a
-  recovery in preparation or an open recovery batch references. A batch
-  that is still deleting after 30 seconds leaves the rest of its runs for
-  the next pass. The pass also keeps the runs when it can't read a recovery
+  recovery in preparation or an open recovery batch references. The pass
+  deletes a run within 30 seconds of leasing it and releases the lease as
+  soon as the run is deleted or kept. On a slow store, a batch stops taking
+  leases after 15 seconds and leaves the rest of its runs for the next
+  pass. The pass also keeps the runs when it can't read a recovery
   run or a recovery batch. It then logs one warning that names the document
   and leaves the workflow's runs for its next pass. A recovery document
   that stays unreadable holds the runs for seven days after its last write,
@@ -121,7 +123,9 @@
   raises, and any other lookup answers with the newest versions that it
   read. A strict lookup also raises for an unreadable record that the
   daemon has neither published nor read, and for the record that it
-  returns.
+  returns. A workflow recovery request whose lookup raises answers `503`
+  with `recovery state is unavailable`, and the MCP recovery tools report
+  the same error.
 - Publishing an artifact or an XCom value costs the same at any number of
   names in the scope. When the daemon publishes a name again, it removes
   the version that the new one replaces, if the daemon published that

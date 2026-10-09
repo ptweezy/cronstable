@@ -54,6 +54,7 @@ from aiohttp import web
 from cronstable import _json
 from cronstable import version as _version
 from cronstable.cron import (
+    _RECOVERY_UNAVAILABLE,
     PAUSE_BY_MAX,
     WEB_ANON_REQUEST_KEY,
     WEB_TOKEN_REQUEST_KEY,
@@ -1259,10 +1260,11 @@ class MCPHandler:
     async def _t_list_jobs(self, args: dict[str, Any]) -> dict[str, Any]:
         cron = self._cron
         jobs = cron.cron_jobs
-        running = cron.running_jobs
+        running = cron._row_instances
         # The filters read what a row reports as `name`, `enabled` and
-        # `running`, straight from the job set, so selection walks names
-        # and the full rows are built for the returned page.
+        # `running`, from the sources that the row builder reads, so
+        # selection walks names and the full rows are built for the
+        # returned page.
         names = list(jobs)
         flt = args.get("filter")
         if isinstance(flt, str) and flt:
@@ -1270,13 +1272,11 @@ class MCPHandler:
             names = [n for n in names if low in n.lower()]
         state = args.get("state")
         if state == "running":
-            names = [n for n in names if running.get(n)]
+            names = [n for n in names if running(n)]
         elif state == "disabled":
             names = [n for n in names if not jobs[n].enabled]
         elif state == "scheduled":
-            names = [
-                n for n in names if jobs[n].enabled and not running.get(n)
-            ]
+            names = [n for n in names if jobs[n].enabled and not running(n)]
         page, meta = self._page(names, args.get("offset"), args.get("limit"))
         return _result(
             {"jobs": cron.jobs_payload_for(page), "page": meta},
@@ -1778,7 +1778,7 @@ class MCPHandler:
                 )
         except RecoveryError as ex:
             return _tool_error(str(ex))
-        except (OSError, asyncio.TimeoutError):
+        except _RECOVERY_UNAVAILABLE:
             return _tool_error("recovery state is unavailable")
         return _result(
             data, "recovery started" if execute else "recovery preview"

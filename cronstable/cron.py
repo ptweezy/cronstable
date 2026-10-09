@@ -123,9 +123,14 @@ from cronstable.resources import (
 from cronstable.state import (
     Lease,
     StateBackend,
+    _DocumentUnreadable,
     make_state_backend,
     store_identity,
 )
+
+# What a recovery request raises when the store cannot answer it.
+# _DocumentUnreadable covers a record or a document that cannot be read.
+_RECOVERY_UNAVAILABLE = (OSError, asyncio.TimeoutError, _DocumentUnreadable)
 
 
 class _AiohttpDoor:
@@ -5671,6 +5676,15 @@ class Cron:
             }
         return out
 
+    def _row_instances(self, name: str) -> list[RunningJob]:
+        """The instances behind a job row's ``running`` and ``pids``.
+
+        One that has ended counts until the reaper records it.  A caller
+        that selects jobs before it builds their rows reads this list too
+        (MCP ``cron_list_jobs``), so its selection matches the rows.
+        """
+        return self.running_jobs.get(name) or []
+
     def _job_to_dict(
         self,
         name: str,
@@ -5682,7 +5696,7 @@ class Cron:
         # agree about the time.
         if now is None:
             now = get_now(datetime.timezone.utc)
-        running = self.running_jobs.get(name) or []
+        running = self._row_instances(name)
         # next scheduled run, in seconds; None when not applicable (disabled,
         # currently running, or a one-off @reboot schedule).
         scheduled_in = self._scheduled_in(name, job, bool(running), now)
@@ -6348,7 +6362,7 @@ class Cron:
             )
         except RecoveryError as ex:
             raise _api_error(web.HTTPConflict, ex.message) from ex
-        except (OSError, asyncio.TimeoutError) as ex:
+        except _RECOVERY_UNAVAILABLE as ex:
             raise _api_error(
                 web.HTTPServiceUnavailable, "recovery state is unavailable"
             ) from ex
@@ -6387,7 +6401,7 @@ class Cron:
             )
         except RecoveryError as ex:
             raise _api_error(web.HTTPConflict, ex.message) from ex
-        except (OSError, asyncio.TimeoutError) as ex:
+        except _RECOVERY_UNAVAILABLE as ex:
             raise _api_error(
                 web.HTTPServiceUnavailable, "recovery state is unavailable"
             ) from ex
@@ -10069,7 +10083,7 @@ class Cron:
         where the wait is pacing, not correctness).
         """
         waited = 0.0
-        while self.running_jobs.get(name):
+        while self._has_unrecorded_instance(name):
             if max_wait is not None and waited >= max_wait:
                 return not self._stop_event.is_set()
             try:
@@ -11012,8 +11026,8 @@ class Cron:
             return
         if not await self._depends_on_past_ok(job):
             logger.info(
-                "Job %s skipped: onlyIfLastSucceeded and its last run did "
-                "not succeed",
+                "Job %s skipped: onlyIfLastSucceeded and its last run is "
+                "not recorded as a success",
                 job.name,
             )
             return
@@ -11022,6 +11036,7 @@ class Cron:
 
         retry = job.onFailure["retry"]
         logger.debug("Job %s retry config: %s", job.name, retry)
+        retry_state: JobRetryState | None = None
         if retry["maximumRetries"]:
             retry_state = JobRetryState(
                 retry["initialDelay"],
@@ -11031,13 +11046,18 @@ class Cron:
             self.retry_state[job.name] = retry_state
 
         try:
-            await self.maybe_launch_job(job)
+            accepted = await self.maybe_launch_job(job)
         except (PoolError, OSError, asyncio.TimeoutError) as ex:
             if job.pool is None:
                 raise
             logger.warning(
                 "Job %s could not enter pool %s: %s", job.name, job.pool, ex
             )
+            return
+        if not accepted and retry_state is not None:
+            # The fire was dropped, so no launch carries its ladder (see
+            # handle_job_success).
+            retry_state.unclaimed = True
 
     async def maybe_launch_job(
         self,
@@ -11076,6 +11096,16 @@ class Cron:
             return await self._launch_job_locked(
                 job, with_retries, pool_ticket
             )
+
+    def _take_retry_ladder(self, name: str) -> JobRetryState | None:
+        """The job's retry ladder, for a launch that will carry it.
+
+        Taking it up clears ``unclaimed``, which a dropped fire sets.
+        """
+        state = self.retry_state.get(name)
+        if state is not None:
+            state.unclaimed = False
+        return state
 
     async def _launch_job_locked(
         self,
@@ -11136,7 +11166,7 @@ class Cron:
                 return False
         logger.info("Starting job %s", job.name)
         retry_state = (
-            self.retry_state.get(job.name)
+            self._take_retry_ladder(job.name)
             if with_retries and pool_ticket is None
             else None
         )
@@ -11198,12 +11228,15 @@ class Cron:
             if run_token is not None and self._job_api is not None:
                 await self._job_api.finish_run(run_token)
             raise
-        first_instance = self._add_running_instance(running_job)
+        # An instance that has ended and awaits the reaper is not live, so
+        # the open record below names this run.
+        first_instance = not self._live_instances(job.name)
+        self._add_running_instance(running_job)
         # every actual launch (scheduled, manual, catch-up, retry) clears
         # the lateAfter breach condition (see _sla_periodic).
         self._sla_last_start[job.name] = get_now(datetime.timezone.utc)
         if self.state_backend is not None and first_instance:
-            # record the run as in-flight (0 -> 1 instances) so a crash
+            # record the run as in-flight (0 -> 1 live instances) so a crash
             # leaves an "open" record for reconciliation; closed again when
             # the LAST instance finishes (see _handle_finished_job). Ordered
             # via the per-job inflight tail so the close cannot sort ahead.
@@ -12371,33 +12404,42 @@ class Cron:
             # entries as RUNNING indefinitely.
             await self._dag.flush_completions()
 
-    def _add_running_instance(self, running_job: RunningJob) -> bool:
+    def _add_running_instance(self, running_job: RunningJob) -> None:
         """Register a launched instance and notify the reaper.
 
         Every launch adds to ``running_jobs`` through this helper, which
         queues its wait registration and invalidates response memos.
         """
-        # returns True when this is the job's first live instance
         name = running_job.config.name
-        first = not self.running_jobs.get(name)
         self.running_jobs[name].append(running_job)
         self._reaper_pending[id(running_job)] = running_job
         self._jobs_running.set()
         self._bust_response_memos()
-        return first
 
     def _live_instances(self, name: str) -> list[RunningJob]:
         """The instances of a job that have a process left to signal.
 
         An instance that has ended stays in ``running_jobs`` until the
         reaper records it.  It keeps its outcome, so a cancel, a
-        replacement, and a concurrency check all pass it over.
+        replacement, and a concurrency check all pass it over.  A gate
+        that waits on that outcome asks :meth:`_has_unrecorded_instance`.
         """
         # .get(), not a bare subscript: subscripting this defaultdict
         # would INSERT a phantom empty-list key, which makes running_jobs
         # truthy with nothing to reap and spins the reaper hot at
         # shutdown.
         return [rj for rj in self.running_jobs.get(name) or () if not rj.ended]
+
+    def _has_unrecorded_instance(self, name: str) -> bool:
+        """Whether the reaper has yet to record an instance of a job.
+
+        True for a live instance and for one that has ended (see
+        :meth:`_live_instances`).  The run row and the retry of an ended
+        instance are still to come, so the gates that read either one
+        wait for it: ``onlyIfLastSucceeded``, the backfill drain, and the
+        retry re-arm and claim scans.
+        """
+        return bool(self.running_jobs.get(name))
 
     def _remove_running_instance(
         self, running_job: RunningJob, *, missing_ok: bool = False
@@ -13048,7 +13090,7 @@ class Cron:
         backend = self.state_backend
         if backend is None:
             return None
-        if name in self.retry_state or self.running_jobs.get(name):
+        if name in self.retry_state or self._has_unrecorded_instance(name):
             # live activity always outranks the ledger
             return None
         try:
@@ -13286,8 +13328,9 @@ class Cron:
         """Whether ``job``'s depends-on-past gate permits a scheduled fire.
 
         True unless onlyIfLastSucceeded is set AND the most recent run
-        outcome was a failure, or the previous instance is STILL RUNNING
-        (else the gate is a race). Judges the NEWEST of two sources by
+        outcome was a failure, or an earlier instance has yet to be
+        RECORDED (else the gate is a race; see
+        _has_unrecorded_instance). Judges the NEWEST of two sources by
         finished_at: the in-memory history (the ledger alone can be a
         beat stale) and the durable ledger (sees other nodes; a store
         error degrades fail-open to the in-memory view). Non-run
@@ -13298,8 +13341,8 @@ class Cron:
         """
         if not job.onlyIfLastSucceeded:
             return True
-        if job.concurrencyPolicy != "Replace" and self.running_jobs.get(
-            job.name
+        if job.concurrencyPolicy != "Replace" and (
+            self._has_unrecorded_instance(job.name)
         ):
             return False
         # Newest real outcome by finished_at, NOT list position: records
@@ -14330,7 +14373,7 @@ class Cron:
             return
         if not job.enabled or not job.onFailure["retry"]["maximumRetries"]:
             return
-        if self.running_jobs.get(name):
+        if self._has_unrecorded_instance(name):
             return
         state = self.retry_state.get(name)
         if state is not None and (state.task is not None or state.count > 0):
@@ -14382,7 +14425,7 @@ class Cron:
         # ladder outranks; drop the just-made claim (its durable pending
         # is host-local and the live ladder settles it on consume).
         existing = self.retry_state.get(name)
-        if self.running_jobs.get(name) or (
+        if self._has_unrecorded_instance(name) or (
             existing is not None
             and (existing.task is not None or existing.count > 0)
         ):
@@ -14668,8 +14711,15 @@ class Cron:
         state = self.retry_state.get(name)
         # A success ends the job's retry sequence.  A ladder with no retry
         # armed belongs to a launch that has yet to finish, so only that
-        # launch's own run ends it.
-        if state is None or state is job.retry_state or state.count > 0:
+        # launch's own run ends it.  The ladder of a dropped fire has no
+        # launch and ends here, unless a Replace pursuit is still to make
+        # one.
+        if (
+            state is None
+            or state is job.retry_state
+            or state.count > 0
+            or (state.unclaimed and name not in self._slot_pursuits)
+        ):
             await self.cancel_job_retries(name, settle="succeeded")
         await job.report_success()
 

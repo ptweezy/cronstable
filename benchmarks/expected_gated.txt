@@ -235,6 +235,7 @@ webui.week_walk_500x20
 #
 # pair.qr_encode_14 measures cronstable.qr, webapi.activity_capped_bytes_500
 # measures the jobs parameter of GET /activity, and webui.swim_400x49 drives
-# the __perf.seedSwim hook.  All three land in 1.2.63.  Run against the
-# 1.2.62 baseline tree each one skips, so the pairing has nothing to compare.
-# Add them once a release that carries them is the baseline.
+# the __perf.seedSwim hook.  The baseline release carries none of the three
+# surfaces, so each metric skips on the baseline side and the pairing has
+# nothing to compare.  Add each one when the baseline is a release that
+# carries its surface.

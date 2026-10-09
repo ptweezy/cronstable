@@ -37,6 +37,7 @@ import contextlib
 import errno
 import functools
 import hashlib
+import itertools
 import logging
 import math
 import os
@@ -197,6 +198,10 @@ _SUPERSEDED_RESCANS = 3
 _RecordReader = Callable[[str], "dict[str, Any] | None"]
 _NewestByValue = dict[str, tuple[str, dict[str, Any]]]
 
+# Where a stream's facts stood before its directory was listed (see
+# _field_index_mark): the facts' ``values`` and their ``added`` count.
+_FieldMark = tuple["OrderedDict[str, str]", int]
+
 
 class _FieldFacts:
     """What a backend knows about one field of one stream's records.
@@ -207,7 +212,7 @@ class _FieldFacts:
     and a name-keyed append, which unlinks the record it supersedes.
     """
 
-    __slots__ = ("values", "newest", "ordered")
+    __slots__ = ("values", "newest", "ordered", "added")
 
     def __init__(self) -> None:
         # record file name -> the string that the record holds in the field
@@ -216,6 +221,8 @@ class _FieldFacts:
         self.newest: dict[str, str] = {}
         # whether ``values`` lists its records oldest first
         self.ordered = True
+        # how many records ``values`` has taken in; it only grows
+        self.added = 0
 
     def learn(self, name: str, value: str) -> str | None:
         """Note that record ``name`` holds ``value``.
@@ -229,6 +236,7 @@ class _FieldFacts:
             if self.ordered and values and name < next(reversed(values)):
                 self.ordered = False
             values[name] = value
+            self.added += 1
         prior = self.newest.get(value)
         if prior is None or prior < name:
             self.newest[value] = name
@@ -2221,6 +2229,7 @@ class FilesystemStateBackend(StateBackend):
         """
         token, stream_dir = self._stream_token_dir(stream)
         key = (token, field)
+        mark = self._field_index_mark(key)
 
         def scan(listing: list[str], read: _RecordReader) -> _NewestByValue:
             with self._field_index_lock:
@@ -2251,7 +2260,7 @@ class FilesystemStateBackend(StateBackend):
                         return {value: (name, data)}
             finally:
                 if learned:
-                    self._field_index_learn(key, learned, listing)
+                    self._field_index_learn(key, learned, listing, mark)
             return {}
 
         found = self._newest_settled(stream, stream_dir, strict, scan)
@@ -2326,7 +2335,17 @@ class FilesystemStateBackend(StateBackend):
 
         def read(name: str) -> dict[str, Any] | None:
             nonlocal superseded
-            data = self._read_record(stream_dir, name, strict=strict)
+            try:
+                data = self._read_record(stream_dir, name, strict=strict)
+            except OSError as ex:
+                # Only a strict read raises.  A stale handle on a record
+                # that has left the stream is a peer's unlink.
+                if ex.errno != errno.ESTALE or not self._record_superseded(
+                    stream_dir, name
+                ):
+                    raise
+                superseded = True
+                return None
             if data is None and not superseded:
                 superseded = self._record_superseded(stream_dir, name)
             return data
@@ -2371,19 +2390,36 @@ class FilesystemStateBackend(StateBackend):
             return ex.errno in (errno.ENOENT, errno.ESTALE)
         return False
 
+    def _field_index_mark(self, key: tuple[str, str]) -> _FieldMark | None:
+        """Where a stream's facts stand, for a caller about to list its
+        directory.
+
+        The listing lacks the records appended after it, and
+        :meth:`_field_index_learn` sweeps against it.  The mark tells the
+        facts about those records from the facts about records that have
+        left.  ``None`` when the stream holds no facts: the sweep then
+        has nothing to drop.
+        """
+        with self._field_index_lock:
+            facts = self._field_index.get(key)
+            return None if facts is None else (facts.values, facts.added)
+
     def _field_index_learn(
         self,
         key: tuple[str, str],
         learned: dict[str, str],
         listing: list[str],
+        mark: _FieldMark | None,
     ) -> None:
         """Fold what a scan or a prune pass read into the field index.
 
-        ``learned`` maps a record file to its value, newest first, and
-        ``listing`` is the stream's directory as the caller read it.
+        ``learned`` maps a record file to its value, newest first.
+        ``listing`` is the stream's directory as the caller read it, and
+        ``mark`` is :meth:`_field_index_mark` from before that read.
         Facts about records that have left the listing are swept out
         after more than :data:`_FIELD_INDEX_STALE_SLACK` of them have
-        piled up, or as soon as the index is over its budget.
+        piled up, or as soon as the index is over its budget.  The sweep
+        keeps the facts added since the mark.
         """
         with self._field_index_lock:
             facts = self._field_index_take(key)
@@ -2393,8 +2429,21 @@ class FilesystemStateBackend(StateBackend):
             slack = _FIELD_INDEX_STALE_SLACK
             if self._field_index_entries + held > _FIELD_INDEX_MAX_ENTRIES:
                 slack = 0
-            if held > len(listing) + slack:
+            # The sweep needs the ``values`` that the mark saw: a shed that
+            # sorts them replaces the dict, and so does a stream that lost
+            # its facts and started over.  A later call sweeps instead.
+            if (
+                held > len(listing) + slack
+                and mark is not None
+                and facts.values is mark[0]
+            ):
                 listed = set(listing)
+                # ``values`` ends with the facts added since the mark
+                listed.update(
+                    itertools.islice(
+                        reversed(facts.values), facts.added - mark[1]
+                    )
+                )
                 for name in [n for n in facts.values if n not in listed]:
                     facts.forget(name)
             self._field_index_put(key, facts)
@@ -2755,6 +2804,7 @@ class FilesystemStateBackend(StateBackend):
         :meth:`_unlink_superseded`).
         """
         token, stream_dir = self._stream_token_dir(stream)
+        mark = self._field_index_mark((token, field))
         try:
             # newest first: the first record kept per value wins (distinct
             # filenames, so the descending sort is the reversed ascending)
@@ -2787,6 +2837,7 @@ class FilesystemStateBackend(StateBackend):
                 (token, field),
                 {name: value for value, name in newest.items()},
                 [n for n in names if n not in gone],
+                mark,
             )
         if stretch:
             self._append_prune_stretch(token, len(names) - len(gone))

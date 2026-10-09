@@ -500,10 +500,11 @@ jobs:
   write; the durable ledger sees runs from *other nodes* on a shared mount.
   `cancelled` and `skipped` records are ignored in both: a skipped tick does
   not clear the gate; only a genuine success re-opens it.
-* **A still-running instance has not "succeeded"**, so it blocks the gate too,
-  except under `concurrencyPolicy: Replace`, whose contract is that a new
-  fire supersedes the running one. There the gate judges the last *finished*
-  outcome.
+* **A still-running instance has not "succeeded"**, so it blocks the gate too.
+  So does an instance whose process has exited, until the daemon records its
+  run, because the gate reads recorded outcomes. The exception is
+  `concurrencyPolicy: Replace`, whose contract is that a new fire supersedes
+  the running one. There the gate judges the last *finished* outcome.
 * **No prior run allows.** A first-ever fire has nothing to depend on and is
   never blocked.
 * **Only scheduled and `@reboot` fires are gated.** Retries, catch-up

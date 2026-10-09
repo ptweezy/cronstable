@@ -12067,18 +12067,21 @@ var qrcode = function() {
   // ---- incident timeline overlay (hotkey i) ----
   function openTimeline() {
     if (!openOverlay("timelineWrap")) { closeTimeline(); return; }
+    clearTimeout(tlClearTimer);
     state.timeline.open = true;
     $("tlFailOnly").checked = state.timeline.failOnly;
     renderTimeline();
     focusFirst($("timelineWrap"));
   }
   // The rows leave the document once the overlay's .12s fade is over, so a
-  // closed timeline holds no [data-ago] cells for tick() to sweep.
+  // closed timeline holds no [data-ago] cells for tick() to sweep. An open
+  // cancels the wait, so it cannot empty a timeline that closes again.
   const TL_CLEAR_MS = 200;
+  let tlClearTimer = null;
   function closeTimeline() {
     if (!closeOverlay("timelineWrap")) return;
     state.timeline.open = false;
-    setTimeout(() => { if (!state.timeline.open) $("tlBody").textContent = ""; }, TL_CLEAR_MS);
+    tlClearTimer = setTimeout(() => { if (!state.timeline.open) $("tlBody").textContent = ""; }, TL_CLEAR_MS);
   }
   function renderTimeline() {
     if (!state.timeline.open) return;

@@ -420,6 +420,44 @@ def test_closed_panels_leave_nothing_for_the_tick_to_sweep(browser, daemon):
         assert page.evaluate(_SWEPT) == table + 40
 
 
+_CLOSE_REOPEN_CLOSE = """async () => {
+  const body = document.getElementById('tlBody');
+  const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+  const close = () => document.getElementById('tlClose').click();
+  close();
+  await sleep(150);
+  document.body.dispatchEvent(
+    new KeyboardEvent('keydown', {key: 'i', bubbles: true}));
+  const reopened = body.childNodes.length;
+  close();
+  // past the first close's wait, and short of the second's
+  await sleep(125);
+  const fading = body.childNodes.length;
+  await sleep(150);
+  return [reopened, fading, body.childNodes.length];
+}"""
+
+
+def test_timeline_closed_twice_keeps_its_rows_through_the_fade(
+    browser, daemon
+):
+    """A close empties the timeline after its fade.  A timeline that is
+    reopened and closed again inside that wait keeps its rows until the
+    second close's fade is over."""
+    with e2e.open_page(
+        browser, daemon.url + "?perf=1", prefs={"pollMs": 0}
+    ) as page:
+        page.evaluate(
+            "() => { window.__perf.seedJobs(40); window.__perf.renderRows(); }"
+        )
+        page.keyboard.press("i")
+        page.wait_for_selector("#timelineWrap.open #tlBody .tlrow")
+        reopened, fading, emptied = page.evaluate(_CLOSE_REOPEN_CLOSE)
+        assert reopened > 0
+        assert fading == reopened
+        assert emptied == 0
+
+
 _POLLS = """(count) => {
   const perf = window.__perf, state = perf.state();
   let touch = window.__touch || 1;

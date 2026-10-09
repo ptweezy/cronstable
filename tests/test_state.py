@@ -2912,6 +2912,101 @@ async def test_newest_record_with_counts_a_stale_handle_as_a_record_gone(
     assert reads.count(newer) == state._SUPERSEDED_RESCANS + 1
 
 
+async def test_strict_lookup_follows_a_stale_handle_to_the_republish(
+    fs_backend_factory, monkeypatch
+):
+    # Two nodes share a mount.  The peer republishes the name and unlinks
+    # the record that a strict lookup has listed, and the mount reports
+    # the unlink as a stale handle at the read.  The lookup lists the
+    # stream again and returns the new version.
+    import errno
+
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    await theirs.append_record("s", {"name": "a", "v": 1})
+    stream_dir = ours._stream_dir("s")
+
+    def listed():
+        return {
+            os.path.normpath(os.path.join(stream_dir, n))
+            for n in os.listdir(stream_dir)
+        }
+
+    stale = listed()
+    real_open = open
+    raced = []
+
+    def stale_open(path, *args, **kwargs):
+        if os.path.normpath(str(path)) in stale:
+            if not raced:
+                raced.append(path)
+                theirs._append_sync("s", {"name": "a", "v": 2}, None, None)
+                os.unlink(path)
+            raise OSError(errno.ESTALE, "stale file handle", str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(state, "open", stale_open, raising=False)
+    got = await ours.newest_record_with("s", "name", "a", strict=True)
+    assert got == {"name": "a", "v": 2}
+    assert await ours.newest_records_by("s", "name", strict=True) == [got]
+    # A stale handle on a record that is still in the stream is not an
+    # unlink, so a strict read fails closed on it.
+    stale.update(listed())
+    with pytest.raises(OSError) as raised:
+        await ours.newest_record_with("s", "name", "a", strict=True)
+    assert raised.value.errno == errno.ESTALE
+    with pytest.raises(OSError):
+        await ours.newest_records_by("s", "name", strict=True)
+    assert await ours.newest_record_with("s", "name", "a") is None
+
+
+async def test_field_index_sweep_keeps_a_record_appended_during_the_scan(
+    fs_backend_factory, monkeypatch
+):
+    # A lookup sweeps the facts about records that have left against the
+    # listing from its start.  A record that this backend appends during
+    # the scan is missing from that listing.  Its fact stays, so the next
+    # publish of the name removes the record.
+    monkeypatch.setattr(state, "_FIELD_INDEX_STALE_SLACK", 0)
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    stream_dir = ours._stream_dir("s")
+
+    def records():
+        return sorted(n for n in os.listdir(stream_dir) if n.endswith(".json"))
+
+    async def publish(data):
+        await ours.append_record("s", data, prune_latest_by="name")
+
+    await publish({"name": "x", "v": 1})
+    await publish({"name": "a"})
+    x1, a1 = records()
+    # a peer publishes a name that this backend holds no fact about, and
+    # removes a record that it does hold one about
+    await theirs.append_record("s", {"name": "c"})
+    os.unlink(os.path.join(stream_dir, a1))
+    real = ours._read_record
+    raced = []
+
+    def racing(stream_dir, name, **kwargs):
+        if not raced:
+            raced.append(name)
+            ours._append_sync("s", {"name": "x", "v": 2}, None, "name")
+        return real(stream_dir, name, **kwargs)
+
+    monkeypatch.setattr(ours, "_read_record", racing)
+    assert await ours.newest_record_with("s", "name", "c") == {"name": "c"}
+    assert len(raced) == 1
+    facts = ours._field_index[state._fs_safe("s"), "name"]
+    assert a1 not in facts.values
+    x2 = facts.newest["x"]
+    assert x2 != x1 and x2 in records()
+    await publish({"name": "x", "v": 3})
+    assert x1 not in records() and x2 not in records()
+    got = await ours.newest_record_with("s", "name", "x")
+    assert got == {"name": "x", "v": 3}
+
+
 @pytest.mark.parametrize("strict", [False, True])
 async def test_newest_records_by_keeps_one_record_per_value(
     fs_backend, strict

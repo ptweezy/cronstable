@@ -544,6 +544,107 @@ async def test_success_ends_a_pending_retry_of_another_run():
     assert reported == [1]
 
 
+async def test_success_ends_the_ladder_of_a_dropped_fire():
+    # A scheduled fire that Forbid drops installs a ladder that no launch
+    # carries.  The success of the instance still running ends it, so a
+    # later start finds no ladder to take up.
+    cron = cronstable.cron.Cron(None, config_yaml=_ended_retry_job("Forbid"))
+    job = cron.cron_jobs["test"]
+    await cron.launch_scheduled_job(job)
+    first = cron.running_jobs["test"][0]
+    carried = cron.retry_state["test"]
+    assert first.retry_state is carried and not carried.unclaimed
+    await cron.launch_scheduled_job(job)
+    assert cron.running_jobs["test"] == [first]
+    dropped = cron.retry_state["test"]
+    assert dropped is not carried and dropped.unclaimed
+    await asyncio.wait_for(first.wait(), 20)
+    await cron._handle_finished_job(first)
+    await cron._drain_completions()
+    assert cron.last_run["test"].outcome == "success"
+    assert "test" not in cron.retry_state
+    assert dropped.cancelled
+
+
+async def test_launch_takes_up_the_ladder_of_a_dropped_fire():
+    # A launch that follows a dropped fire carries the ladder that the
+    # fire installed, so an earlier instance's success leaves it alone.
+    cron = cronstable.cron.Cron(None, config_yaml=_ended_retry_job("Forbid"))
+    job = cron.cron_jobs["test"]
+    await cron.launch_scheduled_job(job)
+    first = cron.running_jobs["test"][0]
+    await cron.launch_scheduled_job(job)
+    dropped = cron.retry_state["test"]
+    assert dropped.unclaimed
+    await asyncio.wait_for(first.wait(), 20)
+    assert await cron.maybe_launch_job(job)
+    second = cron.running_jobs["test"][1]
+    try:
+        assert second.retry_state is dropped and not dropped.unclaimed
+        await cron._handle_finished_job(first)
+        await cron._drain_completions()
+        assert cron.retry_state.get("test") is dropped
+        assert not dropped.cancelled
+    finally:
+        await asyncio.wait_for(second.wait(), 20)
+
+
+async def test_success_leaves_a_dropped_fires_ladder_to_a_replace_pursuit():
+    # A fire that the cluster slot holds back under Replace is dropped
+    # here, and a pursuit launches it once the holder yields.  The ladder
+    # waits for that launch.  It ends with the next success once the
+    # pursuit is over.
+    cron = cronstable.cron.Cron(None, config_yaml=_ended_retry_job("Replace"))
+    ladder = JobRetryState(60, 1, 60)
+    ladder.unclaimed = True
+    cron.retry_state["test"] = ladder
+
+    async def report_success():
+        pass
+
+    job = SimpleNamespace(
+        config=cron.cron_jobs["test"],
+        retry_state=None,
+        report_success=report_success,
+    )
+    cron._slot_pursuits["test"] = asyncio.get_running_loop().create_future()
+    await cron.handle_job_success(job)
+    assert cron.retry_state.get("test") is ladder
+    assert not ladder.cancelled
+    del cron._slot_pursuits["test"]
+    await cron.handle_job_success(job)
+    assert "test" not in cron.retry_state
+    assert ladder.cancelled
+
+
+async def test_launch_beside_an_ended_instance_opens_its_inflight_record(
+    monkeypatch,
+):
+    # The daemon reconciles a crash from the job's newest open record.  A
+    # launch beside a live instance leaves that instance's record in
+    # place.  A launch beside instances that have ended and await the
+    # reaper writes a record for its own run.
+    cron = cronstable.cron.Cron(None, config_yaml=_ended_retry_job("Allow"))
+    job = cron.cron_jobs["test"]
+    opened = []
+    monkeypatch.setattr(cron, "state_backend", object())
+    monkeypatch.setattr(
+        cron, "_queue_inflight_write", lambda name, make: opened.append(name)
+    )
+    await cron.maybe_launch_job(job)
+    await cron.maybe_launch_job(job)
+    assert opened == ["test"]
+    for running in cron.running_jobs["test"]:
+        await asyncio.wait_for(running.wait(), 20)
+        assert running.ended
+    await cron.maybe_launch_job(job)
+    try:
+        assert len(cron.running_jobs["test"]) == 3
+        assert opened == ["test", "test"]
+    finally:
+        await asyncio.wait_for(cron.running_jobs["test"][2].wait(), 20)
+
+
 async def test_handle_finished_job_skips_replaced(monkeypatch):
     # a job cancelled to make way for a replacement must not be reported as a
     # success or failure (and must not trigger retries).

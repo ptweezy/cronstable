@@ -97,6 +97,31 @@ async def test_mcp_store_failures_are_tool_errors(dag_cron, monkeypatch, tool, a
     assert result["content"][0]["text"] == message
 
 
+async def _records_unreadable(*args, **kwargs):
+    from cronstable.state import _DocumentUnreadable
+
+    raise _DocumentUnreadable("stream 's': records kept leaving during the read")
+
+
+async def test_recovery_answers_unavailable_while_its_records_cannot_be_read(dag_cron, tmp_path, monkeypatch):
+    # A strict read that cannot settle raises _DocumentUnreadable, which is
+    # not an OSError.  Every recovery surface answers it as a store outage.
+    cron, key, _, _ = await failed_flow(dag_cron, tmp_path)
+    cron.web_config = {}
+    monkeypatch.setattr(cron.state_backend, "newest_records_by", _records_unreadable)
+    with pytest.raises(web.HTTPServiceUnavailable) as ei:
+        await cron._web_dag_recover(Req(match={"name": "flow", "run_key": key}, body={}))
+    assert json.loads(ei.value.text) == {"error": "recovery state is unavailable"}
+    handler = MCPHandler(cron, _build_mcp_config({"enabled": True, "readOnly": False, "toolsets": ["dags"]}))
+    result = await _call(handler, "cron_preview_recovery", {"dag": "flow", "run_key": key})
+    assert result["isError"]
+    assert result["content"][0]["text"] == "recovery state is unavailable"
+    monkeypatch.setattr(cron._dag, "recover_range", _records_unreadable)
+    with pytest.raises(web.HTTPServiceUnavailable) as ei:
+        await cron._web_dag_recover_range(Req(match={"name": "flow"}, body={"from": "2026-09-01", "to": "2026-09-03"}))
+    assert json.loads(ei.value.text) == {"error": "recovery state is unavailable"}
+
+
 async def test_mcp_recovery_uses_reviewed_plan(dag_cron, tmp_path):
     cron, key, _, marker = await failed_flow(dag_cron, tmp_path)
     handler = MCPHandler(cron, _build_mcp_config({"enabled": True, "readOnly": False, "toolsets": ["dags"]}))
