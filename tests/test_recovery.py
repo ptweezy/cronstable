@@ -206,10 +206,11 @@ async def test_retention_preserves_source_during_recovery_preparation(dag_cron, 
     monkeypatch.setattr(cron._dag, "_try_own", defer)
     preview = await cron._dag.recover("flow", key)
     result = await cron._dag.recover("flow", key, plan_token=preview["planToken"])
-    await cron._dag._delete_run(cron.state_backend, "flow", key, source["runId"])
+    run = [(key, source["runId"])]
+    await cron._dag._delete_run_batch(cron.state_backend, "flow", run)
     assert await cron._dag._read("flow", key) is not None
     await cron._dag._prepare_recovery(("flow", result["runKey"]))
-    await cron._dag._delete_run(cron.state_backend, "flow", key, source["runId"])
+    await cron._dag._delete_run_batch(cron.state_backend, "flow", run)
     assert await cron._dag._read("flow", key) is None
     repeated = await cron._dag.recover("flow", key, plan_token=preview["planToken"])
     assert repeated["runKey"] == result["runKey"]

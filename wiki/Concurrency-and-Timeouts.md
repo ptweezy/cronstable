@@ -85,6 +85,11 @@ according to `concurrencyPolicy`. This local check always runs first. For a
 the job's cluster slot (see
 [concurrency across a cluster](#concurrency-across-a-cluster)).
 
+An instance counts as running while it has a process. One whose process has
+exited, or whose command could not start, does not count, even before the
+daemon has recorded the run. Every policy passes such an instance over, and
+the run keeps the outcome that it ended with.
+
 ### Allow (default)
 
 The new instance is started immediately alongside the existing one(s).

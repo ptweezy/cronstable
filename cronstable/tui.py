@@ -1990,7 +1990,10 @@ if sys.platform == "win32":  # pragma: no cover (windows)
         """msvcrt reader thread -> key-name queue (Proactor-safe).
 
         The Proactor loop cannot watch stdin, so a daemon thread blocks
-        in ``getwch()`` and marshals decoded keys onto the loop.
+        in ``getwch()`` and marshals decoded keys onto the loop.  Keys
+        that wait in the console together, as a paste does, reach the
+        queue in one loop callback.  The keys read before a prefix code
+        go ahead of it, because the read of its scan code can block.
         """
 
         def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -2003,28 +2006,44 @@ if sys.platform == "win32":  # pragma: no cover (windows)
             self._thread.start()
 
         def _pump(self) -> None:
+            keys: list[str] = []
             while not self._stop:
                 try:
                     ch = msvcrt.getwch()
+                    if ch in ("\x00", "\xe0"):
+                        # The scan code read blocks when none follows, as
+                        # after a typed U+00E0, and kbhit() cannot tell.
+                        if keys and not self._post(keys):
+                            return
+                        keys = []
+                        name = _WIN_KEYS.get(msvcrt.getwch())
+                    elif ch == "\x1b":
+                        name = "esc"
+                    elif ch < " " or ch == "\x7f":
+                        name = _decode_control(ch)
+                    else:
+                        name = ch
+                    if name is not None:
+                        keys.append(name)
+                    if not keys or msvcrt.kbhit():
+                        continue
                 except Exception:  # noqa: BLE001 - no console: stop reading
                     return
-                if ch in ("\x00", "\xe0"):
-                    code = msvcrt.getwch()
-                    name = _WIN_KEYS.get(code)
-                    if name is None:
-                        continue
-                elif ch == "\x1b":
-                    name = "esc"
-                elif ch < " " or ch == "\x7f":
-                    name = _decode_control(ch)
-                else:
-                    name = ch
-                try:
-                    self._loop.call_soon_threadsafe(
-                        self._queue.put_nowait, name
-                    )
-                except RuntimeError:  # loop already closed mid-exit
+                if not self._post(keys):
                     return
+                keys = []
+
+        def _post(self, keys: list[str]) -> bool:
+            """Hand ``keys`` to the loop; ``False`` once the loop is closed."""
+            try:
+                self._loop.call_soon_threadsafe(self._enqueue, keys)
+            except RuntimeError:  # loop already closed mid-exit
+                return False
+            return True
+
+        def _enqueue(self, keys: list[str]) -> None:
+            for key in keys:
+                self._queue.put_nowait(key)
 
         async def get(self) -> str:
             return await self._queue.get()

@@ -584,7 +584,9 @@ The daemon cancels instances concurrently, so a job with several running
 instances costs at most one `killTimeout`, not one per instance. A job with no
 running instance is a `409`; success answers
 `{"cancelled": "<name>", "instances": <count>}` (the `cron_cancel_job`
-[MCP tool](MCP)'s ack shape).
+[MCP tool](MCP)'s ack shape). An instance whose process has already exited is
+not running: the request neither signals nor counts it, and the run keeps the
+outcome that it ended with.
 
 A run cancelled this way is recorded in the job's history with the outcome
 `cancelled`. Cancellation is a deliberate operator action, not a job failure,
@@ -773,10 +775,10 @@ response carries its own `ETag` and supports `If-None-Match` and gzip.
 Viewers that send the same `jobs` and `sort` values share one built response,
 and a `jobs` value that covers every job returns the shared default response.
 The daemon holds a shared response for up to eight pairs with `jobs` at most
-256, and for one pair with a larger cap that leaves jobs out. When more pairs
-are in use, the least recently requested one gives up its place and is built
-again on its next request. For example, `GET /activity?jobs=80&sort=name`
-returns the first 80 jobs by name.
+256. When more pairs are in use, the least recently requested one gives up its
+place and is built again on its next request. For a larger cap that leaves
+jobs out, the daemon builds the response for each request. For example,
+`GET /activity?jobs=80&sort=name` returns the first 80 jobs by name.
 
 ### `GET /jobs/{name}/resources`
 

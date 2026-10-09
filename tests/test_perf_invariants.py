@@ -28,6 +28,7 @@ import types
 
 import pytest
 
+import cronstable.pools as pools_mod
 import cronstable.state as state_mod
 from cronstable import dag, dagrun, jobstate, qr, tui
 from cronstable.cron import Cron
@@ -1242,13 +1243,13 @@ async def test_saturated_pool_tick_costs_one_read(tmp_path):
 
         backend.mutate_document = spying_mutate  # type: ignore[method-assign]
         attempts = []
-        real_acquire = pools.acquire
+        real_claim = pools._claim
 
-        async def spying_acquire(pool, key):
+        async def spying_claim(pool, key):
             attempts.append(key)
-            return await real_acquire(pool, key)
+            return await real_claim(pool, key)
 
-        pools.acquire = spying_acquire
+        pools._claim = spying_claim
         launched = []
 
         async def launch(job, **kwargs):
@@ -1281,6 +1282,31 @@ async def test_saturated_pool_tick_costs_one_read(tmp_path):
         body = await backend.read_document("scheduler-pools", "shared")
         states = [e["state"] for e in body["entries"].values()]
         assert states.count("queued") == waiting - 1
+
+        # The head is cancelled between the tick's read and its claim.
+        # The refused claim reports that the entry left the queue, so the
+        # tick goes on to the next head without reading the pool again.
+        await pools.finish(tickets.pop(0))
+        retire = pools._retire_tasks
+
+        async def cancel_the_head(pool, body):
+            head = pools_mod._waiting(body, limit=1)[0]
+            await pools.cancel(pool, head["id"])
+            return await retire(pool, body)
+
+        pools._retire_tasks = cancel_the_head
+        del mutations[:], attempts[:], launched[:]
+        await pools._tick_pool("shared")
+        assert (mutations, len(attempts), len(launched)) == (
+            ["read", "write", "read", "write"],
+            2,
+            1,
+        ), (
+            "a head cancelled mid-tick must cost its cancel, one refused "
+            "claim and one admitting claim; got %r with %d attempt(s)"
+            % (mutations, len(attempts))
+        )
+        tickets.extend(launched)
     finally:
         for ticket in tickets:
             await pools.finish(ticket)
@@ -1524,15 +1550,18 @@ async def test_chain_task_costs_three_document_rewrites(dag_cron, monkeypatch):
 # --- 2. full listings per GC pass -----------------------------------------
 #
 # The retention pass runs inside the scheduler's single-flight service
-# task.  It lists the run namespace once, then deletes each excess run
-# under that run's lease.  The check it repeats there reads the recovery
-# runs in one call and the recovery batches in another, so the listings of
-# the run namespace must not depend on how many runs the pass deletes.
+# task.  It lists the run namespace once, then deletes the excess runs a
+# batch at a time, under the lease of every run in the batch.  The check
+# it repeats there reads the recovery runs in one call and the recovery
+# batches in another, so the full listings of the run namespace must not
+# depend on how many runs the pass deletes, and its keyed listings follow
+# the number of batches.
 
 
 async def test_gc_pass_full_listings_do_not_grow_with_deleted_runs(
     dag_cron, monkeypatch
 ):
+    monkeypatch.setattr(dagrun, "GC_LEASE_BATCH", 4)
     cron = await dag_cron(_dagstate_chain_yaml("gc", 1, retain=2))
     backend = cron.state_backend
     listings = []
@@ -1578,13 +1607,14 @@ async def test_gc_pass_full_listings_do_not_grow_with_deleted_runs(
         assert listings.count("recoverybatch/gc") == 1, (
             "a GC pass lists the recovery batches once; got %r" % (listings,)
         )
+        batches = -(-excess // dagrun.GC_LEASE_BATCH)
         assert (
             keyed.count("dagrun/gc"),
             keyed.count("recoverybatch/gc"),
-        ) == (excess, excess), (
-            "under each deleted run's lease a GC pass reads the recovery "
-            "runs in one call and the recovery batches in another; got %r"
-            % (keyed,)
+        ) == (batches, batches), (
+            "under the leases of each batch of deleted runs a GC pass "
+            "reads the recovery runs in one call and the recovery batches "
+            "in another; got %r" % (keyed,)
         )
     assert seen[3] == seen[12] == 1, (
         "a GC pass must list the run namespace once however many runs it "

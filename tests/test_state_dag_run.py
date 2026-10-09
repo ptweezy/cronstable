@@ -2221,7 +2221,7 @@ async def test_adopt_scan_prunes_the_registry_of_runs_finished_elsewhere(
     await d._adopt_orphans()
     assert ref not in d._launched
     d._launched[ref] = {("a", 0, 0)}
-    await d._delete_run(cron.state_backend, "lin", run_key, body.get("runId"))
+    await _delete_one(cron, "lin", run_key, body.get("runId"))
     assert ref not in d._launched
 
 
@@ -4956,10 +4956,10 @@ async def test_gc_one_dag_skips_empty_run_key(tmp_path, monkeypatch, dag_cron):
     monkeypatch.setattr(cron.state_backend, "list_documents", _docs)
     deleted = []
 
-    async def _spy_delete(backend, name, run_key, run_id):
-        deleted.append(run_key)
+    async def _spy_delete(backend, name, runs):
+        deleted.extend(runs)
 
-    monkeypatch.setattr(cron._dag, "_delete_run", _spy_delete)
+    monkeypatch.setattr(cron._dag, "_delete_run_batch", _spy_delete)
     # excess is 1; the oldest terminal run has an empty run key and is
     # skipped rather than deleted.
     await cron._dag._gc_one_dag(cron.state_backend, "rt", dagcfg)
@@ -4979,9 +4979,7 @@ async def test_delete_run_swallows_prune_error(
     monkeypatch.setattr(cron.state_backend, "prune_records", _boom)
     # a run_id present means the XCom prune is attempted; its failure is
     # swallowed while the document itself is still deleted.
-    await cron._dag._delete_run(
-        cron.state_backend, "lin", "del-k", "some-run-id"
-    )
+    await _delete_one(cron, "lin", "del-k", "some-run-id")
     assert await cron._dag.get_run("lin", "del-k") is None
 
 
@@ -4997,10 +4995,10 @@ async def test_gc_removed_dags_nonstr_runkey_and_cancel(
     monkeypatch.setattr(cron.state_backend, "list_documents", _docs)
     deleted = []
 
-    async def _spy(backend, name, run_key, run_id):
-        deleted.append(run_key)
+    async def _spy(backend, name, runs):
+        deleted.extend(runs)
 
-    monkeypatch.setattr(cron._dag, "_delete_run", _spy)
+    monkeypatch.setattr(cron._dag, "_delete_run_batch", _spy)
     await cron._dag.gc_removed_dags(cron.state_backend, {"lin"}, grace=0.0)
     assert deleted == []  # non-str run key skipped
     monkeypatch.undo()
@@ -5036,6 +5034,13 @@ async def _seed_terminal_runs(backend, name, count, first=0):
     return keys
 
 
+async def _delete_one(cron, name, run_key, run_id):
+    """Run retention's delete of one run: a batch of one."""
+    await cron._dag._delete_run_batch(
+        cron.state_backend, name, [(run_key, run_id)]
+    )
+
+
 def _count_full_listings(monkeypatch, backend):
     """Count ``list_documents`` calls per namespace on ``backend``."""
     calls = {}
@@ -5062,10 +5067,11 @@ def _count_keyed_listings(monkeypatch, backend):
     return calls
 
 
-@pytest.mark.parametrize("excess", [2, 7])
+@pytest.mark.parametrize("excess, batches", [(2, 1), (7, 3)])
 async def test_gc_pass_lists_the_runs_once_however_many_runs_go(
-    excess, monkeypatch, dag_cron
+    excess, batches, monkeypatch, dag_cron
 ):
+    monkeypatch.setattr(dagrun, "GC_LEASE_BATCH", 3)
     cron = await dag_cron(_RETAIN_ONE)  # retainRuns 1
     backend = cron.state_backend
     keys = await _seed_terminal_runs(backend, "rt", 1 + excess)
@@ -5074,10 +5080,103 @@ async def test_gc_pass_lists_the_runs_once_however_many_runs_go(
     await cron._dag._gc_one_dag(backend, "rt", cron.cron_dags["rt"])
     assert await backend.list_document_keys("dagrun/rt") == [keys[-1]]
     # One listing of the runs and one of the recovery batches for the
-    # whole pass.  Under each deleted run's lease, one call reads the
-    # recovery runs and one the recovery batches.
+    # whole pass.  Under the leases of each batch of deleted runs, one
+    # call reads the recovery runs and one the recovery batches.
     assert calls == {"dagrun/rt": 1, "recoverybatch/rt": 1}
-    assert keyed == {"dagrun/rt": excess, "recoverybatch/rt": excess}
+    assert keyed == {"dagrun/rt": batches, "recoverybatch/rt": batches}
+
+
+async def test_delete_run_batch_holds_every_lease_through_the_check(
+    monkeypatch, dag_cron
+):
+    # The references are read while every run of the batch is leased, and
+    # the leases are released after the deletes.  A run whose lease is
+    # held elsewhere stays.
+    cron = await dag_cron(_LINEAR)
+    backend = cron.state_backend
+    keys = await _seed_terminal_runs(backend, "lin", 3)
+    busy = await backend.acquire_lease(
+        cron._dag._lease_name(("lin", keys[1])), "someone-else", 60
+    )
+    assert busy is not None
+    events = []
+    real_acquire = backend.acquire_lease
+    real_release = backend.release_lease
+    real_keyed = backend.list_documents_keyed
+    real_delete = backend.delete_document
+
+    async def acquire(name, holder, ttl):
+        lease = await real_acquire(name, holder, ttl)
+        events.append("lease" if lease is not None else "busy")
+        return lease
+
+    async def release(lease):
+        events.append("release")
+        return await real_release(lease)
+
+    async def keyed(namespace, key_prefix, **kwargs):
+        events.append("check")
+        return await real_keyed(namespace, key_prefix, **kwargs)
+
+    async def delete(namespace, key):
+        events.append("delete")
+        return await real_delete(namespace, key)
+
+    monkeypatch.setattr(backend, "acquire_lease", acquire)
+    monkeypatch.setattr(backend, "release_lease", release)
+    monkeypatch.setattr(backend, "list_documents_keyed", keyed)
+    monkeypatch.setattr(backend, "delete_document", delete)
+    await cron._dag._delete_run_batch(
+        backend, "lin", [(key, None) for key in keys]
+    )
+    assert events == [
+        "lease",
+        "busy",
+        "lease",
+        "check",
+        "check",
+        "delete",
+        "delete",
+        "release",
+        "release",
+    ]
+    assert await backend.list_document_keys("dagrun/lin") == [keys[1]]
+
+
+async def test_delete_run_batch_stops_deleting_at_half_the_lease_ttl(
+    monkeypatch, dag_cron
+):
+    # A slow store must not carry a delete past the run's lease, so the
+    # batch leaves the runs it has not reached for the next pass.
+    from types import SimpleNamespace
+
+    cron = await dag_cron(_LINEAR)
+    backend = cron.state_backend
+    keys = await _seed_terminal_runs(backend, "lin", 3)
+    clock = [1000.0]
+    # the module's own clock: the event loop keeps the real one
+    monkeypatch.setattr(
+        dagrun,
+        "time",
+        SimpleNamespace(time=dagrun.time.time, monotonic=lambda: clock[0]),
+    )
+    real_delete = backend.delete_document
+
+    async def slow_delete(namespace, key):
+        clock[0] += dagrun.GC_LEASE_TTL / 2
+        return await real_delete(namespace, key)
+
+    monkeypatch.setattr(backend, "delete_document", slow_delete)
+    await cron._dag._delete_run_batch(
+        backend, "lin", [(key, None) for key in keys]
+    )
+    assert await backend.list_document_keys("dagrun/lin") == keys[1:]
+    # the leases went back, so the next batch takes the runs
+    monkeypatch.undo()
+    await cron._dag._delete_run_batch(
+        backend, "lin", [(key, None) for key in keys]
+    )
+    assert await backend.list_document_keys("dagrun/lin") == []
 
 
 async def test_gc_removed_dag_lists_its_namespace_once(monkeypatch, dag_cron):
@@ -5090,8 +5189,8 @@ async def test_gc_removed_dag_lists_its_namespace_once(monkeypatch, dag_cron):
     await cron._dag.gc_removed_dags(backend, {"lin"}, grace=0.0)
     assert await backend.list_document_keys("dagrun/lin") == []
     assert calls == {"dagrun/lin": 1}
-    # the references are read under each deleted run's lease
-    assert keyed == {"dagrun/lin": 5, "recoverybatch/lin": 5}
+    # the references are read once, under the leases of the deleted runs
+    assert keyed == {"dagrun/lin": 1, "recoverybatch/lin": 1}
 
 
 def _preparing_recovery(name, source_key, status="preparing"):
@@ -5122,7 +5221,7 @@ async def test_delete_run_spares_the_source_of_a_preparing_recovery(dag_cron):
         )
 
     await _write("preparing")
-    await cron._dag._delete_run(backend, "lin", source, "id000")
+    await _delete_one(cron, "lin", source, "id000")
     assert await cron._dag._read("lin", source) is not None
     # a recovery of ANOTHER run does not hold this one
     other = _preparing_recovery("lin", "someone-else")
@@ -5131,7 +5230,7 @@ async def test_delete_run_spares_the_source_of_a_preparing_recovery(dag_cron):
         "dagrun/lin", other["runKey"], lambda _cur: (other, None)
     )
     await _write("ready")
-    await cron._dag._delete_run(backend, "lin", source, "id000")
+    await _delete_one(cron, "lin", source, "id000")
     assert await cron._dag._read("lin", source) is None
 
 
@@ -5166,7 +5265,7 @@ async def test_delete_run_keeps_the_source_of_an_unreadable_recovery(
         patch.setattr(state, "open", flaky_open, raising=False)
         assert await cron._dag._read("lin", body["runKey"]) is None
         with pytest.raises(state._DocumentUnreadable):
-            await cron._dag._delete_run(backend, "lin", source, "id000")
+            await _delete_one(cron, "lin", source, "id000")
     assert await cron._dag._read("lin", source) is not None
     # the failed delete released the run's lease: after the recovery is
     # readable and prepared, the next delete takes the run
@@ -5174,7 +5273,7 @@ async def test_delete_run_keeps_the_source_of_an_unreadable_recovery(
     await backend.mutate_document(
         "dagrun/lin", body["runKey"], lambda _cur: (body, None)
     )
-    await cron._dag._delete_run(backend, "lin", source, "id000")
+    await _delete_one(cron, "lin", source, "id000")
     assert await cron._dag._read("lin", source) is None
 
 
@@ -5224,7 +5323,7 @@ async def test_delete_run_keeps_the_source_of_every_unreadable_reference(
     with monkeypatch.context() as patch:
         _unreadable_documents(patch, [doc_path])
         with pytest.raises(state._DocumentUnreadable):
-            await cron._dag._delete_run(backend, "lin", source, "id000")
+            await _delete_one(cron, "lin", source, "id000")
     assert await cron._dag._read("lin", source) is not None
 
 
@@ -5286,7 +5385,7 @@ async def test_recovery_reference_check_takes_no_document_lock(
         return await real(namespace, key, transform)
 
     monkeypatch.setattr(backend, "mutate_document", _recording)
-    await cron._dag._delete_run(backend, "lin", source, "id000")
+    await _delete_one(cron, "lin", source, "id000")
     assert await cron._dag._read("lin", source) is None
     assert body["runKey"] not in mutated
 
@@ -5295,7 +5394,8 @@ async def test_gc_pass_waits_for_an_unreadable_recovery_with_one_warning(
     monkeypatch, caplog, dag_cron
 ):
     # One unreadable recovery holds every run of its workflow, so the pass
-    # says so once and ends, where each further run would say it again.
+    # says so once and ends, where each further batch would say it again.
+    monkeypatch.setattr(dagrun, "GC_LEASE_BATCH", 1)
     cron = await dag_cron(_RETAIN_ONE)  # retainRuns 1
     backend = cron.state_backend
     keys = await _seed_terminal_runs(backend, "rt", 4)
@@ -5305,13 +5405,13 @@ async def test_gc_pass_waits_for_an_unreadable_recovery_with_one_warning(
     )
     _lock, doc_path = backend._doc_paths("dagrun/rt", body["runKey"])
     attempts = []
-    real_delete = cron._dag._delete_run
+    real_delete = cron._dag._delete_run_batch
 
     async def _counted_delete(*args):
         attempts.append(args[2])
         return await real_delete(*args)
 
-    monkeypatch.setattr(cron._dag, "_delete_run", _counted_delete)
+    monkeypatch.setattr(cron._dag, "_delete_run_batch", _counted_delete)
     with monkeypatch.context() as patch:
         _unreadable_documents(patch, [doc_path])
         with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
@@ -5335,6 +5435,32 @@ async def test_gc_pass_waits_for_an_unreadable_recovery_with_one_warning(
     assert await backend.list_document_keys("dagrun/rt") == sorted(
         [keys[-1], body["runKey"]]
     )
+
+
+async def test_gc_pass_reports_a_failed_delete_of_the_run_as_its_own(
+    monkeypatch, caplog, dag_cron
+):
+    # The run's own document cannot be read at its delete.  It is no
+    # recovery document, so the pass reports the failure with its
+    # traceback and names no recovery to wait for.
+    from cronstable import state
+
+    cron = await dag_cron(_RETAIN_ONE)  # retainRuns 1
+    backend = cron.state_backend
+    keys = await _seed_terminal_runs(backend, "rt", 2)
+
+    async def _unreadable(namespace, key):
+        raise state._DocumentUnreadable("unknown-schema-or-not-a-document")
+
+    monkeypatch.setattr(backend, "delete_document", _unreadable)
+    with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+        await cron._dag._gc_runs()
+    messages = [record.getMessage() for record in caplog.records]
+    assert not [m for m in messages if "run retention waits" in m]
+    failed = [r for r in caplog.records if "run GC failed" in r.getMessage()]
+    assert len(failed) == 1
+    assert failed[0].exc_info is not None
+    assert await backend.list_document_keys("dagrun/rt") == keys
 
 
 @pytest.mark.parametrize(
@@ -5368,7 +5494,7 @@ async def test_delete_run_spares_the_sources_of_an_open_recovery_batch(
     await backend.mutate_document(
         "recoverybatch/lin", "tok", lambda _cur: (body, None)
     )
-    await cron._dag._delete_run(backend, "lin", source, "id000")
+    await _delete_one(cron, "lin", source, "id000")
     assert (await cron._dag._read("lin", source) is not None) is kept
 
 
@@ -5407,7 +5533,7 @@ async def test_delete_run_reads_each_kind_of_reference_in_one_call(
         return await real_read(namespace, key, **kwargs)
 
     monkeypatch.setattr(backend, "read_document", _counted_read)
-    await cron._dag._delete_run(backend, "lin", source, "id000")
+    await _delete_one(cron, "lin", source, "id000")
     assert keyed == {"dagrun/lin": 1, "recoverybatch/lin": 1}
     assert reads == []
     assert await cron._dag._read("lin", source) is None

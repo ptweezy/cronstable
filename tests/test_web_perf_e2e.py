@@ -286,6 +286,38 @@ def test_a_revalidated_poll_carries_the_token(browser, tmp_path):
             assert page.evaluate(_ANCHOR)["kept"] == len(names)
 
 
+def test_a_poll_that_is_not_a_job_list_leaves_the_held_jobs(
+    browser, tmp_path
+):
+    """The page refuses a ``/jobs`` answer that is not a list of jobs. It
+    keeps the jobs it holds and the validator that names them, so the next
+    poll revalidates them and the connection readout recovers."""
+    with e2e.Daemon(tmp_path) as daemon:
+        with e2e.open_page(
+            browser, daemon.url + "?perf=1", prefs={"pollMs": 0}
+        ) as page:
+            statuses = []
+            page.on(
+                "response",
+                lambda response: (
+                    response.url.endswith("/jobs")
+                    and statuses.append(response.status)
+                ),
+            )
+            names = e2e.row_names(page)
+            held = page.evaluate("window.__perf.state().jobsEtag")
+            assert held
+            page.faults.status("/jobs", 200, body={"oops": 1}, times=1)
+            _refresh(page)
+            assert "no signal" in page.inner_text("#conn")
+            assert page.evaluate("window.__perf.state().jobsEtag") == held
+            assert e2e.row_names(page) == names
+            _refresh(page)
+            assert statuses == [200, 304]
+            assert "live" in page.inner_text("#conn")
+            assert e2e.row_names(page) == names
+
+
 def _freeze(page):
     """Install the page clock and stop it, before navigation."""
     page.clock.install(time="2026-01-01T12:00:00Z")

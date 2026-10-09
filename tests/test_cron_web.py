@@ -1578,6 +1578,45 @@ async def test_web_index_compresses_the_page_off_the_event_loop():
     assert again.body == first.body == cronstable.cron._index_gzip()
 
 
+async def test_web_index_cancelled_first_load_keeps_its_compression():
+    # A first load that is cancelled while the page compresses leaves the
+    # compression running, and the next load waits for it.
+    import asyncio
+    import threading
+
+    cron = _cron(TWO_JOBS)
+    started, release = threading.Event(), threading.Event()
+    runs = []
+    real = cronstable.cron._gzip_static
+
+    def slow(raw):
+        runs.append(1)
+        started.set()
+        release.wait(10)
+        return real(raw)
+
+    request = Req(headers={"Accept-Encoding": "gzip"})
+    loop = asyncio.get_running_loop()
+    cronstable.cron._index_gzip.cache_clear()
+    try:
+        cronstable.cron._gzip_static = slow
+        first = asyncio.ensure_future(cron._web_index(request))
+        assert await loop.run_in_executor(None, started.wait, 10)
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        assert first.cancelled()
+        second = asyncio.ensure_future(cron._web_index(request))
+        await asyncio.sleep(0)
+        release.set()
+        resp = await second
+    finally:
+        release.set()
+        cronstable.cron._gzip_static = real
+    assert len(runs) == 1
+    assert resp.body == cronstable.cron._index_gzip()
+    assert cron._index_gzip_pending is None
+
+
 async def test_web_index_serves_gzip_when_accepted():
     # precompressed once for the life of the process; the compressed body must
     # decode back to exactly the identity body.

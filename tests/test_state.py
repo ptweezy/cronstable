@@ -2254,27 +2254,81 @@ async def test_name_keyed_append_leaves_a_record_it_has_not_seen(
     assert len(_record_files(ours, "s")) == 1
 
 
-async def test_latest_by_learn_displaces_older_records_only(fs_backend):
+async def test_name_keyed_append_supersedes_a_record_that_a_lookup_read(
+    fs_backend_factory,
+):
+    # Two backends on one directory.  A lookup reads the version that the
+    # peer published, so the next publish here removes it without waiting
+    # for a pass.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+
+    async def put(backend, version):
+        await backend.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+
+    await put(ours, 1)
+    await put(theirs, 2)  # its first append: the pass removes version 1
+    got = await ours.newest_record_with("s", "name", "a")
+    assert got == {"name": "a", "v": 2}
+    await put(ours, 3)
+    assert [r["v"] for r in await ours.list_records("s")] == [3]
+
+
+async def test_name_keyed_append_teaches_the_lookup_its_record(
+    fs_backend, monkeypatch
+):
+    # The backend knows the name in a record that it published, so a
+    # lookup of another name does not read that record.
     backend = fs_backend
-    learn = backend._latest_by_learn
-    assert learn("t", "name", {"a": "0002.json"}) == []
+    for name in ("a", "b", "c"):
+        await backend.append_record(
+            "s", {"name": name}, prune_latest_by="name"
+        )
+    reads = _count_record_reads(monkeypatch, backend)
+    assert await backend.newest_record_with("s", "name", "zz") is None
+    assert reads == []
+    # the match itself still comes from the store
+    got = await backend.newest_record_with("s", "name", "b")
+    assert got == {"name": "b"}
+    assert len(reads) == 1
+
+
+def test_field_facts_track_the_newest_record_of_each_value():
+    facts = state._FieldFacts()
+    assert facts.learn("0002.json", "a") is None
     # a record older than the one known is not the newest of its value
-    assert learn("t", "name", {"a": "0001.json"}) == []
-    assert learn("t", "name", {"a": "0003.json", "b": "0003.json"}) == [
-        "0002.json"
-    ]
-    # another field and another stream hold facts of their own
-    assert learn("t", "other", {"a": "0009.json"}) == []
-    assert learn("u", "name", {"a": "0009.json"}) == []
-    assert backend._latest_by_entries == 4
-    assert learn("t", "name", {}) == []
-    backend._latest_by_forget("t")
-    assert backend._latest_by_entries == 1
-    assert list(backend._latest_by) == ["u"]
+    assert facts.learn("0001.json", "a") is None
+    assert facts.newest == {"a": "0002.json"}
+    assert facts.learn("0003.json", "a") == "0002.json"
+    assert facts.learn("0004.json", "b") is None
+    # a fact that is known already changes nothing
+    assert facts.learn("0003.json", "a") is None
+    assert facts.newest == {"a": "0003.json", "b": "0004.json"}
+    # the oldest records go first, whatever order they were learned in
+    assert facts.shed(2) == 2
+    assert list(facts.values) == ["0003.json", "0004.json"]
+    # a value whose newest record is forgotten has no newest record
+    facts.forget("0003.json")
+    assert facts.newest == {"b": "0004.json"}
+    assert facts.shed(0) == 0
+    assert facts.shed(5) == 1
+    assert not facts.values and not facts.newest
 
 
-async def test_latest_by_memo_stays_within_its_budget(fs_backend, monkeypatch):
-    monkeypatch.setattr(state, "_LATEST_BY_MAX_ENTRIES", 4)
+def _field_facts(backend):
+    """How many facts the field index holds per stream token."""
+    return {
+        token: len(facts.values)
+        for (token, _field), facts in backend._field_index.items()
+    }
+
+
+async def test_name_keyed_append_facts_stay_within_the_budget(
+    fs_backend, monkeypatch
+):
+    monkeypatch.setattr(state, "_FIELD_INDEX_MAX_ENTRIES", 4)
     backend = fs_backend
 
     async def put(stream, name, version):
@@ -2282,41 +2336,42 @@ async def test_latest_by_memo_stays_within_its_budget(fs_backend, monkeypatch):
             stream, {"name": name, "v": version}, prune_latest_by="name"
         )
 
-    def facts():
-        return {token: len(held) for token, held in backend._latest_by.items()}
-
     for i in range(4):
         await put("s", "n%d" % i, 0)
-    assert backend._latest_by_entries == 4
+    assert backend._field_index_entries == 4
     # the fifth fact is one over the budget: the oldest one makes room
     await put("s", "n4", 0)
-    assert backend._latest_by_entries == 4
-    # a version that the memo has lost stays for the next pass
+    assert backend._field_index_entries == 4
+    # a version whose fact the index has lost stays for the next pass
     await put("s", "n0", 1)
     assert len(_record_files(backend, "s")) == 6
-    # and a version that the memo still holds is removed
+    # and a version whose fact it still holds is removed
     await put("s", "n4", 1)
     assert len(_record_files(backend, "s")) == 6
-    assert facts() == {"s": 4}
-    # another stream takes its room from the one learned least recently,
-    # whose most recent fact outlasts the others
+    assert _field_facts(backend) == {"s": 4}
+    # another stream takes its room from the one used least recently,
+    # whose newest record outlasts the others
     for i in range(3):
         await put("t", "m%d" % i, 0)
-    assert facts() == {"s": 1, "t": 3}
-    assert list(backend._latest_by["s"]) == [("name", "n4")]
+    assert _field_facts(backend) == {"s": 1, "t": 3}
+    held = backend._field_index[state._fs_safe("s"), "name"]
+    assert list(held.newest) == ["n4"]
+    # the stream in use keeps its share of the budget beside another one
     await put("t", "m3", 0)
-    assert facts() == {"t": 4}
-    assert backend._latest_by_entries == 4
+    assert _field_facts(backend) == {"s": 1, "t": 3}
+    assert backend._field_index_entries == 4
     # a wiped stream leaves no facts behind
     await backend.prune_records("t", keep=0)
-    assert backend._latest_by_entries == 0
-    assert backend._latest_by == {}
+    assert _field_facts(backend) == {"s": 1}
+    assert backend._field_index_entries == 1
 
 
-async def test_latest_by_memo_keeps_the_streams_in_use(fs_backend, monkeypatch):
+async def test_name_keyed_append_facts_follow_the_streams_in_use(
+    fs_backend, monkeypatch
+):
     # A stream that is published to again keeps its facts while a stream
     # that nobody appends to gives its own up.
-    monkeypatch.setattr(state, "_LATEST_BY_MAX_ENTRIES", 4)
+    monkeypatch.setattr(state, "_FIELD_INDEX_MAX_ENTRIES", 4)
     backend = fs_backend
 
     async def put(stream, name, version):
@@ -2332,8 +2387,9 @@ async def test_latest_by_memo_keeps_the_streams_in_use(fs_backend, monkeypatch):
         for name in ("a", "b"):
             await put("busy", name, version)
             assert len(_record_files(backend, "busy")) == 2
-    assert "idle" not in backend._latest_by
-    assert len(backend._latest_by["busy"]) == 2
+    held = _field_facts(backend)
+    assert "idle" not in held
+    assert held["busy"] == 2
 
 
 async def test_superseded_record_unlink_rides_out_a_sharing_violation(
@@ -2527,9 +2583,9 @@ async def test_newest_record_index_stays_within_its_budget(
         assert got == {"name": "n0"}
     # the least recently used stream made room for the others
     held = backend._field_index
-    assert sum(len(facts) for facts in held.values()) <= 6
+    assert sum(len(facts.values) for facts in held.values()) <= 6
     assert backend._field_index_entries == sum(
-        len(facts) for facts in held.values()
+        len(facts.values) for facts in held.values()
     )
     assert (state._fs_safe("s3"), "name") in held
     assert (state._fs_safe("s1"), "name") not in held
@@ -2537,16 +2593,16 @@ async def test_newest_record_index_stays_within_its_budget(
     for stream in streams:
         got = await backend.newest_record_with(stream, "name", "n3")
         assert got == {"name": "n3"}
-    # a stream with more records than the budget holds the facts about
-    # its newest records, so a lookup of a recent name reads its match
-    # and nothing else
+    # beside other streams, a stream with more records than its share of
+    # the budget holds the facts about its newest records, so a lookup of
+    # a recent name reads its match and nothing else
     for i in range(8):
         await backend.append_record("big", {"name": "b%d" % i})
     for _ in range(2):
         got = await backend.newest_record_with("big", "name", "b0")
         assert got == {"name": "b0"}
     big = backend._field_index[state._fs_safe("big"), "name"]
-    assert sorted(big.values()) == ["b%d" % i for i in range(2, 8)]
+    assert sorted(big.values.values()) == ["b%d" % i for i in range(4, 8)]
     assert backend._field_index_entries == 6
     reads = _count_record_reads(monkeypatch, backend)
     got = await backend.newest_record_with("big", "name", "b7")
@@ -2559,7 +2615,8 @@ async def test_newest_record_index_sheds_the_oldest_facts_first(
 ):
     # Two streams that together need more facts than the budget holds:
     # the one used less recently gives up the facts about its oldest
-    # records, and its recent names still cost one read.
+    # records, and its recent names still cost one read.  The stream in
+    # use holds its nine newest records, its share of a budget of twelve.
     monkeypatch.setattr(state, "_FIELD_INDEX_MAX_ENTRIES", 12)
     backend = fs_backend
     for stream in ("a", "b"):
@@ -2567,8 +2624,12 @@ async def test_newest_record_index_sheds_the_oldest_facts_first(
             await backend.append_record(stream, {"name": "n%d" % i})
         await backend.newest_record_with(stream, "name", "n0")
     held = backend._field_index
-    assert len(held[state._fs_safe("b"), "name"]) == 10
-    assert sorted(held[state._fs_safe("a"), "name"].values()) == ["n8", "n9"]
+    assert len(held[state._fs_safe("b"), "name"].values) == 9
+    assert sorted(held[state._fs_safe("a"), "name"].values.values()) == [
+        "n7",
+        "n8",
+        "n9",
+    ]
     reads = _count_record_reads(monkeypatch, backend)
 
     async def lookup(stream, name):
@@ -2580,8 +2641,67 @@ async def test_newest_record_index_sheds_the_oldest_facts_first(
     assert await lookup("a", "n9") == 1
     assert await lookup("b", "n0") == 1
     # an old name of the shed stream reads the records with no fact
-    assert await lookup("a", "n0") == 8
+    assert await lookup("a", "n0") == 7
     assert backend._field_index_entries == 12
+
+
+async def test_newest_record_index_leaves_room_beside_a_large_stream(
+    fs_backend, monkeypatch
+):
+    # Beside another stream, a stream with more records than its share of
+    # the budget holds the facts about its newest records.  A lookup of an
+    # older name in it reads the rest again and leaves the other stream
+    # its facts.
+    monkeypatch.setattr(state, "_FIELD_INDEX_MAX_ENTRIES", 16)
+    backend = fs_backend
+    for i in range(20):
+        await backend.append_record("large", {"name": "g%d" % i})
+    for i in range(4):
+        await backend.append_record("small", {"name": "s%d" % i})
+    got = await backend.newest_record_with("small", "name", "s0")
+    assert got == {"name": "s0"}
+    reads = _count_record_reads(monkeypatch, backend)
+    for expected in (20, 8):
+        del reads[:]
+        assert await backend.newest_record_with("large", "name", "x") is None
+        assert len(reads) == expected
+    held = backend._field_index
+    large = held[state._fs_safe("large"), "name"]
+    assert set(large.values.values()) == {"g%d" % i for i in range(8, 20)}
+    assert len(held[state._fs_safe("small"), "name"].values) == 4
+    assert backend._field_index_entries == 16
+    del reads[:]
+    got = await backend.newest_record_with("small", "name", "s0")
+    assert got == {"name": "s0"}
+    assert len(reads) == 1
+
+
+async def test_newest_record_index_lets_one_stream_fill_the_budget(
+    fs_backend, monkeypatch
+):
+    # No other stream holds facts, so the stream keeps one for each of its
+    # records, past its share and up to the whole budget.  A lookup of a
+    # name that it lacks then reads nothing.
+    monkeypatch.setattr(state, "_FIELD_INDEX_MAX_ENTRIES", 16)
+    backend = fs_backend
+    for i in range(14):  # the share of this budget is 12
+        await backend.append_record("only", {"name": "n%d" % i})
+    reads = _count_record_reads(monkeypatch, backend)
+
+    async def missing():
+        del reads[:]
+        assert await backend.newest_record_with("only", "name", "x") is None
+        return len(reads)
+
+    assert await missing() == 14
+    assert await missing() == 0
+    assert backend._field_index_entries == 14
+    # past the budget it holds the facts about its newest records
+    for i in range(14, 20):
+        await backend.append_record("only", {"name": "n%d" % i})
+    assert await missing() == 6
+    assert backend._field_index_entries == 16
+    assert await missing() == 4
 
 
 @pytest.mark.parametrize("strict", [False, True])
@@ -2699,6 +2819,99 @@ async def test_newest_record_with_best_effort_keeps_its_last_match(
         await backend.newest_record_with("s", "name", "a", strict=True)
 
 
+async def test_newest_record_with_best_effort_answers_from_every_pass(
+    fs_backend, monkeypatch
+):
+    # Every pass meets a record that left the stream, and the version that
+    # the first pass read leaves before the second.  A best-effort read
+    # answers with it, the newest version that any pass read.
+    backend = fs_backend
+    await backend.append_record("s", {"name": "a", "v": 1})
+    await backend.append_record("s", {"name": "b"})
+    older, newer = sorted(os.listdir(backend._stream_dir("s")))
+    real = backend._read_record
+    reads = []
+
+    def leaving(stream_dir, name, **kwargs):
+        reads.append(name)
+        if name == newer or reads.count(older) > 1:
+            return None
+        return real(stream_dir, name, **kwargs)
+
+    monkeypatch.setattr(backend, "_read_record", leaving)
+    monkeypatch.setattr(backend, "_record_superseded", lambda *a: True)
+    got = await backend.newest_record_with("s", "name", "a")
+    assert got == {"name": "a", "v": 1}
+    assert reads.count(newer) == state._SUPERSEDED_RESCANS + 1
+    del reads[:]
+    listed = await backend.newest_records_by("s", "name")
+    assert listed == [{"name": "a", "v": 1}]
+    del reads[:]
+    with pytest.raises(state._DocumentUnreadable):
+        await backend.newest_record_with("s", "name", "a", strict=True)
+
+
+async def test_newest_record_with_counts_an_unexaminable_record_as_present(
+    fs_backend, monkeypatch
+):
+    # A record that fails its read and its lstat with an I/O error has not
+    # left the stream.  The lookup skips it and reads the stream once.
+    import errno
+
+    backend = fs_backend
+    await backend.append_record("s", {"name": "a"})
+    await backend.append_record("s", {"name": "b"})
+    stream_dir = backend._stream_dir("s")
+    newer = sorted(os.listdir(stream_dir))[-1]
+    held = os.path.normpath(os.path.join(stream_dir, newer))
+    _hold_records(monkeypatch, [held])
+    real_lstat = os.lstat
+
+    def failing_lstat(path, *args, **kwargs):
+        if os.path.normpath(str(path)) == held:
+            raise OSError(errno.EIO, "transient I/O error", str(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(state.os, "lstat", failing_lstat)
+    superseded = state.FilesystemStateBackend._record_superseded
+    assert superseded(stream_dir, newer) is False
+    assert superseded(stream_dir, "gone.json") is True
+    reads = _count_record_reads(monkeypatch, backend)
+    got = await backend.newest_record_with("s", "name", "a")
+    assert got == {"name": "a"}
+    assert len(reads) == 2
+
+
+async def test_newest_record_with_counts_a_stale_handle_as_a_record_gone(
+    fs_backend, monkeypatch
+):
+    # A shared mount reports a record that a peer unlinked as a stale
+    # handle.  The lookup lists the stream again, as it does for a record
+    # that is missing.
+    import errno
+
+    backend = fs_backend
+    await backend.append_record("s", {"name": "a"})
+    await backend.append_record("s", {"name": "b"})
+    stream_dir = backend._stream_dir("s")
+    newer = sorted(os.listdir(stream_dir))[-1]
+    held = os.path.normpath(os.path.join(stream_dir, newer))
+    _hold_records(monkeypatch, [held])
+    real_lstat = os.lstat
+
+    def stale_lstat(path, *args, **kwargs):
+        if os.path.normpath(str(path)) == held:
+            raise OSError(errno.ESTALE, "stale file handle", str(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(state.os, "lstat", stale_lstat)
+    assert backend._record_superseded(stream_dir, newer) is True
+    reads = _count_record_reads(monkeypatch, backend)
+    got = await backend.newest_record_with("s", "name", "a")
+    assert got == {"name": "a"}
+    assert reads.count(newer) == state._SUPERSEDED_RESCANS + 1
+
+
 @pytest.mark.parametrize("strict", [False, True])
 async def test_newest_records_by_keeps_one_record_per_value(
     fs_backend, strict
@@ -2763,14 +2976,14 @@ async def test_newest_record_index_drops_records_that_left_the_stream(
         await backend.append_record("s", {"name": "n%d" % i})
     await backend.newest_record_with("s", "name", "n0")
     key = (state._fs_safe("s"), "name")
-    assert len(backend._field_index[key]) == 100
+    assert len(backend._field_index[key].values) == 100
     await backend.prune_records("s", keep=10)
     await backend.append_record("s", {"name": "fresh"})
     assert await backend.newest_record_with("s", "name", "n0") is None
     got = await backend.newest_record_with("s", "name", "fresh")
     assert got == {"name": "fresh"}
     # the facts about the pruned records went with them
-    assert len(backend._field_index[key]) == 11
+    assert len(backend._field_index[key].values) == 11
     assert backend._field_index_entries == 11
 
 
@@ -3058,6 +3271,75 @@ async def test_list_documents_keyed_reads_the_keys_under_a_prefix(
         fobj.write(b"{}")
     assert await keyed("recovery-") == ["recovery-a", "recovery-b", "x"]
     assert len(read) == 4
+
+    # a file name is decoded once: the next listings know its answer
+    def decoding(token):
+        raise AssertionError("decoded " + token)
+
+    monkeypatch.setattr(state, "_decode_fs_token", decoding)
+    assert await keyed("recovery-") == ["recovery-a", "recovery-b", "x"]
+    assert await keyed("co") == ["con", "x"]
+
+
+# Every character of these is one that a token has, so only the rules of
+# the encoder tell them from a whole token.
+_UNWRITTEN_TOKENS = [
+    "recovery%2Dx",  # an escape of a safe character
+    "%61",
+    "%2f",  # lowercase hex
+    "FACE",  # uppercase outside an escape
+    "con",  # a reserved device name, not escaped
+    "",
+    "%4",  # half an escape
+    "%E9",  # no UTF-8 sequence
+    "a" * (state._FS_SAFE_MAX + 1),  # longer than a whole token
+]
+
+
+@pytest.mark.parametrize("token", _UNWRITTEN_TOKENS)
+def test_fs_token_whole_refuses_a_token_the_encoder_never_writes(token):
+    assert state._decode_fs_token(token) is None
+    assert not state._fs_token_whole(token)
+
+
+def test_fs_token_whole_accepts_the_tokens_the_encoder_writes():
+    for name in (
+        "run-1",
+        "2026-08-07T12:00:00+00:00",
+        "con",
+        "a b/c",
+        "caf" + chr(0xE9),
+        "job-" + chr(0xDCFF),  # a lone surrogate
+        "a" * state._FS_SAFE_MAX,
+    ):
+        token = state._fs_safe(name)
+        assert state._decode_fs_token(token) == name
+        assert state._fs_token_whole(token)
+    # a truncated token does not hold its whole name
+    assert not state._fs_token_whole(state._fs_safe(_LONG))
+
+
+async def test_list_documents_keyed_reads_a_name_the_encoder_never_writes(
+    fs_backend, monkeypatch
+):
+    # Such a file holds a key that cannot be recovered, so a listing reads
+    # it under any prefix.
+    backend = fs_backend
+    await backend.mutate_document("ns", "run-1", lambda c: ({"v": 1}, None))
+    foreign = ["recovery%2Dx.doc", "%2f.doc", "FACE.doc", "%4.doc", "%E9.doc"]
+    for name in foreign:
+        with open(os.path.join(backend._doc_dir("ns"), name), "wb") as fobj:
+            fobj.write(b"{}")
+    read = []
+    real = backend._read_doc_file
+
+    def counting(doc_path, **kwargs):
+        read.append(os.path.basename(doc_path))
+        return real(doc_path, **kwargs)
+
+    monkeypatch.setattr(backend, "_read_doc_file", counting)
+    assert await backend.list_documents_keyed("ns", "recovery-") == []
+    assert sorted(read) == sorted(foreign)
 
 
 async def test_list_documents_keyed_strict_waits_out_an_unreadable_document(

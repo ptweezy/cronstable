@@ -811,7 +811,8 @@ Flow:
   If the job has disappeared from the (possibly reloaded) config, it pops the
   stale retry state and returns; otherwise it calls `maybe_launch_job(job)`.
 - **On success** (`handle_job_success`): `cancel_job_retries(name)` clears any
-  pending retry, then `report_success()` runs.
+  pending retry, then `report_success()` runs. A retry state that another
+  run's launch installed and that has scheduled no retry stays in place.
 - **`cancel_job_retries(name)`** pops the state (no-op if absent), sets
   `cancelled = True`, and awaits or cancels the pending `task`. It takes a
   `settle` reason (default `"superseded"`) for the durable retry state described

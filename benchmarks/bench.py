@@ -373,15 +373,27 @@ def _schedule_entries(n):
 def _child_env():
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = "0"
+    # A child runs in a temp directory.  Each PYTHONPATH entry is made
+    # absolute here, so a relative one names the directory that it names
+    # for this process and the child imports the package measured here.
+    paths = [
+        os.path.abspath(p)
+        for p in env.get("PYTHONPATH", "").split(os.pathsep)
+        if p
+    ]
     if _SRC_FALLBACK:
-        prior = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = (
-            _SRC_FALLBACK + os.pathsep + prior if prior else _SRC_FALLBACK
-        )
+        paths.insert(0, _SRC_FALLBACK)
+    if paths:
+        env["PYTHONPATH"] = os.pathsep.join(paths)
     return env
 
 
-def _timed_child(args):
+def _timed_child(args, env=None, stdin=None):
+    """Wall clock of one child interpreter run with ``args``.
+
+    ``env`` replaces the :func:`_child_env` environment, and ``stdin`` is
+    the child's standard input.
+    """
     t0 = time.perf_counter()
     # cwd is a neutral temp dir so the child resolves cronstable from its
     # interpreter's site-packages, never from a checkout it happens to sit
@@ -389,9 +401,10 @@ def _timed_child(args):
     # release, not the repo working tree.
     proc = subprocess.run(
         [sys.executable] + args,
+        stdin=stdin,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        env=_child_env(),
+        env=_child_env() if env is None else env,
         cwd=_tmpdir(),
     )
     dt = time.perf_counter() - t0
@@ -520,19 +533,7 @@ def _timed_client_child(args, extra_env=None):
         if name.startswith(("CRONSTABLE_STATE_", "CRONSTABLE_WEB_")):
             del env[name]
     env.update(extra_env or {})
-    t0 = time.perf_counter()
-    proc = subprocess.run(
-        [sys.executable] + args,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=env,
-        cwd=_tmpdir(),
-    )
-    dt = time.perf_counter() - t0
-    if proc.returncode != 0:
-        raise Skip("child exited %d: %s" % (proc.returncode, " ".join(args)))
-    return dt
+    return _timed_child(args, env=env, stdin=subprocess.DEVNULL)
 
 
 def _state_stub_server():
@@ -4359,31 +4360,13 @@ def bench_state_list_documents():
     return asyncio.run(run())
 
 
-@bench(
-    "state.gc_sweep_2k_streams",
-    "state",
-    detail="collect_garbage over 2k unkept-but-fresh streams",
-    repeats=(3, 2, 1),
-    gate_pct=25.0,
-    gate_floor=0.015,
-)
-def bench_state_gc_sweep():
-    """The GC sweep's classification cost, which grows with store age
-    exactly when nobody watches.
-
-    Cost is driven by STREAM count, not record count (5k records over 200
-    streams measures single-digit ms: a permanently green dead gate), so
-    the fixture is ~2000 streams of 1-2 records each.  They sit under a
-    managed prefix but NOT in the keep set, with FRESH records: kept
-    streams short-circuit before any listing, and actually-deletable ones
-    would be consumed by the warm-up pass -- fresh-but-unkept is the one
-    shape where every pass does the full classify-and-date work
-    idempotently.  The keep dict is prebuilt; only collect_garbage is
-    timed, and the pass must delete nothing.
-    """
-    import asyncio
+def _gc_streams_store():
+    """A store of about 2,000 one-record ``runs/`` streams, built once
+    (untimed).  Returns ``(path, stream count)``."""
 
     def build():
+        import asyncio
+
         path = os.path.join(_tmpdir(), "gc-streams")
         os.makedirs(path, exist_ok=True)
         n = max(_n(2000), 4)
@@ -4408,7 +4391,34 @@ def bench_state_gc_sweep():
         asyncio.run(seed())
         return path, n
 
-    path, _n_streams = fixture("gc_streams_2k", build)
+    return fixture("gc_streams_2k", build)
+
+
+@bench(
+    "state.gc_sweep_2k_streams",
+    "state",
+    detail="collect_garbage over 2k unkept-but-fresh streams",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.015,
+)
+def bench_state_gc_sweep():
+    """The GC sweep's classification cost, which grows with store age
+    exactly when nobody watches.
+
+    Cost is driven by STREAM count, not record count (5k records over 200
+    streams measures single-digit ms: a permanently green dead gate), so
+    the fixture is ~2000 streams of 1-2 records each.  They sit under a
+    managed prefix but NOT in the keep set, with FRESH records: kept
+    streams short-circuit before any listing, and actually-deletable ones
+    would be consumed by the warm-up pass -- fresh-but-unkept is the one
+    shape where every pass does the full classify-and-date work
+    idempotently.  The keep dict is prebuilt; only collect_garbage is
+    timed, and the pass must delete nothing.
+    """
+    import asyncio
+
+    path, _n_streams = _gc_streams_store()
     keep = {"runs/": set()}
 
     async def run():
@@ -4966,33 +4976,7 @@ def bench_state_inventory():
     """
     import asyncio
 
-    def build():
-        path = os.path.join(_tmpdir(), "gc-streams")
-        os.makedirs(path, exist_ok=True)
-        n = max(_n(2000), 4)
-
-        async def seed():
-            backend = _state_backend(path)
-            await backend.start()
-            try:
-                for base in range(0, n, 64):
-                    await asyncio.gather(
-                        *(
-                            backend.append_record(
-                                "runs/s%05d" % i,
-                                {"outcome": "success", "seq": i},
-                            )
-                            for i in range(base, min(base + 64, n))
-                        )
-                    )
-            finally:
-                await backend.stop()
-
-        asyncio.run(seed())
-        return path, n
-
-    # the store state.gc_sweep_2k_streams seeds, under the same fixture name
-    path, n_streams = fixture("gc_streams_2k", build)
+    path, n_streams = _gc_streams_store()
 
     async def run():
         backend = _state_backend(path)

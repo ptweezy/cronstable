@@ -492,10 +492,10 @@ class AdvanceResult:
     # claims hit MAX_CLAIMS_PER_PASS: more instances are claimable right now,
     # so the driver should re-service promptly rather than wait for a wake.
     deferred: bool = False
-    # a task entry reached a terminal state during the current walk, which
-    # can unblock a dependent listed before it (see _propagate_and_claim).
-    # Working state of the pass, so it stays out of the repr and equality.
-    ended: bool = field(default=False, repr=False, compare=False)
+    # how many task entries the pass brought to a terminal state.  One that
+    # ends during a walk can unblock a dependent listed before it (see
+    # _propagate_and_claim).
+    ended: int = 0
 
 
 @dataclass
@@ -941,14 +941,14 @@ def _propagate_and_claim(
     same walk, so :func:`_settle_dependents` carries the verdicts through
     the graph upstream-first and one more walk claims what that made ready.
     """
-    result.ended = False
+    settled = result.ended
     _walk_and_claim(spec, body, now, proc, host, result)
-    if not result.ended:
-        return
-    order = spec.upstream_first
-    while order is not None and result.ended:
+    while result.ended > settled:
+        order = spec.upstream_first
+        if order is None:
+            return
         _settle_dependents(spec, order, body, now, result)
-        result.ended = False
+        settled = result.ended
         _walk_and_claim(spec, body, now, proc, host, result)
 
 
@@ -1483,7 +1483,7 @@ def _terminalise_task(entry, state, now, result) -> None:
     entry["pid"] = None
     entry["updatedAt"] = now
     result.changed = True
-    result.ended = True
+    result.ended += 1
 
 
 def _maybe_terminalise(spec, body, now, result) -> None:

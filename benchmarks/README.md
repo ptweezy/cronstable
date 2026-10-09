@@ -48,7 +48,9 @@ each run names that package's directory on stderr. An interpreter with
 cronstable installed measures the installed copy, which is how CI benchmarks
 an older release with the current harness. To measure a checkout from such an
 interpreter, such as a tox environment, set `PYTHONPATH` to the checkout's
-root. If cronstable is not installed in the interpreter, the harness falls
+root. A relative path works: the subprocess benchmarks run in a temporary
+directory, and the harness gives them each `PYTHONPATH` entry as an absolute
+path. If cronstable is not installed in the interpreter, the harness falls
 back to the source tree it lives in and says so on stderr.
 
 Local numbers are only comparable to other runs on the same machine in the

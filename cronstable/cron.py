@@ -1481,7 +1481,7 @@ _ACTIVITY_CAPPED_MEMOS = 8
 
 #: The largest ``jobs`` cap whose /activity product takes one of those
 #: slots.  A dashboard draws at most 80 rows.  A product's size grows with
-#: its cap, so the pairs with a larger cap share one further slot.
+#: its cap, so a larger cap is built per request.
 _ACTIVITY_CAPPED_MEMO_MAX_JOBS = 256
 
 
@@ -2213,19 +2213,16 @@ class Cron:
             tuple[str, bytes, bytes | None]
         ] = _ResponseMemo()
         # /activity under a `jobs` cap: (jobs, sort) -> memo, least
-        # recently used first (see _activity_capped_memo).  The pairs
-        # above _ACTIVITY_CAPPED_MEMO_MAX_JOBS have their own map.
+        # recently used first, and how many requests wait on each pair's
+        # product (see _activity_capped_memo).
         self._activity_capped_memos: dict[
             tuple[int, str | None],
             _ResponseMemo[tuple[str, bytes, bytes | None]],
         ] = {}
-        self._activity_large_memos: dict[
-            tuple[int, str | None],
-            _ResponseMemo[tuple[str, bytes, bytes | None]],
-        ] = {}
-        # holds concurrent first loads of the dashboard page to one
-        # compression (see _web_index)
-        self._index_gzip_lock = asyncio.Lock()
+        self._activity_capped_waiting: dict[tuple[int, str | None], int] = {}
+        # the dashboard page's compression while it runs on a worker
+        # thread (see _index_gzip_bytes)
+        self._index_gzip_pending: "asyncio.Future[bytes] | None" = None
         # The MCP cron_query_metrics snapshot: the same universe /metrics
         # renders, materialised once per window and filtered per call. It
         # lives here rather than on the handler so _bust_response_memos
@@ -4696,7 +4693,7 @@ class Cron:
         """
         if name not in self.cron_jobs:
             raise ApiActionError("job {!r} not found".format(name), status=404)
-        running = list(self.running_jobs.get(name) or [])
+        running = self._live_instances(name)
         if not running:
             # nothing to cancel: report a conflict rather than a silent no-op
             # so the caller can tell the user the job was not running.
@@ -4709,9 +4706,7 @@ class Cron:
             runjob.cancelled = True
         # cancel instances concurrently: a job with several running instances
         # then costs at most one killTimeout, not one per instance.
-        await asyncio.gather(
-            *(rj.cancel() for rj in running if rj.proc is not None)
-        )
+        await asyncio.gather(*(rj.cancel() for rj in running))
         return len(running)
 
     def _set_pause(self, name: str, info: PauseInfo) -> None:
@@ -5556,15 +5551,7 @@ class Cron:
             return web.Response(status=304, headers=headers)
         if _accepts_gzip(request.headers.get("Accept-Encoding")):
             headers["Content-Encoding"] = "gzip"
-            if not _index_gzip.cache_info().currsize:
-                # compressing the page takes milliseconds of CPU, and
-                # the scheduler runs on this loop
-                async with self._index_gzip_lock:
-                    if not _index_gzip.cache_info().currsize:
-                        await asyncio.get_running_loop().run_in_executor(
-                            None, _index_gzip
-                        )
-            body = _index_gzip()
+            body = await self._index_gzip_bytes()
         else:
             body = raw
         return web.Response(
@@ -5573,6 +5560,30 @@ class Cron:
             charset="utf-8",
             headers=headers,
         )
+
+    async def _index_gzip_bytes(self) -> bytes:
+        """The compressed dashboard page (see :func:`_index_gzip`).
+
+        The first call compresses it on a worker thread, because that
+        takes milliseconds of CPU and the scheduler runs on this loop.
+        The calls that arrive before it finishes wait for that one
+        compression, and a caller that is cancelled leaves it running.
+        """
+        if _index_gzip.cache_info().currsize:
+            return _index_gzip()
+        pending = self._index_gzip_pending
+        if pending is None:
+            pending = asyncio.get_running_loop().run_in_executor(
+                None, _index_gzip
+            )
+            self._index_gzip_pending = pending
+            pending.add_done_callback(self._index_gzip_settled)
+        return await asyncio.shield(pending)
+
+    def _index_gzip_settled(self, _pending: "asyncio.Future[bytes]") -> None:
+        # the next request answers from the cache, or compresses again
+        # after a failure
+        self._index_gzip_pending = None
 
     def _scheduled_in(
         self,
@@ -5995,10 +6006,7 @@ class Cron:
             memo.cached = None
         self._fleet_response_memo.cached = None
         self._activity_response_memo.cached = None
-        for capped in (
-            *self._activity_capped_memos.values(),
-            *self._activity_large_memos.values(),
-        ):
+        for capped in self._activity_capped_memos.values():
             capped.cached = None
         self._metric_samples_memo.cached = None
 
@@ -6613,7 +6621,9 @@ class Cron:
         (every job) in one slot, and a cap that leaves jobs out in the slot
         of its ``(jobs, sort)`` pair (see :meth:`_activity_capped_memo`).
         A narrower ``limit`` is built per request, because a memo would
-        need a slot per distinct value.
+        need a slot per distinct value.  So is a cap above
+        :data:`_ACTIVITY_CAPPED_MEMO_MAX_JOBS`, whose product can be as
+        large as the default one.
         """
         while True:
             # None for a cap that covers every job: that response is the
@@ -6631,15 +6641,24 @@ class Cron:
                     limit, self._activity_job_names(jobs, sort)
                 )
 
-            if limit != RUN_HISTORY_LIMIT:
+            if limit != RUN_HISTORY_LIMIT or (
+                jobs is not None and jobs > _ACTIVITY_CAPPED_MEMO_MAX_JOBS
+            ):
                 return await build()
-            product = await self._shared_response_product(
-                self._activity_response_memo
-                if jobs is None
-                else self._activity_capped_memo(jobs, sort),
-                _ACTIVITY_RESPONSE_TTL,
-                build,
-            )
+            if jobs is None:
+                product = await self._shared_response_product(
+                    self._activity_response_memo,
+                    _ACTIVITY_RESPONSE_TTL,
+                    build,
+                )
+            else:
+                memo = self._activity_capped_memo(jobs, sort)
+                try:
+                    product = await self._shared_response_product(
+                        memo, _ACTIVITY_RESPONSE_TTL, build
+                    )
+                finally:
+                    self._activity_release_memo(jobs, sort)
             # The default product carries every job of the set it was
             # built from.  A reload can grow that set past the cap while
             # the request waits for the product, so the request starts
@@ -6650,24 +6669,49 @@ class Cron:
     def _activity_capped_memo(
         self, jobs: int, sort: str | None
     ) -> "_ResponseMemo[tuple[str, bytes, bytes | None]]":
-        """The memo of the ``jobs``-capped ``/activity`` product for a pair.
+        """The memo of the ``jobs``-capped ``/activity`` product for a pair,
+        for a request that waits on it.
 
-        At most :data:`_ACTIVITY_CAPPED_MEMOS` pairs hold a slot, and one
-        pair above :data:`_ACTIVITY_CAPPED_MEMO_MAX_JOBS`, whose product
-        can be as large as the default one.  A pair that loses its slot is
-        built again on its next request.
+        At most :data:`_ACTIVITY_CAPPED_MEMOS` pairs hold a slot, and the
+        least recently used ones make room.  A pair keeps its slot while a
+        request waits on its product, so every request for the pair joins
+        one build, including the build that follows one that failed.  The
+        caller hands the pair back with :meth:`_activity_release_memo`,
+        and the pairs then go back to the bound.  A pair that loses its
+        slot is built again on its next request.
         """
-        if jobs > _ACTIVITY_CAPPED_MEMO_MAX_JOBS:
-            memos, slots = self._activity_large_memos, 1
-        else:
-            memos, slots = self._activity_capped_memos, _ACTIVITY_CAPPED_MEMOS
-        memo = memos.pop((jobs, sort), None)
+        memos = self._activity_capped_memos
+        pair = (jobs, sort)
+        memo = memos.pop(pair, None)
         if memo is None:
-            if len(memos) >= slots:
-                del memos[next(iter(memos))]
             memo = _ResponseMemo()
-        memos[jobs, sort] = memo  # most recently used last
+        memos[pair] = memo  # most recently used last
+        waiting = self._activity_capped_waiting
+        waiting[pair] = waiting.get(pair, 0) + 1
+        self._activity_trim_memos()
         return memo
+
+    def _activity_release_memo(self, jobs: int, sort: str | None) -> None:
+        """End one request's wait on a pair's product (see
+        :meth:`_activity_capped_memo`)."""
+        waiting = self._activity_capped_waiting
+        pair = (jobs, sort)
+        if waiting[pair] > 1:
+            waiting[pair] -= 1
+        else:
+            del waiting[pair]
+        self._activity_trim_memos()
+
+    def _activity_trim_memos(self) -> None:
+        """Drop the least recently used pairs above the slot count that no
+        request waits on."""
+        memos = self._activity_capped_memos
+        surplus = len(memos) - _ACTIVITY_CAPPED_MEMOS
+        if surplus > 0:
+            waiting = self._activity_capped_waiting
+            idle = [pair for pair in memos if pair not in waiting]
+            for pair in idle[:surplus]:
+                del memos[pair]
 
     async def _build_activity_product(
         self,
@@ -11051,11 +11095,8 @@ class Cron:
                     pool_ticket, "cancelled", "retry superseded"
                 )
                 return False
-        # .get(), not a bare subscript: subscripting this defaultdict
-        # would INSERT a phantom empty-list key, which makes running_jobs
-        # truthy with nothing to reap and spins the reaper hot at
-        # shutdown.
-        if self.running_jobs.get(job.name):
+        live = self._live_instances(job.name)
+        if live:
             logger.warning(
                 "Job %s: still running and concurrencyPolicy is %s",
                 job.name,
@@ -11072,10 +11113,14 @@ class Cron:
                 self._sla_due.pop(job.name, None)
                 return False
             elif job.concurrencyPolicy == "Replace":
-                # over a SNAPSHOT: the reaper concurrently remove()s from
-                # the live list; shrinking it mid-iteration would skip an
-                # instance, leaving it running beside the replacement.
-                for running_job in list(self.running_jobs[job.name]):
+                # ``live`` is a SNAPSHOT: the reaper concurrently
+                # remove()s from running_jobs, and shrinking that list
+                # mid-iteration would skip an instance, leaving it running
+                # beside the replacement.
+                for running_job in live:
+                    if running_job.ended:
+                        # ended while an earlier instance was cancelled
+                        continue
                     # mark before cancelling so the reaper treats the forced
                     # termination as a replacement, not a job failure.
                     running_job.replaced = True
@@ -11614,9 +11659,7 @@ class Cron:
         never awaits it. ``replaced`` is the single-flight guard; the
         cancel record stays in the stream and is re-read every period.
         """
-        pending = [
-            rj for rj in self.running_jobs.get(name) or [] if not rj.replaced
-        ]
+        pending = [rj for rj in self._live_instances(name) if not rj.replaced]
         if not pending:
             return
         logger.info(
@@ -12343,6 +12386,19 @@ class Cron:
         self._bust_response_memos()
         return first
 
+    def _live_instances(self, name: str) -> list[RunningJob]:
+        """The instances of a job that have a process left to signal.
+
+        An instance that has ended stays in ``running_jobs`` until the
+        reaper records it.  It keeps its outcome, so a cancel, a
+        replacement, and a concurrency check all pass it over.
+        """
+        # .get(), not a bare subscript: subscripting this defaultdict
+        # would INSERT a phantom empty-list key, which makes running_jobs
+        # truthy with nothing to reap and spins the reaper hot at
+        # shutdown.
+        return [rj for rj in self.running_jobs.get(name) or () if not rj.ended]
+
     def _remove_running_instance(
         self, running_job: RunningJob, *, missing_ok: bool = False
     ) -> bool:
@@ -12368,7 +12424,7 @@ class Cron:
                 # already reaped, but still drop an emptied key: a phantom
                 # empty list keeps running_jobs truthy with nothing to
                 # reap, which spins the reaper at shutdown (the hazard
-                # _launch_job_locked's own .get() comment names). The
+                # _live_instances' own .get() comment names). The
                 # pre-refactor copy of this arm fell through to the same
                 # cleanup.
                 if not jobs_list:
@@ -14608,7 +14664,13 @@ class Cron:
         )
 
     async def handle_job_success(self, job: RunningJob) -> None:
-        await self.cancel_job_retries(job.config.name, settle="succeeded")
+        name = job.config.name
+        state = self.retry_state.get(name)
+        # A success ends the job's retry sequence.  A ladder with no retry
+        # armed belongs to a launch that has yet to finish, so only that
+        # launch's own run ends it.
+        if state is None or state is job.retry_state or state.count > 0:
+            await self.cancel_job_retries(name, settle="succeeded")
         await job.report_success()
 
     @staticmethod

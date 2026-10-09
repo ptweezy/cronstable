@@ -3888,6 +3888,29 @@ async def test_cancel_terminates_a_running_job():
     await asyncio.wait_for(job.wait(), 20)
 
 
+async def test_cancel_of_an_ended_run_signals_nothing(monkeypatch):
+    # A run that wait() has collected is reaped, so its group id can belong
+    # to an unrelated process. cancel() leaves it alone.
+    job = _running_job(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print(out="hi"))
+        + '\n    schedule: "* * * * *"\n'
+    )
+    await job.start()
+    await asyncio.wait_for(job.wait(), 20)
+    assert job.stopped
+    signalled = []
+
+    async def recording(pid, *, force):
+        signalled.append((pid, force))
+        return True
+
+    monkeypatch.setattr(cronstable.platform, "kill_process_group", recording)
+    await job.cancel()
+    assert signalled == []
+    assert job._terminated is False
+
+
 async def test_cancel_falls_back_to_direct_kill(monkeypatch):
     # where the process group cannot be signalled at all, cancel() must fall
     # back to the direct child: a graceful terminate (guarded against a

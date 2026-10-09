@@ -796,9 +796,13 @@ async def test_run_job_disabled_surfaces_api_action_error():
 
 
 class _FakeRunning:
-    def __init__(self):
+    def __init__(self, ended=False):
         self.cancelled = False
-        self.proc = None
+        self.ended = ended
+        self.signalled = False
+
+    async def cancel(self):
+        self.signalled = True
 
 
 async def test_cancel_job_marks_all_instances():
@@ -810,7 +814,32 @@ async def test_cancel_job_marks_all_instances():
     )
     body = result["structuredContent"]
     assert body == {"cancelled": "hello", "instances": 2}
-    assert all(inst.cancelled for inst in instances)
+    assert all(inst.cancelled and inst.signalled for inst in instances)
+
+
+async def test_cancel_job_leaves_an_ended_instance_its_outcome():
+    # An instance that has ended waits for the reaper with the outcome it
+    # ended with.  A cancel counts and signals the live ones only.
+    h = _handler()
+    ended, live = _FakeRunning(ended=True), _FakeRunning()
+    h._cron.running_jobs["hello"] = [ended, live]
+    result = await _call(
+        h, "cron_cancel_job", {"name": "hello", "confirm": True}
+    )
+    assert result["structuredContent"] == {
+        "cancelled": "hello",
+        "instances": 1,
+    }
+    assert live.cancelled and live.signalled
+    assert not ended.cancelled and not ended.signalled
+    # with no live instance left, the job is not running
+    h._cron.running_jobs["hello"] = [ended]
+    result = await _call(
+        h, "cron_cancel_job", {"name": "hello", "confirm": True}
+    )
+    assert result["isError"] is True
+    assert "not running" in result["content"][0]["text"]
+    assert not ended.cancelled
 
 
 async def test_cancel_job_not_running_is_tool_error():

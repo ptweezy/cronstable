@@ -88,9 +88,15 @@ RECOVERY_MAX_ARTIFACTS = 10000
 
 # How long a recovery batch stays open (its ``expiresAt``).  Run retention
 # waits as long for a recovery document that it cannot read (see
-# _delete_run): a batch last written longer ago has expired, and a recovery
-# still in preparation by then is abandoned.
+# _referenced_runs): a batch last written longer ago has expired, and a
+# recovery still in preparation by then is abandoned.
 RECOVERY_BATCH_TTL = 7 * 86400.0
+
+# Run retention deletes runs a batch at a time (see _delete_run_batch): the
+# TTL of the lease it holds on each run of a batch, and the most runs in
+# one.  One read of the recovery documents covers a batch.
+GC_LEASE_TTL = 60.0
+GC_LEASE_BATCH = 32
 
 # Hard cap on how many missed occurrences a single catch-up replays, mirroring
 # cron.MAX_CATCHUP_OCCURRENCES so a long outage cannot stampede.
@@ -159,8 +165,9 @@ DAG_ROLLUP_BULK_THRESHOLD = 8
 #: re-PARSING terminal runs, but the keys listing itself still hit the store
 #: once per dag per request: with the dashboard's /dags poll (and any open
 #: run drawer) that was N_dags listings every ~3s per viewer, forever, on a
-#: quiescent store.  Every LOCAL write funnels through _mutate/_delete_run
-#: and pops the memo, so this-node changes render immediately; the TTL only
+#: quiescent store.  Every LOCAL write funnels through
+#: _mutate/_delete_run_locked and pops the memo, so this-node changes render
+#: immediately; the TTL only
 #: bounds how late another node's writes appear in the index rollup, which is
 #: well inside the gossip staleness the fleet view already tolerates.  Sits
 #: beside the same tradeoff cron's per-job trends cache (5s TTL, busted on
@@ -214,6 +221,10 @@ def _jitter(max_jitter: float) -> float:
     if max_jitter <= 0:
         return 0.0
     return random.uniform(0.0, max_jitter)  # not cryptographic
+
+
+class _ReferenceUnreadable(_DocumentUnreadable):
+    """A recovery document that could reference a run cannot be read."""
 
 
 @dataclass(slots=True)
@@ -292,8 +303,8 @@ class DagScheduler:
         # dag name -> (monotonic stamp, summaries): the short-TTL memo over
         # _run_summaries' RESULT, so the /dags + run-drawer poll traffic of
         # a quiescent dag costs zero store listings between local writes.
-        # Popped by _mutate/_delete_run (local changes must render at
-        # once), swept with the summary cache in forget(), and pruned of
+        # Popped by _mutate/_delete_run_locked (local changes must render
+        # at once), swept with the summary cache in forget(), and pruned of
         # removed dags by list_dags.  See DAG_SUMMARY_LIST_TTL.
         self._summaries_memo: dict[
             str, tuple[float, list[dict[str, Any]]]
@@ -3391,67 +3402,104 @@ class DagScheduler:
         excess = len(terminal) - dagcfg.retain_runs
         if excess <= 0:
             return
-        for body in terminal[:excess]:
-            run_key = body.get("runKey")
-            if not run_key or run_key in protected:
-                continue
-            if not await self._delete_run_if_unreferenced(
-                backend, name, run_key, body.get("runId")
-            ):
+        await self._delete_runs(
+            backend,
+            name,
+            [
+                (body["runKey"], body.get("runId"))
+                for body in terminal[:excess]
+                if body.get("runKey") and body["runKey"] not in protected
+            ],
+        )
+
+    async def _delete_runs(
+        self,
+        backend: StateBackend,
+        name: str,
+        runs: list[tuple[str, Any]],
+    ) -> None:
+        """Delete each ``(run key, run id)`` of ``runs`` that no recovery
+        references, :data:`GC_LEASE_BATCH` runs at a time.
+
+        A recovery document that cannot be read holds every run of the
+        workflow, so the pass over them ends there with one warning.
+        """
+        for start in range(0, len(runs), GC_LEASE_BATCH):
+            try:
+                await self._delete_run_batch(
+                    backend, name, runs[start : start + GC_LEASE_BATCH]
+                )
+            except _ReferenceUnreadable as ex:
+                logger.warning(
+                    "dag %s: run retention waits for a recovery document "
+                    "that cannot be read: %s",
+                    name,
+                    ex,
+                )
                 return
 
-    async def _delete_run_if_unreferenced(
+    async def _delete_run_batch(
         self,
         backend: StateBackend,
         name: str,
-        run_key: str,
-        run_id: Any,
-    ) -> bool:
-        """:meth:`_delete_run`, or ``False`` when a recovery document that
-        could reference the run cannot be read.
+        runs: list[tuple[str, Any]],
+    ) -> None:
+        """Delete the runs of one batch that no recovery references.
 
-        That document holds every run of the workflow, so the caller ends
-        its pass over them.
+        The references are read under the lease of every run in the
+        batch.  recover() holds a run's lease while it creates a recovery
+        run, so that read lists each recovery accepted before it, and no
+        recovery is accepted between it and the delete.  A run whose lease
+        is held elsewhere stays.  So do the runs that are left when half
+        of :data:`GC_LEASE_TTL` has passed, which keeps every delete
+        inside its lease.
+        """
+        holder = self._cron._proc_token + ":gc:" + os.urandom(12).hex()
+        deadline = time.monotonic() + GC_LEASE_TTL / 2
+        held: list[tuple[Lease, str, Any]] = []
+        try:
+            for run_key, run_id in runs:
+                lease = await asyncio.wait_for(
+                    backend.acquire_lease(
+                        self._lease_name((name, run_key)), holder, GC_LEASE_TTL
+                    ),
+                    STATE_OP_TIMEOUT,
+                )
+                if lease is not None:
+                    held.append((lease, run_key, run_id))
+            if not held:
+                return
+            referenced = await self._referenced_runs(backend, name)
+            for _lease, run_key, run_id in held:
+                if time.monotonic() >= deadline:
+                    break
+                if run_key not in referenced:
+                    await self._delete_run_locked(
+                        backend, name, run_key, run_id
+                    )
+        finally:
+            await asyncio.gather(
+                *(
+                    asyncio.wait_for(
+                        backend.release_lease(lease), STATE_OP_TIMEOUT
+                    )
+                    for lease, _run_key, _run_id in held
+                )
+            )
+
+    async def _referenced_runs(
+        self, backend: StateBackend, name: str
+    ) -> set[Any]:
+        """The run keys that a recovery in preparation or an open recovery
+        batch references.
+
+        Only a recovery run's own document can be "preparing", and its key
+        carries the "recovery-" prefix.  One store call reads each kind, so
+        the check fits the leases of a batch.  A recovery run or a recovery
+        batch that cannot be read raises :class:`_ReferenceUnreadable`,
+        until the document has gone RECOVERY_BATCH_TTL without a write.
         """
         try:
-            await self._delete_run(backend, name, run_key, run_id)
-        except _DocumentUnreadable as ex:
-            logger.warning(
-                "dag %s: run retention waits for a recovery document that "
-                "cannot be read: %s",
-                name,
-                ex,
-            )
-            return False
-        return True
-
-    async def _delete_run(
-        self,
-        backend: StateBackend,
-        name: str,
-        run_key: str,
-        run_id: Any,
-    ) -> None:
-        lease = await asyncio.wait_for(
-            backend.acquire_lease(
-                self._lease_name((name, run_key)),
-                self._cron._proc_token + ":gc:" + os.urandom(12).hex(),
-                60,
-            ),
-            STATE_OP_TIMEOUT,
-        )
-        if lease is None:
-            return
-        try:
-            # Checked under the run's lease, which recover() also holds
-            # while it creates a recovery run, so a recovery accepted at any
-            # moment before this point is listed here.  Only a recovery
-            # run's own document can be "preparing", and its key carries
-            # the "recovery-" prefix.  A recovery run or a recovery batch
-            # that cannot be read raises, and the run stays for the next
-            # pass, until the document has gone RECOVERY_BATCH_TTL without
-            # a write.  One store call reads each kind, so the check fits
-            # the lease.
             references = await asyncio.wait_for(
                 backend.list_documents_keyed(
                     self._ns(name),
@@ -3461,12 +3509,6 @@ class DagScheduler:
                 ),
                 STATE_OP_TIMEOUT,
             )
-            if any(
-                (b.get("recovery") or {}).get("status") == "preparing"
-                and b["recovery"].get("sourceRunKey") == run_key
-                for b in references
-            ):
-                return
             batches = await asyncio.wait_for(
                 backend.list_documents_keyed(
                     "recoverybatch/" + name,
@@ -3476,21 +3518,23 @@ class DagScheduler:
                 ),
                 STATE_OP_TIMEOUT,
             )
-            if any(
+        except _DocumentUnreadable as ex:
+            raise _ReferenceUnreadable(str(ex)) from ex
+        referenced = {
+            b["recovery"].get("sourceRunKey")
+            for b in references
+            if (b.get("recovery") or {}).get("status") == "preparing"
+        }
+        now = _now()
+        for batch in batches:
+            if (
                 not batch.get("complete")
-                and batch.get("expiresAt", float("inf")) > _now()
-                and any(
-                    p.get("sourceRunKey") == run_key
-                    for p in batch.get("plans", [])
-                )
-                for batch in batches
+                and batch.get("expiresAt", float("inf")) > now
             ):
-                return
-            await self._delete_run_locked(backend, name, run_key, run_id)
-        finally:
-            await asyncio.wait_for(
-                backend.release_lease(lease), STATE_OP_TIMEOUT
-            )
+                referenced.update(
+                    p.get("sourceRunKey") for p in batch.get("plans", [])
+                )
+        return referenced
 
     async def _delete_run_locked(
         self,
@@ -3571,6 +3615,7 @@ class DagScheduler:
                     backend.list_documents(self._ns(name)),
                     timeout=STATE_OP_TIMEOUT,
                 )
+                runs = []
                 for body in docs:
                     if not dag.is_terminal_run(body):
                         continue
@@ -3585,10 +3630,8 @@ class DagScheduler:
                         or now - float(updated) < grace
                     ):
                         continue  # too recent, or undatable: keep
-                    if not await self._delete_run_if_unreferenced(
-                        backend, name, run_key, body.get("runId")
-                    ):
-                        break
+                    runs.append((run_key, body.get("runId")))
+                await self._delete_runs(backend, name, runs)
             except Exception:  # noqa: BLE001 - one dag must not stop the pass
                 logger.exception("dag %s: removed-dag run GC failed", name)
 

@@ -9047,9 +9047,14 @@ var qrcode = function() {
       });
       if (res.status !== 304) {
         if (!res.ok) throw new Error("HTTP " + res.status);
-        state.jobs = await res.json();
-        state.byName = {};
-        state.jobs.forEach((j) => { state.byName[j.name] = j; });
+        // The page checks and indexes a body before it keeps any of it,
+        // so state.jobs is always the body that state.jobsEtag names.
+        const body = await res.json();
+        if (!Array.isArray(body)) throw new Error("/jobs body is not a list");
+        const byName = {};
+        body.forEach((j) => { byName[j.name] = j; });
+        state.jobs = body;
+        state.byName = byName;
         state.fetchedAt = performance.now();
         state.fetchedWallAt = Date.now();
         state.jobsEtag = res.headers.get("ETag");

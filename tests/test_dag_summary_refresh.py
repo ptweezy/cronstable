@@ -156,7 +156,7 @@ async def test_new_generation_refresh_keeps_older_reads_out_of_caches(
     older = asyncio.create_task(scheduler._run_summaries(backend, "xc"))
     try:
         await asyncio.wait_for(entered.wait(), 5)
-        await scheduler._delete_run(backend, "xc", "r1", None)
+        await scheduler._delete_run_batch(backend, "xc", [("r1", None)])
         await _mint_run(cron, "r1")
         fresh = await asyncio.wait_for(
             scheduler._run_summaries(backend, "xc"), 5

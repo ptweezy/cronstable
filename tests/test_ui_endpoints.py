@@ -2386,15 +2386,14 @@ async def test_web_activity_capped_products_are_bounded(monkeypatch):
     assert builds == [(1, None), (2, None), (3, None), (2, None)]
 
 
-async def test_web_activity_large_caps_share_one_slot_of_their_own(
-    monkeypatch,
-):
-    # A product grows with its cap, so the pairs above the bound share one
-    # slot and take none from the pairs that the dashboards poll.
+async def test_web_activity_large_cap_is_built_per_request(monkeypatch):
+    # A product grows with its cap, so a cap above the bound holds no
+    # shared response and takes no slot from the pairs that the dashboards
+    # poll.
     import cronstable.cron
 
     monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
-    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_CAPPED_MEMO_MAX_JOBS", 2)
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_CAPPED_MEMO_MAX_JOBS", 1)
     cron = _cron(_ACTIVITY_ORDER_YAML)
     builds = []
     real_names = cron._activity_job_names
@@ -2405,27 +2404,153 @@ async def test_web_activity_large_caps_share_one_slot_of_their_own(
 
     monkeypatch.setattr(cron, "_activity_job_names", counting_names)
     for _ in range(2):
-        small = await cron._web_get_activity(Req({"jobs": "2"}))
+        small = await cron._web_get_activity(Req({"jobs": "1"}))
         large = await cron._web_get_activity(Req({"jobs": "3"}))
-    assert len(json.loads(small.body)["jobs"]) == 2
+    assert len(json.loads(small.body)["jobs"]) == 1
     assert len(json.loads(large.body)["jobs"]) == 3
-    assert builds == [(2, None), (3, None)]
-    assert list(cron._activity_capped_memos) == [(2, None)]
-    assert list(cron._activity_large_memos) == [(3, None)]
+    assert builds == [(1, None), (3, None), (3, None)]
+    assert list(cron._activity_capped_memos) == [(1, None)]
+    assert not cron._activity_capped_waiting
     # a large cap tags and revalidates like any other response
     revalidated = await cron._web_get_activity(
         Req({"jobs": "3"}, headers={"If-None-Match": large.headers["ETag"]})
     )
     assert revalidated.status == 304
-    # another large pair takes the slot, and the first is built again
-    await cron._web_get_activity(Req({"jobs": "3", "sort": "name"}))
-    assert list(cron._activity_large_memos) == [(3, "name")]
+    assert builds[3:] == [(3, None)]
+
+
+async def test_web_activity_pair_in_flight_keeps_its_slot(monkeypatch):
+    # A pair that a request waits on keeps its slot when another pair
+    # needs one, so a second request for it joins the build.  The pairs go
+    # back to the bound after the requests end.
+    import asyncio
+
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_CAPPED_MEMOS", 1)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    gate = asyncio.Event()
+    builds = []
+    real_build = cron._build_activity_product
+
+    async def gated_build(limit, names):
+        builds.append(len(names))
+        await gate.wait()
+        return await real_build(limit, names)
+
+    monkeypatch.setattr(cron, "_build_activity_product", gated_build)
+
+    async def start(jobs):
+        request = Req({"jobs": str(jobs)})
+        task = asyncio.ensure_future(cron._web_get_activity(request))
+        await asyncio.sleep(0)
+        return task
+
+    first = await start(1)
+    other = await start(2)
+    again = await start(1)
+    assert builds == [1, 2]
+    assert list(cron._activity_capped_memos) == [(2, None), (1, None)]
+    gate.set()
+    one, _two, joined = await asyncio.gather(first, other, again)
+    assert joined.body == one.body
+    # the pair that was asked for last has the one slot
+    assert list(cron._activity_capped_memos) == [(1, None)]
+    assert not cron._activity_capped_waiting
     await cron._web_get_activity(Req({"jobs": "3"}))
-    assert builds == [(2, None), (3, None), (3, "name"), (3, None)]
-    # a local change renders on the next poll of a large pair
-    cron._bust_response_memos()
-    await cron._web_get_activity(Req({"jobs": "3"}))
-    assert builds[4:] == [(3, None)]
+    assert list(cron._activity_capped_memos) == [(3, None)]
+
+
+async def test_web_activity_waiters_keep_the_pair_of_a_cancelled_build(
+    monkeypatch,
+):
+    # The request that builds a pair's product is cancelled, as when its
+    # client hangs up, while another pair holds the one slot.  The request
+    # that waited on that build keeps the pair and builds the product, and
+    # a later request for the pair joins that build.
+    import asyncio
+
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_CAPPED_MEMOS", 1)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    gate = asyncio.Event()
+    builds = []
+    real_build = cron._build_activity_product
+
+    async def gated_build(limit, names):
+        builds.append(len(names))
+        await gate.wait()
+        return await real_build(limit, names)
+
+    monkeypatch.setattr(cron, "_build_activity_product", gated_build)
+
+    async def start(jobs):
+        request = Req({"jobs": str(jobs)})
+        task = asyncio.ensure_future(cron._web_get_activity(request))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return task
+
+    leader = await start(1)
+    other = await start(2)
+    waiter = await start(1)
+    assert builds == [1, 2]
+    leader.cancel()
+    await asyncio.gather(leader, return_exceptions=True)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert leader.cancelled()
+    assert builds == [1, 2, 1]
+    late = await start(1)
+    assert builds == [1, 2, 1]
+    gate.set()
+    built, joined, _other = await asyncio.gather(waiter, late, other)
+    assert joined.body == built.body
+    assert builds == [1, 2, 1]
+    assert not cron._activity_capped_waiting
+    assert len(cron._activity_capped_memos) == 1
+
+
+async def test_web_activity_pairs_in_flight_go_back_to_the_bound(monkeypatch):
+    # More pairs in flight than there are slots: each keeps its slot while
+    # a request waits on it, and the pairs asked for last hold the slots.
+    # The requests that those products serve leave the pairs as they are.
+    import asyncio
+
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_CAPPED_MEMOS", 2)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    gate = asyncio.Event()
+    real_build = cron._build_activity_product
+
+    async def gated_build(limit, names):
+        await gate.wait()
+        return await real_build(limit, names)
+
+    monkeypatch.setattr(cron, "_build_activity_product", gated_build)
+    queries = [
+        {"jobs": "1"},
+        {"jobs": "1", "sort": "name"},
+        {"jobs": "2"},
+        {"jobs": "2", "sort": "name"},
+    ]
+    tasks = []
+    for query in queries:
+        tasks.append(asyncio.ensure_future(cron._web_get_activity(Req(query))))
+        await asyncio.sleep(0)
+    assert len(cron._activity_capped_memos) == 4
+    gate.set()
+    await asyncio.gather(*tasks)
+    held = [(2, None), (2, "name")]
+    assert list(cron._activity_capped_memos) == held
+    for query in queries[2:]:
+        await cron._web_get_activity(Req(query))
+    assert list(cron._activity_capped_memos) == held
 
 
 async def test_web_activity_unknown_sort_is_a_400():

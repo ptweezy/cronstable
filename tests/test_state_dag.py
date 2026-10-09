@@ -350,6 +350,8 @@ def test_cascade_settles_in_one_advance_in_any_declaration_order(
     body, result = _one_advance(spec, body)
     expected = dag.UPSTREAM_FAILED if ended == dag.FAILED else dag.SKIPPED
     assert [_state(body, "t%d" % i) for i in range(1, 8)] == [expected] * 7
+    # the pass counts the entries it ended, whatever the listing
+    assert result.ended == 7
     assert result.run_terminal
     assert result.launches == []
     # a skipped chain is a successful run; a failed one is not

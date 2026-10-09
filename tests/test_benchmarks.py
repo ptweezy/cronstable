@@ -230,6 +230,29 @@ def _load_bench():
     return mod
 
 
+def test_child_env_names_the_package_that_the_harness_measures(
+    monkeypatch, tmp_path
+):
+    # A child benchmark runs in a temp directory, so a relative PYTHONPATH
+    # entry would name another directory for it than for the harness, and
+    # the subprocess benchmarks would measure another copy of the package.
+    bench = _load_bench()
+    monkeypatch.chdir(tmp_path)
+    other = str(tmp_path / "elsewhere")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([".", other, ""]))
+    monkeypatch.setattr(bench, "_SRC_FALLBACK", None)
+    paths = bench._child_env()["PYTHONPATH"].split(os.pathsep)
+    assert paths == [os.path.abspath("."), other]
+    # the source fallback goes first, as it does on the harness's own path
+    monkeypatch.setattr(bench, "_SRC_FALLBACK", "/src")
+    paths = bench._child_env()["PYTHONPATH"].split(os.pathsep)
+    assert paths == ["/src", os.path.abspath("."), other]
+    monkeypatch.delenv("PYTHONPATH")
+    assert bench._child_env()["PYTHONPATH"] == "/src"
+    monkeypatch.setattr(bench, "_SRC_FALLBACK", None)
+    assert "PYTHONPATH" not in bench._child_env()
+
+
 def test_yaml_parse_is_gated_above_the_quadratic_threshold(monkeypatch):
     # Config parsing was quadratic in the job count for the whole life of the
     # project: strictyaml's vendored CommentedSeq.__deepcopy__ calls

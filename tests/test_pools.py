@@ -309,6 +309,65 @@ async def test_capacity_change_drains_existing_queue(dag_cron, monkeypatch):
     assert (await cron._pools.snapshot())[0]["slots"] == 1
 
 
+def test_queue_rule_admits_the_head_into_free_slots():
+    # The one statement of the queue rule.  A claim asks it of the stored
+    # pool, and a tick asks it of the copy that it read.
+    from cronstable.pools import _Queue
+
+    def entry(key, state, slots=1, priority=0, at=0.0):
+        return {
+            "id": key,
+            "state": state,
+            "slots": slots,
+            "priority": priority,
+            "queuedAt": at,
+        }
+
+    entries = {
+        e["id"]: e
+        for e in (
+            entry("run", "running"),
+            entry("wide", "queued", slots=3, at=1.0),
+            entry("narrow", "queued", at=2.0),
+            entry("urgent", "queued", priority=5, at=3.0),
+        )
+    }
+    queue = _Queue({"slots": 3, "entries": entries})
+    # the entry of highest priority is the head, and nothing behind it
+    # starts
+    assert queue.admits(entries["urgent"])
+    assert not queue.admits(entries["narrow"])
+    queue.left(entries["urgent"], running=True)
+    # the next head needs three slots and one is free: it holds back the
+    # entry behind it, which would fit
+    assert queue.free == 1
+    assert not queue.admits(entries["wide"])
+    assert not queue.admits(entries["narrow"])
+    queue.left(entries["wide"])
+    assert queue.admits(entries["narrow"])
+    queue.left(entries["narrow"], running=True)
+    assert queue.head is None and queue.free == 0
+
+
+async def test_forbid_admits_past_an_instance_that_has_ended(
+    dag_cron, monkeypatch
+):
+    # An instance that has ended stays in running_jobs until the reaper
+    # records it.  It holds no Forbid job back from the pool.
+    cron = await make(dag_cron, monkeypatch)
+    job = cron.cron_jobs["one"]
+    job.concurrencyPolicy = "Forbid"
+    await cron.maybe_launch_job(job)
+    await cron._pools.tick()
+    (first,) = cron.running_jobs["one"]
+    await first.wait()
+    assert first.ended
+    await cron.maybe_launch_job(job)
+    await cron._pools.tick()
+    assert len(cron.running_jobs["one"]) == 2
+    await _reap_running(cron)
+
+
 async def _fill_pool(cron):
     """Hold both slots of the two-slot pool; return the tickets."""
     tickets = []
@@ -321,13 +380,13 @@ async def _fill_pool(cron):
 
 def _count_admission_attempts(cron, monkeypatch):
     attempts = []
-    acquire = cron._pools.acquire
+    claim = cron._pools._claim
 
     async def counting(pool, key):
         attempts.append(key)
-        return await acquire(pool, key)
+        return await claim(pool, key)
 
-    monkeypatch.setattr(cron._pools, "acquire", counting)
+    monkeypatch.setattr(cron._pools, "_claim", counting)
     return attempts
 
 

@@ -1745,6 +1745,7 @@ async def test_sla_late_after_excused_while_an_instance_runs(monkeypatch):
 
     class _FakeRun:
         started_at = DT(2020, 1, 1, 12, 0, 0, tzinfo=UTC)
+        ended = False
 
     # the 12:10 slot fires while the 12:00 instance still runs: _launch_plan
     # records it as due, and the Forbid drop in maybe_launch_job pops it
@@ -1782,6 +1783,7 @@ async def test_sla_late_after_forbid_drop_survives_the_run_ending(monkeypatch):
 
     class _FakeRun:
         started_at = DT(2020, 1, 1, 12, 0, 0, tzinfo=UTC)
+        ended = False
 
     # the 12:00 run is still going; the 12:10 slot fires and is Forbid-dropped
     cron.running_jobs["s"] = [_FakeRun()]

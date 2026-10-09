@@ -402,13 +402,10 @@ FAILED_SPAWN_REPLACE_JOB = (
 
 
 async def test_replace_policy_survives_failed_spawn():
-    # A spawn failure registers the instance with proc=None (start_failed);
-    # the next fire's Replace branch then cancels whatever running_jobs holds.
-    # cancel() raising RuntimeError("process is not running") there used to
-    # escape maybe_launch_job -- which spawn_jobs runs OUTSIDE run()'s
-    # try/except -- and kill the whole scheduler on the second fire after a
-    # bad deploy. (The cluster slot-renewer cancels through the same method,
-    # so this guards that path too.)
+    # A spawn failure registers the instance with proc=None (start_failed)
+    # until the reaper records it.  It has no process to replace, so the
+    # next fire launches beside it and leaves it its outcome.  The launch
+    # runs OUTSIDE run()'s try/except, so it must not raise either.
     cron = cronstable.cron.Cron(None, config_yaml=FAILED_SPAWN_REPLACE_JOB)
     job = cron.cron_jobs["test"]
 
@@ -416,13 +413,135 @@ async def test_replace_policy_survives_failed_spawn():
     first = cron.running_jobs["test"][0]
     assert first.proc is None
     assert first.start_failed is True
+    assert first.ended and not first.stopped
 
-    await cron.maybe_launch_job(job)  # Replace branch: must not raise
-    assert first.replaced is True
+    await cron.maybe_launch_job(job)
+    assert first.replaced is False
+    assert len(cron.running_jobs["test"]) == 2
 
-    # the reaper still completes the never-spawned instance normally
+    # the reaper records the never-spawned instance as the failure it is
     await first.wait()
     assert first.retcode == 127
+    await cron._handle_finished_job(first)
+    assert cron.last_run["test"].outcome == "failure"
+    assert cron.last_run["test"].exit_code == 127
+
+
+ENDED_REPLACE_JOB = (
+    "jobs:\n  - name: test\n"
+    + yaml_command(cmd_print(out="hi"))
+    + """
+    schedule: "@reboot"
+    captureStdout: true
+    concurrencyPolicy: Replace
+"""
+)
+
+
+async def test_replace_policy_leaves_an_ended_instance_its_outcome(
+    monkeypatch,
+):
+    # An instance that has ended stays in running_jobs until the reaper
+    # records it. A launch in that window sends it no signal and leaves it
+    # unmarked, so the reaper records the outcome it ended with.
+    cron = cronstable.cron.Cron(None, config_yaml=ENDED_REPLACE_JOB)
+    job = cron.cron_jobs["test"]
+    await cron.maybe_launch_job(job)
+    first = cron.running_jobs["test"][0]
+    await asyncio.wait_for(first.wait(), 20)
+    assert first.stopped and first.retcode == 0
+    signalled = []
+
+    async def recording(pid, *, force):
+        signalled.append((pid, force))
+        return True
+
+    with monkeypatch.context() as patch:
+        patch.setattr(platform, "kill_process_group", recording)
+        await cron.maybe_launch_job(job)
+    try:
+        assert signalled == []
+        assert first.replaced is False
+        assert len(cron.running_jobs["test"]) == 2
+    finally:
+        for rj in cron.running_jobs["test"][1:]:
+            await asyncio.wait_for(rj.wait(), 20)
+
+
+def _ended_retry_job(policy):
+    return (
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print(out="hi"))
+        + """
+    schedule: "@reboot"
+    captureStdout: true
+    concurrencyPolicy: %s
+    onFailure:
+      retry:
+        maximumRetries: 2
+        initialDelay: 60
+        maximumDelay: 60
+        backoffMultiplier: 1
+"""
+        % policy
+    )
+
+
+@pytest.mark.parametrize("policy", ["Allow", "Forbid", "Replace"])
+async def test_launch_beside_an_ended_instance_keeps_its_retries(policy):
+    # An instance that has ended stays in running_jobs until the reaper
+    # records it.  The next scheduled launch starts beside it under any
+    # concurrency policy, with a retry ladder of its own, and the ended
+    # instance's success leaves that ladder alone.
+    cron = cronstable.cron.Cron(None, config_yaml=_ended_retry_job(policy))
+    job = cron.cron_jobs["test"]
+    await cron.launch_scheduled_job(job)
+    first = cron.running_jobs["test"][0]
+    await asyncio.wait_for(first.wait(), 20)
+    assert first.ended and first.retcode == 0
+    await cron.launch_scheduled_job(job)
+    assert len(cron.running_jobs["test"]) == 2
+    second = cron.running_jobs["test"][1]
+    try:
+        ladder = cron.retry_state["test"]
+        assert second.retry_state is ladder
+        assert first.retry_state is not ladder
+        await cron._handle_finished_job(first)
+        await cron._drain_completions()
+        assert cron.last_run["test"].outcome == "success"
+        assert cron.retry_state.get("test") is ladder
+        assert not ladder.cancelled
+    finally:
+        await asyncio.wait_for(second.wait(), 20)
+    # the second instance's own success ends its ladder
+    await cron._handle_finished_job(second)
+    await cron._drain_completions()
+    assert "test" not in cron.retry_state
+    assert ladder.cancelled
+
+
+async def test_success_ends_a_pending_retry_of_another_run():
+    # A success ends the job's retry sequence: a retry that another run's
+    # failure armed is cancelled, whichever ladder the successful run
+    # carried.
+    cron = cronstable.cron.Cron(None, config_yaml=_ended_retry_job("Allow"))
+    armed = JobRetryState(60, 1, 60)
+    armed.next_delay()
+    cron.retry_state["test"] = armed
+    reported = []
+
+    async def report_success():
+        reported.append(1)
+
+    job = SimpleNamespace(
+        config=cron.cron_jobs["test"],
+        retry_state=None,
+        report_success=report_success,
+    )
+    await cron.handle_job_success(job)
+    assert "test" not in cron.retry_state
+    assert armed.cancelled
+    assert reported == [1]
 
 
 async def test_handle_finished_job_skips_replaced(monkeypatch):

@@ -5381,6 +5381,94 @@ async def test_queued_filter_keys_share_one_view_rebuild(tmp_path):
     assert len(app.view) == len(jobs)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="the msvcrt key reader")
+async def test_windows_reader_queues_waiting_keys_in_one_callback(
+    monkeypatch,
+):
+    """A paste waits in the console as a run of keys. The reader posts
+    the run to the loop in one callback, so the input loop's drain finds
+    all of it."""
+    import collections
+    import threading
+
+    feed = collections.deque(["a", "b", "\x7f", "c", "\r"])
+    closed = threading.Event()
+
+    def getwch():
+        if not feed:
+            closed.wait()
+            raise OSError("no console")
+        return feed.popleft()
+
+    monkeypatch.setattr(tui.msvcrt, "getwch", getwch)
+    monkeypatch.setattr(tui.msvcrt, "kbhit", lambda: bool(feed))
+    loop = asyncio.get_running_loop()
+    posted = []
+    real_post = loop.call_soon_threadsafe
+
+    def recording_post(callback, *args):
+        posted.append(callback)
+        return real_post(callback, *args)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", recording_post)
+    reader = tui.WindowsKeyReader(loop)
+    try:
+        keys = [await reader.get()]
+        while (key := reader.get_nowait()) is not None:
+            keys.append(key)
+    finally:
+        reader.close()
+        closed.set()
+        reader._thread.join(5)
+    assert keys == ["a", "b", "backspace", "c", "enter"]
+    assert posted.count(reader._enqueue) == 1
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the msvcrt key reader")
+async def test_windows_reader_posts_its_keys_before_a_scan_code_read(
+    monkeypatch,
+):
+    """The read of a scan code blocks when none follows its prefix, as
+    after a typed U+00E0. The keys read before the prefix reach the queue
+    first, so they do not wait for the next key press."""
+    import collections
+    import threading
+
+    feed = collections.deque(["v", "o", "\xe0"])
+    more = threading.Event()
+    closed = threading.Event()
+
+    def getwch():
+        if not feed:
+            # the scan code read: it blocks until another key arrives
+            more.wait()
+            if not feed:
+                closed.wait()
+                raise OSError("no console")
+        return feed.popleft()
+
+    monkeypatch.setattr(tui.msvcrt, "getwch", getwch)
+    monkeypatch.setattr(tui.msvcrt, "kbhit", lambda: bool(feed))
+    reader = tui.WindowsKeyReader(asyncio.get_running_loop())
+    try:
+        first = await asyncio.wait_for(reader.get(), 5)
+        second = await asyncio.wait_for(reader.get(), 5)
+        assert [first, second] == ["v", "o"]
+        assert reader.get_nowait() is None
+        # the next key press ends the read: an arrow key's scan code,
+        # then keys with no name, which are dropped
+        feed.extend(["H", "\x00", "~", "\r"])
+        more.set()
+        keys = [await asyncio.wait_for(reader.get(), 5)]
+        keys.append(await asyncio.wait_for(reader.get(), 5))
+    finally:
+        reader.close()
+        more.set()
+        closed.set()
+        reader._thread.join(5)
+    assert keys == ["up", "enter"]
+
+
 async def test_queued_filter_keys_track_the_selection_edit_by_edit(tmp_path):
     """The selection follows its job through every intermediate filter
     and keeps its row number when the job drops out, so the row a burst

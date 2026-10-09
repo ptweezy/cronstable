@@ -70,6 +70,16 @@
 - A pooled run that finishes while the pool scheduler renews its lease keeps
   its result. The scheduler logs `pool lease lost` and cancels a process only
   for a run that is still going.
+- A run whose process has exited, or whose command could not start, keeps
+  its outcome until the daemon records it. A `concurrencyPolicy: Replace`
+  launch, on this node or on a peer, leaves that run as it is, and a
+  `concurrencyPolicy: Forbid` launch starts its job.
+  `POST /jobs/{name}/cancel` and the MCP `cron_cancel_job` tool signal and
+  count only the runs that are still going. When none is, the request
+  returns `409` and the tool reports an error.
+- When two runs of a job overlap, the success of the earlier run leaves the
+  retries of the later scheduled run in place. A success cancels a retry
+  that is pending for the job.
 - The pool scheduler tries to admit a waiting entry only when the entry is
   at the head of the pool's queue and the pool's free slots can hold it. A
   pass over a pool whose head has to wait reads the pool's queue once,
@@ -85,35 +95,46 @@
   downstream ends `upstream_failed` or `skipped` in that pass, and an
   `all_done` task that the cascade unblocks starts in it.
 - The workflow retention pass lists a workflow's runs once, however many
-  runs it deletes. Under each run's lease it reads the recovery runs in one
-  store operation and the recovery batches in another, so it keeps a run
-  that a recovery in preparation or an open recovery batch references. It
-  also keeps the run when it can't read a recovery run or a recovery batch.
-  It then logs one warning that names the document and leaves the
-  workflow's runs for its next pass. A recovery document that stays
-  unreadable holds the runs for seven days after its last write, the
-  lifetime of a recovery batch. After that, the pass skips the document.
-- An artifact or XCom lookup reads the records that the daemon has not read
-  before and the record that it returns. The daemon remembers the name in
-  each of 16,384 records across all scopes. With more records than that, a
-  lookup reads again the oldest records of the scopes that were used least
-  recently. A lookup or an artifact listing that overlaps a new publish of
-  a name returns the version from before the publish or the one from after
-  it. A strict lookup raises for an unreadable record that it has not read,
-  and for the record that it returns.
+  runs it deletes, and deletes them in batches of up to 32. Under the
+  leases of a batch's runs it reads the recovery runs in one store
+  operation and the recovery batches in another, so it keeps a run that a
+  recovery in preparation or an open recovery batch references. A batch
+  that is still deleting after 30 seconds leaves the rest of its runs for
+  the next pass. The pass also keeps the runs when it can't read a recovery
+  run or a recovery batch. It then logs one warning that names the document
+  and leaves the workflow's runs for its next pass. A recovery document
+  that stays unreadable holds the runs for seven days after its last write,
+  the lifetime of a recovery batch. After that, the pass skips the
+  document.
+- An artifact or XCom lookup reads the records that the daemon has neither
+  published nor read before, and the record that it returns. The daemon
+  remembers the name in each of 16,384 records across all scopes. With more
+  records than that, a lookup reads again the oldest records of the scopes
+  that were used least recently. When the daemon also remembers names for
+  other scopes, the scope in use keeps at least the names of its newest
+  12,288 records. A lookup or an artifact listing that overlaps a new
+  publish of a name returns the version from before the publish or the one
+  from after it.
+  When the publish removes a version that the lookup has not read yet, the
+  lookup reads the scope again, up to three more times. If a publish
+  removes a version during every one of those reads, a strict lookup
+  raises, and any other lookup answers with the newest versions that it
+  read. A strict lookup also raises for an unreadable record that the
+  daemon has neither published nor read, and for the record that it
+  returns.
 - Publishing an artifact or an XCom value costs the same at any number of
   names in the scope. When the daemon publishes a name again, it removes
   the version that the new one replaces, if the daemon published that
-  version or read it in its last cleanup of the scope. A scope that one
-  node publishes to holds one record for each name, and state garbage
-  collection reclaims the replaced payloads. A version that another node
-  published stays until the scope's next cleanup, which runs after the
-  daemon has published to the scope as many times as the scope has names,
-  and at least eight times. Each further node that publishes to the scope
-  can add as many records as the scope has names. The daemon tracks the
-  newest version of 16,384 names across all scopes, and keeps the names of
-  the scopes that it published to most recently. A scope whose names it no
-  longer tracks holds up to about twice as many records as names. Workflow
+  version or read it in a lookup or in its last cleanup of the scope. A
+  scope that one node publishes to holds one record for each name, and
+  state garbage collection reclaims the replaced payloads. A version that
+  another node published and that the daemon has not read stays until the
+  scope's next cleanup, which runs after the daemon has published to the
+  scope as many times as the scope has names, and at least eight times.
+  Each further node that publishes to the scope can add as many records as
+  the scope has names. The daemon finds the version to remove in the same
+  16,384 records that it remembers for lookups. A scope whose records are
+  not among them holds up to about twice as many records as names. Workflow
   recovery's limit of 10,000 artifacts counts names, so superseded records
   do not count toward it.
 - Planning a workflow rerun from a task follows each dependency once.
@@ -137,8 +158,9 @@
   heatmap rows and sends that cap: the web dashboard requests `jobs=80`, and
   the terminal dashboard requests `jobs=80&sort=name`. Viewers that send the
   same `jobs` and `sort` values share one built response. The daemon holds
-  a shared response for up to eight pairs with `jobs` at most 256, and for
-  one pair with a larger cap that leaves jobs out.
+  a shared response for up to eight pairs with `jobs` at most 256. For a
+  larger cap that leaves jobs out, it builds the response for each
+  request.
 - The daemon compresses the dashboard page with zlib at level 9, whichever
   gzip backend is installed. It compresses the page on a worker thread for
   the first browser that accepts gzip and serves the stored result after
@@ -171,7 +193,8 @@
   launch and reaping, pool admission, workflow runs and retention, the HTTP,
   MCP, and gossip response paths, the terminal dashboard's frames, and the
   web dashboard's poll, tick, and keystroke paths. `benchmarks/bench.py`
-  names the cronstable package that it measures, and
+  names the cronstable package that it measures, and its child processes
+  import that package when `PYTHONPATH` gives it as a relative path.
   `benchmarks/compare.py` refuses a pairing whose two sides differ in the
   `isal` gzip backend. The count checks that pair with these metrics are in
   `tests/test_perf_invariants.py`.

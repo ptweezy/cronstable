@@ -2756,6 +2756,15 @@ class RunningJob:
         return self._stopped
 
     @property
+    def ended(self) -> bool:
+        """Whether this run has no process left to signal.
+
+        True once the run has :attr:`stopped`, and for a run whose process
+        never started.
+        """
+        return self._stopped or self.start_failed
+
+    @property
     def failed(self) -> bool:
         return self.fail_reason is not None
 
@@ -2794,7 +2803,12 @@ class RunningJob:
         try/except, so a raise here would take down the whole scheduler.
         The reaper still completes such a run through ``wait()``'s
         ``start_failed`` path, so nothing is left stranded.
+
+        A run that has ended is a NO-OP too. Its process is reaped, so its
+        group id can belong to an unrelated process.
         """
+        if self._stopped:
+            return
         if self._verifier is not None:
             self._terminated = True
             await self._verifier.cancel()

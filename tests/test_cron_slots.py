@@ -711,6 +711,7 @@ async def test_slotlease_slot_renewer_replace_request_cancels_instance(
     class _FakeRun:
         def __init__(self):
             self.replaced = False
+            self.ended = False
             self.cancelled = False
 
         async def cancel(self):
@@ -740,6 +741,25 @@ async def test_slotlease_slot_renewer_replace_request_cancels_instance(
     assert run.replaced is True and run.cancelled is True
 
 
+async def test_slotlease_replace_request_leaves_an_ended_instance_alone():
+    # An instance that has ended keeps its outcome: the request neither
+    # marks it replaced nor cancels it.
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+
+    class _EndedRun:
+        replaced = False
+        ended = True
+
+        async def cancel(self):
+            raise AssertionError("cancelled an instance that has ended")
+
+    run = _EndedRun()
+    cron.running_jobs["s"] = [run]
+    cron._cancel_replaced_instances("s", "peerZ")
+    assert run.replaced is False
+    assert not cron._replace_cancel_tasks
+
+
 async def test_slotlease_slot_renewer_replace_cancel_runs_in_background(
     monkeypatch, caplog
 ):
@@ -755,6 +775,7 @@ async def test_slotlease_slot_renewer_replace_cancel_runs_in_background(
     class _SlowRun:
         def __init__(self):
             self.replaced = False
+            self.ended = False
             self.cancel_calls = 0
             self.config = cron.cron_jobs["s"]
 
