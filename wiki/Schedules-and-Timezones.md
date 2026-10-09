@@ -174,7 +174,7 @@ Resolution order (`timezone` wins):
 
 The resolved value is a `datetime.tzinfo` (or `None`) stored on the job and passed to `get_now(job.timezone)` when the schedule is tested. Because `utc` is `true` by default, **schedules are interpreted in UTC unless you opt out.**
 
-Time zone names are resolved through the standard-library `zoneinfo`, with the `tzdata` package providing the database. Because cronstable depends on `tzdata>=2026.4`, resolution works on minimal and distroless images that lack a system zoneinfo database. An invalid time zone name raises `ConfigError`.
+Time zone names are resolved through the standard-library `zoneinfo`, with the `tzdata` package providing the database. Because cronstable depends on `tzdata>=2026.5`, resolution works on minimal and distroless images that lack a system zoneinfo database. An invalid time zone name raises `ConfigError`.
 
 Local time:
 

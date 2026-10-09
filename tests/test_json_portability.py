@@ -237,8 +237,6 @@ def test_orjson_is_installed_where_a_wheel_exists():
     # or its markers stop matching, instead of degrading back to a skip.
     if sys.platform == "win32" and platform.machine().upper() == "ARM64":
         pytest.skip("no orjson wheel for win-arm64; it builds only with Rust")
-    if sys.version_info >= (3, 15):
-        pytest.skip("orjson may not have built for this Python yet")
     if sysconfig.get_config_var("Py_GIL_DISABLED"):
         pytest.skip("orjson does not support free-threaded Python")
     assert importlib.util.find_spec("orjson") is not None, (

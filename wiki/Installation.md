@@ -8,7 +8,7 @@ method. For Windows-specific behavior, see [running on Windows](Running-on-Windo
 
 | Requirement | Value |
 | --- | --- |
-| Python (pip/pipx) | `>= 3.10` (`requires-python = ">=3.10"`). Versions 3.10, 3.11, 3.12, 3.13, and 3.14 are supported and tested. For an older Python, use the standalone binary instead. |
+| Python (pip/pipx) | `>= 3.10` (`requires-python = ">=3.10"`). Versions 3.10, 3.11, 3.12, 3.13, 3.14, and 3.15 are supported and tested. For an older Python, use the standalone binary instead. |
 | Operating system | Linux, macOS, and Windows. `cronstable/platform.py` isolates OS-specific behavior. `grp` and `pwd` are imported only on POSIX. A few features differ on Windows; see [running on Windows](Running-on-Windows). |
 | CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), for both the container image and the prebuilt binaries. The prebuilt binaries also cover `armv6` and `riscv64` and `loong64` (LoongArch) in both libcs, plus `mips64le` and `armel` (glibc). macOS: `amd64` and `arm64`. Windows: `amd64` (x64), `arm64` (ARM64) and `i686`. Also FreeBSD (`amd64`, `arm64`), OpenBSD, NetBSD and illumos (`amd64`). Every amd64 release binary/package and Docker distro has an `amd64v3` counterpart, recommended for compatible CPUs; `amd64` is the compatibility build; see [CPU requirements](#amd64v3-cpu-requirements). |
 
@@ -25,10 +25,10 @@ Installing the `cronstable` distribution pulls in the following, taken from
 | --- | --- |
 | `strictyaml` | `>=1.7.3,<2` |
 | `aiohttp` | `>=3.14.3,<4` |
-| `sentry-sdk` | `>=2.70.0,<3` |
+| `sentry-sdk` | `>=2.71.0,<3` |
 | `aiosmtplib` | `>=5.1.3,<6` |
 | `jinja2` | `>=3.1.6,<4` |
-| `tzdata` | `>=2026.4` |
+| `tzdata` | `>=2026.5` |
 | `psutil` | `>=7.2.2` |
 
 `tzdata` ships the IANA time-zone database so `zoneinfo` resolves time zones on
@@ -209,6 +209,12 @@ On a 32-bit userland with a 64-bit kernel, install the push extra as
 `linux32 pip install "cronstable[push]"`. Under `linux32`, `uname` reports
 the 32-bit machine, so pip skips `cryptography`, which has no 32-bit wheel,
 rather than failing to build it from source.
+
+On Python 3.15, the `speedups` extra skips `isal`, which has no wheel for
+that version, so the daemon compresses responses with the standard library's
+`zlib`. The `orjson` wheels for Python 3.15 on glibc Linux require glibc 2.39
+or later, which Debian 13 and Ubuntu 24.04 provide. On an older glibc, pip
+builds `orjson` from source, which requires a Rust toolchain.
 
 ## Install using pipx
 

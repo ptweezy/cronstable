@@ -131,7 +131,7 @@ pkgs.python3Packages
       });
   tzdata =
     let
-      version = "2026.4";
+      version = "2026.5";
     in
     if pkgs.lib.versionAtLeast pkgs.python3Packages.tzdata.version version then
       pkgs.python3Packages.tzdata
@@ -141,7 +141,7 @@ pkgs.python3Packages
         src = pkgs.fetchPypi {
           pname = "tzdata";
           inherit version;
-          hash = "sha256-8bi9Nl2NIQxVNT9Nf41thWHAulDXBLcA0ZWpQku6DXk=";
+          hash = "sha256-jMc8Cgv8p9v6WSNdYLLv+CIx3uM/U9IG2xrNkXPPwKc=";
         };
         doCheck = false;
         meta = old.meta // {

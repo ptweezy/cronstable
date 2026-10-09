@@ -7,6 +7,7 @@ checks cannot go unnoticed.
 """
 
 import configparser
+import itertools
 import os
 import re
 
@@ -113,24 +114,95 @@ def test_the_live_backend_lane_cannot_pass_hollow():
     assert 'totals["skipped"] == 0' in run["run"]
 
 
+def _expand(pattern):
+    """Expand a tox generative name such as ``py3{14,15}t{,-posix}``."""
+    parts = re.split(r"\{([^}]*)\}", pattern)
+    choices = [
+        part.split(",") if index % 2 else [part]
+        for index, part in enumerate(parts)
+    ]
+    return {"".join(combo) for combo in itertools.product(*choices)}
+
+
 def test_the_test_envs_install_the_dev_extra():
     # configparser reads each section alone, so `[testenv]` here is the
     # base that every env without its own `extras` inherits.
-    base = _tox()["testenv"]
-    assert base["extras"].split() == ["!py314t:", "dev"]
-    # orjson has no free-threaded build, so 3.14t swaps the extra for the
-    # generated list without it. Both keys carry the factor: dropping
-    # either one installs orjson there or leaves the env with no test deps.
-    assert base["deps"].split() == [
-        "py314t:",
-        "-rrequirements/dev-freethreaded.txt",
+    tox = _tox()
+    assert tox["testenv"]["extras"].split() == ["dev"]
+    # orjson has no free-threaded build, so the free-threaded envs swap the
+    # extra for the generated list without it. Their section sets both
+    # keys: dropping `extras` installs orjson there, and dropping `deps`
+    # leaves the envs with no test deps.
+    (section,) = [
+        name for name in tox.sections() if re.match(r"testenv:py3.*t\{", name)
+    ]
+    assert tox[section]["extras"].strip() == ""
+    assert tox[section]["deps"].split() == [
+        "-rrequirements/dev-freethreaded.txt"
     ]
     assert os.path.exists(
         os.path.join(ROOT, "requirements", "dev-freethreaded.txt")
     )
     # mypy installs the package to resolve the runtime deps and nothing
     # else; inheriting the extra would type-check against the dev tools.
-    assert _tox()["testenv:mypy"]["extras"].strip() == ""
+    assert tox["testenv:mypy"]["extras"].strip() == ""
+
+
+def test_every_free_threaded_ci_cell_has_a_tox_env_without_orjson():
+    # The shared tox steps derive the env from the matrix version (3.15t
+    # runs py315t-posix). A version with no env in the free-threaded
+    # section would fall back to [testenv], whose dev extra includes orjson.
+    (section,) = [
+        name
+        for name in _tox().sections()
+        if re.match(r"testenv:py3.*t\{", name)
+    ]
+    envs = _expand(section.partition(":")[2])
+    jobs = _load_workflow("release.yml")["jobs"]
+    cells = [
+        version
+        for job in ("tox", "tox-experimental")
+        for version in jobs[job]["strategy"]["matrix"]["python"]
+        if version.endswith("t")
+    ]
+    assert cells, "no free-threaded cell is left in the test matrix"
+    for version in cells:
+        assert "py{}-posix".format(version.replace(".", "")) in envs, version
+    run = next(
+        step["run"]
+        for step in jobs["tox"]["steps"]
+        if step.get("name", "").startswith("Test free-threaded Python")
+    )
+    assert run == 'tox -e "py${PYTHON_VERSION//./}-posix"'
+
+
+def test_the_unit_matrix_covers_every_python_the_metadata_declares():
+    # A classifier is a support claim, so each declared version needs a
+    # gating row on every desktop OS and a place in a bare `tox`.
+    declared = {
+        classifier.rpartition(" ")[2]
+        for classifier in _pyproject()["project"]["classifiers"]
+        if re.fullmatch(
+            r"Programming Language :: Python :: 3\.\d+", classifier
+        )
+    }
+    assert declared, "the classifier detector went stale"
+    matrix = _load_workflow("release.yml")["jobs"]["tox"]["strategy"]["matrix"]
+    assert set(matrix["python"]) == declared
+    # split the envlist on the commas outside its braces
+    in_tox = set()
+    for entry in re.split(r",(?![^{]*\})", _tox()["tox"]["envlist"]):
+        in_tox |= _expand(entry.strip())
+    for version in declared:
+        for arm in ("windows", "posix"):
+            env = "py{}-{}".format(version.replace(".", ""), arm)
+            assert env in in_tox, env
+    oldest = re.search(
+        r">=\s*([\d.]+)", _pyproject()["project"]["requires-python"]
+    )[1]
+    assert oldest == min(
+        declared, key=lambda version: tuple(map(int, version.split(".")))
+    )
 
 
 def test_the_chromium_steps_install_the_playwright_the_dev_extra_names():
