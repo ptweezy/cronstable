@@ -212,6 +212,79 @@ sleep() { echo "DELAY:$1"; }
 
 
 @pytest.mark.parametrize(
+    "has_openssl35,version,ok",
+    [
+        (True, "OpenSSL 3.5.8 (stub)", True),
+        (False, "OpenSSL 3.5.9 (stub)", True),
+        (False, "OpenSSL 4.0.1 (stub)", True),
+        (False, "OpenSSL 3.0.22 (stub)", False),
+    ],
+)
+def test_freebsd_installs_the_openssl_35_port_under_either_name(
+    has_openssl35, version, ok
+):
+    # FreeBSD moved security/openssl35 to security/openssl, and each
+    # repository follows on its own schedule. A fixed name fails the
+    # install in one repository or installs OpenSSL 3.0 in another, where
+    # the soft cryptography build would drop ML-KEM without failing.
+    shell = shutil.which("bash")
+    if os.name == "nt":
+        shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+    if shell is None or not Path(shell).is_file():
+        pytest.skip("Bash required for the FreeBSD package setup harness")
+    job = workflow()["jobs"]["binaries-freebsd"]
+    step = next(
+        s
+        for s in job["steps"]
+        if s.get("uses", "").startswith("vmactions/freebsd-vm@")
+    )
+    prelude = """
+pkg() {
+    case "$1" in
+        rquery)
+            [ "$3" = openssl35 ] && [ "$HAS_OPENSSL35" = 1 ] && echo "$3"
+            ;;
+        install)
+            shift
+            echo "INSTALL:$*"
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+}
+openssl() { echo "$OPENSSL_VERSION"; }
+"""
+    for row in job["strategy"]["matrix"]["include"]:
+        assert "openssl" not in row["pkgs"], row
+        prepare = (
+            step["with"]["prepare"]
+            .replace("${{ matrix.pkgs }}", row["pkgs"])
+            .replace("/usr/local/bin/openssl", "openssl")
+        )
+        result = subprocess.run(
+            [shell, "-c", prelude + prepare],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "HAS_OPENSSL35": str(int(has_openssl35)),
+                "OPENSSL_VERSION": version,
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert (result.returncode == 0) == ok, result.stdout + result.stderr
+        name = "openssl35" if has_openssl35 else "openssl"
+        assert result.stdout.splitlines() == [
+            f"INSTALL:-y {row['pkgs']} {name}"
+        ]
+        if not ok:
+            assert "must be 3.5 or later" in result.stderr
+            assert version in result.stderr
+
+
+@pytest.mark.parametrize(
     "name,job,field",
     [
         ("release", "binaries-container", "platform"),
