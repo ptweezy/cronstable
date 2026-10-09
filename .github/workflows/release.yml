@@ -339,8 +339,17 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
+      # Pull first, with retries: `docker run` pulls a missing image once, and
+      # a registry error here skips every test job, because they all need
+      # this one. NOT pull_base: a third-party image; see the binaries job.
       - name: Validate workflow syntax
-        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -shellcheck='' -pyflakes=''
+        env:
+          ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12
+        run: |
+          set -euo pipefail
+          . .github/scripts/retry.sh
+          retry 5 docker pull "$ACTIONLINT_IMAGE"
+          docker run --rm -v "$PWD:/repo" -w /repo "$ACTIONLINT_IMAGE" -shellcheck='' -pyflakes=''
       # The repository is LF-only (.gitattributes). Fail on any tracked blob
       # with CRLF or mixed endings that slipped past `text=auto`.
       - name: Guard against CRLF line endings
