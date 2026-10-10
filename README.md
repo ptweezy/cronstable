@@ -3,10 +3,10 @@
 [![PyPI version](https://img.shields.io/pypi/v/cronstable.svg?logo=pypi&logoColor=white&color=0073b7)](https://pypi.org/project/cronstable/)
 [![GitHub release](https://img.shields.io/github/v/release/ptweezy/cronstable?logo=github&color=8a2be2)](https://github.com/ptweezy/cronstable/releases/latest)
 [![App Store](https://img.shields.io/itunes/v/6801933039?logo=apple&logoColor=white&label=App%20Store&color=0d96f6)](https://apps.apple.com/app/cronstable/id6801933039)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ptweezy/cronstable/blob/main/LICENSE)
 
 [![PyPI status](https://img.shields.io/pypi/status/cronstable.svg?color=2ea44f)](https://pypi.org/project/cronstable/)
 [![Coverage](https://img.shields.io/codecov/c/github/ptweezy/cronstable?logo=codecov&logoColor=white&color=f01f7a)](https://codecov.io/gh/ptweezy/cronstable)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ptweezy/cronstable/blob/main/LICENSE)
 
 [![Release downloads](https://img.shields.io/github/downloads/ptweezy/cronstable/total?logo=github&label=binary%20downloads&color=fb8c00)](https://github.com/ptweezy/cronstable/releases)
 [![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fcronstable-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/cronstable/pkgs/container/cronstable)
