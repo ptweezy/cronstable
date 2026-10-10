@@ -738,6 +738,17 @@ class PoolScheduler:
                 with_retries=payload.get("withRetries", True),
                 pool_ticket=ticket,
             )
+            if not launched and key in self.held:
+                # Declined: the entry goes back to the head. No wake,
+                # because the next tick would decline it again at once.
+                # The except arm repeats a requeue that is interrupted.
+                await self.finish(
+                    ticket,
+                    "queued",
+                    "waiting for concurrency admission",
+                    wake=False,
+                )
+                return
         except BaseException:
             await self.finish(
                 ticket, "queued", "launch interrupted", wake=False
@@ -746,17 +757,8 @@ class PoolScheduler:
         if key not in self.held:
             # The launch closed the entry itself.
             queue.left(entry)
-        elif launched:
-            queue.left(entry, running=True)
         else:
-            # Declined: the entry goes back to the head. No wake, because
-            # the next tick would decline it again at once.
-            await self.finish(
-                ticket,
-                "queued",
-                "waiting for concurrency admission",
-                wake=False,
-            )
+            queue.left(entry, running=True)
 
     async def _retire_tasks(self, pool, body):
         """Retire orphaned claims, including failures nobody can observe.

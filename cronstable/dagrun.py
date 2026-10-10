@@ -3484,13 +3484,22 @@ class DagScheduler:
         it stops taking leases after a quarter of the TTL, so the runs it
         holds still have time for the read and their deletes.  The runs
         it leaves wait for the next pass.
+
+        When a release fails, that lease lapses with its TTL and the batch
+        goes on deleting.  It releases the leases behind the failure
+        together at the end, so a store that fails every release costs the
+        batch two timeouts.
         """
         holder = self._cron._proc_token + ":gc:" + os.urandom(12).hex()
 
-        async def release(lease: Lease) -> None:
-            await asyncio.wait_for(
-                backend.release_lease(lease), STATE_OP_TIMEOUT
-            )
+        async def release(lease: Lease) -> bool:
+            try:
+                await asyncio.wait_for(
+                    backend.release_lease(lease), STATE_OP_TIMEOUT
+                )
+            except Exception:  # noqa: BLE001 - the TTL frees it regardless
+                return False
+            return True
 
         # (lease, when its delete must have started, run key, run id)
         held: list[tuple[Lease, float, str, Any]] = []
@@ -3513,14 +3522,16 @@ class DagScheduler:
             if not held:
                 return
             referenced = await self._referenced_runs(backend, name)
+            releasing = True
             for entry in list(held):
                 lease, deadline, run_key, run_id = entry
                 if run_key not in referenced and time.monotonic() < deadline:
                     await self._delete_run_locked(
                         backend, name, run_key, run_id
                     )
-                held.remove(entry)
-                await release(lease)
+                if releasing:
+                    held.remove(entry)
+                    releasing = await release(lease)
         finally:
             await asyncio.gather(*(release(entry[0]) for entry in held))
 

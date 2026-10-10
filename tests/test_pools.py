@@ -556,6 +556,39 @@ async def test_declined_launch_leaves_the_service_asleep(
     assert pools._wake.is_set()
 
 
+async def test_declined_launch_is_requeued_when_its_requeue_is_interrupted(
+    dag_cron, monkeypatch
+):
+    # A tick that is interrupted while it requeues a declined entry hands
+    # the claim back, and the entry is queued again at once.
+    cron = await make(dag_cron, monkeypatch)
+    pools = cron._pools
+    await cron.maybe_launch_job(cron.cron_jobs["one"])
+
+    async def decline(job, **kwargs):
+        return False
+
+    reasons = []
+    finish = pools.finish
+
+    async def interrupted_once(ticket, state, reason, **kwargs):
+        reasons.append(reason)
+        if len(reasons) == 1:
+            raise asyncio.CancelledError
+        return await finish(ticket, state, reason, **kwargs)
+
+    monkeypatch.setattr(cron, "maybe_launch_job", decline)
+    monkeypatch.setattr(pools, "finish", interrupted_once)
+    with pytest.raises(asyncio.CancelledError):
+        await pools._tick_pool("database")
+    assert reasons == [
+        "waiting for concurrency admission",
+        "launch interrupted",
+    ]
+    assert not pools.held
+    assert (await pools.snapshot())[0]["queued"] == 1
+
+
 async def test_service_loop_waits_out_its_interval_on_a_declined_head(
     dag_cron, monkeypatch
 ):

@@ -5179,6 +5179,39 @@ async def test_delete_run_batch_stops_deleting_at_half_the_lease_ttl(
     assert await backend.list_document_keys("dagrun/lin") == []
 
 
+async def test_delete_run_batch_deletes_past_a_release_that_fails(
+    monkeypatch, dag_cron
+):
+    # A lease that cannot be released lapses with its TTL.  The batch
+    # deletes the runs behind it and releases their leases at the end.
+    cron = await dag_cron(_LINEAR)
+    backend = cron.state_backend
+    keys = await _seed_terminal_runs(backend, "lin", 3)
+    events = []
+    real_release = backend.release_lease
+    real_delete = backend.delete_document
+
+    async def release(lease):
+        events.append("release")
+        if events.count("release") == 1:
+            raise OSError("store went away")
+        return await real_release(lease)
+
+    async def delete(namespace, key):
+        events.append("delete")
+        return await real_delete(namespace, key)
+
+    monkeypatch.setattr(backend, "release_lease", release)
+    monkeypatch.setattr(backend, "delete_document", delete)
+    await cron._dag._delete_run_batch(
+        backend, "lin", [(key, None) for key in keys]
+    )
+    assert events == ["delete", "release", "delete", "delete"] + [
+        "release"
+    ] * 2
+    assert await backend.list_document_keys("dagrun/lin") == []
+
+
 def _slow_lease_clock(monkeypatch, backend):
     """A clock for dagrun that each lease acquire moves on by an eighth
     of the lease TTL."""

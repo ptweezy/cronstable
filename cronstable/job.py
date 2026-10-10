@@ -2160,7 +2160,7 @@ class JobRetryState:
         self.pool_retry: dict[str, str] | None = None
         # True from when the scheduled fire that installed this ladder is
         # dropped until a launch takes the ladder up (see
-        # Cron.handle_job_success).
+        # Cron._unclaimed_ladder).
         self.unclaimed = False
 
     def next_delay(self) -> float:

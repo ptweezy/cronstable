@@ -11054,9 +11054,17 @@ class Cron:
                 "Job %s could not enter pool %s: %s", job.name, job.pool, ex
             )
             return
-        if not accepted and retry_state is not None:
-            # The fire was dropped, so no launch carries its ladder (see
-            # handle_job_success).
+        if (
+            not accepted
+            and retry_state is not None
+            and not any(
+                running.retry_state is retry_state
+                for running in self.running_jobs.get(job.name) or ()
+            )
+        ):
+            # The fire was dropped.  Its ladder is unclaimed unless a
+            # launch that held the launch lock ahead of the fire took the
+            # ladder up (see _unclaimed_ladder).
             retry_state.unclaimed = True
 
     async def maybe_launch_job(
@@ -11097,15 +11105,27 @@ class Cron:
                 job, with_retries, pool_ticket
             )
 
-    def _take_retry_ladder(self, name: str) -> JobRetryState | None:
+    def _take_retry_ladder(
+        self, name: str
+    ) -> tuple[JobRetryState | None, JobRetryState | None]:
         """The job's retry ladder, for a launch that will carry it.
 
-        Taking it up clears ``unclaimed``, which a dropped fire sets.
+        Taking it up clears ``unclaimed``, which a dropped fire sets.  The
+        second value is the ladder if the launch found it unclaimed, for
+        :meth:`_hand_back_retry_ladder`, and ``None`` otherwise.
         """
         state = self.retry_state.get(name)
-        if state is not None:
-            state.unclaimed = False
-        return state
+        if state is None or not state.unclaimed:
+            return state, None
+        state.unclaimed = False
+        return state, state
+
+    @staticmethod
+    def _hand_back_retry_ladder(reclaimed: JobRetryState | None) -> None:
+        """Mark a dropped fire's ladder unclaimed again, for a launch that
+        took the ladder up and registered no run."""
+        if reclaimed is not None:
+            reclaimed.unclaimed = True
 
     async def _launch_job_locked(
         self,
@@ -11165,10 +11185,10 @@ class Cron:
             if not await self._claim_cluster_slot(job):
                 return False
         logger.info("Starting job %s", job.name)
-        retry_state = (
+        retry_state, reclaimed = (
             self._take_retry_ladder(job.name)
             if with_retries and pool_ticket is None
-            else None
+            else (None, None)
         )
         if pool_ticket is not None and with_retries:
             saved = pool_ticket.payload.get("retry")
@@ -11217,6 +11237,7 @@ class Cron:
                     self._pools.check_ticket(pool_ticket)
                 await running_job.start()
         except BaseException:
+            self._hand_back_retry_ladder(reclaimed)
             # start() handles expected spawn failures itself; anything
             # escaping here never registers, so the slot claim must be
             # handed back or its refcount (and renew task) would outlive
@@ -13636,6 +13657,10 @@ class Cron:
                     "Job %s: deferring its retry guard check", job.config.name
                 )
         if state is None or state.cancelled:
+            # No retry follows this run.  The ladder of a dropped fire
+            # ends with it, as with a success (see _unclaimed_ladder).
+            if self._unclaimed_ladder(job.config.name):
+                await self.cancel_job_retries(job.config.name)
             self.metrics.job_permanent_failure(job.config.name)
             await job.report_permanent_failure()
             return
@@ -14706,19 +14731,32 @@ class Cron:
             ),
         )
 
+    def _unclaimed_ladder(self, name: str) -> bool:
+        """Whether the job's retry ladder has no launch to carry it.
+
+        A dropped fire leaves its ladder unclaimed until a launch takes
+        the ladder up.  A Replace pursuit is a launch still to come, so
+        the ladder waits for it.
+        """
+        state = self.retry_state.get(name)
+        return (
+            state is not None
+            and state.unclaimed
+            and name not in self._slot_pursuits
+        )
+
     async def handle_job_success(self, job: RunningJob) -> None:
         name = job.config.name
         state = self.retry_state.get(name)
         # A success ends the job's retry sequence.  A ladder with no retry
         # armed belongs to a launch that has yet to finish, so only that
         # launch's own run ends it.  The ladder of a dropped fire has no
-        # launch and ends here, unless a Replace pursuit is still to make
-        # one.
+        # launch and ends here (see _unclaimed_ladder).
         if (
             state is None
             or state is job.retry_state
             or state.count > 0
-            or (state.unclaimed and name not in self._slot_pursuits)
+            or self._unclaimed_ladder(name)
         ):
             await self.cancel_job_retries(name, settle="succeeded")
         await job.report_success()

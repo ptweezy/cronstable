@@ -617,6 +617,98 @@ async def test_success_leaves_a_dropped_fires_ladder_to_a_replace_pursuit():
     assert ladder.cancelled
 
 
+async def test_dropped_fire_leaves_its_ladder_to_the_launch_that_took_it():
+    # A launch that holds the launch lock ahead of a scheduled fire takes
+    # up the ladder that the fire installed.  Forbid then drops the fire,
+    # and the ladder stays with the run that carries it.
+    cron = cronstable.cron.Cron(None, config_yaml=_ended_retry_job("Forbid"))
+    job = cron.cron_jobs["test"]
+    async with cron._launch_locks["test"]:
+        fire = asyncio.create_task(cron.launch_scheduled_job(job))
+        await _wait_until(lambda: "test" in cron.retry_state)
+        ladder = cron.retry_state["test"]
+        assert await cron._launch_job_locked(job, True)
+    await asyncio.wait_for(fire, 20)
+    (ahead,) = cron.running_jobs["test"]
+    try:
+        assert ahead.retry_state is ladder and not ladder.unclaimed
+
+        async def report_success():
+            pass
+
+        earlier = SimpleNamespace(
+            config=job, retry_state=None, report_success=report_success
+        )
+        await cron.handle_job_success(earlier)
+        assert cron.retry_state.get("test") is ladder
+        assert not ladder.cancelled
+    finally:
+        await asyncio.wait_for(ahead.wait(), 20)
+
+
+async def test_launch_that_never_registers_hands_the_ladder_back(monkeypatch):
+    # A launch takes up the ladder of a dropped fire and is interrupted
+    # before its run registers.  No run carries the ladder, so it is
+    # unclaimed again and the next success ends it.
+    cron = cronstable.cron.Cron(None, config_yaml=_ended_retry_job("Forbid"))
+    job = cron.cron_jobs["test"]
+    await cron.launch_scheduled_job(job)
+    first = cron.running_jobs["test"][0]
+    await cron.launch_scheduled_job(job)
+    dropped = cron.retry_state["test"]
+    assert dropped.unclaimed
+    await asyncio.wait_for(first.wait(), 20)
+
+    async def interrupted(job, retry_state, **kwargs):
+        assert retry_state is dropped and not dropped.unclaimed
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(cron, "_prepare_job_api_run", interrupted)
+    with pytest.raises(asyncio.CancelledError):
+        await cron.maybe_launch_job(job)
+    assert cron.running_jobs["test"] == [first]
+    assert cron.retry_state["test"] is dropped and dropped.unclaimed
+    await cron._handle_finished_job(first)
+    await cron._drain_completions()
+    assert "test" not in cron.retry_state
+    assert dropped.cancelled
+
+
+async def test_permanent_failure_ends_the_ladder_of_a_dropped_fire():
+    # A failed run with no retry to arm ends the ladder of a dropped fire,
+    # as a success does.  The ladder waits while a Replace pursuit is
+    # pending.
+    cron = cronstable.cron.Cron(None, config_yaml=_ended_retry_job("Replace"))
+    ladder = JobRetryState(60, 1, 60)
+    ladder.unclaimed = True
+    cron.retry_state["test"] = ladder
+    reported = []
+
+    async def report_failure():
+        reported.append("failure")
+
+    async def report_permanent_failure():
+        reported.append("permanent")
+
+    job = SimpleNamespace(
+        config=cron.cron_jobs["test"],
+        retry_state=None,
+        stdout=None,
+        stderr=None,
+        report_failure=report_failure,
+        report_permanent_failure=report_permanent_failure,
+    )
+    cron._slot_pursuits["test"] = asyncio.get_running_loop().create_future()
+    await cron.handle_job_failure(job)
+    assert cron.retry_state.get("test") is ladder
+    assert not ladder.cancelled
+    del cron._slot_pursuits["test"]
+    await cron.handle_job_failure(job)
+    assert "test" not in cron.retry_state
+    assert ladder.cancelled
+    assert reported == ["failure", "permanent"] * 2
+
+
 async def test_launch_beside_an_ended_instance_opens_its_inflight_record(
     monkeypatch,
 ):
