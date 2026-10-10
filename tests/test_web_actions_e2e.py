@@ -94,6 +94,32 @@ def test_run_button_starts_the_job(browser, tmp_path):
         assert last["outcome"] == "success"
 
 
+def test_run_button_reports_a_start_that_waits_for_its_cluster_slot(
+    browser, tmp_path
+):
+    with e2e.Daemon(tmp_path, auth="full") as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            token=e2e.FULL_TOKEN,
+            prefs={"pollMs": 1000},
+        ) as page:
+            # the daemon's answer when another node holds the job's
+            # cluster slot under concurrencyPolicy: Replace
+            page.faults.json(
+                "/jobs/alpha-ok/start",
+                {"started": "alpha-ok", "pending": True},
+                method="POST",
+            )
+            _click(page, '#rows [data-run="alpha-ok"]')
+            assert "info" in e2e.wait_toast(
+                page,
+                "alpha-ok starts when another node yields its cluster slot",
+            )
+            # nothing started, so the row keeps its status
+            assert e2e.row_status(page, "alpha-ok") == "Pending"
+
+
 def test_run_failure_shows_in_row_verdict_and_title(browser, tmp_path):
     with e2e.Daemon(tmp_path) as daemon:
         with e2e.open_page(

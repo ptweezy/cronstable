@@ -1132,11 +1132,12 @@ _dag_schema_dict = {
 # Bearer-token scopes for the web control API (web.authTokens[].scopes):
 # `view` = read-only GETs; `control` = mutating POSTs; `approve` = the DAG
 # approval decision only; `params` = choosing run parameter values on a
-# trigger or a backfill, which also needs `control` for the route.
+# trigger or a backfill, or reusing chosen ones in a recovery, each of
+# which also needs `control` for the route.
 # `control`/`approve`/`params` imply `view`; the scalar web.authToken is
 # all-scopes. Enforcement lives in
 # cronstable.cron.Cron._make_auth_middleware / _required_web_scope, and for
-# `params` in the trigger and backfill handlers.
+# `params` in cronstable.params (for_run, check_reuse).
 WEB_TOKEN_SCOPES = ("view", "control", "approve", "params")
 
 CONFIG_SCHEMA = EmptyDict() | Map(
@@ -5278,15 +5279,28 @@ def _validate_dags(config: CronstableConfig) -> None:
     from cronstable import dag
 
     for d in config.dags:
+        # The advised rule needs BRANCHING_PARAMS_ENGINE_LEVEL. Taking the
+        # advice raises only a workflow below that level, so only its line
+        # names the level.
+        level_note = ""
+        if d.spec.engine < dag.BRANCHING_PARAMS_ENGINE_LEVEL:
+            level_note = (
+                ". That rule needs run engine level {}, so upgrade every "
+                "node that shares the state store first".format(
+                    dag.BRANCHING_PARAMS_ENGINE_LEVEL
+                )
+            )
         for task_id, upstreams in dag.skippable_joins(d.spec):
             logger.warning(
                 "dag %r: task %r uses triggerRule all_success and joins "
-                "upstreams that can end skipped (%s), so it is skipped "
-                "whenever one of them is. To run it after the branch that "
-                "ran, set triggerRule: none_failed_min_one_success",
+                "upstreams that can end skipped (%s), so it is skipped when "
+                "one of them is skipped and the rest of its upstreams "
+                "succeed. If they are alternative branches, set "
+                "triggerRule: none_failed_min_one_success%s",
                 d.name,
                 task_id,
                 ", ".join(upstreams),
+                level_note,
             )
 
 

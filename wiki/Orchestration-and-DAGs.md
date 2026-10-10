@@ -201,8 +201,14 @@ XCom list (Airflow's `.expand()`):
 When `list-work` succeeds, the scheduler reads its `items` list and materializes
 `process#0`, `process#1`, `process#2`, each with its own state, retries, and
 XCom, and its item in `$CRONSTABLE_DAG_MAP_ITEM`. A downstream task that
-lists `process` in `dependsOn` waits for **all** the mapped instances (fan-in). An
-empty list resolves the mapped task to `success` immediately.
+lists `process` in `dependsOn` waits for **all** the mapped instances (fan-in).
+
+An empty list creates no instances, so the mapped task follows its
+`triggerRule` as a single task does. It waits for every upstream. Where the
+[trigger rule table](#tasks-and-dependencies) says a task runs, the mapped
+task resolves to `success`, and otherwise it ends `skipped` or
+`upstream_failed`. In this example, `process` has one upstream, so an empty
+list resolves it to `success` as soon as `list-work` succeeds.
 
 The expanded item set is recorded **once** in the dag_run and never recomputed,
 so a crash-resumed run reconstructs the identical set of mapped instances
@@ -345,9 +351,11 @@ Choosing the join's rule:
   skips it when every branch skipped. Use it for a join below alternative
   branches.
 - `none_failed` also runs the join when every branch skipped.
-- `all_success`, the default, skips the join whenever one branch skips. At
-  load, cronstable logs a warning that names an `all_success` task with two
-  or more upstreams that can end `skipped`.
+- `all_success`, the default, skips the join when one branch skips and no
+  branch fails. At load, cronstable logs a warning that names an
+  `all_success` task with two or more upstreams that can end `skipped`. It
+  omits the warning when it detects that those upstreams only ever skip
+  together, as two tasks below one `onReject: skip` gate do.
 
 A branch longer than one task needs no extra keys. A skipped task cascades
 `skipped` to its `all_success` successors, and the join's rule ends the
@@ -683,6 +691,12 @@ A scheduled DAG follows the
 (`skip` / `run-once` / `run-all`) and `startingDeadlineSeconds` bound how many
 missed logical dates a restart replays, capped like a job's catch-up.
 
+Catch-up counts the missed dates from the latest logical date among the runs
+the schedule created, which are its scheduled runs and its catch-up runs. A
+manual run, a backfill, and a recovery leave that reference point where it is,
+whatever logical date they carry. A DAG with no retained scheduled or catch-up
+run has no reference point, so it schedules forward.
+
 `catchupJitterSeconds` spreads the replays, with the same checkpointed
 at-least-once resume the job engine has. The owed watermark goes into a
 `catchup-dag/<dag>` stream (the twin of the job's `catchup/<job>`) before the
@@ -766,12 +780,23 @@ features needs.
 - A node refuses to [recover](Workflow-Recovery) a run above its level.
 - Each node records its level as `dagEngine` in its
   [manifest](Durable-State#garbage-collection-and-manifests). A manifest with
-  no `dagEngine` is at level 1, and the build that wrote it advances any run
-  under the rules it knows.
-- When another live host's newest manifest is below the level a loaded DAG
-  needs, the node logs a warning that names the host, and the DAG's entry in
-  `GET /dags` lists the same text under `fleetWarnings`. A host counts as
-  live while its newest manifest is less than 12 hours old.
+  no `dagEngine` is at level 1, and so is a host that has no manifest. A build
+  at level 1 advances any run under the rules it knows.
+- When another live host is below the level a loaded DAG needs, the node logs
+  a warning that names the host, and the DAG's entry in `GET /dags` lists the
+  same text under `fleetWarnings`. A host counts as live for 12 hours after
+  its newest sign of life on the store: a manifest, or a task that it started
+  in a run of a DAG the node loads.
+- A build at level 1 refuses a configuration that uses a level 2 feature. It
+  keeps running the DAGs that it loaded earlier and records no manifest until
+  it loads a configuration again. Once its last manifest is 12 hours old, only
+  the tasks that it starts keep it in `fleetWarnings`: if it starts no task
+  for 12 hours, it leaves the list, and it returns after it starts its next
+  task.
+- When a host leaves the list of a DAG that still needs the level, the node
+  logs `dag <dag>: host <host> leaves the fleet warning: <reason>`. The reason
+  is either that the host's manifest advertises a high enough level, or that
+  the node finds no manifest or task start from the host in the last 12 hours.
 
 Upgrade every node on a shared store before a configuration uses a feature
 that needs a higher level.

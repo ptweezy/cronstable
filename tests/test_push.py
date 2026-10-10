@@ -1447,8 +1447,7 @@ async def test_file_store_wraps_an_unexpected_error_as_push_error(tmp_path):
     # The twin of test_state_store_unreadable_document_is_push_error: the
     # file store owes callers the same bounded contract for an exception
     # its read/write paths do not model (the backend refusing to start a
-    # worker thread, say), or one escapee takes the rest of the
-    # housekeeping pass with it.
+    # worker thread, say).
     store = push.FileDeviceStore(str(tmp_path / "devices.json"))
 
     def boom():
@@ -1587,10 +1586,9 @@ class _UnreadableDocBackend:
 
 
 async def test_state_store_unreadable_document_is_push_error():
-    # The finding: _bounded normalized OSError only, so a corrupt
-    # pushmeta/collapse document escaped the PushError contract, out of
-    # start_stop_push and into the housekeeping pass, which then skipped
-    # the durable-state manifest and GC on that pass and every later one.
+    # _bounded normalizes every backend exception, the private types
+    # included: a corrupt pushmeta/collapse document surfaces as
+    # PushError, the one type every caller up to start_stop_push expects.
     store = push.StateDeviceStore(lambda: _UnreadableDocBackend())
     with pytest.raises(push.PushError, match="_DocumentUnreadable"):
         await store.load()
@@ -3178,11 +3176,9 @@ async def test_start_stop_push_reload_changed_rebuilds(tmp_path):
 
 
 async def test_start_stop_push_absorbs_a_corrupt_registry_document(caplog):
-    # The end of the finding-2 chain: an unreadable pushmeta document
-    # escaped the PushError contract, out of start_stop_push, and into the
-    # housekeeping pass, which skipped everything after it (the durable
-    # state manifest and garbage collection) on that pass and on every
-    # later one, since the push config never records as applied.
+    # An unreadable pushmeta document stays inside start_stop_push: the
+    # service comes up, the failure is logged, and the push config
+    # records as applied.
     cron = _cron()
     cron.state_backend = _UnreadableDocBackend()
     push_config = {
@@ -3208,8 +3204,7 @@ async def test_start_stop_push_absorbs_a_corrupt_registry_document(caplog):
 
 async def test_start_stop_push_never_raises(monkeypatch, caplog):
     # Belt to the _bounded braces: whatever slips through convergence, the
-    # housekeeping pass carries on. Nothing about push is worth the durable
-    # state manifest and GC that run immediately after it.
+    # housekeeping pass carries on and run() has no bug to report.
     cron = _cron()
 
     async def boom(_push_config):

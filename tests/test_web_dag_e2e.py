@@ -753,6 +753,61 @@ def test_recovery_with_a_stale_plan_shows_the_409_and_retries(
         daemon.stop()
 
 
+def test_recovery_of_chosen_values_without_the_params_scope_shows_the_403(
+    browser, tmp_path
+):
+    """Display the refusal when a token may not reuse a run's values.
+
+    A token that holds `control` alone can preview the recovery of a run
+    that stores a chosen value. When it starts the recovery, the daemon
+    answers 403 and creates no run, and the page shows the reason under the
+    preview.
+    """
+    dag = e2e.diamond_dag("broken", gate=False, fail=True)
+    dag["params"] = [{"name": "limit", "type": "integer", "default": 10}]
+    auth = {
+        "authTokens": [
+            {"value": "ctl-token", "scopes": ["control"], "label": "ci"},
+            {
+                "value": "ops-token",
+                "scopes": ["control", "params"],
+                "label": "ops",
+            },
+        ]
+    }
+    daemon = e2e.Daemon(tmp_path, auth=auth, dags=[dag])
+    daemon.start()
+    try:
+        status, body = daemon.api(
+            "POST", "/dags/broken/trigger", "ops-token", {"params": {"limit": 3}}
+        )
+        assert status == 200, body
+        daemon.wait_dag_state("broken", body["runKey"], "failed", "ops-token")
+        with e2e.open_page(
+            browser, daemon.url, token="ctl-token", allow=("403",)
+        ) as page:
+            _open_dag(page, "broken")
+            page.wait_for_selector("#dgRuns tr.dagrun .rpill.failed")
+            page.wait_for_function(
+                "!document.getElementById('dgRecoverBtn').disabled"
+            )
+            # the preview needs `control` alone
+            page.click("#dgRecoverBtn")
+            page.wait_for_selector("#dgRecoveryGo")
+            page.click("#dgRecoveryGo")
+            page.wait_for_selector("#dgRecoveryError")
+            assert page.get_attribute("#dgRecoveryError", "role") == "alert"
+            assert (
+                "token 'ci' does not grant the 'params' permission required "
+                "to recover a run with parameter values other than the "
+                "declared defaults"
+            ) in page.inner_text("#dgRecoveryError")
+        runs = daemon.api("GET", "/dags/broken/runs", "ops-token")[1]["runs"]
+        assert [r["kind"] for r in runs] == ["manual"]
+    finally:
+        daemon.stop()
+
+
 # --------------------------------------------------------------------------
 # deep links
 # --------------------------------------------------------------------------
@@ -992,6 +1047,20 @@ def _param_dag(name="deploy", schedule=None):
     return dag
 
 
+def _blank_choice_dag():
+    """Two lists that allow the empty string: one with a different default,
+    and one that is required, which only a workflow without a schedule can
+    declare."""
+    return {
+        "name": "deploy",
+        "params": [
+            {"name": "suffix", "default": "-beta", "allowed": ["", "-beta"]},
+            {"name": "ticket", "required": True, "allowed": ["", "OPS-1"]},
+        ],
+        "tasks": [{"id": "release", "command": _py("pass")}],
+    }
+
+
 def _param_errors(page):
     return page.evaluate(
         """() => Object.fromEntries(
@@ -1005,6 +1074,15 @@ def _param_errors(page):
 def _param_form_closed(page):
     page.wait_for_function(
         "!document.getElementById('paramWrap').classList.contains('open')"
+    )
+
+
+def _list_options(page, field):
+    """Each option of a list field as its value and its label."""
+    return page.evaluate(
+        "(id) => [...document.getElementById(id).options]"
+        ".map((o) => [o.value, o.textContent])",
+        field,
     )
 
 
@@ -1112,6 +1190,77 @@ def test_trigger_opens_a_form_for_a_workflow_with_params(browser, tmp_path):
             _param_form_closed(page)
             assert len(_posts(page)) == sent
             assert page.get_attribute("#dagDrawer", "aria-hidden") == "false"
+
+
+def test_param_form_sends_the_empty_choice_of_a_list(browser, tmp_path):
+    trigger = '#dagRows [data-dagtrigger="deploy"]'
+    with e2e.Daemon(tmp_path, dags=[_blank_choice_dag()]) as daemon:
+        with e2e.open_page(browser, daemon.url) as page:
+            page.faults.record()
+            page.wait_for_selector(trigger)
+            _click(page, trigger)
+            page.wait_for_selector("#paramWrap.open")
+            # the default is selected, and the option above it is the
+            # declared ""
+            assert page.input_value("#paramF0") == "-beta"
+            page.select_option("#paramF0", index=0)
+            page.select_option("#paramF1", "OPS-1")
+            page.click("#paramGo")
+            e2e.wait_toast(page, "triggered deploy")
+            _param_form_closed(page)
+            values = {"suffix": "", "ticket": "OPS-1"}
+            # the request carries "", so the daemon does not fill in the
+            # default
+            assert _posts(page)[-1] == (
+                "/dags/deploy/trigger",
+                {"params": values},
+            )
+        run = daemon.api("GET", "/dags/deploy/runs")[1]["runs"][0]
+        assert daemon.dag_run("deploy", run["runKey"])["params"] == values
+
+
+def test_param_form_tells_the_empty_choice_from_the_placeholder(
+    browser, tmp_path
+):
+    trigger = '#dagRows [data-dagtrigger="deploy"]'
+    with e2e.Daemon(tmp_path, dags=[_blank_choice_dag()]) as daemon:
+        with e2e.open_page(browser, daemon.url) as page:
+            page.faults.record()
+            page.wait_for_selector(trigger)
+            _click(page, trigger)
+            page.wait_for_selector("#paramWrap.open")
+            # the option after `choose…` is the declared "", and the dialog
+            # sends it
+            page.select_option("#paramF1", index=1)
+            page.click("#paramGo")
+            e2e.wait_toast(page, "triggered deploy")
+            _param_form_closed(page)
+            values = {"suffix": "-beta", "ticket": ""}
+            assert _posts(page)[-1] == (
+                "/dags/deploy/trigger",
+                {"params": values},
+            )
+            run = daemon.api("GET", "/dags/deploy/runs")[1]["runs"][0]
+            assert daemon.dag_run("deploy", run["runKey"])["params"] == values
+            # the two options have different labels, and `choose…`, which a
+            # required list opens on, leaves the parameter out
+            _click(page, trigger)
+            page.wait_for_selector("#paramWrap.open")
+            assert _list_options(page, "paramF1") == [
+                ["", "choose…"],
+                ["", "(empty)"],
+                ["OPS-1", "OPS-1"],
+            ]
+            page.click("#paramGo")
+            page.wait_for_function(
+                "document.getElementById('paramError').textContent"
+            )
+            assert _param_errors(page) == {"ticket": "ticket is required"}
+            assert _posts(page)[-1] == (
+                "/dags/deploy/trigger",
+                {"params": {"suffix": "-beta"}},
+            )
+            assert len(daemon.api("GET", "/dags/deploy/runs")[1]["runs"]) == 1
 
 
 def test_backfill_sends_the_form_values(browser, tmp_path):

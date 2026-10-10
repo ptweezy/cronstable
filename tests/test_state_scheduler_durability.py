@@ -2216,6 +2216,25 @@ async def _seed_real_run(cron, when):
     )
 
 
+async def _seed_supplied_run(cron, when):
+    # the row of a manual start that supplied run parameter values: the run
+    # is outside the retry ladder, so its instant is under `suppliedRanAt`
+    # and never under `ranAt` (JobRunInfo.to_dict).
+    await cron.state_backend.append_record(
+        "runs/p",
+        {
+            "outcome": "success",
+            "exit_code": 0,
+            "started_at": None,
+            "finished_at": when,
+            "duration": None,
+            "fail_reason": None,
+            "suppliedParams": True,
+            "suppliedRanAt": when,
+        },
+    )
+
+
 async def _seed_held_slot(cron, when):
     # the synthetic row launch_scheduled_job writes for a slot held by a live
     # pause: no `ranAt`, but a `finished_at` that advances durable_last_run_at.
@@ -2370,6 +2389,26 @@ async def test_catch_up_pins_partial_window_backlog_against_held_rows(
     assert backfills == [("p", 5)]
 
 
+async def test_catch_up_pins_backlog_at_a_run_with_supplied_values(
+    stateful_cron,
+):
+    # The pre-pause pin opens at the last run of any kind. The ledger row of
+    # a manual start that supplied run parameter values carries no `ranAt`,
+    # which keeps it out of the retry ladder's superseded-by-run guards, and
+    # catch-up still counts the run. The slots before it are covered, so the
+    # pin opens at 10:03.
+    cron = await stateful_cron(_PAUSE_CATCHUP_JOB)
+    await _seed_real_run(cron, "2026-07-01T10:00:00+00:00")
+    await _seed_supplied_run(cron, "2026-07-01T10:03:00+00:00")
+    _make_pause_live(cron)
+    await cron._catch_up(datetime.datetime(2026, 7, 1, 10, 10, 0, tzinfo=_UTC))
+    assert cron._caught_up is False
+    assert (
+        await cron._pending_catchup_watermark("p")
+        == "2026-07-01T10:03:00+00:00"
+    )
+
+
 @pytest.mark.parametrize("n_held", [0, 1, 5])
 async def test_missed_occurrences_backstops_an_unpinned_pause_window(
     n_held, stateful_cron
@@ -2408,6 +2447,37 @@ async def test_missed_occurrences_backstops_an_unpinned_pause_window(
     )
     assert count == 11  # 5 pre-pause + 6 post-window: backlog preserved
     assert watermark == "2026-07-01T10:00:00+00:00"
+
+
+async def test_missed_occurrences_backstop_counts_a_run_with_supplied_values(
+    stateful_cron,
+):
+    # The backstop falls back to the last run of any kind. A manual start
+    # that supplied run parameter values is a run like any other to catch-up
+    # (only the retry ladder's guards leave it out), so the fallback
+    # watermark is its instant, and catch-up owes none of the slots before
+    # it.
+    cron = await stateful_cron(_PAUSE_CATCHUP_JOB)
+    await _seed_real_run(cron, "2026-07-01T10:00:00+00:00")
+    await _seed_supplied_run(cron, "2026-07-01T10:03:00+00:00")
+    # window [10:05:30, 10:20): 10:04 and 10:05 predate it (owed),
+    # 10:06..10:19 fall inside (excused), 10:20..10:25 follow it (owed).
+    await _seed_pause_window(
+        cron, "2026-07-01T10:05:30+00:00", "2026-07-01T10:20:00+00:00"
+    )
+    for i in range(5):
+        await _seed_held_slot(
+            cron,
+            datetime.datetime(
+                2026, 7, 1, 10, 6 + i, 0, tzinfo=_UTC
+            ).isoformat(),
+        )
+    ref = datetime.datetime(2026, 7, 1, 10, 25, 0, tzinfo=_UTC)
+    count, watermark, _ = await cron._missed_occurrences(
+        cron.cron_jobs["p"], ref
+    )
+    assert count == 8  # 2 pre-pause + 6 post-window
+    assert watermark == "2026-07-01T10:03:00+00:00"
 
 
 _HOURLY_CATCHUP_JOB = """

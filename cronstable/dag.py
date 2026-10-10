@@ -291,6 +291,11 @@ class DagSpec:
 
     ``params`` is the DAG's run parameter declaration, empty for a DAG that
     declares none.
+
+    ``upstream_first`` holds the same tasks, each one after every task it
+    depends on. An advance pass visits them in this order (see
+    :func:`_propagate_and_claim`). ``tasks`` keeps the order the
+    configuration lists them in, which the API and the dashboards show.
     """
 
     name: str
@@ -300,6 +305,7 @@ class DagSpec:
     engine: int = BASE_ENGINE_LEVEL
     params: tuple[ParamSpec, ...] = ()
     conditional_tasks: tuple[TaskSpec, ...] = ()
+    upstream_first: tuple[TaskSpec, ...] = ()
 
     @staticmethod
     def build(
@@ -317,17 +323,64 @@ class DagSpec:
             engine = BRANCHING_PARAMS_ENGINE_LEVEL
         else:
             engine = BASE_ENGINE_LEVEL
+        listed = tuple(tasks)
+        by_id = {t.id: t for t in tasks}
         return DagSpec(
             name=name,
-            tasks=tuple(tasks),
-            by_id={t.id: t for t in tasks},
+            tasks=listed,
+            by_id=by_id,
             mapped_tasks=tuple(t for t in tasks if t.expand is not None),
             engine=engine,
             params=tuple(params),
             conditional_tasks=tuple(
                 t for t in gated if any(c.source == WHEN_XCOM for c in t.when)
             ),
+            upstream_first=_upstream_first(listed, by_id),
         )
+
+
+def _upstream_first(
+    tasks: tuple[TaskSpec, ...], by_id: dict[str, TaskSpec]
+) -> tuple[TaskSpec, ...]:
+    """``tasks`` with each task after every task it depends on.
+
+    A task keeps its listed place unless one of its upstreams comes after
+    it. That upstream then moves to just before the task, behind its own
+    upstreams. A listing that already puts upstreams first comes back as
+    the same tuple.
+
+    :meth:`DagSpec.build` calls this before :func:`validate_graph` has seen
+    the graph, so it accepts what validation refuses: it passes over a
+    ``dependsOn`` id that names no task and places each task of a cycle
+    once.
+    """
+    placed: set[str] = set()
+    for task in tasks:
+        if not placed.issuperset(task.depends_on):
+            break
+        placed.add(task.id)
+    else:
+        return tasks
+    placed.clear()
+    ordered: list[TaskSpec] = []
+    for root in tasks:
+        if root.id in placed:
+            continue
+        placed.add(root.id)
+        # depth-first on an explicit stack: a chain listed last task first
+        # is as deep as the DAG is long
+        stack = [(root, iter(root.depends_on))]
+        while stack:
+            task, deps = stack[-1]
+            for dep in deps:
+                if dep in by_id and dep not in placed:
+                    placed.add(dep)
+                    stack.append((by_id[dep], iter(by_id[dep].depends_on)))
+                    break
+            else:
+                stack.pop()
+                ordered.append(task)
+    return tuple(ordered)
 
 
 class DagValidationError(Exception):
@@ -448,20 +501,33 @@ def _validate_when(task: TaskSpec, seen: dict[str, TaskSpec]) -> None:
 
 
 def skippable_joins(spec: DagSpec) -> list[tuple[str, list[str]]]:
-    """``all_success`` tasks that join two or more upstreams that can skip.
+    """``all_success`` tasks that join upstreams with different skip sources.
 
-    Such a join is skipped whenever one of those upstreams is, which is
-    rarely what a join below alternative branches wants. Returns each join's
-    id with the upstreams concerned, in spec order, for the load-time warning.
+    Such a join is skipped when one of those upstreams is skipped and the
+    rest of its upstreams succeed, which is rarely what a join below
+    alternative branches wants. Returns each join's id with its upstreams
+    that can skip, in spec order, for the load-time warning.
 
-    An upstream can skip when its command can (``skip_exit_codes``), when it
-    has a ``when:`` condition, when it is a gate with ``onReject: skip``,
-    when its rule is ``all_done_min_one_failed``, or when its own rule
-    passes a skip on: ``all_success`` from any upstream,
-    ``none_failed_min_one_success`` once every upstream can skip, and a
-    mapped task from its expand source.
+    A skip source is a task that can end skipped by itself: its command
+    can skip it (``skip_exit_codes``), it has a ``when:`` condition, it is
+    a gate with ``onReject: skip``, or its rule is
+    ``all_done_min_one_failed``.
+
+    Each task carries the set of sources whose skip reaches it.
+    ``all_success`` passes on the sources of every upstream, and a mapped
+    task carries those of its expand source under every rule.
+    ``none_failed_min_one_success`` skips only when every upstream does.
+    Once every upstream can skip, the task takes their sources when they
+    all carry the same set and is a source itself when they differ. It is
+    also a source itself when one of them is a fan-out whose instances can
+    skip themselves, because it runs when that fan-out reads skipped and
+    one of the instances succeeded.
+
+    Upstreams that carry the same set only ever skip together, the way two
+    branches below one gate do, so the lint reports a join when two of its
+    upstreams carry different sets.
     """
-    can_skip = {
+    sources = {
         t.id
         for t in spec.tasks
         if t.skip_exit_codes
@@ -469,34 +535,52 @@ def skippable_joins(spec: DagSpec) -> list[tuple[str, list[str]]]:
         or t.trigger_rule == ALL_DONE_MIN_ONE_FAILED
         or (t.type == APPROVAL and t.on_reject == SKIPPED)
     }
-    if not can_skip:
+    if not sources:
         return []
-    dependents: dict[str, list[TaskSpec]] = {}
-    for t in spec.tasks:
-        for dep in t.depends_on:
-            dependents.setdefault(dep, []).append(t)
-    pending = list(can_skip)
-    while pending:
-        for t in dependents.get(pending.pop(), ()):
-            if t.id in can_skip:
-                continue
-            if t.expand is not None and t.expand.from_task in can_skip:
-                passes = True
-            elif t.trigger_rule == NONE_FAILED_MIN_ONE_SUCCESS:
-                passes = all(dep in can_skip for dep in t.depends_on)
-            else:
-                passes = t.trigger_rule not in (ALL_DONE, NONE_FAILED)
-            if passes:
-                can_skip.add(t.id)
-                pending.append(t.id)
+    # A fan-out whose instances skip themselves can read skipped and still
+    # count as a success for none_failed_min_one_success (see
+    # _any_upstream_succeeded).
+    part_skips = {t.id for t in spec.mapped_tasks if t.skip_exit_codes}
+    # skipped_by[t] is the set of sources whose skip reaches ``t``, as an
+    # int with one bit per source. A union is an OR and a comparison is one
+    # test. Each int can be as wide as the number of sources, so the walk
+    # costs tasks plus edges, times sources over the word size.
+    skipped_by: dict[str, int] = {}
+    bit = 1
+    # upstreams first, so each task reads the final set of every upstream
+    for t in spec.upstream_first:
+        ups = [skipped_by.get(dep, 0) for dep in t.depends_on]
+        own = t.id in sources
+        mask = 0
+        if t.trigger_rule == NONE_FAILED_MIN_ONE_SUCCESS:
+            # A mapped task skips with its expand source, which is one of
+            # its upstreams, so the rule adds no skip of its own.
+            if t.expand is None and ups and all(ups):
+                if len(set(ups)) == 1 and part_skips.isdisjoint(t.depends_on):
+                    mask = ups[0]
+                else:
+                    own = True
+        elif t.trigger_rule not in (
+            ALL_DONE,
+            NONE_FAILED,
+            ALL_DONE_MIN_ONE_FAILED,
+        ):
+            for up in ups:
+                mask |= up
+        if t.expand is not None:
+            mask |= skipped_by.get(t.expand.from_task, 0)
+        if own:
+            mask |= bit
+            bit <<= 1
+        skipped_by[t.id] = mask
     joins = []
     for t in spec.tasks:
         if t.trigger_rule != ALL_SUCCESS:
             continue
         upstreams = [
-            dep for dep in dict.fromkeys(t.depends_on) if dep in can_skip
+            dep for dep in dict.fromkeys(t.depends_on) if skipped_by.get(dep)
         ]
-        if len(upstreams) > 1:
+        if len({skipped_by[dep] for dep in upstreams}) > 1:
             joins.append((t.id, upstreams))
     return joins
 
@@ -1309,10 +1393,12 @@ def plan_and_claim(
     """Build the ``mutate_document`` transform that advances one run.
 
     The returned callable is a pure ``transform(body) -> (new_body, result)``
-    for :meth:`StateBackend.mutate_document`.  In one atomic pass it:
+    for :meth:`StateBackend.mutate_document`.  In one atomic pass over the
+    tasks, upstreams first (see :func:`_propagate_and_claim`), it:
 
-    * applies any pre-read ``expansions`` (materialises ``<id>#<i>`` instances,
-      or resolves an empty map straight to success);
+    * applies any pre-read ``expansions``: it creates the ``<id>#<i>``
+      instances of a list with items, and records an empty list, which
+      reads success, when the task's trigger rule says ready;
     * propagates ``upstream_failed`` / ``skipped`` down the graph;
     * decides each ready task's ``when:`` comparisons, reading XCom values
       from the pre-read ``conditions`` (see :func:`_when_outcome`), and
@@ -1353,9 +1439,8 @@ def plan_and_claim(
         # round trip keeps the in-lock copy cost of a large run document
         # (up to MAX_MAPPED_ITEMS task entries) low.
         working = _json.deepcopy_json(body)
-        _apply_expansions(spec, working, expansions, now, result)
         _propagate_and_claim(
-            spec, working, now, proc, host, result, conditions
+            spec, working, now, proc, host, result, conditions, expansions
         )
         _maybe_terminalise(spec, working, now, result)
         _flag_unread_conditions(spec, working, result)
@@ -1382,71 +1467,86 @@ def is_keep(value: Any) -> bool:
     return isinstance(value, _DocKeep)
 
 
-def _apply_expansions(
+def _apply_expansion(
     spec: DagSpec,
     body: dict[str, Any],
-    expansions: dict[str, list[Any] | None],
+    task: TaskSpec,
+    items: list[Any],
     now: float,
     result: AdvanceResult,
-) -> None:
-    for task_id, items in expansions.items():
-        if items is None:
-            continue
-        task = spec.by_id.get(task_id)
-        if task is None or task.expand is None:
-            continue
-        mapped_all = body.get("mapped")
-        if mapped_all and task_id in mapped_all:
-            continue  # already expanded (stale pre-read); idempotent
-        if task.when and not (body["tasks"].get(task_id) or {}).get("whenMet"):
-            continue  # its condition is undecided under this fresh body
-        if effective_state(spec, body, task.expand.from_task) != SUCCESS:
-            continue  # upstream no longer success under this fresh body
-        if len(items) > MAX_MAPPED_ITEMS:
-            # an oversized fan-out is a per-task failure, never a run wedge:
-            # the placeholder terminalises with a clear reason (downstreams
-            # see upstream_failed) instead of materialising the flood.
-            placeholder = body["tasks"].get(task_id)
-            if placeholder is not None and (
-                placeholder.get("state") == PENDING
-            ):
-                placeholder["failReason"] = (
-                    "mapped fan-out of {} items exceeds the cap of {}".format(
-                        len(items), MAX_MAPPED_ITEMS
-                    )
+) -> bool:
+    """Record ``task``'s fan-out over ``items``; True when it records one.
+
+    :func:`_propagate_and_claim` calls this at the task's visit with the
+    list the driver pre-read. It checks the list against this fresh body,
+    so a stale pre-read expands nothing.
+
+    It records a list with items whatever the trigger rule says so far:
+    the instances start pending, and each takes the rule's verdict as any
+    task does. An empty list has no instance to take the verdict, and the
+    group reads ``success`` as soon as the run holds the list, so it
+    records an empty list only when the rule says ready. Until then the
+    placeholder stays pending, and :func:`_propagate_placeholder` ends it
+    on a ``fail`` or ``skip`` verdict.
+    """
+    assert task.expand is not None
+    placeholder = body["tasks"].get(task.id)
+    if task.when and not (placeholder or {}).get("whenMet"):
+        return False  # its condition is undecided under this fresh body
+    if effective_state(spec, body, task.expand.from_task) != SUCCESS:
+        return False  # upstream no longer success under this fresh body
+    if len(items) > MAX_MAPPED_ITEMS:
+        # an oversized fan-out is a per-task failure, never a run wedge:
+        # the placeholder terminalises with a clear reason (downstreams
+        # see upstream_failed) instead of materialising the flood.
+        if placeholder is not None and placeholder.get("state") == PENDING:
+            placeholder["failReason"] = (
+                "mapped fan-out of {} items exceeds the cap of {}".format(
+                    len(items), MAX_MAPPED_ITEMS
                 )
-                _terminalise_task(placeholder, FAILED, now, result)
-            continue
-        body.setdefault("mapped", {})[task_id] = {
-            "items": list(items),
-            "expandedAt": now,
-        }
-        # the placeholder becomes a non-terminal group marker; instances carry
-        # the real work.
-        placeholder = body["tasks"].get(task_id)
-        if placeholder is not None:
-            placeholder["state"] = EXPANDED
-            placeholder["updatedAt"] = now
-        # Materialise the instances from ONE built entry: the rest are shallow
-        # copies carrying their own mapIndex/mapItem.  A fan-out can hold
-        # MAX_MAPPED_ITEMS instances, and this replaces that many entry builds
-        # (each re-deciding the mapped/sensor/approval keys, then popping the
-        # placeholder-only "mapped" flag straight back off) with that many
-        # dict.copy() calls.  Every template value is an immutable scalar, so
-        # the copies share nothing mutable, and copy-then-overwrite leaves the
-        # key order the per-instance build produced.
-        tasks = body["tasks"]
-        prefix = task_id + "#"
-        template = _new_task_entry(task, now)
-        # task.expand is not None here (checked above), so the flag is always
-        # present; an instance is not the group placeholder.
-        del template["mapped"]
-        for i, item in enumerate(items):
-            entry = template.copy()
-            entry["mapIndex"] = i
-            entry["mapItem"] = item
-            tasks[prefix + str(i)] = entry
-        result.changed = True
+            )
+            _terminalise_task(placeholder, FAILED, now, result)
+        return False
+    if (
+        not items
+        and placeholder is not None
+        and _deps_verdict(spec, body, task) != "ready"
+    ):
+        # No instance would take the rule's verdict, so the placeholder
+        # keeps it (see the docstring).  A task with no placeholder is one
+        # a reload added after the run was created: nothing in the run
+        # reads its state, so its empty list goes on record at once.
+        return False
+    body.setdefault("mapped", {})[task.id] = {
+        "items": list(items),
+        "expandedAt": now,
+    }
+    # the placeholder becomes a non-terminal group marker; instances carry
+    # the real work.
+    if placeholder is not None:
+        placeholder["state"] = EXPANDED
+        placeholder["updatedAt"] = now
+    # Materialise the instances from ONE built entry: the rest are shallow
+    # copies carrying their own mapIndex/mapItem.  A fan-out can hold
+    # MAX_MAPPED_ITEMS instances, and this replaces that many entry builds
+    # (each re-deciding the mapped/sensor/approval keys, then popping the
+    # placeholder-only "mapped" flag straight back off) with that many
+    # dict.copy() calls.  Every template value is an immutable scalar, so
+    # the copies share nothing mutable, and copy-then-overwrite leaves the
+    # key order the per-instance build produced.
+    tasks = body["tasks"]
+    prefix = task.id + "#"
+    template = _new_task_entry(task, now)
+    # the task is mapped (asserted above), so the flag is always present;
+    # an instance is not the group placeholder.
+    del template["mapped"]
+    for i, item in enumerate(items):
+        entry = template.copy()
+        entry["mapIndex"] = i
+        entry["mapItem"] = item
+        tasks[prefix + str(i)] = entry
+    result.changed = True
+    return True
 
 
 def _instances_of(
@@ -1488,24 +1588,44 @@ def _propagate_and_claim(
     host: str,
     result: AdvanceResult,
     conditions: dict[tuple[str, str], Any] | None = None,
+    expansions: dict[str, list[Any] | None] | None = None,
 ) -> None:
+    """Visit each task once, upstreams first, and decide it at that visit.
+
+    The pass settles a task it skips, fails, or expands before it visits
+    that task's dependents, wherever the configuration lists them, so one
+    pass finishes everything it can decide without a driver read.
+    """
     # Hoisted out of the loops: both were re-resolved once per TASK, and
     # body["tasks"] again once per INSTANCE, so a wide DAG or a large fan-out
     # repeated the same two lookups thousands of times per pass.  Both are
     # safe to bind once: nothing below replaces either dict, it only mutates
-    # them (_resolve_missing_instance adds a task entry, and no path here
-    # records a fan-out), so the loop still sees every write.
+    # them (_resolve_missing_instance and _apply_expansion add task
+    # entries), so the loop still sees every write.  Through ``mapped_all``
+    # the loop reads only fan-outs recorded before this pass:
+    # _apply_expansion records one for the task being visited, and that
+    # visit sets ``expanded`` itself.
     tasks = body["tasks"]
     mapped_all: Any = body.get("mapped")
-    for task in spec.tasks:
+    for task in spec.upstream_first:
         expanded = bool(mapped_all) and task.id in mapped_all
         if task.expand is not None and not expanded:
-            # un-expanded mapped placeholder: only propagate an upstream
-            # failure/skip to it (readiness -> expansion needs an out-of-band
-            # XCom read, applied in _apply_expansions, so leave a ready one
-            # pending here for the next pass).
-            _propagate_placeholder(spec, body, task, now, result, conditions)
-            continue
+            # un-expanded mapped placeholder: record its fan-out when the
+            # driver read the list for this pass.  Without a list, or with
+            # one this visit cannot record yet, _propagate_placeholder ends
+            # it when its expand source failed or was skipped, or when its
+            # trigger rule says fail or skip, and decides its own condition.
+            # A ready one stays pending for the pass that brings its list.
+            items = expansions.get(task.id) if expansions else None
+            if items is None or not _apply_expansion(
+                spec, body, task, items, now, result
+            ):
+                _propagate_placeholder(
+                    spec, body, task, now, result, conditions
+                )
+                continue
+            # this visit recorded the fan-out, so it goes on to the instances
+            expanded = True
         if not expanded:
             # A plain task with no recorded fan-out is exactly one instance
             # keyed by its id: :func:`_instances_of`'s single-instance
@@ -1722,7 +1842,7 @@ def _resolve_missing_instance(
     """Materialise and fail a mapped instance the run records but lacks.
 
     The run document's own ``mapped[<task>].items`` records this index, so
-    :func:`_apply_expansions` wrote an entry for it and something later
+    :func:`_apply_expansion` wrote an entry for it and something later
     removed it: a partial backup restore, a hand edit, or a peer on a
     different build.  The entry cannot be recovered, and leaving the hole is
     worse than failing it: :func:`_fold_mapped_instances` reads an absent

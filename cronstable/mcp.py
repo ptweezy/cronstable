@@ -1229,7 +1229,9 @@ class MCPHandler:
                 "cron_recover_dag",
                 "Recover workflow tasks",
                 "Execute a reviewed recovery plan. Requires plan_token and "
-                "confirm=true. Creates a new run preserving successful work.",
+                "confirm=true. Creates a new run preserving successful work. "
+                "With scoped web tokens, a plan whose params differ from "
+                "the declared defaults needs the params scope.",
                 obj(
                     {
                         "dag": _STR,
@@ -1682,6 +1684,12 @@ class MCPHandler:
                 {"queued": name, "queueId": started["queued"], **values},
                 "queued job {!r}".format(name),
             )
+        if started.get("pending"):
+            return _result(
+                {"started": name, **values, "pending": True},
+                "job {!r} starts when another node yields its cluster "
+                "concurrency slot".format(name),
+            )
         return _result(
             {"started": name, **values}, "started job {!r}".format(name)
         )
@@ -1798,6 +1806,7 @@ class MCPHandler:
                     tasks=tasks,
                     plan_token=token,
                     allow_config_change=allow_change,
+                    scopes=_scopes(),
                 )
             else:
                 if tasks or mode != "failed":
@@ -1811,7 +1820,10 @@ class MCPHandler:
                     _req_str(args, "to"),
                     plan_token=token,
                     allow_config_change=allow_change,
+                    scopes=_scopes(),
                 )
+        except ParamError as ex:
+            return _tool_error(_param_error_text(ex))
         except RecoveryError as ex:
             return _tool_error(str(ex))
         except (OSError, asyncio.TimeoutError):
@@ -2821,7 +2833,7 @@ def _require_confirm(args: dict[str, Any], gerund: str) -> None:
 def _scopes() -> "frozenset[str] | None":
     """The scopes of the current caller's token, or ``None`` when no token
     auth applies. A tool that starts runs passes them on, so its REST twin
-    and the tool apply one check to a ``params`` argument."""
+    and the tool apply one check to the parameter values a run takes."""
     caller = _caller.get()
     return None if caller is None else caller.scopes
 

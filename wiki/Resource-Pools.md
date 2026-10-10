@@ -56,9 +56,11 @@ entry and releases its backlog reservation, including timed-out sensors.
 A full queue or a capacity change rejects new scheduled work with a warning;
 the scheduler continues servicing other jobs. Pending retries wait for admission
 without consuming another attempt. A newer scheduled fire, success, or retry
-cancellation also invalidates queued retries in the state store. Catch-up waits
-for each of its own queued runs to finish before admitting the next or closing
-its checkpoint; shutdown leaves unfinished work resumable.
+cancellation also invalidates queued retries in the state store. A manual start
+that supplies [run parameter](Commands-and-Environment#params) values is the
+exception: its success or cancellation leaves queued retries in place. Catch-up
+waits for each of its own queued runs to finish before admitting the next or
+closing its checkpoint; shutdown leaves unfinished work resumable.
 
 The dashboard's **Resource pools** card shows capacity, priorities, deadlines,
 and cancellation controls. `GET /pools` exposes the same data.

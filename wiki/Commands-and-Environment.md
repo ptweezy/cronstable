@@ -293,8 +293,15 @@ How a run gets its values:
 - A start without values, a scheduled run, a catch-up run, and a retry take
   the defaults of the current declaration.
 - A start that supplies values is a single attempt. It stays out of the
-  job's retry ladder, whose retries take the defaults: its failure arms no
-  retry, and its success leaves a pending retry in place.
+  job's retry ladder, whose retries take the defaults. Its failure arms no
+  retry, and its success or cancellation leaves a pending retry in place.
+  With a `state:` section, the pending retry also survives a daemon restart
+  after the run and a crash during it. Two rules apply on the node that
+  runs the start. Under `concurrencyPolicy: Forbid`, a retry that comes due
+  while the run is in progress waits for it to finish. Under `Replace`, a
+  start with values that replaces a running retry ends that retry sequence.
+  See the [retry lifecycle](Failure-Detection-and-Retries#retry-lifecycle),
+  which also covers a run on another node.
 - A job in a [resource pool](Resource-Pools) carries the values in its queue
   entry, so the run takes them when the pool admits it. A change to the
   declaration cancels an entry that is still queued.

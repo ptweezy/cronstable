@@ -1,4 +1,5 @@
 import asyncio
+import copy
 
 import pytest
 
@@ -395,7 +396,7 @@ async def test_slotlease_claim_fails_closed_when_backend_is_none():
     cron._state_configured = True
     cron.state_backend = None
     cron._state_on_unavailable = "fail-closed"
-    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is None
     assert "s" not in cron._slot_refs
 
 
@@ -486,7 +487,7 @@ async def test_slotlease_claim_read_timeout_is_unanswered(monkeypatch):
         acquire=None, read_exc=asyncio.TimeoutError()
     )
     cron._state_on_unavailable = "fail-closed"
-    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is None
 
 
 async def test_slotlease_claim_read_error_is_unanswered(monkeypatch):
@@ -495,7 +496,7 @@ async def test_slotlease_claim_read_error_is_unanswered(monkeypatch):
         acquire=None, read_exc=RuntimeError("EIO")
     )
     cron._state_on_unavailable = "fail-closed"
-    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is None
 
 
 async def test_slotlease_claim_success_cancels_stale_renewer(
@@ -529,6 +530,40 @@ async def test_slotlease_spawn_slot_pursuit_is_single_flight(
     slotlease_reaper(existing)
     cron._spawn_slot_pursuit(job, _slotlease_lease())
     assert cron._slot_pursuits["s"] is existing  # not replaced
+
+
+async def test_slotlease_spawn_slot_pursuit_holds_the_newest_refused_launch(
+    slotlease_reaper,
+):
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    job = cron.cron_jobs["s"]
+    existing = asyncio.create_task(_SLOTLEASE_REAL_SLEEP(30))
+    cron._slot_pursuits["s"] = existing
+    slotlease_reaper(existing)
+    older = {"with_retries": True, "params": None}
+    newer = {"with_retries": False, "params": {"region": "us"}}
+    cron._spawn_slot_pursuit(job, _slotlease_lease(), older)
+    cron._spawn_slot_pursuit(job, _slotlease_lease(), newer)
+    # had both launches started, Replace would have let the newer one win
+    assert cron._slot_pursuit_launch["s"] is newer
+    assert cron._slot_pursuits["s"] is existing
+    # a launch that hands nothing over (a pool entry) leaves it in place
+    cron._spawn_slot_pursuit(job, _slotlease_lease())
+    assert cron._slot_pursuit_launch["s"] is newer
+
+
+async def test_slotlease_spawn_slot_pursuit_drops_the_launch_it_never_made():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    cron.state_backend = None  # the pursuit gives up at once
+    cron._spawn_slot_pursuit(
+        cron.cron_jobs["s"],
+        _slotlease_lease(),
+        {"with_retries": True, "params": None},
+    )
+    await cron._slot_pursuits["s"]
+    await _SLOTLEASE_REAL_SLEEP(0)  # the task's done callback
+    assert "s" not in cron._slot_pursuits
+    assert "s" not in cron._slot_pursuit_launch
 
 
 # --- _pursue_replace_slot --------------------------------------------------
@@ -572,12 +607,46 @@ async def test_slotlease_pursue_replace_relaunches_when_slot_frees(
     relaunched = []
 
     async def _fake_launch(job, **kwargs):
+        relaunched.append((job, kwargs))
+        return True
+
+    monkeypatch.setattr(cron, "maybe_launch_job", _fake_launch)
+    # the launch that the refused claim handed to the pursuit
+    held = {"with_retries": False, "params": {"region": "us"}}
+    cron._slot_pursuit_launch["s"] = held
+    # a reload lands while the pursuit waits, and the pursuit launches the
+    # job's current configuration
+    stale = cron.cron_jobs["s"]
+    current = cron.cron_jobs["s"] = copy.copy(stale)
+    await cron._pursue_replace_slot(stale, _slotlease_lease())
+    ((launched, kwargs),) = relaunched
+    assert launched is current and kwargs == held
+    assert "s" not in cron._slot_pursuit_launch
+    # and it launches nothing for a job that the reload removed
+    cron._slot_pursuit_launch["s"] = held
+    del cron.cron_jobs["s"]
+    await cron._pursue_replace_slot(current, _slotlease_lease())
+    assert len(relaunched) == 1
+
+
+async def test_slotlease_pursue_replace_without_a_launch_only_asks_to_yield(
+    monkeypatch,
+):
+    # a pooled launch hands the pursuit nothing: its queue entry re-attempts
+    # itself when the slot frees
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    backend = _SlotleaseBackend(read=None)
+    cron.state_backend = backend
+    relaunched = []
+
+    async def _fake_launch(job, **kwargs):
         relaunched.append(job.name)
         return True
 
     monkeypatch.setattr(cron, "maybe_launch_job", _fake_launch)
     await cron._pursue_replace_slot(cron.cron_jobs["s"], _slotlease_lease())
-    assert relaunched == ["s"]
+    assert backend.appended and relaunched == []
 
 
 async def test_slotlease_pursue_replace_read_error_is_ignored(monkeypatch, caplog):
@@ -1070,7 +1139,7 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_start_failure(
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     job = cron.cron_jobs["s"]
 
-    async def _claim(j):
+    async def _claim(j, launch=None):
         return True
 
     monkeypatch.setattr(cron, "_claim_cluster_slot", _claim)
@@ -1121,7 +1190,7 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_prepare_cancel(
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     job = cron.cron_jobs["s"]
 
-    async def _claim(j):
+    async def _claim(j, launch=None):
         return True
 
     monkeypatch.setattr(cron, "_claim_cluster_slot", _claim)
@@ -1152,6 +1221,48 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_prepare_cancel(
         await task
     assert released == ["s"]
     assert finished == []
+
+
+async def test_slotlease_launch_that_never_starts_leaves_the_pursuit_waiting(
+    monkeypatch, slotlease_reaper
+):
+    """Only a run that started stands a waiting Replace pursuit down.
+
+    A launch that claims the slot and is then cancelled (a client gone
+    mid-POST) hands the claim back and starts nothing, so the launch that
+    the pursuit holds is still the newest one to make.
+    """
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    job = cron.cron_jobs["s"]
+    pursuit = asyncio.create_task(_SLOTLEASE_REAL_SLEEP(30))
+    slotlease_reaper(pursuit)
+    held = {"with_retries": True, "params": None}
+    cron._slot_pursuits["s"] = pursuit
+    cron._slot_pursuit_launch["s"] = held
+
+    async def _claim(j, launch=None):
+        return True
+
+    async def _release(j):
+        pass
+
+    monkeypatch.setattr(cron, "_claim_cluster_slot", _claim)
+    monkeypatch.setattr(cron, "_release_cluster_slot", _release)
+    parked = asyncio.Event()
+
+    async def _hung_prepare(j, rs, **kwargs):
+        parked.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(cron, "_prepare_job_api_run", _hung_prepare)
+    task = asyncio.create_task(cron.maybe_launch_job(job))
+    await parked.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await _SLOTLEASE_REAL_SLEEP(0)
+    assert not pursuit.done()
+    assert cron._slot_pursuit_launch["s"] is held
 
 
 # --- cancellation propagates through every store call (never swallowed) -----
@@ -1362,5 +1473,6 @@ async def test_slotlease_pursue_replace_polls_until_slot_frees(monkeypatch):
         return True
 
     monkeypatch.setattr(cron, "maybe_launch_job", _launch)
+    cron._slot_pursuit_launch["s"] = {"with_retries": True, "params": None}
     await cron._pursue_replace_slot(cron.cron_jobs["s"], _slotlease_lease())
     assert relaunched == ["s"]

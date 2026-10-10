@@ -672,6 +672,13 @@ next adoption scan, which runs every 30 seconds. To avoid the wait during a
 rollout, upgrade every node on the store before a configuration uses the
 newer feature.
 
+A host on a build at level 1 never logs that line. It refuses a
+configuration that uses a newer feature, logs `Error in configuration
+file(s)`, and keeps advancing runs with the version of the workflow that it
+loaded earlier. `fleetWarnings` names such a host for 12 hours after each
+task that it starts, so the list can be empty while the host is idle. Check
+the cronstable version on every node that shares the store.
+
 ### A join task is skipped when one branch skips
 
 **Symptom.** A task below two or more branches ends `skipped` although one
@@ -681,11 +688,20 @@ upstreams that can end skipped`.
 
 **Cause.** The task's `triggerRule` is `all_success`, the default. Under that
 rule a skipped upstream cascades `skipped` to the task, so a join below
-alternative branches is skipped whenever one branch skips itself.
+alternative branches is skipped when one branch skips itself, even though the
+other branch ran. The daemon logs the line for a task with two or more
+upstreams that can end `skipped`. It logs nothing when it detects that those
+upstreams only ever skip together, as two tasks below one gate do.
 
-**Fix.** Set `triggerRule: none_failed_min_one_success` on the join. It then
-runs after the branch that ran and is skipped only when every branch skipped.
-Use `none_failed` to run the join in that case too. See
+**Fix.** If the upstreams are alternative branches, set
+`triggerRule: none_failed_min_one_success` on the join. It then runs after
+the branch that ran and is skipped only when every branch skipped. Use
+`none_failed` to run the join in that case too. Both rules need
+[run engine level 2](Orchestration-and-DAGs#run-engine-levels). On a store
+that several nodes share, upgrade every node before the configuration uses
+either rule. If the task needs every upstream, as a deploy below two approval
+gates does, keep `all_success`. The skip is then intended, and you can ignore
+the line. See
 [conditional branching](Orchestration-and-DAGs#conditional-branching).
 
 ### A task fails with an exit code that was meant to skip it

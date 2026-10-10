@@ -1124,7 +1124,9 @@ async def test_schedule_retry_job_abandoned_when_no_longer_owner():
         has_conflict=lambda: False,
         view_settled=lambda: True,  # a converged view, not the settle hold
     )
-    job = types.SimpleNamespace(name="j", clusterPolicy="Leader", pool=None)
+    job = types.SimpleNamespace(
+        name="j", clusterPolicy="Leader", pool=None, concurrencyPolicy="Allow"
+    )
     cron.cron_jobs["j"] = job
     state = JobRetryState(0.1, 2, 1)
     cron.retry_state["j"] = state  # a pending retry
@@ -1165,7 +1167,9 @@ async def test_schedule_retry_job_survives_transient_gate_blip(monkeypatch):
         "maybe_launch_job",
         lambda job: launched.append(job.name) or _noop(),
     )
-    job = types.SimpleNamespace(name="j", clusterPolicy="Leader", pool=None)
+    job = types.SimpleNamespace(
+        name="j", clusterPolicy="Leader", pool=None, concurrencyPolicy="Allow"
+    )
     cron.cron_jobs["j"] = job
     state = JobRetryState(0.01, 1, 0.01)
     cron.retry_state["j"] = state
@@ -1206,7 +1210,12 @@ async def test_schedule_retry_job_defers_during_unsettled_view(
         view_settled=lambda: settled,
     )
     # while unsettled, the gate denial must read as transient, never a move
-    job = types.SimpleNamespace(name="j", clusterPolicy="PreferLeader", pool=None)
+    job = types.SimpleNamespace(
+        name="j",
+        clusterPolicy="PreferLeader",
+        pool=None,
+        concurrencyPolicy="Allow",
+    )
     assert cron._cluster_owner_moved(job) is False
     launched = []
     monkeypatch.setattr(
@@ -1262,7 +1271,9 @@ async def test_retry_abandonment_cancels_state_and_records(caplog):
         has_conflict=lambda: False,
         view_settled=lambda: True,
     )
-    job = types.SimpleNamespace(name="j", clusterPolicy="Leader", pool=None)
+    job = types.SimpleNamespace(
+        name="j", clusterPolicy="Leader", pool=None, concurrencyPolicy="Allow"
+    )
     cron.cron_jobs["j"] = job
     state = JobRetryState(0.1, 2, 1)
     cron.retry_state["j"] = state
@@ -3465,6 +3476,9 @@ async def test_lifecycle_state_teardown_cancels_slot_and_retry_tasks(
     claim = asyncio.ensure_future(_idle())
     cron._slot_renewers["j"] = renewer
     cron._slot_pursuits["j"] = pursuit
+    # the launch that the pursuit holds goes with it: a later pursuit of
+    # the job must not make it
+    cron._slot_pursuit_launch["j"] = {"with_retries": True, "params": None}
     cron._retry_claim_task = claim
     await asyncio.sleep(0)  # let the tasks reach their await points
 
@@ -3473,6 +3487,7 @@ async def test_lifecycle_state_teardown_cancels_slot_and_retry_tasks(
     assert cron.state_backend is None
     assert cron._slot_renewers == {}
     assert cron._slot_pursuits == {}
+    assert cron._slot_pursuit_launch == {}
     assert cron._retry_claim_task is None
     await asyncio.sleep(0)
     assert renewer.cancelled()

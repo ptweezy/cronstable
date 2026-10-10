@@ -72,6 +72,28 @@ The preview lists them under `params`.
   `logicalDate` and `params`. That run becomes the date's latest run for
   [failed dates](#failed-dates) recovery.
 
+With [scoped tokens](HTTP-API#scoped-tokens-webauthtokens), reusing a value
+counts as choosing it. The preview needs `control` alone. Execution also
+needs the `params` scope unless every stored value is the current declared
+default:
+
+- Values compare as the run stores them, so a stored `1` differs from a
+  default written `1.0`. A browser writes `1.0` as `1`, which is what a run
+  started from the dashboard's parameter dialog stores under that default.
+  Recovering that run needs `params`.
+- A `required` parameter has no default, so recovering a run of a workflow
+  that declares one always needs `params`.
+- Without `params`, the request answers `403` with the token's label and the
+  missing scope, and creates no run.
+- For [failed dates](#failed-dates), the daemon refuses the whole request
+  when a run in the range stores a value other than its default, and it
+  creates no run for any date.
+- Repeating a single-run request that the daemon already accepted returns
+  the existing run to any token that holds `control`. Resubmitting a
+  failed-dates batch, including a complete one, needs `params` when a run in
+  it stores a value other than its default.
+- In the dashboard, **Start recovery** shows the refusal under the preview.
+
 ## API
 
 Preview a failed-task recovery:
@@ -137,8 +159,10 @@ duplicates for completed entries. Batch progress is retained for seven days.
 Incomplete batches protect their source runs for that period. Date bounds
 are inclusive; a bound without a time zone uses UTC.
 
-Both endpoints require the `control` scope. MCP exposes the same operations
-through `cron_preview_recovery` and `cron_recover_dag`.
+Both endpoints require the `control` scope, and execution can also need
+`params` (see [run parameters](#run-parameters)). MCP exposes the same
+operations through `cron_preview_recovery` and `cron_recover_dag`, with the
+same scopes.
 
 Recovery repeats selected commands and their external side effects. The
 preview identifies the work to repeat; use commands whose writes tolerate

@@ -2225,7 +2225,8 @@ class RunningJob:
         self.params: dict[str, Any] | None = None
         # whether a manual start supplied those values. Such a run is one
         # attempt outside the job's retry ladder: its failure arms no
-        # retry, and its success settles none.
+        # retry, its success or cancellation settles none, and it never
+        # counts as the run that supersedes a pending retry.
         self.supplied_params = False
         # whether this run has parameters of its own (see
         # drop_inherited_params)

@@ -4172,7 +4172,8 @@ class AppActions(App):
         self, name: str, params: dict[str, Any] | None = None
     ) -> bool:
         """POST the start; ``params`` are sent only when given. Returns
-        whether the job started or was queued."""
+        whether the daemon accepted it: the job started, was queued, or
+        waits for its cluster slot."""
         path = "/jobs/%s/start" % _quote(name)
         try:
             if params:
@@ -4189,9 +4190,20 @@ class AppActions(App):
             self.toast("fail", "start %s: %s" % (name, exc))
             return False
         if status in (200, 202):
-            self.toast(
-                "ok", ("queued %s" if status == 202 else "▶ started %s") % name
-            )
+            if isinstance(payload, dict) and payload.get("pending") is True:
+                # the daemon accepted the start, and nothing runs yet:
+                # the run waits for another node to yield the job's
+                # cluster slot
+                self.toast(
+                    "info",
+                    "%s starts when another node yields its cluster slot"
+                    % name,
+                )
+            else:
+                self.toast(
+                    "ok",
+                    ("queued %s" if status == 202 else "▶ started %s") % name,
+                )
             self.refresh_now()
             return True
         if status == 409:

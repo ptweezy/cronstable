@@ -103,7 +103,11 @@ jobs:
 
 If any instance is still running, the new launch is skipped entirely. No new
 process is started. The already-running instance continues unaffected.
-This applies equally to scheduled launches and to retry-triggered launches.
+This applies equally to scheduled launches and to retry-triggered launches,
+with one exception. If the running instance is a manual start that supplied
+[run parameter](Commands-and-Environment#params) values, a retry that comes
+due on the same node waits for that run to end (see the
+[retry lifecycle](Failure-Detection-and-Retries#retry-lifecycle)).
 The instances considered are this process's own. With
 `concurrencyScope: cluster`, an instance running on another node that shares
 the state store also forbids the launch (see
@@ -269,9 +273,17 @@ the holder to yield instead of canceling it directly:
 3. The requester waits in a **background pursuit task**, never inline on the
    scheduler pass: waiting a holder out takes up to two slot TTLs and would
    stall every other due job. When the slot frees, by release or TTL expiry,
-   it re-attempts the launch through every normal gate and logs
+   it makes the refused launch through every normal gate and logs
    `Job <name>: launched after the previous cluster slot holder yielded
-   (concurrencyPolicy: Replace)` on success.
+   (concurrencyPolicy: Replace)` on success. The pursuit makes the launch
+   as it was requested, so a manual start runs with the values it supplied.
+   Until then, the API answers that start with `pending` (see
+   [`POST /jobs/{name}/start`](HTTP-API#post-jobsnamestart)). If the slot
+   claim refuses more launches while the pursuit waits, the pursuit makes
+   the newest one. A run of the job that starts on this node first stands
+   the pursuit down. The queue entry of a job in a
+   [resource pool](Resource-Pools) re-attempts itself, so its pursuit only
+   asks the holder to yield.
 4. The pursuit is bounded at **twice the slot TTL**. If the holder never
    yields, the requester abandons this launch: `Job <name>: the foreign
    holder (<node>) did not yield its cluster concurrency slot within <N>s;

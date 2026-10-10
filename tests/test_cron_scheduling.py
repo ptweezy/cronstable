@@ -1190,6 +1190,46 @@ async def test_pause_and_sla_pass_survives_a_broken_config(monkeypatch):
     assert cron.metrics._job("s").sla_late == {STALE: 1}
 
 
+async def test_state_chores_survive_a_refused_config(tmp_path, monkeypatch):
+    # The durable-state chores must NOT share run()'s reload try/except
+    # either: a node that refuses its configuration keeps running the jobs
+    # it loaded, and its manifest is how peers know that (the GC keep-set,
+    # the DAG fleet warning).
+    state = "state:\n  path: {}\n".format(tmp_path / "store")
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(state + _ONE_JOB)
+    cron = cronstable.cron.Cron(str(cfg))
+    monkeypatch.setattr("cronstable.cron.next_sleep_interval", lambda *a: 0.01)
+    writes = []
+    persist = cron._persist_manifest
+
+    async def counted():
+        writes.append(1)
+        await persist()
+
+    monkeypatch.setattr(cron, "_persist_manifest", counted)
+    refused = []
+
+    async def refuse():
+        refused.append(1)
+        raise cronstable.config.ConfigError("bad yaml on disk")
+
+    task = asyncio.create_task(cron.run())
+    try:
+        await _wait_until(lambda: len(writes) == 1)  # the backend start
+        monkeypatch.setattr(cron, "reload_config", refuse)
+        await _wait_until(lambda: refused)
+        # the manifest falls due on a pass that refuses its reload
+        cron._manifest_next = 0.0
+        seen = len(refused)
+        await _wait_until(lambda: len(refused) >= seen + 3)
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
+    assert len(writes) == 2
+    assert list(cron.cron_jobs) == ["j"]  # still the jobs it loaded
+
+
 async def test_sla_stale_check_breaches_and_clears(monkeypatch, caplog):
     import logging
 

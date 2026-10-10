@@ -2956,6 +2956,22 @@ async def test_job_action_error_and_status_paths(tmp_path):
         await action("j")
         assert _msgs(app)  # an exception surfaces as a toast
 
+    # run_job: a 200 that carries `pending` is accepted, and the toast
+    # says that nothing runs yet; a plain 200 and a 202 keep their words
+    app.toasts = []
+    app.api.post = _post_status(200, {"started": "j", "pending": True})
+    assert await app.run_job("j") is True
+    assert app.toasts[-1][:2] == (
+        "info",
+        "j starts when another node yields its cluster slot",
+    )
+    app.api.post = _post_status(200, {"started": "j"})
+    assert await app.run_job("j") is True
+    assert app.toasts[-1][:2] == ("ok", "▶ started j")
+    app.api.post = _post_status(202, {"queued": "j", "queueId": "q1"})
+    assert await app.run_job("j") is True
+    assert app.toasts[-1][:2] == ("ok", "queued j")
+
     # run_job status ladder: 409 with the daemon's reason, 404 missing,
     # other -> HTTP N
     app.toasts = []

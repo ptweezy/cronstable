@@ -369,8 +369,9 @@ paths:
         declared defaults. A body that is not a JSON object, and any other
         key in one, is refused with `400`. Supplying a non-empty `params` map
         needs the `params` scope in addition to `control`. A `200` means a
-        run started: a `concurrencyPolicy` that admits no new run answers
-        `409`.
+        run started, or, with `pending: true`, that the run starts when
+        another node yields the job's cluster concurrency slot. A
+        `concurrencyPolicy` that admits no new run answers `409`.
       x-required-scope: control
       parameters:
         - $ref: "#/components/parameters/JobName"
@@ -385,7 +386,9 @@ paths:
                 params: { $ref: "#/components/schemas/DagRunParams" }
       responses:
         "200":
-          description: Launched.
+          description: >-
+            Launched, or accepted to launch when another node yields the
+            job's cluster concurrency slot (`pending`).
           content:
             application/json:
               schema:
@@ -398,6 +401,16 @@ paths:
                     description: >-
                       The values the run takes, with defaults applied.
                       Present for a job that declares parameters.
+                  pending:
+                    type: boolean
+                    description: >-
+                      Present, and `true`, when nothing runs yet. Under
+                      `concurrencyPolicy: Replace` with
+                      `concurrencyScope: cluster`, another node holds the
+                      job's slot. This node asks it to yield, and the run
+                      starts when the slot frees. A newer launch of the job
+                      takes its place, and this node skips the run if the
+                      holder keeps the slot for twice `slotTtlSeconds`.
                 required: [started]
         "202":
           description: Accepted into a resource pool queue.
@@ -442,6 +455,14 @@ paths:
           description: >-
             The job is disabled, or its `concurrencyPolicy` admitted no new
             run, so the request starts nothing (JSON error envelope).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: >-
+            The request starts nothing. Pool state is unavailable, or the
+            state store cannot answer for the job's cluster concurrency slot
+            and `onStoreUnavailable` is `fail-closed`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1625,6 +1646,13 @@ paths:
       tags: [dags]
       summary: Preview or execute selective recovery
       operationId: recoverDagRun
+      description: >-
+        Previews a recovery, or executes a reviewed one with `dryRun: false`
+        and the preview's `planToken`. Executing a plan whose `params`
+        differ from the declared defaults needs the `params` scope in
+        addition to `control`. The preview needs `control` alone. So does
+        repeating a request that the daemon already accepted, which returns
+        the existing run.
       x-required-scope: control
       parameters:
         - { name: name, in: path, required: true, schema: { type: string } }
@@ -1646,7 +1674,14 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
+        "403":
+          description: >-
+            The token lacks `control`, or the request executes a plan whose
+            `params` differ from the declared defaults and the token lacks
+            `params`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "409":
           description: The source, configuration, or preview cannot be used.
           content:
@@ -1658,6 +1693,13 @@ paths:
       tags: [dags]
       summary: Preview or recover failed logical dates
       operationId: recoverDagDates
+      description: >-
+        Previews recovery of the failed dates in a range, or executes a
+        reviewed batch with `dryRun: false` and the preview's `planToken`.
+        Executing a batch in which a plan's `params` differ from the
+        declared defaults needs the `params` scope in addition to `control`,
+        including a resubmitted batch that is already complete. A refused
+        request creates no run. The preview needs `control` alone.
       x-required-scope: control
       parameters:
         - { name: name, in: path, required: true, schema: { type: string } }
@@ -1685,7 +1727,14 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
+        "403":
+          description: >-
+            The token lacks `control`, or the request executes a batch in
+            which a plan's `params` differ from the declared defaults and
+            the token lacks `params`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "409":
           description: The range or its preview cannot be used.
           content:
@@ -1704,8 +1753,9 @@ components:
         all scopes, while each `web.authTokens` entry lists some of `view`
         (every read-only GET, and every /mcp method), `control` (the
         mutating POSTs), `approve` (the DAG decision route) and `params`
-        (choosing run parameter values on a DAG trigger or backfill, which
-        also needs `control`); `control`, `approve` and `params` each imply
+        (choosing run parameter values on a DAG trigger or backfill, or
+        reusing chosen values in a DAG recovery, each of which also needs
+        `control`); `control`, `approve` and `params` each imply
         `view`. A recognised token
         that lacks the scope an operation requires is 403, not 401. The
         required scope defaults to `view` for GET/HEAD and `control` for other

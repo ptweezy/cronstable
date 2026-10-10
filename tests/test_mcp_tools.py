@@ -651,6 +651,27 @@ async def test_run_job_success_and_confirm_gate(monkeypatch):
     assert launched == ["hello"]
 
 
+async def test_run_job_reports_a_start_that_waits_for_its_cluster_slot(
+    monkeypatch,
+):
+    h = _handler()
+
+    async def fake_start(name, params=None, scopes=None):
+        return {"queued": None, "params": {"region": "us"}, "pending": True}
+
+    monkeypatch.setattr(h._cron, "start_job", fake_start)
+    result = await _call(h, "cron_run_job", {"name": "hello", "confirm": True})
+    assert result["structuredContent"] == {
+        "started": "hello",
+        "params": {"region": "us"},
+        "pending": True,
+    }
+    assert result["content"][0]["text"] == (
+        "job 'hello' starts when another node yields its cluster "
+        "concurrency slot"
+    )
+
+
 async def test_run_job_disabled_surfaces_api_action_error():
     h = _handler()
     result = await _call(
@@ -2205,6 +2226,55 @@ async def test_params_need_the_params_scope_over_mcp(tmp_path):
             doc = await cron._dag.get_run("nightly", body["runKey"])
             # the run names the token that supplied the values
             assert doc["triggeredBy"] == "ops"
+        finally:
+            mcp_mod._caller.reset(token)
+    finally:
+        await _teardown(cron)
+
+
+async def test_recovering_chosen_values_needs_the_params_scope_over_mcp(
+    tmp_path,
+):
+    # the REST twins refuse to execute a recovery that reuses chosen values
+    # for a token without the scope; the tool applies the same check
+    h, cron = await _param_handler(tmp_path)
+    try:
+        _set_cmd(cron, "nightly", "a", [_PY, "-c", "raise SystemExit(3)"])
+        day = "2026-01-02T00:00:00+00:00"
+        made = await cron._dag.trigger(
+            "nightly", params={"limit": 3}, logical_date=day
+        )
+        source = await _drive(cron, "nightly", made["runKey"])
+        assert source["state"] == "failed"
+        before = await cron._dag.list_runs("nightly")
+        by_key = {"dag": "nightly", "run_key": made["runKey"]}
+        by_date = {"dag": "nightly", "from": day, "to": day}
+        reviewed = []
+        token = _as_caller(frozenset({"view", "control"}), label="ci")
+        try:
+            for args in (by_key, by_date):
+                # the preview stays a `control` tool
+                result = await _call(h, "cron_preview_recovery", args)
+                plan = result["structuredContent"]
+                shown = plan.get("plans") or [plan]
+                assert shown[0]["params"] == {"limit": 3}
+                reviewed.append(
+                    {**args, "plan_token": plan["planToken"], "confirm": True}
+                )
+                result = await _call(h, "cron_recover_dag", reviewed[-1])
+                assert result["isError"] is True, args
+                assert "'params' scope" in result["content"][0]["text"]
+            assert await cron._dag.list_runs("nightly") == before
+        finally:
+            mcp_mod._caller.reset(token)
+        token = _as_caller(
+            frozenset({"view", "control", "params"}), label="ops"
+        )
+        try:
+            # the same reviewed call runs for a token that holds both
+            result = await _call(h, "cron_recover_dag", reviewed[0])
+            assert result["structuredContent"]["created"] is True
+            assert result["structuredContent"]["params"] == {"limit": 3}
         finally:
             mcp_mod._caller.reset(token)
     finally:

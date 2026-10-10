@@ -9,8 +9,8 @@ Covers the feature layer by layer:
     delivery to a real task process, against a real backend and the real
     loopback endpoint (the harness of tests/test_state_dag_run.py).
   * the HTTP routes, with their statuses and the ``params`` scope.
-  * recovery: the stored map is reused, and the declaration is part of the
-    configuration revision.
+  * recovery: the stored map is reused under the caller's scopes, and the
+    declaration is part of the configuration revision.
 """
 
 import json
@@ -700,15 +700,30 @@ async def test_trigger_logical_date_is_stored_in_utc(dag_cron):
             dagrun.TriggerInputError, match="outside the supported"
         ):
             await cron._dag.trigger("plain", logical_date=edge)
-    # the UTC designator reads the same on every Python version
-    zulu = await cron._dag.trigger(
-        "plain", logical_date="2026-10-01T00:00:00Z"
-    )
-    body = await cron._dag.get_run("plain", zulu["runKey"])
-    assert body["logicalDate"] == "2026-10-01T00:00:00+00:00"
+    # every RFC 3339 form reads the same on every Python version
+    for text, stored in (
+        ("2026-10-01T00:00:00Z", "2026-10-01T00:00:00+00:00"),
+        ("2026-10-01T00:00:00.5Z", "2026-10-01T00:00:00.500000+00:00"),
+        (
+            "2026-10-01T00:00:00.123456789Z",
+            "2026-10-01T00:00:00.123456+00:00",
+        ),
+        ("2026-10-01T00:00:00+0000", "2026-10-01T00:00:00+00:00"),
+    ):
+        request = {"logical_date": text, "request_id": text}
+        made = await cron._dag.trigger("plain", **request)
+        body = await cron._dag.get_run("plain", made["runKey"])
+        assert body["logicalDate"] == stored, text
+        # a retry that carries the same text names the same run
+        again = await cron._dag.trigger("plain", **request)
+        assert again == {"runKey": made["runKey"], "created": False}, text
     assert dagrun._parse_iso("2026-10-01T00:00:00z") == dagrun._parse_iso(
         "2026-10-01T00:00:00+00:00"
     )
+    # the trigger refuses a form that only a newer datetime.fromisoformat
+    # reads
+    with pytest.raises(dagrun.TriggerInputError, match="ISO 8601"):
+        await cron._dag.trigger("plain", logical_date="20261001T000000Z")
 
 
 async def test_trigger_checks_the_arguments_a_request_carried(dag_cron):
@@ -1255,6 +1270,44 @@ def test_for_run_checks_the_callers_scopes_before_it_reads_the_values():
     assert params.for_run((), {}, "job 'plain'", control) is None
 
 
+def test_check_reuse_holds_a_caller_without_the_scope_to_the_defaults():
+    specs = _specs(_NIGHTLY)
+    defaults = {"mode": "incremental", "limit": 10}
+    chosen = {**defaults, "limit": 3}
+    control = _effective_web_scopes(["control"])
+    both = _effective_web_scopes(["control", "params"])
+    # the map a run stores when nobody chooses is open to `control`, in
+    # whatever order the document holds it
+    params.check_reuse(specs, defaults, control)
+    params.check_reuse(specs, dict(reversed(defaults.items())), control)
+    # reusing a chosen value is choosing it
+    with pytest.raises(params.ParamScopeError) as err:
+        params.check_reuse(specs, chosen, control)
+    assert "'params' scope" in str(err.value) and not err.value.errors
+    # the scope, or a caller that no token restricts, reuses any map
+    params.check_reuse(specs, chosen, both)
+    params.check_reuse(specs, chosen, None)
+    # values compare as the run document writes them, and the map holds
+    # the declared names and no others
+    ratio = (params.ParamSpec(name="ratio", type=params.NUMBER, default=5),)
+    params.check_reuse(ratio, {"ratio": 5}, control)
+    for stored in ({"ratio": 5.0}, {}, {"ratio": 5, "extra": 1}):
+        with pytest.raises(params.ParamScopeError):
+            params.check_reuse(ratio, stored, control)
+    # a required parameter has no default, so its value is always chosen
+    stored = {**_DEFAULTS, "ticket": "OPS-9"}
+    assert not params.check_stored(_specs(), stored)
+    with pytest.raises(params.ParamScopeError):
+        params.check_reuse(_specs(), stored, control)
+    params.check_reuse(_specs(), stored, both)
+    # the spec holds None in place of a default, and a stored null counts
+    # as chosen all the same
+    with pytest.raises(params.ParamScopeError):
+        params.check_reuse(_specs(), {**_DEFAULTS, "ticket": None}, control)
+    # nothing declared and nothing stored
+    params.check_reuse((), {}, control)
+
+
 async def test_web_param_error_answers_403_for_the_scope_and_400_otherwise(
     dag_cron,
 ):
@@ -1270,6 +1323,15 @@ async def test_web_param_error_answers_403_for_the_scope_and_400_otherwise(
     assert json.loads(err.value.text)["error"] == (
         "token 'ci' does not grant the 'params' permission required to "
         "supply run parameters"
+    )
+    # a route names the action that needs the scope
+    with pytest.raises(web.HTTPForbidden) as err:
+        cron._web_param_error(
+            request, params.ParamScopeError("refused"), "recover a run"
+        )
+    assert json.loads(err.value.text)["error"] == (
+        "token 'ci' does not grant the 'params' permission required to "
+        "recover a run"
     )
     refused = params.ParamError("invalid", {"limit": "must be an integer"})
     response = cron._web_param_error(request, refused)
@@ -1322,6 +1384,273 @@ async def test_recovery_reuses_the_source_parameters(dag_cron, tmp_path):
     assert finished["engine"] == dag.BRANCHING_PARAMS_ENGINE_LEVEL
     # the source run is untouched
     assert await cron._dag.get_run("deploy", source["runKey"]) == source
+
+
+async def _nightly_run(cron, tmp_path, limit, logical=None, fail=True):
+    """A finished run of ``nightly`` that stores ``limit``.
+
+    ``load`` appends the limit it reads to ``seen.txt`` and fails until
+    ``ready`` exists, so a failed source recovers with no configuration
+    change. Returns with ``ready`` in place and ``seen.txt`` empty.
+    """
+    seen, ready = tmp_path / "seen.txt", tmp_path / "ready"
+    load = (
+        "import os; from pathlib import Path; "
+        "limit = os.environ['CRONSTABLE_PARAM_LIMIT']; "
+        "open({!r}, 'a').write(limit + '\\n'); "
+        "assert Path({!r}).exists()"
+    ).format(str(seen), str(ready))
+    _set_cmd(cron, "nightly", "load", [_PY, "-c", load])
+    if fail:
+        ready.unlink(missing_ok=True)
+    else:
+        ready.touch()
+    started = await cron._dag.trigger(
+        "nightly", params={"limit": limit}, logical_date=logical
+    )
+    source = await _drive(cron, "nightly", started["runKey"])
+    assert source["state"] == (dag.FAILED if fail else dag.SUCCESS)
+    ready.touch()
+    seen.write_text("")
+    return source
+
+
+async def test_recovery_of_chosen_values_needs_the_params_scope(
+    dag_cron, tmp_path
+):
+    cron = await dag_cron(_NIGHTLY)
+    key = (await _nightly_run(cron, tmp_path, 3))["runKey"]
+    control = _effective_web_scopes(["control"])
+    both = _effective_web_scopes(["control", "params"])
+    # the preview is the same for every caller
+    preview = await cron._dag.recover("nightly", key, scopes=control)
+    assert preview == await cron._dag.recover("nightly", key)
+    assert preview["params"] == {"mode": "incremental", "limit": 3}
+    rerun = await cron._dag.recover(
+        "nightly", key, mode="from", tasks=["load"], scopes=control
+    )
+    before = await cron._dag.list_runs("nightly")
+    # execution reuses a chosen value, whichever tasks it selects
+    for selection, plan in (
+        ({}, preview),
+        ({"mode": "from", "tasks": ["load"]}, rerun),
+    ):
+        with pytest.raises(params.ParamScopeError):
+            await cron._dag.recover(
+                "nightly",
+                key,
+                plan_token=plan["planToken"],
+                allow_config_change=True,
+                scopes=control,
+                **selection,
+            )
+    assert await cron._dag.list_runs("nightly") == before
+    # the refusal released the source run's lease
+    result = await cron._dag.recover(
+        "nightly", key, plan_token=preview["planToken"], scopes=both
+    )
+    assert result["created"] is True
+    finished = await _drive(cron, "nightly", result["runKey"])
+    assert finished["state"] == dag.SUCCESS
+    assert (tmp_path / "seen.txt").read_text().split() == ["3"]
+    # a repeat of an accepted plan creates nothing, whoever sends it
+    again = await cron._dag.recover(
+        "nightly", key, plan_token=preview["planToken"], scopes=control
+    )
+    assert again["created"] is False and again["runKey"] == result["runKey"]
+
+
+async def test_recovery_of_the_defaults_stays_a_control_action(
+    dag_cron, tmp_path
+):
+    cron = await dag_cron(_NIGHTLY)
+    key = (await _nightly_run(cron, tmp_path, 10))["runKey"]
+    control = _effective_web_scopes(["control"])
+    preview = await cron._dag.recover("nightly", key, scopes=control)
+    result = await cron._dag.recover(
+        "nightly", key, plan_token=preview["planToken"], scopes=control
+    )
+    finished = await _drive(cron, "nightly", result["runKey"])
+    assert finished["state"] == dag.SUCCESS
+    assert finished["params"] == {"mode": "incremental", "limit": 10}
+    # the defaults are the current declaration's: once one moves, the
+    # stored value is a chosen one
+    moved = parse_config_string(
+        _STATE + _NIGHTLY.replace("default: 10", "default: 11"), ""
+    )
+    cron.cron_dags = {d.name: d for d in moved.dags}
+    preview = await cron._dag.recover(
+        "nightly", key, mode="from", tasks=["load"], scopes=control
+    )
+    with pytest.raises(params.ParamScopeError):
+        await cron._dag.recover(
+            "nightly",
+            key,
+            mode="from",
+            tasks=["load"],
+            plan_token=preview["planToken"],
+            allow_config_change=True,
+            scopes=control,
+        )
+
+
+async def test_failed_dates_recovery_refuses_before_it_records_a_batch(
+    dag_cron, tmp_path
+):
+    cron = await dag_cron(_NIGHTLY)
+    await _nightly_run(cron, tmp_path, 10, "2026-09-01T00:00:00+00:00")
+    await _nightly_run(cron, tmp_path, 3, "2026-09-02T00:00:00+00:00")
+    control = _effective_web_scopes(["control"])
+    window = ("nightly", "2026-09-01", "2026-09-02")
+    preview = await cron._dag.recover_range(*window, scopes=control)
+    assert [p["params"]["limit"] for p in preview["plans"]] == [10, 3]
+    before = await cron._dag.list_runs("nightly")
+    with pytest.raises(params.ParamScopeError):
+        await cron._dag.recover_range(
+            *window,
+            plan_token=preview["planToken"],
+            allow_config_change=True,
+            scopes=control,
+        )
+    # refused whole: the date that stores the defaults did not start, and
+    # no batch holds the source runs back from retention
+    assert await cron._dag.list_runs("nightly") == before
+    batches = await cron.state_backend.list_documents("recoverybatch/nightly")
+    assert batches == []
+    # the date that stores the defaults stays a `control` action
+    first = ("nightly", "2026-09-01", "2026-09-01")
+    one = await cron._dag.recover_range(*first, scopes=control)
+    done = await cron._dag.recover_range(
+        *first, plan_token=one["planToken"], scopes=control
+    )
+    assert len(done["runs"]) == 1
+
+
+async def test_a_control_caller_cannot_continue_a_batch_of_chosen_values(
+    dag_cron, tmp_path, monkeypatch
+):
+    cron = await dag_cron(_NIGHTLY)
+    await _nightly_run(cron, tmp_path, 3, "2026-09-01T00:00:00+00:00")
+    window = ("nightly", "2026-09-01", "2026-09-01")
+    preview = await cron._dag.recover_range(*window)
+    both = _effective_web_scopes(["control", "params"])
+    recover = cron._dag.recover
+    handed = {}
+
+    async def interrupted(name, key, **kwargs):
+        handed.update(kwargs)
+        raise recovery.RecoveryError("temporary interruption")
+
+    # a caller with the scope records the batch and is interrupted
+    monkeypatch.setattr(cron._dag, "recover", interrupted)
+    with pytest.raises(recovery.RecoveryError, match="interruption"):
+        await cron._dag.recover_range(
+            *window, plan_token=preview["planToken"], scopes=both
+        )
+    # recover() checks each date again under the configuration it creates
+    # the run with, so it gets the caller's scopes
+    assert handed["scopes"] == both
+    monkeypatch.setattr(cron._dag, "recover", recover)
+    before = await cron._dag.list_runs("nightly")
+    with pytest.raises(params.ParamScopeError):
+        await cron._dag.recover_range(
+            *window,
+            plan_token=preview["planToken"],
+            scopes=_effective_web_scopes(["control"]),
+        )
+    assert await cron._dag.list_runs("nightly") == before
+    # the caller that recorded it continues it
+    done = await cron._dag.recover_range(
+        *window, plan_token=preview["planToken"], scopes=both
+    )
+    assert len(done["runs"]) == 1
+
+
+async def test_http_recovery_needs_the_params_scope_for_chosen_values(
+    dag_cron, tmp_path
+):
+    import aiohttp
+
+    cron = await dag_cron(_NIGHTLY)
+    day = "2026-09-01T00:00:00+00:00"
+    succeeded = await _nightly_run(cron, tmp_path, 3, fail=False)
+    await _nightly_run(cron, tmp_path, 3, day)
+    seen = tmp_path / "seen.txt"
+    await cron.start_stop_web_app(
+        {
+            "listen": ["http://127.0.0.1:0"],
+            "ui": False,
+            "authTokens": [
+                {"value": "ctl", "scopes": ["control"], "label": "ci"},
+                {
+                    "value": "ops",
+                    "scopes": ["control", "params"],
+                    "label": "ops-laptop",
+                },
+            ],
+        }
+    )
+    base = "http://127.0.0.1:{}/dags/nightly".format(
+        cron.web_runner.addresses[0][1]
+    )
+    requests = (
+        # a successful run, replayed from its task
+        (
+            base + "/runs/{}/recover".format(succeeded["runKey"]),
+            {"mode": "from", "tasks": ["load"]},
+        ),
+        # a failed date
+        (base + "/recover", {"from": day, "to": day}),
+    )
+
+    def bearer(token):
+        return {"Authorization": "Bearer " + token}
+
+    before = await cron._dag.list_runs("nightly")
+    try:
+        async with aiohttp.ClientSession() as s:
+            reviewed = []
+            for url, body in requests:
+                # the preview stays a `control` action
+                async with s.post(url, headers=bearer("ctl"), json=body) as r:
+                    assert r.status == 200, url
+                    plan = await r.json()
+                shown = plan.get("plans") or [plan]
+                assert [p["params"]["limit"] for p in shown] == [3]
+                # the acknowledgement is the caller's own to give, so it
+                # does not stand in for the scope
+                reviewed.append(
+                    {
+                        **body,
+                        "dryRun": False,
+                        "planToken": plan["planToken"],
+                        "allowConfigChange": True,
+                    }
+                )
+                async with s.post(
+                    url, headers=bearer("ctl"), json=reviewed[-1]
+                ) as r:
+                    assert r.status == 403, url
+                    assert (await r.json())["error"] == (
+                        "token 'ci' does not grant the 'params' permission "
+                        "required to recover a run with parameter values "
+                        "other than the declared defaults"
+                    )
+            assert await cron._dag.list_runs("nightly") == before
+            assert seen.read_text() == ""
+            # the same reviewed requests run for a token that holds both
+            for (url, _body), execute in zip(requests, reviewed):
+                async with s.post(
+                    url, headers=bearer("ops"), json=execute
+                ) as r:
+                    assert r.status == 200, url
+                    done = await r.json()
+                for key in done.get("runs") or [done["runKey"]]:
+                    finished = await _drive(cron, "nightly", key)
+                    assert finished["params"]["limit"] == 3
+            assert seen.read_text().split() == ["3", "3"]
+    finally:
+        await cron.start_stop_web_app(None)
 
 
 async def test_recovery_refuses_values_the_declaration_no_longer_fits(

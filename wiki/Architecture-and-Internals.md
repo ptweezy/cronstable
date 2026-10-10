@@ -826,8 +826,8 @@ one, the preceding flow is complete and retries die with the process):
   the attempt number, the **absolute** `notBefore` deadline, and the job's
   `fingerprint.job_digest`. Every resolution appends a `settled` record on top
   (`_persist_retry_settled`) with a reason: `launched`, `succeeded`,
-  `superseded`, `cancelled`, `exhausted`, `owner-moved`, `job-removed`, or a
-  re-arm-time invalidation reason.
+  `superseded`, `cancelled`, `exhausted`, `replaced`, `owner-moved`,
+  `job-removed`, or a re-arm-time invalidation reason.
 
   When cross-node retry resume is active (a shared-topology store plus leader
   election) the stream carries a third kind: an ownership move writes a

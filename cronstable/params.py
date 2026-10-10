@@ -103,7 +103,8 @@ class ParamError(Exception):
 
 
 class ParamScopeError(ParamError):
-    """Values from a caller whose token does not grant :data:`SCOPE`."""
+    """Values that a caller supplies or reuses although its token does not
+    grant :data:`SCOPE`."""
 
 
 def _echo(name: str) -> str:
@@ -326,6 +327,38 @@ def check_stored(
         if name not in stored:
             errors[name] = "has no stored value"
     return errors
+
+
+def check_reuse(
+    specs: Iterable[ParamSpec],
+    stored: Mapping[str, Any],
+    scopes: Collection[str] | None,
+) -> None:
+    """Refuse to reuse ``stored`` for a caller whose token lacks :data:`SCOPE`.
+
+    A recovery run reuses its source run's map as it is. A caller without
+    the scope starts runs with the declared defaults, so the only map it
+    reuses is the one a run stores when nobody chooses, with every declared
+    name at its default. Values compare as the run document writes them, so
+    the number ``5.0`` differs from a default of ``5``. A ``required``
+    parameter has no default, so its value is always a chosen one.
+    ``scopes`` are the scopes of the caller's token, or ``None`` for a
+    caller that no token restricts.
+
+    Raises :class:`ParamScopeError`.
+    """
+    if scopes is None or SCOPE in scopes:
+        return
+    specs = tuple(specs)
+    defaults = {spec.name: spec.default for spec in specs}
+    if any(spec.required for spec in specs) or json.dumps(
+        stored, sort_keys=True
+    ) != json.dumps(defaults, sort_keys=True):
+        raise ParamScopeError(
+            "the token lacks the {!r} scope that recovering a run with "
+            "parameter values other than the declared defaults "
+            "requires".format(SCOPE)
+        )
 
 
 def env_text(value: Any) -> str:

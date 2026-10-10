@@ -1147,8 +1147,7 @@ class FileDeviceStore:
         except Exception as exc:  # noqa: BLE001 - normalized to PushError
             # Same normalization as StateDeviceStore._bounded: every
             # caller up to send_report and the pairing handlers expects
-            # PushError and nothing else, and an escapee here would take
-            # the rest of the housekeeping pass with it.
+            # PushError and nothing else.
             raise PushError(
                 "{} push devices file {} failed: {}: {}".format(
                     doing, self.path, type(exc).__name__, exc
@@ -1351,13 +1350,11 @@ class StateDeviceStore:
         ``Cron.start_stop_push`` expects PushError and nothing else, so
         this is where a backend's exception vocabulary stops.
 
-        Catching only OSError was not enough, and failed in the quietest
-        possible way: one unreadable ``pushmeta/collapse`` document made
-        ``ensure_salt`` raise past ``start_stop_push`` into the
-        housekeeping pass, which skipped everything after it, including
-        the durable-state manifest and garbage collection, on that pass
-        and on every later one (the push config never records as applied,
-        so the same read is retried and raises again forever).  Note
+        Catching only OSError is too narrow: one unreadable
+        ``pushmeta/collapse`` document makes ``ensure_salt`` raise a
+        backend type that its callers do not expect, and it does so on
+        every housekeeping pass (the push config never records as
+        applied, so the same read is retried and raises again).  Note
         ``Exception``, not ``BaseException``: a cancelled housekeeping
         pass must still cancel.
         """

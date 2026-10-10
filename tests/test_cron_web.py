@@ -2503,6 +2503,7 @@ async def test_webloop_run_shutdown_teardown(tmp_path, monkeypatch, run_cron):
     cron._catchup_tasks.add(catchup)
     pursuit = asyncio.create_task(asyncio.sleep(100))
     cron._slot_pursuits["p"] = pursuit
+    cron._slot_pursuit_launch["p"] = {"with_retries": True, "params": None}
     # a Replace cancel still in its tail is joined, never cancelled
     replace_cancel = asyncio.create_task(asyncio.sleep(0.05))
     cron._replace_cancel_tasks.add(replace_cancel)
@@ -2520,6 +2521,7 @@ async def test_webloop_run_shutdown_teardown(tmp_path, monkeypatch, run_cron):
     assert renewer.cancelled()
     assert catchup.cancelled()
     assert pursuit.cancelled()
+    assert cron._slot_pursuit_launch == {}
     assert cron._slot_renewers == {}
 
 

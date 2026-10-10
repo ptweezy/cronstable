@@ -30,7 +30,10 @@ Resource and recovery endpoints share this API's authentication:
 | `POST /dags/{name}/recover` | `control` | Preview or execute recovery for failed dates. |
 
 Recovery defaults to a preview. Execution requires `dryRun: false` and the
-preview's `planToken`. See [workflow recovery](Workflow-Recovery) for request
+preview's `planToken`. With [scoped tokens](#scoped-tokens-webauthtokens),
+execution also needs the `params` scope when a source run stores
+[run parameter](Orchestration-and-DAGs#run-parameters) values other than the
+declared defaults. See [workflow recovery](Workflow-Recovery) for request
 fields and conflict handling. A pooled job's start endpoint returns `202`
 with its queue ID; see [resource pools](Resource-Pools). Completed run history
 includes [verification results](Result-Verification) when configured.
@@ -595,9 +598,23 @@ declared JSON type, and the answer lists the values the run takes:
 Manual launch goes through `maybe_launch_job`, so the job's `concurrencyPolicy`
 applies. If an instance is already running, `Allow` starts another and
 `Replace` cancels the running instance(s) first. `Forbid` starts nothing and
-answers `409` with the reason, and so does a
-[cluster concurrency slot](Concurrency-and-Timeouts#concurrency-across-a-cluster)
-that another node holds. A `200` means that a run started. See
+answers `409` with the reason.
+
+When another node holds the job's
+[cluster concurrency slot](Concurrency-and-Timeouts#concurrency-across-a-cluster),
+`Forbid` answers `409` too. `Replace` answers `200` with `"pending": true`:
+
+```json
+{"started": "reindex", "params": {"index": "orders", "full": false}, "pending": true}
+```
+
+Nothing runs yet. This node asks the holder to yield, and the run starts with
+the values in the answer when the slot frees. The pending run does not start
+if a newer launch of the job comes first, or if the holder keeps the slot for
+twice `slotTtlSeconds`. If the state store cannot answer for the slot and
+[`onStoreUnavailable`](Durable-State#when-the-store-is-unavailable-onstoreunavailable)
+is `fail-closed`, the request starts nothing and answers `503`. A `200`
+without `pending` means that a run started. See
 [concurrency and timeouts](Concurrency-and-Timeouts).
 
 ### `POST /jobs/{name}/cancel`
@@ -614,7 +631,11 @@ running instance is a `409`; success answers
 A run cancelled this way is recorded in the job's history with the outcome
 `cancelled`. Cancellation is a deliberate operator action, not a job failure,
 so it is **not** reported (`onFailure` does not fire) and does **not** trigger
-retries.
+retries. It also ends the job's
+[retry sequence](Failure-Detection-and-Retries#retry-lifecycle), with one
+exception: the run of a manual start that supplied
+[run parameter](Commands-and-Environment#params) values is outside the
+sequence, so its cancellation leaves a pending retry in place.
 
 ### `POST /jobs/{name}/pause`
 
@@ -669,7 +690,7 @@ the endpoint the [web dashboard](Web-Dashboard) polls.
 | `schedule_findings` | The [schedule linter's](Schedule-Linting) advisory findings for this crontab, each `{code, level, message}` (empty for a clean schedule). Computed once at config load, in the job's own time zone. |
 | `params` | The [run parameters](Commands-and-Environment#params) the job declares, in the shape `GET /dags` uses for a DAG's declaration. Present only on a job that declares them. `last_run` and each run of `GET /jobs/{name}/runs` carry the values that run took under `params`. |
 | `schedule_resolved` | Present only for [`H` hashed schedules](Hashed-Schedules): the plain expression the `H` items resolved to for this job, so clients can compute previews while displaying the `H` the user wrote. |
-| `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`, `skip_reason`, `resources`, and `ranAt` on a run that was not `skipped`), or `null` if the job has not run yet. One exception: a run in progress when this host crashed is reported here as `unknown` even though it never finished. It stands at the instant it started, so a run that finished while it was still going can carry a later `finished_at`. The crash stays visible instead of hidden behind whatever outlived it. |
+| `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`, `skip_reason`, `resources`, and the run instant keys that [`GET /jobs/{name}/runs`](#get-jobsnameruns) describes), or `null` if the job has not run yet. One exception: a run in progress when this host crashed is reported here as `unknown` even though it never finished. It stands at the instant it started, so a run that finished while it was still going can carry a later `finished_at`. The crash stays visible instead of hidden behind whatever outlived it. |
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`, whose ordering note covers this tail too. |
 | `paused` | Always present: the active [runtime pause](Pausing-Jobs), `{since, until, note, by, channel}` (ISO-8601 instants), or `null` when the job is not paused. |
 | `sla` | Present only for jobs with a configured [`sla:` block](Late-Run-Detection): `{thresholds, state, breaches}`, where `thresholds` holds the non-null threshold keys, `state` is `"ok"` or `"late"`, and `breaches` lists each latched check as `{check, since, observed_seconds, threshold_seconds}` (`observed_seconds` re-measured at payload time). |
@@ -742,9 +763,14 @@ later, and a crash-reconciled row stands where its interrupted run began. The
 
 Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
 (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`,
-`fail_reason`, and `resources`), plus `ranAt` on every entry whose outcome is
-not `skipped`: the same instant as `finished_at`, under the key the run
-ledger uses, so ledger-derived and in-memory records read alike. `resources`
+`fail_reason`, and `resources`), plus the run instant on every entry whose
+outcome is not `skipped`: the same instant as `finished_at`, under the key the
+run ledger uses, so ledger-derived and in-memory records read alike. That key
+is `ranAt`. The run of a manual start that supplied
+[run parameter](Commands-and-Environment#params) values carries
+`suppliedRanAt` in its place, beside `suppliedParams: true`, because the run
+stays outside the job's
+[retry sequence](Failure-Detection-and-Retries#retry-lifecycle). `resources`
 is `null` unless the job opted into
 [`monitorResources`](Resource-Monitoring), in which case it is
 `{cpu_user_seconds, cpu_system_seconds, cpu_total_seconds, max_rss_bytes,
@@ -1044,7 +1070,7 @@ request with no body starts a run with the declared parameter defaults.
 | Field | Meaning |
 | --- | --- |
 | `params` | Values for the [run parameters](Orchestration-and-DAGs#run-parameters) the DAG declares, each in its declared JSON type. A non-empty object needs the `params` scope. |
-| `logicalDate` | An ISO 8601 instant that the run records as its logical date, stored in UTC. A value without an offset is read as UTC. |
+| `logicalDate` | An RFC 3339 date and time, such as `2026-10-01T09:00:00-05:00`, that the run records as its logical date. A value without an offset is read as UTC. The run stores the instant in UTC, to the microsecond. [Catch-up](Orchestration-and-DAGs#scheduling-catch-up-and-backfill) counts from the runs the schedule created, whatever date a manual run carries. |
 | `requestId` | A string of 1 to 200 characters that makes the request repeatable. The run key is derived from it, so a repeated request returns the first run while that run is retained. |
 
 ```json
@@ -1544,7 +1570,7 @@ There are four scopes:
 | `view` | Every read-only `GET`: jobs, runs, DAGs, cluster/fleet, schedule intelligence, the state inspector, the SSE log tail, the calendar feeds, and `/metrics`. Also the MCP endpoint (`POST /mcp`) and its read tools. |
 | `control` | The mutating actions: `POST` start / cancel / pause / resume, DAG trigger / backfill, and the MCP tools that take them, plus `cron_preview_recovery`. |
 | `approve` | Only the DAG approval-gate decision (`POST …/decision`). |
-| `params` | Choosing [run parameter](Orchestration-and-DAGs#run-parameters) values on a job start, a DAG trigger, or a DAG backfill. Those routes also need `control`. |
+| `params` | Choosing [run parameter](Orchestration-and-DAGs#run-parameters) values on a job start, a DAG trigger, or a DAG backfill, and executing a [recovery](Workflow-Recovery#run-parameters) that reuses values other than the declared defaults. Those routes also need `control`. |
 
 `control`, `approve`, and `params` each **imply** `view` (an action UI has to
 read state first), so a `[control]` token can also call every `GET`.
@@ -1577,8 +1603,10 @@ this table denies it over REST.
 
 No route requires `params` by itself. The trigger and backfill handlers
 check it when the request body carries a non-empty `params` object, and so
-do `cron_trigger_dag` and `cron_backfill_dag`. A daemon with no token
-configured accepts parameter values, as it accepts every action.
+do `cron_trigger_dag` and `cron_backfill_dag`. The recovery handlers and
+`cron_recover_dag` check it when an execution reuses values other than the
+declared defaults. A recovery preview needs `control` alone. A daemon with no
+token configured accepts parameter values, as it accepts every action.
 
 The two failure modes are distinct:
 

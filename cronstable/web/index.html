@@ -8221,9 +8221,13 @@ var qrcode = function() {
       if (params) { opts.headers = { "Content-Type": "application/json" }; opts.body = JSON.stringify({ params: params }); }
       const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/start", opts);
       if (res.ok) {
-        toast("ok", (res.status === 202 ? "Queued " : "▶ started ") + name);
+        // A 200 that carries `pending` starts nothing yet: the run waits
+        // for another node to yield the job's cluster slot.
+        const waiting = res.status === 200 && (await res.json().catch(() => ({}))).pending === true;
+        if (waiting) toast("info", name + " starts when another node yields its cluster slot");
+        else toast("ok", (res.status === 202 ? "Queued " : "▶ started ") + name);
         if (res.status === 202) loadPools();
-        if (res.status !== 202 && state.drawerJob === name) setTimeout(() => startStream(name, true), 250);
+        if (res.status !== 202 && !waiting && state.drawerJob === name) setTimeout(() => startStream(name, true), 250);
         setTimeout(loadJobs, 300);
         return true;
       }
@@ -10843,8 +10847,11 @@ var qrcode = function() {
     if (p.type === "boolean") {
       control = '<input type="checkbox" id="' + id + '"' + (def === true ? " checked" : "") + ">";
     } else if (p.allowed && p.allowed.length) {
+      // An allowed "" is labeled (empty), so the operator can tell it from
+      // `choose…`. Both options have the value "", so paramFieldValue
+      // distinguishes them by position.
       control = '<select id="' + id + '">' + (p.required ? '<option value="">choose…</option>' : "") +
-        p.allowed.map((v) => '<option value="' + escAttr(paramText(v)) + '"' + (!p.required && v === def ? " selected" : "") + ">" + esc(paramText(v)) + "</option>").join("") +
+        p.allowed.map((v) => '<option value="' + escAttr(paramText(v)) + '"' + (!p.required && v === def ? " selected" : "") + ">" + esc(v === "" ? "(empty)" : paramText(v)) + "</option>").join("") +
         "</select>";
     } else {
       control = '<input type="text" id="' + id + '" value="' + escAttr(def == null ? "" : paramText(def)) + '"' +
@@ -10871,8 +10878,12 @@ var qrcode = function() {
     const f = $("paramF" + i);
     if (p.type === "boolean") return f.checked;
     if (p.type === "string") {
-      // an empty required field is a value the caller has not supplied
-      return f.value === "" && (p.required || (p.allowed && p.allowed.length)) ? undefined : f.value;
+      // "" can be an allowed value. Only the `choose…` option, which
+      // paramFieldHtml puts first in a required list, leaves the parameter
+      // out.
+      if (p.allowed && p.allowed.length) return p.required && f.selectedIndex === 0 ? undefined : f.value;
+      // an empty required text box is a value the caller has not supplied
+      return f.value === "" && p.required ? undefined : f.value;
     }
     const t = f.value.trim();
     if (t === "") return undefined;

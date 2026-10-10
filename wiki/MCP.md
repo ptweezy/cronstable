@@ -112,7 +112,9 @@ For a job that declares [run parameters](Commands-and-Environment#params), `cron
 declaration under `params`, and `cron_run_job` takes a `params` object. The
 result lists the values the run takes. A refused value returns an error that
 names it, and nothing starts. A start that the job's `concurrencyPolicy`
-refuses returns an error too.
+refuses returns an error too. A start that waits for another node to yield
+the job's cluster concurrency slot returns `pending: true` (see
+[`POST /jobs/{name}/start`](HTTP-API#post-jobsnamestart)).
 
 For a workflow that declares
 [run parameters](Orchestration-and-DAGs#run-parameters), `cron_list_dags`
@@ -149,8 +151,11 @@ payload. Semantics: [pausing jobs](Pausing-Jobs) and
 `cron_recover_dag` executes that preview with its `plan_token`. Cancellation
 and recovery execution require `confirm: true` and a writable MCP setup.
 Recovery also requires `allow_config_change: true` when the preview reports
-a configuration change. See [resource pools](Resource-Pools) and
-[workflow recovery](Workflow-Recovery) for behavior and limits.
+a configuration change. With scoped web tokens, `cron_recover_dag` also needs
+the `params` scope when a plan's `params` differ from the declared defaults,
+as on the REST routes. `cron_preview_recovery` needs `control` alone. See
+[resource pools](Resource-Pools) and [workflow recovery](Workflow-Recovery)
+for behavior and limits.
 
 The three schedule-authoring tools make an agent a competent schedule
 **author**, not only a reader, with the daemon's own engine as the authority:

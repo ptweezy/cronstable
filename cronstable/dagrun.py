@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -67,8 +68,10 @@ GC_INTERVAL = 3600.0
 
 # How often a node re-reads the engine level each peer's manifest advertises
 # (see DagScheduler._check_fleet), which bounds how long a fleet warning
-# outlives a peer's upgrade.  A reload that changes what the loaded dags
-# need is checked on the next schedule pass.
+# outlives a peer's upgrade in place.  A peer that stops, or returns under
+# another host name, stays listed until its newest sign of life is
+# cron.MANIFEST_LIVE_SECONDS old.  A reload that changes what the loaded
+# dags need is checked on the next schedule pass.
 FLEET_CHECK_INTERVAL = 300.0
 
 # How often the adopt scan does a FULL body listing instead of the cheap
@@ -192,7 +195,7 @@ def _parse_portable_xcom(data: bytes) -> Any:
     second copy and forced the str branch, whose wide-int prescan is a
     whole-payload regex rather than the bytes branch's translate fast path.
     An over-long list skips the portability walk on purpose:
-    ``_apply_expansions`` rejects it at its own MAX_MAPPED_ITEMS check, so
+    ``_apply_expansion`` rejects it at its own MAX_MAPPED_ITEMS check, so
     the O(len) walk would be pure waste on a list never embedded in the run
     document.  Raises ``_json.UnsupportedValue`` for a non-portable value
     and any other ``ValueError`` for undecodable bytes or invalid JSON,
@@ -356,19 +359,28 @@ class DagScheduler:
         # gate on every pass while it is parked, so this dedups to one alert
         # per gate; a run's entries drop when it reaches a terminal state.
         self._approval_notified: set[tuple[str, str, str]] = set()
+        # run ref -> the fan-out list reads, each (run id, upstream task,
+        # XCom key), that returned a definitive empty list.  An empty list
+        # waits for the mapped task's trigger rule (dag._apply_expansion),
+        # and every pass of that wait asks for it again, so _read_expansions
+        # reads the store once and reuses the answer.  The run id keeps an
+        # entry from answering for another run under the same key; a run's
+        # entries drop when this node stops owning it.
+        self._empty_expansions: dict[RunRef, set[tuple[str, str, str]]] = {}
         # active runs above this build's engine level (dag.supports_run),
         # each logged once.  The adopt scan meets such a run on every pass
         # until a newer node finishes it; pruned as its key leaves the scan.
         self._engine_refused: set[RunRef] = set()
-        # dag name -> warnings naming the hosts whose manifest advertises an
-        # engine level below the one the dag needs (see _check_fleet);
-        # list_dags serves them as ``fleetWarnings``.
+        # dag name -> warnings naming the live hosts below the engine level
+        # the dag needs (see _check_fleet); list_dags serves them as
+        # ``fleetWarnings``.
         self._fleet_warnings: dict[str, list[str]] = {}
         # dag name -> engine level, as of the last completed check: a reload
         # that changes it is checked without waiting out the interval.
         self._fleet_needs: dict[str, int] = {}
-        # (dag, host, level the host advertises) already logged, so a warning
-        # that persists across checks is one log line.
+        # (dag, host, the host's level) already logged, so a warning that
+        # persists across checks is one log line, and a host that leaves
+        # one is one more.
         self._fleet_logged: set[tuple[str, str, int]] = set()
         self._service_task: asyncio.Task | None = None
         self._next_sched_check = 0.0
@@ -777,7 +789,7 @@ class DagScheduler:
         if pending_dt is not None and (after is None or pending_dt < after):
             after = pending_dt
         if after is None:
-            return  # never ran: nothing missed to replay
+            return  # the schedule has created no run, so it has missed none
         # The cycle's reference watermark: pre-deadline-cutoff, like the job
         # engine's (the cutoff moves with the clock, so recomputation on
         # resume re-applies it against the resume-time now).
@@ -939,6 +951,14 @@ class DagScheduler:
     async def _durable_watermark(
         self, dagcfg: Any
     ) -> datetime.datetime | None:
+        """The newest logical date the schedule has created a run for.
+
+        Only scheduled and catch-up runs count. Each one fills a slot of
+        the schedule, so the newest shows how far the scheduler has served
+        it. A manual run, a backfill, and a recovery each carry a date
+        their caller chose, and that date says nothing about the slots
+        before it.
+        """
         backend = self._backend()
         if backend is None:
             return None
@@ -948,6 +968,8 @@ class DagScheduler:
         )
         latest: datetime.datetime | None = None
         for body in docs:
+            if body.get("kind") not in ("scheduled", "catchup"):
+                continue
             iso = body.get("logicalDate")
             when = _parse_iso(iso) if isinstance(iso, str) else None
             if when is not None and (latest is None or when > latest):
@@ -1247,6 +1269,7 @@ class DagScheduler:
         self._owned.pop(ref, None)
         self._wake.pop(ref, None)
         self._advance_again.discard(ref)
+        self._empty_expansions.pop(ref, None)
         renewer = self._renewers.pop(ref, None)
         if renewer is not None and not renewer.done():
             renewer.cancel()
@@ -1594,7 +1617,7 @@ class DagScheduler:
             # compare XCom values: pre-read them from the reconciled body
             # (outside any document lock), then run the classic claim RMW
             # as the second step.
-            expansions = await self._read_expansions(dagcfg, run_id, body)
+            expansions = await self._read_expansions(dagcfg, ref, run_id, body)
             conditions = await self._read_conditions(dagcfg, run_id, body)
             unread = any(value is None for value in conditions.values())
             now = _now()
@@ -1795,15 +1818,36 @@ class DagScheduler:
         return False
 
     async def _read_expansions(
-        self, dagcfg: Any, run_id: str, body: dict[str, Any]
+        self, dagcfg: Any, ref: RunRef, run_id: str, body: dict[str, Any]
     ) -> dict[str, list[Any] | None]:
+        """The list each mapped task awaiting expansion fans out over.
+
+        The pass that reads a list with items records it, and a later pass
+        retries a read the store could not answer (``None``). An empty list
+        can wait many passes for the task's trigger rule (see
+        :func:`dag._apply_expansion`): a parked gate alone brings a pass
+        every few seconds. The upstream has succeeded, so its output is
+        final, and the first definitive empty read answers for the rest of
+        the wait (:attr:`_empty_expansions`). While this node owns the run,
+        the wait costs one store read, and an output that maps to empty logs
+        its warning once.
+        """
         expansions: dict[str, list[Any] | None] = {}
         for tid, from_task, key in dag.tasks_awaiting_expansion(
             dagcfg.spec, body
         ):
-            expansions[tid] = await self._read_xcom_list(
+            read = (run_id, from_task, key)
+            if read in self._empty_expansions.get(ref, ()):
+                expansions[tid] = []
+                continue
+            items = await self._read_xcom_list(
                 run_id, dagcfg.name, from_task, key
             )
+            # ownership can end during the read, and nothing drops an entry
+            # added after that
+            if items == [] and ref in self._owned:
+                self._empty_expansions.setdefault(ref, set()).add(read)
+            expansions[tid] = items
         return expansions
 
     async def _read_conditions(
@@ -1891,7 +1935,8 @@ class DagScheduler:
         Only ever read after the upstream has *succeeded*, so its output is
         final: a genuine list expands to itself; a **definitively** absent,
         non-list or unrecoverable output (including a swept blob) expands to
-        the **empty list** (a mapped task with no items -> success), so a
+        the **empty list** (a mapped task with no items follows its trigger
+        rule, and reads success when the rule says ready), so a
         mis-publishing upstream cannot wedge the run forever.
 
         A store failure that says nothing about what the upstream published --
@@ -2903,6 +2948,7 @@ class DagScheduler:
         tasks=(),
         plan_token=None,
         allow_config_change=False,
+        scopes=None,
     ):
         from cronstable import recovery
 
@@ -2964,6 +3010,10 @@ class DagScheduler:
                     "revision to recover"
                 )
             config = self._dags()[name]
+            # reusing the source run's values is choosing them
+            run_params.check_reuse(
+                config.spec.params, plan.get("params", {}), scopes
+            )
             for record in plan["artifacts"]:
                 if not await asyncio.wait_for(
                     backend.blob_exists(record["sha256"], record["size"]),
@@ -3001,12 +3051,14 @@ class DagScheduler:
         *,
         plan_token=None,
         allow_config_change=False,
+        scopes=None,
     ):
         from cronstable import recovery
 
         backend = self._backend()
+        config = self._dags().get(name)
         start, end = _parse_iso(start_iso), _parse_iso(end_iso)
-        if backend is None or name not in self._dags():
+        if backend is None or config is None:
             raise recovery.RecoveryError(
                 ("workflow or state store is unavailable")
             )
@@ -3074,6 +3126,14 @@ class DagScheduler:
             raise recovery.RecoveryError(
                 "configuration differs; acknowledge the current revision"
             )
+        # Check every date before the first run starts, so a refused
+        # request starts none and records no incomplete batch to hold its
+        # source runs back from retention. recover() checks each date
+        # again as it creates the run.
+        for plan in plans:
+            run_params.check_reuse(
+                config.spec.params, plan.get("params", {}), scopes
+            )
 
         def create(current):
             if current is not None:
@@ -3101,6 +3161,7 @@ class DagScheduler:
                 source,
                 plan_token=plan["planToken"],
                 allow_config_change=allow_config_change,
+                scopes=scopes,
             )
 
             def record(current, source=source, run_key=result["runKey"]):
@@ -3407,10 +3468,13 @@ class DagScheduler:
 
         Such a peer leaves the dag's runs for a newer node.  A build with no
         engine check advances them under the rules it knows, which is why
-        the operator is told to upgrade it.  Each peer's level comes from
-        its newest manifest (``Cron._peer_dag_engines``).  Every build
-        reaches ``dag.BASE_ENGINE_LEVEL``, so the store is read only while a
-        loaded dag needs more.
+        the operator is told to upgrade it.  That build also records no
+        manifest while it refuses its configuration, so a peer is live on
+        either sign of life: its newest manifest, or a task it started
+        (:meth:`_task_starts`, ``Cron._peer_dag_engines``).  A peer that
+        leaves a warning is logged with the reason.  Every build reaches
+        ``dag.BASE_ENGINE_LEVEL``, so the store is read only while a loaded
+        dag needs more.
         """
         needs = {
             name: cfg.spec.engine
@@ -3428,9 +3492,12 @@ class DagScheduler:
         # asked again once the interval is over
         self._next_fleet_check = now + FLEET_CHECK_INTERVAL
         self._fleet_needs = needs
-        peers = await self._cron._peer_dag_engines()
-        if peers is None:
+        started = await self._task_starts()
+        if started is None:
             return  # the store could not answer: keep the last result
+        peers = await self._cron._peer_dag_engines(started)
+        if peers is None:
+            return  # as above
         warnings: dict[str, list[str]] = {}
         logged: set[tuple[str, str, int]] = set()
         for name, level in needs.items():
@@ -3447,9 +3514,60 @@ class DagScheduler:
                 logged.add(seen)
                 if seen not in self._fleet_logged:
                     logger.warning("dag %s: %s", name, text)
+        # Imported here: cron imports this module at load (see _fire_past_gap).
+        from cronstable.cron import MANIFEST_LIVE_SECONDS
+
+        # A host that leaves a dag's warning is logged with what the store
+        # shows.  Two exits log nothing: a reload that ends the dag's own
+        # need, and a host listed again at another level.
+        listed = {(name, host) for name, host, _ in logged}
+        for name, host, _ in sorted(self._fleet_logged - logged):
+            if name not in needs or (name, host) in listed:
+                continue
+            if host in peers:
+                reason = "its manifest advertises run engine level {}".format(
+                    peers[host]
+                )
+            else:
+                reason = (
+                    "this node finds no manifest or task start from it in "
+                    "the last {:g} hours".format(MANIFEST_LIVE_SECONDS / 3600)
+                )
+            logger.info(
+                "dag %s: host %s leaves the fleet warning: %s",
+                name,
+                host,
+                reason,
+            )
         self._fleet_needs = needs
         self._fleet_warnings = warnings
         self._fleet_logged = logged
+
+    async def _task_starts(self) -> dict[str, float] | None:
+        """When each host last started a task in a run of a loaded dag.
+
+        Host to epoch seconds, over every retained run.  A host that starts
+        a task is running, whatever its manifest says, and a task start is
+        the one sign of life a build leaves while it records no manifest
+        (see :meth:`_check_fleet`).  Read through the run summaries, which
+        parse a finished run once.  ``None`` when the store cannot answer.
+        """
+        backend = self._backend()
+        if backend is None:
+            return None
+        started: dict[str, float] = {}
+        try:
+            for name in list(self._dags()):
+                summaries = await self._run_summaries(backend, name)
+                if summaries is None:
+                    return None
+                for summary in summaries:
+                    for host, at in summary["taskStarts"].items():
+                        started[host] = max(at, started.get(host, 0.0))
+        except Exception as ex:  # noqa: BLE001 - advisory; retried later
+            logger.debug("dag: cannot read the task starts: %s", ex)
+            return None
+        return started
 
     async def list_dags(self) -> list[dict[str, Any]]:
         """Per-DAG summary for the dashboard index.
@@ -3526,12 +3644,21 @@ class DagScheduler:
         cache entry per run, filled once, rather than each caller re-reading
         and re-parsing every retained document.  The task histogram is a walk
         of the body the caller has already parsed, which is cheap next to the
-        parse it saves on later calls.
+        parse it saves on later calls.  The same walk collects
+        ``taskStarts``, the newest task start per host, for
+        :meth:`_task_starts`.
         """
         counts: dict[str, int] = {}
+        starts: dict[str, float] = {}
         for entry in body.get("tasks", {}).values():
             st = entry.get("state", "unknown")
             counts[st] = counts.get(st, 0) + 1
+            # startedAt, never updatedAt: only the host that claims a task
+            # stamps it, while a peer that reconciles a dead host's task
+            # stamps updatedAt on an entry that still names the dead host.
+            host, at = entry.get("host"), entry.get("startedAt")
+            if isinstance(host, str) and isinstance(at, (int, float)):
+                starts[host] = max(at, starts.get(host, 0.0))
         return {
             "runKey": body.get("runKey"),
             "runId": body.get("runId"),
@@ -3541,6 +3668,7 @@ class DagScheduler:
             "createdAt": body.get("createdAt"),
             "updatedAt": body.get("updatedAt"),
             "taskStates": counts,
+            "taskStarts": starts,
             "terminal": dag.is_terminal_run(body),
         }
 
@@ -4088,6 +4216,7 @@ class DagScheduler:
         self._renewers.clear()
         self._owned.clear()
         self._wake.clear()
+        self._empty_expansions.clear()
         self._advance_pending.clear()
         self._locks.clear()
         self._next_logical.clear()
@@ -4137,29 +4266,64 @@ class DagScheduler:
 # --------------------------------------------------------------------------
 
 
+# The date and time forms a request or a stored record carries: an RFC 3339
+# date-time and its shorter forms. The time, its minutes and seconds, and
+# the offset are each optional. A space can replace the "T", and an offset
+# can drop its colon or its minutes.
+_ISO_INSTANT = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})"
+    r"(?:[Tt ](\d{2})(?::(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?"
+    r"(?:[Zz]|([+-])(\d{2})(?::?([0-5]\d))?)?)?",
+    re.ASCII,
+)
+
+
 def _parse_iso(value: str | None) -> datetime.datetime | None:
-    if not value:
+    """Read an ISO 8601 date and time as an aware datetime, or ``None``.
+
+    The pattern :data:`_ISO_INSTANT` is the whole grammar, so every
+    interpreter reads the same forms. This function avoids
+    ``datetime.fromisoformat``, which reads a different set of forms on
+    each Python version. A value without an offset reads as UTC, and the
+    fraction keeps its first six digits.
+    """
+    match = _ISO_INSTANT.fullmatch(value) if value else None
+    if match is None:
         return None
-    if value[-1] in "Zz":
-        # Python 3.10's fromisoformat refuses the UTC designator
-        value = value[:-1] + "+00:00"
+    year, month, day, hour, minute, second, fraction, sign, off_h, off_m = (
+        match.groups()
+    )
     try:
-        dt = datetime.datetime.fromisoformat(value)
+        zone = datetime.timezone.utc
+        if sign:
+            offset = datetime.timedelta(
+                hours=int(off_h), minutes=int(off_m or 0)
+            )
+            zone = datetime.timezone(-offset if sign == "-" else offset)
+        return datetime.datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour or 0),
+            int(minute or 0),
+            int(second or 0),
+            # the first six fraction digits are the microseconds
+            int((fraction or "")[:6].ljust(6, "0")),
+            zone,
+        )
     except ValueError:
+        # a field outside the calendar, the clock, or a day's offset
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
-    return dt
 
 
 def _listed_run(summary: dict[str, Any]) -> dict[str, Any]:
     """One run summary as the run-list payload.
 
     Rebuilt field by field rather than returned as-is: a summary carries the
-    rollup's private ``terminal`` flag, and callers must never see it (nor be
-    able to mutate the cached dict it may have come from).  The single
-    definition of that payload, so the cached and full-listing paths of
-    :meth:`DagScheduler.list_runs` cannot drift apart.
+    private ``terminal`` flag and ``taskStarts`` map, and callers must never
+    see them (nor be able to mutate the cached dict it may have come from).
+    The single definition of that payload, so the cached and full-listing
+    paths of :meth:`DagScheduler.list_runs` cannot drift apart.
     """
     return {
         "runKey": summary.get("runKey"),
