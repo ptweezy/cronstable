@@ -423,6 +423,26 @@ def test_a_name_that_utf8_cannot_encode_is_a_clean_error(
         )
 
 
+def test_json_format_escapes_what_a_terminal_does_not_print(
+    monkeypatch, capsys
+):
+    # a node name with C1 controls (CSI, OSC, ST), a bidi override, DEL,
+    # and a zero-width space, which a terminal acts on or hides
+    hostile = "prod\x9b2J\x9d0;owned\x9c\u202eedon\x7f\u200b"
+    cluster = {"enabled": True, "node_name": hostile}
+    _serve(monkeypatch, _routes(cluster=cluster))
+    assert paircli.dispatch(_args()) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert out.endswith("\n") and out[:-1].isprintable()
+    assert (
+        r'"name":"prod\u009b2J\u009d0;owned\u009c\u202eedon\u007f\u200b"'
+        in out
+    )
+    # and the app reads the name that the daemon sent
+    assert json.loads(out)["name"] == hostile
+
+
 def test_public_url_goes_into_the_code(monkeypatch, capsys):
     daemon = _serve(monkeypatch, _routes(base=LOOPBACK))
     args = _args(url=LOOPBACK, public_url="https://cron.example.net/")
@@ -980,6 +1000,27 @@ def test_loopback_url_without_a_lan_address_is_an_error(monkeypatch, capsys):
     assert "which a phone cannot reach. Add a LAN" in err
 
 
+def test_hostname_that_idna_refuses_counts_as_no_lan_address(
+    monkeypatch, capsys
+):
+    def no_route(*args):
+        raise OSError("network is unreachable")
+
+    # no default route, and a hostname of one 64-character label, which
+    # the idna codec refuses with UnicodeError ahead of any lookup
+    _serve(monkeypatch, _routes(base=LOOPBACK))
+    monkeypatch.setattr(netutil.socket, "socket", no_route)
+    monkeypatch.setattr(netutil.socket, "gethostname", lambda: "n" * 64)
+    assert paircli.dispatch(_args(url=LOOPBACK)) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == (
+        "cronstable pair: {} is a loopback address, which a phone cannot "
+        "reach. Add a LAN or VPN address to web.listen, or pass "
+        "--public-url with the address the phone uses.\n".format(LOOPBACK)
+    )
+
+
 def test_loopback_in_another_spelling_gets_the_same_check(monkeypatch, capsys):
     short = "http://127.1:8080"
     routes = _routes(base=short)
@@ -1362,6 +1403,22 @@ def test_host_that_no_request_can_name(monkeypatch, capsys, flag):
     bad = "http://cron example.test:8080"
     err = _fails(monkeypatch, capsys, _routes(), **{flag: bad})
     assert "{!r} is not an http:// or https:// URL".format(bad) in err
+
+
+@pytest.mark.parametrize("flag", ["url", "public_url"])
+@pytest.mark.parametrize("empty", ["", " "])
+def test_empty_url_is_no_url(monkeypatch, capsys, flag, empty):
+    # what a script passes for a variable that it left unset
+    daemon = _serve(monkeypatch, _routes())
+    assert paircli.dispatch(_args(**{flag: empty})) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == (
+        "cronstable pair: {!r} is not an http:// or https:// URL\n".format(
+            empty
+        )
+    )
+    assert daemon.requests == []
 
 
 @pytest.mark.parametrize(

@@ -447,17 +447,20 @@
      these rules hide readouts in order, least essential first: the job-set
      hash, the meter bars (the percentages stay), the clock, the version and
      the node meter, the status pills, and then the text labels. The buttons
-     on the right always stay. The rules are container queries because the UI
-     scale setting zooms the page, which narrows the header without changing
-     the viewport width. Content that the rules can't predict, such as a long
-     version string or four-digit counts, wraps to a second row. */
+     on the right always stay. The node meter also toggles the node resources
+     card, so the command palette has an entry that does the same. The
+     connection label hides only while it reads "live", so an outage always
+     shows "no signal" in words. The rules are container queries because the
+     UI scale setting zooms the page, which narrows the header without
+     changing the viewport width. Content that the rules can't predict, such
+     as a long version string or four-digit counts, wraps to a second row. */
   @container hdr (max-width: 1379px) { #jobset { display: none; } }
   @container hdr (max-width: 1299px) { .nodemeter .bar { display: none; } }
   @container hdr (max-width: 1209px) { .clock { display: none; } }
   @container hdr (max-width: 1109px) { .nodemeter, .brand .ver { display: none; } }
   @container hdr (max-width: 949px) { .summary .pill.opt { display: none; } }
   @container hdr (max-width: 519px) { .summary, #authLabel { display: none; } }
-  @container hdr (max-width: 339px) { #connTxt { display: none; } }
+  @container hdr (max-width: 339px) { .dot.live + #connTxt { display: none; } }
   /* A container query can't style its own container, so the narrower gap
      on phones is a media query. */
   @media (max-width: 560px) { header { gap: 8px; } }
@@ -9074,7 +9077,10 @@ var qrcode = function() {
   function setConnected(ok) {
     if (state.connected !== ok) {
       state.connected = ok;
-      $("conn").innerHTML = '<span class="dot ' + (ok ? "live" : "dead") + '"></span><span>' + (ok ? "live" : "no signal") + "</span>";
+      // Update the dot and the label in place. The narrow-header rule
+      // selects the label by its ID and by the dot's class.
+      $("conn").querySelector(".dot").className = "dot " + (ok ? "live" : "dead");
+      $("connTxt").textContent = ok ? "live" : "no signal";
       kickMark();  // the pendulum logo follows the live state (collapses when dead, recovers when live)
       updateTitle();  // "○ no signal" / recovery reach the tab without waiting for a render pass
     }
@@ -10367,6 +10373,11 @@ var qrcode = function() {
       { ic: "▦", lbl: "Toggle activity heatmap", run: () => setHeat(!prefs.heat) },
       { ic: "▥", lbl: "Toggle schedule load", sub: "scheduled runs at the same time and identical schedules", run: () => setPressure(!prefs.press) },
       { ic: "⊞", lbl: "Toggle fleet view", sub: "every node's runs", run: () => setFleet(!prefs.fleet) },
+      // A click on the header's node meter toggles this card too, but a
+      // narrow header hides the meter. The palette works at any width. The
+      // card sits at the top of the page, so opening it from a scrolled
+      // page brings it into view.
+      { ic: "▤", lbl: "Toggle node resources", sub: "CPU and memory history", run: () => { setNodeCard(!prefs.nodeCard); if (prefs.nodeCard) $("nodeCard").scrollIntoView({ block: "center" }); } },
       { ic: "≋", lbl: "Live logs", run: () => openTail([]) },
       { ic: "≋", lbl: "Live logs: failing jobs", run: () => tailPreset("fail") },
       { ic: "≋", lbl: "Live logs: running jobs", run: () => tailPreset("run") },

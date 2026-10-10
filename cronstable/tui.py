@@ -3178,8 +3178,11 @@ class App:
         """Put overlay ``name`` on top, raising it when it is open already.
 
         The top overlay is the one drawn, the one that takes keys, and the
-        one that Esc closes.
+        one that Esc closes. The palette takes keys ahead of every other
+        overlay, so opening another overlay closes the palette.
         """
+        if name != "palette" and self.is_open("palette"):
+            self.close("palette")
         if name in self.open_overlays:
             self.open_overlays.remove(name)
         self.open_overlays.append(name)

@@ -427,6 +427,25 @@ def test_payload_keeps_non_ascii_names_and_writes_an_empty_token():
     }
 
 
+def test_payload_escapes_what_a_terminal_does_not_print():
+    # DEL, a C1 control (CSI), a bidi override, a zero-width space, and a
+    # language tag from beyond the BMP, in a name that the daemon sent
+    name = "na\x7f\x9b2J\u202es\u200b\U000e0001 büro"
+    url = "https://cron.example.net"
+    text = pairlink.payload(name, url, "t")
+    assert text == (
+        r'{"v":1,"name":"na\u007f\u009b2J\u202es\u200b\udb40\udc01 büro",'
+        '"url":"https://cron.example.net","token":"t"}'
+    )
+    assert text.isprintable()
+    # the app reads the name that the page's own JSON carries
+    assert json.loads(text) == {"v": 1, "name": name, "url": url, "token": "t"}
+    link = pairlink.pairing(PHONE, url, "t", name=name).link
+    fragment = link.split("#")[1]
+    decoded = base64.urlsafe_b64decode(fragment + "=" * (-len(fragment) % 4))
+    assert json.loads(decoded)["name"] == name
+
+
 @pytest.mark.parametrize(
     "name, url, named",
     [
@@ -567,6 +586,15 @@ def test_hint_warns_that_the_code_carries_the_token():
     scan, warning = pairlink.hint("s3cr3t")
     assert "Scan QR" in scan
     assert "access token" in warning and "HTTPS" in warning
+
+
+def test_hint_names_the_apps_control_by_its_label():
+    # "Scan QR code" labels the app's button and its Add a server menu item
+    [scan] = pairlink.hint(None)
+    assert scan == (
+        "Scan the code with the phone's camera, or tap Scan QR code in the "
+        "app."
+    )
 
 
 @pytest.mark.parametrize("token", [None, ""])

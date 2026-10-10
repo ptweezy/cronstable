@@ -42,10 +42,12 @@ The `state get|set|delete|keys`, `cursor`, `lock`, `artifact`, `idempotent`,
 them to reach the daemon's store through its loopback endpoint. See
 [job-facing state commands](#job-facing-state-commands).
 
-The `mcp` and `tui` subcommands are clients of a running daemon's web listener:
-the MCP stdio bridge and the terminal dashboard. See the
-[`mcp` subcommand](#the-mcp-subcommand) and the
-[`tui` subcommand](#the-tui-subcommand).
+The `mcp`, `tui`, and `pair` subcommands are clients of a running daemon's web
+listener: the MCP stdio bridge, the terminal dashboard, and the command that
+prints the iOS app's pairing QR code. See the
+[`mcp` subcommand](#the-mcp-subcommand), the
+[`tui` subcommand](#the-tui-subcommand), and the
+[`pair` subcommand](#the-pair-subcommand).
 
 `cronstable` runs as a single foreground process. It does not daemonize, does not
 fork, and does not write a PID file. Diagnostics go to stdout/stderr through
@@ -77,8 +79,9 @@ The other command-line surfaces are the
 [`state` subcommand](#the-state-subcommand) described later, which administers
 the durable state store; the
 [job-facing state commands](#job-facing-state-commands) a running job uses; and
-the client subcommands [`mcp`](#the-mcp-subcommand) and
-[`tui`](#the-tui-subcommand), which talk to a running daemon's web listener.
+the client subcommands [`mcp`](#the-mcp-subcommand),
+[`tui`](#the-tui-subcommand), and [`pair`](#the-pair-subcommand), which talk to
+a running daemon's web listener.
 Job schedules, commands, environment, reporting, and the web API are
 configured entirely in YAML, not on the command line; see the
 [configuration reference](Configuration-Reference).
@@ -422,6 +425,14 @@ The commands share one exit-code convention, made for shell branching:
 | `4` | The looked-up key, cursor, artifact, secret, or XCom key does not exist (`state delete` of an absent key too). |
 | `5` | The `idempotent` key was already claimed (a duplicate). |
 
+The commands count only a `2xx` reply from the state endpoint as success. For
+any other status, a command prints one line to stderr, prints nothing to
+stdout, and exits `1`. That includes a redirect status with no `Location`
+header, such as a `302` from a proxy at `CRONSTABLE_STATE_URL`, which the
+command reports as `the state endpoint returned HTTP 302`. Two cases differ:
+the `404` for a `get` or `pull` of a missing item is code `4`, and `lock run`
+keeps its command's exit code when the release that follows fails.
+
 ### `state get|set|delete|keys` (durable key/value)
 
 ```
@@ -456,6 +467,11 @@ first blocks up to `--timeout` seconds (default `0`, so `--wait` alone makes
 one pass and gives up). `release` takes the token, and no scope flags. `run`
 holds the lock while `COMMAND...` (everything after `--`) runs and exits with
 the command's own exit code, or `3` if the lock was not acquired.
+
+`--timeout` takes a finite number of seconds, and a negative value counts as
+`0`. A value of `nan` or `inf` is a usage error (exit `2`), with or without
+`--wait`. With `--wait`, the command gives the daemon 30 seconds more than
+`--timeout` to reply, up to 2,147,483 seconds in all (about 24.9 days).
 
 `--permits` accepts `1` (the default, a mutex) through `1024`; outside that
 range the command exits `1`. `--ttl` overrides the lease TTL (default
@@ -683,7 +699,7 @@ See [running on Windows](Running-on-Windows).
 | --- | --- |
 | `0` | Setup guidance for a bare invocation with no default configuration; `--version`, `--third-party-licenses`, or `--sealable-suites` printed; `--validate-config` succeeded; `--job-set-id` printed; `--help`; a `state` action succeeded; or normal shutdown after a signal. |
 | `1` | Configuration error (parse/schema/validation failure or unreadable configuration); a missing default path when arguments request configuration loading; an `init` refusal; a `state` action failed (see [`state` exit codes](#state-exit-codes)); or the reader of a command's output closed the pipe, as `head` does, which also prints `cronstable: cannot write the output` to stderr. |
-| `2` | Usage error (argparse builtin): unknown option or missing required option (such as `state backup` without `-o`); an invalid `--log-level` value; `cronstable state` invoked with no action; or a `--` separator in any invocation other than `lock run` (see [`lock`](#lock-acquirereleaserun-distributed-mutexsemaphore)). |
+| `2` | Usage error (argparse builtin): unknown option or missing required option (such as `state backup` without `-o`); an invalid `--log-level` value; a `--timeout` that `cronstable mcp` or `cronstable lock` refuses; `cronstable state` invoked with no action; or a `--` separator in any invocation other than `lock run` (see [`lock`](#lock-acquirereleaserun-distributed-mutexsemaphore)). |
 
 ## Examples
 

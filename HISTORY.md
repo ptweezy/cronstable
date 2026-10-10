@@ -12,14 +12,18 @@
   listener there, and the address must answer with the daemon's instance ID.
   The command sends the token only to `--url`, and `--public-url` sets the
   address that the phone dials. `--format link` and `--format json` print the
-  pairing link and the pairing JSON as text. The terminal dashboard's command
-  palette opens the same code with "Pair a device (QR)".
+  pairing link and the pairing JSON as text, and the JSON escapes a character
+  that isn't printable, such as a control character in the server name. The
+  terminal dashboard's command palette opens the same code with
+  "Pair a device (QR)".
 - `GET /whoami` reports `instance`, an ID that the daemon draws at random
   when it starts, and `listeners`, the addresses of its bound TCP sockets.
   The reply to an anonymous request under `web.anonymousScopes` has no
-  `listeners`. Every response, including a `401`, carries the ID in the
-  `Cronstable-Instance` header, so a client can tell one daemon from another
-  without presenting a token.
+  `listeners`. Every response that the web API serves, including a `401` and
+  a `404`, carries the ID in the `Cronstable-Instance` header, so a client
+  can tell one daemon from another without presenting a token. The `400` for
+  a request that the server can't parse, such as one with a malformed request
+  line, doesn't carry the header.
 - `cronstable mcp` reports an HTTP redirect as a transport error that names
   the redirect's target, and the `--url` value to pass when the redirect
   leads to the `/mcp` endpoint at another address. The bridge does not follow
@@ -37,23 +41,42 @@
   `idempotent`, `secret`, and `xcom`) report an HTTP redirect from the state
   endpoint as an error that names the redirect's target. They do not follow
   redirects, because each request carries the run's token. A reply that is
-  not HTTP gets a one-line error.
+  not HTTP gets a one-line error. Only a `2xx` reply counts as success, so a
+  redirect status that names no target, such as a `302` with no `Location`
+  header, ends the command with status 1.
+- `cronstable mcp --timeout` takes a finite number greater than 0, and any
+  other value is a usage error. `cronstable lock acquire` and `lock run` read
+  a negative `--timeout` as 0, and a value of `nan` or `inf` is a usage
+  error. Each command waits at most 2,147,483 seconds, about 24.9 days, for
+  a reply.
 - Every subcommand ends with one line on stderr and status 1 when the reader
   of its output closes the pipe, as `head` does after its last line.
 - In the terminal dashboard, `Esc` closes the panel or drawer that is on
-  top.
+  top. When a `401` opens the access token prompt while the command palette
+  is open, the palette closes and the prompt takes the keys.
 - The Bonjour advert skips a listener bound to `[::]`. That socket accepts
-  IPv6 connections only, and the advert's address record is IPv4.
+  IPv6 connections only, and the advert's address record is IPv4. On a host
+  with no default route and a hostname that isn't a valid DNS name, such as
+  one with a 64-character label, the daemon logs a warning and skips the
+  advert.
 - Configuration checks read a loopback or wildcard address in every form that
   the socket layer reads, such as `127.1`, so `state.jobApi.listen:
-  http://127.1:9000` counts as a loopback bind.
+  http://127.1:9000` counts as a loopback bind. A form with a leading zero
+  that the host's C library reads as octal in one call and as decimal in
+  another, such as `0177.0.0.1` on macOS, counts as a hostname, so the checks
+  treat it as a non-loopback address.
 - The web dashboard's header keeps its buttons in view at any window width.
   As the window narrows, the header hides readouts, least essential first:
   the job-set ID chip, the node meter's bars, the clock, the version and the
   node meter, and then the summary pills. On a phone-width screen, the token
-  button shows only its lock icon. A larger UI scale narrows the header in
+  button shows only its lock icon. In a window about 375px wide or narrower,
+  the connection indicator shows only its dot while it reads `live`, and it
+  always shows `no signal` in words. A larger UI scale narrows the header in
   the same way. Content that still doesn't fit, such as a long version
   string, wraps to a second row.
+- The web dashboard's command palette has a "Toggle node resources" entry.
+  It opens and closes the node resources card at any window width, including
+  when the header hides the node meter.
 - In the web dashboard's log panes, line numbers and timestamps have a
   contrast ratio of at least 4.5:1 in all ten themes. Placeholder text in
   every field uses the theme's faint ink.

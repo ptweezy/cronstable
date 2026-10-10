@@ -1,5 +1,9 @@
 """Tests for the host address helpers (cronstable.netutil)."""
 
+import ipaddress
+import itertools
+import socket
+
 import pytest
 
 from cronstable import netutil
@@ -115,6 +119,35 @@ def test_lan_address_none_without_a_route_or_a_hostname_address(monkeypatch):
     assert netutil.lan_address() is None
 
 
+@pytest.mark.parametrize(
+    "hostname",
+    [
+        # a label of 64 characters, which Linux allows
+        "n" * 64,
+        "host..example",
+        ".leading",
+    ],
+)
+def test_lan_address_none_for_a_hostname_that_idna_refuses(
+    monkeypatch, hostname
+):
+    # the real lookup: the codec raises UnicodeError ahead of any resolver
+    monkeypatch.setattr(netutil.socket, "socket", _no_route)
+    monkeypatch.setattr(netutil.socket, "gethostname", lambda: hostname)
+    assert netutil.lan_address() is None
+
+
+def test_lan_address_none_when_the_lookup_raises_unicode_error(monkeypatch):
+    def refused(name):
+        raise UnicodeError("label too long")
+
+    monkeypatch.setattr(
+        netutil.socket, "socket", lambda *a: _FakeSocket("127.0.0.1")
+    )
+    monkeypatch.setattr(netutil.socket, "gethostbyname", refused)
+    assert netutil.lan_address() is None
+
+
 @pytest.mark.parametrize("resolved", ["127.0.1.1", "0.0.0.0"])
 def test_lan_address_none_when_every_answer_is_loopback(monkeypatch, resolved):
     monkeypatch.setattr(
@@ -162,6 +195,61 @@ def test_ip_literal_reads_an_address_in_any_spelling(host, expected):
 )
 def test_ip_literal_none_for_a_name(host):
     assert netutil.ip_literal(host) is None
+
+
+# 0127 and 0177 are 127 and 177 in decimal, and 87 and 127 in octal.
+_SPELLED = ["127.0.0.1", "177.20.30.40", "0.0.0.0", "10.0.0.8", "192.168.1.50"]
+
+
+def _spellings():
+    """Each address of ``_SPELLED`` in every form of one to four parts,
+    with each part in decimal, with a leading zero, in octal, and in
+    hexadecimal."""
+    for dotted in _SPELLED:
+        packed = ipaddress.ip_address(dotted).packed
+        for split in range(4):
+            # the last part holds the bytes that the parts ahead of it leave
+            values = [*packed[:split], int.from_bytes(packed[split:], "big")]
+            forms = [
+                (str(v), "0{}".format(v), "0{:o}".format(v), hex(v))
+                for v in values
+            ]
+            for parts in itertools.product(*forms):
+                yield ".".join(parts)
+
+
+def _socket_layer(host):
+    """The addresses that this host's socket layer reads ``host`` as.
+
+    A bind or a connect asks ``inet_pton`` and then ``getaddrinfo``. The C
+    libraries differ in how each call reads a leading zero.
+    """
+    found = set()
+    try:
+        found.add(socket.inet_ntoa(socket.inet_pton(socket.AF_INET, host)))
+    except OSError:
+        pass
+    try:
+        infos = socket.getaddrinfo(
+            host, None, socket.AF_INET, flags=socket.AI_NUMERICHOST
+        )
+    except OSError:
+        infos = []
+    return found | {info[4][0] for info in infos}
+
+
+def test_ip_literal_reads_an_address_as_this_hosts_socket_layer_does():
+    for dotted in _SPELLED:
+        assert str(netutil.ip_literal(dotted)) == dotted
+        assert _socket_layer(dotted) == {dotted}
+    # a check that calls a host loopback holds only when the listener then
+    # binds the address that the check read
+    misread = {}
+    for host in _spellings():
+        address, bound = netutil.ip_literal(host), _socket_layer(host)
+        if address is not None and not bound <= {str(address)}:
+            misread[host] = (str(address), sorted(bound))
+    assert misread == {}
 
 
 def test_netloc_brackets_an_ipv6_address():

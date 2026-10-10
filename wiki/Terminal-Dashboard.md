@@ -228,6 +228,9 @@ unauthenticated start is fine: the first `401` opens the token prompt,
 and the token is kept for the session only, never written to the prefs
 file.
 
+When the token prompt opens while the command palette is open, the
+terminal dashboard closes the palette, and the prompt takes the keys.
+
 Mutating keys (`r`, `x`, DAG trigger/backfill/decision) go through the
 same `POST` endpoints. The daemon's cross-site `Origin` gate does not
 apply to a native client, so no extra configuration is needed.

@@ -1,3 +1,4 @@
+import ipaddress
 import logging
 import os
 import sys
@@ -15,6 +16,7 @@ from cronstable.config import (
     parse_config_string,
 )
 from cronstable.platform import IS_WINDOWS
+from tests.test_netutil import _socket_layer
 
 
 def test_mergedicts():
@@ -1986,6 +1988,33 @@ def test_listener_checks_read_a_host_as_the_socket_layer_does():
     assert config._loopback_ip_version("192.168.1.50") is None
     assert config._loopback_ip_version("localhost") is None
     assert config._is_wildcard_host("nas.local") is False
+
+
+@pytest.mark.parametrize(
+    "host", ["0177.0.0.1", "0177.20.30.40", "0127.0.0.1", "010.0.0.1"]
+)
+def test_loopback_checks_refuse_a_host_that_binds_elsewhere(host):
+    # a leading zero is octal to some calls of the socket layer and decimal
+    # to others, and the C libraries differ in which
+    bound = [ipaddress.ip_address(found) for found in _socket_layer(host)]
+    if all(address.is_loopback for address in bound):
+        pytest.skip("{} is no address beyond loopback here".format(host))
+    assert config._is_local_listener("http://{}:8080".format(host)) is False
+    assert config._loopback_ip_version(host) is None
+    assert not config._is_self_listed(host + ":7946", "0.0.0.0:7946", "n")
+    with pytest.raises(ConfigError, match="is not loopback"):
+        parse_config_string(
+            "state:\n  path: /x\n  jobApi:\n"
+            "    listen: http://{}:9000\n".format(host),
+            "",
+        )
+    open_mcp = parse_config_string(
+        "web:\n  listen:\n    - http://{}:8080\n"
+        "mcp:\n  enabled: true\n".format(host),
+        "",
+    )
+    with pytest.raises(ConfigError, match="without authentication"):
+        config._validate_cross_sections(open_mcp)
 
 
 # ---------------------------------------------------------------------------

@@ -4800,6 +4800,69 @@ async def test_palette_key_navigation(tmp_path):
     assert not app.is_open("palette")
 
 
+def test_opening_another_overlay_closes_the_palette(tmp_path):
+    app = _bare_app(tmp_path)
+    app.open("help")
+    app.open("palette")
+    app.focus = "palette"
+    # as when the --job drawer opens while the palette is open
+    app.open("drawer")
+    assert app.open_overlays == ["help", "drawer"] and app.focus is None
+
+
+async def test_poll_401_over_the_palette_gives_the_token_prompt_the_keys(
+    tmp_path,
+):
+    app = _bare_app(tmp_path)
+    app.api.get_json = _raise_unauth
+    await app.handle_key("ctrl+k")
+    # the daemon answers the poll with a 401 while the palette is open
+    await app._poll_once()
+    assert app.open_overlays == ["token"] and app.focus == "token"
+    app.paint()
+    screen = app.term.screen()
+    assert "access token" in screen and "command palette" not in screen
+    # the prompt on screen takes the keys, and Enter saves them as the
+    # token; typed into the palette, they select the wallboard
+    for ch in "wall":
+        await app.handle_key(ch)
+    assert (app.inputs["token"], app.inputs["palette"]) == ("wall", "")
+    await app.handle_key("enter")
+    assert app.api.token == "wall" and not app.wallboard
+    assert app.open_overlays == []
+
+
+async def test_action_401_over_the_palette_gives_the_token_prompt_the_keys(
+    tmp_path,
+):
+    app = _bare_app(tmp_path)
+    app.api.post = _raise_unauth
+    app.dag_name, app.dag_run_key = "d", "rk"
+    actions = (
+        lambda: app.run_job("j"),
+        lambda: app.cancel_job("j"),
+        lambda: app.pause_job("j"),
+        lambda: app.resume_job("j"),
+        lambda: app.dag_trigger("d"),
+        lambda: app.dag_decision("t", "approve"),
+        lambda: app.dag_backfill("2026-01-01..2026-01-02"),
+    )
+    for action in actions:
+        # the prompt is open already, and the palette opens over it
+        app._open_token()
+        await app.handle_key("ctrl+k")
+        assert app.open_overlays == ["token", "palette"]
+        # the action's 401 lands while the palette is open
+        await action()
+        assert app.open_overlays == ["token"] and app.focus == "token"
+        await app.handle_key("z")
+        assert (app.inputs["token"], app.inputs["palette"]) == ("z", "")
+        # Esc closes the prompt, the overlay on screen
+        await app.handle_key("esc")
+        assert app.open_overlays == []
+        app.inputs["token"] = ""
+
+
 async def test_filter_tab_blurs(tmp_path):
     app = _bare_app(tmp_path)
     app.jobs = [_job("a")]

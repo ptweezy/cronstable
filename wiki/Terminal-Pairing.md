@@ -15,7 +15,7 @@ cronstable pair --url http://nas.local:8080          # a remote daemon
 cronstable pair --public-url https://cron.example.net  # behind a proxy
 ```
 
-Scan the code with the phone's camera, or tap **Scan QR** in the app.
+Scan the code with the phone's camera, or tap **Scan QR code** in the app.
 
 The command is a client of the running daemon, like `cronstable tui` and
 `cronstable mcp`. It reads no configuration file, and it works on Linux,
@@ -115,10 +115,10 @@ a container bridge, and only a phone on that network can dial it.
 The command sends the token only to `--url`. It sends each address a request
 without the token, and the reply must carry the instance ID that the daemon
 reported at `--url`. A daemon puts its instance ID in the
-`Cronstable-Instance` header of every reply, including a `401`. A second
-daemon on the address has another ID, even when it shares the first daemon's
-configuration and tokens. The command reads the headers of the reply and
-leaves the body unread.
+`Cronstable-Instance` header of every reply that its web API serves,
+including a `401`. A second daemon on the address has another ID, even when
+it shares the first daemon's configuration and tokens. The command reads the
+headers of the reply and leaves the body unread.
 
 When no listener gives an address, the command sends no request. A process
 that holds the LAN address while the daemon listens only on loopback
@@ -151,9 +151,12 @@ serves without a token under `web.anonymousScopes`. The command then has no
 address to check. Present a token, or pass `--public-url`.
 
 A loopback address is `localhost`, a name under it, or an address such as
-`127.0.0.1`, `::1`, or `0.0.0.0` in any spelling. Any other hostname goes into
-the code as given, because the phone resolves it. A path in the address goes
-into the code percent-encoded.
+`127.0.0.1`, `::1`, or `0.0.0.0` in any form that the socket layer reads, such
+as `127.1`. A form with a leading zero that this host's C library reads as
+octal in one call and as decimal in another, such as `0177.0.0.1` on macOS,
+counts as a hostname. Any other hostname goes into the code as given, because
+the phone resolves it. A path in the address goes into the code
+percent-encoded.
 
 The command doesn't follow redirects, because its request carries the token.
 When `--url` answers with a redirect, the command reports the redirect's
@@ -201,7 +204,12 @@ Prompt, PowerShell, and Windows Terminal all work.
 | --- | --- |
 | `qr` (default) | The caption and the QR code. |
 | `link` | The pairing link as one line of text, for another QR tool. |
-| `json` | The pairing JSON as one line of text. Paste it into the **Paste pairing JSON from the dashboard** field of the app's add-server form. |
+| `json` | The pairing JSON as one line of text. Paste it into the **Paste pairing details from the dashboard** field of the app's add-server form. |
+
+In the pairing JSON, the command writes a character that isn't printable,
+such as a control character or a bidirectional override in the server name,
+as a JSON escape. The app reads the escape as the same character. The link
+and the QR code carry the JSON in this form.
 
 Each format contains the token, so handle the output as a secret.
 
@@ -243,7 +251,7 @@ cronstable pair [--url URL] [--token TOKEN] [--token-env VAR]
 | `--url URL` | `http://127.0.0.1:8080` | The address where the command reaches the daemon. |
 | `--token TOKEN` | unset | The bearer token to present and to put in the code. Prefer `--token-env`, which keeps the token out of the process list. |
 | `--token-env VAR` | `CRONSTABLE_WEB_TOKEN` | The environment variable that holds the token. |
-| `--public-url URL` | see [the address in the code](#the-address-in-the-code) | The address that the phone uses to reach the daemon. |
+| `--public-url URL` | see [the address in the code](#the-address-in-the-code) | The address that the phone uses to reach the daemon. An empty value is an error. |
 | `--name NAME` | the cluster node name, or the address's host and port | The server name that the app shows. |
 | `--format FORMAT` | `qr` | `qr`, `link`, or `json`. See [other formats](#other-formats). |
 | `--cacert`, `--client-cert`, `--client-key`, `--insecure` | unset | TLS options for an `https://` listener. See [client configuration](Listener-TLS#client-configuration). |
@@ -265,6 +273,7 @@ build or write the code, and with status 2 for a usage error.
 | `pairing link base` and `is not a printable http:// or https:// URL` | The daemon's [`GET /whoami`](HTTP-API#get-whoami) reply carries a `pairLinkBase` that the command can't put in a link. Check `push.relay.url` in the daemon's configuration. |
 | `redirects to` | The address answers with a redirect, which the command doesn't follow. When the redirect leads to the same API at another address, the message ends with the `--url` value to pass. Any other redirect, such as one to a sign-in page, means that the address doesn't serve the API itself, so pass an address that does. |
 | `no HTTP reply from` | Something other than an HTTP server answers at the address, or the reply ended early. Check the port in `--url`. |
+| `is not an http:// or https:// URL` | The value of `--url` or `--public-url` is empty, or it isn't a whole `http://` or `https://` address. The usual cause of an empty value is a shell variable that isn't set. Pass the address with its scheme, such as `https://cron.example.net`. |
 | `requires an access token` | The daemon has a token configured. Set `CRONSTABLE_WEB_TOKEN`, or pass `--token-env`. |
 | `rejected the access token` | The token matches no `web.authToken` or `web.authTokens` entry. |
 | `holds a line break or another character that an HTTP header cannot carry` | The token from `--token` or the environment variable contains a control character, which a request can't send. The usual cause is the line ending of a file that the variable was read from. Set the token again without it. The command sends every other character as UTF-8, which is the form that the daemon compares. |

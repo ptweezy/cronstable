@@ -25,6 +25,10 @@ def ip_literal(host: str) -> Address | None:
     reads an address with or without a URL's brackets, and the short and
     hexadecimal IPv4 forms that the socket layer reads, such as ``127.1``
     and ``0x7f.0.0.1``. It calls no resolver.
+
+    A form that the host's C library reads as two addresses is a name: in
+    ``0177.0.0.1``, a leading zero is octal to one call and decimal to
+    another.
     """
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
@@ -36,9 +40,16 @@ def ip_literal(host: str) -> Address | None:
         # Some C libraries read an address with other text after it.
         return None
     try:
-        return ipaddress.ip_address(socket.inet_aton(host))
+        address = ipaddress.ip_address(socket.inet_aton(host))
     except (OSError, ValueError):
         return None
+    try:
+        # A bind or a connect asks inet_pton first. Some C libraries read
+        # a leading zero as decimal there and as octal in inet_aton.
+        packed = socket.inet_pton(socket.AF_INET, host)
+    except OSError:
+        return address
+    return address if packed == address.packed else None
 
 
 def netloc(host: str, port: int | str | None = None) -> str:
@@ -84,7 +95,8 @@ def lan_address() -> str | None:
     if address is None or is_loopback("http://{}".format(address)):
         try:
             address = socket.gethostbyname(socket.gethostname())
-        except OSError:
+        except (OSError, UnicodeError):
+            # The idna codec refuses some hostnames before any lookup.
             return None
     if is_loopback("http://{}".format(address)):
         return None

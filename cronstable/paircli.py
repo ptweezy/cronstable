@@ -154,7 +154,9 @@ def _pair(args: argparse.Namespace) -> int:
     try:
         base = pairlink.base_url(args.url)
         public = (
-            pairlink.base_url(args.public_url) if args.public_url else None
+            pairlink.base_url(args.public_url)
+            if args.public_url is not None
+            else None
         )
     except ValueError as ex:
         raise _PairError(str(ex)) from None

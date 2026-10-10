@@ -126,11 +126,18 @@ sleep() { echo "DELAY:$1"; }
 
 
 @pytest.mark.parametrize(
-    "failures,digest_ok",
-    [(0, True), (2, True), (5, True), (0, False)],
+    "failures,stalled,digest_ok",
+    [
+        (0, False, True),
+        (2, False, True),
+        (5, False, True),
+        (0, False, False),
+        (1, True, True),
+        (5, True, True),
+    ],
 )
 def test_workflow_lint_runs_a_pinned_binary_fetched_with_retries(
-    failures, digest_ok, tmp_path
+    failures, stalled, digest_ok, tmp_path
 ):
     # Every test job needs tox-static, so a download that fails once, or a
     # registry that rate-limits an image pull, would skip the whole suite.
@@ -139,10 +146,9 @@ def test_workflow_lint_runs_a_pinned_binary_fetched_with_retries(
         shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
     if shell is None or not Path(shell).is_file():
         pytest.skip("Bash required for the workflow lint harness")
+    job = workflow()["jobs"]["tox-static"]
     step = next(
-        s
-        for s in workflow()["jobs"]["tox-static"]["steps"]
-        if s.get("name") == "Validate workflow syntax"
+        s for s in job["steps"] if s.get("name") == "Validate workflow syntax"
     )
     assert "docker" not in step["run"]
     version = step["env"]["ACTIONLINT_VERSION"]
@@ -151,12 +157,27 @@ def test_workflow_lint_runs_a_pinned_binary_fetched_with_retries(
     temp = tmp_path.as_posix()
     # The stubs stand in for the network, the digest check, and the
     # archive: `tar` leaves a script that reports how the linter is called.
+    # A stalled `curl` returns only when its time limit runs out. With no
+    # limit, it waits until the job timeout cancels the step. The stub
+    # reports that case as a hang and ends the script.
     prelude = r"""
 attempts=0
 curl() {
     attempts=$((attempts + 1))
-    for arg in "$@"; do url=$arg; done
+    limit=
+    url=
+    for arg in "$@"; do
+        if [ "$url" = --max-time ]; then limit=$arg; fi
+        url=$arg
+    done
     echo "FETCH:$attempts:$url"
+    if [ "$STALLED" = 1 ] && [ "$attempts" -le "$FAILURES" ]; then
+        if [ -z "$limit" ]; then
+            echo "HANG:$attempts"
+            exit 1
+        fi
+        echo "LIMIT:$limit"
+    fi
     [ "$attempts" -gt "$FAILURES" ]
 }
 sha256sum() {
@@ -178,12 +199,16 @@ sleep() { echo "DELAY:$1"; }
             **step["env"],
             "RUNNER_TEMP": temp,
             "FAILURES": str(failures),
+            "STALLED": str(int(stalled)),
             "DIGEST_OK": str(int(digest_ok)),
         },
         capture_output=True,
         text=True,
         timeout=30,
     )
+    # Every attempt has a time limit, so a stalled one fails and the retry
+    # handles it like any other failed attempt.
+    assert "HANG:" not in result.stdout, result.stdout + result.stderr
     fetched = failures < 5
     assert (result.returncode == 0) == (fetched and digest_ok), (
         result.stdout + result.stderr
@@ -198,6 +223,14 @@ sleep() { echo "DELAY:$1"; }
         f"FETCH:{n}:{url}" for n in range(1, expected_attempts + 1)
     ]
     assert result.stdout.count("DELAY:") == expected_attempts - 1
+    # A stalled attempt lasts for its whole time limit. The limits and the
+    # delays between attempts fit inside the job timeout with two minutes
+    # to spare for the checkout and the steps after this one, so a download
+    # that stalls on every attempt ends with the retry error.
+    limits = [float(line[6:]) for line in out if line.startswith("LIMIT:")]
+    delays = [float(line[6:]) for line in out if line.startswith("DELAY:")]
+    assert len(limits) == (failures if stalled else 0)
+    assert sum(limits) + sum(delays) <= job["timeout-minutes"] * 60 - 120
     # The digest check sees the pinned digest and the downloaded archive,
     # and only a download that succeeded reaches it.
     assert [line for line in out if line.startswith("VERIFY:")] == (
