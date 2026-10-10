@@ -238,19 +238,16 @@ def test_freebsd_installs_the_openssl_35_port_under_either_name(
         for s in job["steps"]
         if s.get("uses", "").startswith("vmactions/freebsd-vm@")
     )
+    # As on FreeBSD, `pkg install` fails for a package the repository
+    # lacks. Any other subcommand fails too: `pkg rquery` exits without
+    # output on a VM that has no catalogue yet, so the step cannot use it.
     prelude = """
 pkg() {
-    case "$1" in
-        rquery)
-            [ "$3" = openssl35 ] && [ "$HAS_OPENSSL35" = 1 ] && echo "$3"
-            ;;
-        install)
-            shift
-            echo "INSTALL:$*"
-            ;;
-        *)
-            return 2
-            ;;
+    [ "$1" = install ] || return 1
+    shift
+    echo "INSTALL:$*"
+    case " $* " in
+        *" openssl35 "*) [ "$HAS_OPENSSL35" = 1 ] ;;
     esac
 }
 openssl() { echo "$OPENSSL_VERSION"; }
@@ -275,9 +272,15 @@ openssl() { echo "$OPENSSL_VERSION"; }
             timeout=30,
         )
         assert (result.returncode == 0) == ok, result.stdout + result.stderr
-        name = "openssl35" if has_openssl35 else "openssl"
-        assert result.stdout.splitlines() == [
-            f"INSTALL:-y {row['pkgs']} {name}"
+        installs = [
+            line
+            for line in result.stdout.splitlines()
+            if line.startswith("INSTALL:")
+        ]
+        assert installs == [
+            f"INSTALL:-y {row['pkgs']}",
+            "INSTALL:-y openssl35",
+            *([] if has_openssl35 else ["INSTALL:-y openssl"]),
         ]
         if not ok:
             assert "must be 3.5 or later" in result.stderr
