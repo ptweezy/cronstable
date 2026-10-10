@@ -2099,14 +2099,17 @@ jobs:
             # the OpenSSL 3.5 port. That port is security/openssl35 until a
             # package repository picks up its 2026-09-30 move to
             # security/openssl, and each architecture's repository moves on
-            # its own schedule. Install the name that this repository has.
+            # its own schedule. Try the first name and fall back to the
+            # second: `pkg install` fails for a package the repository
+            # lacks. `pkg rquery` cannot ask first, because it exits
+            # without output until a catalogue has been fetched.
             # TODO: Install `openssl` alone when the latest and quarterly
             # repositories of both architectures have made the move.
-            openssl=openssl
-            if [ -n "$(pkg rquery %n openssl35 2>/dev/null)" ]; then
-              openssl=openssl35
+            pkg install -y ${{ matrix.pkgs }}
+            if ! pkg install -y openssl35; then
+              echo "No openssl35 in this repository; installing openssl."
+              pkg install -y openssl
             fi
-            pkg install -y ${{ matrix.pkgs }} "$openssl"
             # The cryptography build is soft: against an older OpenSSL it
             # drops ML-KEM and the job still passes. Fail here instead.
             case "$(/usr/local/bin/openssl version)" in
