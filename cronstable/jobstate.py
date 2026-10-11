@@ -373,12 +373,12 @@ async def artifact_put(
     size, at, meta}`` is appended to the scope's ``artifacts/`` stream, so a
     later run or a peer node reads the newest version back by name.  Only the
     newest record per name is ever read back, so the append carries
-    ``prune_latest_by="name"``: it removes the record that it supersedes, or
-    a later prune pass does (the next sweep reclaims the now-orphan blob),
-    bounding the stream by the number of distinct names, whatever the number
-    of publishes (:meth:`StateBackend.append_record` gives the factor).  The
-    scope's whole artifact stream is still reclaimed together when the job
-    is garbage collected.
+    ``prune_latest_by="name"``: it removes the record two versions behind
+    its own, or a later prune pass does (the next sweep reclaims the
+    now-orphan blob), bounding the stream by the number of distinct names,
+    whatever the number of publishes (:meth:`StateBackend.append_record`
+    gives the factor).  The scope's whole artifact stream is still reclaimed
+    together when the job is garbage collected.
     """
     if max_bytes and max_bytes > 0 and len(data) > max_bytes:
         raise JobStateError(
@@ -431,10 +431,15 @@ async def artifact_get_record(
     scope = _require_scope(scope)
     # A stream accumulates one immutable record per publish, and a scope
     # that takes one name per task instance (XCom) holds as many records as
-    # the run has instances.  The backend lists the stream on every call,
-    # reads each record it has not read before (so a peer's publish is seen
-    # at once) plus the match itself, and skips the records it already
-    # knows to carry another name.
+    # the run has instances.  The backend lists the stream on every call
+    # and reads each record it has not read before, so a peer's publish is
+    # seen at once.  It skips the records it already knows to carry another
+    # name.  It remembers no name over its length limit, and reads a record
+    # that carries one on every call.  A strict lookup reads the match from
+    # the store, and a best-effort lookup can take a match it has read
+    # before from the record cache.  When the listing lacks the newest
+    # record that the backend remembers for the name, the lookup finds that
+    # record in the store and answers with it.
     return await backend.newest_record_with(
         ARTIFACT_STREAM_PREFIX + scope, "name", name, strict=strict
     )

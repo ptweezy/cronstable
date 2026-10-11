@@ -13,7 +13,7 @@ from typing import Any
 
 from cronstable import _json
 from cronstable.fingerprint import job_digest_cached
-from cronstable.state import DOC_KEEP
+from cronstable.state import DOC_KEEP, _DocumentUnreadable
 
 logger = logging.getLogger(__name__)
 NAMESPACE = "scheduler-pools"
@@ -35,6 +35,23 @@ class PoolError(Exception):
         self.message = message
         self.pool = pool
         self.key = key
+
+
+class PoolUnavailable(PoolError):
+    """A pool operation made while the daemon has no state backend."""
+
+    def __init__(self, message: str = "pool state is unavailable") -> None:
+        super().__init__(message)
+
+
+# What a pool operation raises when its state cannot be read or written.
+# Catch these ahead of PoolError: PoolUnavailable is one.
+POOL_UNAVAILABLE = (
+    PoolUnavailable,
+    OSError,
+    asyncio.TimeoutError,
+    _DocumentUnreadable,
+)
 
 
 def _unobserved_task(entry) -> bool:
@@ -209,9 +226,12 @@ class PoolScheduler:
 
     async def _change(self, pool, action, *, backend=None, strict=False):
         backend = backend or self.cron.state_backend
-        if backend is None:
-            raise PoolError("pool state is unavailable")
         conf = self.cron.pool_config.get(pool)
+        if backend is None:
+            if conf is None and not self.cron._state_configured:
+                # no ``state`` section either: there is no store to wait for
+                raise PoolError("unknown pool {!r}".format(pool))
+            raise PoolUnavailable()
         if strict and conf is None:
             raise PoolError("unknown pool {!r}".format(pool))
         if strict and await self.cron._slot_fidelity_reason():
@@ -219,6 +239,15 @@ class PoolScheduler:
         now = time.time()
 
         def transform(current):
+            if current is not None and not (
+                isinstance(current, dict)
+                and isinstance(current.get("entries"), dict)
+                and "slots" in current
+            ):
+                # a body that no pool scheduler wrote
+                raise _DocumentUnreadable(
+                    "pool {!r}: not a pool document".format(pool)
+                )
             body = (
                 # current is freshly parsed JSON, so a JSON round trip is a
                 # faithful deep copy
@@ -432,7 +461,7 @@ class PoolScheduler:
                 )
             try:
                 await self._flush_retry_settlements(pool)
-            except (PoolError, OSError, asyncio.TimeoutError):
+            except (PoolError, *POOL_UNAVAILABLE):
                 logger.warning("pool %s: retry settlement deferred", pool)
         self.service()
 
@@ -550,7 +579,10 @@ class PoolScheduler:
             # Retry the completion on the next heartbeat.
             ticket.completion = (state, reason)
             return
-        self.held.pop((ticket.pool, ticket.key), None)
+        # A retried completion can land after a later ticket claims the
+        # key, and that ticket stays held.
+        if self.held.get((ticket.pool, ticket.key)) is ticket:
+            del self.held[(ticket.pool, ticket.key)]
         if wake:
             self._wake.set()
 
@@ -655,7 +687,7 @@ class PoolScheduler:
             running = ticket.running
             # A run that has ended keeps its result; only a live one is
             # cancelled.
-            if running is not None and not running.stopped:
+            if running is not None and not running.ended:
                 logger.error(
                     "pool lease lost for %s; cancelling its process",
                     ticket.key,

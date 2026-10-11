@@ -32,7 +32,6 @@ legacy path, where ``initialize`` negotiates ``2025-11-25`` or an earlier
 revision.
 """
 
-import asyncio
 import base64
 import binascii
 import json as _stdlib_json
@@ -1691,28 +1690,26 @@ class MCPHandler:
         return _result({"resumed": name}, "resumed job {!r}".format(name))
 
     async def _t_list_pools(self, args):
-        from cronstable.pools import PoolError
+        from cronstable.pools import POOL_UNAVAILABLE, PoolError
 
         try:
             pools = await self._cron._pools.snapshot()
-        except PoolError as ex:
-            return _tool_error(str(ex))
-        except (OSError, asyncio.TimeoutError):
+        except (PoolError, *POOL_UNAVAILABLE):
             return _tool_error("pool state is unavailable")
         return _result({"pools": pools}, "resource pools")
 
     async def _t_cancel_queued(self, args):
-        from cronstable.pools import PoolError
+        from cronstable.pools import POOL_UNAVAILABLE, PoolError
 
         _require_confirm(args, "cancelling queued work")
         try:
             entry = await self._cron._pools.cancel(
                 _req_str(args, "pool"), _req_str(args, "id")
             )
+        except POOL_UNAVAILABLE:
+            return _tool_error("pool state is unavailable")
         except PoolError as ex:
             return _tool_error(str(ex))
-        except (OSError, asyncio.TimeoutError):
-            return _tool_error("pool state is unavailable")
         return _result(
             {"id": entry["id"], "state": entry["state"]},
             "queued work cancelled",
@@ -1776,10 +1773,10 @@ class MCPHandler:
                     plan_token=token,
                     allow_config_change=allow_change,
                 )
-        except RecoveryError as ex:
-            return _tool_error(str(ex))
         except _RECOVERY_UNAVAILABLE:
             return _tool_error("recovery state is unavailable")
+        except RecoveryError as ex:
+            return _tool_error(str(ex))
         return _result(
             data, "recovery started" if execute else "recovery preview"
         )

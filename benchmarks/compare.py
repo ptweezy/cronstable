@@ -159,6 +159,15 @@ def _load_budgets(path):
     return doc.get("budgets", {})
 
 
+def _usable(entry):
+    """Whether ``entry`` is a measured row whose value is finite."""
+    return (
+        entry is not None
+        and not entry.get("skipped")
+        and math.isfinite(entry["value"])
+    )
+
+
 def _budget_failures(budgets, current):
     """Budget breaches, and budgeted metrics this run did not measure."""
     breaches = []
@@ -169,7 +178,8 @@ def _budget_failures(budgets, current):
         if entry is None or entry.get("skipped"):
             unmeasured.append(name)
             continue
-        if entry["value"] > spec["max"]:
+        # A NaN compares false against every ceiling, so it is tested first.
+        if not math.isfinite(entry["value"]) or entry["value"] > spec["max"]:
             breaches.append(
                 "%s measured %s, exceeding its absolute limit of %s"
                 % (
@@ -205,13 +215,24 @@ def _merge(docs):
 
     The entry's stats are recomputed over every round's raw repeats; `value`
     uses the metric's declared estimator across rounds.
+
+    A measured entry lists in ``short_rounds`` each of its rounds that
+    skipped or ran fewer repeats than declared.  A metric's rounds are
+    numbered in the order of the documents that hold it.
     """
     merged = {}
     for doc in docs:
         for entry in doc.get("results", []):
             name = entry["name"]
-            slot = merged.setdefault(name, {"entry": None, "round_values": []})
+            slot = merged.setdefault(
+                name, {"entry": None, "round_values": [], "rounds": 0}
+            )
+            slot["rounds"] += 1
             if entry.get("skipped"):
+                slot.setdefault("short", []).append(
+                    "round %d skipped (%s)"
+                    % (slot["rounds"], entry.get("reason"))
+                )
                 slot.setdefault("skip_reason", entry.get("reason"))
                 # Keep the skipped row's declared config. bench.py stamps
                 # gate_pct/gate_floor/info on a skipped result too, and that
@@ -220,6 +241,16 @@ def _merge(docs):
                 # it every skipped metric looks ungateable by design.
                 slot.setdefault("skipped_entry", entry)
                 continue
+            if entry.get("partial_reason"):
+                slot.setdefault("short", []).append(
+                    "round %d ran %s of %s repeats (%s)"
+                    % (
+                        slot["rounds"],
+                        entry.get("runs"),
+                        entry.get("repeats"),
+                        entry["partial_reason"],
+                    )
+                )
             if slot["entry"] is None:
                 slot["entry"] = dict(entry)
             slot["round_values"].append(entry["value"])
@@ -239,18 +270,24 @@ def _merge(docs):
             continue
         entry = slot["entry"]
         vals = slot["round_values"]
-        entry["value"] = (
-            min(vals)
-            if entry.get("compare") == "min"
-            else statistics.median(vals)
-        )
+        # min() and median() depend on round order over a NaN, so a round
+        # with a non-finite value decides the merged value.
+        broken = [v for v in vals if not math.isfinite(v)]
+        if broken:
+            entry["value"] = broken[0]
+        elif entry.get("compare") == "min":
+            entry["value"] = min(vals)
+        else:
+            entry["value"] = statistics.median(vals)
         entry["round_values"] = vals
+        if "short" in slot:
+            entry["short_rounds"] = slot["short"]
         out[name] = entry
     return out
 
 
 def _delta_pct(base, cur):
-    if base <= 0:
+    if not (math.isfinite(base) and math.isfinite(cur)) or base <= 0:
         return None
     return (cur - base) / base * 100.0
 
@@ -259,8 +296,8 @@ def _rel_cov(entry):
     """A side's round-to-round scatter as a coefficient of variation.
 
     Uses the per-round estimator values that _merge preserved in
-    ``round_values``; needs at least two rounds to estimate scatter, else
-    None.  Returned as a fraction of the metric's center.
+    ``round_values``; needs at least two rounds, all finite, to estimate
+    scatter, else None.  Returned as a fraction of the metric's center.
 
     From three rounds up the scatter is a robust estimate: the median absolute
     deviation scaled to a standard-deviation equivalent (x1.4826).  A single
@@ -273,6 +310,8 @@ def _rel_cov(entry):
     """
     rounds = entry.get("round_values") or []
     if len(rounds) < _MIN_ROUNDS_FOR_NOISE:
+        return None
+    if not all(math.isfinite(v) for v in rounds):
         return None
     center = statistics.median(rounds)
     if center <= 0:
@@ -288,9 +327,10 @@ def _rel_cov(entry):
 
 def _baseline_of(side_map):
     """The interpreter-startup floor (``startup.python_baseline``) measured on
-    one side, or None if it was not run (older release, filtered run)."""
+    one side, or None if it was not run (older release, filtered run) or
+    its value is not finite."""
     entry = side_map.get("startup.python_baseline")
-    if entry is None or entry.get("skipped"):
+    if not _usable(entry):
         return None
     return entry.get("value")
 
@@ -404,6 +444,10 @@ def _gate_coverage(baseline, current):
     report that does not count them presents a pass over a shrunken set as a
     pass over the whole one.  Only metrics that declare a ``gate_pct`` are
     counted; an ``info``-only metric skipping is not lost coverage.
+
+    A side counts as measured when its value is finite.  The baseline value
+    must also be above zero: the percentage change is undefined otherwise,
+    so no limit can fire on the metric.
     """
     coverage = {
         "compared": 0,
@@ -416,8 +460,8 @@ def _gate_coverage(baseline, current):
         if _declared_gate_pct(baseline, current, name) is None:
             continue
         cur, base = current.get(name), baseline.get(name)
-        cur_ok = cur is not None and not cur.get("skipped")
-        base_ok = base is not None and not base.get("skipped")
+        cur_ok = _usable(cur)
+        base_ok = _usable(base) and base["value"] > 0
         if cur_ok and base_ok:
             coverage["compared"] += 1
             coverage["compared_names"].append(name)
@@ -541,6 +585,26 @@ def _floor_bound(rows, slack=1.05):
         ):
             out.append(row)
     out.sort(key=lambda r: -(r["effective_pct"] / r["entry"]["gate_pct"]))
+    return out
+
+
+def _short_sides(rows, baseline, current):
+    """One message per side of a compared metric that has ``short_rounds``.
+
+    The merge keeps the rounds that measured, so the comparison shows no
+    sign of a round that crashed or hung.
+    """
+    out = []
+    for row in rows:
+        if row["delta_pct"] is None:
+            continue
+        for side, entries in (("baseline", baseline), ("current", current)):
+            short = entries[row["name"]].get("short_rounds")
+            if short:
+                out.append(
+                    "%s was compared with a short %s side: %s"
+                    % (row["name"], side, "; ".join(short))
+                )
     return out
 
 
@@ -1061,6 +1125,18 @@ def main(argv=None):
         expected = _load_expected_gated(args.expected_gated)
         compared_names = set(coverage["compared_names"])
         expected_missing = [n for n in expected if n not in compared_names]
+        if current_docs[0].get("mode") in ("quick", "smoke"):
+            # A reduced workload can finish inside one step of its clock and
+            # read zero, which says nothing about the gate at full scale.
+            expected_missing = [
+                n
+                for n in expected_missing
+                if not (
+                    _usable(baseline.get(n))
+                    and _usable(current.get(n))
+                    and baseline[n]["value"] == 0
+                )
+            ]
 
     if args.merged_out:
         merged_doc = dict(current_docs[0])
@@ -1130,6 +1206,8 @@ def main(argv=None):
             "::warning::perf gate: %d declared-gate metric(s) not compared, "
             "so ungated this run: %s" % (len(lost), ", ".join(lost))
         )
+    for short in _short_sides(rows, baseline, current):
+        print("::warning::perf gate: %s" % short)
     for violation in violations:
         if args.accept or args.warn_only:
             print("::warning::perf gate: %s" % violation)

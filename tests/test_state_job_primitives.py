@@ -588,6 +588,58 @@ async def test_artifact_list_newest_per_name(fs_backend):
     assert [r["name"] for r in listing] == ["a", "b"]
 
 
+async def test_artifact_put_after_a_listing_outranks_a_fast_clocked_peer(
+    fs_backend_factory, monkeypatch
+):
+    # Two nodes share a store, and the peer's clock runs a minute ahead.
+    # This node reads the peer's version in a listing and then publishes
+    # the name, and both nodes read that publish back.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    await jobstate.artifact_put(ours, "s", "x", b"v1")
+    real_now = state._now
+    with monkeypatch.context() as ahead:
+        ahead.setattr(state, "_now", lambda: real_now() + 60.0)
+        await jobstate.artifact_put(theirs, "s", "x", b"v2")
+    (listed,) = await jobstate.artifact_list(ours, "s")
+    assert await ours.get_blob(listed["sha256"]) == b"v2"
+    await jobstate.artifact_put(ours, "s", "x", b"v3")
+    for backend in (ours, theirs):
+        _rec, data = await jobstate.artifact_get(
+            backend, "s", "x", strict=True
+        )
+        assert data == b"v3"
+        (listed,) = await jobstate.artifact_list(backend, "s")
+        assert await backend.get_blob(listed["sha256"]) == b"v3"
+
+
+async def test_artifact_with_a_long_name_publishes_reads_and_lists(fs_backend):
+    # A job chooses its artifact names, and the job API admits a name of
+    # about 8,000 characters.  The backend remembers no name that long,
+    # and every primitive serves it.
+    backend = fs_backend
+    name = "\U0001f600" + "n" * 8000
+    await jobstate.artifact_put(backend, "s", "short", b"s")
+    for version in range(20):
+        payload = b"v%d" % version
+        await jobstate.artifact_put(backend, "s", name, payload)
+        _rec, data = await jobstate.artifact_get(
+            backend, "s", name, strict=True
+        )
+        assert data == payload
+    listing = await jobstate.artifact_list(backend, "s")
+    assert [r["name"] for r in listing] == ["short", name]
+    raw = await backend.list_records(jobstate.ARTIFACT_STREAM_PREFIX + "s")
+    # the superseded versions of the long name wait for a prune pass
+    assert len(raw) <= state._PRUNE_EVERY_APPENDS + 2
+    held = [
+        value
+        for facts in backend._field_index.values()
+        for value in facts.values.values()
+    ]
+    assert held == ["short"]
+
+
 async def test_artifact_put_prunes_superseded_same_name_records(fs_backend):
     # Republishing one name must not grow the stream without bound: the name-
     # keyed prune drops superseded records, keeping only the newest per name,

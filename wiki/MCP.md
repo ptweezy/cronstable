@@ -133,7 +133,18 @@ payload. Semantics: [pausing jobs](Pausing-Jobs) and
 `cron_recover_dag` executes that preview with its `plan_token`. Cancellation
 and recovery execution require `confirm: true` and a writable MCP setup.
 Recovery also requires `allow_config_change: true` when the preview reports
-a configuration change. See [resource pools](Resource-Pools) and
+a configuration change. A recovery that the REST routes answer with `409` or
+`503`, such as `source run is busy; retry shortly` or
+`recovery state is unavailable`, comes back as a tool error with the same
+message. `cron_list_pools`, `cron_cancel_queued`, and `cron_run_job` for a
+pooled job return the tool error `pool state is unavailable` when pool state
+cannot be read or written. A refusal by a pool that answers comes back as a
+tool error with the refusal's message, such as `queue entry not found` or
+`pool queue is full`. On a daemon whose configuration has no `state`
+section, the recovery tools return `workflow run not found` for a run and
+`workflow not found` for a date range, and `cron_cancel_queued` returns
+`unknown pool '<name>'`. The [HTTP API](HTTP-API#enabling-the-api) lists the
+cases behind each answer. See [resource pools](Resource-Pools) and
 [workflow recovery](Workflow-Recovery) for behavior and limits.
 
 The three schedule-authoring tools make an agent a competent schedule

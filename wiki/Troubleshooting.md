@@ -47,7 +47,11 @@ a missing file instead surfaces as a `ConfigError` (see the next entry).
 **Cause.** Any `ConfigError` raised during initial parse stops startup
 (`__main__.py` wraps `Cron(args.config)` and exits on `ConfigError`). When `-c`
 points at a single file that is missing or unreadable, `parse_config` catches the
-`OSError` and re-raises it as a clean `ConfigError` with the OS message.
+`OSError` and re-raises it as a clean `ConfigError` with the OS message. A
+configuration file that is not valid UTF-8 is a `ConfigError` as well:
+`Could not load config file '<path>': 'utf-8' codec can't decode byte ...`. A
+redirect (`>`) in Windows PowerShell 5.1 writes UTF-16, which is the usual cause
+(see [output encoding](Running-on-Windows#output-encoding)).
 
 **Fix.** Correct the path, permissions, or YAML. Run `cronstable -v -c <path>` to
 validate without starting the scheduler. On success it logs `Configuration is valid.`
@@ -676,22 +680,27 @@ and possibly `Job <name> did not gracefully terminate after <n> seconds, killing
 **Cause.** `executionTimeout` (default unset/`None`) cancels a job still running after
 N seconds (recorded internally as retcode `-100`). Cancellation signals the job's
 whole process group (each job runs in its own session): `SIGTERM` to the group, then
-after `killTimeout` seconds (default `30`) an unconditional `SIGKILL` to the group,
-sent even if the main process already exited, so background helpers the command
-left behind go down with it.
+an unconditional `SIGKILL` to the group when the job's own process has exited or
+`killTimeout` seconds (default `30`) have passed, whichever comes first. The daemon
+sends the `SIGKILL` even when the main process has already exited, so background
+helpers the command left behind go down with it.
 
 **Windows note.** The same two-step runs with Windows primitives: the graceful
 step is a trappable `CTRL_BREAK_EVENT` to the job's process group
 (`signal.SIGBREAK` in Python), and the forced step is a `taskkill /F /T` of
-the job's live process tree, `killTimeout` seconds later. A daemon with no
+the job's live process tree when the job's own process has exited or
+`killTimeout` seconds have passed. A daemon with no
 console cannot deliver the break, and a service has no console. There the
 graceful step becomes the tree kill immediately, and `killTimeout` adds
 nothing. See
 [running on Windows](Running-on-Windows).
 
-**Fix.** Raise `executionTimeout`, or give the process more graceful-shutdown time with
-`killTimeout` (have the job handle `SIGTERM` on POSIX / `SIGBREAK` on Windows to
-use that grace). See
+**Fix.** Raise `executionTimeout`, or give the job's own process more time to shut
+down with `killTimeout` (have it handle `SIGTERM` on POSIX / `SIGBREAK` on Windows
+to use that grace). The grace period lasts while the job's own process runs, which
+is the shell for a `command` given as a string. On POSIX, a program that needs the
+whole `killTimeout` must be the job's own process: pass `command` as a list, or end
+the shell command with `exec`. See
 [cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout)
 on [concurrency and timeouts](Concurrency-and-Timeouts).
 

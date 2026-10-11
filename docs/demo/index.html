@@ -7500,7 +7500,11 @@ var qrcode = function() {
     // gsig change, and the steady state reconciles per row below.
     // ctl reaches every row (the action-button pair), so a scope change
     // (whoami resolving, a token saved or cleared) rebuilds the table.
-    const gsig = JSON.stringify({ ow: showOwner, cn: state.clusterNode, ctl: canControl() });
+    // day and tz reach every row's "Next at" label (see fmtAt), so local
+    // midnight and a time zone change rebuild the table too.
+    const today = new Date();
+    const gsig = JSON.stringify({ ow: showOwner, cn: state.clusterNode, ctl: canControl(),
+      day: today.toDateString(), tz: today.getTimezoneOffset() });
     const sigs = jobs.map(rowSig);
     if (gsig !== state.lastRowSig) {
       state.lastRowSig = gsig;

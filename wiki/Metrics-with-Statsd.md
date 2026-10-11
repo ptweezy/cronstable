@@ -95,6 +95,8 @@ async def _on_stop(self) -> None:
 
 With `concurrencyPolicy: Replace`, cancellation and completion may both call `_on_stop`; only the first call emits metrics. See [concurrency and timeouts](Concurrency-and-Timeouts) for the policies and [failure detection and retries](Failure-Detection-and-Retries) for how `success` is computed.
 
+A run canceled during its command gets `_on_stop` at the end of `cancel()`. A cancel that arrives while the run's [verification](Result-Verification) check runs terminates the check and does not call `_on_stop`; `wait()` calls it once it has collected the check. The stop datagram for that run therefore goes out when the daemon has collected the check, `success` reflects the check's outcome, and `duration` runs to that moment.
+
 > The `start_time` guard means a forced cancellation also yields a correct duration. The duration is measured from the recorded `perf_counter` start to the moment `job_stopped` runs, regardless of how the process ended (normal exit, `executionTimeout`, or `Replace` cancellation).
 
 ## See also

@@ -411,7 +411,20 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: The job is disabled (JSON error envelope).
+          description: >-
+            The job is disabled, or its resource pool refuses the run: the
+            pool queue is full, the pool is draining before a capacity
+            change, or pool state requires reliable exclusive locks (JSON
+            error envelope).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: >-
+            Pool state is unavailable for a job in a resource pool: the
+            configured store has not started, a store operation fails with
+            an I/O error or takes longer than 5 seconds, or a pool document
+            cannot be read.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1430,14 +1443,20 @@ paths:
         The single-page Web Dashboard, registered unless `web.ui: false`.
         Served without authentication (the page holds no data; the browser
         sends the stored bearer token on the data requests it makes, and
-        none on an anonymous-view board).
+        none on an anonymous-view board). Supports `ETag` / `If-None-Match`
+        (304) and gzip, like `GET /jobs`.
+      parameters:
+        - $ref: "#/components/parameters/IfNoneMatch"
       security: []
       responses:
         "200":
           description: The dashboard HTML.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
           content:
             text/html:
               schema: { type: string }
+        "304": { description: Not modified (matching `If-None-Match`). }
 
   /pools:
     get:
@@ -1455,7 +1474,10 @@ paths:
                   $ref: "#/components/schemas/ResourcePool"
         "401": { $ref: "#/components/responses/Unauthorized" }
         "503":
-          description: Pool state is unavailable.
+          description: >-
+            Pool state is unavailable: the configured store has not
+            started, a store operation fails with an I/O error or takes
+            longer than 5 seconds, or a pool document cannot be read.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1482,7 +1504,20 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "409":
-          description: The entry is absent or has already left the queue.
+          description: >-
+            The pool holds no entry under the key (`queue entry not found`),
+            or the entry is running, finished, or expired
+            (`only waiting entries can be cancelled`). A daemon whose
+            configuration has no `state` section answers
+            `unknown pool '<name>'`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: >-
+            Pool state is unavailable: the configured store has not
+            started, a store operation fails with an I/O error or takes
+            longer than 5 seconds, or a pool document cannot be read.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1515,7 +1550,23 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "409":
-          description: The source, configuration, or preview cannot be used.
+          description: >-
+            The workflow or the run is not found
+            (`workflow run not found`), the source, configuration, or
+            preview cannot be used, or the source run is busy. A daemon
+            whose configuration has no `state` section answers
+            `workflow run not found`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: >-
+            Recovery state is unavailable: the configured store has not
+            started, a store operation fails or times out, or a record or
+            document cannot be read. When the write that creates the
+            recovery run times out, the source run's lease stays until it
+            lapses, so a retry answers `409` with a busy source for up to
+            60 seconds, unless the write landed.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1554,7 +1605,32 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "409":
-          description: The range or its preview cannot be used.
+          description: >-
+            The workflow is absent from the configuration
+            (`workflow not found`), the range or its preview cannot be used,
+            or a source run is busy. The first execution of a preview takes
+            the lease of every source run before it records the batch. It
+            records no batch when one of those leases is held, when a source
+            differs from the preview, or when taking the leases and
+            confirming the sources takes 30 seconds or longer. After a busy
+            answer from that step, the same token succeeds once the lease is
+            free, or answers `recovery preview is stale; preview again` when
+            retention has deleted the source or another recovery has created
+            a run for its date. Once the batch is recorded, the request
+            leases each source again while it creates that run's recovery. A
+            source that is busy then leaves the batch recorded, and the same
+            token continues it. A daemon whose configuration has no `state`
+            section answers `workflow not found`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: >-
+            Recovery state is unavailable: the configured store has not
+            started, a store operation fails or times out, or a record or
+            document cannot be read. When the write of the batch times out,
+            the source leases stay until they lapse, so a retry answers
+            `409` with a busy source for up to 60 seconds.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1987,7 +2063,11 @@ components:
         name: { type: string }
         slots: { type: integer }
         priority: { type: integer }
-        queueUnavailable: { type: boolean }
+        queueUnavailable:
+          type: boolean
+          description: >-
+            Present as `true`, in place of `queued`, when pool state cannot
+            be read or written. The job routes still answer `200`.
         queued:
           type: array
           items: { $ref: "#/components/schemas/PoolEntry" }

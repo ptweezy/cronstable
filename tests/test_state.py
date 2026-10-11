@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import threading
 import time
 
@@ -2186,10 +2187,21 @@ def _record_files(backend, stream):
     return [n for n in names if n.endswith(".json")]
 
 
-async def test_name_keyed_append_unlinks_the_record_it_supersedes(fs_backend):
-    # Republishing every name of a stream: each append removes the version
-    # it replaces, so the stream holds one record per name after every
-    # append, however far off its next prune pass is.
+async def _versions(backend, stream):
+    """The ``v`` of every record that the stream holds, oldest first, by
+    name."""
+    held = {}
+    for rec in await backend.list_records(stream):
+        held.setdefault(rec["name"], []).append(rec["v"])
+    return held
+
+
+async def test_name_keyed_append_unlinks_the_record_two_versions_behind(
+    fs_backend,
+):
+    # Republishing every name of a stream: each append keeps the version
+    # it replaces and removes the one before that, so the stream holds at
+    # most two records per name, however far off its next prune pass is.
     backend = fs_backend
     names = 40
     for version in range(3):
@@ -2197,17 +2209,116 @@ async def test_name_keyed_append_unlinks_the_record_it_supersedes(fs_backend):
             await backend.append_record(
                 "s", {"name": "n%d" % i, "v": version}, prune_latest_by="name"
             )
-            if version:
-                assert len(_record_files(backend, "s")) == names
-    recs = await backend.list_records("s")
-    assert sorted(r["name"] for r in recs) == sorted(
-        "n%d" % i for i in range(names)
-    )
-    assert {r["v"] for r in recs} == {2}
+            held = await _versions(backend, "s")
+            both = [version - 1, version]
+            assert held["n%d" % i] == (both if version else [0])
+            assert len(_record_files(backend, "s")) <= 2 * names
+    held = await _versions(backend, "s")
+    assert sorted(held) == sorted("n%d" % i for i in range(names))
+    assert {versions[-1] for versions in held.values()} == {2}
     # a value that is not a string names no version to supersede
     for _ in range(2):
-        await backend.append_record("s", {"name": 7}, prune_latest_by="name")
-    assert len(_record_files(backend, "s")) == names + 2
+        await backend.append_record(
+            "s", {"name": 7, "v": 0}, prune_latest_by="name"
+        )
+    assert (await _versions(backend, "s"))[7] == [0, 0]
+
+
+async def test_a_listing_from_before_one_republish_still_holds_a_version(
+    fs_backend, monkeypatch
+):
+    # A directory listing that overlaps a publish can lack the new record.
+    # The record that it holds for the name outlasts that publish and the
+    # prune pass that the publish carries.
+    backend = fs_backend
+    stream_dir = backend._stream_dir("s")
+    sizes = _prune_pass_sizes(monkeypatch, backend)
+    for version in range(2 * state._PRUNE_EVERY_APPENDS + 2):
+        listed = set(_record_files(backend, "s")) if version else set()
+        await backend.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+        assert not version or listed & set(os.listdir(stream_dir))
+    assert len(sizes) == 3
+    assert (await _versions(backend, "s"))["a"] == [version - 1, version]
+
+
+async def test_a_reader_that_lists_before_one_republish_reads_its_record(
+    fs_backend_factory, monkeypatch
+):
+    # A previous release's lookup lists the stream once and skips a record
+    # that is gone at its read.  The peer republishes between the listing
+    # and the read, and the lookup returns the version that it listed.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+
+    def publish(version):
+        theirs._append_sync("s", {"name": "a", "v": version}, None, "name")
+
+    publish(1)
+    publish(2)
+    real = ours._read_record
+    raced = []
+
+    def racing(stream_dir, name, **kwargs):
+        if not raced:
+            raced.append(name)
+            publish(3)
+        return real(stream_dir, name, **kwargs)
+
+    monkeypatch.setattr(ours, "_read_record", racing)
+    got = await state.StateBackend.newest_record_with(ours, "s", "name", "a")
+    assert got == {"name": "a", "v": 2}
+    assert len(raced) == 1
+
+
+async def test_name_keyed_prune_pass_keeps_what_its_append_superseded(
+    fs_backend, monkeypatch
+):
+    # The pass that an append carries keeps the newest record of each name
+    # and, for the name just appended, the record that the append
+    # superseded.  A pass that no append carries keeps the newest only.
+    backend = fs_backend
+    sizes = _prune_pass_sizes(monkeypatch, backend)
+
+    async def put(name, version):
+        await backend.append_record(
+            "s", {"name": name, "v": version}, prune_latest_by="name"
+        )
+
+    for version in range(4):
+        await put("a", version)
+        await put("b", version)
+    assert len(sizes) == 1
+    assert await _versions(backend, "s") == {"a": [2, 3], "b": [2, 3]}
+    await put("a", 4)
+    assert len(sizes) == 2
+    assert await _versions(backend, "s") == {"a": [3, 4], "b": [3]}
+    # the facts follow the pass: the next publishes remove what they know
+    facts = backend._field_index[state._fs_safe("s"), "name"]
+    assert len(facts.values) == 3 and list(facts.prior) == ["a"]
+    await put("b", 4)
+    await put("b", 5)
+    assert await _versions(backend, "s") == {"a": [3, 4], "b": [4, 5]}
+    assert backend._prune_latest_by_sync("s", "name") == 2
+    assert await _versions(backend, "s") == {"a": [4], "b": [5]}
+
+
+async def test_name_keyed_prune_pass_keeps_one_record_its_append_superseded(
+    fs_backend_factory,
+):
+    # The stream holds three versions of a name that the backend has no
+    # facts about, as it does after another node's publishes.  The pass
+    # that the backend's first publish carries keeps the new version and
+    # the one before it.
+    theirs = await fs_backend_factory()
+    for version in (1, 2, 3):
+        await theirs.append_record("s", {"name": "a", "v": version})
+    ours = await fs_backend_factory()
+    await ours.append_record(
+        "s", {"name": "a", "v": 4}, prune_latest_by="name"
+    )
+    assert (await _versions(ours, "s"))["a"] == [3, 4]
 
 
 async def test_name_keyed_append_supersedes_what_the_first_pass_kept(
@@ -2215,7 +2326,8 @@ async def test_name_keyed_append_supersedes_what_the_first_pass_kept(
 ):
     # A backend that starts on a stream another one filled, as a daemon
     # does after a restart: the pass its first append carries reads the
-    # stream, and every later append removes the version it replaces.
+    # stream, and every later append keeps the version it replaces and
+    # removes the one before that.
     names = 20
     before = await fs_backend_factory()
     for i in range(names):
@@ -2223,12 +2335,16 @@ async def test_name_keyed_append_supersedes_what_the_first_pass_kept(
             "s", {"name": "n%d" % i, "v": 0}, prune_latest_by="name"
         )
     after = await fs_backend_factory()
-    for i in range(names):
-        await after.append_record(
-            "s", {"name": "n%d" % i, "v": 1}, prune_latest_by="name"
-        )
-        assert len(_record_files(after, "s")) == names
-    assert {r["v"] for r in await after.list_records("s")} == {1}
+    for version in (1, 2):
+        for i in range(names):
+            await after.append_record(
+                "s", {"name": "n%d" % i, "v": version}, prune_latest_by="name"
+            )
+            held = await _versions(after, "s")
+            assert held["n%d" % i] == [version - 1, version]
+            assert len(_record_files(after, "s")) <= 2 * names
+    held = await _versions(after, "s")
+    assert {versions[-1] for versions in held.values()} == {2}
 
 
 async def test_name_keyed_append_leaves_a_record_it_has_not_seen(
@@ -2246,11 +2362,13 @@ async def test_name_keyed_append_leaves_a_record_it_has_not_seen(
         )
 
     await put(ours, 1)
-    await put(theirs, 2)  # its first append: the pass removes version 1
-    await put(ours, 3)
-    recs = await ours.list_records("s")
-    assert sorted(r["v"] for r in recs) == [2, 3]
-    assert ours._prune_latest_by_sync("s", "name") == 1
+    await put(ours, 2)
+    await put(theirs, 3)  # its first append: the pass removes version 1
+    await put(ours, 4)
+    await put(ours, 5)
+    # sorted: the two backends name their records from the wall clock
+    assert sorted((await _versions(ours, "s"))["a"]) == [3, 4, 5]
+    assert ours._prune_latest_by_sync("s", "name") == 2
     assert len(_record_files(ours, "s")) == 1
 
 
@@ -2258,8 +2376,8 @@ async def test_name_keyed_append_supersedes_a_record_that_a_lookup_read(
     fs_backend_factory,
 ):
     # Two backends on one directory.  A lookup reads the version that the
-    # peer published, so the next publish here removes it without waiting
-    # for a pass.
+    # peer published, so the next publish here removes the version before
+    # it without waiting for a pass.
     ours = await fs_backend_factory()
     theirs = await fs_backend_factory()
 
@@ -2269,11 +2387,322 @@ async def test_name_keyed_append_supersedes_a_record_that_a_lookup_read(
         )
 
     await put(ours, 1)
-    await put(theirs, 2)  # its first append: the pass removes version 1
+    await put(theirs, 2)  # its first append: the pass keeps both versions
     got = await ours.newest_record_with("s", "name", "a")
     assert got == {"name": "a", "v": 2}
     await put(ours, 3)
-    assert [r["v"] for r in await ours.list_records("s")] == [3]
+    assert (await _versions(ours, "s"))["a"] == [2, 3]
+
+
+async def test_lookup_between_write_and_unlink_strands_no_record(
+    fs_backend, monkeypatch
+):
+    # A lookup on another worker thread reads the new record before the
+    # append has learned it.  The append still removes the record two
+    # versions behind its own.
+    backend = fs_backend
+    real = backend._unlink_superseded
+    looked_up = []
+
+    def looked_up_first(*args):
+        got = backend._newest_record_with_sync("s", "name", "a", False)
+        looked_up.append(got["v"])
+        real(*args)
+
+    async def put(version):
+        await backend.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+
+    await put(1)
+    await put(2)
+    monkeypatch.setattr(backend, "_unlink_superseded", looked_up_first)
+    await put(3)
+    await put(4)
+    assert looked_up == [3, 4]
+    assert (await _versions(backend, "s"))["a"] == [3, 4]
+
+
+async def test_name_keyed_append_keeps_a_record_that_became_the_previous_one(
+    fs_backend_factory, monkeypatch
+):
+    # The append reads the record two versions behind its own before its
+    # write.  During the write the newest known record leaves the stream
+    # and a lookup sweeps its fact.  The record that was read is then the
+    # previous version, so the append keeps it.
+    monkeypatch.setattr(state, "_FIELD_INDEX_STALE_SLACK", 0)
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    stream_dir = ours._stream_dir("s")
+
+    async def put(version):
+        await ours.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+
+    await put(1)
+    await put(2)
+    v2 = max(_record_files(ours, "s"))
+    await theirs.append_record("s", {"name": "c", "v": 0})
+    real = ours._atomic_write
+    raced = []
+
+    def racing(dest, payload, **kwargs):
+        if not raced:
+            raced.append(dest)
+            os.unlink(os.path.join(stream_dir, v2))
+            got = ours._newest_record_with_sync("s", "name", "c", False)
+            assert got == {"name": "c", "v": 0}
+        real(dest, payload, **kwargs)
+
+    monkeypatch.setattr(ours, "_atomic_write", racing)
+    await put(3)
+    assert len(raced) == 1
+    assert (await _versions(ours, "s"))["a"] == [1, 3]
+
+
+async def test_name_keyed_append_keeps_its_previous_record_when_one_has_left(
+    fs_backend,
+):
+    # The backend remembers two records of the name, and the newer one
+    # has left the stream with no successor, as a quarantined record
+    # does.  The next publish confirms that record in the store before it
+    # unlinks the older one.  It finds the record gone, so it keeps the
+    # version that it supersedes and drops the fact.
+    backend = fs_backend
+
+    async def put(version):
+        await backend.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+
+    await put(1)
+    await put(2)
+    v2 = max(_record_files(backend, "s"))
+    os.unlink(os.path.join(backend._stream_dir("s"), v2))
+    await put(3)
+    assert (await _versions(backend, "s"))["a"] == [1, 3]
+    facts = backend._field_index[state._fs_safe("s"), "name"]
+    assert len(facts.values) == 1 and not facts.prior
+    assert backend._field_index_entries == 1
+    # the version that stayed has no fact, so it waits for the next pass
+    await put(4)
+    await put(5)
+    assert (await _versions(backend, "s"))["a"] == [1, 4, 5]
+    assert backend._prune_latest_by_sync("s", "name") == 2
+
+
+async def test_name_keyed_append_confirms_a_remembered_record_above_its_own(
+    fs_backend_factory, monkeypatch
+):
+    # A node whose clock runs ahead publishes the name, and this backend
+    # looks it up before its first append to the stream, so its own
+    # records sort below the one that it remembers.  That record has left
+    # the stream with no successor.  The second publish confirms it in
+    # the store, finds it gone, and keeps the version that it supersedes.
+    ours = await fs_backend_factory()
+    fast = await fs_backend_factory()
+    real_now = state._now
+    monkeypatch.setattr(state, "_now", lambda: real_now() + 60.0)
+    await fast.append_record(
+        "s", {"name": "a", "v": 1}, prune_latest_by="name"
+    )
+    monkeypatch.setattr(state, "_now", real_now)
+    assert await ours.newest_record_with("s", "name", "a") == {
+        "name": "a",
+        "v": 1,
+    }
+    (v1,) = _record_files(ours, "s")
+    os.unlink(os.path.join(ours._stream_dir("s"), v1))
+    for version in (2, 3):
+        await ours.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+    assert v1 > max(_record_files(ours, "s"))
+    assert (await _versions(ours, "s"))["a"] == [2, 3]
+    facts = ours._field_index[state._fs_safe("s"), "name"]
+    assert v1 not in facts.values
+    assert ours._field_index_entries == len(facts.values) == 1
+
+
+async def test_name_keyed_append_unlinks_nothing_once_its_facts_are_lost(
+    fs_backend, monkeypatch
+):
+    # The append reads the record two versions behind its own before its
+    # write.  During the write, publishes to other streams evict the
+    # stream's facts.  The append then remembers no second newer record
+    # to confirm in the store, so it unlinks nothing.
+    monkeypatch.setattr(state, "_FIELD_INDEX_MAX_ENTRIES", 2)
+    backend = fs_backend
+    key = (state._fs_safe("s"), "name")
+
+    async def put(version):
+        await backend.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+
+    await put(1)
+    await put(2)
+    real = backend._atomic_write
+    raced = []
+
+    def racing(dest, payload, **kwargs):
+        if not raced:
+            raced.append(dest)
+            for other in ("t", "u"):
+                backend._append_sync(other, {"name": "x"}, None, "name")
+            assert key not in backend._field_index
+        real(dest, payload, **kwargs)
+
+    monkeypatch.setattr(backend, "_atomic_write", racing)
+    await put(3)
+    assert len(raced) == 1
+    assert (await _versions(backend, "s"))["a"] == [1, 2, 3]
+    assert backend._prune_latest_by_sync("s", "name") == 2
+
+
+async def test_publish_sorts_above_a_peer_record_that_a_lookup_read(
+    fs_backend_factory, monkeypatch
+):
+    # Two nodes share a store, and the peer's clock runs a minute ahead.
+    # This node reads the peer's version, so its next publish of the name
+    # takes a record name above the peer's and is the version read back.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+
+    async def put(backend, version):
+        return await backend.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+
+    async def newest(backend):
+        return await backend.newest_record_with("s", "name", "a", strict=True)
+
+    await put(ours, 1)
+    real_now = state._now
+    with monkeypatch.context() as ahead:
+        ahead.setattr(state, "_now", lambda: real_now() + 60.0)
+        peer = await put(theirs, 2)
+    assert (await newest(ours))["v"] == 2
+    assert await put(ours, 3) > peer
+    assert (await newest(ours))["v"] == 3
+    assert (await newest(theirs))["v"] == 3
+    # the node's later publishes of other names leave the version in place
+    for i in range(2 * state._PRUNE_EVERY_APPENDS):
+        await ours.append_record(
+            "s", {"name": "other%d" % i, "v": 0}, prune_latest_by="name"
+        )
+    assert (await newest(theirs))["v"] == 3
+
+
+async def _publish_under_a_fast_peer(monkeypatch, ours, theirs, name="a"):
+    """Publish ``name`` on ``ours``, then on ``theirs`` with its clock a
+    minute ahead.  Return the id of the peer's record."""
+    await ours.append_record(
+        "s", {"name": name, "v": 1}, prune_latest_by="name"
+    )
+    real_now = state._now
+    with monkeypatch.context() as ahead:
+        ahead.setattr(state, "_now", lambda: real_now() + 60.0)
+        return await theirs.append_record(
+            "s", {"name": name, "v": 2}, prune_latest_by="name"
+        )
+
+
+async def _publish_over(ours, theirs, peer, name="a"):
+    """Publish ``name`` on ``ours`` and check that the record sorts above
+    ``peer`` and is the version that both nodes read back."""
+    mine = await ours.append_record(
+        "s", {"name": name, "v": 3}, prune_latest_by="name"
+    )
+    assert mine > peer
+    for backend in (ours, theirs):
+        got = await backend.newest_record_with("s", "name", name, strict=True)
+        assert got == {"name": name, "v": 3}
+        listed = await backend.newest_records_by("s", "name", strict=True)
+        assert [rec["v"] for rec in listed if rec["name"] == name] == [3]
+
+
+async def _publish_until_a_pass(monkeypatch, backend):
+    """Publish other names on ``backend`` until a publish carries a prune
+    pass.  Return the ids of those records."""
+    sizes = _prune_pass_sizes(monkeypatch, backend)
+    ids = []
+    while not sizes:
+        ids.append(
+            await backend.append_record(
+                "s",
+                {"name": "other%d" % len(ids), "v": 0},
+                prune_latest_by="name",
+            )
+        )
+    return ids
+
+
+@pytest.mark.parametrize("read", ["store", "cache", "capped"])
+async def test_publish_sorts_above_a_peer_record_that_a_listing_read(
+    fs_backend_factory, monkeypatch, read
+):
+    # Two nodes share a store, and the peer's clock runs a minute ahead.
+    # This node reads the peer's version in a listing alone (from the store
+    # or the record cache), so its next publish of the name takes a record
+    # name above the peer's and is the version read back.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    peer = await _publish_under_a_fast_peer(monkeypatch, ours, theirs)
+    if read == "cache":
+        # an unkeyed read leaves the peer's record in the record cache
+        assert len(await ours.list_records("s")) == 2
+        path = ours._stream_dir("s") + os.sep + peer + ".json"
+        assert path in ours._record_cache
+    listed = await ours.newest_records_by(
+        "s",
+        "name",
+        strict=read == "store",
+        max_values=1 if read == "capped" else None,
+    )
+    assert listed == [{"name": "a", "v": 2}]
+    await _publish_over(ours, theirs, peer)
+
+
+async def test_publish_sorts_above_a_peer_record_that_a_cleanup_kept(
+    fs_backend_factory, monkeypatch
+):
+    # Two nodes share a store, and the peer's clock runs a minute ahead.
+    # This node meets the peer's version only in the cleanup pass that its
+    # publish of another name carries, and its next publish of the name
+    # takes a record name above it.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    peer = await _publish_under_a_fast_peer(monkeypatch, ours, theirs)
+    others = await _publish_until_a_pass(monkeypatch, ours)
+    # the clock alone names this node's records below the peer's
+    assert max(others) < peer
+    await _publish_over(ours, theirs, peer)
+
+
+@pytest.mark.parametrize("read", ["lookup", "listing", "cleanup"])
+async def test_publish_sorts_above_a_peer_record_with_a_long_name(
+    fs_backend_factory, monkeypatch, read
+):
+    # The peer's version carries a name over the field index's length
+    # limit, so this node keeps no fact about the record.  Each way of
+    # reading it raises the stream's name floor.
+    limit = state._FIELD_INDEX_MAX_VALUE_CHARS
+    name = "n" * (limit + 1)
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    peer = await _publish_under_a_fast_peer(monkeypatch, ours, theirs, name)
+    if read == "lookup":
+        got = await ours.newest_record_with("s", "name", name)
+        assert got == {"name": name, "v": 2}
+    elif read == "listing":
+        listed = await ours.newest_records_by("s", "name")
+        assert listed == [{"name": name, "v": 2}]
+    else:
+        await _publish_until_a_pass(monkeypatch, ours)
+    await _publish_over(ours, theirs, peer, name)
+    assert max(map(len, _field_index_strings(ours)), default=0) <= limit
 
 
 async def test_name_keyed_append_teaches_the_lookup_its_record(
@@ -2295,26 +2724,44 @@ async def test_name_keyed_append_teaches_the_lookup_its_record(
     assert len(reads) == 1
 
 
-def test_field_facts_track_the_newest_record_of_each_value():
+def test_field_facts_track_the_two_newest_records_of_each_value():
     facts = state._FieldFacts()
     assert facts.learn("0002.json", "a") is None
-    # a record older than the one known is not the newest of its value
+    # a record older than the one known is the one that it supersedes
     assert facts.learn("0001.json", "a") is None
     assert facts.newest == {"a": "0002.json"}
-    assert facts.learn("0003.json", "a") == "0002.json"
+    assert facts.prior == {"a": "0001.json"}
+    # a third record pushes out the oldest of the three
+    assert facts.learn("0003.json", "a") == "0001.json"
+    assert facts.prior == {"a": "0002.json"}
     assert facts.learn("0004.json", "b") is None
     # a fact that is known already changes nothing
     assert facts.learn("0003.json", "a") is None
+    assert facts.learn("0002.json", "a") is None
+    # and neither does a record older than the two newest
+    assert facts.learn("0000.json", "a") is None
     assert facts.newest == {"a": "0003.json", "b": "0004.json"}
+    assert facts.prior == {"a": "0002.json"}
+    # a record between the two newest pushes out the older one
+    assert facts.learn("0002x.json", "a") == "0002.json"
+    assert facts.prior == {"a": "0002x.json"}
     # the oldest records go first, whatever order they were learned in
-    assert facts.shed(2) == 2
-    assert list(facts.values) == ["0003.json", "0004.json"]
-    # a value whose newest record is forgotten has no newest record
+    assert facts.shed(3) == 3
+    assert list(facts.values) == ["0002x.json", "0003.json", "0004.json"]
+    assert facts.prior == {"a": "0002x.json"}
+    # a value whose newest record is forgotten falls back to the one that
+    # it superseded, and then has no newest record
     facts.forget("0003.json")
+    assert facts.newest == {"a": "0002x.json", "b": "0004.json"}
+    assert not facts.prior
+    facts.forget("0002x.json")
     assert facts.newest == {"b": "0004.json"}
+    assert facts.learn("0005.json", "b") is None
+    facts.forget("0004.json")
+    assert facts.newest == {"b": "0005.json"} and not facts.prior
     assert facts.shed(0) == 0
     assert facts.shed(5) == 1
-    assert not facts.values and not facts.newest
+    assert not facts.values and not facts.newest and not facts.prior
 
 
 def _field_facts(backend):
@@ -2323,6 +2770,16 @@ def _field_facts(backend):
         token: len(facts.values)
         for (token, _field), facts in backend._field_index.items()
     }
+
+
+def _field_index_strings(backend):
+    """Every string that the field index holds as a field value, one for
+    each object."""
+    held = {}
+    for facts in backend._field_index.values():
+        for text in (*facts.values.values(), *facts.newest, *facts.prior):
+            held[id(text)] = text
+    return list(held.values())
 
 
 async def test_name_keyed_append_facts_stay_within_the_budget(
@@ -2345,9 +2802,13 @@ async def test_name_keyed_append_facts_stay_within_the_budget(
     # a version whose fact the index has lost stays for the next pass
     await put("s", "n0", 1)
     assert len(_record_files(backend, "s")) == 6
-    # and a version whose fact it still holds is removed
+    # a version whose fact it still holds stays while it is the previous
+    # one, and is removed by the publish after
     await put("s", "n4", 1)
-    assert len(_record_files(backend, "s")) == 6
+    assert len(_record_files(backend, "s")) == 7
+    await put("s", "n4", 2)
+    assert len(_record_files(backend, "s")) == 7
+    assert (await _versions(backend, "s"))["n4"] == [1, 2]
     assert _field_facts(backend) == {"s": 4}
     # another stream takes its room from the one used least recently,
     # whose newest record outlasts the others
@@ -2355,7 +2816,7 @@ async def test_name_keyed_append_facts_stay_within_the_budget(
         await put("t", "m%d" % i, 0)
     assert _field_facts(backend) == {"s": 1, "t": 3}
     held = backend._field_index[state._fs_safe("s"), "name"]
-    assert list(held.newest) == ["n4"]
+    assert list(held.newest) == ["n4"] and not held.prior
     # the stream in use keeps its share of the budget beside another one
     await put("t", "m3", 0)
     assert _field_facts(backend) == {"s": 1, "t": 3}
@@ -2370,8 +2831,9 @@ async def test_name_keyed_append_facts_follow_the_streams_in_use(
     fs_backend, monkeypatch
 ):
     # A stream that is published to again keeps its facts while a stream
-    # that nobody appends to gives its own up.
-    monkeypatch.setattr(state, "_FIELD_INDEX_MAX_ENTRIES", 4)
+    # that nobody appends to gives its own up.  The budget of six holds
+    # the two newest records of the busy stream's two names.
+    monkeypatch.setattr(state, "_FIELD_INDEX_MAX_ENTRIES", 6)
     backend = fs_backend
 
     async def put(stream, name, version):
@@ -2386,10 +2848,223 @@ async def test_name_keyed_append_facts_follow_the_streams_in_use(
         await put("fresh%d" % version, "x", 0)
         for name in ("a", "b"):
             await put("busy", name, version)
-            assert len(_record_files(backend, "busy")) == 2
+            held = await _versions(backend, "busy")
+            assert held[name] == [version - 1, version]
     held = _field_facts(backend)
     assert "idle" not in held
-    assert held["busy"] == 2
+    assert held["busy"] == 4
+
+
+def test_field_facts_learn_no_value_over_the_length_limit():
+    limit = state._FIELD_INDEX_MAX_VALUE_CHARS
+    facts = state._FieldFacts()
+    assert facts.learn("0001.json", "a" * limit) is None
+    for name in ("0002.json", "0003.json", "0004.json"):
+        assert facts.learn(name, "b" * (limit + 1)) is None
+    assert list(facts.values) == ["0001.json"] and facts.added == 1
+    assert facts.newest == {"a" * limit: "0001.json"} and not facts.prior
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_name_over_the_length_limit_is_read_with_no_fact(
+    fs_backend, monkeypatch, strict
+):
+    # The field index learns no name over its length limit.  A lookup
+    # reads a record that carries one every time it reaches it, and a
+    # lookup of the name and a listing answer with its newest record.
+    backend = fs_backend
+    limit = state._FIELD_INDEX_MAX_VALUE_CHARS
+    long_a, long_b = "a" * (limit + 1), "\U0001f600" * (limit + 1)
+
+    async def put(name, version):
+        await backend.append_record(
+            "s", {"name": name, "v": version}, prune_latest_by="name"
+        )
+
+    await put(long_a, 1)
+    await put("short", 1)
+    await put(long_b, 1)
+    await put(long_a, 2)
+    reads = _count_record_reads(monkeypatch, backend)
+
+    async def lookup(name):
+        del reads[:]
+        return await backend.newest_record_with(
+            "s", "name", name, strict=strict
+        )
+
+    for _ in range(2):  # the first round taught the index nothing
+        assert await lookup(long_a) == {"name": long_a, "v": 2}
+        assert len(reads) == 1
+        assert await lookup(long_b) == {"name": long_b, "v": 1}
+        assert len(reads) == 2
+        # the two records above the match hold names with no fact
+        assert await lookup("short") == {"name": "short", "v": 1}
+        assert len(reads) == 3
+        assert await lookup("missing") is None
+        assert len(reads) == 3
+        listed = await backend.newest_records_by("s", "name", strict=strict)
+        assert listed == [
+            {"name": long_a, "v": 2},
+            {"name": long_b, "v": 1},
+            {"name": "short", "v": 1},
+        ]
+    assert set(_field_index_strings(backend)) == {"short"}
+    assert backend._field_index_entries == 1
+
+
+async def test_name_over_the_length_limit_waits_for_the_prune_pass(
+    fs_backend, monkeypatch
+):
+    # A publish finds the record two versions behind its own in the field
+    # index, which learns no name over its length limit.  The superseded
+    # versions of such a name stay until the pass that a later publish
+    # carries, and that pass keeps the two newest.
+    backend = fs_backend
+    name = "n" * (state._FIELD_INDEX_MAX_VALUE_CHARS + 1)
+    cadence = state._PRUNE_EVERY_APPENDS
+    sizes = _prune_pass_sizes(monkeypatch, backend)
+    for version in range(2 * cadence + 1):
+        await backend.append_record(
+            "s", {"name": name, "v": version}, prune_latest_by="name"
+        )
+    # the first pass kept one record and the second kept two, and each
+    # later pass met those and the publishes since
+    assert sizes == [1, cadence + 1, cadence + 2]
+    assert await _versions(backend, "s") == {name: [version - 1, version]}
+    got = await backend.newest_record_with("s", "name", name, strict=True)
+    assert got == {"name": name, "v": version}
+    # a pass that no publish carries keeps the newest version alone
+    assert backend._prune_latest_by_sync("s", "name") == 1
+    assert await _versions(backend, "s") == {name: [version]}
+    assert not backend._field_index and backend._field_index_entries == 0
+
+
+async def test_name_keyed_prune_spaces_its_next_pass_by_the_records_left(
+    fs_backend_factory, monkeypatch
+):
+    # Two backends on one directory.  The peer's pass removes the
+    # superseded records while ours reads its first one, so ours finds
+    # them gone.  Only a pass removes the old versions of a name over the
+    # length limit, and the next one comes after as many publishes as
+    # records were left.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    name = "n" * (state._FIELD_INDEX_MAX_VALUE_CHARS + 1)
+    cadence = state._PRUNE_EVERY_APPENDS
+    piled = 3 * cadence
+    for version in range(piled):
+        await theirs.append_record("s", {"name": name, "v": version})
+    sizes = _prune_pass_sizes(monkeypatch, ours)
+    real = ours._read_record
+    raced = []
+
+    def racing(stream_dir, record, **kwargs):
+        if not raced:
+            raced.append(theirs._prune_latest_by_sync("s", "name"))
+        return real(stream_dir, record, **kwargs)
+
+    monkeypatch.setattr(ours, "_read_record", racing)
+
+    async def put(version):
+        await ours.append_record(
+            "s", {"name": name, "v": version}, prune_latest_by="name"
+        )
+
+    await put(piled)
+    assert raced == [piled]
+    assert len(_record_files(ours, "s")) == 1
+    for version in range(piled + 1, piled + 1 + cadence):
+        await put(version)
+        assert len(_record_files(ours, "s")) <= cadence
+    assert sizes == [piled + 1, cadence + 1]
+    assert await _versions(ours, "s") == {name: [version - 1, version]}
+
+
+async def test_name_keyed_prune_spacing_counts_the_records_it_cannot_judge(
+    fs_backend, monkeypatch
+):
+    # A record of another schema version and one whose name is not a
+    # string stay in the stream, and every pass reads them again.  They
+    # count toward the spacing like the records that the pass kept.
+    backend = fs_backend
+    cadence = state._PRUNE_EVERY_APPENDS
+    stream_dir = backend._stream_dir("s")
+    os.makedirs(stream_dir, exist_ok=True)
+    for i in range(cadence):
+        with open(os.path.join(stream_dir, "00000-%d.json" % i), "w") as fobj:
+            json.dump({"schemaVersion": "v99", "data": {"name": "a"}}, fobj)
+        await backend.append_record("s", {"name": i})
+    sizes = _prune_pass_sizes(monkeypatch, backend)
+
+    async def put(version):
+        await backend.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+
+    # the first pass leaves the 2 * cadence records above and the publish
+    await put(0)
+    for version in range(1, 2 * cadence + 1):
+        await put(version)
+    assert sizes == [2 * cadence + 1]
+    await put(version + 1)
+    assert sizes == [2 * cadence + 1, 2 * cadence + 2]
+
+
+async def test_field_index_holds_no_bytes_of_a_long_name(fs_backend):
+    # A job chooses its artifact names, and each fact holds a name.  The
+    # index learns no name over its length limit from a publish, a
+    # lookup, a listing or a prune pass, so the bytes that it retains do
+    # not grow with the length of the names in the stream.
+    backend = fs_backend
+    limit = state._FIELD_INDEX_MAX_VALUE_CHARS
+    # one character outside the BMP: CPython then stores four bytes for
+    # each character of the name
+    longs = ["\U0001f600%d " % i + "x" * 8000 for i in range(12)]
+    shorts = ["s%d" % i for i in range(3)] + ["y" * limit]
+    for version in (1, 2, 3):
+        for name in longs + shorts:
+            await backend.append_record(
+                "s", {"name": name, "v": version}, prune_latest_by="name"
+            )
+    for strict in (False, True):
+        for name in (longs[0], shorts[0], "missing"):
+            await backend.newest_record_with("s", "name", name, strict=strict)
+        listed = await backend.newest_records_by("s", "name", strict=strict)
+        assert {rec["name"] for rec in listed} == set(longs + shorts)
+    backend._prune_latest_by_sync("s", "name")
+    held = _field_index_strings(backend)
+    assert set(held) == set(shorts)
+    assert sum(map(sys.getsizeof, held)) < sys.getsizeof(longs[0])
+
+
+async def test_lookup_scan_keeps_no_name_over_the_length_limit(
+    fs_backend, monkeypatch
+):
+    # A lookup of a name that the stream lacks reads every record with no
+    # fact.  It keeps the names that the index learns and none over the
+    # limit, so its memory does not grow with the long names that it reads.
+    backend = fs_backend
+    limit = state._FIELD_INDEX_MAX_VALUE_CHARS
+    kept = "s" * limit  # the longest name that the index learns
+    for name in ("a" * (limit + 1), kept, "b" * (limit + 1)):
+        await backend.append_record("s", {"name": name})
+    handed = []
+    real = backend._field_index_learn
+
+    def learning(key, learned, *args):
+        handed.append(dict(learned))
+        real(key, learned, *args)
+
+    monkeypatch.setattr(backend, "_field_index_learn", learning)
+    for strict in (False, True):
+        got = await backend.newest_record_with(
+            "s", "name", "missing", strict=strict
+        )
+        assert got is None
+    # the second lookup read the two long names again and learned nothing
+    (learned,) = handed
+    assert list(learned.values()) == [kept]
 
 
 async def test_superseded_record_unlink_rides_out_a_sharing_violation(
@@ -2405,6 +3080,7 @@ async def test_superseded_record_unlink_rides_out_a_sharing_violation(
         )
 
     await put(1)
+    await put(2)
     monkeypatch.setattr(state, "IS_WINDOWS", True)
     monkeypatch.setattr(state.time, "sleep", lambda _seconds: None)
     real_unlink = os.unlink
@@ -2417,10 +3093,10 @@ async def test_superseded_record_unlink_rides_out_a_sharing_violation(
         real_unlink(path)
 
     monkeypatch.setattr(state.os, "unlink", held_once)
-    await put(2)
+    await put(3)
     monkeypatch.undo()
     assert len(failures) == 1
-    assert [r["v"] for r in await backend.list_records("s")] == [2]
+    assert [r["v"] for r in await backend.list_records("s")] == [2, 3]
 
 
 # --- newest record by field (the artifact store's lookup) ------------------
@@ -2450,6 +3126,54 @@ def _hold_records(monkeypatch, paths):
         return real_open(path, *args, **kwargs)
 
     monkeypatch.setattr(state, "open", _flaky_open, raising=False)
+
+
+def _tear_listing(monkeypatch, backend, stream, during, listed):
+    """Make the next listing of ``stream`` overlap ``during()``.
+
+    A directory read is not a snapshot.  It returns each entry that
+    exists throughout, and an entry that is created or removed meanwhile
+    may be missing.  The torn listing lacks the entries created meanwhile
+    and holds the ``listed`` oldest of the entries removed.  Return the
+    list that collects what each listing of the stream returned.
+    """
+    stream_dir = os.path.normpath(backend._stream_dir(stream))
+    real = os.listdir
+    listings = []
+    busy = []
+
+    def tearing(path="."):
+        if busy or os.path.normpath(str(path)) != stream_dir:
+            return real(path)
+        if listings:
+            listings.append(real(path))
+            return listings[-1]
+        before = sorted(real(path))
+        busy.append(path)
+        during()
+        del busy[:]
+        after = set(real(path))
+        stayed = [n for n in before if n in after]
+        left = [n for n in before if n not in after]
+        listings.append(stayed + left[:listed])
+        return listings[0]
+
+    monkeypatch.setattr(state.os, "listdir", tearing)
+    return listings
+
+
+def _count_confirmed(monkeypatch, backend):
+    """Record the name of every record that ``backend`` looks for in the
+    store without reading it."""
+    confirmed = []
+    real = backend._record_superseded
+
+    def _counted(stream_dir, name):
+        confirmed.append(name)
+        return real(stream_dir, name)
+
+    monkeypatch.setattr(backend, "_record_superseded", _counted)
+    return confirmed
 
 
 @pytest.mark.parametrize("strict", [False, True])
@@ -2709,9 +3433,9 @@ async def test_newest_record_with_follows_a_republish_during_the_lookup(
     fs_backend_factory, monkeypatch, strict
 ):
     # Two backends on one directory: two nodes sharing a mount.  The peer
-    # republishes between the lookup's listing and its read, which removes
-    # the record that the lookup listed.  The lookup lists the stream
-    # again and returns the version that replaced it.
+    # republishes twice between the lookup's listing and its read, which
+    # removes the record that the lookup listed.  The lookup lists the
+    # stream again and returns the version that replaced it.
     ours = await fs_backend_factory()
     theirs = await fs_backend_factory()
     versions = iter(range(1, 10))
@@ -2729,16 +3453,19 @@ async def test_newest_record_with_follows_a_republish_during_the_lookup(
         if not raced:
             raced.append(name)
             publish()
+            publish()
         return real(stream_dir, name, **kwargs)
 
     monkeypatch.setattr(ours, "_read_record", racing)
     got = await ours.newest_record_with("s", "name", "a", strict=strict)
-    assert got == {"name": "a", "v": 2}
+    assert got == {"name": "a", "v": 3}
     # The name-keyed listing meets the same race.  A best-effort read
-    # holds the body of the record it listed, the version current then.
+    # holds the bodies of the records it listed, the versions current
+    # then.
+    assert await ours.newest_records_by("s", "name") == [got]
     del raced[:]
     listed = await ours.newest_records_by("s", "name", strict=strict)
-    assert listed == [{"name": "a", "v": 3 if strict else 2}]
+    assert listed == [{"name": "a", "v": 5 if strict else 3}]
     assert len(raced) == 1
 
 
@@ -2770,6 +3497,221 @@ async def test_newest_record_with_rescans_past_an_older_record_of_the_name(
     got = await ours.newest_record_with("s", "name", "a", strict=strict)
     assert got == {"name": "a", "v": 3}
     assert raced == [v2]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("listed", [0, 1])
+async def test_lookup_answers_from_a_listing_torn_by_two_republishes(
+    fs_backend, monkeypatch, strict, listed
+):
+    # The name is published twice while the lookup reads the directory.
+    # The listing lacks both new records.  It holds the record of the
+    # name that the first publish removed, or no record of it.  The
+    # backend remembers the newest record of the name, finds it in the
+    # store, and answers with it.
+    backend = fs_backend
+
+    def put(version):
+        backend._append_sync("s", {"name": "a", "v": version}, None, "name")
+
+    for version in (1, 2):
+        put(version)
+        # the record cache then holds the version
+        got = await backend.newest_record_with("s", "name", "a")
+        assert got == {"name": "a", "v": version}
+    listings = _tear_listing(
+        monkeypatch, backend, "s", lambda: (put(3), put(4)), listed
+    )
+    got = await backend.newest_record_with("s", "name", "a", strict=strict)
+    assert got == {"name": "a", "v": 4}
+    assert len(listings[0]) == listed
+    # a strict lookup reads the record that it listed from the store,
+    # finds it gone, and lists the stream again
+    assert len(listings) == (2 if strict and listed else 1)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("listed", [0, 1])
+async def test_listing_torn_by_two_republishes_holds_the_remembered_record(
+    fs_backend, monkeypatch, strict, listed
+):
+    # The oldest name is published twice while the listing reads the
+    # directory.  The walk meets the version that the first publish
+    # removed, or no version of the name.  It takes the record that the
+    # backend remembers as the name's newest, and the names come back
+    # newest first.
+    backend = fs_backend
+
+    def put(name, version):
+        backend._append_sync("s", {"name": name, "v": version}, None, "name")
+
+    for version in (1, 2):
+        put("a", version)
+        # the record cache then holds the version
+        got = await backend.newest_records_by("s", "name")
+        assert got == [{"name": "a", "v": version}]
+    put("b", 1)
+    put("c", 1)
+    listings = _tear_listing(
+        monkeypatch, backend, "s", lambda: (put("a", 3), put("a", 4)), listed
+    )
+    got = await backend.newest_records_by("s", "name", strict=strict)
+    assert got == [
+        {"name": "a", "v": 4},
+        {"name": "c", "v": 1},
+        {"name": "b", "v": 1},
+    ]
+    assert len(listings[0]) == 2 + listed
+    assert len(listings) == (2 if strict and listed else 1)
+
+
+async def test_capped_listing_recalls_only_the_records_above_its_cut(
+    fs_backend, monkeypatch
+):
+    # ``max_values`` stops the walk at the newest name that the torn
+    # listing holds.  The name republished meanwhile is newer than the
+    # cut, so the walk takes its remembered record.  The walk leaves the
+    # remembered record below the cut alone.
+    backend = fs_backend
+
+    def put(name, version):
+        backend._append_sync("s", {"name": name, "v": version}, None, "name")
+
+    for name in ("a", "b", "c"):
+        put(name, 1)
+    put("a", 2)
+    confirmed = _count_confirmed(monkeypatch, backend)
+
+    def republish():
+        put("a", 3)
+        put("a", 4)
+        # each publish looked for the record that its unlink rests on
+        del confirmed[:]
+
+    listings = _tear_listing(monkeypatch, backend, "s", republish, 0)
+    got = await backend.newest_records_by("s", "name", max_values=1)
+    assert got == [{"name": "a", "v": 4}]
+    assert len(listings) == 1
+    assert confirmed == [max(_record_files(backend, "s"))]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_lookup_answers_nothing_from_a_stream_that_a_peer_wiped(
+    fs_backend_factory, strict
+):
+    # The backend remembers the two newest records of each name and holds
+    # their bodies in the record cache.  A peer wipes the stream.  The
+    # lookup and the listing look for each remembered record in the
+    # store, answer with none of them, and drop their facts.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    for version in (1, 2):
+        for name in ("a", "b"):
+            await ours.append_record(
+                "s", {"name": name, "v": version}, prune_latest_by="name"
+            )
+            got = await ours.newest_record_with("s", "name", name)
+            assert got == {"name": name, "v": version}
+    assert ours._field_index_entries == 4
+    await theirs.prune_records("s", keep=0)
+    got = await ours.newest_record_with("s", "name", "a", strict=strict)
+    assert got is None
+    assert ours._field_index_entries == 2
+    assert await ours.newest_records_by("s", "name", strict=strict) == []
+    assert ours._field_index_entries == 0
+    assert not ours._field_index
+
+
+async def test_lookup_forgets_a_remembered_record_that_left_the_stream(
+    fs_backend, monkeypatch
+):
+    # The newest record that the backend remembers for the name has left
+    # the stream with no successor, as a quarantined record does.  The
+    # lookup looks for it in the store, drops its fact, and lists the
+    # stream again.  The index then counts the one fact that it holds.
+    backend = fs_backend
+    for version in (1, 2):
+        await backend.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+    v1, v2 = sorted(_record_files(backend, "s"))
+    os.unlink(os.path.join(backend._stream_dir("s"), v2))
+    confirmed = _count_confirmed(monkeypatch, backend)
+    got = await backend.newest_record_with("s", "name", "a")
+    assert got == {"name": "a", "v": 1}
+    assert confirmed == [v2]
+    facts = backend._field_index[state._fs_safe("s"), "name"]
+    assert list(facts.values) == [v1]
+    assert facts.newest == {"a": v1} and not facts.prior
+    assert backend._field_index_entries == 1
+    # the next lookup has nothing to look for
+    assert await backend.newest_record_with("s", "name", "a") == got
+    assert confirmed == [v2]
+
+
+async def test_read_opens_an_unreadable_remembered_record_once(
+    fs_backend, monkeypatch, caplog
+):
+    # The newest record that the backend remembers for the name is in the
+    # listing and cannot be read.  A best-effort read opens it once and
+    # logs it once: it finds the record in the store and reads it no
+    # second time.
+    backend = fs_backend
+    for version in (1, 2):
+        await backend.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+    held = os.path.normpath(
+        os.path.join(
+            backend._stream_dir("s"), max(_record_files(backend, "s"))
+        )
+    )
+    opened = []
+    real_open = open
+
+    def _denied(filename, *args, **kwargs):
+        if os.path.normpath(str(filename)) == held:
+            opened.append(filename)
+            raise OSError(5, "input/output error", str(filename))
+        return real_open(filename, *args, **kwargs)
+
+    monkeypatch.setattr(state, "open", _denied, raising=False)
+    got = await backend.newest_record_with("s", "name", "a")
+    assert got == {"name": "a", "v": 1}
+    assert len(opened) == 1
+    assert await backend.newest_records_by("s", "name") == [got]
+    assert len(opened) == 2
+    assert caplog.text.count("cannot read record") == 2
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_lookup_recalls_a_record_that_its_own_sweep_forgets(
+    fs_backend_factory, monkeypatch, strict
+):
+    # The reader remembers the peer's newest record of the name.  The
+    # peer publishes the name twice while the reader lists the stream, so
+    # the listing holds no record of it.  The scan reads a record of
+    # another name, and the sweep that follows forgets the remembered
+    # record.  The lookup still looks for that record in the store, finds
+    # it gone, and lists the stream again.
+    monkeypatch.setattr(state, "_FIELD_INDEX_STALE_SLACK", 0)
+    reader = await fs_backend_factory()
+    peer = await fs_backend_factory()
+
+    def put(name, version):
+        peer._append_sync("s", {"name": name, "v": version}, None, "name")
+
+    for version in (1, 2):
+        put("a", version)
+        got = await reader.newest_record_with("s", "name", "a")
+        assert got == {"name": "a", "v": version}
+    put("b", 1)
+    listings = _tear_listing(
+        monkeypatch, reader, "s", lambda: (put("a", 3), put("a", 4)), 0
+    )
+    got = await reader.newest_record_with("s", "name", "a", strict=strict)
+    assert got == {"name": "a", "v": 4}
+    assert len(listings[0]) == 1 and len(listings) == 2
 
 
 async def test_newest_record_with_gives_up_on_a_stream_that_keeps_moving(
@@ -2912,6 +3854,136 @@ async def test_newest_record_with_counts_a_stale_handle_as_a_record_gone(
     assert reads.count(newer) == state._SUPERSEDED_RESCANS + 1
 
 
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("held_reads", [1, 4, 5])
+async def test_record_read_retries_windows_sharing_violations(
+    fs_backend, monkeypatch, caplog, strict, held_reads
+):
+    # On Windows an open that overlaps the rename that lands a record is a
+    # sharing violation.  The read retries, as a document read does, and
+    # a record that stays unreadable is reported with the same-user hint.
+    backend = fs_backend
+    await backend.append_record("s", {"name": "a"})
+    stream_dir = backend._stream_dir("s")
+    path = os.path.join(stream_dir, os.listdir(stream_dir)[0])
+    real_open = open
+    attempts = 0
+
+    def held_open(filename, *args, **kwargs):
+        nonlocal attempts
+        if filename == path:
+            attempts += 1
+            if attempts <= held_reads:
+                raise PermissionError(13, "sharing violation", filename)
+        return real_open(filename, *args, **kwargs)
+
+    monkeypatch.setattr(state, "IS_WINDOWS", True)
+    monkeypatch.setattr(state, "open", held_open, raising=False)
+    monkeypatch.setattr(state.time, "sleep", lambda _: None)
+    if held_reads == 5 and strict:
+        with pytest.raises(PermissionError):
+            await backend.newest_record_with("s", "name", "a", strict=True)
+    else:
+        got = await backend.newest_record_with(
+            "s", "name", "a", strict=strict
+        )
+        assert got == (None if held_reads == 5 else {"name": "a"})
+    assert attempts == min(held_reads + 1, 5)
+    assert ("run as the same user" in caplog.text) == (held_reads == 5)
+
+
+class _SteppedClock:
+    """``time`` for the ``state`` module: a monotonic clock that only a
+    sleep or the test moves."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+async def test_record_reads_wait_once_for_records_that_stay_denied(
+    fs_backend, monkeypatch
+):
+    # On Windows a record that the account cannot open fails like a
+    # sharing violation.  The first such record uses up its retries.  For
+    # the next second each record gets a single attempt, so a scan over
+    # many of them waits once.  After that second a read retries again.
+    backend = fs_backend
+    for i in range(3):
+        await backend.append_record("s", {"name": "n%d" % i})
+    stream_dir = os.path.normpath(backend._stream_dir("s"))
+    real_open = open
+    attempts = []
+
+    def denied(filename, *args, **kwargs):
+        if os.path.dirname(os.path.normpath(str(filename))) == stream_dir:
+            attempts.append(filename)
+            raise PermissionError(13, "access denied", filename)
+        return real_open(filename, *args, **kwargs)
+
+    clock = _SteppedClock()
+    monkeypatch.setattr(state, "IS_WINDOWS", True)
+    monkeypatch.setattr(state, "open", denied, raising=False)
+    monkeypatch.setattr(state, "time", clock)
+    assert await backend.newest_records_by("s", "name") == []
+    assert len(attempts) == 5 + 1 + 1
+    assert clock.sleeps == pytest.approx([0.02, 0.04, 0.06, 0.08])
+    # a lookup inside that second waits for nothing, strict or best-effort
+    assert await backend.newest_record_with("s", "name", "n0") is None
+    with pytest.raises(PermissionError):
+        await backend.newest_record_with("s", "name", "n0", strict=True)
+    assert len(attempts) == 7 + 3 + 1
+    assert len(clock.sleeps) == 4
+    clock.now += state._RECORD_DENIED_HOLD
+    assert await backend.newest_records_by("s", "name") == []
+    assert len(attempts) == 11 + 5 + 1 + 1
+    assert len(clock.sleeps) == 8
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_lookup_follows_a_record_held_mid_unlink_on_windows(
+    fs_backend_factory, monkeypatch, strict
+):
+    # On Windows an open that overlaps the unlink of a record is a sharing
+    # violation while the record is still listed.  The retry finds it
+    # gone, so the lookup lists the stream again and returns the version
+    # that replaced it.
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    await theirs.append_record("s", {"name": "a", "v": 1})
+    stream_dir = ours._stream_dir("s")
+    path = os.path.join(stream_dir, os.listdir(stream_dir)[0])
+    real_open = open
+    opens = []
+
+    def held_open(filename, *args, **kwargs):
+        if filename == path:
+            opens.append(filename)
+            if len(opens) == 1:
+                theirs._append_sync("s", {"name": "a", "v": 2}, None, None)
+                raise PermissionError(13, "sharing violation", filename)
+            if len(opens) == 2:
+                os.unlink(path)
+        return real_open(filename, *args, **kwargs)
+
+    monkeypatch.setattr(state, "IS_WINDOWS", True)
+    monkeypatch.setattr(state, "open", held_open, raising=False)
+    monkeypatch.setattr(state.time, "sleep", lambda _: None)
+    got = await ours.newest_record_with("s", "name", "a", strict=strict)
+    assert got == {"name": "a", "v": 2}
+    assert len(opens) == 2
+
+
 async def test_strict_lookup_follows_a_stale_handle_to_the_republish(
     fs_backend_factory, monkeypatch
 ):
@@ -2965,8 +4037,8 @@ async def test_field_index_sweep_keeps_a_record_appended_during_the_scan(
 ):
     # A lookup sweeps the facts about records that have left against the
     # listing from its start.  A record that this backend appends during
-    # the scan is missing from that listing.  Its fact stays, so the next
-    # publish of the name removes the record.
+    # the scan is missing from that listing.  Its fact stays, so the
+    # second publish of the name after it removes the record.
     monkeypatch.setattr(state, "_FIELD_INDEX_STALE_SLACK", 0)
     ours = await fs_backend_factory()
     theirs = await fs_backend_factory()
@@ -3001,10 +4073,56 @@ async def test_field_index_sweep_keeps_a_record_appended_during_the_scan(
     assert a1 not in facts.values
     x2 = facts.newest["x"]
     assert x2 != x1 and x2 in records()
+    assert facts.prior["x"] == x1
     await publish({"name": "x", "v": 3})
-    assert x1 not in records() and x2 not in records()
+    assert x1 not in records() and x2 in records()
+    await publish({"name": "x", "v": 4})
+    assert x2 not in records()
     got = await ours.newest_record_with("s", "name", "x")
-    assert got == {"name": "x", "v": 3}
+    assert got == {"name": "x", "v": 4}
+
+
+async def test_field_index_sweep_skips_facts_that_started_over(
+    fs_backend_factory, monkeypatch
+):
+    # Publishes to other streams evict a stream's facts during a lookup
+    # of it, and publishes to the stream then start its facts over.  The
+    # lookup's mark describes the facts that were evicted, so its sweep
+    # stands down and the new facts stay.
+    monkeypatch.setattr(state, "_FIELD_INDEX_MAX_ENTRIES", 4)
+    ours = await fs_backend_factory()
+    theirs = await fs_backend_factory()
+    key = (state._fs_safe("s"), "name")
+    for version in range(5):
+        await ours.append_record(
+            "s", {"name": "a", "v": version}, prune_latest_by="name"
+        )
+    before = ours._field_index[key]
+    # a peer publishes a name that this backend holds no fact about
+    await theirs.append_record("s", {"name": "c"})
+    real = ours._read_record
+    raced = []
+
+    def racing(stream_dir, name, **kwargs):
+        if not raced:
+            raced.append(name)
+            for i in range(3):
+                ours._append_sync("t", {"name": "t%d" % i}, None, "name")
+            ours._append_sync("u", {"name": "u0"}, None, "name")
+            assert key not in ours._field_index
+            for fresh in ("x", "y", "z"):
+                ours._append_sync("s", {"name": fresh}, None, "name")
+        return real(stream_dir, name, **kwargs)
+
+    monkeypatch.setattr(ours, "_read_record", racing)
+    assert await ours.newest_record_with("s", "name", "c") == {"name": "c"}
+    assert len(raced) == 1
+    facts = ours._field_index[key]
+    assert facts is not before
+    assert sorted(facts.values.values()) == ["x", "y", "z"]
+    assert ours._field_index_entries == sum(
+        len(held.values) for held in ours._field_index.values()
+    )
 
 
 @pytest.mark.parametrize("strict", [False, True])

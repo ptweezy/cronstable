@@ -41,7 +41,12 @@
 - Every subcommand ends with one line on stderr and status 1 when the reader
   of its output closes the pipe, as `head` does after its last line.
 - In the terminal dashboard, `Esc` closes the panel or drawer that is on
-  top.
+  top. Some terminals send `Alt` with a navigation key as an `Esc` ahead of
+  the key's own sequence, such as `ESC ESC [ A` for `Alt` with the up
+  arrow. On every platform except Windows, the dashboard reads that as the
+  plain key (an arrow, `Home`, `End`, `PgUp`, `PgDn`, `Insert`, `Delete`,
+  or `Shift-Tab`): the key acts as it does without `Alt`, and the panel or
+  drawer stays open.
 - The Bonjour advert skips a listener bound to `[::]`. That socket accepts
   IPv6 connections only, and the advert's address record is IPv4.
 - Configuration checks read a loopback or wildcard address in every form that
@@ -69,27 +74,133 @@
   place without sliding. The demo dashboard includes all of these changes.
 - A pooled run that finishes while the pool scheduler renews its lease keeps
   its result. The scheduler logs `pool lease lost` and cancels a process only
-  for a run that is still going.
-- A run whose process has exited, or whose command could not start, keeps
-  its outcome until the daemon records it. A `concurrencyPolicy: Replace`
+  for a run that has not ended. A run whose command could not start has
+  ended, so a lost lease logs nothing for it and sends no cancel.
+- A run that has ended keeps its outcome until the daemon records it. A run
+  has ended when the daemon has collected its exit status and captured
+  output and has finished any verification, when the daemon has finished
+  canceling it, or when its command could not start. A cancel that arrives
+  during verification cancels the check, and the run has ended once the
+  daemon has canceled the check, including while a process that the check
+  started holds the check's output open. A `concurrencyPolicy: Replace`
   launch, on this node or on a peer, leaves that run as it is, and a
-  `concurrencyPolicy: Forbid` launch starts its job.
-  `POST /jobs/{name}/cancel` and the MCP `cron_cancel_job` tool signal and
-  count only the runs that are still going. When none is, the request
-  returns `409` and the tool reports an error.
+  `concurrencyPolicy: Forbid` launch starts its job. A canceled run has
+  ended even when a process that left its process group or process tree is
+  still alive, so a `Forbid` job's next fire can start beside that process.
+  `POST /jobs/{name}/cancel` and the MCP `cron_cancel_job` tool ask the runs
+  that have not ended to stop, and `instances` counts those runs. When every
+  run has ended, the request returns `409` and the tool reports an error.
+- When the daemon cancels a run, it waits up to `killTimeout` for the job's
+  own process and stops waiting when that process exits, including while a
+  process that the job started holds its output open. On every platform
+  except Windows, the forced kill of the rest of the process group follows
+  within about 0.25 seconds of that exit. A process that the job started
+  therefore has the grace period only while the job's own process is
+  running, and for a command string that process is the shell. A workload
+  that needs all of `killTimeout` to shut down must be the job's own
+  process (an argv list, or `exec` as the last step of a shell command), or
+  the shell must keep running until the workload exits. The daemon logs
+  `did not gracefully terminate` only when the job's process is still
+  running at the end of `killTimeout`. On those platforms, once the job's
+  own process has exited and another process holds its process ID, the
+  daemon sends that ID's process group no signal.
+- The daemon records a canceled run within a time limit when a process that
+  the run started still holds its output open. A run canceled by an
+  operator, a `Replace` launch, or a lost pool lease has one 30-second
+  bound for both captured streams, which starts when the daemon finishes
+  canceling it. When the job's process outlives the forced kill, the daemon
+  looks for its exit every 30 seconds, and the bound starts at the look
+  that finds the process gone. A run that its `executionTimeout` ends has
+  30 seconds for each captured stream to reach end-of-file. A verification
+  check that reaches `verify.timeout` has 30 seconds for each of its two
+  streams, including a check whose own process has exited while a process
+  that it started holds its output open. In each case the daemon then logs
+  a warning, keeps the output captured so far, and records the run. A check
+  that timed out fails its run as a verification timeout: the
+  verification's `exit_code` is `-100`, and the run keeps the command's own
+  exit code. The daemon records that run and goes on recording the runs
+  that finish after it.
+- A recorded run's `finished_at` is the instant the run ended, and `ranAt`
+  and the archived output carry the same instant. A run that the daemon did
+  not cancel ends after its captured output closes, and a run whose
+  verification check times out ends after the check's streams have closed
+  or their bounds have expired, so `duration` includes those waits. For a
+  run that the daemon canceled or that its `executionTimeout` ended,
+  `duration` leaves out the wait for output that a surviving process holds
+  open. A canceled or timed-out run that waits on such output can be
+  recorded after a later run of the same job. The later run then stays the
+  job's last run, under every concurrency policy: `last_run` in `GET /jobs`
+  names it, and the Logs tab replays its output. The earlier run still
+  enters the run history, the ledger, and the output archive, counts in the
+  Prometheus metrics, and gets its reports and its retry handling.
+  `onlyIfLastSucceeded` judges the newest success or failure by the instant
+  each run ended, on this node and on a peer that reads the shared ledger,
+  so a run that its `executionTimeout` ended and that is recorded after a
+  later success leaves the gate open. The `maxTimeSinceSuccess` reference,
+  missed-run catch-up, and the check that a finished run supersedes a
+  pending retry go by the same instant.
 - When two runs of a job overlap, the success of the earlier run leaves the
-  retries of the later scheduled run in place. A success cancels a retry
-  that is pending for the job.
+  retries of the later scheduled run in place until that run has scheduled
+  a retry. Once a retry is pending or its attempt is running, a success of
+  any run of the job ends the retry sequence: it cancels a pending retry,
+  and a retry attempt that is running and then fails is a permanent
+  failure. The record of a run canceled through `POST /jobs/{name}/cancel`
+  or `cron_cancel_job` follows the same rule. A scheduled run that starts
+  beside a canceled run therefore keeps its retries, and a pooled fire that
+  waits behind one is admitted with its retries. The rule holds on the node
+  that holds the retry sequence. For a pooled job whose `clusterPolicy` is
+  not `EveryNode`, the nodes that share a store also share the job's retry
+  scope. A success or an operator cancel of a run on a node that does not
+  hold the sequence ends it for the job: a fire that waits in the pool is
+  then admitted without retries, and a fire that is running on another node
+  and then fails is a permanent failure.
 - The pool scheduler tries to admit a waiting entry only when the entry is
   at the head of the pool's queue and the pool's free slots can hold it. A
   pass over a pool whose head has to wait reads the pool's queue once,
   whatever its length. When a concurrency rule declines the entry at the
   head, the entry stays at the head and the scheduler tries it again on its
-  next pass, one second later. When the entry at the head is cancelled
+  next pass, one second later. When the entry at the head is canceled
   during a pass, that pass goes on to the entry behind it.
-- The job reaper holds no finished run while it waits for the next one. A
-  run's captured output and process handles are freed after the run is
-  recorded.
+- When the store write that records a pooled entry's completion fails, the
+  pool scheduler keeps the completion and writes it again on its next pass
+  and on each lease heartbeat, every five seconds. The retried write
+  records the completion while the claim's 30-second lease lasts, and the
+  entry then runs once. A write that lands after the lease has lapsed
+  records nothing: the entry is back in the queue, and a job that had
+  finished is admitted and runs again unless its `queueTimeout` has passed.
+  A write that lands after the same queue entry has been claimed again
+  leaves the new claim in place. The node keeps renewing that claim's lease
+  and records its completion once, so the pool stays within its slots. When
+  the launch for the new claim is declined, the entry returns to the queue
+  at once.
+- `GET /pools`, `POST /pools/{name}/queue/{key}/cancel`, and
+  `POST /jobs/{name}/start` for a pooled job answer `503` with
+  `pool state is unavailable` whenever pool state cannot be read or
+  written: the store raises an I/O error, a pool operation takes longer
+  than five seconds, a pool document cannot be read (an I/O error on the
+  file, a damaged body, or an unknown schema version), or the configured
+  state store has not started. In those cases `GET /jobs` and
+  `GET /jobs/{name}` answer `200`, and the `pool` object of each pooled job
+  carries `queueUnavailable: true` and no `queued` list. A refusal from a
+  pool that answers is a `409` with the pool's own message. A start gets
+  `pool queue is full`, `pool is draining before a capacity change`, or
+  `pool state requires reliable exclusive locks`, and a queue cancel gets
+  `queue entry not found` or `only waiting entries can be cancelled`. On a
+  daemon whose configuration has no `state` section, a queue cancel answers
+  `409` with `unknown pool '<name>'`. The MCP `cron_list_pools`,
+  `cron_cancel_queued`, and `cron_run_job` tools report these answers as
+  tool errors with the same text. When a scheduled or deferred `@reboot`
+  fire of a pooled job finds pool state unavailable, the daemon logs the
+  warning `Job <name> could not enter pool <pool>: <reason>`, drops that
+  fire, and goes on scheduling other jobs. A pooled run that fails in that
+  state arms its next retry, or counts its permanent failure when no retry
+  remains, and a due retry waits for pool admission without using an
+  attempt.
+- The job reaper holds no finished run while it waits for the next one. Once
+  a run is recorded and its reports are sent, the daemon frees the run's
+  process handles and the copy of its output that reports read. The run
+  record keeps the output lines that the Logs tab replays until the job's
+  next run is recorded.
 - A workflow whose configuration lists a task before its upstreams settles a
   failure in one scheduler pass. When a task fails or is skipped, every task
   downstream ends `upstream_failed` or `skipped` in that pass, and an
@@ -98,62 +209,246 @@
   runs it deletes, and deletes them in batches of up to 32. Under the
   leases of a batch's runs it reads the recovery runs in one store
   operation and the recovery batches in another, so it keeps a run that a
-  recovery in preparation or an open recovery batch references. The pass
-  deletes a run within 30 seconds of leasing it and releases the lease as
-  soon as the run is deleted or kept. On a slow store, a batch stops taking
-  leases after 15 seconds and leaves the rest of its runs for the next
-  pass. The pass also keeps the runs when it can't read a recovery
-  run or a recovery batch. It then logs one warning that names the document
-  and leaves the workflow's runs for its next pass. A recovery document
-  that stays unreadable holds the runs for seven days after its last write,
-  the lifetime of a recovery batch. After that, the pass skips the
-  document.
-- An artifact or XCom lookup reads the records that the daemon has neither
-  published nor read before, and the record that it returns. The daemon
-  remembers the name in each of 16,384 records across all scopes. With more
-  records than that, a lookup reads again the oldest records of the scopes
-  that were used least recently. When the daemon also remembers names for
-  other scopes, the scope in use keeps at least the names of its newest
-  12,288 records. A lookup or an artifact listing that overlaps a new
-  publish of a name returns the version from before the publish or the one
-  from after it.
-  When the publish removes a version that the lookup has not read yet, the
-  lookup reads the scope again, up to three more times. If a publish
-  removes a version during every one of those reads, a strict lookup
-  raises, and any other lookup answers with the newest versions that it
-  read. A strict lookup also raises for an unreadable record that the
-  daemon has neither published nor read, and for the record that it
-  returns. A workflow recovery request whose lookup raises answers `503`
-  with `recovery state is unavailable`, and the MCP recovery tools report
-  the same error.
+  recovery in preparation or an open recovery batch references. A
+  date-range recovery takes the lease of each source run before it writes
+  its batch, so the pass also keeps the sources of a batch that is accepted
+  while it runs. The pass deletes a run only while the document is still
+  the finished run that it listed, which it identifies by run ID and
+  creation time. A recovery run that is accepted again after another node's
+  pass deleted it has the same key and run ID and a later creation time, so
+  the pass keeps it and its XCom values, and this node's run listings show
+  it on their next read. The pass starts a run's delete within 30 seconds
+  of leasing the run and releases each lease when the batch reaches that
+  run. A delete that times out or is canceled can still land, so the pass
+  releases the other leases of the batch and leaves that run's lease to
+  lapse, 60 seconds after it was taken. Until then, a recovery of that run
+  answers `409` with `source run is busy; retry shortly` when it is
+  executed. On a slow store, a batch stops taking leases after 15 seconds,
+  and a run whose delete cannot start in time waits for the next pass,
+  which runs hourly and at daemon start. A full batch needs about 64
+  rate-limited store operations inside those 30 seconds, two for each run.
+  Under `state.maxOpsPerSecond` of about 2 or lower, or on a store slow
+  enough that a batch's operations outlast the 30 seconds, a busy workflow
+  can therefore hold more than `retainRuns` finished runs. The node creates
+  no scheduled workflow run while a pass is in flight, so on such a store a
+  scheduled run can start late, and a fire that the pass delays past its
+  slot is left to `onMissed`, which skips it by default. The pass also
+  keeps the runs when it can't read a recovery run or a recovery batch. It
+  then logs one warning that names the document and leaves the workflow's
+  runs for its next pass. A recovery document that stays unreadable holds
+  the runs for seven days after its last write, the lifetime of a recovery
+  batch. After that, the pass skips the document.
+- The first execution of a date-range recovery preview takes the lease of
+  each source run before it writes its batch. Ahead of that write, the
+  request can answer `409` about the leases and the presence of the source
+  runs. While retention or another recovery holds the lease of a source run,
+  the message is `source run is busy; retry shortly`. When a source run is
+  gone or its key holds another run, the message is
+  `recovery preview is stale; preview again`. When a source run is deleted
+  between the request's listing of the workflow's runs and its planning of
+  that run, the message is `workflow run not found`, and a preview can get
+  the same answer. When taking the leases and confirming the sources takes
+  30 seconds or longer, the message is
+  `leasing the source runs took too long; retry or select fewer dates`.
+  After the busy answer, once the lease is free, the same token succeeds
+  when the source run is still the latest failed run of its date or when a
+  request with the same token has recorded the batch. The token answers
+  `recovery preview is stale; preview again` when retention has deleted the
+  source run, or when a single-run recovery or a date-range recovery with
+  another token has created a run for its date. Once the batch is written,
+  the request recovers each source under that source's own lease. The
+  answer `source run is busy; retry shortly` can therefore also come with
+  the batch recorded and the earlier dates recovered, when retention or a
+  single-run recovery holds that lease. The same token then continues the
+  batch. The MCP `cron_recover_dag` tool reports the same messages.
+- When the write of a date-range recovery's batch times out, the request
+  answers `503` with `recovery state is unavailable`. After a write that
+  timed out, or a request that was canceled during the write, the source
+  leases stay until they lapse, 60 seconds after they were taken. Until
+  then the same token answers `source run is busy; retry shortly`. After
+  that it continues the batch if the write landed, and records the batch if
+  it did not. The write that creates a recovery run, for a single-run
+  recovery and for each date of a recorded batch, answers a timeout with
+  the same `503`, and a timeout or a canceled request leaves the source
+  run's lease to lapse in the same way. If that write landed, the same
+  token answers at once: for a single-run recovery it returns the recovery
+  run with `created: false`, and for a batch it continues the batch. If the
+  write did not land, the token answers `409` with
+  `source run is busy; retry shortly` until the lease lapses and then
+  creates the run.
+- `POST /dags/{name}/recover` and `POST /dags/{name}/runs/{run_key}/recover`
+  answer a preview or an execution of a workflow recovery with `503` and
+  `recovery state is unavailable` whenever the state store cannot answer: on
+  a store I/O error or a timeout, on a record or a document that cannot be
+  read, and while the configured store has not started. On a daemon whose
+  configuration has no `state` section, a single-run recovery answers `409`
+  with `workflow run not found`, and a date-range recovery answers `409`
+  with `workflow not found`. With the store available, `workflow not found`
+  is also the answer to a date-range recovery of a workflow that is absent
+  from the configuration. The MCP tools `cron_preview_recovery` and
+  `cron_recover_dag` report these answers as tool errors with the same text.
+- An artifact or XCom lookup lists the scope and reads the records that the
+  daemon has neither published nor read before. A strict read fails on a
+  record that it cannot read, where any other read skips the record. The
+  lookup that expands a mapped workflow task is strict, and so is the
+  artifact listing of a workflow recovery plan. A strict lookup also reads
+  the record that it returns, and any other lookup can return a record that
+  the daemon has read before from memory. The daemon remembers the name in
+  each of 16,384 records across all scopes. With more records than that, a
+  lookup reads again the oldest records of the scopes that were used least
+  recently. When the daemon also remembers names for other scopes, the
+  scope in use keeps at least the names of its newest 12,288 records. A
+  name that has been published again holds two records and uses two of
+  those places. The daemon remembers no name longer than 256 characters.
+  The job API accepts a longer name for an artifact, and a lookup reads
+  each record that carries such a name every time it reaches the record:
+  newest first down to its match, or every such record for a name that the
+  scope lacks. A lookup or an artifact listing whose directory read
+  overlaps one publish of a name returns the version from before the
+  publish or the one from after it. When the directory read misses the
+  newest record that the daemon remembers for a name, the lookup or the
+  listing answers from that record, once it has found the record's file in
+  the store. A read can still miss the current version of a name that is
+  published twice during one directory read, or is published once while the
+  scope is cleaned up during that read, when the reading node remembers no
+  record of the name newer than the ones that it listed. No node remembers
+  a record of a name longer than 256 characters. The lookup then answers
+  not found, or the listing leaves the name out, unless the scope still
+  holds an older version of the name, such as one that another node
+  published: the read then returns that version, strict or not. A lookup or
+  a listing that is not strict can also return the older version that the
+  daemon last read. The next call returns the current version. When a
+  publish removes a version that the lookup has not read yet, or a
+  remembered record has left the store, the lookup reads the scope again,
+  up to three more times. If a publish removes a version during every one
+  of those reads, a strict lookup raises, and any other lookup answers with
+  the newest versions that it read. A strict lookup also raises for an
+  unreadable record that the daemon has neither published nor read, or that
+  carries a name longer than 256 characters, and for the record that it
+  returns. On Windows, a record read meets a sharing violation while the
+  record is renamed into place or removed, and the daemon tries the read
+  again four times over about 200 ms. When a record is still unreadable
+  after the fourth retry, the daemon reads every record with a single
+  attempt for the next second. A workflow recovery request whose lookup
+  raises answers `503` with `recovery state is unavailable`, and the MCP
+  recovery tools report the same error.
 - Publishing an artifact or an XCom value costs the same at any number of
-  names in the scope. When the daemon publishes a name again, it removes
-  the version that the new one replaces, if the daemon published that
-  version or read it in a lookup or in its last cleanup of the scope. A
-  scope that one node publishes to holds one record for each name, and
-  state garbage collection reclaims the replaced payloads. A version that
-  another node published and that the daemon has not read stays until the
-  scope's next cleanup, which runs after the daemon has published to the
-  scope as many times as the scope has names, and at least eight times.
-  Each further node that publishes to the scope can add as many records as
-  the scope has names. The daemon finds the version to remove in the same
-  16,384 records that it remembers for lookups. A scope whose records are
-  not among them holds up to about twice as many records as names. Workflow
-  recovery's limit of 10,000 artifacts counts names, so superseded records
-  do not count toward it.
+  names in the scope. When the daemon publishes a name again, it keeps the
+  version that the new one replaces and removes the version before that, if
+  the daemon published that older version or read it in a lookup or in its
+  last cleanup of the scope. The publish first confirms that the version
+  it replaces is still in the store. When that version is gone, as after
+  another node wipes the scope or a record is quarantined, the publish
+  removes nothing, and the older version waits for the scope's next
+  cleanup. A scope that one node publishes to holds at most two records
+  for each name, the current version and the one before it, and one older
+  record more for a name that lost a record in that way. State garbage
+  collection can reclaim a replaced payload once its record is gone, which
+  is at the name's next publish or at the scope's next cleanup. A version
+  that another node published and that the daemon has not read stays until
+  the scope's next cleanup, which runs after the daemon has published to
+  the scope as many times as its last cleanup left records in the scope,
+  and at least eight times. The cleanup removes every superseded record
+  except the one that its own publish replaced. Each further node that
+  publishes to the scope can add up to about twice as many records as the
+  scope has names. Measured with 50 names that every node republishes
+  without a pause, a scope peaks at about 2 times as many records as names
+  with one publishing node, at up to 4 times with two, and at up to 6 times
+  with three. The daemon finds the version to remove in the same 16,384
+  records that it remembers for lookups. A scope whose records are not
+  among them holds up to about twice as many records as names. So does a
+  scope of names longer than 256 characters, which the daemon does not
+  remember. With fewer than eight such names, the scope holds up to eight
+  records more than its names, so one such name that is republished alone
+  holds up to 9 records. A publish of such a name removes no older
+  version, and the superseded versions and their payloads stay until the
+  scope's next cleanup. Workflow recovery's limit of 10,000 artifacts
+  counts names, so superseded records do not count toward it.
+- A publish takes a record name above every record of the scope that the
+  daemon has published, read in a lookup or listing, or kept in a cleanup. A
+  node whose clock is behind a peer's therefore publishes above the peer's
+  version once it has read that version, and lookups return its publish. A
+  node that has not read the peer's version can publish below it, so nodes
+  that share a store need synchronized clocks.
+- Nodes that share a state store should move to this release together.
+  Until they do, a node on the previous release can answer not found for an
+  artifact or an XCom value, or leave a name out of a listing, when a node
+  on this release publishes the name twice, or publishes it and then cleans
+  the scope, between the older node's listing and its read. The older node
+  also reads up to twice as many records in a scope that this release
+  republishes. Its workflow recovery limit of 10,000 counts records, so it
+  can answer `409` with `recovery supports at most 10000 artifact records`
+  for a run that holds between 5,001 and 10,000 artifact names, once a node
+  on this release has republished them, while a node on this release
+  accepts the request. A date-range recovery that an older node executes
+  writes its batch without the source leases, so a retention pass on
+  another node can delete a source run while that batch is written.
 - Planning a workflow rerun from a task follows each dependency once.
-- A configuration directory or include tree of more than 1,024 files
-  reloads by reparsing only the files that changed. The per-file parse cache
-  holds every file of the loaded configuration, and at least 1,024 files. A
+- A configuration directory of more than 1,024 files reloads by reparsing
+  only the files that changed. An include tree of that size reparses each
+  changed file, each file that includes it, and the entry file, which is
+  parsed on every load. The per-file parse cache has room for every file of
+  the loaded configuration, and for at least 1,024 files. A first load, and
+  a reload of unchanged files, opens each configuration file once, or once
+  for each file that includes it. A reload after an edit opens files again:
+  the cache checks a file against the disk before it reparses the file, and
+  a file that includes others checks every file under it. In a
+  configuration directory whose files include files that include others, an
+  edit to a file at the third level opens that file four times, its
+  includer and the files beside it three times, and the top file twice. A
   reload that fails keeps the cached files of the last configuration that
   loaded.
+- A configuration file, an included file, or an `env_file` that changes
+  while the daemon loads the configuration is parsed again. The per-file
+  parse cache signs each file with the bytes that its parse read, including
+  those of the files it includes and of each `env_file`, and reuses a parse
+  only while the files on disk match that signature. The daemon takes a
+  fingerprint of the files before a parse and again after it, and the
+  once-a-minute check trusts the fingerprint only when the two match. An
+  edit that lands during a parse, including one between the check and the
+  read of the file, is therefore parsed again at the next check. `SIGHUP` or
+  `cronstable service reload` picks it up on the next pass, and a reload
+  request that arrives while a parse is running gets a parse of its own.
+  At startup, the daemon reads each regular file a second time, and when a
+  file differs from the bytes that it parsed, the first scheduling pass
+  parses the configuration again. A source that cannot be read twice, such
+  as a pipe, a FIFO, or `/dev/stdin`, is read once at startup and left out
+  of that comparison. The once-a-minute check compares the size and
+  modification time of regular files, so it does not watch a pipe or a
+  FIFO. After a reload that reads a different set of files, the daemon
+  parses once more at the next check. After each parse of a configuration
+  directory, at startup and on a reload, the daemon also lists the directory
+  again and compares the names of the files that it loads with the names
+  that the parse listed. When such a file joined or left the directory
+  during the parse, the daemon parses again: in the first scheduling pass
+  after startup, and at the next check after a reload, including when the
+  directory's modification time did not move.
+- A configuration file, a file of a configuration directory, or an included
+  file that is not valid UTF-8 is a configuration error. The message is
+  `Could not load config file '<path>':` followed by the decoding error.
+  For a little-endian UTF-16 file that starts with a byte order mark, the
+  error is
+  `'utf-8' codec can't decode byte 0xff in position 0: invalid start byte`.
+  At startup, and under `--validate-config` or `--job-set-id`, the process
+  logs `Configuration error:` with that message and exits with status 1. A
+  reload logs the error and keeps the jobs of the last configuration that
+  loaded, and `cronstable_config_last_reload_successful` reads 0. Windows
+  PowerShell 5.1 writes little-endian UTF-16 with a byte order mark when it
+  redirects output to a file, which is the usual cause.
+- The file that `cluster.etcd.password.fromFile` names is a configuration
+  source, as an `env_file` is. The once-a-minute check parses the
+  configuration again when the file's size or modification time changes.
+  A reload request reads a password that was rewritten in place, whether
+  the configuration is a single file, a directory, or an include tree.
+  Change the password on the etcd server before you replace the file.
 - Configuration parse time grows in proportion to the number of keys in a
   mapping. A `pools` or `web.headers` block with 2,000 entries loads in
   under a second.
 - The jobs and workflow tasks of one configuration file share one read of an
   `env_file` that they name or inherit from `defaults`.
 - `cronstable --validate-config` and `cronstable --job-set-id` exit without
-  loading asyncio or psutil.
+  loading psutil. They load asyncio only for a configuration that has a
+  `push` section or enables `web.bonjour`.
 - `GET /activity` takes two optional query parameters that cap the jobs in
   the response. `jobs=N` returns at most `N` jobs: the first `N` in
   configuration order, the order `GET /jobs` lists them, or the first `N` by
@@ -163,12 +458,12 @@
   the terminal dashboard requests `jobs=80&sort=name`. Viewers that send the
   same `jobs` and `sort` values share one built response. The daemon holds
   a shared response for up to eight pairs with `jobs` at most 256. For a
-  larger cap that leaves jobs out, it builds the response for each
-  request.
+  larger cap that leaves jobs out, and for a request that sets `limit`
+  below the retained window, it builds the response for each request.
 - The daemon compresses the dashboard page with zlib at level 9, whichever
   gzip backend is installed. It compresses the page on a worker thread for
   the first browser that accepts gzip and serves the stored result after
-  that. Such a browser downloads about 180 KB. JSON responses keep level 1
+  that. Such a browser downloads about 180 KB. JSON responses use level 1
   on the installed backend. The page answers `304 Not Modified` to an
   `If-None-Match` header that carries its `ETag` in weak form or in a list.
 - The MCP `cron_list_jobs` tool builds full job rows for the page that it
@@ -179,29 +474,79 @@
   table once. Keystrokes that reach the dashboard together share one
   rebuild, and the table and the selected row end up where typing the same
   keys one at a time leaves them.
+- Except on Windows, the terminal dashboard asks the terminal to mark each
+  paste (bracketed paste), and marked text is text only. The text field
+  with the focus takes it without its line breaks and other control
+  characters, so a pasted line break commits nothing. With no text field to
+  take it, the paste does nothing, and no pasted character acts as a
+  shortcut. A paste that arrives right behind an `Esc` press is still text
+  only. When the end marker of a paste never arrives, the dashboard takes
+  every later key as pasted text until `Ctrl-C`, pressed after a pause,
+  ends the paste and quits the dashboard. The Windows console marks no
+  paste, so a pasted line break, tab, or escape arrives as `Enter`, `Tab`,
+  or `Esc`. When a key takes the focus out of a text field (`Enter`, `Tab`
+  in the filter, or `Esc`) and more keys reached the dashboard together
+  with it, the dashboard drops those keys as the rest of a paste.
+- On Windows, the terminal dashboard reads key events from the console. A
+  typed U+00E0 (`a` with a grave accent) is a character, and the key after
+  it is its own key. A character outside the Basic Multilingual Plane, such
+  as an emoji, arrives as one character, and a character composed with
+  `Alt` and the numeric keypad is delivered. A control character entered
+  that way acts as its key, so `Alt` with `013` is `Enter`. `Shift-Tab`
+  steps the tabs of the job drawer and the state inspector backward, as it
+  does on other platforms. The dashboard restores the console's input mode
+  when it exits, including after an error. On every platform, a frame with
+  a character that the terminal's encoding cannot encode is painted with
+  `?` in that place.
 - In the web dashboard, a job's countdown and its **Next at** time stay tied
-  to the `/jobs` response that delivered them. Each poll sends the previous
-  response's `ETag` in `If-None-Match` and bypasses the browser's HTTP
-  cache. When the daemon answers `304 Not Modified`, the dashboard keeps the
-  jobs it holds, and their countdowns run on. After the computer sleeps or
-  its clock is set, the next poll takes a full response and restarts the
-  countdowns from it.
+  to the `/jobs` response that delivered them. Every poll bypasses the
+  browser's HTTP cache, and a poll that follows a response the dashboard
+  still holds sends that response's `ETag` in `If-None-Match`. When the
+  daemon answers `304 Not Modified`, the dashboard keeps the jobs it holds,
+  and their countdowns run on. After the computer sleeps or its clock is
+  set, the next poll takes a full response and restarts the countdowns from
+  it when the browser's wall clock and its monotonic clock then disagree by
+  one second or more about the age of the response that the dashboard
+  holds. The **Next at** label names its day from the browser's local date:
+  the time alone for today, `tom` for tomorrow, and the month and day
+  beyond that. The first poll after local midnight, or after the browser's
+  UTC offset changes, rebuilds the jobs table once, so the labels follow
+  the date.
 - The web dashboard's jobs table and fleet matrix keep their painted rows
   through a frame that repaints something else, such as each frame of the
   swaying logo.
 - Closing the web dashboard's fleet view or incident timeline removes its
-  rows from the page, so the once-per-second update of relative times covers
-  only open panels. The header clock, the connection tooltip, and the
-  upcoming-runs countdowns are written when their text changes.
+  rows from the page, so the once-per-second update of relative times skips
+  them. The header clock, the connection tooltip, and the upcoming-runs
+  countdowns are written when their text changes.
 - The performance suite registers 199 benchmarks. Its coverage includes job
   launch and reaping, pool admission, workflow runs and retention, the HTTP,
   MCP, and gossip response paths, the terminal dashboard's frames, and the
   web dashboard's poll, tick, and keystroke paths. `benchmarks/bench.py`
   names the cronstable package that it measures, and its child processes
-  import that package when `PYTHONPATH` gives it as a relative path.
+  import that package when `PYTHONPATH` gives it as a relative path or as
+  an empty entry. A benchmark repeat whose child process exits nonzero, or
+  runs longer than six minutes (five and a half for a peak-RSS target),
+  fails with a one-line reason. The benchmark is skipped with that reason
+  when no repeat produced a value. When an earlier repeat produced one, the
+  benchmark keeps those values, and its result line ends with
+  `PARTIAL (N of M repeats: reason)`. Its result row carries the reason in
+  `partial_reason` and the declared repeat count in `repeats`.
   `benchmarks/compare.py` refuses a pairing whose two sides differ in the
-  `isal` gzip backend. The count checks that pair with these metrics are in
-  `tests/test_perf_invariants.py`.
+  `isal` gzip backend. It counts a metric as compared only when both sides
+  hold a finite value and the baseline is above zero, and a metric in
+  `benchmarks/expected_gated.txt` that is not compared fails the run. A
+  `--quick` or `--smoke` run reports a baseline of exactly zero without
+  failing. For each compared metric that skipped or ran short in a round on
+  one side, `benchmarks/compare.py` prints a `::warning::perf gate:` line
+  that says the metric `was compared with a short` baseline or current
+  side and names those rounds with their reasons. The warning leaves the
+  verdict and the exit code as they are. The merged results that
+  `--merged-out` writes list the short rounds of the current side in the
+  `short_rounds` field of the metric. The count checks that pair with these
+  metrics are in `tests/test_perf_invariants.py`. Those for the web
+  dashboard are in `tests/test_web_perf_e2e.py` and in the benchmarks' own
+  post-conditions.
 - cronstable supports Python 3.15 for `pip` and `pipx` installs, and the
   test matrix runs it on Linux, Windows, and macOS. On Python 3.15, the
   `speedups` extra skips `isal`, which has no wheel for that version, so the

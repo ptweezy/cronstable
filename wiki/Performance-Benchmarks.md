@@ -55,6 +55,14 @@ subprocess, disk I/O, and peak-RSS metrics), by more than its absolute floor,
 and by more than twice its measured round-to-round noise. Microsecond jitter
 on a tiny metric can therefore never gate.
 
+A metric counts as compared only when both sides hold a finite value and the
+baseline is above zero. A metric that skipped in some rounds of a side, or
+ran fewer repeats than declared, is compared from the rounds that produced a
+value, and the job log carries a warning that names those rounds. A metric
+that `benchmarks/expected_gated.txt` lists and that is not compared is a
+dead gate, which fails the run. A metric with an absolute budget whose value
+is not finite counts as a budget breach.
+
 On an ordinary commit or pull request the comparison only warns. On a release
 the gate is enforced: the publish jobs require `perf`, so a gated regression
 stops the release before anything ships.

@@ -427,6 +427,29 @@ quotes (`'C:\scripts\nightly.bat'`): in double-quoted YAML a backslash starts
 an escape sequence, so `"C:\temp\x"` silently becomes something else. Prefer
 `utf-8` without a BOM for `env_file` files; files with a BOM are handled too.
 
+A configuration file, a file of a configuration directory, or an `include`
+target that is not valid UTF-8 is a configuration error that names the
+file. A redirect (`>`) in Windows PowerShell 5.1 writes UTF-16, which is
+the common cause, and the message for such a file reads:
+
+```text
+Could not load config file 'C:\\ProgramData\\cronstable\\jobs.yaml': 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
+```
+
+The message prints the path as a Python string literal, so each backslash
+is doubled. At startup, and under `--validate-config` or `--job-set-id`,
+cronstable logs `Configuration error:` followed by the message and exits
+`1`. The Windows service logs the same line and does not start. On a
+reload, the daemon logs the message and keeps the jobs that it has.
+
+To write a YAML file from Windows PowerShell 5.1, use
+`Out-File -Encoding utf8` in place of the redirect. That cmdlet starts the
+file with a byte order mark (BOM). The YAML loader accepts the BOM, and a
+[classic crontab](Classic-Crontabs) that starts with one is a configuration
+error. Write a crontab with `[System.IO.File]::WriteAllLines`, which writes
+UTF-8 with no BOM, or with `Out-File -Encoding ascii` when the file holds
+only ASCII characters.
+
 ## Graceful shutdown
 
 To stop cronstable on Windows, press `Ctrl-C`. As on POSIX, this is a
@@ -650,10 +673,10 @@ source registration, and why `includeOutput` is off by default.
 When the daemon stops a job, because its `executionTimeout` expired, because
 of `concurrencyPolicy: Replace`, or because of a cancel request through the
 [HTTP control API](HTTP-API), it performs a graceful step, waits up to
-`killTimeout` seconds, then force-stops the run. The scope and meaning of the
-two steps differ by platform:
+`killTimeout` seconds for the job's own process to exit, then force-stops
+the run. The scope and meaning of the two steps differ by platform:
 
-| Platform | Graceful step | Forced step (after `killTimeout`) |
+| Platform | Graceful step | Forced step |
 | --- | --- | --- |
 | POSIX | `SIGTERM` to the job's whole process group (trappable; each job is spawned in its own session) | `SIGKILL` to the whole group, sent unconditionally |
 | Windows | `CTRL_BREAK_EVENT` to the job's whole process group (trappable; each job is spawned in its own group) | `taskkill /F /T` on the job's live process tree |
@@ -661,12 +684,21 @@ two steps differ by platform:
 Each job is spawned into its own console process group
 (`CREATE_NEW_PROCESS_GROUP`), so the graceful step is a real, trappable
 request. The job receives `CTRL_BREAK_EVENT`. A Python program handles that as
-`signal.SIGBREAK`, a native program through `SetConsoleCtrlHandler`, and an
-untrapped cmd.exe or console program by terminating.
+`signal.SIGBREAK`, a native program through `SetConsoleCtrlHandler`, and a
+console program that sets no handler by terminating. A cmd.exe that is
+waiting for a program keeps running after the break until that program
+exits.
 
-The job gets `killTimeout` seconds to flush and exit on its own terms. The
-forced step then runs `taskkill /F /T /PID <pid>`, which walks the job's live
-parent/child process tree and ends descendants the command left behind.
+The job's own process has up to `killTimeout` seconds to exit: the program
+itself when `command` is a list, and the shell (cmd.exe by default) when
+`command` is a string. A program that cmd.exe is waiting for therefore has
+the whole `killTimeout` to flush and exit. The forced step follows when the
+job's own process exits or the wait ends. It runs
+`taskkill /F /T /PID <pid>`, which walks the parent/child process tree from
+the job's own process. While that process is running, the walk ends it and
+each descendant whose parent chain is alive. Once that process has exited,
+the walk finds no process, and a descendant that is still running survives,
+as the bounds later in this section describe.
 
 The break needs a console shared between the daemon and the job. Where there
 is none, such as a daemon started by a service wrapper with no console, the
@@ -686,7 +718,10 @@ Honest bounds on the sequence:
 - The `taskkill` run itself is given 10 seconds before cronstable abandons it
   and falls back to ending the direct child alone.
 - A descendant that was already orphaned when `taskkill` ran (its parent
-  exited first) is no longer in the tree and survives.
+  exited first) is no longer in the tree and survives. Once the job's own
+  process has exited, that holds for every descendant that is still running,
+  such as a program that the command launched with `start` and did not wait
+  for.
 
 A survivor cannot strand the run: the wait for a stopped run's output pipes to
 drain is separately bounded.
@@ -944,6 +979,18 @@ left open by a previous daemon is not declared dead while its recorded pid
 still exists, because a daemon crash does not end the job processes it
 spawned.
 
+On Windows, reading a state record while a publish renames it into place or
+removes it is a sharing violation. The daemon tries the read again four times
+over about 200 ms, so an [artifact](Durable-State#artifact-store) or XCom
+lookup that overlaps a publish returns the version from before the publish or
+the one from after it. The daemon logs a record that stays unreadable, with a
+hint that every node sharing the store must run as the same user, and a
+strict lookup raises for it. After such a record, the daemon reads every
+record with a single attempt for one second, so a scan over many unreadable
+records waits about 200 ms once. A read that overlaps a publish in that
+second gets no retry: a strict lookup can raise, and any other lookup can
+skip the record.
+
 ## Everything else behaves identically
 
 Apart from the preceding differences, cronstable behaves the same on Windows
@@ -955,8 +1002,11 @@ capturing, concurrency, failure detection and retries, and reporting
 
 So are statsd metrics, the Prometheus `/metrics` endpoint, the HTTP control
 API, the web dashboard, and the `cronstable tui` terminal dashboard, which
-enables VT mode on the Windows console and reads keys with `msvcrt`. All of it
-works as documented elsewhere in this wiki:
+enables VT mode on the Windows console and reads key events from the
+console's input buffer. The console marks no paste, so the dashboard handles
+a pasted line break, tab, or escape as
+[pasting text](Terminal-Dashboard#pasting-text) describes. All of it works as
+documented elsewhere in this wiki:
 
 - [Classic Crontabs](Classic-Crontabs)
 - [Importing from Task Scheduler](Importing-Task-Scheduler)

@@ -27,7 +27,14 @@ The TUI requires an interactive terminal. If stdin or stdout is not a tty
 needs an interactive terminal (stdin/stdout are not a tty)` to stderr
 and exiting with code 2. On Windows it turns on the console's ANSI/VT
 processing itself, so a stock Command Prompt or PowerShell window works.
-For fonts missing the status glyphs, use `--ascii`.
+It reads key events from the console, so a character outside the Basic
+Multilingual Plane, such as an emoji, and a character composed with
+`Alt` and the numeric keypad each arrive as one character. A control
+character entered with `Alt` and the keypad acts as its key, so `013`
+is `Enter`. The TUI restores the console's input mode when it exits,
+including after an error. A TUI process that is ended with `Ctrl-Break`
+or killed leaves the console in raw input mode. For fonts missing the
+status glyphs, use `--ascii`.
 
 ## Options
 
@@ -71,14 +78,30 @@ The web page's shortcut table applies verbatim to both frontends. Press
 
 Terminal-only extras are grouped separately in the `?` overlay. `q`
 quits, `s`/`S` cycle the sort key/direction, `f` cycles the status
-filter, `m` opens the live logs panel, `←`/`→` (or `Tab`) switch
-drawer tabs, and `PgUp`/`PgDn` scroll.
+filter, `m` opens the live logs panel, `←`/`→` (or `Tab` and
+`Shift-Tab`) switch drawer tabs, and `PgUp`/`PgDn` scroll.
 
 Inside the **Logs** tab, `f`/`t`/`w` toggle follow/timestamps/wrap;
 `/` searches, with `n`/`N` for next/previous match; and `d` saves the
 log to your home directory as
 `cronstable-<job>-<YYYYmmdd-HHMMSS>.log` (a toast confirms the exact
 path).
+
+On every platform except Windows, `Esc` is also the first byte of each
+navigation key that the terminal sends, so the TUI takes an `Esc` on
+its own as the key once 30 ms pass with no more input. Two `Esc`
+presses that arrive within that gap both act as `Esc` when it passes.
+Each closes one layer, the panel or drawer on top first.
+
+Some terminals send `Alt` as an `Esc` ahead of the key's own sequence,
+such as `ESC ESC [ A` for `Alt` with `↑`. The TUI reads a navigation
+key with that prefix as the plain key: the arrows, `Home`, `End`,
+`PgUp`, `PgDn`, `Insert`, `Delete`, and `Shift-Tab`, in CSI or SS3
+(application cursor) form, with or without a modifier parameter. The
+key acts in the open panel or drawer as it does without `Alt`, and the
+panel or drawer stays open, as it does for the xterm form
+`ESC [ 1;3 A`. A key with the prefix that the TUI does not bind, such
+as a function key, does nothing.
 
 ## Features
 
@@ -88,7 +111,8 @@ The TUI includes:
   ages, duration sparklines, live CPU/memory chips for monitored jobs,
   the owner column under a spread cluster, filtering, sorting, and the
   status segments. The filter matches job names and commands, and text
-  pasted into it rebuilds the board once. A [paused](Pausing-Jobs) job
+  pasted into it rebuilds the board once (see
+  [pasting text](#pasting-text)). A [paused](Pausing-Jobs) job
   shows the `⏸` glyph
   (`p` in `--ascii` mode) with `⏸ til HH:MM` in the next-fire column,
   and `p` toggles pause/resume (also in the palette). A job
@@ -148,7 +172,8 @@ The TUI includes:
 
 Text is sanitized before display. For log lines, only the last nonempty
 `\r` segment is kept, so progress bars and cmd.exe's CRLF output display
-correctly. Tabs expand, and other control characters are dropped.
+correctly. Tabs expand, and other control characters are dropped. A
+character that the terminal's encoding cannot encode is painted as `?`.
 
 Every escape sequence except SGR styling is scrubbed from job output and
 from API-derived strings such as job and node names, which under
@@ -220,6 +245,43 @@ OSC 52; most modern ones do, and tmux passes it through only when its
 The TUI reports success without being able to verify OSC 52 delivery.
 If the clipboard is empty in a remote session, check the emulator's
 OSC 52 support. Incident writeups are also saved to a file.
+
+## Pasting text
+
+Except on Windows, the TUI asks the terminal to mark each paste
+(bracketed paste) while it holds the screen. It turns the mode off when
+it quits, including on `Ctrl-C` and after an error. Marked text is text
+only. The text field with the focus takes it, and line breaks and other
+control characters are dropped, so a pasted line break commits nothing
+and the field keeps its focus. With no field focused, an open command
+palette, schedule preview, or token prompt takes the text. Anywhere
+else the paste does nothing, and no pasted character acts as a
+shortcut.
+
+A terminal that ignores the request sends a paste as typed keys. A TUI
+process that is killed with `SIGTERM` exits without restoring the
+terminal, so bracketed paste stays on with raw mode and the alternate
+screen.
+
+When a terminal starts a marked paste and its end marker never arrives,
+the TUI takes every later key as pasted text, so `q`, `Esc`, and
+`Enter` do nothing. `Ctrl-C` pressed after a pause of 30 ms or more
+ends the paste and quits the TUI. A pasted `Ctrl-C` character that
+follows such a pause quits the TUI too.
+
+The Windows console marks no paste, so a pasted line break, tab, or
+escape arrives as `Enter`, `Tab`, or `Esc`. When a key takes the focus
+out of a text field and more keys reached the TUI together with it, the
+TUI drops those keys as the rest of a paste. `Enter`, `Tab` in the
+filter, and `Esc` take the focus out of a field. A key that leaves the
+field focused drops nothing: after `Tab` in the command palette, or
+`Enter` there with no match, the keys behind it are typed into the
+field. Keys that arrive on their own act as typed. When the console
+delivers a paste in more than one piece, the TUI drops only the rest of
+the piece that holds the key that left the field, and the later pieces
+act as typed keys. A paste with no text field focused acts as typed
+keys too. While the TUI is busy, a key typed right after a key that
+leaves a field can reach the TUI together with it and is then dropped.
 
 ## Authentication
 

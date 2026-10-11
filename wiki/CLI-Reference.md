@@ -635,7 +635,8 @@ When started normally (no `--version`, no `--validate-config`, no
 
 The scheduler checks the configuration files about once a minute and reparses
 them when a file's modification time or size changes, so edits take effect
-without a restart. On POSIX, `SIGHUP` forces an immediate reparse (on Windows,
+without a restart. The next check picks up an edit that lands while a reload
+is parsing. On POSIX, `SIGHUP` forces an immediate reparse (on Windows,
 `cronstable service reload`). A configuration that
 becomes invalid after a successful start is logged and ignored, and the
 previously loaded jobs keep running. See

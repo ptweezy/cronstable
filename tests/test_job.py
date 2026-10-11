@@ -263,6 +263,53 @@ async def test_stream_reader_join_timeout_keeps_partial_output():
     assert discarded == 0
 
 
+async def test_stream_reader_join_again_after_a_cancelled_caller():
+    # A caller that is canceled in join() leaves the read loop running, so
+    # a second join() returns what the loop read before and after.
+    fake_stream = asyncio.StreamReader()
+    reader = cronstable.job.StreamReader("test", "other", fake_stream, "", 10)
+    fake_stream.feed_data(b"line1\n")
+    caller = asyncio.ensure_future(reader.join())
+    await _wait_until(lambda: reader.save_top == ["line1\n"])
+    caller.cancel()
+    await asyncio.wait({caller})
+    assert caller.cancelled()
+    fake_stream.feed_data(b"line2\n")
+    fake_stream.feed_eof()
+    again = asyncio.ensure_future(reader.join(5))
+    await asyncio.wait({again})
+    assert not again.cancelled()
+    assert again.result() == ("line1\nline2\n", 0)
+
+
+async def test_stream_reader_join_keeps_what_a_cancelled_read_loop_read():
+    # A read loop that was canceled counts as drained.
+    fake_stream = asyncio.StreamReader()
+    reader = cronstable.job.StreamReader("test", "other", fake_stream, "", 10)
+    fake_stream.feed_data(b"line1\n")
+    await _wait_until(lambda: reader.save_top == ["line1\n"])
+    reader._reader.cancel()
+    joined = asyncio.ensure_future(reader.join())
+    await asyncio.wait({joined})
+    assert not joined.cancelled()
+    assert joined.result() == ("line1\n", 0)
+
+
+async def test_stream_reader_join_raises_a_failure_of_the_read_loop():
+    # Every join() raises it: while the loop runs and once it is done.
+    def on_line(stream_name, line):
+        raise RuntimeError("no listener")
+
+    fake_stream = asyncio.StreamReader()
+    reader = cronstable.job.StreamReader(
+        "test", "other", fake_stream, "", 10, on_line=on_line
+    )
+    fake_stream.feed_data(b"line1\n")
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="no listener"):
+            await reader.join(5)
+
+
 @pytest.mark.parametrize(
     "save_limit, input_lines, output, expected_failure",
     [
@@ -1874,6 +1921,757 @@ async def test_killed_job_with_an_escaped_descendant_still_finishes(
     os.kill(helper_pid, signal.SIGKILL if not IS_WINDOWS else signal.SIGTERM)
 
 
+async def _never_reaches_the_group(pid, *, force):
+    return False  # simulate a descendant outside the group's reach
+
+
+async def test_cancelled_job_with_an_escaped_descendant_still_finishes(
+    monkeypatch, caplog
+):
+    # The same wedge when cancel() ends a run that wait() is collecting (a
+    # user cancel, a Replace, a lost pool lease): the surviving helper holds
+    # the pipe open, and the run still finishes within the drain bound with
+    # the output captured before the kill.
+    monkeypatch.setattr(
+        cronstable.platform, "kill_process_group", _never_reaches_the_group
+    )
+    monkeypatch.setattr(cronstable.job, "KILLED_STREAM_DRAIN_TIMEOUT", 1.0)
+    job = _running_job(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_spawn_helper_then_sleep(30))
+        + """
+    killTimeout: 1
+    schedule: "* * * * *"
+    captureStderr: false
+    captureStdout: true
+"""
+    )
+    await job.start()
+    await _wait_until(lambda: bool(job.output.lines))
+    helper_pid = int(job.output.lines[0][1])
+    try:
+        collected = asyncio.ensure_future(job.wait())
+        # wait() registers for the exit before the kill
+        await asyncio.sleep(0)
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await asyncio.wait_for(job.cancel(), 20)
+            await asyncio.wait_for(collected, 20)
+        assert job.stopped
+        assert job.stdout == "%d\n" % helper_pid
+        assert "did not reach end-of-file" in caplog.text
+    finally:
+        os.kill(
+            helper_pid, signal.SIGKILL if not IS_WINDOWS else signal.SIGTERM
+        )
+
+
+class _HeldPipeProcess:
+    """A child whose output pipes a descendant holds open.
+
+    Its exit wait resolves once the pipes close, as on an asyncio whose
+    ``Process.wait()`` resolves only once every pipe has closed.  With
+    ``wakes_at_exit`` it resolves when the process exits.  With
+    ``closing_at_exit`` the transport also reports itself as closing from
+    then on, as uvloop's does.  With ``exits`` false the process outlives
+    both signals.
+    """
+
+    pid = 4321
+
+    def __init__(self, exits=True, wakes_at_exit=False, closing_at_exit=False):
+        self.returncode = None
+        self.exits = exits
+        self.closing_at_exit = closing_at_exit
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self._transport = self
+        self._exited = asyncio.Event()
+        self._pipes_closed = asyncio.Event()
+        self._pipe = Mock(is_closing=self._pipes_closed.is_set)
+        self._wakes = self._exited if wakes_at_exit else self._pipes_closed
+
+    def exit(self, returncode):
+        self.returncode = returncode
+        self._exited.set()
+
+    def terminate(self):
+        if self.exits:
+            self.exit(-15)
+
+    def kill(self):
+        pass
+
+    def get_pipe_transport(self, fd):
+        return self._pipe
+
+    def is_closing(self):
+        return self._pipes_closed.is_set() or (
+            self.closing_at_exit and self.returncode is not None
+        )
+
+    def close(self):
+        self._pipes_closed.set()
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+
+    async def wait(self):
+        await self._wakes.wait()
+        return self.returncode
+
+
+def _held_pipe_job(monkeypatch, capture=(), **proc_kw):
+    monkeypatch.setattr(
+        cronstable.platform, "kill_process_group", _never_reaches_the_group
+    )
+    monkeypatch.setattr(cronstable.job, "KILLED_STREAM_DRAIN_TIMEOUT", 0.05)
+    monkeypatch.setattr(cronstable.job, "EXIT_POLL_INTERVAL", 0.01)
+    job = _fresh_job()
+    job.config.killTimeout = 0.01
+    job.proc = _HeldPipeProcess(**proc_kw)
+    for name in capture:
+        reader = cronstable.job.StreamReader(
+            "test", name, getattr(job.proc, name), "", 10
+        )
+        setattr(job, "_%s_reader" % name, reader)
+    return job
+
+
+async def test_cancel_bounds_an_exit_wait_that_needs_the_pipes_closed(
+    monkeypatch, caplog
+):
+    # A descendant that holds a pipe keeps such an exit wait, and wait()
+    # behind it, from the bounded drain.  cancel() closes the pipes once
+    # the drain bound has passed, and wait() collects the run.
+    job = _held_pipe_job(monkeypatch)
+    collected = asyncio.ensure_future(job.wait())
+    await asyncio.sleep(0)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        # awaited directly: a loop turn before the assertions below could
+        # fire the bound's timer
+        await job.cancel()
+        assert job.stopped and not collected.done()
+        assert not job.proc.is_closing()
+        await asyncio.wait_for(collected, 10)
+    assert job.proc.is_closing()
+    assert job.retcode == -15
+    assert "did not reach end-of-file" in caplog.text
+
+
+async def test_exit_wait_bound_waits_for_a_process_that_outlives_the_kill(
+    monkeypatch,
+):
+    # A process that outlives the kill keeps its pipes until it exits.
+    job = _held_pipe_job(monkeypatch, exits=False)
+    collected = asyncio.ensure_future(job.wait())
+    await asyncio.sleep(0)
+    await asyncio.wait_for(job.cancel(), 10)
+    # four times the bound: timers fire in deadline order, so the bound
+    # has passed when this sleep returns
+    await asyncio.sleep(0.2)
+    assert not job.proc.is_closing() and not collected.done()
+    job.proc.returncode = -9
+    await asyncio.wait_for(collected, 10)
+    assert job.proc.is_closing()
+    assert job.retcode == -9
+
+
+async def test_exit_wait_bound_gives_a_late_exit_a_whole_bound(
+    monkeypatch, caplog
+):
+    # The look that first finds the process gone leaves its pipes open:
+    # wait() may be about to collect that exit in the same loop turn.  A
+    # forced kill shows as an exit a moment after cancel() returns, so
+    # the first look comes early.
+    job = _held_pipe_job(monkeypatch, exits=False)
+    loop = asyncio.get_running_loop()
+    call_later = loop.call_later
+    looks = []
+
+    def spy(delay, callback, *args):
+        if callback is cronstable.job.RunningJob._bound_exit_wait:
+            looks.append((delay, args[1]))
+        return call_later(delay, callback, *args)
+
+    monkeypatch.setattr(loop, "call_later", spy)
+    # the exit registers a loop turn after the kill, as a real one does
+    job.proc.kill = lambda: loop.call_soon(job.proc.exit, -9)
+    collected = asyncio.ensure_future(job.wait())
+    await asyncio.sleep(0)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await asyncio.wait_for(job.cancel(), 10)
+        await asyncio.wait_for(collected, 10)
+    assert looks == [(0.01, False), (0.05, True)]
+    assert caplog.text.count("did not reach end-of-file") == 1
+
+
+@pytest.mark.parametrize("closing_at_exit", [False, True])
+async def test_cancel_bounds_a_drain_that_began_before_the_kill(
+    monkeypatch, caplog, closing_at_exit
+):
+    # wait() collected the exit before the cancel, so its drain has no
+    # bound of its own while a descendant holds the pipe.
+    job = _held_pipe_job(
+        monkeypatch,
+        capture=["stdout"],
+        wakes_at_exit=True,
+        closing_at_exit=closing_at_exit,
+    )
+    job.proc.stdout.feed_data(b"kept\n")
+    job.proc.exit(0)
+    collected = asyncio.ensure_future(job.wait())
+    await _wait_until(lambda: job.retcode == 0)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await asyncio.wait_for(job.cancel(), 10)
+        await asyncio.wait_for(collected, 10)
+    assert job.retcode == 0
+    assert job.stdout == "kept\n"
+    assert "did not reach end-of-file" in caplog.text
+
+
+async def test_cancelled_job_that_exited_with_an_escaped_descendant_finishes(
+    monkeypatch, caplog
+):
+    # The same ordering with a real process: the job exits by itself, a
+    # surviving helper holds its stdout, wait() collects the exit, and the
+    # cancel comes afterwards.
+    monkeypatch.setattr(
+        cronstable.platform, "kill_process_group", _never_reaches_the_group
+    )
+    monkeypatch.setattr(cronstable.job, "KILLED_STREAM_DRAIN_TIMEOUT", 1.0)
+    code = (
+        "import subprocess, sys; "
+        "p = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(30)']); "
+        "sys.stdout.buffer.write(('%d\\n' % p.pid).encode()); "
+        "sys.stdout.buffer.flush()"
+    )
+    job = _running_job(
+        "jobs:\n  - name: test\n"
+        + yaml_command([PYTHON, "-c", code])
+        + """
+    killTimeout: 1
+    schedule: "* * * * *"
+    captureStderr: false
+    captureStdout: true
+"""
+    )
+    await job.start()
+    await _wait_until(lambda: bool(job.output.lines))
+    helper_pid = int(job.output.lines[0][1])
+    try:
+        await _wait_until(
+            lambda: job.proc.returncode is not None, tries=1000
+        )
+        # an exit wait that begins after the exit resolves at once
+        collected = asyncio.ensure_future(job.wait())
+        await _wait_until(lambda: job.retcode is not None)
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await asyncio.wait_for(job.cancel(), 20)
+            await asyncio.wait_for(collected, 20)
+        assert job.retcode == 0
+        assert job.stdout == "%d\n" % helper_pid
+        assert "did not reach end-of-file" in caplog.text
+    finally:
+        os.kill(
+            helper_pid, signal.SIGKILL if not IS_WINDOWS else signal.SIGTERM
+        )
+
+
+async def test_run_that_wait_timed_out_keeps_a_drain_bound_per_stream(
+    monkeypatch, caplog
+):
+    # executionTimeout: wait() kills the run and drains each stream under
+    # its own bound, so cancel() adds none.
+    job = _held_pipe_job(monkeypatch, capture=["stderr", "stdout"])
+    job.config.executionTimeout = 0.01
+    job.execution_deadline = time.perf_counter()
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await asyncio.wait_for(job.wait(), 10)
+    assert job.retcode == -100
+    assert "stderr did not reach end-of-file" in caplog.text
+    assert "stdout did not reach end-of-file" in caplog.text
+    assert "output did not reach end-of-file" not in caplog.text
+
+
+async def test_cancel_reads_an_exit_that_the_exit_wait_withholds(
+    monkeypatch, caplog
+):
+    # A descendant that holds a pipe keeps the exit wait unresolved after
+    # the process has exited.  cancel() returns when the process exits.
+    job = _held_pipe_job(monkeypatch, exits=False)
+    job.config.killTimeout = 30
+    asyncio.get_running_loop().call_later(0.05, job.proc.exit, -15)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await asyncio.wait_for(job.cancel(), 10)
+    assert job.proc.returncode == -15
+    assert "did not gracefully terminate" not in caplog.text
+
+
+async def test_cancel_with_no_kill_timeout_lets_an_exit_register(
+    monkeypatch,
+):
+    # kill() on a process whose exit the loop has yet to see collects the
+    # exit status, so killTimeout 0 still yields to the loop once.
+    job = _held_pipe_job(monkeypatch, exits=False)
+    job.config.killTimeout = 0
+    loop = asyncio.get_running_loop()
+    # the exit registers a loop turn after the signal, as a real one does
+    job.proc.terminate = lambda: loop.call_soon(job.proc.exit, -15)
+    job.proc.kill = Mock()
+    await asyncio.wait_for(job.cancel(), 10)
+    assert job.proc.returncode == -15
+    job.proc.kill.assert_not_called()
+
+
+async def test_cancel_waits_out_kill_timeout_for_a_running_process(
+    monkeypatch, caplog
+):
+    # A process that outlives the graceful signal gets the whole
+    # killTimeout before the forced kill.
+    job = _held_pipe_job(monkeypatch, exits=False)
+    job.config.killTimeout = 0.3
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + job.config.killTimeout
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await asyncio.wait_for(job.cancel(), 10)
+    assert loop.time() >= deadline
+    assert "did not gracefully terminate after 0.3 seconds" in caplog.text
+
+
+def _held_pipe_checks(monkeypatch, returncode=None, **proc_kw):
+    """Give every verification check a :class:`_HeldPipeProcess`.
+
+    Each of its streams holds one line.  With ``returncode`` the check
+    has exited by the time it starts.
+    """
+
+    async def start(check):
+        check.proc = _HeldPipeProcess(**proc_kw)
+        if returncode is not None:
+            check.proc.exit(returncode)
+        for name in ("stderr", "stdout"):
+            stream = getattr(check.proc, name)
+            stream.feed_data(b"kept\n")
+            reader = cronstable.job.StreamReader(
+                "test", "verify." + name, stream, "", 10
+            )
+            setattr(check, "_%s_reader" % name, reader)
+
+    monkeypatch.setattr(cronstable.job.RunningJob, "start", start)
+
+
+async def test_verification_timeout_in_the_checks_drain_fails_the_run(
+    monkeypatch, caplog
+):
+    # The check has exited and a descendant holds its output, so
+    # verify.timeout expires while the check drains.  Each stream then
+    # has the drain bound, as it has when the check is still running.
+    job = _held_pipe_job(monkeypatch)
+    _held_pipe_checks(monkeypatch, returncode=0, wakes_at_exit=True)
+    job.config.verify = {"command": "true", "timeout": 0.05}
+    verified = asyncio.ensure_future(job._verify_result())
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await asyncio.wait({verified}, timeout=10)
+    assert verified.done() and not verified.cancelled()
+    assert job.verification["exit_code"] == -100
+    assert job.verification["stderr"] == "kept\n"
+    assert job.verification["stdout"] == "kept\n"
+    assert "verify.stderr did not reach end-of-file" in caplog.text
+    assert "verify.stdout did not reach end-of-file" in caplog.text
+
+
+async def test_cancelled_wait_closes_the_pipes_of_a_draining_check(
+    monkeypatch,
+):
+    # The caller's own cancellation still ends wait(), after the check's
+    # readers and pipes are closed.
+    job = _held_pipe_job(monkeypatch)
+    _held_pipe_checks(monkeypatch, returncode=0, wakes_at_exit=True)
+    job.config.verify = {"command": "true", "timeout": 30}
+    verified = asyncio.ensure_future(job._verify_result())
+    # the check's exit is collected, so its drain has begun
+    await _wait_until(
+        lambda: job._verifier is not None and job._verifier.retcode == 0
+    )
+    check = job._verifier
+    verified.cancel()
+    await asyncio.wait({verified}, timeout=10)
+    assert verified.cancelled()
+    assert job.verification == {
+        "outcome": "failure",
+        "fail_reason": "verification interrupted",
+    }
+    assert check.proc.is_closing()
+    assert check._stderr_reader._reader.done()
+    assert check._stdout_reader._reader.done()
+
+
+async def test_cancelled_wait_closes_the_pipes_of_a_timed_out_check(
+    monkeypatch,
+):
+    # verify.timeout has expired and the killed check is draining when
+    # the caller's cancellation arrives.
+    job = _held_pipe_job(monkeypatch)
+    _held_pipe_checks(monkeypatch, returncode=0, wakes_at_exit=True)
+    # that drain lasts until the cancellation is in
+    monkeypatch.setattr(cronstable.job, "KILLED_STREAM_DRAIN_TIMEOUT", 30)
+    job.config.verify = {"command": "true", "timeout": 0.05}
+    verified = asyncio.ensure_future(job._verify_result())
+    await _wait_until(
+        lambda: job._verifier is not None and job._verifier.stopped
+    )
+    check = job._verifier
+    verified.cancel()
+    monkeypatch.setattr(cronstable.job, "KILLED_STREAM_DRAIN_TIMEOUT", 0.05)
+    await asyncio.wait({verified}, timeout=10)
+    assert verified.cancelled()
+    assert job.verification == {
+        "outcome": "failure",
+        "fail_reason": "verification interrupted",
+    }
+    assert check.proc.is_closing()
+    assert check._stderr_reader._reader.done()
+    assert check._stdout_reader._reader.done()
+
+
+def _cmd_leave_helper(popen_kwargs=""):
+    """argv that starts a helper, writes the helper's pid, and exits.
+
+    The helper inherits the output pipes and outlives the command.
+    """
+    code = (
+        "import subprocess, sys; "
+        "p = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(30)']{}); "
+        "sys.stdout.buffer.write(('%d\\n' % p.pid).encode()); "
+        "sys.stdout.buffer.flush()"
+    ).format(popen_kwargs)
+    return [PYTHON, "-c", code]
+
+
+def _kill_helper(pid):
+    try:
+        os.kill(pid, signal.SIGKILL if not IS_WINDOWS else signal.SIGTERM)
+    except OSError:
+        pass
+
+
+async def test_verification_timeout_with_the_checks_output_held_open(
+    monkeypatch,
+):
+    # The same with real processes: the check exits, and a helper that it
+    # started holds its output past verify.timeout.
+    monkeypatch.setattr(
+        cronstable.platform, "kill_process_group", _never_reaches_the_group
+    )
+    monkeypatch.setattr(cronstable.job, "KILLED_STREAM_DRAIN_TIMEOUT", 0.25)
+    job = _running_job(
+        "jobs:\n  - name: test\n"
+        + yaml_command([PYTHON, "-c", "pass"])
+        + "\n    verify:\n"
+        + yaml_command(_cmd_leave_helper(), indent=6)
+        + "\n      timeout: 2\n"
+        + '    schedule: "* * * * *"\n'
+    )
+
+    async def check_has_exited():
+        # An exit wait that begins after the exit resolves at once on
+        # every asyncio, so the check goes on to drain its output.
+        await _wait_until(
+            lambda: job._verifier.proc.returncode is not None, tries=1000
+        )
+
+    job.on_verifying = check_has_exited
+    await job.start()
+    # a task of its own, as the reaper waits
+    collected = asyncio.ensure_future(job.wait())
+    try:
+        await asyncio.wait({collected}, timeout=30)
+        assert collected.done() and not collected.cancelled()
+        assert job.stopped
+        assert job.retcode == 0
+        assert job.verification["exit_code"] == -100
+        assert job.fail_reason == (
+            "verification failed: command exited with code -100"
+        )
+        published = [
+            line for name, line in job.output.lines if name == "verify.stdout"
+        ]
+        assert job.verification["stdout"] == "".join(published)
+    finally:
+        for name, line in job.output.lines:
+            if name == "verify.stdout":
+                _kill_helper(int(line))
+
+
+async def test_cancel_during_verification_ends_the_run(monkeypatch):
+    # cancel() has terminated the check, so the run has ended.  A
+    # descendant holds the check's output, and wait() collects the check
+    # and sends the stop metrics once the drain bound has passed.
+    job = _held_pipe_job(monkeypatch)
+    job.proc.exit(0)
+    job.proc.close()
+    _held_pipe_checks(monkeypatch)
+    job.config.verify = {"command": "true", "timeout": 30}
+    stops = []
+
+    async def job_stopped():
+        stops.append(job.failed)
+
+    job.statsd_writer = Mock(job_stopped=job_stopped)
+    collected = asyncio.ensure_future(job.wait())
+    await _wait_until(
+        lambda: job._verifier is not None and job._verifier.proc is not None
+    )
+    await job.cancel()
+    assert job.stopped and job.ended
+    ended_at = job.ended_at
+    assert ended_at is not None
+    assert not collected.done() and stops == []
+    await asyncio.wait_for(collected, 10)
+    assert job.verification["exit_code"] == -15
+    assert stops == [True]
+    assert job.ended_at is ended_at
+    # a repeated cancel sends no second set of stop metrics
+    await job.cancel()
+    assert stops == [True]
+    assert job.ended_at is ended_at
+
+
+async def test_cancel_before_the_check_spawns_ends_the_run_at_its_kill(
+    monkeypatch,
+):
+    # The check has no process yet, so the cancel has nothing to signal.
+    # The run ends once the check, spawned, is killed.
+    job = _held_pipe_job(monkeypatch)
+    job.proc.exit(0)
+    job.proc.close()
+    _held_pipe_checks(monkeypatch)
+    # the check's output stays held until the test lets go of it
+    monkeypatch.setattr(cronstable.job, "KILLED_STREAM_DRAIN_TIMEOUT", 30)
+    start = cronstable.job.RunningJob.start
+    spawning = asyncio.Event()
+    seen = []
+
+    async def held_start(check):
+        await spawning.wait()
+        await start(check)
+
+    async def on_verifying():
+        seen.append((job._verifier.proc is not None, job.ended))
+
+    monkeypatch.setattr(cronstable.job.RunningJob, "start", held_start)
+    job.on_verifying = on_verifying
+    job.config.verify = {"command": "true", "timeout": 30}
+    collected = asyncio.ensure_future(job.wait())
+    await _wait_until(lambda: job._verifier is not None)
+    check = job._verifier
+    await job.cancel()
+    assert check.proc is None
+    assert not job.stopped and not job.ended and job.ended_at is None
+    spawning.set()
+    await _wait_until(lambda: job.ended)
+    assert seen == [(True, False)]
+    assert check.stopped and job.ended_at is not None
+    assert not collected.done()
+    check.proc.close()
+    await asyncio.wait_for(collected, 10)
+    assert job.verification["exit_code"] == -15
+
+
+@pytest.mark.parametrize("expires_in", ["on_verifying", "the_kill"])
+async def test_cancel_before_the_check_spawns_ends_the_run_at_a_timeout_kill(
+    monkeypatch, expires_in
+):
+    # verify.timeout expires before verify() has killed the check: in
+    # on_verifying, or in a kill that the check outlives.  The run ends
+    # once the timeout has killed the check.
+    job = _held_pipe_job(monkeypatch)
+    job.proc.exit(0)
+    job.proc.close()
+    _held_pipe_checks(monkeypatch, exits=expires_in == "on_verifying")
+    # the check's output stays held until the test lets go of it
+    monkeypatch.setattr(cronstable.job, "KILLED_STREAM_DRAIN_TIMEOUT", 30)
+    start = cronstable.job.RunningJob.start
+    checks = []
+
+    async def start_after_cancel(check):
+        # the cancel arrives while the check has no process
+        await job.cancel()
+        checks.append((check, job.ended))
+        await start(check)
+
+    monkeypatch.setattr(
+        cronstable.job.RunningJob, "start", start_after_cancel
+    )
+    if expires_in == "on_verifying":
+        job.on_verifying = asyncio.Event().wait
+    else:
+        # longer than verify.timeout
+        job.config.killTimeout = 0.2
+    job.config.verify = {"command": "true", "timeout": 0.05}
+    collected = asyncio.ensure_future(job.wait())
+    # a poll shorter than the loop clock's tick (15.6 ms on Windows up
+    # to Python 3.12) does not sleep beside the kill's 10 ms poll
+    await _wait_until(
+        lambda: checks and checks[0][0].stopped, interval=0.05
+    )
+    check, ended_at_cancel = checks[0]
+    ended = (job.ended, job.ended_at is not None, collected.done())
+    # let go of the check's output, so that wait() returns
+    check.proc.close()
+    await asyncio.wait_for(collected, 10)
+    assert not ended_at_cancel
+    assert ended == (True, True, False)
+    assert job.verification["exit_code"] == -100
+
+
+@pytest.mark.parametrize(
+    "answer, signals",
+    [
+        (None, []),
+        (PermissionError, []),
+        (ProcessLookupError, [False, True]),
+    ],
+    ids=["a-process", "another-users-process", "no-process"],
+)
+async def test_cancel_spares_the_group_of_a_reused_pid(
+    monkeypatch, answer, signals
+):
+    # The leader is reaped.  A process that answers to its pid is then an
+    # unrelated one, and the group that it leads is left alone.
+    job = _held_pipe_job(monkeypatch)
+    job.proc.exit(0)
+    probes = []
+    sent = []
+
+    def kill(pid, sig):
+        probes.append((pid, sig))
+        if answer is not None:
+            raise answer()
+
+    async def kill_process_group(pid, *, force):
+        sent.append(force)
+        return False
+
+    monkeypatch.setattr(cronstable.platform, "IS_WINDOWS", False)
+    monkeypatch.setattr(cronstable.platform.os, "kill", kill)
+    monkeypatch.setattr(
+        cronstable.platform, "kill_process_group", kill_process_group
+    )
+    await asyncio.wait_for(job.cancel(), 10)
+    assert sent == signals
+    assert probes == [(4321, 0), (4321, 0)]
+
+
+async def test_cancel_signals_a_running_leaders_group_unprobed(monkeypatch):
+    # A leader that is still running answers to its own pid, so the probe
+    # is for a reaped leader only.
+    job = _held_pipe_job(monkeypatch, exits=False)
+    sent = []
+
+    async def kill_process_group(pid, *, force):
+        sent.append(force)
+        return True
+
+    monkeypatch.setattr(cronstable.platform, "IS_WINDOWS", False)
+    monkeypatch.setattr(
+        cronstable.platform.os, "kill", Mock(side_effect=AssertionError)
+    )
+    monkeypatch.setattr(
+        cronstable.platform, "kill_process_group", kill_process_group
+    )
+    await asyncio.wait_for(job.cancel(), 10)
+    assert sent == [False, True]
+
+
+def test_pid_reused_is_never_probed_on_windows(monkeypatch):
+    # os.kill(pid, 0) sends CTRL_C_EVENT there.
+    monkeypatch.setattr(cronstable.platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        cronstable.platform.os, "kill", Mock(side_effect=AssertionError)
+    )
+    assert cronstable.platform.pid_reused(4321) is False
+
+
+def _leaves_helper_yaml(popen_kwargs=""):
+    return (
+        "jobs:\n  - name: test\n"
+        + yaml_command(_cmd_leave_helper(popen_kwargs))
+        + """
+    killTimeout: 1
+    schedule: "* * * * *"
+    captureStderr: false
+    captureStdout: true
+"""
+    )
+
+
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="process groups (and killpg) are POSIX-only"
+)
+async def test_cancel_reaches_the_group_of_a_leader_that_has_exited():
+    # The leader is reaped and a helper in its group holds the output.
+    # The group keeps the leader's pid out of use, so no process answers
+    # to it and the group is signaled.
+    job = _running_job(_leaves_helper_yaml())
+    await job.start()
+    await _wait_until(lambda: bool(job.output.lines))
+    helper_pid = int(job.output.lines[0][1])
+    try:
+        await _wait_until(
+            lambda: job.proc.returncode is not None, tries=1000
+        )
+        await asyncio.wait_for(job.cancel(), 20)
+        assert await _await_reaped(helper_pid), (
+            "the helper outlived the group kill"
+        )
+        await asyncio.wait_for(job.wait(), 20)
+        assert job.stdout == "%d\n" % helper_pid
+    finally:
+        _kill_helper(helper_pid)
+
+
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="process groups (and killpg) are POSIX-only"
+)
+async def test_cancel_spares_a_process_that_took_a_reaped_leaders_pid(
+    monkeypatch,
+):
+    # The helper left the leader's session and holds the output, so the
+    # leader's pid is free.  A stranger that leads a group of its own
+    # stands in for the process that the kernel gave the pid to.
+    job = _running_job(_leaves_helper_yaml(", start_new_session=True"))
+    await job.start()
+    await _wait_until(lambda: bool(job.output.lines))
+    helper_pid = int(job.output.lines[0][1])
+    stranger = await asyncio.create_subprocess_exec(
+        PYTHON, "-c", "import time; time.sleep(30)", start_new_session=True
+    )
+    sent = []
+    killpg = os.killpg
+
+    def recording(pgid, sig):
+        sent.append((pgid, sig))
+        killpg(pgid, sig)
+
+    try:
+        await _wait_until(
+            lambda: job.proc.returncode is not None, tries=1000
+        )
+        monkeypatch.setattr(job.proc, "pid", stranger.pid)
+        monkeypatch.setattr(os, "killpg", recording)
+        await asyncio.wait_for(job.cancel(), 20)
+        assert sent == []
+        assert stranger.returncode is None
+    finally:
+        _kill_helper(helper_pid)
+        if stranger.returncode is None:
+            stranger.kill()
+        await stranger.wait()
+        await asyncio.wait_for(job.wait(), 20)
+
+
 async def test_untouched_job_drain_is_not_bounded(monkeypatch):
     # The bound is only for a run we killed: a job left to exit on its own owns
     # its lifetime, and its output is not ours to cut short. Assert the gate,
@@ -2922,6 +3720,8 @@ async def test_cancel_with_no_process_is_noop():
     # the reaper path still pairs the finish: conventional 127 exit
     await job.wait()
     assert job.retcode == 127
+    # no process ran, so the run has no end instant
+    assert job.ended and job.ended_at is None
 
 
 # --- shell reporter timeout --------------------------------------------------

@@ -196,6 +196,11 @@ def test_bench_smoke_produces_results(tmp_path):
     # json.roundtrip_orjson_3k where orjson is absent (the tox envs).
     needs_nacl = ("push.seal_500", "push.fanout_8x100")
     for name in _expected_gated_names():
+        # Ahead of the excuses: an excused metric skips, and a skipped
+        # metric still has its row in the document.
+        assert name in results, (
+            "expected-gated metric %s is not registered" % name
+        )
         if name.startswith("webui."):
             continue
         if name.startswith("mem.rss_") and os.name == "nt":
@@ -206,10 +211,35 @@ def test_bench_smoke_produces_results(tmp_path):
             continue
         if name == "json.roundtrip_orjson_3k" and not _importable("orjson"):
             continue
-        assert name in results, (
-            "expected-gated metric %s is not registered" % name
-        )
         assert not results[name]["skipped"], results[name]
+
+
+# Gating benchmarks that expected_gated.txt leaves out, each for the reason
+# given at the bottom of that file.
+_UNLISTED_GATING = {
+    "pair.qr_encode_14",
+    "webapi.activity_capped_bytes_500",
+    "webui.swim_400x49",
+}
+
+
+def test_gating_benchmarks_and_expected_gated_list_agree():
+    # A gating benchmark missing from the list has no dead-gate check, and
+    # the release comparison reports nothing for it.
+    bench = _load_bench()
+    names = [spec["name"] for spec in bench._BENCHMARKS]
+    assert len(names) == len(set(names)), sorted(
+        name for name in set(names) if names.count(name) > 1
+    )
+    listed = _expected_gated_names()
+    assert len(listed) == len(set(listed)), sorted(
+        name for name in set(listed) if listed.count(name) > 1
+    )
+    gating = {spec["name"] for spec in bench._BENCHMARKS if not spec["info"]}
+    # compare.py never counts an info benchmark as compared, so a listed
+    # one fails every release.
+    assert set(listed) <= gating, sorted(set(listed) - gating)
+    assert gating - set(listed) == _UNLISTED_GATING
 
 
 def test_bench_only_filter(tmp_path):
@@ -236,21 +266,430 @@ def test_child_env_names_the_package_that_the_harness_measures(
     # A child benchmark runs in a temp directory, so a relative PYTHONPATH
     # entry would name another directory for it than for the harness, and
     # the subprocess benchmarks would measure another copy of the package.
+    # An empty entry is relative too: Python reads it as the current
+    # directory.
     bench = _load_bench()
     monkeypatch.chdir(tmp_path)
+    here = os.path.abspath(".")
     other = str(tmp_path / "elsewhere")
-    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([".", other, ""]))
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["sub", other, ""]))
     monkeypatch.setattr(bench, "_SRC_FALLBACK", None)
     paths = bench._child_env()["PYTHONPATH"].split(os.pathsep)
-    assert paths == [os.path.abspath("."), other]
+    assert paths == [os.path.join(here, "sub"), other, here]
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["", other]))
+    paths = bench._child_env()["PYTHONPATH"].split(os.pathsep)
+    assert paths == [here, other]
     # the source fallback goes first, as it does on the harness's own path
     monkeypatch.setattr(bench, "_SRC_FALLBACK", "/src")
     paths = bench._child_env()["PYTHONPATH"].split(os.pathsep)
-    assert paths == ["/src", os.path.abspath("."), other]
+    assert paths == ["/src", here, other]
+    # Python ignores a PYTHONPATH that is set to nothing, so it adds no
+    # entry here either
+    monkeypatch.setenv("PYTHONPATH", "")
+    assert bench._child_env()["PYTHONPATH"] == "/src"
     monkeypatch.delenv("PYTHONPATH")
     assert bench._child_env()["PYTHONPATH"] == "/src"
     monkeypatch.setattr(bench, "_SRC_FALLBACK", None)
     assert "PYTHONPATH" not in bench._child_env()
+
+
+_FAILING_CHILD = (
+    "import sys\n"
+    "sys.stderr.write('first line\\nthe cause\\n')\n"
+    "sys.exit(7)\n"
+)
+
+
+def test_failed_child_skips_with_a_one_line_reason_naming_the_cause():
+    # The reason is printed on the benchmark's result line and stored in
+    # the result document, and a release that fails on the skip is
+    # diagnosed from it.
+    bench = _load_bench()
+    with pytest.raises(bench.Skip) as caught:
+        bench._timed_child(["-c", _FAILING_CHILD, "an-argument"])
+    reason = str(caught.value)
+    assert "\n" not in reason, reason
+    assert reason == (
+        "child exited 7: -c <script> an-argument (stderr: the cause)"
+    )
+    # a one-line script stays in the reason
+    with pytest.raises(bench.Skip) as caught:
+        bench._timed_child(["-c", "import sys; sys.exit(3)"])
+    assert str(caught.value) == "child exited 3: -c import sys; sys.exit(3)"
+    assert bench._timed_child(["-c", "pass"]) > 0.0
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="peak RSS is read through getrusage"
+)
+def test_failed_rss_child_skips_with_the_target_and_its_cause():
+    # The target runs under a wrapper process, which has to pass the
+    # target's stderr on.
+    bench = _load_bench()
+    with pytest.raises(bench.Skip) as caught:
+        bench._child_peak_rss_mb(["-c", _FAILING_CHILD, "an-argument"])
+    assert str(caught.value) == (
+        "child exited 7: -c <script> an-argument (stderr: the cause)"
+    )
+    assert bench._child_peak_rss_mb(["-c", "pass"]) > 0.0
+
+
+_HUNG_CHILD = (
+    "import sys, time\n"
+    "time.sleep(30)\n"
+    "open(sys.argv[1], 'w').close()\n"
+)
+
+
+def test_hung_child_is_killed_and_skips(monkeypatch, tmp_path):
+    # Without a bound, a child that never exits holds the perf job until
+    # the job's own time limit.  The child's sleep outlasts the bound and
+    # ends inside the test's time limit.  A child that the kill misses
+    # then writes a file, which fails the test.
+    bench = _load_bench()
+    outlived = tmp_path / "outlived"
+    monkeypatch.setattr(bench, "_CHILD_TIMEOUT", 0.25)
+    with pytest.raises(bench.Skip, match="child timed out") as caught:
+        bench._timed_child(["-c", _HUNG_CHILD, str(outlived)])
+    assert "-c <script>" in str(caught.value)
+    assert not outlived.exists()
+
+
+def test_main_names_a_benchmark_before_it_runs(capsys):
+    # A result line prints when a benchmark ends, so the log of a run that
+    # hangs would otherwise end on the benchmark before the stuck one.
+    bench = _load_bench()
+    printed = []
+
+    @bench.bench("zznamed.first", "zznamed", repeats=(1, 1, 1))
+    def _first():
+        printed.append(capsys.readouterr())
+        return 0.001
+
+    assert bench.main(["--smoke", "--no-stabilize", "--only", "zznamed"]) == 0
+    assert printed[0].err.splitlines()[-1] == "running zznamed.first"
+    assert "zznamed.first" not in printed[0].out
+
+
+@pytest.mark.parametrize(
+    "failure, reason",
+    [
+        ("skip", "child timed out after 360s: -c <script>"),
+        ("error", "error: RuntimeError('boom')"),
+    ],
+)
+def test_failure_on_a_later_repeat_is_recorded_and_printed(
+    tmp_path, capsys, failure, reason
+):
+    # The repeats that measured stay the row's values, so the reason of
+    # the repeat that failed is the only record of a child that crashed
+    # or hung.
+    bench = _load_bench()
+    calls = []
+
+    @bench.bench("zzshort.later", "zzshort", repeats=(3, 3, 3))
+    def _later():
+        calls.append(True)
+        if len(calls) < 2:
+            return 0.002
+        if failure == "skip":
+            raise bench.Skip("child timed out after 360s: -c <script>")
+        raise RuntimeError("boom")
+
+    @bench.bench("zzshort.whole", "zzshort", repeats=(3, 3, 3))
+    def _whole():
+        return 0.002
+
+    out = tmp_path / "short.json"
+    args = ["--smoke", "--no-stabilize", "--only", "zzshort"]
+    assert bench.main(args + ["--json", str(out)]) == 0
+    printed = capsys.readouterr().out
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    rows = {r["name"]: r for r in doc["results"]}
+    short = rows["zzshort.later"]
+    assert not short["skipped"] and short["values"] == [0.002]
+    assert (short["runs"], short["repeats"]) == (1, 3)
+    assert short["partial_reason"] == reason
+    # a result line starts with its benchmark's name
+    lines = {
+        line.split()[0]: line
+        for line in printed.splitlines()
+        if line.startswith("zzshort.")
+    }
+    assert lines["zzshort.later"].endswith(
+        "PARTIAL (1 of 3 repeats: %s)" % reason
+    )
+    assert "2 benchmarks, 0 skipped, 1 partial" in printed
+    # a benchmark that ran every repeat carries neither field
+    whole = rows["zzshort.whole"]
+    assert whole["runs"] == 3
+    assert "partial_reason" not in whole and "repeats" not in whole
+    assert "PARTIAL" not in lines["zzshort.whole"]
+
+
+# Each memo a benchmark empties by name before a timed call, as (owner,
+# attribute).  bench.py reaches every one through getattr with a default,
+# so that it also runs against a release that predates the memo.
+_CLEARED_MEMOS = (
+    ("dag", "_summaries_memo"),
+    ("dag", "_dag_summary_cache"),
+    ("cron", "_jobs_response_memo"),
+    ("cron", "_metrics_response_memo"),
+    ("cron", "_metric_samples_memo"),
+    ("cron", "_activity_response_memo"),
+)
+
+
+def test_memos_that_benchmarks_clear_by_name_exist_in_the_package():
+    # A memo renamed in the package leaves the benchmark's clear with
+    # nothing to reach, and the timed region then measures memo hits.
+    from cronstable.cron import Cron
+
+    with open(BENCH, encoding="utf-8") as f:
+        source = f.read()
+    cron = Cron(
+        None,
+        config_yaml=(
+            "jobs:\n  - name: j\n    command: 'x'\n"
+            "    schedule: '0 0 * * *'\n"
+        ),
+    )
+    owners = {"cron": cron, "dag": cron._dag}
+    for owner, name in _CLEARED_MEMOS:
+        assert '"%s"' % name in source, (
+            "bench.py does not reach %s; drop it from _CLEARED_MEMOS" % name
+        )
+        assert hasattr(owners[owner], name), (
+            "%s is gone from the package but bench.py still clears it by "
+            "that name" % name
+        )
+    assert isinstance(cron._dag._summaries_memo, dict)
+    assert isinstance(cron._dag._dag_summary_cache, dict)
+    for memo in (
+        cron._jobs_response_memo,
+        cron._metric_samples_memo,
+        cron._activity_response_memo,
+        *cron._metrics_response_memo.values(),
+    ):
+        assert memo.cached is None
+
+
+def test_benchmark_fails_when_its_memo_clear_reaches_nothing(monkeypatch):
+    # The harness as it would behave after such a rename: every memo name
+    # it reaches for is one the package lacks.  Each benchmark counts the
+    # work under its memo and has to raise, where a result would read as
+    # a large improvement.
+    import types
+
+    from cronstable import cron as cron_mod
+
+    with open(BENCH, encoding="utf-8") as f:
+        source = f.read()
+    for _owner, name in _CLEARED_MEMOS:
+        source = source.replace('"%s"' % name, '"%s_absent"' % name)
+    # A product that never ages: loop.stall_jobs_500 passes on one build,
+    # which a product that expired during a stalled run would cause.
+    monkeypatch.setattr(cron_mod, "_JOBS_RESPONSE_TTL", 3600.0)
+    bench = types.ModuleType("_bench_mod_renamed")
+    bench.__file__ = BENCH
+    exec(compile(source, BENCH, "exec"), bench.__dict__)
+    bench._MODE = "smoke"
+    specs = {spec["name"]: spec for spec in bench._BENCHMARKS}
+    try:
+        for name, complaint in (
+            ("dag.list_dags_warm_x300", "timed memo hits"),
+            ("dag.list_runs_warm", "timed memo hits"),
+            ("dag.full_sweep_50x200", "reused cached summaries"),
+            ("webapi.jobs_payload_500", "timed memo hits"),
+            ("mcp.query_metrics_500", "timed memo hits"),
+            ("loop.stall_jobs_500", "gauged an idle loop"),
+            ("loop.stall_metrics_2000", "gauged an idle loop"),
+        ):
+            with pytest.raises(RuntimeError, match=complaint):
+                specs[name]["fn"]()
+    finally:
+        bench._evict_fixtures("renamed")
+
+
+def test_benchmark_fails_when_its_memo_clear_reaches_an_unused_memo(
+    monkeypatch,
+):
+    # These two skip when their memo's name is gone.  Here the package
+    # still has the name and another slot serves the product, so the clear
+    # succeeds and the timed requests are memo hits.
+    import types
+
+    from cronstable import cron as cron_mod
+
+    with open(BENCH, encoding="utf-8") as f:
+        source = f.read()
+    for name in ("_activity_response_memo", "_jobs_response_memo"):
+        source = source.replace('"%s"' % name, '"%s_unused"' % name)
+        monkeypatch.setattr(
+            cron_mod.Cron,
+            name + "_unused",
+            types.SimpleNamespace(cached=None),
+            raising=False,
+        )
+    # a product that never ages, so a stalled run cannot turn a hit into
+    # a build
+    monkeypatch.setattr(cron_mod, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cron_mod, "_JOBS_RESPONSE_TTL", 3600.0)
+    bench = types.ModuleType("_bench_mod_unused")
+    bench.__file__ = BENCH
+    exec(compile(source, BENCH, "exec"), bench.__dict__)
+    # A floor of two on every scaled count: the /pools loop's first /jobs
+    # request has no earlier product to hit, and smoke mode makes only one.
+    bench._MODE = "smoke"
+    scaled = bench._n
+    bench._n = lambda base, floor=1: scaled(base, max(floor, 2))
+    specs = {spec["name"]: spec for spec in bench._BENCHMARKS}
+    try:
+        for name in ("webapi.activity_build_500", "webapi.pools_poll_4x130"):
+            with pytest.raises(RuntimeError, match="timed memo hits"):
+                specs[name]["fn"]()
+    finally:
+        bench._evict_fixtures("unused")
+
+
+def _bench_fn(bench, name):
+    return next(s["fn"] for s in bench._BENCHMARKS if s["name"] == name)
+
+
+def test_stream_passthrough_hands_the_mirror_a_batch_per_read(monkeypatch):
+    # A pipe delivers a read at a time and the reader hands the mirror one
+    # batch per read.  A stream that is whole before the reader starts
+    # yields one batch, and the benchmark then pays a per-batch cost once.
+    from cronstable import job
+
+    bench = _load_bench()
+    monkeypatch.setattr(bench, "_MODE", "quick")
+    batches = []
+    submit = job._MIRROR.submit
+
+    def counting(job_name, stream_name, text):
+        batches.append(len(text))
+        return submit(job_name, stream_name, text)
+
+    monkeypatch.setattr(job._MIRROR, "submit", counting)
+    try:
+        _bench_fn(bench, "job.stream_passthrough_240k")()
+    finally:
+        bench._evict_fixtures("job")
+    # 24k lines are about 1.2 MiB, which is 20 reads of 64 KiB; the bound
+    # leaves room for an event loop that orders its callbacks differently
+    assert len(batches) >= 10, batches
+    assert max(batches) < 4 * 65536, batches
+
+
+@pytest.mark.parametrize(
+    "name, queues",
+    [
+        ("job.launch_reap_2k", True),
+        ("job.launch_fail_retry_2k", True),
+        # This one reads the memory a finished batch can pin.  Behind the
+        # gate the reaper's last batch is the 4 runs past the 16 permits,
+        # and a pinned batch that small stays under the metric's floor.
+        ("mem.launch_reap_steady_20x55", False),
+    ],
+)
+def test_launch_herd_timings_queue_on_the_spawn_gate(name, queues):
+    # A real spawn suspends, so every launch past the gate's permits waits
+    # on it.  A stubbed spawn that returns at once never fills the gate,
+    # and the herd then skips the queueing that a real one pays.
+    import asyncio
+
+    bench = _load_bench()
+    # full mode is the one where each herd is larger than the gate
+    bench._MODE = "full"
+    waited = []
+
+    class _Gate(asyncio.Semaphore):
+        async def acquire(self):
+            if self.locked():
+                waited.append(True)
+            return await super().acquire()
+
+    herd_cron = bench._herd_cron
+
+    def counting_cron():
+        cron = herd_cron()
+        assert isinstance(cron._spawn_gate, asyncio.Semaphore)
+        cron._spawn_gate = _Gate(cron._spawn_gate._value)
+        return cron
+
+    bench._herd_cron = counting_cron
+    try:
+        _bench_fn(bench, name)()
+    finally:
+        bench._evict_fixtures("job")
+    assert bool(waited) == queues, (name, len(waited))
+
+
+def test_tui_poll_benchmark_keeps_the_payload_decode_off_the_clock(
+    monkeypatch,
+):
+    # The stand-in API's JSON decode is the standard library's work on a
+    # body the harness serialized; inside the timed region it would be
+    # most of the value and no change to the dashboard could move it.
+    import time
+
+    bench = _load_bench()
+    monkeypatch.setattr(bench, "_MODE", "smoke")
+    events = []
+
+    class _Time:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        def perf_counter(self):
+            events.append("clock")
+            return time.perf_counter()
+
+    class _Json:
+        def __getattr__(self, name):
+            return getattr(json, name)
+
+        def loads(self, text):
+            events.append("decode")
+            return json.loads(text)
+
+    monkeypatch.setattr(bench, "time", _Time())
+    monkeypatch.setattr(bench, "json", _Json())
+    try:
+        _bench_fn(bench, "tui.poll_absorb_5k")()
+    finally:
+        bench._evict_fixtures("tui")
+    assert "decode" in events and "clock" in events
+    running = False
+    for event in events:
+        if event == "clock":
+            running = not running
+        else:
+            assert not running, events
+    assert not running, events
+
+
+def test_seeded_store_fixtures_rebuild_into_a_fresh_directory():
+    # The harness drops every fixture at a group boundary and builds one
+    # again when a later benchmark asks.  These builders append to their
+    # store, so a second build into the same directory doubles it, and
+    # each benchmark below checks the size of the store it reads.
+    bench = _load_bench()
+    bench._MODE = "smoke"
+    names = (
+        "state.list_records_warm",
+        "state.artifact_get_oldest_2k",
+        "state.artifact_put_distinct_2k",
+        "jobapi.sem_denied_64x10",
+        "mem.gc_manifest_scan_128x2k",
+    )
+    for _build in range(2):
+        try:
+            for name in names:
+                _bench_fn(bench, name)()
+        finally:
+            bench._evict_fixtures("state")
 
 
 def test_yaml_parse_is_gated_above_the_quadratic_threshold(monkeypatch):
@@ -846,6 +1285,58 @@ def test_gate_coverage_ignores_info_only_metrics(tmp_path):
     assert "**Regression check: passed.**" in text
 
 
+def test_compare_warns_when_a_compared_metric_skipped_or_ran_short(tmp_path):
+    # The merge keeps the rounds that measured, so the metric counts as
+    # compared and the exit code is the gate's.  The warning is the only
+    # sign in the job log that a child crashed or hung.
+    name = "startup.daemon_first_pass_2k"
+    hung = "child timed out after 360s: -m cronstable"
+    short = _entry(name, 1.0)
+    short.update(runs=1, repeats=2, partial_reason=hung)
+    whole = [
+        _write(tmp_path / ("whole%d.json" % i), _doc([_entry(name, 1.0)]))
+        for i in (1, 2)
+    ]
+    broken = [
+        _write(tmp_path / "broken1.json", _doc([short])),
+        _write(tmp_path / "broken2.json", _doc([_skipped(name, hung)])),
+    ]
+    expected = tmp_path / "expected.txt"
+    expected.write_text(name + "\n", encoding="utf-8")
+    merged = tmp_path / "merged.json"
+    args = [COMPARE, "--expected-gated", str(expected)]
+    args += ["--merged-out", str(merged)]
+    rounds = [
+        "round 1 ran 1 of 2 repeats (%s)" % hung,
+        "round 2 skipped (%s)" % hung,
+    ]
+    for side, base, cur in (
+        ("current", whole, broken),
+        ("baseline", broken, whole),
+    ):
+        proc = _run(args + ["--baseline"] + base + ["--current"] + cur)
+        assert proc.returncode == 0, proc.stdout
+        assert "compared 1 metrics" in proc.stdout
+        assert "0 gate violation(s)" in proc.stdout
+        warnings = [
+            line
+            for line in proc.stdout.splitlines()
+            if line.startswith("::warning::")
+        ]
+        assert warnings == [
+            "::warning::perf gate: %s was compared with a short %s side: %s"
+            % (name, side, "; ".join(rounds))
+        ]
+        row = json.loads(merged.read_text(encoding="utf-8"))["results"][0]
+        assert row.get("short_rounds") == (
+            rounds if side == "current" else None
+        )
+    # every round ran every repeat, so there is nothing to report
+    proc = _run(args + ["--baseline"] + whole + ["--current"] + whole)
+    assert proc.returncode == 0, proc.stdout
+    assert "::warning::" not in proc.stdout
+
+
 def test_rel_cov_is_robust_to_one_outlier_round():
     compare = _load_compare()
     steady = {"round_values": [1.00, 1.05, 0.95, 1.02, 0.98]}
@@ -1065,6 +1556,36 @@ def test_budget_breach_fails_and_accept_does_not_excuse_it(tmp_path):
     assert "perf budget" not in proc.stdout
 
 
+@pytest.mark.parametrize("broken", ["nan", "inf", "-inf"])
+def test_non_finite_value_breaches_its_budget(tmp_path, broken):
+    # NaN compares false against every ceiling, and -inf sits under every
+    # one, so neither can exceed a limit by comparison alone.
+    base = _write(
+        tmp_path / "base.json",
+        _doc([_entry("schedule.cold_build_100k", 0.5)]),
+    )
+    cur = _write(
+        tmp_path / "cur.json",
+        _doc(
+            [_entry("schedule.cold_build_100k", float(broken))],
+            version="1.1.0",
+        ),
+    )
+    budgets = _budgets(
+        tmp_path / "budgets.json",
+        {"schedule.cold_build_100k": {"max": 4.0, "unit": "s"}},
+    )
+    args = [COMPARE, "--baseline", base, "--current", cur]
+    args += ["--budgets", budgets]
+    proc = _run(args)
+    assert proc.returncode == 1, proc.stdout
+    assert "::error::perf budget: schedule.cold_build_100k" in proc.stdout
+    assert _run(args + ["--accept"]).returncode == 1
+    proc = _run(args + ["--warn-only"])
+    assert proc.returncode == 0, proc.stdout
+    assert "::warning::perf budget:" in proc.stdout
+
+
 def test_budgeted_metric_not_measured_warns_but_does_not_fail(tmp_path):
     # A skipped/absent budgeted metric is lost COVERAGE, which is
     # expected_gated.txt's job to fail on; the budget check only warns so the
@@ -1177,29 +1698,191 @@ def test_expected_gated_dead_gate_fails(tmp_path):
     assert proc.returncode == 0, proc.stdout
 
 
+def _gate_pair(tmp_path, tag, base_value, cur_value, mode="full"):
+    """Paths of a baseline and a current document that hold tui.drawer at
+    the two values, beside a metric that compares cleanly."""
+    paths = []
+    for side, value in (("base", base_value), ("cur", cur_value)):
+        doc = _doc(
+            [_entry("startup.version", 0.1), _entry("tui.drawer", value)]
+        )
+        doc["mode"] = mode
+        paths.append(_write(tmp_path / ("%s-%s.json" % (tag, side)), doc))
+    return paths
+
+
+@pytest.mark.parametrize(
+    "tag, base_value, cur_value",
+    [
+        ("zero-base", 0.0, 0.5),
+        ("zero-both", 0.0, 0.0),
+        ("negative-base", -0.001, 40.0),
+        ("nan-base", float("nan"), 0.09),
+        ("nan-cur", 0.09, float("nan")),
+        ("inf-cur", 0.09, float("inf")),
+    ],
+)
+def test_value_that_no_limit_can_fire_on_is_a_dead_gate(
+    tmp_path, tag, base_value, cur_value
+):
+    # A percentage change needs a finite pair and a baseline above zero.
+    # Without them no limit can fire, whatever the current side reads, so
+    # the metric is counted with the uncompared ones and a listed one
+    # fails the run.
+    base, cur = _gate_pair(tmp_path, tag, base_value, cur_value)
+    expected = tmp_path / "expected.txt"
+    expected.write_text("startup.version\ntui.drawer\n", encoding="utf-8")
+    md = tmp_path / "out.md"
+    args = [
+        COMPARE,
+        "--baseline",
+        base,
+        "--current",
+        cur,
+        "--expected-gated",
+        str(expected),
+    ]
+    proc = _run(args + ["--md", str(md)])
+    assert proc.returncode == 1, proc.stdout
+    assert "::error::perf gate integrity: tui.drawer" in proc.stdout
+    assert "compared 1 metrics" in proc.stdout
+    text = md.read_text(encoding="utf-8")
+    assert "**Regression check: passed** for 1 of 2 metrics" in text
+    assert "No percentage comparison available: tui.drawer." in text
+    assert "nan%" not in text and "inf%" not in text
+    # not [perf:accept]-able; --warn-only still downgrades.
+    assert _run(args + ["--accept"]).returncode == 1
+    proc = _run(args + ["--warn-only"])
+    assert proc.returncode == 0, proc.stdout
+    assert "::warning::perf gate integrity: tui.drawer" in proc.stdout
+
+
+def test_zero_reading_of_a_reduced_workload_is_not_a_dead_gate(tmp_path):
+    # --quick and --smoke shrink a workload until it can finish inside one
+    # step of its clock (webui.log_count_5k does in --quick), so a zero
+    # there is the mode's doing and does not fail a local paired run.
+    expected = tmp_path / "expected.txt"
+    expected.write_text("startup.version\ntui.drawer\n", encoding="utf-8")
+    for mode in ("quick", "smoke"):
+        for cur_value in (0.0, 0.0001):
+            base, cur = _gate_pair(tmp_path, mode, 0.0, cur_value, mode=mode)
+            proc = _run(
+                [
+                    COMPARE,
+                    "--baseline",
+                    base,
+                    "--current",
+                    cur,
+                    "--expected-gated",
+                    str(expected),
+                ]
+            )
+            assert proc.returncode == 0, (mode, cur_value, proc.stdout)
+            assert "integrity" not in proc.stdout
+        # every other reading that cannot gate still fails in these modes
+        for base_value, cur_value in (
+            (-0.001, 0.09),
+            (0.09, float("nan")),
+            (float("nan"), 0.09),
+        ):
+            base, cur = _gate_pair(
+                tmp_path, mode, base_value, cur_value, mode=mode
+            )
+            proc = _run(
+                [
+                    COMPARE,
+                    "--baseline",
+                    base,
+                    "--current",
+                    cur,
+                    "--expected-gated",
+                    str(expected),
+                ]
+            )
+            assert proc.returncode == 1, (mode, base_value, proc.stdout)
+            assert "perf gate integrity: tui.drawer" in proc.stdout
+
+
+def test_non_finite_round_decides_the_merged_value():
+    # min() and median() skip or keep a NaN depending on where it sits in
+    # the round order, so a broken round must not merge away.
+    import math
+
+    compare = _load_compare()
+    for estimator in ("min", "median"):
+        for position in range(3):
+            values = [1.0, 1.1, 0.9]
+            values[position] = float("nan")
+            docs = []
+            for value in values:
+                entry = _entry("state.broken", value)
+                entry["compare"] = estimator
+                docs.append(_doc([entry]))
+            merged = compare._merge(docs)["state.broken"]
+            assert math.isnan(merged["value"]), (estimator, position)
+            # statistics.stdev raises on a NaN, so the noise estimate
+            # stands down
+            assert compare._rel_cov(merged) is None
+
+
 def test_incomparable_sides_refuse_to_gate(tmp_path):
-    # A one-sided backend (orjson here) turns a backend swap into a fake code
-    # regression, or masks a real one; the pairing is invalid either way, so
-    # the comparison refuses a verdict entirely -- exit 2 even under
-    # --warn-only, never a pass or a fail.
-    base_doc = _doc([_entry("json.roundtrip_3k", 0.7)])
-    base_doc["orjson"] = False
-    cur_doc = _doc([_entry("json.roundtrip_3k", 0.4)], version="1.1.0")
-    cur_doc["orjson"] = True
-    base = _write(tmp_path / "base.json", base_doc)
-    cur = _write(tmp_path / "cur.json", cur_doc)
-    for flags in ([], ["--warn-only"]):
-        proc = _run([COMPARE, "--baseline", base, "--current", cur] + flags)
-        assert proc.returncode == 2, (flags, proc.stdout)
-        assert "not comparable" in proc.stdout
-        assert "orjson" in proc.stdout
-    # Mixed run modes WITHIN one side are just as invalid.
-    cur_quick = _doc([_entry("json.roundtrip_3k", 0.1)], version="1.1.0")
-    cur_quick["orjson"] = True
-    cur_quick["mode"] = "quick"
-    cur2 = _write(tmp_path / "cur2.json", cur_quick)
-    proc = _run([COMPARE, "--baseline", base, "--current", cur, cur2])
-    assert proc.returncode == 2, proc.stdout
+    # A one-sided backend turns a backend swap into a fake code regression,
+    # or masks a real one; the pairing is invalid either way, so the
+    # comparison refuses a verdict entirely: exit 2 even under --warn-only,
+    # never a pass or a fail.  The same holds for an interpreter, platform
+    # or run mode that differs.
+    #
+    # The keys are written out here.  A loop over compare.py's own tuple
+    # would lose a key together with the tuple.
+    same = {
+        "mode": "full",
+        "python": "3.14.0",
+        "platform": "linux",
+        "orjson": True,
+        "uvloop": False,
+        "isal": True,
+    }
+    other = {
+        "mode": "quick",
+        "python": "3.13.0",
+        "platform": "darwin",
+        "orjson": False,
+        "uvloop": True,
+        "isal": False,
+    }
+    assert set(_load_compare()._COMPARABILITY_KEYS) == set(same), (
+        "compare.py's comparability keys changed; give each one a "
+        "mismatch below"
+    )
+
+    def stamped(value, version, **stamp):
+        doc = _doc([_entry("json.roundtrip_3k", value)], version=version)
+        doc.update(same)
+        doc.update(stamp)
+        return doc
+
+    base = _write(tmp_path / "base.json", stamped(0.7, "1.0.0"))
+    cur = _write(tmp_path / "cur.json", stamped(0.7, "1.1.0"))
+    # the control: documents that agree on every key do compare
+    proc = _run([COMPARE, "--baseline", base, "--current", cur])
+    assert proc.returncode == 0, proc.stdout
+    for key in same:
+        odd = _write(
+            tmp_path / ("cur-%s.json" % key),
+            stamped(0.7, "1.1.0", **{key: other[key]}),
+        )
+        for flags in ([], ["--warn-only"]):
+            proc = _run(
+                [COMPARE, "--baseline", base, "--current", odd] + flags
+            )
+            assert proc.returncode == 2, (key, flags, proc.stdout)
+            assert "not comparable" in proc.stdout
+            # the one key that differs is the one named
+            assert " on %s (" % key in proc.stdout, (key, proc.stdout)
+        # A mismatch WITHIN one side is just as invalid.
+        proc = _run([COMPARE, "--baseline", base, "--current", cur, odd])
+        assert proc.returncode == 2, (key, proc.stdout)
+        assert " on %s (" % key in proc.stdout, (key, proc.stdout)
 
 
 def test_effective_gate_percentage_is_reported(tmp_path):

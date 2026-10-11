@@ -1751,6 +1751,163 @@ async def test_artifact_put_record_reads_do_not_grow_with_distinct_names(
     )
 
 
+# --- 5b. what a republish costs between prune passes -----------------------
+#
+# Publishing a name again keeps the version that it replaces and unlinks the
+# one before that, which the backend remembers.  Between prune passes a
+# republish lists no directory and reads no record, and the stream holds two
+# records per name.  Each unlink follows one lstat, of the remembered record
+# that it rests on.
+
+
+async def test_artifact_republish_lists_and_reads_nothing_between_passes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(os, "fsync", lambda fd: None)
+    monkeypatch.setattr(state_mod, "fsync_directory", lambda path: None)
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        names = ["report-a", "report-b"]
+        # every publish before the stream's second prune pass
+        rounds = state_mod._PRUNE_EVERY_APPENDS // len(names)
+        stream = jobstate.ARTIFACT_STREAM_PREFIX + "scope"
+        stream_dir = os.path.normpath(backend._stream_dir(stream))
+
+        async def publish(version):
+            for name in names:
+                await jobstate.artifact_put(
+                    backend, "scope", name, b"v%d" % version
+                )
+
+        await publish(0)
+        listed = []
+        read = []
+        unlinked = []
+        confirmed = []
+        real_listdir = os.listdir
+        real_unlink = os.unlink
+        real_lstat = os.lstat
+        real_read = backend._read_record
+
+        def spying_listdir(path="."):
+            if os.path.normpath(str(path)) == stream_dir:
+                listed.append(path)
+            return real_listdir(path)
+
+        def spying_unlink(path, *args, **kwargs):
+            if os.path.dirname(os.path.normpath(str(path))) == stream_dir:
+                unlinked.append(path)
+            return real_unlink(path, *args, **kwargs)
+
+        def spying_lstat(path, *args, **kwargs):
+            if os.path.dirname(os.path.normpath(str(path))) == stream_dir:
+                confirmed.append(path)
+            return real_lstat(path, *args, **kwargs)
+
+        def counting_read(stream_dir, name, **kwargs):
+            read.append(name)
+            return real_read(stream_dir, name, **kwargs)
+
+        monkeypatch.setattr(os, "listdir", spying_listdir)
+        monkeypatch.setattr(os, "unlink", spying_unlink)
+        monkeypatch.setattr(os, "lstat", spying_lstat)
+        backend._read_record = counting_read  # type: ignore[method-assign]
+        for version in range(1, rounds):
+            await publish(version)
+        monkeypatch.undo()
+        backend._read_record = real_read  # type: ignore[method-assign]
+
+        assert listed == [] and read == [], (
+            "a republish between prune passes listed the stream %d times "
+            "and read %d records" % (len(listed), len(read))
+        )
+        assert len(unlinked) == (rounds - 2) * len(names), (
+            "%d republishes of %d names unlinked %d records; each one "
+            "after a name's first unlinks the version two publishes back"
+            % ((rounds - 1) * len(names), len(names), len(unlinked))
+        )
+        assert len(confirmed) == len(unlinked), (
+            "%d unlinks followed %d lstats of the stream's records, "
+            "expected one each" % (len(unlinked), len(confirmed))
+        )
+        records = await backend.list_records(stream)
+        assert len(records) == 2 * len(names)
+        for name in names:
+            result = await jobstate.artifact_get(backend, "scope", name)
+            assert result is not None
+            assert result[1] == b"v%d" % (rounds - 1)
+    finally:
+        monkeypatch.undo()
+        await backend.stop()
+
+
+# --- 5c. what an artifact read costs beside the name memory -----------------
+#
+# A lookup and a listing compare their answer with the newest record that
+# the backend remembers for each name.  When the answer is that record, the
+# read has listed the stream once and looks for nothing else in the store.
+
+
+async def test_artifact_reads_list_once_and_confirm_nothing_when_untorn(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(os, "fsync", lambda fd: None)
+    monkeypatch.setattr(state_mod, "fsync_directory", lambda path: None)
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        names = ["report-%d" % i for i in range(6)]
+        stream = jobstate.ARTIFACT_STREAM_PREFIX + "scope"
+        stream_dir = os.path.normpath(backend._stream_dir(stream))
+        for version in range(2):
+            for name in names:
+                await jobstate.artifact_put(
+                    backend, "scope", name, b"v%d" % version
+                )
+        listed = []
+        confirmed = []
+        real_listdir = os.listdir
+        real_lstat = os.lstat
+
+        def spying_listdir(path="."):
+            if os.path.normpath(str(path)) == stream_dir:
+                listed.append(path)
+            return real_listdir(path)
+
+        def spying_lstat(path, *args, **kwargs):
+            if os.path.dirname(os.path.normpath(str(path))) == stream_dir:
+                confirmed.append(path)
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "listdir", spying_listdir)
+        monkeypatch.setattr(os, "lstat", spying_lstat)
+        reads = 0
+        for strict in (False, True):
+            for name in names:
+                record = await jobstate.artifact_get_record(
+                    backend, "scope", name, strict=strict
+                )
+                assert record is not None and record["name"] == name
+                reads += 1
+            listing = await jobstate.artifact_list(backend, "scope")
+            assert [record["name"] for record in listing] == names
+            reads += 1
+        monkeypatch.undo()
+
+        assert len(listed) == reads, (
+            "%d artifact reads listed the stream %d times, expected one "
+            "listing each" % (reads, len(listed))
+        )
+        assert confirmed == [], (
+            "%d artifact reads of an untorn stream looked for %d records "
+            "in the store" % (reads, len(confirmed))
+        )
+    finally:
+        monkeypatch.undo()
+        await backend.stop()
+
+
 # --- 6. file opens per inventory walk ---------------------------------------
 #
 # GET /state and MCP cron_inspect_state walk the store on every poll.  The
@@ -2584,6 +2741,69 @@ def test_unchanged_warm_load_reparses_no_file(tmp_path, monkeypatch, files):
         handle.write("jobs:\n# edited\n")
     config.parse_config(str(tmp_path))
     assert [os.path.basename(path) for path in parsed] == ["job-0500.yaml"]
+
+
+# --- one read per source per load --------------------------------------------
+#
+# A cache entry is signed with the bytes its parse read, so a cold load
+# opens each file once however deep the include tree is.  A warm load opens
+# each file once to validate it.  A count, for the reason the env_file one
+# above is.
+
+
+def test_a_load_opens_each_config_file_once(tmp_path, monkeypatch):
+    import builtins
+    from collections import Counter, OrderedDict
+
+    from cronstable import config
+
+    monkeypatch.setattr(config, "_DIR_FILE_CACHE", OrderedDict())
+    job = (
+        "jobs:\n  - name: job-%d-%d\n    command: echo x\n"
+        "    schedule: '0 3 * * *'\n"
+    )
+    confdir = tmp_path / "conf"
+    leaves = confdir / "leaves"
+    leaves.mkdir(parents=True)
+    names = []
+    for m in range(3):
+        for i in range(4):
+            name = "leaf-%d-%d.yaml" % (m, i)
+            (leaves / name).write_text(job % (m, i))
+            names.append(name)
+        mid = "mid-%d.yaml" % m
+        (leaves / mid).write_text(
+            "include:\n"
+            + "".join("  - leaf-%d-%d.yaml\n" % (m, i) for i in range(4))
+        )
+        names.append(mid)
+        top = "top-%d.yaml" % m
+        (confdir / top).write_text("include:\n  - leaves/%s\n" % mid)
+        names.append(top)
+    opens = Counter()
+    real_open = builtins.open
+
+    def counting(file, *args, **kwargs):
+        if isinstance(file, str) and file.endswith(".yaml"):
+            opens[os.path.basename(file)] += 1
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting)
+    cold = config.parse_config(str(confdir))
+    cold_opens = dict(opens)
+    opens.clear()
+    warm = config.parse_config(str(confdir))
+    warm_opens = dict(opens)
+    monkeypatch.undo()
+
+    assert len(cold.jobs) == len(warm.jobs) == 12
+    once = dict.fromkeys(names, 1)
+    assert cold_opens == once, (
+        "a cold load opened a file more than once; a cache entry must be "
+        "signed from the read its parse made: %r"
+        % sorted(n for n, c in cold_opens.items() if c != 1)
+    )
+    assert warm_opens == once
 
 
 # --- the thin clients stay thin ----------------------------------------------
@@ -3623,19 +3843,17 @@ async def test_the_pairing_code_is_encoded_once_per_link(
 
 
 class _TuiFrameLog(tui.Term):
-    """A terminal that records when each frame is painted, and the paint
-    gate the loop had just set for the frame after it."""
+    """A terminal that records when each frame is painted."""
 
     def __init__(self):
         super().__init__(stream=_TuiWire())
-        self.app = None
         self.painted = []
 
     def size(self):
         return (100, 30)
 
     def paint(self, rows, bg):
-        self.painted.append((time.monotonic(), self.app._paint_gate))
+        self.painted.append(time.monotonic())
         super().paint(rows, bg)
 
 
@@ -3649,7 +3867,6 @@ def _tui_cadence_app(tmp_path):
         boot=False,
         prefs_file=str(tmp_path / "prefs.json"),
     )
-    term.app = app
     return app, term
 
 
@@ -3723,23 +3940,28 @@ async def test_a_burst_of_marks_paints_at_most_once_per_33_ms(tmp_path):
         )
 
         # sustained marking, a mark per loop turn, for as long as four
-        # frames take: a slow runner spreads the frames out and never
-        # brings two closer than the gate
+        # frames take.  Each frame is timed from the last mark before the
+        # frame ahead of it: that frame's gate opens 33 ms past the mark
+        # or later, so a slow runner only widens the gap.
         del term.painted[:]
+        marked = []
         deadline = time.monotonic() + 60.0
         while len(term.painted) < 4:
             assert time.monotonic() < deadline, (
                 "sustained marking painted %d frames in a minute"
                 % len(term.painted)
             )
+            at = time.monotonic()
             app.mark()
             await asyncio.sleep(0)
-        for (_, gate_set), (painted, _) in zip(
-            term.painted, term.painted[1:], strict=False
-        ):
-            assert painted >= gate_set - slack, (
-                "a frame was painted %.1f ms before the gate the previous "
-                "frame set" % ((gate_set - painted) * 1e3)
+            # a frame slower than the gate is followed by the next in
+            # the same turn
+            marked += [at] * (len(term.painted) - len(marked))
+        for at, painted in zip(marked, term.painted[1:], strict=False):
+            assert painted - at >= 0.033 - slack, (
+                "a frame was painted %.1f ms after the last mark before "
+                "the frame ahead of it; the paint loop keeps 33 ms "
+                "between frames" % ((painted - at) * 1e3)
             )
     finally:
         app.quit = True

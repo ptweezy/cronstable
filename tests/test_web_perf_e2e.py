@@ -6,6 +6,8 @@ The count tests open the page with ``?perf=1`` and drive it through
 state does, such as the rows a poll rebuilds or the DOM writes a tick makes.
 """
 
+import datetime
+
 import pytest
 
 pytest.importorskip("playwright.sync_api")
@@ -173,16 +175,30 @@ def test_a_revalidated_poll_keeps_the_countdown_anchor(browser, tmp_path):
     rows stay as they were, and the connection readout still counts the
     poll as a response. When the two clocks disagree on the age of that
     response, as they do after a suspend that stops the monotonic clock,
-    the page asks for the body again and takes its anchors from it."""
+    the page asks for the body again and takes its anchors from it. Every
+    poll bypasses the browser's HTTP cache."""
     jobs = [e2e.job("job%d" % i, schedule="%d 3 1 1 *" % i) for i in range(6)]
+    polls = []
+
+    def before_goto(page):
+        # The page's clock is installed before the first poll, so both
+        # anchors of that poll are read from it. It starts at midday in
+        # the page's zone, so the test stays inside one local day.
+        page.clock.install(time="2026-01-01T12:00:00Z")
+        page.on(
+            "request",
+            lambda request: (
+                request.url.endswith("/jobs") and polls.append(request)
+            ),
+        )
+
     with e2e.Daemon(tmp_path, jobs=jobs) as daemon:
-        # the page's clock is installed before the first poll, so both
-        # anchors of that poll are read from it
         with e2e.open_page(
             browser,
             daemon.url + "?perf=1",
             prefs={"pollMs": 0},
-            before_goto=lambda page: page.clock.install(),
+            before_goto=before_goto,
+            timezone_id="UTC",
         ) as page:
             statuses = []
             page.on(
@@ -236,6 +252,133 @@ def test_a_revalidated_poll_keeps_the_countdown_anchor(browser, tmp_path):
             assert statuses == [304, 200, 304]
             assert page.evaluate(_ANCHOR)["targets"] == woken["targets"]
 
+            # all_headers() includes the headers the browser adds on the
+            # wire. A fetch that bypasses the HTTP cache carries no-cache,
+            # and the page-load and wake polls name no validator.
+            sent = [request.all_headers() for request in polls]
+            assert [h.get("cache-control") for h in sent] == ["no-cache"] * 4
+            assert ["if-none-match" in h for h in sent] == [
+                False,
+                True,
+                False,
+                True,
+            ]
+
+
+def _daily_job():
+    """A job whose next fire is about twelve hours away."""
+    fire = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        hours=12
+    )
+    return e2e.job("daily", schedule="%d %d * * *" % (fire.minute, fire.hour))
+
+
+# Reads the "Next at" label and the rows kept since the last read.
+_NEXT_AT = """() => {
+  const state = window.__perf.state();
+  const at = new Date(
+    state.fetchedWallAt + state.jobs[0].scheduled_in * 1000);
+  const rows = [...document.querySelectorAll('#rows tr[data-job]')];
+  const kept = rows.filter((tr) => tr.__kept).length;
+  rows.forEach((tr) => { tr.__kept = true; });
+  return {
+    kept,
+    label: rows[0].querySelector('.col-nextat span').textContent,
+    // the fire's hour and minute in the page's zone
+    time: [at.getHours(), at.getMinutes()]
+      .map((n) => String(n).padStart(2, '0')).join(':'),
+  };
+}"""
+
+
+def test_next_at_names_its_day_from_the_browsers_local_date(browser, tmp_path):
+    """The "Next at" label names a fire's day relative to the browser's
+    local date. The first poll after local midnight rebuilds the rows,
+    even on a 304, and the polls after it keep them."""
+
+    def before_goto(page):
+        # stopped one minute before midnight in the page's zone
+        page.clock.install(time="2026-03-10T14:00:00Z")
+        page.clock.pause_at("2026-03-10T14:59:00Z")
+
+    with e2e.Daemon(tmp_path, jobs=[_daily_job()]) as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url + "?perf=1",
+            prefs={"pollMs": 0, "cols": {"nextat": True}},
+            before_goto=before_goto,
+            timezone_id="Asia/Tokyo",
+        ) as page:
+            statuses = []
+            page.on(
+                "response",
+                lambda response: (
+                    response.url.endswith("/jobs")
+                    and statuses.append(response.status)
+                ),
+            )
+            before = page.evaluate(_NEXT_AT)
+            assert before["label"] == "tom " + before["time"]
+            _refresh(page)
+            assert page.evaluate(_NEXT_AT)["kept"] == 1
+
+            page.clock.fast_forward(61000)
+            _refresh(page)
+            after = page.evaluate(_NEXT_AT)
+            assert statuses == [304, 304]
+            assert after["kept"] == 0
+            assert after["label"] == before["time"]
+            _refresh(page)
+            assert page.evaluate(_NEXT_AT)["kept"] == 1
+
+
+def test_next_at_follows_a_change_of_the_browsers_time_zone(browser, tmp_path):
+    """The "Next at" label gives a fire's day and time in the browser's
+    time zone, so the first poll after a zone change rebuilds the rows."""
+    sessions = []
+
+    def before_goto(page):
+        # Playwright's timezone_id holds the zone for the life of the
+        # context, so the test sets the zone through its own CDP session.
+        session = page.context.new_cdp_session(page)
+        session.send("Emulation.setTimezoneOverride", {"timezoneId": "UTC"})
+        sessions.append(session)
+        page.clock.install(time="2026-03-10T05:00:00Z")
+        page.clock.pause_at("2026-03-10T06:00:00Z")
+
+    with e2e.Daemon(tmp_path, jobs=[_daily_job()]) as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url + "?perf=1",
+            prefs={"pollMs": 0, "cols": {"nextat": True}},
+            before_goto=before_goto,
+        ) as page:
+            statuses = []
+            page.on(
+                "response",
+                lambda response: (
+                    response.url.endswith("/jobs")
+                    and statuses.append(response.status)
+                ),
+            )
+            offset = "new Date().getTimezoneOffset()"
+            assert page.evaluate(offset) == 0
+            before = page.evaluate(_NEXT_AT)
+            assert before["label"] == before["time"]
+
+            # nine hours later on the same local date: the fire falls on
+            # the next one
+            sessions[0].send(
+                "Emulation.setTimezoneOverride", {"timezoneId": "Asia/Tokyo"}
+            )
+            assert page.evaluate(offset) == -540
+            _refresh(page)
+            after = page.evaluate(_NEXT_AT)
+            assert statuses == [304]
+            assert after["kept"] == 0
+            assert after["time"] != before["time"]
+            assert after["label"] == "tom " + after["time"]
+
 
 def test_a_revalidated_poll_carries_the_token(browser, tmp_path):
     """The conditional request authenticates like any other. A token the
@@ -247,6 +390,11 @@ def test_a_revalidated_poll_carries_the_token(browser, tmp_path):
             daemon.url + "?perf=1",
             token=e2e.FULL_TOKEN,
             prefs={"pollMs": 0},
+            # midday in the page's zone, so the polls share one local day
+            before_goto=lambda page: page.clock.install(
+                time="2026-01-01T12:00:00Z"
+            ),
+            timezone_id="UTC",
         ) as page:
             page.faults.record()
             statuses = []
@@ -385,6 +533,9 @@ def test_closed_panels_leave_nothing_for_the_tick_to_sweep(browser, daemon):
     with e2e.open_page(
         browser, daemon.url + "?perf=1", prefs={"pollMs": 0}
     ) as page:
+        # The start-up /cluster reply clears the fleet, so the seed below
+        # waits for it.
+        page.wait_for_load_state("networkidle")
         page.evaluate(
             "() => { window.__perf.seedJobs(40); window.__perf.renderRows(); }"
         )
@@ -496,7 +647,11 @@ def test_polls_leave_node_and_listener_counts_flat(browser, daemon):
         browser,
         daemon.url + "?perf=1",
         prefs={"pollMs": 0, "motion": True},
+        before_goto=_freeze,
     ) as page:
+        # The counts are compared exactly, so only the polls may write:
+        # the clock is stopped and the start-up requests are answered.
+        page.wait_for_load_state("networkidle")
         page.evaluate(
             "() => { window.__perf.seedJobs(200);"
             " window.__perf.renderRows(); }"

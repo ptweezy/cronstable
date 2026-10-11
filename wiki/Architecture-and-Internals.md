@@ -315,16 +315,77 @@ The run loop reloads through `reload_config`, which reparses off the loop only
 when the config files' stat signature changed; `update_config` is the
 synchronous twin used at construction. When `config_arg` is `None` (the
 unit-test path) both return an empty `CronstableConfig`. Otherwise they call
-`parse_config_with_sources`, which runs `parse_config(config_arg)` and records
-the files the parse read for the next signature check. `parse_config`
-dispatches on whether the argument is a directory (`_parse_config_dir`) or a
-single file (`parse_config_file`). On success the reload overwrites
-`self.cron_jobs` with a fresh `OrderedDict` keyed by job name and returns the
-full `CronstableConfig` (jobs, web config, job defaults, logging config).
+`parse_config_with_sources`, which runs `parse_config(config_arg)` and reports
+the files the parse read. `parse_config` dispatches on whether the argument
+is a directory (`_parse_config_dir`) or a single file (`parse_config_file`).
+On success the reload overwrites `self.cron_jobs` with a fresh `OrderedDict`
+keyed by job name and returns the full `CronstableConfig` (jobs, web config,
+job defaults, logging config).
+
+The stat signature holds each source file's path, modification time in
+nanoseconds, and size, plus a configuration directory's own modification
+time. For a source that is not a regular file, such as a pipe or a FIFO, it
+holds the path alone, because reading such a source moves its modification
+time. `reload_config` takes it before the parse starts and again when the
+parse returns, and records the first value only when the two are equal. An
+edit that lands while a parse runs, including one between the signature and
+the read of the file, is therefore parsed again at the next check. This
+holds for a single configuration file as well as for a directory or an
+include tree. When an edit and its reversal both land between the two
+signatures and restore the file's size and modification time, the daemon
+keeps what the parse read until the file changes again or a reload is
+requested. After a reload that reads a different set of source files (a
+configuration file, an include, or an `env_file` added or removed), the
+daemon records no signature and parses once more at the next check.
+`update_config` parses once at startup, then reads every source that is a
+regular file again and compares it with the bytes that it parsed. When a
+file changed in between, the first scheduling pass parses the configuration
+again. A source that cannot be read twice (a pipe, a FIFO, a terminal,
+`/dev/stdin`, or `/dev/fd/N`) is read once at startup and left out of that
+comparison. A later parse reads such a source again, so a FIFO that is
+written once blocks that parse.
+
+For a configuration directory, `update_config` and `reload_config` also
+list the directory again when the parse returns. They compare the names
+that the loader takes (YAML by extension or a crontab by name, without the
+names that start with `_` or `.`) with the names that the parse listed.
+When a file that the loader takes joined or left the directory in between,
+the daemon records no signature, and the next check parses again. A file
+that joins the directory while a parse runs is therefore loaded at the next
+check, including when the directory's modification time did not move.
+
+The files of a configuration directory and the targets of `include` go
+through a per-file parse cache. Each entry is signed with a digest of the
+bytes that its parse read: the file's own bytes, those of every file it
+includes, and those of every `env_file` that its jobs and workflow tasks
+read. A load reuses an entry only while each of those files on disk still
+hashes to the signature, so a file that is replaced after the daemon read it
+is parsed again by the next load that reaches the parser. When one load reads
+a file in two different states, the entry of the file that includes it gets
+a signature that matches no content, and the next load parses that entry
+again. An edit to one file of an include tree reparses that file, each file
+that includes it, and the entry file, which is parsed on every load. The
+cache has room for every file of the loaded configuration, and for at least
+1,024 files.
+
+The file that `cluster.etcd.password.fromFile` names is a source file like
+an `env_file`. It is part of the stat signature and the startup comparison,
+and of the cache signature of the file that holds the `cluster` section and
+of each file that includes it. The once-a-minute check therefore parses
+again when the password file's size or modification time changes, and a
+reload request reads a password that was rewritten in place. The check that
+reads a new password restarts the cluster connection once. Change the
+password on the etcd server before you replace the file: when the file
+changes first, the restarted connection fails to authenticate until the
+server has the new password. The other `fromFile` secrets are read outside
+the parse and are not source files.
 
 Because housekeeping checks for a reload at most once per wall-clock minute,
 and immediately on `SIGHUP`, configuration edits take effect within a minute
-without a restart. Schedule parsing, include
+without a restart. `SIGHUP` clears the recorded signature, so the next pass
+parses whatever the files' stats say. A request that arrives while a parse is
+running gets a parse of its own on the next pass, and a request that arrives
+before the parse starts is served by that parse. Schedule parsing, include
 merging, and defaults application all happen inside `parse_config*`. See
 [includes, defaults, and multi-file config](Includes-and-Defaults).
 
@@ -596,12 +657,17 @@ waits have no polling timeout. Registration work is proportional to new
 instances, and each completion callback takes constant time.
 
 The reaper handles completed jobs in batches. It removes each job from
-`wait_tasks`, reads `task.result()`, and passes the job to
-`_handle_finished_job`. An unexpected wait exception is logged as bug (2). A
-handler exception is logged as bug (6), and processing continues with the rest
-of the batch. If that instance remains in `running_jobs`, it is queued for
-another completion attempt. Each batch flushes buffered DAG completions in a
-`finally` block, including when cancellation interrupts the batch.
+`wait_tasks`, checks `task.cancelled()`, reads `task.result()` when the task
+was not canceled, and passes the job to `_handle_finished_job`. A wait task
+that ended canceled is logged at `ERROR` with the line
+`The wait on job <name> was canceled; please report this as a bug (9)`.
+Its job still goes to `_handle_finished_job`, so the instance leaves
+`running_jobs`, and the reaper continues with the batch. An unexpected wait
+exception is logged as bug (2). A handler exception is logged as bug (6),
+and processing continues with the rest of the batch. If that instance
+remains in `running_jobs`, it is queued for another completion attempt. Each
+batch flushes buffered DAG completions in a `finally` block, including when
+cancellation interrupts the batch.
 
 `CancelledError` is re-raised. Other unexpected exceptions in the outer loop
 are logged as bug (3), followed by a one-second sleep.
@@ -723,6 +789,13 @@ calls `await running_job.start()`, and registers the instance with
    forced call shells out to `taskkill /F /T`, which walks the live process tree
    (the `taskkill` run is bounded at 10s).
 
+   On POSIX, once asyncio has reaped the direct child, `cancel()` checks
+   before each group signal whether a process exists under the child's pid
+   (`platform.pid_reused`, a signal 0 probe). POSIX keeps a pid out of use
+   while a process group with that id has a member, so a process that exists
+   there is an unrelated one and the job's own group is empty. In that case
+   `cancel()` sends the group no signal. Windows makes no such check.
+
    A run whose spawn failed (`proc is None`) makes `cancel()` a logged no-op
    rather than an error, because callers (the `Replace` branch, the cluster
    slot-renewer) run outside the scheduler loop's try/except. On a run that
@@ -732,7 +805,11 @@ calls `await running_job.start()`, and registers the instance with
    `cancel()` calls `_on_stop()`, which is idempotent (guarded by
    `self._stopped`) because `cancel()` and `wait()` can both reach it for one
    run (for example, under `Replace`); it emits the statsd `job_stopped` metric
-   once. Full user-facing semantics:
+   once. A cancel that arrives while the run's verification check runs goes
+   to the check, and `cancel()` returns without calling `_on_stop()`.
+   `wait()` calls it once it has collected the check, so the stop metrics
+   are sent then and the success gauge carries the check's outcome. Full
+   user-facing semantics:
    [cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout).
 
 5. **Failure classification.** `fail_reason` is a property evaluated against
@@ -813,6 +890,8 @@ Flow:
 - **On success** (`handle_job_success`): `cancel_job_retries(name)` clears any
   pending retry, then `report_success()` runs. A retry state that another
   run's launch installed and that has scheduled no retry stays in place.
+  The record of an operator-canceled run applies the same test
+  (`_ends_retry_sequence`) before it settles the retries as `cancelled`.
 - **`cancel_job_retries(name)`** pops the state (no-op if absent), sets
   `cancelled = True`, and awaits or cancels the pending `task`. It takes a
   `settle` reason (default `"superseded"`) for the durable retry state described

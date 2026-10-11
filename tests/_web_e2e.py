@@ -475,6 +475,42 @@ def default_jobs():
     ]
 
 
+# Chromium's kRestrictedPorts (net/base/port_util.cc), the entries above 1023.
+_UNSAFE_PORTS = frozenset(
+    {1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061, 6000, 6566, 6697, 10080}
+    | set(range(6665, 6670))
+)
+
+
+def _bind_past_unsafe_ports(create_server):
+    """Wrap ``loop.create_server`` so that port 0 gets a port Chromium loads.
+
+    Chromium fails a navigation to a restricted port with
+    ``ERR_UNSAFE_PORT``, and the operating system can assign one. A refused
+    listener stays open until another port is bound, so each bind gets a
+    different port. A caller that names its port gets that port.
+    """
+
+    async def bind(protocol_factory, host=None, port=None, **kwargs):
+        refused = []
+        try:
+            while True:
+                server = await create_server(
+                    protocol_factory, host, port, **kwargs
+                )
+                if port != 0 or not any(
+                    sock.getsockname()[1] in _UNSAFE_PORTS
+                    for sock in server.sockets
+                ):
+                    return server
+                refused.append(server)
+        finally:
+            for server in refused:
+                server.close()
+
+    return bind
+
+
 class Daemon:
     """Run the scheduler and web app on a thread from a configuration file.
 
@@ -550,6 +586,7 @@ class Daemon:
 
     def _run(self):
         loop = asyncio.new_event_loop()
+        loop.create_server = _bind_past_unsafe_ports(loop.create_server)
         asyncio.set_event_loop(loop)
         self.loop = loop
         try:

@@ -120,6 +120,16 @@ model and every other surface the numbers reach. Like the run counters,
 restart-durable by a `state:` store (see
 [semantics and guarantees](#semantics-and-guarantees)).
 
+`cronstable_job_duration_seconds` and the `cronstable_job_last_run_*` gauges
+read the run record, whose `finished_at` is the instant the run ended (see
+[`GET /jobs/{name}/runs`](HTTP-API#get-jobsnameruns)).
+`cronstable_job_last_success_timestamp_seconds` and
+`cronstable_job_last_failure_timestamp_seconds` hold the time at which the
+daemon recorded the run. The two instants are apart for a run that the
+daemon killed while a surviving process holds its output open: the daemon
+records that run when the output closes or the
+[bound on it](Concurrency-and-Timeouts#cancellation-and-killtimeout) ends.
+
 ### State backend
 
 Emitted when a [durable state store](Durable-State) is configured (a `state:` section). Without one, cronstable is stateless and these families are absent. They observe the store itself. The preceding job families are unchanged, except that the store makes the per-job counters restart-durable (see [semantics and guarantees](#semantics-and-guarantees)). Families and label values appear as they first become relevant, so a store that never contends a lock or is never throttled does not export frozen zero series forever.

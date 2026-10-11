@@ -325,6 +325,32 @@ swept by the record garbage collector (GC). Instead each DAG keeps its newest
 `retainRuns` **terminal** runs (default 50) and prunes the rest, along with
 their XCom, on a periodic DAG-owned pass.
 
+Each node runs the pass hourly and at daemon start. It deletes runs in
+batches of up to 32, each run under its own lease, and keeps a run that a
+[recovery](Workflow-Recovery) references. The pass deletes a run only while
+the document is still the finished run that it listed, which it identifies
+by run ID and creation time. A run that a backfill creates again under the
+key of a deleted run therefore stays, and an adopt scan picks it up. A
+recovery run that is accepted again after another node's pass deleted it has
+the same key and run ID and a later creation time, so the pass keeps it and
+its XCom. When the pass finds another run under a key that it listed, this
+node's `GET /dags/{name}/runs`, the `latestRun` and `runCounts` of
+`GET /dags`, and the MCP run listings show the run that the key holds on
+their next read.
+
+A batch starts a run's delete within 30 seconds of leasing the run and
+leaves the runs it cannot reach for the next pass. On a rate-limited or slow
+store, a busy DAG can therefore hold more than `retainRuns` terminal runs.
+The node creates no scheduled run while the pass is in flight. See
+[rate limiting](Durable-State#rate-limiting-maxopspersecond) for the figures.
+
+A delete that times out or is canceled can still land, so the pass keeps
+that run's lease until it lapses, 60 seconds after it was taken, and
+releases the other leases of the batch. Until the lease lapses, a
+[recovery](Workflow-Recovery) execution that names the run answers `409`
+with `source run is busy; retry shortly`, and no node can take the advance
+lease of that run key.
+
 A DAG *removed from every config* ages out like a removed job. After it has
 been absent from every config and recent manifest for a full
 `state.gcGraceSeconds`, the daemon's

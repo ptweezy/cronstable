@@ -46,7 +46,7 @@ import stat
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -150,8 +150,8 @@ LEASE_CALL_SLOTS = 8
 # by up to K-1 records, invisible to readers.  A stream pruned by
 # ``prune_latest_by`` alone waits for as many appends as its last pass kept
 # records when that is more than K (see _append_prune_stretch).  Between
-# its passes an append unlinks the record it supersedes when the backend
-# knows that record (see _unlink_superseded).
+# its passes an append unlinks the record two versions behind its own when
+# the backend knows that record (see _unlink_superseded).
 _PRUNE_EVERY_APPENDS = 8
 
 # Bound on the per-stream append countdown map (see _append_prune_due),
@@ -163,10 +163,18 @@ _PRUNE_COUNTDOWN_MAX_STREAMS = 4096
 # Bounds on the per-backend record CONTENT cache (see _read_record).
 # Records are immutable with forever-unique names, so path -> bytes never
 # goes stale; entry count and total bytes are capped, and an oversized
-# body is not cached at all rather than evicting many small ones.
-_RECORD_CACHE_MAX_ENTRIES = 2048
+# body is not cached at all rather than evicting many small ones.  The
+# entry cap holds an artifact scope of 2,048 names at its two records per
+# name (see append_record's ``prune_latest_by``).
+_RECORD_CACHE_MAX_ENTRIES = 4096
 _RECORD_CACHE_MAX_BYTES = 4 * 1024 * 1024
 _RECORD_CACHE_MAX_ITEM_BYTES = 16 * 1024
+
+# How long, in seconds, record reads on Windows make a single attempt after
+# one of them stays access-denied through every retry (see _read_record).
+# A scan over many records that the account cannot open waits through one
+# round of retries.
+_RECORD_DENIED_HOLD = 1.0
 
 # Bound on the per-backend field index (see _FieldFacts): how many
 # ``record file -> field value`` facts it holds across all streams.  The
@@ -182,6 +190,11 @@ _FIELD_INDEX_MAX_ENTRIES = 16384
 # holds the index alone can fill it.
 _FIELD_INDEX_STREAM_SHARE = 0.75
 
+# The longest field value, in characters, that a fact holds.  A record with
+# a longer value has no fact: every lookup that reaches it reads it again,
+# and its superseded versions wait for the stream's next prune pass.
+_FIELD_INDEX_MAX_VALUE_CHARS = 256
+
 # How many facts about records gone from a stream the index tolerates
 # before a scan sweeps them out.  A name-keyed prune removes a few records
 # at a time, so sweeping on every one would cost a pass over the stream's
@@ -192,7 +205,7 @@ _FIELD_INDEX_STALE_SLACK = 64
 # had listed was gone at its read (see _newest_settled).
 _SUPERSEDED_RESCANS = 3
 
-# One pass of a name-keyed read (see _newest_settled): the reader that it
+# One pass of a name-keyed read (see _newest_settled): a reader that it
 # takes its records from, and what it returns, the newest (record file
 # name, record) per field value.
 _RecordReader = Callable[[str], "dict[str, Any] | None"]
@@ -209,16 +222,22 @@ class _FieldFacts:
     A record never changes after it is written and its name is never
     reused, so a fact holds for as long as the file is listed.  The facts
     serve a lookup, which skips the records known to hold another value,
-    and a name-keyed append, which unlinks the record it supersedes.
+    and a name-keyed append, which unlinks the record two versions behind
+    its own.  They also name the newest record of a value for a read whose
+    directory listing lacks it.  A fact can outlive its record, so the
+    append and the read confirm a remembered record in the store before
+    they rely on it.
     """
 
-    __slots__ = ("values", "newest", "ordered", "added")
+    __slots__ = ("values", "newest", "prior", "ordered", "added")
 
     def __init__(self) -> None:
         # record file name -> the string that the record holds in the field
         self.values: OrderedDict[str, str] = OrderedDict()
         # field value -> the newest record file known to hold it
         self.newest: dict[str, str] = {}
+        # field value -> the record that its newest one supersedes
+        self.prior: dict[str, str] = {}
         # whether ``values`` lists its records oldest first
         self.ordered = True
         # how many records ``values`` has taken in; it only grows
@@ -227,27 +246,46 @@ class _FieldFacts:
     def learn(self, name: str, value: str) -> str | None:
         """Note that record ``name`` holds ``value``.
 
-        Return the record that it replaces as the newest known of the
-        value.  A record name only ever replaces an older one, so that
-        record is superseded.
+        Return the record that it pushes out of the two newest known of
+        the value.  Two newer records hold the value, so a name-keyed
+        append can unlink that one.  A value longer than
+        :data:`_FIELD_INDEX_MAX_VALUE_CHARS` is not noted.
         """
+        if len(value) > _FIELD_INDEX_MAX_VALUE_CHARS:
+            return None
         values = self.values
         if name not in values:
             if self.ordered and values and name < next(reversed(values)):
                 self.ordered = False
             values[name] = value
             self.added += 1
-        prior = self.newest.get(value)
-        if prior is None or prior < name:
+        newest = self.newest.get(value)
+        if newest is None or newest < name:
             self.newest[value] = name
+            if newest is None:
+                return None
+            name = newest
+        elif newest == name:
+            return None
+        prior = self.prior.get(value)
+        if prior is None or prior < name:
+            self.prior[value] = name
             return prior
         return None
 
     def forget(self, name: str) -> None:
         """Drop the fact about record ``name``."""
         value = self.values.pop(name, None)
-        if value is not None and self.newest.get(value) == name:
-            del self.newest[value]
+        if value is None:
+            return
+        if self.prior.get(value) == name:
+            del self.prior[value]
+        elif self.newest.get(value) == name:
+            prior = self.prior.pop(value, None)
+            if prior is None:
+                del self.newest[value]
+            else:
+                self.newest[value] = prior
 
     def shed(self, excess: int) -> int:
         """Drop the facts about the ``excess`` oldest records; return how
@@ -259,14 +297,19 @@ class _FieldFacts:
             dropped = len(values)
             values.clear()
             self.newest.clear()
+            self.prior.clear()
             return dropped
         if not self.ordered:
             self.values = values = OrderedDict(sorted(values.items()))
             self.ordered = True
         newest = self.newest
+        prior = self.prior
         for _ in range(excess):
+            # oldest first: a value's prior record goes before its newest
             name, value = values.popitem(last=False)
-            if newest.get(value) == name:
+            if prior.get(value) == name:
+                del prior[value]
+            elif newest.get(value) == name:
                 del newest[value]
         return excess
 
@@ -805,17 +848,24 @@ class StateBackend(abc.ABC):
         current version of any value.  Amortised too: a pass reads every
         record, so the backend may space passes by the number of records
         the last one kept, which holds the reads per append constant.
-        Between passes an append can remove the record it supersedes when
-        the backend knows that record: one that it appended, or that a
-        pass or a lookup of its own read.  A stream that one process
-        appends to then holds one record per value.  Without that
-        knowledge the stream stays under about twice its distinct values.
-        The spacing counts one process's appends, so each further process
-        can add as many again.
+        Between passes an append can remove the record two versions
+        behind its own when the backend knows that record: one that it
+        appended, or that a pass or a lookup of its own read.  It removes
+        nothing when the record in between has left the stream.  The
+        record that the append supersedes stays until the value's next
+        append or the stream's next pass, so a directory listing that
+        overlaps one append holds a version of the value.  A pass keeps
+        the record that its own append superseded.  A stream that one
+        process appends to then holds at most two records per value, or
+        three for a value whose record left the stream by other means,
+        until the next pass.  Without that knowledge, as for a value
+        longer than :data:`_FIELD_INDEX_MAX_VALUE_CHARS`, the stream stays
+        under about twice its distinct values.  The spacing counts one
+        process's appends, so each further process can add as many again.
 
         A reader that lists the stream before such a removal finds the
-        superseded record gone.  :meth:`newest_record_with` and
-        :meth:`newest_records_by` read the stream again for the record
+        record gone.  :meth:`newest_record_with` and
+        :meth:`newest_records_by` read the stream again for the records
         that replaced it.
         """
 
@@ -1360,6 +1410,10 @@ class FilesystemStateBackend(StateBackend):
         self._record_cache: OrderedDict[str, bytes] = OrderedDict()
         self._record_cache_bytes = 0
         self._record_cache_lock = threading.Lock()
+        # Monotonic time until which record reads on Windows make a single
+        # attempt (see _RECORD_DENIED_HOLD).  Worker threads read and set
+        # it unlocked: a lost update costs one more round of retries.
+        self._record_denied_until = 0.0
         # Field index: (stream token, field) -> what the backend knows
         # about that field of the stream's records (see _FieldFacts).  A
         # lookup, a name-keyed append, and a name-keyed prune pass all
@@ -1837,10 +1891,18 @@ class FilesystemStateBackend(StateBackend):
         payload = _json.dumps_bytes(
             {"schemaVersion": SCHEMA_VERSION, "data": data}, sort_keys=True
         )
+        stale = None
+        if prune_latest_by:
+            stale = self._superseded_twice(token, prune_latest_by, data)
         self._atomic_write(os.path.join(stream_dir, rec_id + ".json"), payload)
         if prune_latest_by:
             self._unlink_superseded(
-                token, stream_dir, prune_latest_by, data, rec_id + ".json"
+                token,
+                stream_dir,
+                prune_latest_by,
+                data,
+                rec_id + ".json",
+                stale,
             )
         # None and a non-positive keep both mean no bounded prune, folded to
         # one int so the gate and the prune call below test it once.
@@ -1861,7 +1923,10 @@ class FilesystemStateBackend(StateBackend):
                         self._prune_sync(stream, keep)
                     if prune_latest_by:
                         self._prune_latest_by_sync(
-                            stream, prune_latest_by, stretch=not keep
+                            stream,
+                            prune_latest_by,
+                            stretch=not keep,
+                            spare=data.get(prune_latest_by),
                         )
                 except OSError as ex:
                     logger.warning(
@@ -1891,8 +1956,8 @@ class FilesystemStateBackend(StateBackend):
 
         A name-keyed pass reads every record, so waiting for ``kept`` more
         of this process's appends keeps the reads per append constant.
-        The appends in between remove what they supersede themselves (see
-        :meth:`_unlink_superseded`), and
+        The appends in between remove the records two versions behind
+        their own (see :meth:`_unlink_superseded`), and
         :meth:`StateBackend.append_record` gives the stream size that
         follows.  Only lengthens the countdown the pass's gate check set,
         and never inserts.
@@ -1901,6 +1966,22 @@ class FilesystemStateBackend(StateBackend):
             if self._prune_countdown.get(token, kept) < kept - 1:
                 self._prune_countdown[token] = kept - 1
 
+    def _superseded_twice(
+        self, token: str, field: str, data: dict[str, Any]
+    ) -> str | None:
+        """The record two versions behind an append of ``data``, as the
+        backend knows the stream before the append's write.
+
+        A lookup that reads the new record before the append has learned
+        it pushes this record out of the facts.
+        """
+        value = data.get(field)
+        if not isinstance(value, str):
+            return None
+        with self._field_index_lock:
+            facts = self._field_index.get((token, field))
+            return None if facts is None else facts.prior.get(value)
+
     def _unlink_superseded(
         self,
         token: str,
@@ -1908,13 +1989,23 @@ class FilesystemStateBackend(StateBackend):
         field: str,
         data: dict[str, Any],
         name: str,
+        stale: str | None,
     ) -> None:
-        """Unlink the record that the one just appended as ``name``
-        supersedes, when the backend knows it.
+        """Unlink the record two versions behind the one just appended as
+        ``name``, when the backend knows it.
 
         The name-keyed prune between passes: a stream that one process
-        appends to stays at one record per value of ``field``.  Best-effort
-        like the pass, which removes a record that stays.
+        appends to stays within two records per value of ``field``.  The
+        record that ``name`` supersedes stays: a directory listing that
+        overlaps the append can lack ``name``.  ``stale`` is
+        :meth:`_superseded_twice` from before the write.  Best-effort like
+        the pass, which removes a record that stays.
+
+        The unlink rests on two newer records of the value: ``name``, and
+        one that the facts remember.  A remembered record can have left
+        the stream with no successor (a wipe, a quarantine), so the append
+        confirms it in the store.  When it is gone, or the facts remember
+        none, the append unlinks nothing.
         """
         value = data.get(field)
         if not isinstance(value, str):
@@ -1922,11 +2013,26 @@ class FilesystemStateBackend(StateBackend):
         key = (token, field)
         with self._field_index_lock:
             facts = self._field_index_take(key)
-            older = facts.learn(name, value)
-            if older is not None:
+            pushed = facts.learn(name, value)
+            kept = (facts.newest.get(value), facts.prior.get(value))
+            doomed = {
+                older
+                for older in (stale, pushed)
+                if older is not None and older not in kept
+            }
+            for older in doomed:
                 facts.forget(older)
             self._field_index_put(key, facts)
-        if older is not None:
+        if not doomed:
+            return
+        # the newer record that the facts remember beside ``name``
+        other = kept[1] if kept[0] == name else kept[0]
+        if other is None:
+            return
+        if self._record_superseded(stream_dir, other):
+            self._field_index_drop(key, other)
+            return
+        for older in doomed:
             with contextlib.suppress(OSError):
                 self._unlink(os.path.join(stream_dir, older))
 
@@ -1973,8 +2079,8 @@ class FilesystemStateBackend(StateBackend):
         would never see it.  When the natural stem does not clear the
         floor, the floor's epoch is bumped one microsecond; instance+seq
         keeps the name unique.  The floor is in-process on purpose: peers'
-        names fold in at seed time and at each amortised prune, and a
-        restart re-seeds from the directory itself.
+        names fold in at seed time, at each amortised prune, and at each
+        name-keyed read, and a restart re-seeds from the directory itself.
         """
         with self._record_name_floor_lock:
             seeded = token in self._record_name_floor
@@ -2006,14 +2112,31 @@ class FilesystemStateBackend(StateBackend):
     def _record_name_floor_raise(self, token: str, stem: str) -> None:
         """Raise (never lower, never insert) one stream's name floor.
 
-        Fed by listings the prune already paid for, so other processes'
-        names fold in at every amortised prune.  Never inserts: a stream
-        this process never appends to needs no entry in the bounded map.
+        Fed by listings the prune already paid for and by the records a
+        name-keyed read lists or learns (see
+        :meth:`_record_name_floor_fold` and :meth:`_field_index_learn`),
+        so other processes' names fold in at every amortised prune,
+        lookup, and listing.
+        Never inserts: a stream this process never appends to needs no
+        entry in the bounded map.
         """
         with self._record_name_floor_lock:
             known = self._record_name_floor.get(token)
             if known is not None and stem > known:
                 self._record_name_floor[token] = stem
+
+    def _record_name_floor_fold(self, token: str, names: list[str]) -> None:
+        """Raise a stream's name floor to the newest canonical record in
+        ``names``, record files sorted newest first.
+
+        A name-keyed read passes the records that it is about to read, so
+        the process's next append sorts above each of them.
+        """
+        for name in names:
+            stem = name[: -len(".json")]
+            if _record_name_epoch_str(stem) is not None:
+                self._record_name_floor_raise(token, stem)
+                break
 
     def _record_name_floor_forget(self, token: str) -> None:
         """Drop one stream's name floor after its directory is removed.
@@ -2097,11 +2220,31 @@ class FilesystemStateBackend(StateBackend):
         raw = None if strict else self._record_cache_get(path)
         cached = raw is not None
         if raw is None:
-            try:
+
+            def read() -> bytes:
                 # unbuffered, like the other whole-file readers below: a
                 # whole-file read gains nothing from a buffer
                 with open(path, "rb", buffering=0) as fobj:
-                    raw = fobj.read()
+                    return fobj.read()
+
+            try:
+                if IS_WINDOWS and (
+                    time.monotonic() >= self._record_denied_until
+                ):
+                    # On Windows an open that overlaps the rename or the
+                    # unlink of the record is a sharing violation, and it
+                    # raises the same error as a record that the account
+                    # cannot open.  A failure that outlasts the retries
+                    # counts as such a record (see _RECORD_DENIED_HOLD).
+                    try:
+                        raw = self._retry_sharing_violation(read)
+                    except PermissionError:
+                        self._record_denied_until = (
+                            time.monotonic() + _RECORD_DENIED_HOLD
+                        )
+                        raise
+                else:
+                    raw = read()
             except FileNotFoundError:
                 # raced away (pruned/quarantined) between listdir and open.
                 return None
@@ -2215,14 +2358,21 @@ class FilesystemStateBackend(StateBackend):
     def _newest_record_with_sync(
         self, stream: str, field: str, value: str, strict: bool
     ) -> dict[str, Any] | None:
-        """The newest record whose ``field`` is ``value``, read from the store.
+        """The newest record whose ``field`` is ``value``.
 
         A newest-first scan that skips the records this backend knows to
         hold another value (see :class:`_FieldFacts`).  Every call lists
         the directory and reads each record it has no fact for, so a
         peer's append is seen at once (and a ``strict`` lookup fails
-        closed on one it cannot read).  The match itself always comes
-        from the store.
+        closed on one it cannot read).  A ``strict`` lookup reads the
+        match from the store.  A best-effort lookup reads it through
+        :meth:`_read_record`, which can serve a record that it has read
+        before from the record cache.
+
+        A listing that overlaps two appends of ``value`` can lack the
+        newest record of ``value``.  It then holds a superseded record of
+        it, or none.  When the facts hold a newer record of ``value`` than
+        the scan's match, the scan answers with that record.
 
         The scan runs under :meth:`_newest_settled`: a superseded record
         that it met could be a newer one of ``value`` than its match.
@@ -2231,7 +2381,9 @@ class FilesystemStateBackend(StateBackend):
         key = (token, field)
         mark = self._field_index_mark(key)
 
-        def scan(listing: list[str], read: _RecordReader) -> _NewestByValue:
+        def scan(
+            listing: list[str], read: _RecordReader, recall: _RecordReader
+        ) -> _NewestByValue:
             with self._field_index_lock:
                 facts = self._field_index.get(key)
                 if facts is not None:
@@ -2247,23 +2399,41 @@ class FilesystemStateBackend(StateBackend):
                 if known_get(n, value) == value and n.endswith(".json")
             ]
             todo.sort(reverse=True)
+            self._record_name_floor_fold(token, todo)
             learned: dict[str, str] = {}
+            hit: tuple[str, dict[str, Any]] | None = None
             try:
                 for name in todo:
                     data = read(name)
                     if data is None:
                         continue
                     got = data.get(field)
-                    if isinstance(got, str) and known_get(name) != got:
+                    # the index learns no value over its length limit, so
+                    # the scan holds none
+                    if (
+                        isinstance(got, str)
+                        and len(got) <= _FIELD_INDEX_MAX_VALUE_CHARS
+                        and known_get(name) != got
+                    ):
                         learned[name] = got
                     if got == value:
-                        return {value: (name, data)}
+                        hit = (name, data)
+                        break
             finally:
+                # before the learn: its sweep forgets a record that the
+                # listing lacks
+                with self._field_index_lock:
+                    facts = self._field_index.get(key)
+                    known = None if facts is None else facts.newest.get(value)
                 if learned:
                     self._field_index_learn(key, learned, listing, mark)
-            return {}
+            if known is not None and (hit is None or hit[0] < known):
+                data = recall(known)
+                if data is not None and data.get(field) == value:
+                    hit = (known, data)
+            return {} if hit is None else {value: hit}
 
-        found = self._newest_settled(stream, stream_dir, strict, scan)
+        found = self._newest_settled(stream, stream_dir, key, strict, scan)
         match = found.get(value)
         return None if match is None else match[1]
 
@@ -2288,14 +2458,30 @@ class FilesystemStateBackend(StateBackend):
         self, stream: str, field: str, strict: bool, max_values: int | None
     ) -> list[dict[str, Any]]:
         """One newest-first walk that keeps the first record of each value,
-        under :meth:`_newest_settled`."""
+        under :meth:`_newest_settled`.
 
-        def walk(listing: list[str], read: _RecordReader) -> _NewestByValue:
+        A listing that overlaps two appends of a value can lack its newest
+        record.  For each value that the walk met no record of, or met at
+        an older record than the newest in the facts (see
+        :class:`_FieldFacts`), the walk takes the record that the facts
+        hold.  The walk teaches the facts nothing, and it raises the
+        stream's name floor to the newest record that it listed.
+        """
+        token, stream_dir = self._stream_token_dir(stream)
+        key = (token, field)
+
+        def walk(
+            listing: list[str], read: _RecordReader, recall: _RecordReader
+        ) -> _NewestByValue:
             newest: _NewestByValue = {}
             names = [n for n in listing if n.endswith(".json")]
             names.sort(reverse=True)
+            self._record_name_floor_fold(token, names)
+            # the first record that ``max_values`` kept the walk from
+            unwalked = ""
             for name in names:
                 if max_values is not None and len(newest) >= max_values:
+                    unwalked = name
                     break
                 data = read(name)
                 if data is None:
@@ -2303,11 +2489,30 @@ class FilesystemStateBackend(StateBackend):
                 value = data.get(field)
                 if isinstance(value, str) and value not in newest:
                     newest[value] = (name, data)
+            with self._field_index_lock:
+                facts = self._field_index.get(key)
+                remembered = {} if facts is None else dict(facts.newest)
+            recalled = False
+            for value, known in remembered.items():
+                held = newest.get(value)
+                # ``max_values`` newer values outrank a record at or below
+                # ``unwalked``
+                if known > unwalked and (held is None or held[0] < known):
+                    data = recall(known)
+                    if data is not None and data.get(field) == value:
+                        newest[value] = (known, data)
+                        recalled = True
+            if recalled:
+                newest = dict(
+                    sorted(
+                        newest.items(),
+                        key=lambda item: item[1][0],
+                        reverse=True,
+                    )
+                )
             return newest
 
-        found = self._newest_settled(
-            stream, self._stream_dir(stream), strict, walk
-        )
+        found = self._newest_settled(stream, stream_dir, key, strict, walk)
         # the passes of an unsettled read can hold more values between them
         return [data for _name, data in found.values()][:max_values]
 
@@ -2315,23 +2520,36 @@ class FilesystemStateBackend(StateBackend):
         self,
         stream: str,
         stream_dir: str,
+        key: tuple[str, str],
         strict: bool,
-        scan: Callable[[list[str], _RecordReader], _NewestByValue],
+        scan: Callable[
+            [list[str], _RecordReader, _RecordReader], _NewestByValue
+        ],
     ) -> _NewestByValue:
         """Run ``scan`` over the stream's listing until a pass meets no
         superseded record; return what that pass found.
 
-        ``scan(listing, read)`` gets the directory's entries in no order,
-        record files and others.  It takes its records from ``read`` and
-        returns the newest ``(file name, record)`` it read for each field
-        value, newest first.  A record that the pass listed and that has been
-        superseded since (see :meth:`_record_superseded`) could be newer
-        than those, so the read lists the stream again, up to
-        :data:`_SUPERSEDED_RESCANS` times.  When every pass met one, a
-        ``strict`` read raises, and a best-effort one answers with the
-        newest record of each value that any pass read.
+        ``scan(listing, read, recall)`` gets the directory's entries in no
+        order, record files and others.  It takes the records that it
+        listed from ``read`` and returns the newest ``(file name, record)``
+        it read for each field value, newest first.  A record that the pass
+        listed and that has been superseded since (see
+        :meth:`_record_superseded`) could be newer than those, so the read
+        lists the stream again, up to :data:`_SUPERSEDED_RESCANS` times.
+        When every pass met one, a ``strict`` read raises, and a
+        best-effort one answers with the newest record of each value that
+        any pass read.
+
+        ``recall`` reads a record that the field index under ``key`` holds
+        as the newest of a value.  It confirms the record in the store
+        first: a best-effort read of a record that has left the stream
+        would answer from the record cache.  A record that is gone loses
+        its fact and counts as superseded, so the next pass checks the
+        value's previous record the same way.
         """
         superseded = False
+        # the records that the pass could not read
+        unread: set[str] = set()
 
         def read(name: str) -> dict[str, Any] | None:
             nonlocal superseded
@@ -2346,9 +2564,21 @@ class FilesystemStateBackend(StateBackend):
                     raise
                 superseded = True
                 return None
-            if data is None and not superseded:
-                superseded = self._record_superseded(stream_dir, name)
+            if data is None:
+                unread.add(name)
+                if not superseded:
+                    superseded = self._record_superseded(stream_dir, name)
             return data
+
+        def recall(name: str) -> dict[str, Any] | None:
+            nonlocal superseded
+            if self._record_superseded(stream_dir, name):
+                self._field_index_drop(key, name)
+                superseded = True
+                return None
+            if name in unread:
+                return None
+            return read(name)
 
         newest: _NewestByValue = {}
         for _pass in range(_SUPERSEDED_RESCANS + 1):
@@ -2357,7 +2587,8 @@ class FilesystemStateBackend(StateBackend):
             except FileNotFoundError:
                 return {}
             superseded = False
-            found = scan(listing, read)
+            unread.clear()
+            found = scan(listing, read, recall)
             if not superseded:
                 return found
             for value, hit in found.items():
@@ -2375,12 +2606,12 @@ class FilesystemStateBackend(StateBackend):
 
     @staticmethod
     def _record_superseded(stream_dir: str, name: str) -> bool:
-        """Whether a listed record that did not read back has left the
-        stream.
+        """Whether a record has left the stream: one that was listed and
+        did not read back, or one that the field index remembers.
 
-        A name-keyed prune removes a record after it writes the one that
-        supersedes it (see :meth:`_unlink_superseded`), so the stream's
-        next listing holds the newer record of the same value.  A stale
+        A name-keyed prune removes a record after it writes the ones that
+        supersede it (see :meth:`_unlink_superseded`), so the stream's
+        next listing holds a newer record of the same value.  A stale
         handle is how a shared mount reports a peer's unlink.  A record
         that cannot be examined for another reason counts as present.
         """
@@ -2410,21 +2641,33 @@ class FilesystemStateBackend(StateBackend):
         learned: dict[str, str],
         listing: list[str],
         mark: _FieldMark | None,
+        gone: Iterable[str] = (),
     ) -> None:
         """Fold what a scan or a prune pass read into the field index.
 
         ``learned`` maps a record file to its value, newest first.
         ``listing`` is the stream's directory as the caller read it, and
         ``mark`` is :meth:`_field_index_mark` from before that read.
+        ``gone`` names the records that the caller removed.
         Facts about records that have left the listing are swept out
         after more than :data:`_FIELD_INDEX_STALE_SLACK` of them have
         piled up, or as soon as the index is over its budget.  The sweep
         keeps the facts added since the mark.
+
+        The newest record learned raises the stream's name floor, so the
+        process's next append sorts above every record that it knows.
         """
+        for name in learned:
+            stem = name[: -len(".json")]
+            if _record_name_epoch_str(stem) is not None:
+                self._record_name_floor_raise(key[0], stem)
+                break
         with self._field_index_lock:
             facts = self._field_index_take(key)
             for name in reversed(learned):
                 facts.learn(name, learned[name])
+            for name in gone:
+                facts.forget(name)
             held = len(facts.values)
             slack = _FIELD_INDEX_STALE_SLACK
             if self._field_index_entries + held > _FIELD_INDEX_MAX_ENTRIES:
@@ -2446,6 +2689,17 @@ class FilesystemStateBackend(StateBackend):
                 )
                 for name in [n for n in facts.values if n not in listed]:
                     facts.forget(name)
+            self._field_index_put(key, facts)
+
+    def _field_index_drop(self, key: tuple[str, str], name: str) -> None:
+        """Forget the fact about a record that has left its stream.
+
+        A value whose newest record is dropped falls back to the record
+        that it superseded (see :meth:`_FieldFacts.forget`).
+        """
+        with self._field_index_lock:
+            facts = self._field_index_take(key)
+            facts.forget(name)
             self._field_index_put(key, facts)
 
     def _field_index_take(self, key: tuple[str, str]) -> _FieldFacts:
@@ -2785,7 +3039,12 @@ class FilesystemStateBackend(StateBackend):
         return deleted
 
     def _prune_latest_by_sync(
-        self, stream: str, field: str, *, stretch: bool = False
+        self,
+        stream: str,
+        field: str,
+        *,
+        stretch: bool = False,
+        spare: Any = None,
     ) -> int:
         """Keep only the newest record per distinct value of ``field``.
 
@@ -2798,9 +3057,10 @@ class FilesystemStateBackend(StateBackend):
         a name.  Best-effort like :meth:`_prune_sync`.
 
         ``stretch`` is the append path's flag: the pass then spaces the
-        stream's next one by the records it kept (see
-        :meth:`_append_prune_stretch`).  The record it keeps per value is
-        what the appends before that next pass supersede (see
+        stream's next one by the records it left in place (see
+        :meth:`_append_prune_stretch`).  ``spare`` is the value of the
+        append that carries the pass, and the newest superseded record of
+        that value stays, as it does between passes (see
         :meth:`_unlink_superseded`).
         """
         token, stream_dir = self._stream_token_dir(stream)
@@ -2814,7 +3074,10 @@ class FilesystemStateBackend(StateBackend):
             )
         except FileNotFoundError:
             return 0
-        newest: dict[str, str] = {}
+        # record file -> value of each record kept for its value, newest
+        # first
+        kept: dict[str, str] = {}
+        seen: set[str] = set()
         gone: set[str] = set()
         for name in names:
             data = self._read_record(stream_dir, name)
@@ -2823,24 +3086,36 @@ class FilesystemStateBackend(StateBackend):
             value = data.get(field)
             if not isinstance(value, str):
                 continue  # unclassifiable: keep it, cannot judge supersession
-            if value in newest:
+            if value not in seen:
+                seen.add(value)
+                kept[name] = value
+            elif value == spare:
+                spare = None
+                kept[name] = value
+            else:
                 try:
                     os.unlink(os.path.join(stream_dir, name))
                     gone.add(name)
                 except OSError:
                     # already gone (raced with another prune/node): ignore.
                     pass
-            else:
-                newest[value] = name
-        if newest:
+        if kept:
             self._field_index_learn(
                 (token, field),
-                {name: value for value, name in newest.items()},
+                kept,
                 [n for n in names if n not in gone],
                 mark,
+                gone,
             )
         if stretch:
-            self._append_prune_stretch(token, len(names) - len(gone))
+            # the records left in the stream: an overlapping pass can have
+            # removed one that did not read or unlink here
+            left = len(kept) + sum(
+                not self._record_superseded(stream_dir, name)
+                for name in names
+                if name not in kept and name not in gone
+            )
+            self._append_prune_stretch(token, left)
         return len(gone)
 
     # --- lease -----------------------------------------------------------

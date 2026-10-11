@@ -519,6 +519,7 @@ jobs:
             tests/test_web_perf_e2e.py \
             tests/test_web_prefs_e2e.py \
             tests/test_web_surfaces_e2e.py \
+            tests/test_web_e2e_helper.py \
             -v -rs --junitxml=parity-enforce.xml
           .tox/py-posix/bin/python - <<'EOF'
           import xml.etree.ElementTree as ET

@@ -1,10 +1,10 @@
 # Concurrency and timeouts
 
 `concurrencyPolicy` controls overlapping runs of the same job.
-`executionTimeout` limits each run's duration, and `killTimeout` sets how long
-cancellation waits before forcing termination. These settings apply separately
-to each job and can also be set in `defaults`. They do not coordinate different
-jobs.
+`executionTimeout` limits each run's duration, and `killTimeout` sets the
+longest that cancellation waits for the job's own process before forcing
+termination. These settings apply separately to each job and can also be set
+in `defaults`. They do not coordinate different jobs.
 
 By default, the concurrency policy applies within one daemon process.
 `concurrencyScope` can extend `Forbid` and `Replace` to all nodes sharing a
@@ -58,7 +58,7 @@ becomes the tree kill immediately).
 | `concurrencyPolicy` | enum: `Allow`, `Forbid`, `Replace` | `Allow` | Behavior when a launch is requested while another instance of the same job is still running. |
 | `concurrencyScope` | enum: `node`, `cluster` | `node` | How far `concurrencyPolicy` reaches. With `node`, only this process's running instances count. With `cluster`, `Forbid` and `Replace` also exclude instances on other nodes sharing the [`state` store](Durable-State). See [concurrency across a cluster](#concurrency-across-a-cluster). |
 | `executionTimeout` | float (seconds, `> 0` when set) | none (`null`) | Maximum wall-clock duration of a single run. On expiry the run is cancelled and assigned return code `-100`. |
-| `killTimeout` | float (seconds, `>= 0`) | `30` | When a run is cancelled, seconds to wait after the graceful process-group signal (SIGTERM on POSIX, `CTRL_BREAK_EVENT` on Windows) before the unconditional kill (process-group SIGKILL on POSIX, `taskkill /F /T` tree kill on Windows). See [running on Windows](Running-on-Windows). |
+| `killTimeout` | float (seconds, `>= 0`) | `30` | When a run is canceled, the longest the daemon waits for the job's own process to exit after the graceful process-group signal (SIGTERM on POSIX, `CTRL_BREAK_EVENT` on Windows). The unconditional kill (process-group SIGKILL on POSIX, `taskkill /F /T` tree kill on Windows) follows when that process exits or the wait ends. See [cancellation and killTimeout](#cancellation-and-killtimeout) and [running on Windows](Running-on-Windows). |
 
 Types come from the strictyaml schema: `concurrencyPolicy` is
 `Enum(["Allow", "Forbid", "Replace"])`, `concurrencyScope` is
@@ -85,10 +85,18 @@ according to `concurrencyPolicy`. This local check always runs first. For a
 the job's cluster slot (see
 [concurrency across a cluster](#concurrency-across-a-cluster)).
 
-An instance counts as running while it has a process. One whose process has
-exited, or whose command could not start, does not count, even before the
-daemon has recorded the run. Every policy passes such an instance over, and
-the run keeps the outcome that it ended with.
+An instance counts as running until the daemon has collected its command's
+exit status and captured output and has finished any
+[result verification](Result-Verification), or until the daemon has finished
+[canceling it](#cancellation-and-killtimeout). The instance has then ended,
+and an instance whose command could not start has ended as well. The daemon
+reads captured output to the end of the stream, so a process that the
+command started and that holds the stream open keeps the instance running
+after the command exits, until the stream closes or the instance is
+canceled. An instance that has ended does not count, even before the daemon
+has recorded the run. Every policy passes such an instance over, and the run
+keeps the outcome that it ended with. Until the run is recorded, `GET /jobs`
+reports the job as `running` and keeps the instance's process ID in `pids`.
 
 ### Allow (default)
 
@@ -392,9 +400,11 @@ jobs:
 
 ## Cancellation and killTimeout
 
-Both an `executionTimeout` expiry and `concurrencyPolicy: Replace` invoke
-cancellation (`RunningJob.cancel`). It terminates the run and everything the
-run spawned. On POSIX each job is started in a fresh session
+An `executionTimeout` expiry, `concurrencyPolicy: Replace`, an operator
+cancel ([`POST /jobs/{name}/cancel`](HTTP-API#post-jobsnamecancel) or the MCP
+`cron_cancel_job` tool), and a lost [resource pool](Resource-Pools) lease all
+invoke cancellation (`RunningJob.cancel`). It terminates the run and
+everything the run spawned. On POSIX each job is started in a fresh session
 (`start_new_session`), so the job and every descendant share one process
 group (the child's own pid), which cancellation then signals as a unit
 (`os.killpg` in `cronstable/platform.py`). Windows has no equivalent at spawn
@@ -406,10 +416,12 @@ time, so descendants are reached through the live process tree instead
    be signaled (it is already empty, or `killpg` failed), fall back to
    SIGTERM on the direct child with `proc.terminate()`. A `ProcessLookupError`
    (process already gone) is ignored.
-2. Wait up to `killTimeout` seconds for the direct child to exit, using
-   `asyncio.wait_for(proc.wait(), killTimeout)`. If it has not exited by then,
-   log `Job <name> did not gracefully terminate after <N> seconds, killing
-   it...`.
+2. Wait up to `killTimeout` seconds for the direct child to exit. The daemon
+   waits on the child and also reads its exit status every 0.25 seconds, so
+   the wait ends within about 0.25 seconds of the exit, including while a
+   descendant holds one of the job's output pipes open. If the child is
+   still running at the end of `killTimeout`, log `Job <name> did not
+   gracefully terminate after <N> seconds, killing it...`.
 3. Send SIGKILL to the whole process group, **unconditionally**, whether or
    not the direct child exited within `killTimeout`. The child exiting says
    nothing about descendants sharing its group, and those are what hold the
@@ -424,6 +436,19 @@ job's stdout/stderr pipes. Killing only the shell would leave the pipes open,
 so the run would never finish draining, its slot would never be released, and
 under `concurrencyPolicy: Forbid` the job would never run again. Killing the
 group takes the helper down with the shell.
+
+Both group signals address the group by the process ID of the direct child.
+After the daemon has collected the child's exit status, the operating system
+can give the ID to another process, which POSIX permits only once the job's
+group is empty. On POSIX the daemon therefore checks, before each of the two
+group signals, whether a process exists under the ID. A process that another
+user owns counts. When one exists, the job's group is empty, and the daemon
+sends neither SIGTERM nor SIGKILL to that group ID. When none exists, the
+daemon sends the signal, which reaches the descendants that share the group.
+Until the daemon has collected the exit status, it sends both signals
+without the check. Windows makes no such check. One reuse goes undetected: a
+process that took the ID, exited, and left members in a process group of its
+own. The daemon then sends its signals to that group.
 
 On Windows each job is likewise spawned in its own process group
 (`CREATE_NEW_PROCESS_GROUP`), and the steps map onto the platform's own
@@ -441,16 +466,58 @@ immediately and no graceful signal reaches the job. See
 
 `killTimeout` defaults to `30` seconds and must be `>= 0`. A value of `0` is
 valid and means the group SIGKILL follows almost immediately after the group
-SIGTERM (the `asyncio.wait_for` with a zero timeout gives the process
-essentially no grace period).
+SIGTERM: the daemon lets the event loop run once in between, so the process
+gets no grace period. The daemon logs the `did not gracefully terminate`
+line only when the process has not exited by then.
 
-`killTimeout` gives a job time to flush buffers and clean up after the
-graceful signal. Raise it for jobs that need longer to shut down, and lower
-it for jobs that may ignore the graceful signal and must be force-killed
-quickly. The guidance applies on both platforms (the graceful signal is
-SIGTERM on POSIX and `CTRL_BREAK_EVENT` on Windows), with one Windows caveat:
-a daemon without a console cannot deliver the break, and there `killTimeout`
-has nothing to bound because the tree kill runs at once. See
+`killTimeout` is the time that the job's own process has to exit after the
+graceful signal. The job's own process is the one that the daemon started
+(the direct child in the preceding steps): the program itself when `command`
+is a list, and the shell when `command` is a string. The wait ends when that
+process exits, and the forced step follows within about 0.25 seconds,
+whatever remains of `killTimeout`. On POSIX the forced step ends every
+process that is left in the group. On Windows the tree kill finds no process
+once the job's own process has exited. Raise `killTimeout` for a job whose
+own process needs longer to shut down, and lower it for a job that may
+ignore the graceful signal and must be force-killed quickly.
+
+On POSIX the SIGTERM reaches the shell and the programs that it started at
+the same moment. A shell that sets no trap for SIGTERM exits at once, and
+the SIGKILL then ends the rest of the group. A program that runs as a child
+of the shell therefore has the grace period only while the shell is alive.
+A workload that needs the whole `killTimeout` must be the job's own process,
+or the shell must wait for it:
+
+- Pass `command` as a list. The program runs with no shell.
+- End a shell command with `exec`, which replaces the shell with the
+  program. Write the `exec` for a single command too, because shells differ:
+  bash replaces itself with a lone command, and dash 0.5.12, the `/bin/sh`
+  of Ubuntu 24.04, does not.
+- Set a trap that runs a command, such as `trap 'exit 143' TERM`, ahead of
+  the workload. The shell runs the trap only after the program that it is
+  waiting for has exited.
+
+```yaml
+jobs:
+  - name: queue-worker
+    command: |
+      cd /srv/queue
+      exec ./worker --drain   # the worker replaces /bin/sh
+    schedule: "*/15 * * * *"
+    killTimeout: 120          # the worker has 120 seconds to exit
+```
+
+On Windows the graceful signal is `CTRL_BREAK_EVENT`, and cmd.exe keeps
+running until the program that it is running exits, so a workload under a
+string `command` has the whole `killTimeout`. A program that the command
+launches with `start` and does not wait for is the exception: once cmd.exe
+has exited, the tree kill does not reach that program, and it keeps running.
+When the interrupted program exits, cmd.exe goes on to the next step of a
+command joined with `&`. That step starts after the break, so it runs until
+it exits or until `killTimeout` ends and the tree kill stops it. A step
+joined with `&&` starts only when the interrupted program exits with
+status 0. A daemon without a console cannot deliver the break, and there
+`killTimeout` has nothing to bound because the tree kill runs at once. See
 [running on Windows](Running-on-Windows).
 
 As defense in depth, a descendant that escaped the group entirely (it called
@@ -461,10 +528,64 @@ deliberately independent of `killTimeout`, which is legitimately `0` for jobs
 that must be force-killed at once but whose already-captured output should
 not be discarded.
 
-When that bound expires the readers are cancelled, the output captured so far
-is kept, cronstable closes its end of the job's pipes, and the run leaves the
-running set, at the cost only of output the escaped descendant would have
-produced afterwards.
+When that bound expires, cronstable keeps the output captured so far, closes
+its end of the job's pipes, logs a warning, and records the run. The run
+loses only the output that the escaped descendant produces afterward. How
+the bound is counted depends on what canceled the run:
+
+- For an operator cancel, a `Replace`, or a lost pool lease, one 30-second
+  bound covers both streams and starts when the cancel sequence finishes.
+  The warning reads `job <name>: output did not reach end-of-file within
+  30.0 seconds of the job being killed`. The bound applies whether the
+  job's process was still running when the cancel arrived or had already
+  exited by itself. When the process needed the forced kill, the daemon
+  looks for its exit 0.25 seconds after the sequence and counts the 30
+  seconds from there. While the process outlives the forced kill, the pipes
+  stay open: the daemon looks again every 30 seconds and closes them 30
+  seconds after the look that first finds the process gone. A cancel of
+  this kind that arrives during a [verification](Result-Verification) check
+  counts the same bound for the check's streams, and its warning names
+  `verify.output`.
+- For an `executionTimeout`, and for a
+  [verification](Result-Verification) check that times out, each captured
+  stream has 30 seconds to reach EOF after the cancel sequence, stderr first
+  and then stdout. A run whose two captured streams are both held open is
+  recorded within 60 seconds. The warning names the stream: `job <name>:
+  <stream> did not reach end-of-file within 30.0 seconds of the job being
+  killed`. A check's streams are named `verify.stderr` and `verify.stdout`.
+
+On a Python runtime that reports a process's exit while one of its pipes is
+still open, a cancel of the first kind can also log the per-stream warning
+for the first held stream beside the `output` warning, in either order. The
+run is recorded at the same time on every runtime.
+
+A run that a cancel or an `executionTimeout` stops has ended when the cancel
+sequence finishes, and the wait for held output comes after that instant.
+The run record's `finished_at` is that instant, so its `duration` excludes
+the wait (see [`GET /jobs/{name}/runs`](HTTP-API#get-jobsnameruns)). A run
+of the same job that started after that instant can be recorded first, and
+it stays the job's last run. A verification check that times out is part of
+its run: the run ends, and the daemon takes its `finished_at`, when the
+check's streams have closed or their bounds have expired.
+
+An instance that the daemon has finished canceling has ended (see
+[concurrency policy](#concurrency-policy)), even when one of its processes is
+still alive: a descendant that left the process group or the process tree,
+or a process that outlives the forced kill. A `concurrencyPolicy: Forbid`
+job's next fire then starts a new instance beside that process. A job that
+only ignores the graceful signal causes no such overlap, because its fires
+are dropped for the whole `killTimeout` and the forced kill ends it.
+
+A cancel that arrives while a run's [verification](Result-Verification)
+check runs applies the sequence to the check's process group, with the job's
+`killTimeout`. The run has ended when that sequence finishes, even while a
+process that the check started still holds the check's output open. The
+daemon records the run when that output closes or its bound expires. A
+cancel that arrives while the daemon is starting the check, before the check
+has a process, leaves the instance running. The daemon terminates the check
+right after it starts (for a workflow task, after the task's verifying
+status is published), or when `verify.timeout` expires if that comes first,
+and the instance has ended from then on.
 
 ```yaml
 jobs:

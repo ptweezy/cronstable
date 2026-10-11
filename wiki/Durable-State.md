@@ -197,12 +197,14 @@ with no built-in rename:
   unknown `schemaVersion`, truncated JSON from a crash mid-write) is moved to
   `quarantine/` on read and skipped, never guessed at and never fatal. A plain
   I/O error (a transient NFS failure) leaves the record in place and skips it
-  for that read only. The two readers that would act on "absent" as permanent
+  for that read only. The readers that would act on "absent" as permanent
   opt out of that skip with a **strict** read that propagates the error
   instead: the DAG
   [mapped-expansion read](Orchestration-and-DAGs#fan-out-dynamic-mapping)
-  retries later, and the [GC blob sweep](#garbage-collection-and-manifests)
-  stands down for that pass.
+  retries later, a [workflow recovery](Workflow-Recovery) request answers
+  `503` with `recovery state is unavailable`, and the
+  [GC blob sweep](#garbage-collection-and-manifests) stands down for that
+  pass.
 * **Derived watermarks, no mutable cursors.** The "last fired" cursor is
   computed as the maximum over the immutable records, so nothing depends on
   rewriting an existing file, and the answer is order-independent even when
@@ -296,17 +298,24 @@ and bounded (with a slow store the daemon skips it with a warning; history
 then fills in as jobs run, exactly as with no rehydration).
 
 A job's *latest* run is the one with the newest finish time, not the last
-record in the stream. Each node appends through a per-job chain, which orders
-that node's own writes but cannot order the appends a peer makes from its own
-process on the same mount, so an interleaved append can leave an older run
-last.
+record in the stream. A run's finish time is the instant the run
+[ended](Concurrency-and-Timeouts#concurrency-policy), and it is never later
+than the instant the daemon recorded the run. The daemon records a canceled
+or timed-out run when the wait for its captured output ends, so a run of the
+same job that started after it ended can be recorded first. Each node appends
+through a per-job chain, which orders that node's own writes by the instant
+it records them and cannot order the appends a peer makes from its own
+process on the same mount. In both cases an older run can be the last record
+in the stream.
 
 Everything that answers "the latest run" folds by finish time instead: the
 rehydrated `last_run`, the retry sequence's superseded-by-run watermark, the
-`maxTimeSinceSuccess` reference, the `onlyIfLastSucceeded` memo, and the
-`last_duration`, `last_cpu_seconds` and `last_rss_bytes` fields in the `stats`
-block. Two runs sharing a finish instant resolve to the later one in the
-stream.
+missed-run catch-up watermark, the `maxTimeSinceSuccess` reference, the
+`onlyIfLastSucceeded` memo, and the `last_duration`, `last_cpu_seconds` and
+`last_rss_bytes` fields in the `stats` block. Two runs sharing a finish
+instant resolve to the later one in the stream. A run that ended before a
+retry was armed does not supersede that retry when the daemon records it
+afterward.
 
 One kind of row becomes the latest whatever its instant: a run of *this* node
 that a crash interrupted. Its record stands in the instant the run started,
@@ -319,10 +328,11 @@ and cannot displace a newer local run.
 The run *listings* are a different question, and nothing re-orders them at
 read time. A restart rebuilds the ring in finish order; after that it grows in
 the order this node observed the completions, so a peer's interleaved append,
-or a crash-reconciled row standing in a past instant, leaves the tail out of
-finish order. A listing shows every row it holds, so an inverted pair moves a
-cell rather than changing a verdict, and an interrupted run reads better where
-it was seen than a long way back in the history.
+a run that the daemon records after a newer one, or a crash-reconciled row
+standing in a past instant, leaves the tail out of finish order. A listing
+shows every row it holds, so an inverted pair moves a cell rather than
+changing a verdict, and an interrupted run reads better where it was seen
+than a long way back in the history.
 
 > **A different feature with a similar name:** the
 > [web dashboard's opt-in run ledger](Web-Dashboard#browser-run-history) records
@@ -495,14 +505,18 @@ jobs:
 ```
 
 * **Newest real outcome wins.** The gate reads both the in-memory history and
-  the durable ledger, and judges whichever `success`/`failure` is newest. The
-  in-memory history is updated synchronously, so it never lags the durable
-  write; the durable ledger sees runs from *other nodes* on a shared mount.
-  `cancelled` and `skipped` records are ignored in both: a skipped tick does
-  not clear the gate; only a genuine success re-opens it.
+  the durable ledger, and judges whichever `success`/`failure` is newest by
+  the instant the run ended. The in-memory history is updated synchronously,
+  so it never lags the durable write; the durable ledger sees runs from
+  *other nodes* on a shared mount. `cancelled` and `skipped` records are
+  ignored in both: a skipped tick does not clear the gate; only a genuine
+  success re-opens it. A run that `executionTimeout` ended and that the
+  daemon records after a newer successful run leaves the gate open, on this
+  node and on a peer that reads the shared ledger.
 * **A still-running instance has not "succeeded"**, so it blocks the gate too.
-  So does an instance whose process has exited, until the daemon records its
-  run, because the gate reads recorded outcomes. The exception is
+  So does an instance that has
+  [ended](Concurrency-and-Timeouts#concurrency-policy), until the daemon
+  records its run, because the gate reads recorded outcomes. The exception is
   `concurrencyPolicy: Replace`, whose contract is that a new fire supersedes
   the running one. There the gate judges the last *finished* outcome.
 * **No prior run allows.** A first-ever fire has nothing to depend on and is
@@ -866,8 +880,10 @@ On a request-billed shared mount, a busy store (many jobs, tight schedules,
 archived output) has a literal price. `state.maxOpsPerSecond` puts a token
 bucket over **every backend operation except lease operations** (burst = one
 second's tokens). Operations past the rate queue rather than fail. The delay
-is invisible to scheduling: writes are already background tasks, and bounded
-reads still honor their timeout. The throttling is observable as
+is invisible to job scheduling: writes are already background tasks, and
+bounded reads still honor their timeout. [Workflow](Orchestration-and-DAGs)
+scheduling waits for its store operations, as described later in this
+section. The throttling is observable as
 `cronstable_state_throttled_ops_total` /
 `cronstable_state_throttle_wait_seconds_total`.
 `0` (the default) disables the limiter, the right choice for a local
@@ -878,6 +894,38 @@ a burst of bulk writes could overshoot its TTL, expiring a live holder's
 lease and double-running the very job the lease exists to fence. The
 coordination traffic is a handful of small operations per running slot-gated
 job, so exempting it costs little.
+
+A low cap slows workflow
+[run retention](Orchestration-and-DAGs#retention-and-gc). A retention batch
+leases up to 32 runs, and takes the leases at once because lease operations
+bypass the bucket. The batch starts a run's delete only within 30 seconds of
+leasing the run. Each deleted run costs two rate-limited operations, and
+each batch costs two more, so a full batch needs about 64 operations inside
+those 30 seconds. A cap of about 2 or lower cannot supply them: at
+`maxOpsPerSecond: 1`, a batch deletes about 15 of its 32 runs. The batch
+releases a run whose delete cannot start in time and leaves it for the
+node's next pass, which runs hourly and at daemon start. A workflow that
+finishes runs faster than the passes delete them holds more than
+`retainRuns`. Each node runs its own pass. A store that takes about 0.3
+seconds or more per operation has the same effect without a cap, because a
+full batch runs about 96 store operations, lease operations included,
+between leasing its last run and deleting it.
+
+A retention delete that times out can still land, so the batch keeps that
+run's lease until it lapses, 60 seconds after it was taken, and releases its
+other leases. [Retention and GC](Orchestration-and-DAGs#retention-and-gc)
+describes what the held lease blocks.
+
+A low cap also delays scheduled workflow runs. A node's workflow service
+pass waits for its store operations, including the retention pass, and the
+node creates no scheduled run while a pass is in flight. At
+`maxOpsPerSecond: 1`, a retention pass takes about 2 seconds for each run it
+deletes, at two rate-limited operations for each run. A fire that a pass
+delays by 10 seconds or more resumes at the current slot: the daemon logs
+`its next fire fell <N>s behind`, creates the run only if the current time
+still matches the schedule, and leaves the slots in between to the
+workflow's [`onMissed`](#missed-run-catch-up) policy, which skips them by
+default.
 
 ## Job-facing state
 
@@ -1042,6 +1090,84 @@ collected](#garbage-collection-and-manifests) with the rest of a removed job's
 state. Blobs deduplicate across scopes, and a payload blob no surviving
 artifact record references is swept by the same GC pass after it is older
 than the grace.
+
+Publishing a name again keeps the version that it replaces and removes the
+one before that, so a scope that one node publishes to holds at most two
+records for each name. The publish first confirms that the version it
+replaces is still in the store. When that version is gone, as after another
+node wipes the scope or a record is quarantined, the publish removes
+nothing, and one older record of the name stays until the scope's next
+cleanup. The replaced payload stays referenced until the name's next publish
+or the scope's next cleanup. That cleanup runs after the daemon has
+published to the scope as many times as its last cleanup left records in the
+scope, and at least eight times. The records left are the ones that the
+cleanup kept and the ones that it could not read or classify. The cleanup
+also removes the superseded versions that other nodes published. Each node
+counts its own publishes toward its own cleanup, so a scope that several
+nodes publish to holds more records. In tests with 50 names that every node
+republished without pause, the scope peaked at about 2 times the names with
+one node, at up to 4 times with two, and at up to 6 times with three.
+
+`artifact get` and `artifact list` read the scope's directory and then its
+records, as lookups of a workflow's XCom values do. A read that overlaps one
+publish of a name returns the version from before that publish or the one
+from after it. The daemon remembers the newest record of each name that it
+published, read in a lookup, or kept in a cleanup. When a directory read
+misses that record, the read answers from it, once the daemon has found the
+record's file in the store. A read can still miss the current version of a
+name when the reading node remembers no record of the name newer than the
+ones that its directory read listed, and the name is published twice during
+that read, or is published once and the scope is cleaned up during it. When
+the directory read then holds no record of the name, `get` answers not found
+and `list` leaves the name out. When it holds an older record of the name
+that another node left in the scope, `get` returns that version and `list`
+lists it. A [strict](#the-store-model) read returns that version too. `get`
+and `list` can also return an older version that the daemon has read before.
+The next call returns the current version.
+
+A publish takes a record name above every record of the scope that the
+daemon has published, kept in a cleanup, or met in a lookup or a listing
+(`artifact get`, `artifact list`, an XCom lookup or listing, or a workflow
+recovery plan). A node whose clock is behind a peer's therefore publishes
+above the peer's version once it has read that version in a lookup or a
+listing. A node that has not read it can publish below it, which is one
+reason that nodes sharing a store need synchronized clocks (see
+[operational notes](#operational-notes)).
+
+The daemon remembers a record's name only when the name is at most 256
+characters. `put`, `get`, and `list` serve a longer name, with three
+differences:
+
+* A lookup reads a record that carries such a name every time it reaches
+  the record: newest first down to its match, and every such record when the
+  scope lacks the name that it looks for. A [strict](#the-store-model)
+  lookup reads those records from the store, and any other lookup can take
+  one that the daemon has read before from memory.
+* The daemon remembers no newest record of such a name. A lookup or a
+  listing whose directory read overlaps two publishes of the name, or one
+  publish and a cleanup, can therefore answer not found or leave the name
+  out, and the next call returns the current version.
+* Publishing such a name again removes no older version at the publish. The
+  superseded versions, and the payloads that they reference, stay until the
+  scope's next cleanup, which keeps the newest version of each name and the
+  version that its own publish replaced. A scope of such names that one node
+  publishes to holds up to about twice as many records as names, or eight
+  records more than its names when it has fewer than eight, so one such name
+  that is republished alone holds up to 9 records.
+
+Move the nodes that share a store to one build together. A node on an older
+build can answer not found, or leave a name out of a listing, when a newer
+node publishes the name twice, or publishes it and then cleans the scope,
+between the older node's directory read and its record read. The older node
+also reads up to twice as many records in a scope that a newer node
+republishes. That slows it once the scope passes about 1,000 republished
+names, where two records for each name outgrow the older build's cache of
+2,048 records. The older node's limit for workflow recovery, 10,000
+artifacts, counts records, and a newer node's limit counts names. The older
+node can therefore answer `409` with
+`recovery supports at most 10000 artifact records` for a run that holds
+between 5,001 and 10,000 artifact names that a newer node republished. A
+newer node accepts that run.
 
 ### Run-scoped secrets
 

@@ -60,10 +60,28 @@ cancellation also invalidates queued retries in the state store. Catch-up waits
 for each of its own queued runs to finish before admitting the next or closing
 its checkpoint; shutdown leaves unfinished work resumable.
 
+Pool state cannot be read or written when the store raises an I/O error, a
+pool operation exceeds its 5-second bound, a pool document cannot be read
+(an I/O error on the file, a damaged body, or an unknown schema version), or
+the configured store has not started. A scheduled fire, or a deferred
+`@reboot` run, that arrives in that state is dropped with the same warning,
+`Job <name> could not enter pool <pool>: <reason>`, and the scheduler
+continues servicing other jobs. The fire also logs
+`pool <pool>: retry settlement deferred` for each pool whose retry
+settlement it could not write. The next enqueue, retry check, or queue
+service pass that reaches the pool applies that settlement. A failed run and
+a due retry in that state are covered under
+[retry lifecycle](Failure-Detection-and-Retries#retry-lifecycle).
+
 The dashboard's **Resource pools** card shows capacity, priorities, deadlines,
 and cancellation controls. `GET /pools` exposes the same data.
 `POST /pools/{name}/queue/{key}/cancel` cancels waiting work. A manual start of
-a pooled job returns HTTP `202` with `queued`, `queueId`, and `pool`.
+a pooled job returns HTTP `202` with `queued`, `queueId`, and `pool`. While
+pool state cannot be read or written, these three requests answer `503` with
+`pool state is unavailable`. When a pool refuses a start or a queue cancel,
+the request answers `409` with the pool's own message.
+[Enabling the API](HTTP-API#enabling-the-api) lists the cases for both
+answers.
 
 All participating daemons must share the state store and pool configuration.
 Pool admission requires reliable exclusive filesystem locks and stops when
@@ -71,6 +89,15 @@ the store cannot coordinate admission. A running claim has a renewable
 30-second lease. Losing renewal cancels its process; an expired claim can be
 admitted again before its queue deadline. Commands must tolerate replay after
 a crash or loss of coordination.
+
+The lease also bounds a completion that the daemon cannot write to the
+store. The daemon keeps that completion and writes it again on its next
+passes, and it stops renewing the claim's lease. A write that lands before
+the lease lapses records the completion. Once the lease has lapsed, 30
+seconds after its last renewal, the entry returns to the queue with no
+completion recorded, and a job that has already finished can be admitted and
+run again. An entry whose queue deadline has passed by then expires and
+does not run.
 
 Changing capacity lets existing work drain at the stored capacity before
 admission switches to the configured capacity. New enqueue requests fail

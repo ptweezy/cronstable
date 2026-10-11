@@ -88,7 +88,7 @@ the window. Optional columns:
 | --- | --- |
 | **Policy** | *(cluster only)* the job's [`clusterPolicy`](Clustering-and-Leader-Election#per-job-policy): `Leader`, `PreferLeader`, or `EveryNode`; hover for what the policy means. Standalone daemons show `—`. Sortable, to group jobs by policy. |
 | **TZ** | The schedule's reference frame: `UTC` (the default), the job's IANA `timezone` (such as `America/Los_Angeles`), or `local` (`utc: false`). Useful when a fleet mixes frames. |
-| **Next at** | The next run as a wall-clock time in *your browser's* time zone (`04:00`, `tom 04:00`, `Jul 12 04:00`), the absolute complement to **Next**'s countdown. |
+| **Next at** | The next run as a wall-clock time in *your browser's* time zone (`04:00`, `tom 04:00`, `Jul 12 04:00`), the absolute complement to **Next**'s countdown. The day word follows the browser's local date: the first poll after local midnight, or after the browser's UTC offset changes, rewrites every label. With polling paused, the labels update at the next refresh, filter, or sort. |
 | **Rate** | The success percentage over the recent runs the sparkline draws, colored green / amber / red, a numeric complement to **Trend**. |
 
 The toolbar above the table lets you:
@@ -769,7 +769,7 @@ re-probes `/whoami` and redraws.
 
 The dashboard is a thin client over the [HTTP control API](HTTP-API):
 
-- it polls `GET /jobs` on the refresh interval for the overview (each job carries a compact tail of recent runs for the sparkline). Each poll sends the previous response's `ETag` in `If-None-Match`. When only the countdowns have moved, the daemon answers `304 Not Modified`, and the dashboard keeps the jobs it holds and continues each countdown from the response that carried it. If the browser's wall clock and monotonic clock disagree about the age of that response, as they can after the computer sleeps or its clock is set, the next poll omits `If-None-Match` and takes a full response;
+- it polls `GET /jobs` on the refresh interval for the overview (each job carries a compact tail of recent runs for the sparkline). Every poll bypasses the browser's HTTP cache, and each poll after the first sends the previous response's `ETag` in `If-None-Match`. When only the countdowns have moved, the daemon answers `304 Not Modified`, and the dashboard keeps the jobs it holds and continues each countdown from the response that carried it. If the browser's wall clock and monotonic clock disagree about the age of that response by one second or more, as they can after the computer sleeps or its clock is set, the next poll omits `If-None-Match` and takes a full response;
 - it polls `GET /cluster` on the same interval for the [cluster panel](#cluster-panel) (the panel stays hidden unless a cluster section is configured);
 - `GET /node` (the header's [node meter](#the-job-overview)), `GET /dags` (the [workflows card](#dag-orchestration)), and `GET /pools` (the resource pools card) ride the same poll;
 - while the [fleet view](#fleet-view-every-nodes-runs-in-one-pane) is open, `GET /fleet` rides the same poll (the daemon answers it from gossip state it already holds);

@@ -21,6 +21,13 @@ class RecoveryError(Exception):
         self.message = message
 
 
+class RecoveryUnavailable(RecoveryError):
+    """A recovery request made while the daemon has no state backend."""
+
+    def __init__(self, message: str = "recovery state is unavailable") -> None:
+        super().__init__(message)
+
+
 def digest(value):
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()

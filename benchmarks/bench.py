@@ -45,6 +45,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tracemalloc
 from datetime import datetime, timedelta, timezone
@@ -376,11 +377,9 @@ def _child_env():
     # A child runs in a temp directory.  Each PYTHONPATH entry is made
     # absolute here, so a relative one names the directory that it names
     # for this process and the child imports the package measured here.
-    paths = [
-        os.path.abspath(p)
-        for p in env.get("PYTHONPATH", "").split(os.pathsep)
-        if p
-    ]
+    # An empty entry is relative too: it names the current directory.
+    raw = env.get("PYTHONPATH", "")
+    paths = [os.path.abspath(p) for p in raw.split(os.pathsep)] if raw else []
     if _SRC_FALLBACK:
         paths.insert(0, _SRC_FALLBACK)
     if paths:
@@ -388,29 +387,90 @@ def _child_env():
     return env
 
 
+# Seconds a benchmark child may run before the harness kills it.  The daemon
+# child gives up on its own after 300.
+_CHILD_TIMEOUT = 360.0
+
+
+def _child_skip(what, args, stderr):
+    """The Skip for a child that ``what`` (exited N, timed out).
+
+    The reason is one line: ``args`` with any multi-line argument (a ``-c``
+    script) replaced by a placeholder, then the last line of ``stderr``.
+    """
+    shown = " ".join("<script>" if "\n" in arg else arg for arg in args)
+    reason = "child %s: %s" % (what, shown)
+    lines = (stderr or b"").decode("utf-8", "replace").strip().splitlines()
+    if lines:
+        reason += " (stderr: %s)" % lines[-1].strip()[:300]
+    return Skip(reason)
+
+
+def _run_child(
+    args, env=None, stdin=None, stdout=subprocess.DEVNULL, wrapper=()
+):
+    """Run one child interpreter with ``args`` to its exit.
+
+    Returns ``(wall-clock seconds, captured stdout)``.  ``env`` replaces
+    the :func:`_child_env` environment, and ``stdin`` is the child's
+    standard input.  ``wrapper`` is interpreter arguments placed before
+    ``args`` and left out of a skip reason.  A child that exits nonzero or
+    outlives ``_CHILD_TIMEOUT`` raises Skip.
+    """
+    started = []
+    expired = threading.Event()
+
+    def kill():
+        expired.set()
+        for proc in started:
+            proc.kill()
+
+    # stderr goes to a file: a pipe would stay open, and hold the wait, for
+    # as long as any process the child started kept it.
+    with tempfile.TemporaryFile(dir=_tmpdir()) as errors:
+        # A wait with a timeout polls for the exit, which would quantize
+        # the wall clock, so the wait is unbounded and this timer ends a
+        # hung child.
+        timer = threading.Timer(_CHILD_TIMEOUT, kill)
+        timer.daemon = True
+        timer.start()
+        try:
+            t0 = time.perf_counter()
+            # cwd is a neutral temp dir so the child resolves cronstable
+            # from its interpreter's site-packages, never from a checkout
+            # it happens to sit in.  In the paired CI run the old side's
+            # children must import the old release, not the repo working
+            # tree.
+            with subprocess.Popen(
+                [sys.executable, *wrapper, *args],
+                stdin=stdin,
+                stdout=stdout,
+                stderr=errors,
+                env=_child_env() if env is None else env,
+                cwd=_tmpdir(),
+            ) as proc:
+                started.append(proc)
+                if expired.is_set():
+                    proc.kill()
+                out, _ = proc.communicate()
+            dt = time.perf_counter() - t0
+        finally:
+            timer.cancel()
+        errors.seek(0)
+        err = errors.read()
+    if expired.is_set():
+        raise _child_skip("timed out after %ds" % _CHILD_TIMEOUT, args, err)
+    if proc.returncode != 0:
+        raise _child_skip("exited %d" % proc.returncode, args, err)
+    return dt, out
+
+
 def _timed_child(args, env=None, stdin=None):
     """Wall clock of one child interpreter run with ``args``.
 
-    ``env`` replaces the :func:`_child_env` environment, and ``stdin`` is
-    the child's standard input.
+    ``env`` and ``stdin`` are as for :func:`_run_child`.
     """
-    t0 = time.perf_counter()
-    # cwd is a neutral temp dir so the child resolves cronstable from its
-    # interpreter's site-packages, never from a checkout it happens to sit
-    # in.  In the paired CI run the old side's children must import the old
-    # release, not the repo working tree.
-    proc = subprocess.run(
-        [sys.executable] + args,
-        stdin=stdin,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=_child_env() if env is None else env,
-        cwd=_tmpdir(),
-    )
-    dt = time.perf_counter() - t0
-    if proc.returncode != 0:
-        raise Skip("child exited %d: %s" % (proc.returncode, " ".join(args)))
-    return dt
+    return _run_child(args, env=env, stdin=stdin)[0]
 
 
 @bench(
@@ -2770,6 +2830,27 @@ async def _teardown_cron(cron):
             await backend.stop()
 
 
+def _count_calls(obj, name):
+    """Count the calls of ``obj.name`` from here on.
+
+    Returns a one-item list that holds the count.  The counter is an
+    instance attribute, so ``delattr(obj, name)`` removes it.  A benchmark
+    that clears a memo by a private name checks the count, which stays
+    short when the clear reached nothing.
+    """
+    real = getattr(obj, name, None)
+    if real is None:
+        raise Skip("%s.%s not present" % (type(obj).__name__, name))
+    calls = [0]
+
+    def counted(*args, **kwargs):
+        calls[0] += 1
+        return real(*args, **kwargs)
+
+    setattr(obj, name, counted)
+    return calls
+
+
 _BENCH_DAG_YAML = (
     "dags:\n  - name: benchdag\n    tasks:\n"
     "      - id: a\n        command: 'x'\n"
@@ -2856,7 +2937,9 @@ def bench_dag_list_dags_warm():
             await _teardown_cron(cron)
             raise Skip("cron._dag.list_dags not present")
         try:
+            listings = _count_calls(backend, "list_document_keys")
             await dagsched.list_dags()  # warm any terminal-run cache
+            listed = listings[0]
             t0 = time.perf_counter()
             for _ in range(polls):
                 # Keep measuring the ROLLUP (keys listing + cached
@@ -2868,6 +2951,11 @@ def bench_dag_list_dags_warm():
             dt = time.perf_counter() - t0
         finally:
             await _teardown_cron(cron)
+        if listings[0] - listed < polls:
+            raise RuntimeError(
+                "%d list_dags polls listed the run keys %d times; the "
+                "region timed memo hits" % (polls, listings[0] - listed)
+            )
         total = listing[0].get("totalRuns") if listing else None
         if total != runs:
             raise RuntimeError(
@@ -2889,14 +2977,13 @@ def bench_dag_list_dags_warm():
 def bench_dag_list_runs_warm():
     """The run-list poll behind the dashboard's DAG runs tab.
 
-    dag.list_dags_warm measures the ROLLUP, which lists keys and consults a
-    per-key terminal cache; list_runs is the sibling that gets no such help.
-    It reads every run document's body on every call, sorts them all, and
-    then returns the newest `limit`, so the read grows with retention
+    list_runs serves a terminal run from the per-key summary cache, which
+    the untimed first call fills.  Every seeded run is terminal, so a timed
+    call reads no run document: it lists the run keys, sorts every cached
+    summary and returns the newest `limit`.  The sort grows with retention
     while the answer does not, and the dashboard asks again on every poll
-    for as long as the tab is open.  A terminal run is immutable, which is
-    what makes the rollup's cache correct and is exactly the property this
-    path does not exploit yet.
+    for as long as the tab is open.  dag.full_sweep_50x200 times the cold
+    read of every run document.
 
     Driven through the scheduler's own list_runs (the handler adds routing
     and a JSON encode measured elsewhere), and the row count is asserted so
@@ -2940,19 +3027,25 @@ def bench_dag_list_runs_warm():
             # 60 polls: a minute of an open runs tab, and one call measures
             # far under the harness's 50ms rule (the metric would gate at an
             # effective ~230% against its declared 25%)
+            polls = 60
+            listings = _count_calls(backend, "list_document_keys")
             t0 = time.perf_counter()
-            for _ in range(60):
-                # Keep measuring the READ-EVERY-BODY path this docstring
-                # promises: the short-TTL summaries memo would otherwise
-                # serve all 60 calls from the untimed warm call's product
-                # and a regression in the real uncached path could no
-                # longer fire the gate.  getattr, so a release predating
-                # the memo clears a throwaway dict and changes nothing.
+            for _ in range(polls):
+                # Keep measuring the keys listing and the sort: the
+                # short-TTL summaries memo would otherwise serve all 60
+                # calls from the untimed warm call's product.  getattr, so
+                # a release predating the memo clears a throwaway dict and
+                # changes nothing.
                 getattr(dagsched, "_summaries_memo", {}).clear()
                 await dagsched.list_runs("benchdag", limit=25)
             dt = time.perf_counter() - t0
         finally:
             await _teardown_cron(cron)
+        if listings[0] < polls:
+            raise RuntimeError(
+                "%d list_runs polls listed the run keys %d times; the "
+                "region timed memo hits" % (polls, listings[0])
+            )
         return dt
 
     return asyncio.run(run())
@@ -3162,6 +3255,24 @@ def bench_dag_full_sweep():
                 if not hasattr(dagsched, attr):
                     raise Skip("dag scheduler lacks %s" % attr)
             dagcfg = cron.cron_dags["benchdag"]
+            # run documents read: one per body a listing returns, one per
+            # single read
+            bodies = [0]
+            real_list = backend.list_documents
+            real_read = backend.read_document
+
+            async def counting_list(*args, **kwargs):
+                found = await real_list(*args, **kwargs)
+                bodies[0] += len(found)
+                return found
+
+            def counting_read(*args, **kwargs):
+                bodies[0] += 1
+                return real_read(*args, **kwargs)
+
+            backend.list_documents = counting_list
+            backend.read_document = counting_read
+            rolled = 0
             t0 = time.perf_counter()
             for _ in range(rounds):
                 await dagsched.reconcile_on_boot()
@@ -3171,7 +3282,9 @@ def bench_dag_full_sweep():
                 # a cold rollup: no memo and no per-run summary to reuse
                 getattr(dagsched, "_summaries_memo", {}).clear()
                 getattr(dagsched, "_dag_summary_cache", {}).clear()
+                read = bodies[0]
                 listing = await dagsched.list_dags()
+                rolled += bodies[0] - read
             dt = time.perf_counter() - t0
             owned = len(getattr(dagsched, "_owned", ()))
             known = getattr(dagsched, "_terminal_run_keys", {}).get(
@@ -3179,6 +3292,12 @@ def bench_dag_full_sweep():
             )
         finally:
             await _teardown_cron(cron)
+        if rolled < rounds * runs:
+            raise RuntimeError(
+                "%d cold rollups read %d run documents, expected %d; the "
+                "region reused cached summaries"
+                % (rounds, rolled, rounds * runs)
+            )
         total = listing[0].get("totalRuns") if listing else None
         if owned or len(known) != runs or total != runs:
             raise RuntimeError(
@@ -3653,8 +3772,8 @@ def _state_dir_with_records():
     def build():
         import asyncio
 
-        path = os.path.join(_tmpdir(), "state-seeded")
-        os.makedirs(path, exist_ok=True)
+        # appended into, so each build seeds a directory of its own
+        path = tempfile.mkdtemp(prefix="state-seeded-", dir=_tmpdir())
         n = _n(2000)
 
         async def seed():
@@ -4691,8 +4810,8 @@ def _dagstate_artifact_scope():
 
         from cronstable import jobstate
 
-        path = os.path.join(_tmpdir(), "dagstate-artifacts")
-        os.makedirs(path, exist_ok=True)
+        # appended into, so each build seeds a directory of its own
+        path = tempfile.mkdtemp(prefix="dagstate-artifacts-", dir=_tmpdir())
         names = _n(2000, floor=12)
         stream = jobstate.ARTIFACT_STREAM_PREFIX + "bench"
 
@@ -5872,20 +5991,22 @@ def bench_tui_frame_bytes():
 @bench(
     "tui.poll_absorb_5k",
     "tui",
-    detail="2 x App._poll_once over a 5k-job /jobs body: decode, fold, "
-    "sort, verdict",
+    detail="6 x App._poll_once over a decoded 5k-job /jobs payload: index, "
+    "fold, sort, verdict",
     repeats=(5, 2, 1),
     gate_floor=0.005,
 )
 def bench_tui_poll_absorb():
-    """What one poll costs the dashboard's own event loop: the JSON decode
-    aiohttp's ``resp.json()`` performs, the by-name index, the failure
-    diff, the aggregates fold, the view sort and the verdict.
+    """What one poll costs the dashboard's own code: the by-name index, the
+    failure diff, the aggregates fold, the view sort and the verdict.
 
     The poll runs every 3 seconds by default and is the largest idle cost
-    at fleet scale.  The fake API decodes a pre-serialized body on every
-    call, as the client does, so a payload-shaped regression (a second
+    at fleet scale.  The fake API hands each poll its own freshly decoded
+    payload, as the client does, so a payload-shaped regression (a second
     walk of every job, a costlier sort key) lands in the timed region.
+    The decode of a payload and the release of the one it replaces run
+    between the timed polls: both are the interpreter's work on a body
+    that webapi.jobs_bytes_500 sizes.
     """
     import asyncio
 
@@ -5899,29 +6020,37 @@ def bench_tui_poll_absorb():
     class _Daemon:
         url = "http://127.0.0.1:1"
         token = None
-        decoded = 0
+        payload = None
+        served = 0
 
         async def get_json(self, path, timeout_s=10.0):
             if path == "/jobs":
-                self.decoded += 1
-                return json.loads(body.decode("utf-8"))
+                self.served += 1
+                payload, self.payload = self.payload, None
+                return payload
             return {}
 
     daemon = _Daemon()
     app = _tui_board(tui, [], 200, 60, _TuiSink(), api=daemon)
     if not hasattr(app, "_poll_once"):
         raise Skip("TuiApp._poll_once not present")
-    polls = 2
+    polls = 6
 
     async def run():
-        t0 = time.perf_counter()
+        dt = 0.0
         for _ in range(polls):
+            # holds the payload this poll replaces until the clock stops
+            outgoing = app.jobs
+            daemon.payload = json.loads(body.decode("utf-8"))
+            t0 = time.perf_counter()
             await app._poll_once()
-        return time.perf_counter() - t0
+            dt += time.perf_counter() - t0
+            del outgoing
+        return dt
 
     dt = asyncio.run(run())
     if (
-        daemon.decoded != polls
+        daemon.served != polls
         or len(app.jobs) != len(jobs)
         or len(app.view) != len(jobs)
         or app.verdict is None
@@ -5929,7 +6058,7 @@ def bench_tui_poll_absorb():
         raise RuntimeError(
             "%d polls absorbed %d of %d jobs into a %d-row view (verdict %r)"
             % (
-                daemon.decoded,
+                daemon.served,
                 len(app.jobs),
                 len(jobs),
                 len(app.view),
@@ -8002,11 +8131,22 @@ def bench_loop_stall_jobs():
             cron._jobs_response_cache = None
             await cron._web_list_jobs(_mocked_get("/jobs"))
 
-        beat = asyncio.create_task(heartbeat())
-        await asyncio.sleep(0)  # let the heartbeat take its first timestamp
-        await asyncio.gather(*(poll() for _ in range(20)))
-        stop = True
-        await beat
+        builds = _count_calls(cron, "jobs_payload")
+        try:
+            beat = asyncio.create_task(heartbeat())
+            # let the heartbeat take its first timestamp
+            await asyncio.sleep(0)
+            await asyncio.gather(*(poll() for _ in range(20)))
+            stop = True
+            await beat
+        finally:
+            del cron.jobs_payload
+        # concurrent polls share a build, so one is all that is certain
+        if not builds[0]:
+            raise RuntimeError(
+                "20 /jobs polls built no payload; the heartbeat gauged an "
+                "idle loop"
+            )
         return max_gap
 
     return asyncio.run(run())
@@ -8212,24 +8352,36 @@ def bench_loop_stall_metrics():
                     max_gap = gap
                 last = now_t
 
-        beat = asyncio.create_task(heartbeat())
-        await asyncio.sleep(0)  # let the heartbeat take its first timestamp
-        for _ in range(4):
-            # Keep the loop actually rendering: the cross-scraper response
-            # memo primed by the untimed warm call would otherwise serve
-            # all 4 scrapes from cache and the heartbeat would gauge an
-            # idle loop. The memo has two spellings across releases
-            # (_metrics_response_memo since the scaffold,
-            # _metrics_response_cache before it): getattr both, so a
-            # release with either (or neither) clears what it has and
-            # changes nothing else.
-            for memo in getattr(cron, "_metrics_response_memo", {}).values():
-                memo.cached = None
-            getattr(cron, "_metrics_response_cache", {}).clear()
-            resp = await cron._web_metrics(_mocked_get("/metrics"))
+        scrapes = 4
+        builds = _count_calls(cron.metrics, "families")
+        try:
+            beat = asyncio.create_task(heartbeat())
+            # let the heartbeat take its first timestamp
             await asyncio.sleep(0)
-        stop = True
-        await beat
+            for _ in range(scrapes):
+                # Keep the loop actually rendering: the cross-scraper
+                # response memo primed by the untimed warm call would
+                # otherwise serve all 4 scrapes from cache and the
+                # heartbeat would gauge an idle loop. The memo has two
+                # spellings across releases (_metrics_response_memo since
+                # the scaffold, _metrics_response_cache before it): getattr
+                # both, so a release with either (or neither) clears what
+                # it has and changes nothing else.
+                memos = getattr(cron, "_metrics_response_memo", {})
+                for memo in memos.values():
+                    memo.cached = None
+                getattr(cron, "_metrics_response_cache", {}).clear()
+                resp = await cron._web_metrics(_mocked_get("/metrics"))
+                await asyncio.sleep(0)
+            stop = True
+            await beat
+        finally:
+            del cron.metrics.families
+        if builds[0] < scrapes:
+            raise RuntimeError(
+                "%d /metrics scrapes built the families %d times; the "
+                "heartbeat gauged an idle loop" % (scrapes, builds[0])
+            )
         if not resp.body:
             raise RuntimeError("/metrics returned an empty exposition")
         return max_gap
@@ -8631,22 +8783,33 @@ def bench_webapi_jobs_payload():
     async def run():
         await cron._web_list_jobs(_mocked_get("/jobs"))  # executor spawn
         request = _mocked_get("/jobs")
-        t0 = time.perf_counter()
-        for _ in range(20):
-            # Keep measuring the BUILD: the cross-poller response memo
-            # would otherwise serve 19 of these 20 straight from cache and
-            # the metric would stop gating the payload/encode cost its id
-            # promises. The memo has two spellings across releases
-            # (_jobs_response_memo since the scaffold,
-            # _jobs_response_cache before it): clear whichever exists;
-            # the plain write is the documented no-op on releases with
-            # neither.
-            memo = getattr(cron, "_jobs_response_memo", None)
-            if memo is not None:
-                memo.cached = None
-            cron._jobs_response_cache = None
-            await cron._web_list_jobs(request)
-        return time.perf_counter() - t0
+        polls = 20
+        builds = _count_calls(cron, "jobs_payload")
+        try:
+            t0 = time.perf_counter()
+            for _ in range(polls):
+                # Keep measuring the BUILD: the cross-poller response memo
+                # would otherwise serve 19 of these 20 straight from cache
+                # and the metric would stop gating the payload/encode cost
+                # its id promises. The memo has two spellings across
+                # releases (_jobs_response_memo since the scaffold,
+                # _jobs_response_cache before it): clear whichever exists;
+                # the plain write is the documented no-op on releases with
+                # neither.
+                memo = getattr(cron, "_jobs_response_memo", None)
+                if memo is not None:
+                    memo.cached = None
+                cron._jobs_response_cache = None
+                await cron._web_list_jobs(request)
+            dt = time.perf_counter() - t0
+        finally:
+            del cron.jobs_payload
+        if builds[0] < polls:
+            raise RuntimeError(
+                "%d /jobs requests built %d payloads; the region timed "
+                "memo hits" % (polls, builds[0])
+            )
+        return dt
 
     return asyncio.run(run())
 
@@ -9036,13 +9199,24 @@ def bench_webapi_activity_build():
         request = _mocked_get("/activity")
         # the executor's first call spawns its thread
         await cron._web_get_activity(request)
-        t0 = time.perf_counter()
-        for _ in range(3):
-            # keep measuring the build: the shared product would otherwise
-            # serve the later requests from the first one's bytes
-            memo.cached = None
-            resp = await cron._web_get_activity(request)
-        dt = time.perf_counter() - t0
+        polls = 3
+        builds = _count_calls(cron, "_build_activity_product")
+        try:
+            t0 = time.perf_counter()
+            for _ in range(polls):
+                # keep measuring the build: the shared product would
+                # otherwise serve the later requests from the first one's
+                # bytes
+                memo.cached = None
+                resp = await cron._web_get_activity(request)
+            dt = time.perf_counter() - t0
+        finally:
+            del cron._build_activity_product
+        if builds[0] < polls:
+            raise RuntimeError(
+                "%d /activity requests built %d products; the region timed "
+                "memo hits" % (polls, builds[0])
+            )
         jobs = _httpapi_activity_jobs(resp.body, "GET /activity")
         if len(jobs) != len(cron.cron_jobs):
             raise RuntimeError(
@@ -9242,17 +9416,24 @@ def bench_webapi_pools_poll():
         cron._state_configured = True
         pools_req = _mocked_get("/pools")
         jobs_req = _mocked_get("/jobs")
+        polls = _n(10)
         try:
             # the store's worker threads start on the first call
             await cron._web_pools(pools_req)
+            builds = _count_calls(cron, "jobs_payload")
             t0 = time.perf_counter()
-            for _ in range(_n(10)):
+            for _ in range(polls):
                 pools_resp = await cron._web_pools(pools_req)
                 memo.cached = None
                 jobs_resp = await cron._web_list_jobs(jobs_req)
             dt = time.perf_counter() - t0
         finally:
             await _teardown_cron(cron)
+        if builds[0] < polls:
+            raise RuntimeError(
+                "%d /jobs requests built %d payloads; the region timed memo "
+                "hits" % (polls, builds[0])
+            )
         listed = json.loads(bytes(pools_resp.body))
         if sum(pool.get("queued", 0) for pool in listed) != queued:
             raise RuntimeError(
@@ -10056,8 +10237,8 @@ def _httpapi_semaphore_store():
     def build():
         import asyncio
 
-        path = os.path.join(_tmpdir(), "httpapi-semaphore")
-        os.makedirs(path, exist_ok=True)
+        # leases are taken in it, so each build seeds a directory of its own
+        path = tempfile.mkdtemp(prefix="httpapi-semaphore-", dir=_tmpdir())
         permits = _n(64, floor=4)
 
         async def seed():
@@ -11611,12 +11792,22 @@ def bench_mcp_query_metrics():
                 % (first.get("totalMatched"), jobs)
             )
         memo = getattr(cron, "_metric_samples_memo", None)
-        t0 = time.perf_counter()
-        for _ in range(calls):
-            if memo is not None:
-                memo.cached = None
-            await handler.handle_http(request)
-        return time.perf_counter() - t0
+        walks = _count_calls(cron.metrics, "iter_samples")
+        try:
+            t0 = time.perf_counter()
+            for _ in range(calls):
+                if memo is not None:
+                    memo.cached = None
+                await handler.handle_http(request)
+            dt = time.perf_counter() - t0
+        finally:
+            del cron.metrics.iter_samples
+        if walks[0] < calls:
+            raise RuntimeError(
+                "%d cron_query_metrics calls walked the metrics %d times; "
+                "the region timed memo hits" % (calls, walks[0])
+            )
+        return dt
 
     return asyncio.run(run())
 
@@ -12015,7 +12206,11 @@ def _herd_launch_reap(n, retry=False):
         await asyncio.sleep(0)
         try:
             return await _herd_cycle(
-                cron, plan, counts, returncode=1 if retry else 0
+                cron,
+                plan,
+                counts,
+                returncode=1 if retry else 0,
+                yielding=True,
             )
         finally:
             armed = sum(
@@ -12052,7 +12247,8 @@ def bench_job_launch_reap():
     (handle_job_success).  Only the OS spawn is stubbed, with a child that
     has already exited, so the value is the scheduler's own per-run work,
     paid once per job per fire, and a regression anywhere on that path
-    moves it.
+    moves it.  The stub suspends once, as a real spawn does, so every
+    launch past the spawn gate's 16 permits waits on the gate.
 
     The process environment is swapped for a fixed 32-variable one around
     the timed region: every launch scans os.environ
@@ -12083,16 +12279,19 @@ def bench_job_launch_fail_retry():
 
 
 class _MirrorSink:
-    """Stands in for the daemon's stderr: counts the bytes, keeps none."""
+    """Stands in for the daemon's stderr: counts the bytes and the writes
+    (the mirror makes one per batch), keeps none."""
 
     encoding = "utf-8"
 
     def __init__(self):
         self.buffer = self
         self.size = 0
+        self.writes = 0
 
     def write(self, payload):
         self.size += len(payload)
+        self.writes += 1
         return len(payload)
 
     def flush(self):
@@ -12115,6 +12314,10 @@ def bench_job_stream_passthrough():
     and its write) and publishes it to the live log buffer, which together
     cost more than the capture.  Both run per output line on the event
     loop, so a per-line cost added to either leg shows here.
+
+    The stream arrives as a pipe delivers it, one 64 KiB read at a time,
+    and the reader hands the mirror one batch per read, so a per-batch cost
+    (the submit, its lock, the thread wake) is paid about 190 times.
 
     The daemon's stderr is replaced by a sink that counts bytes, and the
     region ends when the mirror thread has drained.  No subscriber is
@@ -12144,15 +12347,28 @@ def bench_job_stream_passthrough():
                     "2026-07-18 12:00:%02d INFO worker %d processed batch\n"
                     % (i % 60, i)
                 )
-        return "".join(lines).encode("utf-8")
+        blob = "".join(lines).encode("utf-8")
+        # one piece per pipe read (cronstable.job._READ_CHUNK)
+        return [blob[i : i + 65536] for i in range(0, len(blob), 65536)]
 
-    blob = fixture("passthrough_blob_%d" % n, build)
-    mirrored = len(blob) + n * len("[bench stderr] ")
+    pieces = fixture("passthrough_pieces_%d" % n, build)
+    mirrored = sum(map(len, pieces)) + n * len("[bench stderr] ")
 
     async def run():
         stream = asyncio.StreamReader()
-        stream.feed_data(blob)
-        stream.feed_eof()
+
+        async def produce():
+            for fed, piece in enumerate(pieces, 1):
+                stream.feed_data(piece)
+                # the reader drains the piece and schedules its batch
+                await asyncio.sleep(0)
+                if fed % 32 == 0:
+                    # This loop feeds faster than a pipe, so the wait
+                    # keeps the queued batches under the cap past which
+                    # the mirror sheds the oldest.
+                    mirror.drain(30.0)
+            stream.feed_eof()
+
         output = JobOutputStream()
         sink = _MirrorSink()
         real_stderr = sys.stderr
@@ -12172,7 +12388,9 @@ def bench_job_stream_passthrough():
                 raise Skip(
                     "StreamReader signature changed: %r" % exc
                 ) from None
+            feeder = asyncio.create_task(produce())
             _saved, discarded = await reader.join()
+            await feeder
             drained = mirror.drain(30.0)
             dt = time.perf_counter() - t0
         finally:
@@ -12180,13 +12398,22 @@ def bench_job_stream_passthrough():
         if (
             not drained
             or sink.size != mirrored
+            or sink.writes < max(1, len(pieces) // 2)
             or output.published != n
             or discarded != n - save_limit
         ):
             raise RuntimeError(
-                "the pipeline mirrored %d of %d bytes and published %d of "
-                "%d lines; the region did not process the stream"
-                % (sink.size, mirrored, output.published, n)
+                "the pipeline mirrored %d of %d bytes in %d batches for %d "
+                "reads and published %d of %d lines; the region did not "
+                "process the stream as a pipe delivers it"
+                % (
+                    sink.size,
+                    mirrored,
+                    sink.writes,
+                    len(pieces),
+                    output.published,
+                    n,
+                )
             )
         return dt
 
@@ -12975,10 +13202,15 @@ def bench_mem_retired_output():
     return (after - before) / 1048576.0
 
 
+# argv: the target's own timeout in seconds, then the target command.  The
+# target inherits the wrapper's stderr, which the harness reads.
 _RSS_WRAPPER = (
     "import resource,subprocess,sys\n"
-    "r=subprocess.run(sys.argv[1:],stdout=subprocess.DEVNULL,"
-    "stderr=subprocess.DEVNULL)\n"
+    "try:\n"
+    "    r=subprocess.run(sys.argv[2:],stdout=subprocess.DEVNULL,"
+    "timeout=float(sys.argv[1]))\n"
+    "except subprocess.TimeoutExpired:\n"
+    "    sys.exit('timed out after %ss' % sys.argv[1])\n"
     "print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)\n"
     "sys.exit(r.returncode)\n"
 )
@@ -12993,16 +13225,11 @@ def _child_peak_rss_mb(args):
     """
     if sys.platform == "win32":
         raise Skip("peak-RSS benchmark requires POSIX getrusage")
-    proc = subprocess.run(
-        [sys.executable, "-c", _RSS_WRAPPER, sys.executable] + args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=_child_env(),
-        cwd=_tmpdir(),
-    )
-    if proc.returncode != 0:
-        raise Skip("child exited %d: %s" % (proc.returncode, " ".join(args)))
-    raw = int(proc.stdout.split()[0])
+    # The wrapper times its target out first: killing the wrapper would
+    # leave the target running.
+    wrapper = ["-c", _RSS_WRAPPER, str(_CHILD_TIMEOUT - 30.0), sys.executable]
+    _dt, out = _run_child(args, stdout=subprocess.PIPE, wrapper=wrapper)
+    raw = int(out.split()[0])
     # ru_maxrss is bytes on macOS, KiB on Linux and the BSDs.
     return raw / 1048576.0 if sys.platform == "darwin" else raw / 1024.0
 
@@ -13269,6 +13496,10 @@ def bench_mem_launch_reap_steady():
         try:
             before, _ = tracemalloc.get_traced_memory()
             for _ in range(cycles):
+                # The spawn stub does not suspend here: the reading needs
+                # each herd reaped as one batch of 20, because a pinned
+                # batch of the 4 runs past the spawn gate's permits is
+                # under this metric's floor.
                 await _herd_cycle(cron, plan, counts)
             # let the reaper park and the last done callbacks run
             for _ in range(5):
@@ -13305,8 +13536,8 @@ def _gc_manifest_store(records, names):
             raise Skip("parse_config_string unavailable: %r" % exc) from None
         if not hasattr(Cron, "_manifest_stream"):
             raise Skip("Cron._manifest_stream not present")
-        path = os.path.join(_tmpdir(), "gc-manifests")
-        os.makedirs(path, exist_ok=True)
+        # appended into, so each build seeds a directory of its own
+        path = tempfile.mkdtemp(prefix="gc-manifests-", dir=_tmpdir())
         text = (
             "state:\n  path: %s\n  jobApi:\n    enabled: false\n"
             "jobs:\n  - name: live\n    command: 'true'\n"
@@ -13769,6 +14000,10 @@ def _run_one(spec):
             "max": max(values),
         }
     )
+    if error is not None:
+        # A repeat failed after others measured: the row keeps their
+        # values, and these two fields are its only record of the failure.
+        result.update({"partial_reason": error, "repeats": reps})
     result["elapsed_seconds"] = round(time.perf_counter() - t_started, 3)
     return result
 
@@ -13921,12 +14156,20 @@ def main(argv=None):
         if prev_group is not None and spec["group"] != prev_group:
             _evict_fixtures(prev_group)
         prev_group = spec["group"]
+        # A complete line, so the log of a run that hangs here ends on it.
+        print("running %s" % spec["name"], file=sys.stderr, flush=True)
         result = _run_one(spec)
         results.append(result)
         if result["skipped"]:
             line = "SKIP (%s)" % result["reason"]
         else:
             line = _fmt(result["value"], result["unit"])
+            if "partial_reason" in result:
+                line += " PARTIAL (%d of %d repeats: %s)" % (
+                    result["runs"],
+                    result["repeats"],
+                    result["partial_reason"],
+                )
         print("%-28s %s" % (result["name"], line), flush=True)
     # The last group's fixtures get the same finalize-and-audit pass; without
     # this a leak in the final group would only surface once it stopped being
@@ -13975,11 +14218,14 @@ def main(argv=None):
             f.write("\n")
         print("wrote %s" % args.json)
     ran = sum(1 for r in results if not r["skipped"])
+    partial = sum(1 for r in results if "partial_reason" in r)
     print(
-        "%d benchmarks, %d skipped, %.1fs total (%s mode, cronstable %s)"
+        "%d benchmarks, %d skipped, %d partial, %.1fs total "
+        "(%s mode, cronstable %s)"
         % (
             ran,
             len(results) - ran,
+            partial,
             doc["suite_seconds"],
             _MODE,
             meta["version"],

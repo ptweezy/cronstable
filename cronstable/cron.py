@@ -21,6 +21,7 @@ import os
 import secrets
 import socket
 import ssl
+import stat
 import sys
 import time
 import zlib
@@ -73,6 +74,8 @@ from cronstable.config import (
     cluster_config_warnings,
     parse_config_string,
     parse_config_with_sources,
+    parsed_listing_unchanged,
+    parsed_sources_unchanged,
     resolve_bonjour_config,
     validate_pools,
 )
@@ -106,14 +109,19 @@ from cronstable.job import (
     schedule_string,
 )
 from cronstable.leadership import LeadershipBackend, make_backend
-from cronstable.pools import PoolError, PoolScheduler, Ticket
+from cronstable.pools import (
+    POOL_UNAVAILABLE,
+    PoolError,
+    PoolScheduler,
+    Ticket,
+)
 from cronstable.prometheus import (
     CONTENT_TYPE_OPENMETRICS,
     CONTENT_TYPE_TEXT,
     PrometheusMetrics,
     resolve_metrics_config,
 )
-from cronstable.recovery import RecoveryError
+from cronstable.recovery import RecoveryError, RecoveryUnavailable
 from cronstable.redact import redact_lines
 from cronstable.resources import (
     NodeResourceSampler,
@@ -130,7 +138,13 @@ from cronstable.state import (
 
 # What a recovery request raises when the store cannot answer it.
 # _DocumentUnreadable covers a record or a document that cannot be read.
-_RECOVERY_UNAVAILABLE = (OSError, asyncio.TimeoutError, _DocumentUnreadable)
+# Catch these ahead of RecoveryError: RecoveryUnavailable is one.
+_RECOVERY_UNAVAILABLE = (
+    RecoveryUnavailable,
+    OSError,
+    asyncio.TimeoutError,
+    _DocumentUnreadable,
+)
 
 
 class _AiohttpDoor:
@@ -936,9 +950,10 @@ def _run_finish_key(info: "JobRunInfo") -> datetime.datetime:
     Every reader that has to answer "which of these runs is the newest"
     folds on this key rather than trusting the row's position in the
     stream. The per-job write chain orders the appends THIS node makes to
-    ``runs/<job>``; it cannot order appends a peer node sharing the mount
-    issues through its own process, so the last record in a listing can
-    be an older run.
+    ``runs/<job>`` by record time, which trails the finish of a killed run
+    (see :meth:`Cron._finished_at`); it cannot order appends a peer node
+    sharing the mount issues through its own process. Either way the last
+    record in a listing can be an older run.
 
     ``finished_at`` is the key, and on a crash-reconciled row it is the
     interrupted run's START instant: the ledger record for an
@@ -2317,6 +2332,9 @@ class Cron:
         self._config_sources: frozenset[str] = frozenset()
         self._config_sig: tuple | None = None
         self._last_config: CronstableConfig | None = None
+        # Counts signal_reload calls, so that reload_config can tell a
+        # request made while its parse ran.
+        self._reload_requests = 0
         # Run the Windows service host's ownership check before every
         # file parse, including startup (see _parse_guarded).
         self._config_guard = config_guard
@@ -2855,9 +2873,11 @@ class Cron:
         knows something the fingerprint can miss (a credential file
         rewritten in place, a coarse-mtime or network filesystem). The
         void survives a failed parse, so the request keeps retrying until
-        a parse succeeds and re-records the signature.
+        a parse succeeds and re-records the signature. A request made
+        while a parse runs gets a parse of its own (see reload_config).
         """
         logger.info("Reload requested (%s); reloading configuration", source)
+        self._reload_requests += 1
         self._config_sig = None
         self._last_housekeeping_minute = None
         self._wake_event.set()
@@ -2891,16 +2911,22 @@ class Cron:
 
         ``(abspath, st_mtime_ns, st_size)`` per file, sorted; a vanished
         file collapses to a sentinel so a deletion still registers. A
-        DIRECTORY config source folds in its own mtime, so a brand-new
-        entry (touching no tracked file) is still noticed.
+        source that is not a regular file (a pipe, a FIFO) records no
+        mtime or size, because reading it moves its mtime. A DIRECTORY
+        config source folds in its own mtime, so a brand-new entry
+        (touching no tracked file) is still noticed.
         """
         parts: list[tuple] = []
         for f in sorted(files):
             try:
                 st = os.stat(f)
-                parts.append((f, st.st_mtime_ns, st.st_size))
             except OSError:
                 parts.append((f, None, None))
+                continue
+            if stat.S_ISREG(st.st_mode):
+                parts.append((f, st.st_mtime_ns, st.st_size))
+            else:
+                parts.append((f, 0, 0))
         if self.config_arg is not None and os.path.isdir(self.config_arg):
             try:
                 parts.append(("\0dir", os.stat(self.config_arg).st_mtime_ns))
@@ -2936,17 +2962,54 @@ class Cron:
             None, self._config_signature, sources
         )
 
+    async def _config_drift(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        sig: tuple,
+        sources: frozenset[str],
+    ) -> tuple[bool, bool]:
+        """Whether the fingerprint moved from ``sig``, and whether a config
+        directory still lists the entries the parse of ``sources`` read.
+
+        Both probes share one executor hop, from
+        :data:`_CONFIG_SIGNATURE_OFFLOAD_MIN` sources.
+        """
+        tracked = self._config_sources
+
+        def probe() -> tuple[bool, bool]:
+            return (
+                self._config_signature(tracked) != sig,
+                parsed_listing_unchanged(sources),
+            )
+
+        if max(len(tracked), len(sources)) < _CONFIG_SIGNATURE_OFFLOAD_MIN:
+            return probe()
+        return await loop.run_in_executor(None, probe)
+
     def _record_config(
-        self, config: CronstableConfig, sources: frozenset[str]
+        self,
+        config: CronstableConfig,
+        sources: frozenset[str],
+        sig: tuple | None = None,
+        listed: bool = True,
     ) -> None:
         """Cache a successful parse for the unchanged-config skip.
 
-        Fingerprints ``sources`` immediately after the parse, so the next
-        pass compares against the on-disk state actually parsed; an edit
-        inside that microsecond window is picked up on a later change.
+        ``sig`` must predate the parse, and ``listed`` is then the
+        :func:`parsed_listing_unchanged` of ``sources``.  A fingerprint
+        taken here is kept only while the sources hold the bytes that were
+        parsed.  Either one is void when a config directory lists other
+        entries than the parse did, which its mtime does not always show.
+        A void fingerprint makes the next pass parse again.
         """
+        if sig is None:
+            sig = self._config_signature(sources)
+            if not parsed_sources_unchanged(sources):
+                sig = None
+        elif sources != self._config_sources or not listed:
+            sig = None
         self._config_sources = sources
-        self._config_sig = self._config_signature(sources)
+        self._config_sig = sig
         self._last_config = config
 
     def update_config(self) -> CronstableConfig:
@@ -2984,16 +3047,18 @@ class Cron:
         if self.config_arg is None:
             return self._empty_config()
         loop = asyncio.get_running_loop()
+        # Taken before the parse: an edit that lands while the parse runs
+        # differs from this fingerprint on the next pass.
+        sig = await self._current_config_signature(loop)
         # a signal_reload voids _config_sig, so this skip cannot fire
         # again until a parse succeeds and re-records the signature.
-        if self._last_config is not None and (
-            await self._current_config_signature(loop) == self._config_sig
-        ):
+        if self._last_config is not None and sig == self._config_sig:
             logger.debug("config unchanged on disk; skipping reparse")
             return self._last_config
         collecting = gc.isenabled() and self._quiet_gc_for_reparse()
         if collecting:
             gc.disable()
+        requests = self._reload_requests
         try:
             config, sources = await loop.run_in_executor(
                 None, _parse_guarded, self.config_arg, self._config_guard
@@ -3006,8 +3071,15 @@ class Cron:
         finally:
             if collecting:
                 gc.enable()
+        # A fingerprint that moved while the parse ran may not match the
+        # bytes the parse read.
+        moved, listed = await self._config_drift(loop, sig, sources)
         result = self._apply_reload(config)
-        self._record_config(config, sources)
+        self._record_config(config, sources, sig, listed)
+        if moved or self._reload_requests != requests:
+            # the next pass parses again; a request made since the parse
+            # started is answered by that parse
+            self._config_sig = None
         return result
 
     @staticmethod
@@ -4679,18 +4751,18 @@ class Cron:
             try:
                 entry = await self._pools.enqueue_job(job, manual=True)
                 return str(entry["id"])
-            except PoolError as ex:
-                raise ApiActionError(str(ex), status=409) from ex
-            except (OSError, asyncio.TimeoutError) as ex:
+            except POOL_UNAVAILABLE as ex:
                 raise ApiActionError(
                     "pool state is unavailable", status=503
                 ) from ex
+            except PoolError as ex:
+                raise ApiActionError(str(ex), status=409) from ex
         else:
             await self.maybe_launch_job(job)
         return None
 
     async def cancel_job_by_name(self, name: str) -> int:
-        """Cancel a job's running instances; return how many were signalled.
+        """Cancel a job's running instances; return the number asked to stop.
 
         Behind ``POST /jobs/{name}/cancel`` and MCP ``cron_cancel_job``.
         Raises :class:`ApiActionError` for an unknown (404) or not-running
@@ -5986,7 +6058,7 @@ class Cron:
             return
         try:
             pools = {p["name"]: p for p in await self._pools.snapshot()}
-        except (PoolError, OSError, asyncio.TimeoutError):
+        except (PoolError, *POOL_UNAVAILABLE):
             for job in jobs:
                 if "pool" in job:
                     job["pool"]["queueUnavailable"] = True
@@ -6307,9 +6379,7 @@ class Cron:
     async def _web_pools(self, request: web.Request) -> web.Response:
         try:
             payload = await self._pools.snapshot()
-        except PoolError as ex:
-            raise _api_error(web.HTTPServiceUnavailable, ex.message) from ex
-        except (OSError, asyncio.TimeoutError) as ex:
+        except (PoolError, *POOL_UNAVAILABLE) as ex:
             raise _api_error(
                 web.HTTPServiceUnavailable, "pool state is unavailable"
             ) from ex
@@ -6320,12 +6390,12 @@ class Cron:
             payload = await self._pools.cancel(
                 request.match_info["name"], request.match_info["key"]
             )
-        except PoolError as ex:
-            raise _api_error(web.HTTPConflict, ex.message) from ex
-        except (OSError, asyncio.TimeoutError) as ex:
+        except POOL_UNAVAILABLE as ex:
             raise _api_error(
                 web.HTTPServiceUnavailable, "pool state is unavailable"
             ) from ex
+        except PoolError as ex:
+            raise _api_error(web.HTTPConflict, ex.message) from ex
         return _json_response(
             {"id": payload["id"], "state": payload["state"]},
             headers=self._web_headers(),
@@ -6360,12 +6430,12 @@ class Cron:
                 plan_token=None if dry_run else token,
                 allow_config_change=allow_change,
             )
-        except RecoveryError as ex:
-            raise _api_error(web.HTTPConflict, ex.message) from ex
         except _RECOVERY_UNAVAILABLE as ex:
             raise _api_error(
                 web.HTTPServiceUnavailable, "recovery state is unavailable"
             ) from ex
+        except RecoveryError as ex:
+            raise _api_error(web.HTTPConflict, ex.message) from ex
         return _json_response(result, headers=self._web_headers())
 
     async def _web_dag_recover_range(
@@ -6399,12 +6469,12 @@ class Cron:
                 plan_token=None if dry_run else token,
                 allow_config_change=allow_change,
             )
-        except RecoveryError as ex:
-            raise _api_error(web.HTTPConflict, ex.message) from ex
         except _RECOVERY_UNAVAILABLE as ex:
             raise _api_error(
                 web.HTTPServiceUnavailable, "recovery state is unavailable"
             ) from ex
+        except RecoveryError as ex:
+            raise _api_error(web.HTTPConflict, ex.message) from ex
         return _json_response(result, headers=self._web_headers())
 
     async def _web_dag_backfill(self, request: web.Request) -> web.Response:
@@ -6645,10 +6715,14 @@ class Cron:
             jobs = (
                 cap if cap is not None and cap < len(self.cron_jobs) else None
             )
+            # the size of the job set that this pass's own build read
+            built: list[int] = []
 
             async def build(
                 jobs: int | None = jobs,
+                built: list[int] = built,
             ) -> tuple[str, bytes, bytes | None]:
+                built.append(len(self.cron_jobs))
                 # the build selects the jobs, so a request served from the
                 # shared product selects none
                 return await self._build_activity_product(
@@ -6674,10 +6748,20 @@ class Cron:
                 finally:
                     self._activity_release_memo(jobs, sort)
             # The default product carries every job of the set it was
-            # built from.  A reload can grow that set past the cap while
-            # the request waits for the product, so the request starts
-            # over under its cap.
-            if jobs is not None or cap is None or cap >= len(self.cron_jobs):
+            # built from, which a reload can replace while the request
+            # waits.  A product that this pass did not build comes from
+            # the current set, because every reload voids the memo and
+            # the builds in flight.  The request starts over when its cap
+            # leaves out a job of the current set or of the set its own
+            # build read.
+            if (
+                jobs is not None
+                or cap is None
+                or (
+                    cap >= len(self.cron_jobs)
+                    and (not built or cap >= built[0])
+                )
+            ):
                 return product
 
     def _activity_capped_memo(
@@ -11047,7 +11131,7 @@ class Cron:
 
         try:
             accepted = await self.maybe_launch_job(job)
-        except (PoolError, OSError, asyncio.TimeoutError) as ex:
+        except (PoolError, *POOL_UNAVAILABLE) as ex:
             if job.pool is None:
                 raise
             logger.warning(
@@ -12388,14 +12472,22 @@ class Cron:
         try:
             for job in done_jobs:
                 task = wait_tasks.pop(job)
-                try:
-                    task.result()
-                except Exception:  # pragma: no cover
-                    logger.exception(
-                        "Unexpected error while waiting on job %s; please "
-                        "report this as a bug (2)",
+                if task.cancelled():
+                    # result() would raise CancelledError and end the reaper
+                    logger.error(
+                        "The wait on job %s was canceled; please report "
+                        "this as a bug (9)",
                         job.config.name,
                     )
+                else:
+                    try:
+                        task.result()
+                    except Exception:
+                        logger.exception(
+                            "Unexpected error while waiting on job %s; "
+                            "please report this as a bug (2)",
+                            job.config.name,
+                        )
                 try:
                     await self._handle_finished_job(job)
                 except Exception:
@@ -12518,14 +12610,15 @@ class Cron:
 
         ``last_run`` is by default the NEWEST finished run by
         ``finished_at`` (:func:`_run_finish_key`), not the last row
-        installed. Two paths install a row older than one this node
+        installed. Three paths install a row older than one this node
         already recorded: a slot takeover reconciling a FOREIGN node's
         interrupted run (see :meth:`_reconcile_open_record`, which
         advances rather than assigns its own watermark for the same
-        reason), and a completion landing out of order on a mount a peer
-        node also writes. ``>=`` keeps a same-instant install behaving
-        exactly as the plain assignment did, which several tests depend
-        on.
+        reason), a completion landing out of order on a mount a peer
+        node also writes, and a killed run that the reaper records after
+        a newer run of the job (see :meth:`_finished_at`). ``>=`` keeps a
+        same-instant install behaving exactly as the plain assignment
+        did, which several tests depend on.
 
         ``promote`` overrides the fold in ONE direction. ``True`` installs
         the row whatever its instant, for the one caller that knows its
@@ -12963,9 +13056,10 @@ class Cron:
                 if info is not None
             ]
             # By finish time, not stream position. The per-job write chain
-            # orders THIS node's appends; a peer sharing the mount appends
-            # through its own process and no local chain can order those,
-            # so the last record in the listing can be an older run.
+            # orders THIS node's appends by record time, which trails the
+            # finish of a killed run; a peer sharing the mount appends
+            # through its own process and no local chain can order those.
+            # Either way the last record in the listing can be an older run.
             # sorted() is stable, so records sharing an instant keep their
             # stream order. At most RUN_HISTORY_LIMIT rows per job, once
             # per boot, and they all end up in the deque anyway.
@@ -13452,6 +13546,18 @@ class Cron:
                 None if completed else "completion interrupted",
             )
 
+    @staticmethod
+    def _finished_at(job: RunningJob) -> datetime.datetime:
+        """The instant ``job`` ended, capped at the present instant.
+
+        A killed run is recorded after its output drain, when a newer run
+        can already be on record; the cap covers a wall clock stepped back
+        since the run ended.
+        """
+        now = get_now(datetime.timezone.utc)
+        ended: datetime.datetime | None = getattr(job, "ended_at", None)
+        return ended if ended is not None and ended < now else now
+
     async def _record_finished_job(self, job: RunningJob) -> None:
         if getattr(job, "dag_ref", None) is not None:
             # a DAG task instance: route to the DAG scheduler and skip
@@ -13499,13 +13605,16 @@ class Cron:
                     outcome="cancelled",
                     exit_code=job.retcode,
                     started_at=job.started_at,
-                    finished_at=get_now(datetime.timezone.utc),
+                    finished_at=self._finished_at(job),
                     fail_reason="cancelled via web UI",
                     output=job.output,
                     resource_usage=getattr(job, "resource_usage", None),
                 ),
             )
-            await self.cancel_job_retries(job.config.name, settle="cancelled")
+            if self._ends_retry_sequence(job):
+                await self.cancel_job_retries(
+                    job.config.name, settle="cancelled"
+                )
             return
 
         if job.start_failed:
@@ -13532,7 +13641,7 @@ class Cron:
                 outcome="failure" if fail_reason is not None else "success",
                 exit_code=job.retcode,
                 started_at=job.started_at,
-                finished_at=get_now(datetime.timezone.utc),
+                finished_at=self._finished_at(job),
                 fail_reason=fail_reason,
                 output=job.output,
                 resource_usage=getattr(job, "resource_usage", None),
@@ -13651,7 +13760,7 @@ class Cron:
             try:
                 if not await self._pools.retry_current(state.pool_retry):
                     state.cancelled = True
-            except (PoolError, OSError, asyncio.TimeoutError):
+            except (PoolError, *POOL_UNAVAILABLE):
                 # Admission rechecks the guard and defers during outages.
                 logger.warning(
                     "Job %s: deferring its retry guard check", job.config.name
@@ -14078,7 +14187,7 @@ class Cron:
                     state.cancelled = True
                     return False
                 await self._pools.enqueue_job(job)
-            except (PoolError, OSError, asyncio.TimeoutError) as ex:
+            except (PoolError, *POOL_UNAVAILABLE) as ex:
                 if not quiet:
                     logger.warning(
                         "Job %s retry #%i waiting for pool admission: %s",
@@ -14745,20 +14854,26 @@ class Cron:
             and name not in self._slot_pursuits
         )
 
-    async def handle_job_success(self, job: RunningJob) -> None:
+    def _ends_retry_sequence(self, job: RunningJob) -> bool:
+        """Whether a run's success or cancellation ends the job's retry ladder.
+
+        A ladder with no retry armed belongs to a launch that has yet to
+        finish, so only that launch's own run ends it.  The ladder of a
+        dropped fire has no launch and ends with any run (see
+        :meth:`_unclaimed_ladder`).
+        """
         name = job.config.name
         state = self.retry_state.get(name)
-        # A success ends the job's retry sequence.  A ladder with no retry
-        # armed belongs to a launch that has yet to finish, so only that
-        # launch's own run ends it.  The ladder of a dropped fire has no
-        # launch and ends here (see _unclaimed_ladder).
-        if (
+        return (
             state is None
             or state is job.retry_state
             or state.count > 0
             or self._unclaimed_ladder(name)
-        ):
-            await self.cancel_job_retries(name, settle="succeeded")
+        )
+
+    async def handle_job_success(self, job: RunningJob) -> None:
+        if self._ends_retry_sequence(job):
+            await self.cancel_job_retries(job.config.name, settle="succeeded")
         await job.report_success()
 
     @staticmethod

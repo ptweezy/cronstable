@@ -2313,6 +2313,138 @@ async def test_web_activity_cap_holds_when_a_reload_outgrows_it(monkeypatch):
     assert len(builds) == 3  # both served from the products already built
 
 
+async def test_web_activity_cap_holds_over_a_product_another_request_built(
+    monkeypatch,
+):
+    # Two requests wait on a default build that a reload voids.  The
+    # uncapped one builds the default product from the six jobs the reload
+    # left.  The `jobs=2` request reads that product from the memo, and
+    # its response still carries two jobs.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    cron = _cron(_ACTIVITY_YAML)
+    reloaded = _cron(_ACTIVITY_ORDER_YAML).cron_jobs
+    release = asyncio.Event()
+    builds = []
+    real_build = cron._build_activity_product
+
+    async def held_build(*args, **kwargs):
+        builds.append(args)
+        if len(builds) == 1:
+            await release.wait()
+        return await real_build(*args, **kwargs)
+
+    monkeypatch.setattr(cron, "_build_activity_product", held_build)
+    requests = [
+        asyncio.ensure_future(cron._web_get_activity(Req(query)))
+        for query in ({}, {}, {"jobs": "2"})
+    ]
+    await asyncio.sleep(0)
+    assert len(builds) == 1  # the other two wait on the first one's build
+    cron.cron_jobs.update(reloaded)
+    cron._bust_response_memos()
+    release.set()
+    _leader, uncapped, capped = await asyncio.gather(*requests)
+    every = {"a", "b", *_ACTIVITY_ORDER_NAMES}
+    assert set(json.loads(uncapped.body)["jobs"]) == every
+    assert list(json.loads(capped.body)["jobs"]) == ["a", "b"]
+    assert [names for _limit, names in builds[1:]] == [None, ["a", "b"]]
+
+
+def _activity_fleet_yaml(count):
+    # a fleet past _JOBS_SERIALIZE_OFFLOAD_MIN builds its default product
+    # on the executor
+    return "jobs:\n" + "".join(
+        "  - name: f%03d\n    command: echo hi\n    schedule: '*/5 * * * *'\n"
+        % i
+        for i in range(count)
+    )
+
+
+async def test_web_activity_cap_holds_across_a_reload_pair(monkeypatch):
+    # `jobs=250` covers a fleet of 240, so the request waits on the default
+    # product.  A reload to 260 jobs voids that build and the request
+    # builds the default product itself; a reload back to 240 lands before
+    # that build returns.  The response carries the 240 configured jobs.
+    import cronstable.cron
+    from cronstable.config import parse_config_string
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    small, large = _activity_fleet_yaml(240), _activity_fleet_yaml(260)
+    cron = _cron(small)
+    built = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    builds = []
+    real_build = cron._build_activity_product
+
+    async def held_build(limit, names):
+        index = len(builds)
+        builds.append(len(cron.cron_jobs) if names is None else len(names))
+        product = await real_build(limit, names)
+        if index < 2:
+            built[index].set()
+            await release[index].wait()
+        return product
+
+    monkeypatch.setattr(cron, "_build_activity_product", held_build)
+    leader = asyncio.ensure_future(cron._web_get_activity(Req()))
+    await asyncio.sleep(0)
+    request = Req({"jobs": "250"})
+    capped = asyncio.ensure_future(cron._web_get_activity(request))
+    await asyncio.sleep(0)
+    assert builds == [240]  # the capped request waits on the leader's build
+    cron._apply_reload(parse_config_string(large, ""))
+    release[0].set()
+    await built[1].wait()
+    cron._apply_reload(parse_config_string(small, ""))
+    release[1].set()
+    resp = await capped
+    await leader
+    assert list(json.loads(resp.body)["jobs"]) == list(cron.cron_jobs)
+    assert builds == [240, 260, 240]
+    again = await cron._web_get_activity(request)
+    assert again.body == resp.body
+    assert len(builds) == 3  # served from the product the request stored
+
+
+async def test_web_activity_covered_request_keeps_a_build_a_reload_overtook(
+    monkeypatch,
+):
+    # `jobs=80` covers the job set before the reload and after it, so the
+    # product that the request built from the earlier set is its response.
+    import cronstable.cron
+    from cronstable.config import parse_config_string
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    cron = _cron(_ACTIVITY_YAML)
+    built, release = asyncio.Event(), asyncio.Event()
+    builds = []
+    real_build = cron._build_activity_product
+
+    async def held_build(limit, names):
+        builds.append(names)
+        product = await real_build(limit, names)
+        if len(builds) == 1:
+            built.set()
+            await release.wait()
+        return product
+
+    monkeypatch.setattr(cron, "_build_activity_product", held_build)
+    request = Req({"jobs": "80"})
+    capped = asyncio.ensure_future(cron._web_get_activity(request))
+    await built.wait()
+    cron._apply_reload(parse_config_string(_ACTIVITY_ORDER_YAML, ""))
+    release.set()
+    resp = await capped
+    assert list(json.loads(resp.body)["jobs"]) == ["a", "b"]
+    assert builds == [None]
+    # a reload voids the build, so the next request builds again
+    again = await cron._web_get_activity(request)
+    assert list(json.loads(again.body)["jobs"]) == list(_ACTIVITY_ORDER_NAMES)
+    assert builds == [None, None]
+
+
 async def test_web_activity_capped_requests_share_a_product_per_pair(
     monkeypatch,
 ):

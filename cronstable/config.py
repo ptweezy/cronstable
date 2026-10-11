@@ -2,16 +2,18 @@ import contextlib
 import copy
 import datetime
 import hashlib
+import io
 import logging
 import math
 import os
 import re
 import socket
+import stat
 import sys
 import threading
 import types
 from collections import Counter, OrderedDict
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple, NewType
 from urllib.parse import ParseResult, urlparse
@@ -2601,8 +2603,9 @@ def parse_environment_file(path: str) -> dict[str, str]:
         # first variable's NAME: the job then has a variable whose name
         # starts with U+FEFF set, and the expected one absent, with no
         # error anywhere.
-        with open(path, "r", encoding="utf-8-sig") as env_file:
-            lines = env_file.readlines()
+        lines = io.TextIOWrapper(
+            io.BytesIO(_read_source(path)), encoding="utf-8-sig"
+        ).readlines()
     except ValueError as err:
         raise ConfigError(
             "Could not load env_file {!r}: {}".format(path, err)
@@ -3278,16 +3281,20 @@ def _resolve_secret(spec: dict | None, what: str) -> str | None:
         secret = str(spec["value"])
     elif spec.get("fromFile"):
         try:
+            # A parse that resolves the secret is signed with the bytes of
+            # this file (see _add_read_files).
+            raw = _read_source(spec["fromFile"])
             # utf-8-sig, not the locale default, for the reason
             # parse_environment_file gives: on Windows "rt" decodes the ANSI
             # code page, so a UTF-8 secret with any non-ASCII byte is
             # mojibake from a file that is correct on Linux, and a BOM
             # (Notepad, a PowerShell redirect) survives .strip() and rides
             # into the secret itself.
-            with open(
-                spec["fromFile"], "rt", encoding="utf-8-sig"
-            ) as secret_file:
-                secret = secret_file.read().strip()
+            secret = (
+                io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8-sig")
+                .read()
+                .strip()
+            )
         # Broad on purpose: callers only handle ConfigError, and on the
         # job-secret staging path anything else escapes the scheduler loop
         # and crash-loops the daemon at every fire of that job.  Beyond
@@ -4793,8 +4800,16 @@ def parse_config_file(
     if abspath in _seen:
         raise ConfigError("include cycle detected at {}".format(path))
     _seen.add(abspath)
-    with open(path, "rt", encoding="utf-8") as stream:
-        data = stream.read()
+    # ValueError: a NUL in the path, or bytes that are not UTF-8 (see
+    # parse_environment_file).
+    try:
+        data = io.TextIOWrapper(
+            io.BytesIO(_read_source(path)), encoding="utf-8"
+        ).read()
+    except ValueError as err:
+        raise ConfigError(
+            "Could not load config file {!r}: {}".format(path, err)
+        ) from err
     if _is_crontab_config(path, data):
         return parse_crontab_string(data, path)
     return parse_config_string(data, path, _seen, _sources)
@@ -4935,13 +4950,15 @@ def _validate_dags(config: CronstableConfig) -> None:
 
 
 def parse_config(
-    config_arg: str, _sources: set | None = None
+    config_arg: str,
+    _sources: set | None = None,
+    _listed: dict[str, list[str]] | None = None,
 ) -> CronstableConfig:
     # One call is one load of a whole configuration, the unit the per-file
     # parse cache keeps whole (see _dir_file_cache_load).
     with _dir_file_cache_load():
         if os.path.isdir(config_arg):
-            config = _parse_config_dir(config_arg, _sources)
+            config = _parse_config_dir(config_arg, _sources, _listed)
         else:
             try:
                 config = parse_config_file(config_arg, _sources=_sources)
@@ -4960,13 +4977,18 @@ def parse_config_with_sources(
     """Parse ``config_arg`` and report the on-disk files the parse read.
 
     ``sources`` is the absolute path of every YAML/crontab file consulted
-    (including transitive ``include``s) and every job's and DAG task's
-    ``env_file``.  The scheduler stats this exact set to skip the reparse on
-    an unchanged config; because it covers includes and env_files, an edit
-    to any file that actually feeds the config is still noticed.
+    (including transitive ``include``s), every job's and DAG task's
+    ``env_file``, and every file the parse resolved a secret from
+    (``cluster.etcd.password.fromFile``).  The scheduler stats this exact
+    set to skip the reparse on an unchanged config; because it covers
+    includes and env_files, an edit to any file that actually feeds the
+    config is still noticed.
     """
+    global _LAST_LOAD
     sources: set = set()
-    config = parse_config(config_arg, sources)
+    listed: dict[str, list[str]] = {}
+    with _signed_parse() as reads:
+        config = parse_config(config_arg, sources, listed)
     # jobs commonly share an env_file (it inherits through defaults), so
     # resolve each distinct path once
     sources.update(
@@ -4981,15 +5003,77 @@ def parse_config_with_sources(
         for template in dag_cfg.task_templates.values():
             if template.env_file is not None:
                 sources.add(os.path.abspath(template.env_file))
-    return config, frozenset(sources)
+    _add_read_files(sources, reads)
+    frozen = frozenset(sources)
+    _LAST_LOAD = (frozen, reads, listed)
+    return config, frozen
+
+
+def parsed_sources_unchanged(sources: frozenset[str]) -> bool:
+    """Whether ``sources`` still hold the bytes their load read.
+
+    ``sources`` is the set the newest :func:`parse_config_with_sources`
+    call returned.  Any other set answers False.  Only the sources that
+    can be read again are compared (see _rereadable).  A config directory
+    must also pass :func:`parsed_listing_unchanged`.
+    """
+    last = _LAST_LOAD
+    if last is None or last[0] is not sources:
+        return False
+    if not _listing_unchanged(last[2]):
+        return False
+    again = frozenset(filter(_rereadable, sources))
+    return _dir_file_content_sig(again) == _parsed_sig(again, last[1])
+
+
+def parsed_listing_unchanged(sources: frozenset[str]) -> bool:
+    """Whether a config directory still lists the entries its load parsed.
+
+    A file that joins the directory changes the bytes of no source.
+    ``sources`` is as for :func:`parsed_sources_unchanged`.  A load of a
+    single file answers True.
+    """
+    last = _LAST_LOAD
+    if last is None or last[0] is not sources:
+        return False
+    return _listing_unchanged(last[2])
+
+
+def _listing_unchanged(listed: dict[str, list[str]]) -> bool:
+    """Whether each directory in ``listed`` still lists those entries."""
+    for directory, names in listed.items():
+        try:
+            entries = _config_dir_entries(directory)
+        except OSError:
+            return False
+        if [direntry.name for direntry in entries] != names:
+            return False
+    return True
+
+
+def _rereadable(path: str) -> bool:
+    """Whether a second read of ``path`` returns its bytes again.
+
+    A pipe, FIFO or terminal gives its bytes once: a second read returns
+    nothing or blocks.  So does ``/dev/stdin`` or ``/dev/fd/N`` on a
+    system where opening it shares the descriptor's offset.  A missing
+    file counts as readable, so that a deletion reads as a change.
+    """
+    if path == "/dev/stdin" or path.startswith("/dev/fd/"):
+        return False
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return True
 
 
 class _CachedDirFile(NamedTuple):
     """A remembered per-file parse for the per-file parse cache.
 
     ``sources`` is every on-disk file the parse read; ``sig`` the sorted
-    ``(abspath, content_digest)`` fingerprint of exactly those; ``config``
-    the parsed result to reuse while they stay byte-for-byte current.
+    ``(abspath, content_digest)`` signature of the bytes it read from each
+    (see _parsed_sig); ``config`` the parsed result to reuse while they
+    stay byte-for-byte current.
     ``included`` is the narrower set the include-cycle guard reasons about
     (config files only, no env_files): serving a cached parse must leave the
     caller's cycle scope holding exactly what a real parse would have added.
@@ -5003,9 +5087,9 @@ class _CachedDirFile(NamedTuple):
 
 #: Per-file parse cache, keyed by absolute path and validated by hashing
 #: each source's CONTENT: an edit to one file of a config directory or
-#: include tree re-runs strictyaml only for that file.  A cache hit is
-#: byte-exact with a full reparse, never merely mtime-close.  Bounded LRU;
-#: a stale or evicted entry only costs a reparse, never correctness.
+#: include tree reparses that file and each file that includes it.  The
+#: entry file of an include tree is parsed on every load.  A cache hit is
+#: byte-exact with a full reparse, never merely mtime-close.  Bounded LRU.
 #:
 #: The bound is ``_DIR_FILE_CACHE_MAX`` entries, or the number of files the
 #: configuration being loaded uses when that is larger: a load never evicts
@@ -5023,6 +5107,25 @@ _DIR_FILE_CACHE_LOAD = threading.local()
 #: that raises can stop before it reaches every file of the configuration,
 #: so its trim keeps these keys beside its own.
 _DIR_FILE_CACHE_KEPT: frozenset[str] = frozenset()
+
+#: What one signed parse read: one iterable of ``(abspath, digest)`` pairs
+#: per report, in read order (see _note_parsed).
+_ParsedReads = list[Iterable[tuple[str, str | None]]]
+
+#: ``stack`` holds the reads of each signed parse running on this thread,
+#: innermost last (see _signed_parse).
+_DIR_FILE_PARSED = threading.local()
+
+#: Signs a source that one parse read in two different states.  No content
+#: hashes to it, so a signature that holds it never validates.
+_DIGEST_CONFLICT = "conflict"
+
+#: The sources the newest parse_config_with_sources call returned, with
+#: what it read from them and the entries it parsed of each config
+#: directory that it listed.
+_LAST_LOAD: (
+    tuple[frozenset[str], _ParsedReads, dict[str, list[str]]] | None
+) = None
 
 
 @contextlib.contextmanager
@@ -5067,10 +5170,81 @@ def _trim_dir_file_cache(used: "set[str] | frozenset[str]") -> None:
             _DIR_FILE_CACHE.pop(key, None)
 
 
+@contextlib.contextmanager
+def _signed_parse() -> Iterator[_ParsedReads]:
+    """Collect what a parse on this thread reads, for _parsed_sig.
+
+    A signed parse inside this one collects its own reads and reports
+    them here as its signature.
+    """
+    stack = getattr(_DIR_FILE_PARSED, "stack", None)
+    if stack is None:
+        stack = _DIR_FILE_PARSED.stack = []
+    reads: _ParsedReads = []
+    stack.append(reads)
+    try:
+        yield reads
+    finally:
+        stack.pop()
+
+
+def _note_parsed(pairs: Iterable[tuple[str, str | None]]) -> None:
+    """Report ``(abspath, digest)`` pairs to the innermost signed parse."""
+    stack = getattr(_DIR_FILE_PARSED, "stack", None)
+    if stack:
+        stack[-1].append(pairs)
+
+
+def _read_source(path: str) -> bytes:
+    """Read one config file, env_file or secret file, and report it to the
+    signed parse in progress on this thread, if there is one."""
+    with open(path, "rb") as stream:
+        data = stream.read()
+    if getattr(_DIR_FILE_PARSED, "stack", None):
+        # the digest _dir_file_content_sig takes of the same bytes
+        digest = hashlib.blake2b(data, digest_size=16).hexdigest()
+        _note_parsed(((os.path.abspath(path), digest),))
+    return data
+
+
+def _add_read_files(sources: set, reads: _ParsedReads) -> None:
+    """Add to ``sources`` each file in ``reads`` that it lacks, such as the
+    file of a ``fromFile`` secret.
+
+    A file that cannot be read again stays out, because the next load
+    would read it to validate the cached parse (see _rereadable).
+    """
+    for pairs in reads:
+        for src, _ in pairs:
+            if src not in sources and _rereadable(src):
+                sources.add(src)
+
+
+def _parsed_sig(
+    sources: frozenset[str], reads: _ParsedReads
+) -> tuple[tuple[str, str | None], ...]:
+    """Sorted ``(abspath, content_digest)`` signature of a signed parse.
+
+    Each digest is of the bytes the parse read, so a later edit fails
+    validation.  A source read in two different states gets
+    _DIGEST_CONFLICT.  A source no reader reported (a stand-in reader) is
+    hashed from disk.
+    """
+    parsed: dict[str, str | None] = {}
+    for pairs in reads:
+        for src, digest in pairs:
+            if parsed.setdefault(src, digest) != digest:
+                parsed[src] = _DIGEST_CONFLICT
+    unreported = sources.difference(parsed)
+    if unreported:
+        parsed.update(_dir_file_content_sig(unreported))
+    return tuple((src, parsed[src]) for src in sorted(sources))
+
+
 def _dir_file_content_sig(
     sources: frozenset[str],
 ) -> tuple[tuple[str, str | None], ...]:
-    """Sorted ``(abspath, content_digest)`` fingerprint of a parse's inputs.
+    """Sorted ``(abspath, content_digest)`` fingerprint of files on disk.
 
     Hashes each source's bytes rather than trusting a ``(mtime_ns, size)``
     stat, so a size- and mtime-preserving edit (coarse filesystems,
@@ -5125,11 +5299,13 @@ def _parse_file_cached(
             used.update(cached.included)
         if _seen is not None:
             _seen.update(cached.included)
+        _note_parsed(cached.sig)
         return cached.config, cached.sources, cached.included
     file_sources: set = set()
     seen: set = set() if _seen is None else _seen
     before = frozenset(seen)
-    config = parse_config_file(path, seen, file_sources)
+    with _signed_parse() as reads:
+        config = parse_config_file(path, seen, file_sources)
     file_included = frozenset(seen) - before
     # env_files are read at parse time, so a change to one must invalidate
     # the cached parse too: fold them into the fingerprint (each distinct
@@ -5144,9 +5320,13 @@ def _parse_file_cached(
         for template in dag_cfg.task_templates.values():
             if template.env_file is not None:
                 file_sources.add(os.path.abspath(template.env_file))
+    _add_read_files(file_sources, reads)
     frozen = frozenset(file_sources)
+    sig = _parsed_sig(frozen, reads)
+    # the enclosing parse read these sources through this one
+    _note_parsed(sig)
     _DIR_FILE_CACHE[abspath] = _CachedDirFile(
-        frozen, file_included, _dir_file_content_sig(frozen), config
+        frozen, file_included, sig, config
     )
     _DIR_FILE_CACHE.move_to_end(abspath)
     if used is not None:
@@ -5162,7 +5342,8 @@ def _parse_included_file(
     """Parse one ``include:`` target, reusing an unchanged prior parse.
 
     Routed through the same content-hash cache the config-directory loader
-    uses, so editing one file of an include tree reparses only that file.
+    uses, so editing one file of an include tree reparses that file and
+    each file that includes it.
     """
     config, sources, _ = _parse_file_cached(path, _seen)
     if _sources is not None:
@@ -5193,8 +5374,43 @@ def _claim_config_dir_section(
     return new_value, path
 
 
+def _config_dir_entries(config_arg: str) -> "list[os.DirEntry[str]]":
+    """The entries of a config directory that the loader parses.
+
+    Sorted by name so job order and the "first config found" error
+    messages are deterministic; os.scandir yields entries in arbitrary FS
+    order.
+    """
+    entries = []
+    for direntry in sorted(os.scandir(config_arg), key=lambda e: e.name):
+        base, ext = os.path.splitext(direntry.name)
+        if base[0] in {"_", "."}:
+            continue
+        # YAML by extension, or a classic crontab by filename marker
+        # (.crontab / .cron / a file named "crontab"); anything else is
+        # skipped, so a stray README or data file never becomes jobs.
+        #
+        # Case-folded, like every other place a config name is judged
+        # (_is_crontab_config, crontabs.is_crontab_path, and
+        # platform._holds_config, which picks the Windows default config
+        # directory).  Windows filesystems preserve case without
+        # distinguishing it, so a JOBS.YAML written by an editor that
+        # upper-cases the suffix is the same file to the user, and a
+        # case-sensitive test here would skip it in silence: a directory
+        # of such files parses to zero jobs, and no error path reports
+        # that.  It would also split this loader from the same file named
+        # directly, which case-folds before it picks a front end.
+        is_yaml = ext.lower() in _YAML_EXTENSIONS
+        if not is_yaml and not crontabs.is_crontab_path(direntry.name):
+            continue
+        entries.append(direntry)
+    return entries
+
+
 def _parse_config_dir(
-    config_arg: str, _sources: set | None = None
+    config_arg: str,
+    _sources: set | None = None,
+    _listed: dict[str, list[str]] | None = None,
 ) -> CronstableConfig:
     jobs: list[JobConfig] = []
     dags: list[DagConfig] = []
@@ -5215,29 +5431,12 @@ def _parse_config_dir(
     push_config_source_fname: str | None = None
     pools: dict[str, dict[str, int]] = {}
     job_defaults: JobDefaults = JobDefaults({})
-    # Sort by name so job order and the "first config found" error messages
-    # are deterministic; os.scandir yields entries in arbitrary FS order.
-    for direntry in sorted(os.scandir(config_arg), key=lambda e: e.name):
-        base, ext = os.path.splitext(direntry.name)
-        if base[0] in {"_", "."}:
-            continue
-        # YAML by extension, or a classic crontab by filename marker
-        # (.crontab / .cron / a file named "crontab"); anything else is
-        # skipped, so a stray README or data file never becomes jobs.
-        #
-        # Case-folded, like every other place a config name is judged
-        # (_is_crontab_config, crontabs.is_crontab_path, and
-        # platform._holds_config, which picks the Windows default config
-        # directory).  Windows filesystems preserve case without
-        # distinguishing it, so a JOBS.YAML written by an editor that
-        # upper-cases the suffix is the same file to the user, and a
-        # case-sensitive test here would skip it in silence: a directory
-        # of such files parses to zero jobs, and no error path reports
-        # that.  It would also split this loop from the same file named
-        # directly, which case-folds before it picks a front end.
-        is_yaml = ext.lower() in _YAML_EXTENSIONS
-        if not is_yaml and not crontabs.is_crontab_path(direntry.name):
-            continue
+    entries = _config_dir_entries(config_arg)
+    if _listed is not None:
+        # for parsed_listing_unchanged: a file that joins the directory
+        # from here on is in no source of this load
+        _listed[config_arg] = [direntry.name for direntry in entries]
+    for direntry in entries:
         try:
             config, file_sources, _ = _parse_file_cached(direntry.path)
         except ConfigError as err:

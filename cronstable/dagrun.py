@@ -33,7 +33,7 @@ import logging
 import os
 import random
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,6 +44,7 @@ from cronstable.cronexpr import CronTab
 from cronstable.dag import DagSpec
 from cronstable.job import RunningJob
 from cronstable.state import (
+    DOC_DELETE,
     DOC_KEEP,
     Lease,
     StateBackend,
@@ -92,6 +93,10 @@ RECOVERY_MAX_ARTIFACTS = 10000
 # _referenced_runs): a batch last written longer ago has expired, and a
 # recovery still in preparation by then is abandoned.
 RECOVERY_BATCH_TTL = 7 * 86400.0
+
+# TTL of the lease that recover_range holds on each source run while it
+# writes a new batch.  It starts the write only in the first half of it.
+RECOVERY_SOURCE_LEASE_TTL = 60.0
 
 # Run retention deletes runs a batch at a time (see _delete_run_batch): the
 # TTL of the lease it holds on each run of a batch, and the most runs in
@@ -2621,13 +2626,29 @@ class DagScheduler:
             self._spawn_advance((dag_name, run_key))
         return result or {"ok": False, "reason": "no such run"}
 
+    def _recovery_backend(self, name: str, absent: str) -> StateBackend:
+        """The state backend for a recovery request about workflow ``name``.
+
+        Without one the request is unavailable.  A daemon that has neither
+        the workflow nor a ``state`` section has no store to wait for, and
+        the request fails as ``absent``.
+        """
+        from cronstable import recovery
+
+        backend = self._backend()
+        if backend is not None:
+            return backend
+        if name not in self._dags() and not self._cron._state_configured:
+            raise recovery.RecoveryError(absent)
+        raise recovery.RecoveryUnavailable()
+
     async def recovery_plan(self, name, run_key, *, mode="failed", tasks=()):
         from cronstable import recovery
 
+        backend = self._recovery_backend(name, "workflow run not found")
         config = self._dags().get(name)
         source = await self._read(name, run_key)
-        backend = self._backend()
-        if config is None or source is None or backend is None:
+        if config is None or source is None:
             raise recovery.RecoveryError(("workflow run not found"))
         # The cap counts artifact names.  A scope's stream can hold more
         # records than names (see append_record's ``prune_latest_by``), so
@@ -2700,9 +2721,7 @@ class DagScheduler:
                 "runKey": accepted_key,
                 "created": False,
             }
-        backend = self._backend()
-        if backend is None:
-            raise recovery.RecoveryError("state is unavailable")
+        backend = self._recovery_backend(name, "workflow run not found")
         holder = self._cron._proc_token + ":recovery:" + os.urandom(12).hex()
         lease = await asyncio.wait_for(
             backend.acquire_lease(
@@ -2742,11 +2761,21 @@ class DagScheduler:
                     return DOC_KEEP, False
                 return body, True
 
-            _, created = await self._mutate(name, key, create)
+            try:
+                _, created = await self._mutate(name, key, create)
+            except (
+                TimeoutError,
+                asyncio.TimeoutError,
+                asyncio.CancelledError,
+            ):
+                # the abandoned create can still land
+                lease = None
+                raise
         finally:
-            await asyncio.wait_for(
-                backend.release_lease(lease), STATE_OP_TIMEOUT
-            )
+            if lease is not None:
+                await asyncio.wait_for(
+                    backend.release_lease(lease), STATE_OP_TIMEOUT
+                )
         await self._try_own(config, (name, key))
         return {
             "dryRun": False,
@@ -2766,12 +2795,10 @@ class DagScheduler:
     ):
         from cronstable import recovery
 
-        backend = self._backend()
+        backend = self._recovery_backend(name, "workflow not found")
         start, end = _parse_iso(start_iso), _parse_iso(end_iso)
-        if backend is None or name not in self._dags():
-            raise recovery.RecoveryError(
-                ("workflow or state store is unavailable")
-            )
+        if name not in self._dags():
+            raise recovery.RecoveryError("workflow not found")
         if start is None or end is None or end < start:
             raise recovery.RecoveryError("invalid recovery date range")
         ns = "recoverybatch/" + name
@@ -2851,8 +2878,9 @@ class DagScheduler:
             }
             return body, body
 
-        _, batch = await asyncio.wait_for(
-            backend.mutate_document(ns, token, create), STATE_OP_TIMEOUT
+        # a batch that exists holds its sources without their leases
+        batch = await self._write_recovery_batch(
+            backend, name, token, create, plans if existing is None else []
         )
         for plan in plans:
             source = plan["sourceRunKey"]
@@ -2882,6 +2910,94 @@ class DagScheduler:
             "runs": list(batch["results"].values()),
             "complete": True,
         }
+
+    async def _write_recovery_batch(
+        self,
+        backend: StateBackend,
+        name: str,
+        token: str,
+        create: Callable[[dict[str, Any] | None], tuple[Any, dict[str, Any]]],
+        plans: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Apply ``create`` to recovery batch ``token`` and return the batch.
+
+        Run retention deletes a run under its lease after one read of the
+        recovery batches (see _delete_run_batch).  A new batch is therefore
+        written under the lease of the source run of each of ``plans``,
+        after a listing under those leases shows each source to be the run
+        that was planned.  The write starts only within half the lease TTL
+        of the first acquire.  recover() takes the same leases, so this
+        releases them before it returns.  A write that ends in a timeout
+        or a cancellation can still land, so its leases stay until their
+        TTL.
+        """
+        from cronstable import recovery
+
+        holder = self._cron._proc_token + ":recovery:" + os.urandom(12).hex()
+        leases: list[Lease] = []
+        try:
+            if plans:
+                started = time.monotonic()
+                for plan in plans:
+                    lease = await asyncio.wait_for(
+                        backend.acquire_lease(
+                            self._lease_name((name, plan["sourceRunKey"])),
+                            holder,
+                            RECOVERY_SOURCE_LEASE_TTL,
+                        ),
+                        STATE_OP_TIMEOUT,
+                    )
+                    if lease is None:
+                        raise recovery.RecoveryError(
+                            "source run is busy; retry shortly"
+                        )
+                    leases.append(lease)
+                stored = {
+                    body["runKey"]: body.get("runId")
+                    for body in await asyncio.wait_for(
+                        backend.list_documents(self._ns(name)),
+                        STATE_OP_TIMEOUT,
+                    )
+                    if isinstance(body.get("runKey"), str)
+                }
+                if any(
+                    stored.get(plan["sourceRunKey"]) != plan["sourceRunId"]
+                    for plan in plans
+                ):
+                    raise recovery.RecoveryError(
+                        "recovery preview is stale; preview again"
+                    )
+                if time.monotonic() - started >= RECOVERY_SOURCE_LEASE_TTL / 2:
+                    raise recovery.RecoveryError(
+                        "leasing the source runs took too long; retry or "
+                        "select fewer dates"
+                    )
+            try:
+                _, batch = await asyncio.wait_for(
+                    backend.mutate_document(
+                        "recoverybatch/" + name, token, create
+                    ),
+                    STATE_OP_TIMEOUT,
+                )
+            except (
+                TimeoutError,
+                asyncio.TimeoutError,
+                asyncio.CancelledError,
+            ):
+                # the abandoned write can still land
+                leases.clear()
+                raise
+        finally:
+            await asyncio.gather(
+                *(
+                    asyncio.wait_for(
+                        backend.release_lease(lease), STATE_OP_TIMEOUT
+                    )
+                    for lease in leases
+                ),
+                return_exceptions=True,
+            )
+        return batch
 
     async def _prepare_recovery_or_fail(self, ref: RunRef) -> bool:
         from cronstable.recovery import RecoveryError
@@ -3432,7 +3548,7 @@ class DagScheduler:
             backend,
             name,
             [
-                (body["runKey"], body.get("runId"))
+                (body["runKey"], body.get("runId"), body.get("createdAt"))
                 for body in terminal[:excess]
                 if body.get("runKey") and body["runKey"] not in protected
             ],
@@ -3442,10 +3558,10 @@ class DagScheduler:
         self,
         backend: StateBackend,
         name: str,
-        runs: list[tuple[str, Any]],
+        runs: list[tuple[str, Any, Any]],
     ) -> None:
-        """Delete each ``(run key, run id)`` of ``runs`` that no recovery
-        references, :data:`GC_LEASE_BATCH` runs at a time.
+        """Delete each listed ``(run key, run ID, createdAt)`` of ``runs``
+        that no recovery references, :data:`GC_LEASE_BATCH` runs at a time.
 
         A recovery document that cannot be read holds every run of the
         workflow, so the pass over them ends there with one warning.
@@ -3468,22 +3584,25 @@ class DagScheduler:
         self,
         backend: StateBackend,
         name: str,
-        runs: list[tuple[str, Any]],
+        runs: list[tuple[str, Any, Any]],
     ) -> None:
         """Delete the runs of one batch that no recovery references.
 
         The references are read under the lease of every run that the
         batch holds.  recover() holds a run's lease while it creates a
-        recovery run, so that read lists each recovery accepted before it,
-        and no recovery is accepted between it and the delete.  A run
-        whose lease is held elsewhere stays.
+        recovery run, and recover_range() holds the lease of every source
+        while it writes a new batch, so that read lists each recovery
+        accepted before it, and no recovery is accepted between it and the
+        delete.  A run whose lease is held elsewhere stays.
 
         The batch deletes a run within half of :data:`GC_LEASE_TTL` of
         that run's acquire, which keeps the delete inside its lease, and
-        releases the lease as soon as the run is settled.  On a slow store
-        it stops taking leases after a quarter of the TTL, so the runs it
-        holds still have time for the read and their deletes.  The runs
-        it leaves wait for the next pass.
+        releases the lease as soon as the run is settled.  A delete that
+        ends in a timeout or a cancellation can still land, so its lease
+        stays until its TTL.  On a slow store the batch stops taking
+        leases after a quarter of the TTL, so the runs it holds still have
+        time for the read and their deletes.  The runs it leaves wait for
+        the next pass.
 
         When a release fails, that lease lapses with its TTL and the batch
         goes on deleting.  It releases the leases behind the failure
@@ -3501,11 +3620,12 @@ class DagScheduler:
                 return False
             return True
 
-        # (lease, when its delete must have started, run key, run id)
-        held: list[tuple[Lease, float, str, Any]] = []
+        # (lease, when its delete must have started, run key, run ID,
+        # listed createdAt)
+        held: list[tuple[Lease, float, str, Any, Any]] = []
         try:
             started = time.monotonic()
-            for run_key, run_id in runs:
+            for run_key, run_id, created_at in runs:
                 taken = time.monotonic()
                 if held and taken - started >= GC_LEASE_TTL / 4:
                     break
@@ -3516,19 +3636,27 @@ class DagScheduler:
                     STATE_OP_TIMEOUT,
                 )
                 if lease is not None:
-                    held.append(
-                        (lease, taken + GC_LEASE_TTL / 2, run_key, run_id)
-                    )
+                    deadline = taken + GC_LEASE_TTL / 2
+                    held.append((lease, deadline, run_key, run_id, created_at))
             if not held:
                 return
             referenced = await self._referenced_runs(backend, name)
             releasing = True
             for entry in list(held):
-                lease, deadline, run_key, run_id = entry
+                lease, deadline, run_key, run_id, created_at = entry
                 if run_key not in referenced and time.monotonic() < deadline:
-                    await self._delete_run_locked(
-                        backend, name, run_key, run_id
-                    )
+                    try:
+                        await self._delete_run_locked(
+                            backend, name, run_key, run_id, created_at
+                        )
+                    except (
+                        TimeoutError,
+                        asyncio.TimeoutError,
+                        asyncio.CancelledError,
+                    ):
+                        # the abandoned delete can still land
+                        held.remove(entry)
+                        raise
                 if releasing:
                     held.remove(entry)
                     releasing = await release(lease)
@@ -3576,8 +3704,18 @@ class DagScheduler:
         name: str,
         run_key: str,
         run_id: Any,
+        created_at: Any,
     ) -> None:
         """Delete one run document and prune its XCom record stream.
+
+        The document goes only while it is the finished run that the
+        caller listed.  ``created_at`` is that run's ``createdAt``: a
+        recovery that is accepted again takes the key and the run ID of
+        the recovery run before it.  ``run_id`` names the listed run as
+        well, and without one any run ID counts.  When the key holds
+        another document, that document and the stream stay.  When it
+        holds none, another pass took the run, and this pass prunes the
+        stream.
 
         The stream's blobs become unreferenced once the records are gone;
         the state GC's orphan-blob sweep (cron._collect_state_garbage /
@@ -3586,9 +3724,22 @@ class DagScheduler:
         a doc-less stream the stream GC ages out, never a live run whose
         XCom vanished.
         """
+
+        def delete(current):
+            if current is None:
+                # another pass took the run
+                return DOC_KEEP, True
+            if (
+                not dag.is_terminal_run(current)
+                or (run_id and current.get("runId") != run_id)
+                or current.get("createdAt") != created_at
+            ):
+                return DOC_KEEP, False
+            return DOC_DELETE, True
+
         try:
-            await asyncio.wait_for(
-                backend.delete_document(self._ns(name), run_key),
+            _, gone = await asyncio.wait_for(
+                backend.mutate_document(self._ns(name), run_key, delete),
                 timeout=STATE_OP_TIMEOUT,
             )
         finally:
@@ -3607,6 +3758,14 @@ class DagScheduler:
             # same logical date re-creates it): a deleted key must not linger
             # as "known terminal".
             known.discard(run_key)
+        # same for the rollup cache, which serves a terminal summary without
+        # reading the key again.
+        summaries = self._dag_summary_cache.get(name)
+        if summaries is not None:
+            summaries.pop(run_key, None)
+        if not gone:
+            # another run holds the key: the registry and the stream stay
+            return
         # nothing of a collected run is left to claim: the launch registry
         # this node may keep for it goes with the document
         self._launched.pop((name, run_key), None)
@@ -3664,7 +3823,9 @@ class DagScheduler:
                         or now - float(updated) < grace
                     ):
                         continue  # too recent, or undatable: keep
-                    runs.append((run_key, body.get("runId")))
+                    runs.append(
+                        (run_key, body.get("runId"), body.get("createdAt"))
+                    )
                 await self._delete_runs(backend, name, runs)
             except Exception:  # noqa: BLE001 - one dag must not stop the pass
                 logger.exception("dag %s: removed-dag run GC failed", name)

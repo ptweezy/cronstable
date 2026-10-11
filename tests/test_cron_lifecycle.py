@@ -3,6 +3,7 @@ import datetime
 import gc
 import os
 import signal
+import threading
 import time
 import warnings
 from collections import OrderedDict
@@ -19,7 +20,12 @@ from cronstable.cron import Cron, JobRunInfo, _job_run_info_from_dict
 from cronstable.job import JobOutputStream, JobRetryState, RunningJob
 from cronstable.redact import REDACTED
 from cronstable.state import make_state_backend
-from tests._commands import cmd_hang, cmd_print, yaml_command
+from tests._commands import (
+    cmd_hang,
+    cmd_print,
+    cmd_print_sleep_print,
+    yaml_command,
+)
 from tests._configs import _DEP_JOB, _ONE_JOB, _TLS_CLUSTER_YAML
 from tests._cron_helpers import (
     _WEB_ONE_JOB,
@@ -32,6 +38,7 @@ from tests._cron_helpers import (
     _noop,
     _reboot_job,
     _reboot_mgr,
+    _set_now,
     fixed_current_time,  # noqa: F401
 )
 from tests._helpers import (
@@ -468,6 +475,62 @@ async def test_replace_policy_leaves_an_ended_instance_its_outcome(
             await asyncio.wait_for(rj.wait(), 20)
 
 
+def _two_step_job(policy, extra=""):
+    """A job whose command prints ``ready`` and then sleeps.
+
+    A test swaps ``command`` for a short one between two launches.
+    """
+    return (
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print_sleep_print("ready", 30, "done"))
+        + """
+    schedule: "@reboot"
+    captureStdout: true
+    killTimeout: 1
+    concurrencyPolicy: %s
+%s"""
+        % (policy, extra)
+    )
+
+
+async def test_replace_policy_spares_an_instance_that_ends_mid_replacement(
+    monkeypatch,
+):
+    # A Replace launch cancels the live instances one after another.  One
+    # that ends by itself while an earlier one is being canceled keeps its
+    # outcome.
+    cron = cronstable.cron.Cron(None, config_yaml=_two_step_job("Allow"))
+    job = cron.cron_jobs["test"]
+    await cron.maybe_launch_job(job)
+    (first,) = cron.running_jobs["test"]
+    # Wait for Python initialization before sending CTRL_BREAK.
+    await _wait_until(lambda: bool(first.output.lines))
+    job.command = cmd_print(out="hi")
+    await cron.maybe_launch_job(job)
+    second = cron.running_jobs["test"][1]
+    assert not first.ended and not second.ended
+    # two live instances under Replace, as a reload from Allow leaves them
+    job.concurrencyPolicy = "Replace"
+    cancel = first.cancel
+
+    async def cancel_once_the_second_has_ended():
+        await asyncio.wait_for(second.wait(), 20)
+        await cancel()
+
+    monkeypatch.setattr(first, "cancel", cancel_once_the_second_has_ended)
+    await cron.maybe_launch_job(job)
+    third = cron.running_jobs["test"][2]
+    try:
+        assert first.replaced
+        assert second.ended and not second.replaced
+        await cron._handle_finished_job(second)
+        await cron._drain_completions()
+        assert [r.outcome for r in cron.run_history["test"]] == ["success"]
+    finally:
+        await asyncio.wait_for(third.wait(), 20)
+        await asyncio.wait_for(first.wait(), 20)
+
+
 def _ended_retry_job(policy):
     return (
         "jobs:\n  - name: test\n"
@@ -709,6 +772,159 @@ async def test_permanent_failure_ends_the_ladder_of_a_dropped_fire():
     assert reported == ["failure", "permanent"] * 2
 
 
+def _cancellable_retry_job(policy, extra=""):
+    return (
+        "%sjobs:\n  - name: test\n" % extra
+        + yaml_command(cmd_print_sleep_print("ready", 30, "done"))
+        + """
+    schedule: "@reboot"
+    captureStdout: true
+    killTimeout: 1
+    concurrencyPolicy: %s
+    onFailure:
+      retry:
+        maximumRetries: 2
+        initialDelay: 60
+        maximumDelay: 60
+        backoffMultiplier: 1
+"""
+        % policy
+    )
+
+
+async def _cancel_running(cron, run):
+    """Cancel ``run`` through the API once its process is up."""
+    # Wait for Python initialization before sending CTRL_BREAK.
+    await _wait_until(lambda: bool(run.output.lines))
+    assert await cron.cancel_job_by_name("test") == 1
+    assert run.ended and run.cancelled
+    await asyncio.wait_for(run.wait(), 20)
+
+
+@pytest.mark.parametrize("policy", ["Allow", "Forbid", "Replace"])
+async def test_cancelled_run_leaves_a_later_launch_its_retries(policy):
+    # A cancelled instance stays in running_jobs until the reaper records
+    # it.  The next scheduled launch starts beside it under any concurrency
+    # policy, with a retry ladder of its own, and the cancelled record
+    # leaves that ladder alone.
+    cron = cronstable.cron.Cron(
+        None, config_yaml=_cancellable_retry_job(policy)
+    )
+    job = cron.cron_jobs["test"]
+    await cron.launch_scheduled_job(job)
+    first = cron.running_jobs["test"][0]
+    await _cancel_running(cron, first)
+    await cron.launch_scheduled_job(job)
+    assert len(cron.running_jobs["test"]) == 2
+    second = cron.running_jobs["test"][1]
+    try:
+        ladder = cron.retry_state["test"]
+        assert second.retry_state is ladder
+        assert first.retry_state is not ladder
+        await cron._handle_finished_job(first)
+        assert cron.last_run["test"].outcome == "cancelled"
+        assert cron.retry_state.get("test") is ladder
+        assert not ladder.cancelled
+    finally:
+        await _cancel_running(cron, second)
+    # cancelling the second instance ends the ladder that it carries
+    await cron._handle_finished_job(second)
+    assert "test" not in cron.retry_state
+    assert ladder.cancelled
+
+
+async def test_cancelled_record_leaves_a_starting_launch_its_retries(
+    monkeypatch,
+):
+    # The cancelled record can land while the next scheduled launch is
+    # starting its process, before that run registers.  The run registers
+    # with its ladder intact.
+    cron = cronstable.cron.Cron(
+        None, config_yaml=_cancellable_retry_job("Forbid")
+    )
+    job = cron.cron_jobs["test"]
+    await cron.launch_scheduled_job(job)
+    first = cron.running_jobs["test"][0]
+    await _cancel_running(cron, first)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_start = RunningJob.start
+
+    async def held_start(self):
+        entered.set()
+        await release.wait()
+        await real_start(self)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(RunningJob, "start", held_start)
+        fire = asyncio.create_task(cron.launch_scheduled_job(job))
+        await asyncio.wait_for(entered.wait(), 20)
+        ladder = cron.retry_state["test"]
+        assert cron.running_jobs["test"] == [first]
+        await cron._handle_finished_job(first)
+        release.set()
+        await asyncio.wait_for(fire, 20)
+    (second,) = cron.running_jobs["test"]
+    try:
+        assert second.retry_state is ladder
+        assert cron.retry_state.get("test") is ladder
+        assert not ladder.cancelled
+    finally:
+        await _cancel_running(cron, second)
+
+
+@pytest.mark.parametrize("carried", [True, False])
+async def test_cancelled_run_ends_a_retry_sequence_under_way(carried):
+    # A cancellation ends a retry sequence that has scheduled a retry:
+    # the one that the cancelled attempt carries, and one that another
+    # run's failure armed.
+    cron = cronstable.cron.Cron(
+        None, config_yaml=_cancellable_retry_job("Allow")
+    )
+    await cron.launch_scheduled_job(cron.cron_jobs["test"])
+    run = cron.running_jobs["test"][0]
+    ladder = run.retry_state if carried else JobRetryState(60, 1, 60)
+    ladder.next_delay()
+    cron.retry_state["test"] = ladder
+    await _cancel_running(cron, run)
+    await cron._handle_finished_job(run)
+    assert cron.last_run["test"].outcome == "cancelled"
+    assert "test" not in cron.retry_state
+    assert ladder.cancelled
+
+
+@pytest.mark.parametrize("policy", ["Allow", "Forbid"])
+async def test_cancelled_pooled_run_leaves_a_queued_fire_its_retries(
+    dag_cron, monkeypatch, policy
+):
+    # A scheduled fire that waits in the pool queue behind a run keeps its
+    # retries when that run is cancelled.
+    cron = await dag_cron(
+        _cancellable_retry_job(policy, "pools:\n  solo:\n    slots: 1\n")
+        + "    pool: solo\n"
+    )
+    monkeypatch.setattr(cron._pools, "service", lambda: None)
+    job = cron.cron_jobs["test"]
+    await cron.launch_scheduled_job(job)
+    await cron._pools.tick()
+    (first,) = cron.running_jobs["test"]
+    await cron.launch_scheduled_job(job)
+    await cron._pools.tick()
+    assert cron.running_jobs["test"] == [first]
+    await _cancel_running(cron, first)
+    await cron._handle_finished_job(first)
+    assert cron.last_run["test"].outcome == "cancelled"
+    await cron._pools.tick()
+    (second,) = cron.running_jobs["test"]
+    try:
+        assert second.retry_state is not None
+        assert not second.retry_state.cancelled
+        assert cron.retry_state.get("test") is second.retry_state
+    finally:
+        await _cancel_running(cron, second)
+        await cron._handle_finished_job(second)
+
+
 async def test_launch_beside_an_ended_instance_opens_its_inflight_record(
     monkeypatch,
 ):
@@ -735,6 +951,188 @@ async def test_launch_beside_an_ended_instance_opens_its_inflight_record(
         assert opened == ["test", "test"]
     finally:
         await asyncio.wait_for(cron.running_jobs["test"][2].wait(), 20)
+
+
+def _one_clock(monkeypatch):
+    """Put the daemon and its runs on one wall clock that the test sets.
+
+    Returns the holder: ``holder["now"]`` is the present instant.
+    """
+    holder = {"now": DT(2020, 1, 1)}
+    _set_now(monkeypatch, holder)
+    monkeypatch.setattr(
+        "cronstable.job.datetime",
+        SimpleNamespace(now=lambda tz=None: cron_mod.get_now(tz)),
+    )
+    return holder
+
+
+async def test_run_recorded_late_keeps_the_instant_it_ended(monkeypatch):
+    # The reaper records a killed run when its output drain ends, up to a
+    # minute after the run ended, and a run that started in between can be
+    # recorded first.  The row carries the instant the run ended, so the
+    # newer run stays the job's last run and keeps its log ring.
+    clock = _one_clock(monkeypatch)
+    cron = cronstable.cron.Cron(None, config_yaml=_two_step_job("Forbid"))
+    job = cron.cron_jobs["test"]
+    await cron.launch_scheduled_job(job)
+    (first,) = cron.running_jobs["test"]
+    # Wait for Python initialization before sending CTRL_BREAK.
+    await _wait_until(lambda: bool(first.output.lines))
+    clock["now"] = DT(2020, 1, 1, 0, 1)
+    assert await cron.cancel_job_by_name("test") == 1
+    clock["now"] = DT(2020, 1, 1, 0, 2)
+    job.command = cmd_print(out="newer")
+    await cron.launch_scheduled_job(job)
+    second = cron.running_jobs["test"][1]
+    await asyncio.wait_for(second.wait(), 20)
+    await cron._handle_finished_job(second)
+    clock["now"] = DT(2020, 1, 1, 0, 3)
+    await asyncio.wait_for(first.wait(), 20)
+    await cron._handle_finished_job(first)
+    await cron._drain_completions()
+    newer, late = cron.run_history["test"]
+    assert (newer.outcome, late.outcome) == ("success", "cancelled")
+    assert cron.last_run["test"] is newer
+    assert list(newer.output.lines) == [("stdout", "newer\n")]
+    assert not late.output.lines
+    assert late.finished_at == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
+    assert late.duration == 60
+    runs = cron.metrics.counters_snapshot()["jobs"]["test"]["runs"]
+    assert (runs["success"], runs["cancelled"]) == (1, 1)
+
+
+async def test_run_recorded_late_leaves_the_gate_to_the_newer_run(
+    tmp_path, monkeypatch
+):
+    # onlyIfLastSucceeded judges the newest run by the instant it ended, in
+    # memory and in the ledger.  A run that executionTimeout ended is
+    # recorded as a failure after a newer success, and the gate stays open.
+    clock = _one_clock(monkeypatch)
+    cron = cronstable.cron.Cron(
+        None,
+        config_yaml=_two_step_job(
+            "Replace",
+            "    onlyIfLastSucceeded: true\n    executionTimeout: 60\n",
+        ),
+    )
+    await start_state(
+        cron,
+        _state_cfg(
+            _state_yaml(tmp_path) + "\n  jobApi:\n    enabled: false\n"
+        ),
+    )
+    job = cron.cron_jobs["test"]
+    await cron.launch_scheduled_job(job)
+    (first,) = cron.running_jobs["test"]
+    # Wait for Python initialization before sending CTRL_BREAK.
+    await _wait_until(lambda: bool(first.output.lines))
+    clock["now"] = DT(2020, 1, 1, 0, 1)
+    first.execution_deadline = time.perf_counter()
+    await asyncio.wait_for(first.wait(), 20)
+    assert first.retcode == -100
+    clock["now"] = DT(2020, 1, 1, 0, 2)
+    job.command = cmd_print(out="newer")
+    await cron.launch_scheduled_job(job)
+    second = cron.running_jobs["test"][1]
+    assert not first.replaced
+    await asyncio.wait_for(second.wait(), 20)
+    await cron._handle_finished_job(second)
+    clock["now"] = DT(2020, 1, 1, 0, 3)
+    await cron._handle_finished_job(first)
+    await cron._drain_completions()
+    await asyncio.gather(*list(cron._pending_state_writes))
+    rows = cron.run_history["test"]
+    assert [r.outcome for r in rows] == ["success", "failure"]
+    assert cron.last_run["test"] is rows[0]
+    assert await cron._depends_on_past_ok(job)
+    recs = await cron.state_backend.list_records(cron._run_stream("test"))
+    assert [(r["outcome"], r["finished_at"]) for r in recs] == [
+        ("success", "2020-01-01T00:02:00+00:00"),
+        ("failure", "2020-01-01T00:01:00+00:00"),
+    ]
+    assert all(r["ranAt"] == r["finished_at"] for r in recs)
+    counters = cron.metrics.counters_snapshot()["jobs"]["test"]
+    assert counters["runs"]["failure"] == 1
+    assert counters["permanent_failures"] == 1
+    # the ledger alone gives the same answer
+    rows.clear()
+    cron._last_real_outcome.clear()
+    assert await cron._depends_on_past_ok(job)
+
+
+async def test_run_cancelled_while_verifying_is_recorded_at_the_cancel(
+    monkeypatch,
+):
+    # A run that is canceled while its check runs has ended: a second
+    # cancel finds nothing to stop, and a Forbid fire starts.  Its wait()
+    # returns once the check's output closes, and the row carries the
+    # instant of the cancel.
+    clock = _one_clock(monkeypatch)
+    cron = cronstable.cron.Cron(
+        None,
+        config_yaml=(
+            "jobs:\n  - name: test\n"
+            + yaml_command(cmd_print())
+            + "\n    verify:\n"
+            + yaml_command(cmd_print_sleep_print("ready", 30, "done"), 6)
+            + "\n      timeout: 60\n"
+            + "    killTimeout: 1\n    concurrencyPolicy: Forbid\n"
+            + '    schedule: "@reboot"\n'
+        ),
+    )
+    job = cron.cron_jobs["test"]
+    drained = asyncio.Event()
+    drain = RunningJob._read_job_streams
+
+    async def held_drain(self, **kwargs):
+        if self._output_prefix:
+            # the check: a process that it started holds its output
+            await drained.wait()
+        await drain(self, **kwargs)
+
+    monkeypatch.setattr(RunningJob, "_read_job_streams", held_drain)
+    await cron.launch_scheduled_job(job)
+    (run,) = cron.running_jobs["test"]
+    collected = asyncio.ensure_future(run.wait())
+    try:
+        # Wait for Python initialization before sending CTRL_BREAK.
+        await _wait_until(lambda: bool(run.output.lines), tries=1000)
+        clock["now"] = DT(2020, 1, 1, 0, 1)
+        assert await cron.cancel_job_by_name("test") == 1
+        assert run.ended and not collected.done()
+        with pytest.raises(cron_mod.ApiActionError) as refused:
+            await cron.cancel_job_by_name("test")
+        assert refused.value.status == 409
+        clock["now"] = DT(2020, 1, 1, 0, 2)
+        # the fire needs no check of its own
+        job.verify = None
+        assert await cron.maybe_launch_job(job)
+    finally:
+        drained.set()
+        for fired in cron.running_jobs["test"][1:]:
+            await asyncio.wait_for(fired.wait(), 20)
+        await asyncio.wait_for(collected, 20)
+    await cron._handle_finished_job(run)
+    (row,) = cron.run_history["test"]
+    assert row.outcome == "cancelled"
+    assert row.finished_at == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
+
+
+def test_finished_at_is_the_end_of_the_run_capped_at_now():
+    # the clock of this module stands at 1999-12-31 12:00
+    now = DT(1999, 12, 31, 12, 0, tzinfo=UTC)
+    minute = datetime.timedelta(minutes=1)
+
+    def finished_at(**attrs):
+        return Cron._finished_at(SimpleNamespace(**attrs))
+
+    assert finished_at(ended_at=now - minute) == now - minute
+    # a wall clock stepped back since the run ended
+    assert finished_at(ended_at=now + minute) == now
+    # a run whose process never started, and a stand-in for a run
+    assert finished_at(ended_at=None) == now
+    assert finished_at() == now
 
 
 async def test_handle_finished_job_skips_replaced(monkeypatch):
@@ -1193,6 +1591,52 @@ async def test_reaper_retries_handler_failure_before_instance_removal(
     assert not cron.running_jobs
     assert not cron._reaper_pending
     assert "bug (6)" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "ending, bug",
+    [("cancelled", "bug (9)"), ("raised", "bug (2)")],
+    ids=["cancelled", "raised"],
+)
+async def test_reaper_finishes_a_job_whose_wait_task_failed(
+    monkeypatch, caplog, ending, bug
+):
+    # A wait task that ends canceled, or with an error, still has its job
+    # finished, and the reaper goes on to the next job.
+    cron = Cron(None)
+
+    class FailedWait(_EventRunningJob):
+        async def wait(self):
+            await super().wait()
+            if ending == "cancelled":
+                raise asyncio.CancelledError
+            raise RuntimeError("wait failed")
+
+    failed, later = FailedWait("failed"), _EventRunningJob("later")
+    handled = asyncio.Queue()
+
+    async def finish(job):
+        cron._remove_running_instance(job)
+        handled.put_nowait(job)
+
+    monkeypatch.setattr(cron, "_handle_finished_job", finish)
+    cron._add_running_instance(failed)
+    reaper = asyncio.create_task(cron._wait_for_running_jobs())
+    try:
+        failed.exit.set()
+        assert await asyncio.wait_for(handled.get(), timeout=2) is failed
+        cron._add_running_instance(later)
+        later.exit.set()
+        assert await asyncio.wait_for(handled.get(), timeout=2) is later
+    finally:
+        failed.exit.set()
+        later.exit.set()
+        cron.signal_shutdown()
+        await asyncio.wait({reaper}, timeout=2)
+    assert reaper.done() and not reaper.cancelled()
+    assert not cron.running_jobs
+    assert not cron._reaper_pending
+    assert bug in caplog.text
 
 
 async def test_reaper_parks_between_batches(monkeypatch):
@@ -1691,6 +2135,47 @@ async def test_run_survives_config_error(tmp_path, monkeypatch, run_cron):
     assert cron.metrics._last_reload_ok is False
 
 
+async def test_run_survives_a_pooled_fire_whose_pool_is_unreadable(
+    tmp_path, monkeypatch, caplog, run_cron
+):
+    # Nothing in run() catches an error of a scheduled fire, so a pool
+    # document that cannot be read costs only that fire.
+    from cronstable.pools import NAMESPACE
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(
+        "state:\n  path: {}\n  jobApi:\n    enabled: false\n"
+        "pools:\n  database:\n    slots: 2\n    maxQueued: 4\n"
+        "jobs:\n  - name: one\n".format(tmp_path / "state")
+        + yaml_command(cmd_print())
+        + '\n    schedule: "@reboot"\n    pool: database\n'
+    )
+    # a first daemon writes the pool's document, for there to be one to
+    # damage
+    first = cronstable.cron.Cron(str(cfg))
+    await first.start_stop_state((await first.reload_config()).state_config)
+    try:
+        await first._pools.snapshot()
+        _lock, path = first.state_backend._doc_paths(NAMESPACE, "database")
+    finally:
+        await first._pools.close()
+        await first.start_stop_state(None)
+    Path(path).write_bytes(b"{not json")
+
+    monkeypatch.setattr("cronstable.cron.next_sleep_interval", lambda *a: 0.01)
+    cron = cronstable.cron.Cron(str(cfg))
+    with caplog.at_level("WARNING", logger="cronstable"):
+        task = run_cron(cron)
+        await _wait_until(
+            lambda: task.done()
+            or "Job one could not enter pool database" in caplog.text,
+            tries=3000,
+        )
+    assert not task.done()
+    assert "Job one could not enter pool database" in caplog.text
+    assert not cron.running_jobs
+
+
 async def test_config_guard_runs_before_every_parse(
     tmp_path, monkeypatch, run_cron
 ):
@@ -1738,6 +2223,31 @@ async def test_config_guard_runs_before_every_parse(
     assert parsed == []
     assert set(cron.cron_jobs) == {"alpha", "beta"}
     assert cron.metrics._last_reload_ok is False
+
+
+async def test_run_survives_a_config_file_that_is_not_utf8(
+    tmp_path, monkeypatch, run_cron, caplog
+):
+    # A redirect in Windows PowerShell 5.1 writes UTF-16.  The reload fails
+    # as it does for any invalid file, and the error names the file.
+    import logging
+
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    cfg = confdir / "jobs.yaml"
+    cfg.write_text(TWO_JOBS)
+    cron = cronstable.cron.Cron(str(confdir))
+    assert cron.metrics._last_reload_ok is True
+    monkeypatch.setattr("cronstable.cron.next_sleep_interval", lambda *a: 0.01)
+    cfg.write_bytes("jobs: []\n".encode("utf-16"))
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        task = run_cron(cron)
+        await _wait_until(lambda: cron.metrics._last_reload_ok is False)
+    assert not task.done()
+    assert set(cron.cron_jobs) == {"alpha", "beta"}
+    assert "Error in configuration file(s)" in caplog.text
+    assert "Could not load config file {!r}".format(str(cfg)) in caplog.text
+    assert "please report this as a bug" not in caplog.text
 
 
 def test_parse_frees_the_yaml_parse_tree(tmp_path):
@@ -3121,6 +3631,469 @@ async def test_signal_reload_is_immediate_in_subminute_mode(
     await _wait_until(lambda: set(cron.cron_jobs) == {"alpha", "gamma"})
     cron.signal_shutdown()
     await asyncio.wait_for(task, timeout=5)
+
+
+# Each version has its own size, so the stat fingerprint tells them apart
+# whatever the filesystem's mtime granularity is.
+_RELOAD_V3 = (
+    _RELOAD_V2
+    + """  - name: delta
+    command: echo delta
+    schedule: "0 0 * * *"
+"""
+)
+
+
+def _count_parses(monkeypatch, after_first=None):
+    """Record each config parse; ``after_first`` runs once the first one
+    has read its files, as an edit that lands while it runs would."""
+    parses = []
+    real_parse = cronstable.cron.parse_config_with_sources
+
+    def counting(arg):
+        parsed = real_parse(arg)
+        parses.append(arg)
+        if after_first is not None and len(parses) == 1:
+            after_first()
+        return parsed
+
+    monkeypatch.setattr("cronstable.cron.parse_config_with_sources", counting)
+    return parses
+
+
+async def test_reload_parses_again_after_an_edit_during_a_parse(
+    tmp_path, monkeypatch
+):
+    # reload_config records the fingerprint it took before the parse.
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_V1)
+    cron = cronstable.cron.Cron(str(cfg))
+    cfg.write_text(_RELOAD_V2)
+    parses = _count_parses(monkeypatch, lambda: cfg.write_text(_RELOAD_V3))
+
+    await cron.reload_config()
+    assert set(cron.cron_jobs) == {"alpha", "gamma"}
+    await cron.reload_config()
+    assert set(cron.cron_jobs) == {"alpha", "gamma", "delta"}
+    assert len(parses) == 2
+
+    # the unchanged file is skipped again
+    await cron.reload_config()
+    assert len(parses) == 2
+
+
+async def test_reload_parses_again_after_the_source_set_changes(
+    tmp_path, monkeypatch
+):
+    # No fingerprint taken before the parse covers a source the parse
+    # added, so the fingerprint stays void for one more pass.
+    def who():
+        job = cron.cron_jobs["alpha"]
+        return {e["key"]: e["value"] for e in job.environment}
+
+    env = tmp_path / "vars.env"
+    env.write_text("WHO=old\n")
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_V1)
+    cron = cronstable.cron.Cron(str(cfg))
+    cfg.write_text("defaults:\n  env_file: {}\n".format(env) + _RELOAD_V1)
+    parses = _count_parses(monkeypatch, lambda: env.write_text("WHO=new\n"))
+
+    await cron.reload_config()
+    assert who() == {"WHO": "old"}
+    assert cron._config_sig is None
+    await cron.reload_config()
+    assert who() == {"WHO": "new"}
+    assert len(parses) == 2
+
+    await cron.reload_config()
+    assert len(parses) == 2
+
+
+async def test_boot_parse_is_repeated_after_an_edit_during_it(
+    tmp_path, monkeypatch
+):
+    # No fingerprint predates the boot parse, so the one taken after it is
+    # kept only while the files still hold the bytes that were parsed.
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_V1)
+    parses = _count_parses(monkeypatch, lambda: cfg.write_text(_RELOAD_V2))
+    cron = cronstable.cron.Cron(str(cfg))
+    assert set(cron.cron_jobs) == {"alpha", "beta"}
+    assert cron._config_sig is None
+
+    await cron.reload_config()
+    assert set(cron.cron_jobs) == {"alpha", "gamma"}
+    assert len(parses) == 2
+    await cron.reload_config()
+    assert len(parses) == 2
+
+
+async def test_boot_parse_of_an_unchanged_config_is_not_repeated(
+    tmp_path, monkeypatch
+):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_V1)
+    parses = _count_parses(monkeypatch)
+    cron = cronstable.cron.Cron(str(cfg))
+    assert cron._config_sig is not None
+
+    await cron.reload_config()
+    assert len(parses) == 1
+
+
+_RELOAD_ADDED = """
+jobs:
+  - name: delta
+    command: echo delta
+    schedule: "0 0 * * *"
+"""
+
+
+async def test_boot_parse_is_repeated_after_a_file_joins_the_directory(
+    tmp_path, monkeypatch
+):
+    # The fingerprint taken after the boot parse covers a file that joined
+    # the directory during it, and no parsed file holds that file's bytes.
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    (confdir / "a.yaml").write_text(_RELOAD_V1)
+    parses = _count_parses(
+        monkeypatch, lambda: (confdir / "b.yaml").write_text(_RELOAD_ADDED)
+    )
+    cron = cronstable.cron.Cron(str(confdir))
+    assert set(cron.cron_jobs) == {"alpha", "beta"}
+    assert cron._config_sig is None
+
+    await cron.reload_config()
+    assert set(cron.cron_jobs) == {"alpha", "beta", "delta"}
+    assert len(parses) == 2
+
+    # that parse added a source, which costs one more parse
+    await cron.reload_config()
+    await cron.reload_config()
+    assert len(parses) == 3
+
+
+async def test_boot_parse_of_an_unchanged_directory_is_not_repeated(
+    tmp_path, monkeypatch
+):
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    (confdir / "a.yaml").write_text(_RELOAD_V1)
+    parses = _count_parses(
+        monkeypatch, lambda: (confdir / "README").write_text("notes\n")
+    )
+    cron = cronstable.cron.Cron(str(confdir))
+    assert cron._config_sig is not None
+
+    await cron.reload_config()
+    assert len(parses) == 1
+
+
+async def test_reload_parses_again_after_a_file_joins_the_directory_unseen(
+    tmp_path, monkeypatch
+):
+    # A file that joins the directory within one step of the directory's
+    # mtime leaves the fingerprint taken before the parse as it was.
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    cfg = confdir / "a.yaml"
+    cfg.write_text(_RELOAD_V1)
+    cron = cronstable.cron.Cron(str(confdir))
+    cfg.write_text(_RELOAD_V2)
+    before = os.stat(str(confdir))
+
+    def join_unseen():
+        (confdir / "b.yaml").write_text(_RELOAD_ADDED)
+        os.utime(str(confdir), ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    parses = _count_parses(monkeypatch, join_unseen)
+    await cron.reload_config()
+    assert set(cron.cron_jobs) == {"alpha", "gamma"}
+    assert os.stat(str(confdir)).st_mtime_ns == before.st_mtime_ns
+    await cron.reload_config()
+    assert set(cron.cron_jobs) == {"alpha", "gamma", "delta"}
+    assert len(parses) == 2
+
+    # that parse added a source, which costs one more parse
+    await cron.reload_config()
+    await cron.reload_config()
+    assert len(parses) == 3
+
+
+@pytest.mark.parametrize(
+    "files, off_loop",
+    [(2, False), (cronstable.cron._CONFIG_SIGNATURE_OFFLOAD_MIN, True)],
+    ids=["small", "large"],
+)
+async def test_reload_lists_a_large_config_directory_off_the_loop(
+    tmp_path, monkeypatch, files, off_loop
+):
+    # The listing comparison shares the executor rule of the fingerprint.
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    cfg = confdir / "a.yaml"
+    cfg.write_text(_RELOAD_V1)
+    for index in range(1, files):
+        (confdir / "more{}.yaml".format(index)).write_text(
+            "jobs:\n  - name: more{}\n    command: echo more\n"
+            '    schedule: "0 0 * * *"\n'.format(index)
+        )
+    cron = cronstable.cron.Cron(str(confdir))
+    assert len(cron._config_sources) == files
+    cfg.write_text(_RELOAD_V2)
+    listings = []
+    real_listing = cronstable.cron.parsed_listing_unchanged
+
+    def recording(sources):
+        listings.append(threading.get_ident() != loop_thread)
+        return real_listing(sources)
+
+    loop_thread = threading.get_ident()
+    monkeypatch.setattr(
+        "cronstable.cron.parsed_listing_unchanged", recording
+    )
+    await cron.reload_config()
+    assert "gamma" in cron.cron_jobs
+    assert listings == [off_loop]
+    assert cron._config_sig is not None
+
+
+async def test_boot_keeps_a_config_read_from_a_pipe():
+    # A pipe gives its bytes once, so the boot comparison leaves it out.
+    read_end, write_end = os.pipe()
+    try:
+        path = "/dev/fd/{}".format(read_end)
+        try:
+            # FreeBSD without fdescfs has nodes for 0, 1 and 2 alone.
+            if not os.path.exists(path):
+                pytest.skip("needs /dev/fd/N for an open descriptor")
+            os.write(write_end, _RELOAD_V1.encode())
+        finally:
+            os.close(write_end)
+        cron = cronstable.cron.Cron(path)
+        assert set(cron.cron_jobs) == {"alpha", "beta"}
+        await cron.reload_config()
+        assert set(cron.cron_jobs) == {"alpha", "beta"}
+    finally:
+        os.close(read_end)
+
+
+@pytest.mark.skipif(not os.path.isdir("/dev/fd"), reason="needs /dev/fd")
+async def test_boot_keeps_a_config_read_from_a_descriptor_path(
+    tmp_path, monkeypatch
+):
+    # On macOS and BSD, opening /dev/fd/N shares the offset of descriptor
+    # N, so a second read of a regular file returns nothing.  The stand-in
+    # gives every platform that behavior.
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_V1)
+    fd = os.open(str(cfg), os.O_RDONLY)
+    path = "/dev/fd/{}".format(fd)
+
+    def shared_offset_open(file, *args, **kwargs):
+        if file == path:
+            return os.fdopen(os.dup(fd), *args, **kwargs)
+        return open(file, *args, **kwargs)
+
+    monkeypatch.setattr(
+        cronstable.config, "open", shared_offset_open, raising=False
+    )
+    try:
+        cron = cronstable.cron.Cron(path)
+        assert set(cron.cron_jobs) == {"alpha", "beta"}
+        await cron.reload_config()
+        assert set(cron.cron_jobs) == {"alpha", "beta"}
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+def test_boot_returns_when_an_env_file_is_a_fifo(tmp_path):
+    # A FIFO that is written once has no writer for a second open, and
+    # that open blocks.
+    fifo = tmp_path / "secrets.env"
+    os.mkfifo(str(fifo))
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("defaults:\n  env_file: {}\n".format(fifo) + _RELOAD_V1)
+    writer = threading.Thread(
+        target=lambda: fifo.write_text("WHO=x\n"), daemon=True
+    )
+    writer.start()
+    booted = []
+    boot = threading.Thread(
+        target=lambda: booted.append(cronstable.cron.Cron(str(cfg))),
+        daemon=True,
+    )
+    boot.start()
+    boot.join(10)
+    stuck = boot.is_alive()
+    if stuck:
+        # release the open that waits for a writer
+        os.close(os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK))
+        boot.join(5)
+    writer.join(5)
+    assert not stuck
+    assert set(booted[0].cron_jobs) == {"alpha", "beta"}
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+def test_config_signature_holds_no_mtime_for_a_fifo(tmp_path):
+    # Reading a FIFO moves its mtime, so the fingerprint leaves it out.
+    fifo = tmp_path / "secrets.env"
+    os.mkfifo(str(fifo))
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_V1)
+    cron = cronstable.cron.Cron(str(cfg))
+    st = os.stat(str(cfg))
+    assert cron._config_signature(frozenset([str(fifo), str(cfg)])) == (
+        (str(cfg), st.st_mtime_ns, st.st_size),
+        (str(fifo), 0, 0),
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+async def test_reload_of_a_fed_fifo_env_file_is_not_repeated(
+    tmp_path, monkeypatch
+):
+    # A feeder serves every open of the FIFO.  Each of its writes moves
+    # the FIFO's mtime, during the parse that reads it.
+    fifo = tmp_path / "secrets.env"
+    os.mkfifo(str(fifo))
+    cfg = tmp_path / "c.yaml"
+    body = "defaults:\n  env_file: {}\n".format(fifo) + _RELOAD_V1
+    cfg.write_text(body)
+    stop = threading.Event()
+
+    def feed():
+        while not stop.is_set():
+            with open(str(fifo), "w") as stream:  # waits for a reader
+                stream.write("WHO=x\n")
+            # the next open waits until the reader has closed its end
+            while not stop.is_set():
+                try:
+                    os.close(os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK))
+                except OSError:
+                    break
+                time.sleep(0.001)
+
+    feeder = threading.Thread(target=feed, daemon=True)
+    feeder.start()
+    try:
+        cron = cronstable.cron.Cron(str(cfg))
+        parses = _count_parses(monkeypatch)
+        cfg.write_text(body + "# an edit the fingerprint sees\n")
+        await cron.reload_config()
+        assert len(parses) == 1
+        await cron.reload_config()
+        await cron.reload_config()
+        assert len(parses) == 1
+    finally:
+        stop.set()
+        # a reader releases a feeder that waits in open()
+        reader = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+        feeder.join(5)
+        os.close(reader)
+
+
+async def test_reload_parses_again_after_an_early_edit_is_put_back(
+    tmp_path, monkeypatch
+):
+    # The edit lands after the fingerprint and before the read.  The file
+    # is then put back with its size and mtime, so it matches the
+    # fingerprint taken before the parse.
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_V1)
+    cron = cronstable.cron.Cron(str(cfg))
+    before = os.stat(str(cfg))
+    real_parse = cronstable.cron.parse_config_with_sources
+
+    def edit_then_parse(arg):
+        cfg.write_text(_RELOAD_V2)
+        return real_parse(arg)
+
+    monkeypatch.setattr(
+        "cronstable.cron.parse_config_with_sources", edit_then_parse
+    )
+    cron.signal_reload()
+    await cron.reload_config()
+    assert set(cron.cron_jobs) == {"alpha", "gamma"}
+
+    monkeypatch.setattr(
+        "cronstable.cron.parse_config_with_sources", real_parse
+    )
+    cfg.write_text(_RELOAD_V1)
+    os.utime(str(cfg), ns=(before.st_atime_ns, before.st_mtime_ns))
+    await cron.reload_config()
+    assert set(cron.cron_jobs) == {"alpha", "beta"}
+
+
+async def test_reload_request_during_a_parse_gets_its_own_parse(
+    tmp_path, monkeypatch
+):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_V1)
+    cron = cronstable.cron.Cron(str(cfg))
+    cfg.write_text(_RELOAD_V2)
+    loop = asyncio.get_running_loop()
+
+    def request_reload():
+        # called on the parse's worker thread; the request runs on the loop
+        asked = threading.Event()
+
+        def ask():
+            cron.signal_reload()
+            asked.set()
+
+        loop.call_soon_threadsafe(ask)
+        assert asked.wait(10)
+
+    parses = _count_parses(monkeypatch, request_reload)
+    await cron.reload_config()
+    assert set(cron.cron_jobs) == {"alpha", "gamma"}
+    assert cron._config_sig is None
+    await cron.reload_config()
+    assert len(parses) == 2
+
+    # the request is spent
+    await cron.reload_config()
+    assert len(parses) == 2
+
+
+async def test_forced_reload_reads_a_secret_file_rewritten_in_place(tmp_path):
+    # The rewrite keeps the secret file's size and mtime, so the stat
+    # fingerprint does not move.  A forced reload reaches the parser, which
+    # checks the cached file against the secret's bytes.
+    secret = tmp_path / "etcd.pw"
+    secret.write_text("old-password\n")
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    (confdir / "cluster.yaml").write_text(
+        "cluster:\n"
+        "  backend: etcd\n"
+        "  nodeName: node-a\n"
+        "  etcd:\n"
+        "    endpoints:\n"
+        "      - https://127.0.0.1:2379\n"
+        "    password:\n"
+        "      fromFile: {}\n".format(secret)
+    )
+    (confdir / "jobs.yaml").write_text(_RELOAD_V1)
+    cron = cronstable.cron.Cron(str(confdir))
+
+    def password():
+        return cron._last_config.cluster_config["etcd"]["resolved_password"]
+
+    assert password() == "old-password"
+    before = os.stat(str(secret))
+    secret.write_text("new-password\n")
+    os.utime(str(secret), ns=(before.st_atime_ns, before.st_mtime_ns))
+    await cron.reload_config()
+    assert password() == "old-password"
+    cron.signal_reload()
+    await cron.reload_config()
+    assert password() == "new-password"
 
 
 _RETRY_DRAIN_JOB = (

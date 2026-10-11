@@ -23,8 +23,24 @@ job API context. `command` accepts a shell string or an argument list.
 The verifier must exit with code zero. A nonzero exit, timeout, or launch
 failure fails the whole run, triggers its failure reporters, and follows its
 retry policy. Retrying runs the command and verifier again. A failed or
-cancelled main command skips verification. Cancellation during verification
-terminates the verifier. Its timeout is separate from `executionTimeout`.
+canceled main command skips verification. The verifier's timeout is
+separate from `executionTimeout`.
+
+The timeout covers the verifier's output as well as its process. A verifier
+that has exited, while a process that it started still holds its stdout or
+stderr open at `timeout`, fails the run as a timeout. After a timeout the
+daemon cancels the verifier with the job's
+[cancellation sequence](Concurrency-and-Timeouts#cancellation-and-killtimeout),
+and each of the verifier's two output streams then has 30 seconds to close
+before the daemon records the run. The verification `exit_code` is `-100`,
+and the run's `fail_reason` is
+`verification failed: command exited with code -100`.
+
+A cancel during verification applies the same sequence to the verifier, and
+the run has ended when the sequence finishes.
+[Cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout)
+also covers a cancel that arrives before the verifier has a process, and the
+bound on output that a surviving process holds open.
 
 The command's exit code remains intact. History includes a separate
 `verification` object with the check's outcome, exit code, timing, and

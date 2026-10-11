@@ -50,8 +50,9 @@ an older release with the current harness. To measure a checkout from such an
 interpreter, such as a tox environment, set `PYTHONPATH` to the checkout's
 root. A relative path works: the subprocess benchmarks run in a temporary
 directory, and the harness gives them each `PYTHONPATH` entry as an absolute
-path. If cronstable is not installed in the interpreter, the harness falls
-back to the source tree it lives in and says so on stderr.
+path. An empty entry names the current directory, as it does for Python. If
+cronstable is not installed in the interpreter, the harness falls back to the
+source tree it lives in and says so on stderr.
 
 Local numbers are only comparable to other runs on the same machine in the
 same session. The CI comparison is paired for exactly that reason: both
@@ -141,15 +142,25 @@ audits found the relative gate alone could not deliver them:
   across many quick releases compounds under a green gate (seven release
   hops in five days at a legal 15% each is 2.7x). A handful of headline
   metrics carry absolute ceilings; a breach fails the run even when the
-  relative gate passes. Raising a ceiling is a deliberate edit to
-  `budgets.json`, made in the same PR as the change that needs it.
+  relative gate passes. A value that is not finite counts as a breach.
+  Raising a ceiling is a deliberate edit to `budgets.json`, made in the
+  same PR as the change that needs it.
 - **Gate integrity** (`expected_gated.txt`, `compare.py --expected-gated`).
   A metric whose BASELINE side skips is filed as first-release coverage and
   warned about by nothing, so a gate that died because a private seam
   drifted was silently ungated forever. The checked-in list names every
   metric that must actually be compared; a listed metric that was not is an
-  integrity failure. The companion net is `tests/test_benchmarks.py`'s
-  never-skip list, which catches a drifted seam in the ordinary test run.
+  integrity failure. A metric counts as compared when both sides measured a
+  finite value and the baseline value is above zero, because a percentage
+  change is undefined otherwise and no limit can fire. One exception keeps
+  a local paired run usable: under `--quick` and `--smoke` a baseline that
+  reads exactly zero is not an integrity failure, because a reduced workload
+  can finish inside one step of its clock (`webui.log_count_5k` does under
+  `--quick`). The metric is still reported as not compared. The companion
+  net is `tests/test_benchmarks.py`'s never-skip list, which catches a
+  drifted seam in the ordinary test run. The same file checks that every
+  listed id is registered and that every gating benchmark is either listed
+  or named in its exclusion set.
 - **The effective gate column.** The percentage and absolute-floor tests
   are ANDed, so a metric whose value sits near its floor really gates at
   `100*floor/value`, however tight its declared `gate_pct` reads. The floor
@@ -169,7 +180,21 @@ audits found the relative gate alone could not deliver them:
 `bench.py` also stamps per-benchmark wall clock (fixtures included) into
 every result row and prints its ten slowest benchmarks per run, so the CI
 job's timeout ceiling is triaged from the log rather than by bisecting a
-timed-out release.
+timed-out release. It names each benchmark on stderr before running it, so
+the log of a run that hangs ends on the benchmark that hung. A child process
+that exits nonzero, or that runs for more than six minutes (five and a half
+for a peak-RSS target), fails its repeat, and the reason carries the last
+line the child wrote to stderr. If no repeat produced a value, the benchmark
+is recorded as skipped with that reason. If an earlier repeat did, the
+benchmark keeps those values: its result line ends with
+`PARTIAL (N of M repeats: <reason>)`, and its row stores the reason in
+`partial_reason`, next to `runs` (the repeats that produced a value) and
+`repeats` (the repeats declared). `compare.py` merges the rounds that
+produced a value. For each side of a compared metric that skipped or ran
+short in any round, it prints a `::warning::perf gate:` line that names
+those rounds and their reasons. The warning changes neither the verdict nor
+the exit code. The merged results (`--merged-out`) list the current side's
+short rounds in the row's `short_rounds` field.
 
 ## Waivers: what is deliberately not measured
 
@@ -246,10 +271,12 @@ read the states of visible tasks directly.
 `tui.table_paint_5k` paints full frames of the jobs table over 5,000 jobs,
 steady and while the selection scrolls, and `tui.frame_bytes_5k` gates the
 bytes that one full repaint writes to the terminal. `tui.poll_absorb_5k`
-times what one `/jobs` poll costs the dashboard: the JSON decode, the health
-fold, the sort, and the verdict. `tui.view_sort_5k` and `tui.palette_type_5k`
-time the filter and sort pass and the command palette's ranking, which run on
-each keystroke. `tui.fleet_paint_15x400`, `tui.week_rows_500`, and
+times what the dashboard does with one decoded `/jobs` payload: the by-name
+index, the health fold, the sort, and the verdict. The JSON decode, and the
+release of the payload that a poll replaces, run off the clock.
+`tui.view_sort_5k` and `tui.palette_type_5k` time the filter and sort pass
+and the command palette's ranking, which run on each keystroke.
+`tui.fleet_paint_15x400`, `tui.week_rows_500`, and
 `tui.wallboard_paint_5k` cover the overlays, `tui.tail_ingest_30k` covers
 the live log tail, and `tui.mark_idle_300` covers the header mark's idle
 animation.
@@ -336,6 +363,12 @@ Ground rules:
 - Scale the workload with `_n(base)` so `--quick` and `--smoke` stay cheap.
 - Import cronstable inside the function and raise `Skip` when an API is
   missing, so the harness still runs against older releases.
+- A benchmark that empties a memo by its private name also counts the work
+  the memo hides (see `_count_calls`) and raises when a timed call skipped
+  it. A renamed memo then fails the benchmark, where a clear that reached
+  nothing would read as a large improvement.
+  `tests/test_benchmarks.py` lists those memo names and checks that the
+  package still has each one.
 - Keep workloads deterministic: fixed datetimes, fixed inputs, no network.
 - Memory metrics use `unit="MB"` and `compare="median"`.
 - A benchmark that measures a child process (cold start, import, peak RSS)
