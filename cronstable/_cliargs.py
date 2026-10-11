@@ -45,6 +45,49 @@ DEFAULT_THEME_HUE = "standard"
 THEME_HUES = ["standard", "carolina", "amber", "green", "modern"]
 
 
+def _finite_seconds(text: str, bound: str = "") -> float:
+    """``text`` as a finite number of seconds.
+
+    The clients build a socket timeout from the value, and a socket
+    refuses one that is not a number. ``bound`` completes the message
+    for a flag that has a further limit, such as `` greater than 0``.
+    """
+    try:
+        seconds = float(text)
+    except ValueError:
+        seconds = float("nan")
+    # NaN differs from itself.
+    if seconds != seconds or abs(seconds) == float("inf"):
+        raise argparse.ArgumentTypeError(
+            "SECONDS must be a finite number{}, not {!r}".format(bound, text)
+        )
+    return seconds
+
+
+def _wait_seconds(text: str) -> float:
+    """The argparse type of a wait: a finite number of seconds.
+
+    A negative wait is no wait, which is how the daemon reads a negative
+    ``blockSeconds``.
+    """
+    return max(0.0, _finite_seconds(text))
+
+
+def _deadline_seconds(text: str) -> float:
+    """The argparse type of a deadline: more than 0 seconds.
+
+    A socket refuses a negative timeout, and a timeout of 0 makes it
+    non-blocking.
+    """
+    bound = " greater than 0"
+    seconds = _finite_seconds(text, bound)
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError(
+            "SECONDS must be a finite number{}, not {!r}".format(bound, text)
+        )
+    return seconds
+
+
 def _add_scope_flags(parser: argparse.ArgumentParser) -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -162,7 +205,7 @@ def add_job_commands(sub: Any) -> None:
         )
         p.add_argument(
             "--timeout",
-            type=float,
+            type=_wait_seconds,
             default=0.0,
             metavar="SECONDS",
             help="maximum wait time with --wait, in seconds",
@@ -366,7 +409,7 @@ def add_mcp_command(sub: Any) -> None:
     )
     parser.add_argument(
         "--timeout",
-        type=float,
+        type=_deadline_seconds,
         default=MCP_DEFAULT_TIMEOUT,
         metavar="SECONDS",
         help="per-request deadline (default: %(default)s)",

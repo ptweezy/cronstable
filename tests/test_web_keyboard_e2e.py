@@ -7,9 +7,11 @@ key events. Tests check these behaviors:
   a shortcut to the dialog requires a corresponding test.
 * Modifier combinations and typing in fields retain browser behavior.
 * Escape closes stacked panels one at a time, starting with the top panel.
+* The token dialog that a 401 raises paints above every other panel.
 * Tab stays within the top panel. Closed overlays leave the tab order, and
   closing a panel restores the previous focus.
-* The command palette filters, ranks, selects, and runs entries.
+* The command palette filters, ranks, selects, and runs entries. It opens
+  only as the top surface, and opening another surface closes it.
 * Dialogs have the expected roles, and drawers expose ``aria-hidden``.
 """
 
@@ -360,24 +362,31 @@ def test_escape_closes_stacked_surfaces_topmost_first(browser, tmp_path):
             _wait_open(page, "drawer")
             _palette_run(page, "Live logs")
             _wait_open(page, "tailWrap")
-            _palette_run(page, "Incident timeline")
-            _wait_open(page, "timelineWrap")
-            _palette_run(page, "Schedule preview")
-            _wait_open(page, "sandboxWrap")
-            _palette_run(page, "Review actions for failing jobs")
-            _wait_open(page, "mitigateWrap")
-            _palette_run(page, "Pair a device")
-            _wait_open(page, "pairWrap")
-            _palette_run(page, "Keyboard shortcuts")
-            _wait_open(page, "helpWrap")
-            _palette_run(page, "Open settings")
-            _wait_open(page, "settingsWrap")
-            _palette_run(page, "Set access token")
-            _wait_open(page, "modalWrap")
+            # the palette opens over the drawer and the console, and it is
+            # the first surface that Escape closes
             page.keyboard.press("Control+k")
             _wait_open(page, "paletteWrap")
+            page.keyboard.press("Escape")
+            _wait_open(page, "paletteWrap", False)
+            assert sorted(_open_ids(page)) == ["drawer", "tailWrap"]
+            _palette_run(page, "Schedule preview")
+            _wait_open(page, "sandboxWrap")
+            # the palette stays closed under the schedule preview and under
+            # the panels opened next. Scripted clicks on buttons that the
+            # open panels cover build the rest of the stack. A user cannot
+            # stack these panels by hand, so the stack pins only the order
+            # of the Escape chain
+            for opener, surface in (
+                ("#vTimeline", "timelineWrap"),
+                ("#vMitigate", "mitigateWrap"),
+                ("#openPair", "pairWrap"),
+                ("#openHelp", "helpWrap"),
+                ("#settingsBtn", "settingsWrap"),
+                ("#authBtn", "modalWrap"),
+            ):
+                _click(page, opener)
+                _wait_open(page, surface)
             expected = [
-                "paletteWrap",
                 "modalWrap",
                 "settingsWrap",
                 "helpWrap",
@@ -626,21 +635,21 @@ def test_closed_surfaces_stay_out_of_the_tab_order(browser, tmp_path):
 def test_closing_a_surface_returns_focus_in_lifo_order(browser, tmp_path):
     with e2e.Daemon(tmp_path) as daemon:
         with e2e.open_page(browser, daemon.url, prefs={"pollMs": 0}) as page:
-            page.focus("#settingsBtn")
+            page.focus("#tailBtn")
             page.keyboard.press("Enter")
-            _wait_open(page, "settingsWrap")
+            _wait_open(page, "tailWrap")
             page.wait_for_function(
-                "document.getElementById('settingsWrap')"
+                "document.getElementById('tailWrap')"
                 ".contains(document.activeElement)"
             )
             # a second surface on top, opened from inside the first
-            page.focus("#setPoll")
+            page.focus("#tailSearch")
             page.keyboard.press("Control+k")
             _wait_active(page, "paletteInput")
             page.keyboard.press("Escape")
-            _wait_active(page, "setPoll")
+            _wait_active(page, "tailSearch")
             page.keyboard.press("Escape")
-            _wait_active(page, "settingsBtn")
+            _wait_active(page, "tailBtn")
 
             # the filter keeps its caret across a palette round trip
             page.focus("#search")
@@ -829,6 +838,150 @@ def test_palette_entries_follow_job_state(browser, tmp_path):
             assert verbs("alpha-ok") == sorted(base + ["Resume", "Run"])
             assert verbs("delta-off") == sorted(base + ["Pause"])
             assert verbs("beta-fail") == sorted(base + ["Pause", "Run"])
+
+
+def _surface_at(page, element_id):
+    """Id of the overlay or drawer painted at the center of an element."""
+    return page.evaluate(
+        """(id) => {
+          const box = document.getElementById(id).getBoundingClientRect();
+          const hit = document.elementFromPoint(
+            box.left + box.width / 2, box.top + box.height / 2);
+          const host = hit && hit.closest('.overlay, .drawer');
+          return host ? host.id : null;
+        }""",
+        element_id,
+    )
+
+
+def test_palette_opens_on_top_of_a_drawer_and_the_log_console(
+    browser, tmp_path
+):
+    with e2e.Daemon(tmp_path) as daemon:
+        with e2e.open_page(browser, daemon.url, prefs={"pollMs": 0}) as page:
+            for opener, surface in (
+                ('#rows [data-logs="alpha-ok"]', "drawer"),
+                ("#tailBtn", "tailWrap"),
+            ):
+                _click(page, opener)
+                _wait_open(page, surface)
+                _wait_focus_inside(page, surface)
+                page.keyboard.press("Control+k")
+                _wait_active(page, "paletteInput")
+                assert _surface_at(page, "paletteInput") == "paletteWrap"
+                assert _surface_at(page, "paletteList") == "paletteWrap"
+                page.keyboard.type("zzzz no such thing")
+                assert page.input_value("#paletteInput") == (
+                    "zzzz no such thing"
+                )
+                page.keyboard.press("Escape")
+                _wait_open(page, "paletteWrap", False)
+                assert _open_ids(page) == [surface]
+                page.keyboard.press("Escape")
+                _wait_open(page, surface, False)
+
+
+def test_palette_stays_closed_under_a_panel_painted_above_it(
+    browser, tmp_path
+):
+    """The palette opens only as the top surface.
+
+    These panels follow the palette in the markup, so each one paints above
+    it. A palette opened beneath one would take focus and keys while the
+    panel covers it.
+    """
+    with e2e.Daemon(tmp_path) as daemon:
+        daemon.run_and_wait("beta-fail")
+        with e2e.open_page(browser, daemon.url, prefs={"pollMs": 0}) as page:
+            for label, surface in (
+                ("Open settings", "settingsWrap"),
+                ("Keyboard shortcuts", "helpWrap"),
+                ("Pair a device", "pairWrap"),
+                ("Set access token", "modalWrap"),
+                ("Incident timeline", "timelineWrap"),
+                ("Review actions for failing jobs", "mitigateWrap"),
+                ("Schedule preview", "sandboxWrap"),
+            ):
+                _palette_run(page, label)
+                _wait_open(page, surface)
+                _wait_focus_inside(page, surface)
+                held = _active(page)
+                for chord in ("Control+k", "Meta+k", "Control+p"):
+                    page.keyboard.press(chord)
+                    assert _open_ids(page) == [surface], chord
+                # the header button is the shortcut's other route
+                _click(page, "#paletteBtn")
+                assert _open_ids(page) == [surface]
+                assert _active(page) == held, surface
+                # Escape goes to the panel, and nothing stays open under it
+                page.keyboard.press("Escape")
+                _wait_open(page, surface, False)
+                assert _open_ids(page) == []
+
+
+def test_token_modal_raised_by_a_401_paints_above_every_panel(
+    browser, tmp_path
+):
+    """The token modal is the top surface whenever it is open.
+
+    A 401 raises the modal on its own, whatever panel is open. The modal
+    takes focus and the first Escape, so it has to paint above the panel.
+    """
+    with e2e.Daemon(tmp_path) as daemon:
+        daemon.run_and_wait("beta-fail")
+        with e2e.open_page(browser, daemon.url, prefs={"pollMs": 0}) as page:
+            for label, surface in (
+                ("Live logs", "tailWrap"),
+                ("Open settings", "settingsWrap"),
+                ("Keyboard shortcuts", "helpWrap"),
+                ("Pair a device", "pairWrap"),
+                ("Incident timeline", "timelineWrap"),
+                ("Review actions for failing jobs", "mitigateWrap"),
+                ("Schedule preview", "sandboxWrap"),
+            ):
+                _palette_run(page, label)
+                _wait_open(page, surface)
+                _wait_focus_inside(page, surface)
+                # a refresh that answers 401 raises the modal, as a poll does
+                page.faults.status(r"/jobs", 401, times=1, method="GET")
+                _click(page, "#refreshBtn")
+                _wait_open(page, "modalWrap")
+                _wait_active(page, "tokenInput")
+                assert sorted(_open_ids(page)) == sorted(
+                    [surface, "modalWrap"]
+                )
+                for element_id in ("modalTitle", "tokenInput", "tokenSave"):
+                    assert _surface_at(page, element_id) == "modalWrap", (
+                        surface,
+                        element_id,
+                    )
+                # Escape closes the modal first, and then the panel
+                page.keyboard.press("Escape")
+                _wait_open(page, "modalWrap", False)
+                assert _open_ids(page) == [surface]
+                _wait_focus_inside(page, surface)
+                page.keyboard.press("Escape")
+                _wait_open(page, surface, False)
+                assert _open_ids(page) == []
+
+
+def test_drawer_opened_by_a_deep_link_closes_the_palette(browser, tmp_path):
+    """A surface that opens while the palette is open closes the palette.
+
+    The drawer takes focus as it opens. A palette left open above it would
+    keep Enter, Escape, and the arrow keys.
+    """
+    with e2e.Daemon(tmp_path) as daemon:
+        with e2e.open_page(browser, daemon.url, prefs={"pollMs": 0}) as page:
+            page.keyboard.press("Control+k")
+            _wait_active(page, "paletteInput")
+            page.evaluate("location.hash = '#job/alpha-ok'")
+            _wait_open(page, "drawer")
+            assert _open_ids(page) == ["drawer"]
+            _wait_focus_inside(page, "drawer")
+            page.keyboard.press("Escape")
+            _wait_open(page, "drawer", False)
+            assert page.get_attribute("#drawer", "aria-hidden") == "true"
 
 
 # --------------------------------------------------------------------------

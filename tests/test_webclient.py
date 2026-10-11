@@ -12,9 +12,11 @@ import argparse
 import http.client
 import http.server
 import io
+import socketserver
 import ssl
 import threading
 import urllib.error
+import urllib.request
 from email.message import Message
 
 import pytest
@@ -62,15 +64,105 @@ def test_build_opener_without_context_is_the_shared_one(monkeypatch):
     assert webclient.build_opener(None) is stand_in
 
 
-def test_openers_use_no_proxy_and_follow_no_redirect():
-    for opener in (
-        webclient.OPENER,
-        webclient.build_opener(ssl.create_default_context()),
-    ):
+def _proxy_env(monkeypatch, proxy="http://127.0.0.1:1"):
+    """Name ``proxy`` in every proxy variable that urllib reads, and unset
+    the variables that exempt hosts from it."""
+    for name in ("http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(name, proxy)
+    for name in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _env_proxy_opener(ctx):
+    """The TLS opener as urllib builds it by default: it reads its proxies
+    from the environment. The no-proxy tests use it as their control."""
+    return urllib.request.build_opener(
+        webclient.NoRedirect(), urllib.request.HTTPSHandler(context=ctx)
+    )
+
+
+def test_openers_use_no_proxy_and_follow_no_redirect(monkeypatch):
+    # urllib registers a ProxyHandler only when a proxy is configured, so
+    # this test builds the TLS opener with one in the environment. The
+    # control shows that an opener that reads it has the handler. OPENER
+    # is built at import, before this environment exists:
+    # test_cli_subprocess_ignores_proxy_env in tests/test_state_job_api.py
+    # proves the same property for it.
+    _proxy_env(monkeypatch)
+    ctx = ssl.create_default_context()
+    control = [type(h).__name__ for h in _env_proxy_opener(ctx).handlers]
+    assert "ProxyHandler" in control
+    for opener in (webclient.OPENER, webclient.build_opener(ctx)):
         handlers = [type(h).__name__ for h in opener.handlers]
         assert "NoRedirect" in handlers
         assert "HTTPRedirectHandler" not in handlers
         assert "ProxyHandler" not in handlers
+
+
+class _FirstBytes(socketserver.BaseRequestHandler):
+    """Keeps what each connection sends first, then closes it."""
+
+    def handle(self):
+        self.request.settimeout(5.0)
+        try:
+            self.server.heard.append(self.request.recv(4096))
+        except OSError:
+            self.server.heard.append(b"")
+
+
+@pytest.fixture
+def listeners():
+    """Starts loopback TCP servers; each call returns one server's port and
+    the list of what its connections sent."""
+    started = []
+
+    def listen():
+        server = socketserver.TCPServer(("127.0.0.1", 0), _FirstBytes)
+        server.heard = []
+        # a short poll, so that shutdown returns at once
+        thread = threading.Thread(
+            target=server.serve_forever, args=(0.01,), daemon=True
+        )
+        thread.start()
+        started.append((server, thread))
+        return server.server_address[1], server.heard
+
+    try:
+        yield listen
+    finally:
+        for server, thread in started:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+
+def test_tls_opener_connects_past_a_proxy_in_the_environment(
+    monkeypatch, listeners
+):
+    # a live request: with https_proxy set, the TLS opener still opens its
+    # connection to the daemon, and the proxy hears nothing
+    proxy_port, proxy_heard = listeners()
+    daemon_port, daemon_heard = listeners()
+    _proxy_env(monkeypatch, "http://127.0.0.1:{}".format(proxy_port))
+    ctx = ssl.create_default_context()
+    url = "https://127.0.0.1:{}/whoami".format(daemon_port)
+    # the listener is no TLS server, so the handshake fails either way
+    with pytest.raises(webclient.ClientError):
+        webclient.send(url, webclient.build_opener(ctx), 5.0, WHAT)
+    assert proxy_heard == []
+    # a TLS handshake record, sent straight to the daemon's address
+    assert [first[:1] for first in daemon_heard] == [b"\x16"]
+
+    # the control: an opener that reads the environment asks the proxy for
+    # a tunnel to the daemon instead
+    del daemon_heard[:]
+    with pytest.raises(webclient.ClientError):
+        webclient.send(url, _env_proxy_opener(ctx), 5.0, WHAT)
+    assert daemon_heard == []
+    [asked] = proxy_heard
+    assert asked.startswith(
+        "CONNECT 127.0.0.1:{} ".format(daemon_port).encode()
+    )
 
 
 def test_verifies_reads_the_context():
@@ -436,6 +528,73 @@ def test_limit_bounds_the_body_of_an_error_reply():
         BASE + "/whoami", _Opener(reply), 1.0, WHAT, limit=8
     )
     assert (status, body) == (401, b"x" * 8)
+
+
+@pytest.mark.parametrize(
+    "timeout, shown",
+    [
+        (0, "0"),
+        (0.0, "0"),
+        (-1, "-1"),
+        (-0.5, "-0.5"),
+        (float("nan"), "nan"),
+        (float("-inf"), "-inf"),
+    ],
+)
+def test_timeout_that_is_not_greater_than_0_is_refused_before_any_request(
+    timeout, shown
+):
+    # a socket raises ValueError or OverflowError for these, and a timeout
+    # of 0 leaves it non-blocking
+    with pytest.raises(webclient.ClientError) as caught:
+        webclient.send(BASE + "/whoami", _Unreached(), timeout, WHAT)
+    assert str(caught.value) == (
+        "cannot send a request to {}: the timeout of {} seconds is not "
+        "greater than 0".format(WHAT, shown)
+    )
+
+
+@pytest.mark.parametrize("timeout", [-1, float("nan")])
+def test_timeout_that_a_socket_refuses_never_reaches_it(recorder, timeout):
+    # the unpatched opener, whose socket raises ValueError for the value
+    url, seen = recorder
+    with pytest.raises(webclient.ClientError, match="the timeout of"):
+        webclient.send(url + "/whoami", webclient.OPENER, timeout, WHAT)
+    assert seen == []
+
+
+@pytest.mark.parametrize("timeout", [2147484.0, 1e10, 1e300, float("inf")])
+def test_timeout_longer_than_a_socket_takes_waits_the_longest_it_can(
+    recorder, timeout
+):
+    # the unpatched opener: a socket raises OverflowError for a timeout
+    # past its platform's limit, which is lowest on Windows
+    url, _seen = recorder
+    status, _headers, body = webclient.send(
+        url + "/whoami",
+        webclient.OPENER,
+        timeout,
+        WHAT,
+        headers={"Authorization": "Bearer t"},
+    )
+    assert (status, body) == (200, b'{"ok": true}')
+
+
+def test_timeout_reaches_the_opener_capped_at_the_longest():
+    seen = []
+
+    class _Timed:
+        def open(self, req, timeout=None):
+            seen.append(timeout)
+            raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+    for timeout in (0.25, webclient._LONGEST_TIMEOUT, 1e10, float("inf")):
+        with pytest.raises(webclient.ClientError, match="cannot reach"):
+            webclient.send(BASE + "/whoami", _Timed(), timeout, WHAT)
+    longest = webclient._LONGEST_TIMEOUT
+    assert seen == [0.25, longest, longest, longest]
+    # whole seconds, within the milliseconds that a C int holds
+    assert longest == int(longest) and longest * 1000 <= 2**31 - 1
 
 
 # ---------------------------------------------------------------------------

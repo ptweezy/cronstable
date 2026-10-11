@@ -447,17 +447,20 @@
      these rules hide readouts in order, least essential first: the job-set
      hash, the meter bars (the percentages stay), the clock, the version and
      the node meter, the status pills, and then the text labels. The buttons
-     on the right always stay. The rules are container queries because the UI
-     scale setting zooms the page, which narrows the header without changing
-     the viewport width. Content that the rules can't predict, such as a long
-     version string or four-digit counts, wraps to a second row. */
+     on the right always stay. The node meter also toggles the node resources
+     card, so the command palette has an entry that does the same. The
+     connection label hides only while it reads "live", so an outage always
+     shows "no signal" in words. The rules are container queries because the
+     UI scale setting zooms the page, which narrows the header without
+     changing the viewport width. Content that the rules can't predict, such
+     as a long version string or four-digit counts, wraps to a second row. */
   @container hdr (max-width: 1379px) { #jobset { display: none; } }
   @container hdr (max-width: 1299px) { .nodemeter .bar { display: none; } }
   @container hdr (max-width: 1209px) { .clock { display: none; } }
   @container hdr (max-width: 1109px) { .nodemeter, .brand .ver { display: none; } }
   @container hdr (max-width: 949px) { .summary .pill.opt { display: none; } }
   @container hdr (max-width: 519px) { .summary, #authLabel { display: none; } }
-  @container hdr (max-width: 339px) { #connTxt { display: none; } }
+  @container hdr (max-width: 339px) { .dot.live + #connTxt { display: none; } }
   /* A container query can't style its own container, so the narrower gap
      on phones is a media query. */
   @media (max-width: 560px) { header { gap: 8px; } }
@@ -1995,20 +1998,6 @@
   </div>
 </div>
 
-<!-- token modal -->
-<div class="overlay" id="modalWrap">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalMsg">
-    <h3 id="modalTitle">Access token required</h3>
-    <p id="modalMsg">This cronstable instance requires a bearer token. The dashboard stores the token only in this browser tab.</p>
-    <input id="tokenInput" type="password" placeholder="paste token…" autocomplete="off" />
-    <div class="modal-actions">
-      <button class="btn" id="tokenClear" style="margin-right:auto">Clear</button>
-      <button class="btn" id="tokenCancel">Cancel</button>
-      <button class="btn primary" id="tokenSave">Save</button>
-    </div>
-  </div>
-</div>
-
 <!-- incident timeline overlay -->
 <div class="overlay" id="timelineWrap">
   <div class="tlpanel" role="dialog" aria-label="Incident timeline">
@@ -2051,6 +2040,23 @@
       <button class="iconbtn" id="sbxClose" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
     <div class="sbxbody" id="sbxBody"></div>
+  </div>
+</div>
+
+<!-- token modal. LAST among the .overlay surfaces: the overlays share one
+     z-index, so DOM order is paint order. A 401 can raise this modal while
+     any other panel is open, and the keyboard layer ranks it topmost
+     (activeSurface and the Esc chain), so it paints above every panel. -->
+<div class="overlay" id="modalWrap">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalMsg">
+    <h3 id="modalTitle">Access token required</h3>
+    <p id="modalMsg">This cronstable instance requires a bearer token. The dashboard stores the token only in this browser tab.</p>
+    <input id="tokenInput" type="password" placeholder="paste token…" autocomplete="off" />
+    <div class="modal-actions">
+      <button class="btn" id="tokenClear" style="margin-right:auto">Clear</button>
+      <button class="btn" id="tokenCancel">Cancel</button>
+      <button class="btn primary" id="tokenSave">Save</button>
+    </div>
   </div>
 </div>
 
@@ -8182,7 +8188,10 @@ var qrcode = function() {
   function setConnected(ok) {
     if (state.connected !== ok) {
       state.connected = ok;
-      $("conn").innerHTML = '<span class="dot ' + (ok ? "live" : "dead") + '"></span><span>' + (ok ? "live" : "no signal") + "</span>";
+      // Update the dot and the label in place. The narrow-header rule
+      // selects the label by its ID and by the dot's class.
+      $("conn").querySelector(".dot").className = "dot " + (ok ? "live" : "dead");
+      $("connTxt").textContent = ok ? "live" : "no signal";
       kickMark();  // the pendulum logo follows the live state (collapses when dead, recovers when live)
       updateTitle();  // "○ no signal" / recovery reach the tab without waiting for a render pass
     }
@@ -9477,6 +9486,11 @@ var qrcode = function() {
       { ic: "▦", lbl: "Toggle activity heatmap", run: () => setHeat(!prefs.heat) },
       { ic: "▥", lbl: "Toggle schedule load", sub: "scheduled runs at the same time and identical schedules", run: () => setPressure(!prefs.press) },
       { ic: "⊞", lbl: "Toggle fleet view", sub: "every node's runs", run: () => setFleet(!prefs.fleet) },
+      // A click on the header's node meter toggles this card too, but a
+      // narrow header hides the meter. The palette works at any width. The
+      // card sits at the top of the page, so opening it from a scrolled
+      // page brings it into view.
+      { ic: "▤", lbl: "Toggle node resources", sub: "CPU and memory history", run: () => { setNodeCard(!prefs.nodeCard); if (prefs.nodeCard) $("nodeCard").scrollIntoView({ block: "center" }); } },
       { ic: "≋", lbl: "Live logs", run: () => openTail([]) },
       { ic: "≋", lbl: "Live logs: failing jobs", run: () => tailPreset("fail") },
       { ic: "≋", lbl: "Live logs: running jobs", run: () => tailPreset("run") },
@@ -9551,6 +9565,11 @@ var qrcode = function() {
     if (cur) cur.scrollIntoView({ block: "nearest" });
   }
   function openPalette() {
+    // The palette opens only as the top surface. The overlays share one
+    // z-index, so an open overlay that follows #paletteWrap in the markup
+    // paints above it. A palette opened beneath one would take focus and
+    // keys from the overlay that covers it.
+    if (document.querySelector("#paletteWrap ~ .overlay.open")) return;
     if (!openOverlay("paletteWrap")) return;
     state.palette.open = true; state.palette.cur = 0;
     $("paletteInput").value = "";
@@ -9891,6 +9910,11 @@ var qrcode = function() {
   function openOverlay(id) {
     const surf = $(id);
     if (surf.classList.contains("open")) return false;
+    // The palette takes keys ahead of every other surface, so opening
+    // another surface closes the palette. A 401 raises the token modal
+    // on its own. A palette left open beneath the modal would run its
+    // current row when Enter saves the token.
+    if (id !== "paletteWrap") closePalette();
     pushFocus();
     surf.classList.add("open");
     return true;
@@ -9967,7 +9991,8 @@ var qrcode = function() {
     // any key wakes the zen screensaver back to the live wallboard grid (without
     // consuming the key — Esc still exits the wallboard, w/a still work below).
     if (state.zen.on) zenWake();
-    // palette navigation has priority
+    // palette navigation has priority: the palette is the top surface
+    // whenever it is open (see openPalette and openOverlay)
     if (state.palette.open) {
       if (e.key === "Escape") { e.preventDefault(); closePalette(); return; }
       else if (e.key === "ArrowDown") { e.preventDefault(); state.palette.cur = Math.min(state.palette.items.length - 1, state.palette.cur + 1); renderPalette(); return; }
@@ -11425,7 +11450,10 @@ var qrcode = function() {
     $("tokenClear").addEventListener("click", () => { sessionStorage.removeItem(TOKEN_KEY); tokenChanged(); });
     $("tokenCancel").addEventListener("click", closeModal);
     $("modalWrap").addEventListener("click", (e) => { if (e.target === $("modalWrap")) closeModal(); });
-    $("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("tokenSave").click(); });
+    // Saving closes the modal, and closing it returns focus to the control
+    // that held it before. The field consumes Enter so that the browser
+    // does not go on to activate that control with the same key press.
+    $("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("tokenSave").click(); } });
 
     // pair a device
     $("openPair").addEventListener("click", () => { closeSettings(); openPair(); });

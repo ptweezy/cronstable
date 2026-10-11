@@ -126,11 +126,18 @@ sleep() { echo "DELAY:$1"; }
 
 
 @pytest.mark.parametrize(
-    "failures,digest_ok",
-    [(0, True), (2, True), (5, True), (0, False)],
+    "failures,stalled,digest_ok",
+    [
+        (0, False, True),
+        (2, False, True),
+        (5, False, True),
+        (0, False, False),
+        (1, True, True),
+        (5, True, True),
+    ],
 )
 def test_workflow_lint_runs_a_pinned_binary_fetched_with_retries(
-    failures, digest_ok, tmp_path
+    failures, stalled, digest_ok, tmp_path
 ):
     # Every test job needs tox-static, so a download that fails once, or a
     # registry that rate-limits an image pull, would skip the whole suite.
@@ -139,10 +146,9 @@ def test_workflow_lint_runs_a_pinned_binary_fetched_with_retries(
         shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
     if shell is None or not Path(shell).is_file():
         pytest.skip("Bash required for the workflow lint harness")
+    job = workflow()["jobs"]["tox-static"]
     step = next(
-        s
-        for s in workflow()["jobs"]["tox-static"]["steps"]
-        if s.get("name") == "Validate workflow syntax"
+        s for s in job["steps"] if s.get("name") == "Validate workflow syntax"
     )
     assert "docker" not in step["run"]
     version = step["env"]["ACTIONLINT_VERSION"]
@@ -151,12 +157,27 @@ def test_workflow_lint_runs_a_pinned_binary_fetched_with_retries(
     temp = tmp_path.as_posix()
     # The stubs stand in for the network, the digest check, and the
     # archive: `tar` leaves a script that reports how the linter is called.
+    # A stalled `curl` returns only when its time limit runs out. With no
+    # limit, it waits until the job timeout cancels the step. The stub
+    # reports that case as a hang and ends the script.
     prelude = r"""
 attempts=0
 curl() {
     attempts=$((attempts + 1))
-    for arg in "$@"; do url=$arg; done
+    limit=
+    url=
+    for arg in "$@"; do
+        if [ "$url" = --max-time ]; then limit=$arg; fi
+        url=$arg
+    done
     echo "FETCH:$attempts:$url"
+    if [ "$STALLED" = 1 ] && [ "$attempts" -le "$FAILURES" ]; then
+        if [ -z "$limit" ]; then
+            echo "HANG:$attempts"
+            exit 1
+        fi
+        echo "LIMIT:$limit"
+    fi
     [ "$attempts" -gt "$FAILURES" ]
 }
 sha256sum() {
@@ -178,12 +199,16 @@ sleep() { echo "DELAY:$1"; }
             **step["env"],
             "RUNNER_TEMP": temp,
             "FAILURES": str(failures),
+            "STALLED": str(int(stalled)),
             "DIGEST_OK": str(int(digest_ok)),
         },
         capture_output=True,
         text=True,
         timeout=30,
     )
+    # Every attempt has a time limit, so a stalled one fails and the retry
+    # handles it like any other failed attempt.
+    assert "HANG:" not in result.stdout, result.stdout + result.stderr
     fetched = failures < 5
     assert (result.returncode == 0) == (fetched and digest_ok), (
         result.stdout + result.stderr
@@ -198,6 +223,14 @@ sleep() { echo "DELAY:$1"; }
         f"FETCH:{n}:{url}" for n in range(1, expected_attempts + 1)
     ]
     assert result.stdout.count("DELAY:") == expected_attempts - 1
+    # A stalled attempt lasts for its whole time limit. The limits and the
+    # delays between attempts fit inside the job timeout with two minutes
+    # to spare for the checkout and the steps after this one, so a download
+    # that stalls on every attempt ends with the retry error.
+    limits = [float(line[6:]) for line in out if line.startswith("LIMIT:")]
+    delays = [float(line[6:]) for line in out if line.startswith("DELAY:")]
+    assert len(limits) == (failures if stalled else 0)
+    assert sum(limits) + sum(delays) <= job["timeout-minutes"] * 60 - 120
     # The digest check sees the pinned digest and the downloaded archive,
     # and only a download that succeeded reaches it.
     assert [line for line in out if line.startswith("VERIFY:")] == (
@@ -207,6 +240,322 @@ sleep() { echo "DELAY:$1"; }
     # download or its digest check.
     runs = [line for line in out if line.startswith("RUN:")]
     assert len(runs) == (1 if fetched and digest_ok else 0)
+    if not fetched:
+        assert "still failing after 5 attempts" in result.stderr
+
+
+# GitHub cancels a job that sets no timeout-minutes after six hours.
+DEFAULT_JOB_MINUTES = 360
+# No step uses wget or a PowerShell downloader. A step that starts to use
+# one first needs its stall flags in stalled_seconds.
+DOWNLOADERS = (
+    "curl",
+    "fetch",
+    "ftp",
+    "wget",
+    "Invoke-WebRequest",
+    "iwr",
+    "Invoke-RestMethod",
+    "irm",
+)
+
+
+def strings(node):
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from strings(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from strings(value)
+
+
+def workflow_jobs():
+    """Return every job of every workflow, keyed by file and job name."""
+    return {
+        (path, job): body
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml"))
+        for job, body in workflow(path.stem)["jobs"].items()
+    }
+
+
+def downloads(jobs):
+    """Yield each downloader call in a script, an action, or a workflow.
+
+    Each item holds the file, the job (None outside a workflow), the
+    command with only its `retry` wrapper, the tool, and the tool's
+    arguments.
+    """
+    github = ROOT / ".github"
+    texts = [
+        (path, None, path.read_text(encoding="utf-8"))
+        for path in sorted(github.glob("scripts/*.sh"))
+        + sorted(github.glob("scripts/*.ps1"))
+    ]
+    for path in sorted(github.glob("actions/*/action.yml")):
+        action = YAML(typ="safe").load(path.read_text(encoding="utf-8"))
+        texts += [(path, None, text) for text in strings(action)]
+    for (path, job), body in jobs.items():
+        texts += [(path, job, text) for text in strings(body)]
+    keywords = (
+        *("if", "then", "else", "elif", "do", "while", "until"),
+        *("!", "{", "(", "time", "exec", "command"),
+    )
+    for path, job, text in texts:
+        for line in text.replace("\\\n", " ").splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            for command in re.split(r"&&|\|\||[;|`]|\$\(", line):
+                words = command.split()
+                while words and words[0] in keywords:
+                    del words[0]
+                retry = words[:2] if words[:1] == ["retry"] else []
+                words = words[len(retry) :]
+                # An assignment, a variable, or `sudo` or `env` with its
+                # options can come before the tool.
+                while words and (
+                    "=" in words[0]
+                    or words[0].startswith(("$", "-"))
+                    or words[0] in ("sudo", "env")
+                ):
+                    del words[0]
+                if not words:
+                    continue
+                # A step can name the tool with a directory or as curl.exe.
+                # The command carries the bare name, so the stubs of the
+                # stalled download harness stand in for it.
+                words[0] = words[0].rsplit("/", 1)[-1].removesuffix(".exe")
+                if words[0] not in DOWNLOADERS:
+                    continue
+                # A probe of a service on the runner is not a download.
+                if re.search(r"://(127\.0\.0\.1|localhost)[:/]", command):
+                    continue
+                yield path, job, " ".join(retry + words), words[0], words[1:]
+
+
+def stalled_seconds(tool, args):
+    """Return the longest that one call waits on a transfer that stalls.
+
+    None means that the call has no limit: it waits until the job timeout
+    cancels the step, so no retry ever runs.
+    """
+    # Each word maps to the word after it, so a flag maps to its value.
+    value = dict(zip(args, args[1:], strict=False))
+    if tool == "curl":
+        detector = ("--connect-timeout", "--speed-limit", "--speed-time")
+        if "--max-time" in value:
+            attempt = float(value["--max-time"])
+        elif all(flag in value for flag in detector):
+            # curl averages the speed over five seconds, so up to six
+            # seconds pass before it sees a stopped transfer as slow.
+            connect, quiet = value["--connect-timeout"], value["--speed-time"]
+            attempt = float(connect) + float(quiet) + 6
+            # curl reads a zero as the absence of that limit.
+            if min(float(value[flag]) for flag in detector) <= 0:
+                return None
+        else:
+            return None
+        if attempt <= 0:
+            return None
+        # curl counts a timeout as retryable. Without --retry-delay it
+        # waits one second before the first retry and doubles the wait.
+        retries = int(value.get("--retry", 0))
+        waits = [
+            float(value.get("--retry-delay", 2**n)) for n in range(retries)
+        ]
+        total = (retries + 1) * attempt + sum(waits)
+        if "--retry-max-time" in value:
+            # No retry starts after this window. The last retry to start
+            # waits for the retry delay and then runs to its own limit.
+            window = float(value["--retry-max-time"])
+            total = min(total, window + max(waits, default=0) + attempt)
+        return total
+    # fetch and ftp apply the limit to each phase on its own. fetch has
+    # two phases (the connection, then a read) and ftp has four (the
+    # connection, the TLS handshake, the response, then the body).
+    if tool == "fetch" and "-T" in value:
+        return 2 * float(value["-T"])
+    if tool == "ftp" and "-q" in value:
+        return 4 * float(value["-q"])
+    return None
+
+
+def job_minutes(jobs, path, job):
+    """Return the shortest timeout among the jobs that run a download."""
+    if job is None:
+        # A script or an action: every job that names it runs it.
+        name = path.parent.name if path.name == "action.yml" else path.name
+        bodies = [body for body in jobs.values() if name in str(body)]
+    else:
+        bodies = [jobs[path, job]]
+    return min(
+        (body.get("timeout-minutes", DEFAULT_JOB_MINUTES) for body in bodies),
+        default=DEFAULT_JOB_MINUTES,
+    )
+
+
+def test_every_download_has_a_stall_limit():
+    # A download with no time limit never fails when the transfer stalls,
+    # so the retry around it never runs and the step waits for the job
+    # timeout.
+    found = list(downloads(workflow_jobs()))
+    unlimited = [
+        f"{path.name} ({job}): {command}"
+        for path, job, command, tool, args in found
+        if stalled_seconds(tool, args) is None
+    ]
+    assert not unlimited, "no stall limit:\n" + "\n".join(unlimited)
+    # The scan sees every kind of download that the files under .github
+    # hold.
+    assert {
+        ("install_pbs.sh", "curl"),
+        ("build_packages.sh", "curl"),
+        ("build-pq-wheels.yml", "curl"),
+        ("release.yml", "curl"),
+        ("release.yml", "fetch"),
+        ("release.yml", "ftp"),
+    } <= {(path.name, tool) for path, _, _, tool, _ in found}
+    # The Python helpers download through urllib, which takes its limit as
+    # an argument.
+    for path in sorted((ROOT / ".github/scripts").glob("*.py")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "urlopen(" in line:
+                assert "timeout=" in line, f"{path.name}: {line.strip()}"
+
+
+def test_downloads_that_stall_on_every_attempt_fit_the_job_timeout(tmp_path):
+    shell = shutil.which("bash")
+    if os.name == "nt":
+        shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+    if shell is None or not Path(shell).is_file():
+        pytest.skip("Bash required for the stalled download harness")
+    # Each stub stands in for a downloader whose transfer stalls: the call
+    # fails once its limits run out. `retry` is the real one, so the
+    # attempts and the delays between them are the ones that a job makes.
+    prelude = """
+. "$RETRY_SH"
+download() { echo "FETCH:$*"; return 1; }
+curl() { download curl "$@"; }
+fetch() { download fetch "$@"; }
+ftp() { download ftp "$@"; }
+sleep() { echo "DELAY:$1"; }
+"""
+    retry_sh = (ROOT / ".github/scripts/retry.sh").as_posix()
+    jobs = workflow_jobs()
+    for path, job, command, _, _ in downloads(jobs):
+        where = f"{path.name} ({job}): {command}"
+        result = subprocess.run(
+            [shell, "-c", prelude + re.sub(r"\$\{\{.*?\}\}", "x", command)],
+            cwd=tmp_path,
+            env={**os.environ, "RETRY_SH": retry_sh},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        out = result.stdout.splitlines()
+        calls = [line[6:].split() for line in out if line.startswith("FETCH:")]
+        assert calls and result.returncode != 0, where + result.stderr
+        if command.startswith("retry "):
+            assert "still failing after" in result.stderr, where
+        limits = [stalled_seconds(call[0], call[1:]) for call in calls]
+        assert None not in limits, "no stall limit: " + where
+        delays = [float(line[6:]) for line in out if line.startswith("DELAY:")]
+        # Every attempt and every delay fits inside the job timeout. A job
+        # of up to 20 minutes keeps two minutes for its other steps, and a
+        # longer job keeps 60 percent of its timeout for the build that it
+        # runs. A download that stalls on every attempt then ends with its
+        # own error.
+        minutes = job_minutes(jobs, path, job)
+        reserve = 120 if minutes <= 20 else minutes * 36
+        assert sum(limits) + sum(delays) <= minutes * 60 - reserve, where
+
+
+@pytest.mark.parametrize(
+    "failures,digest_ok", [(0, True), (2, True), (5, True), (0, False)]
+)
+def test_python_runtime_download_is_retried_then_verified(
+    failures, digest_ok, tmp_path
+):
+    # The glibc binary lanes freeze with this interpreter, so the retry
+    # keeps one failed download from costing a lane its binary.
+    shell = shutil.which("bash")
+    if os.name == "nt":
+        shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+    if shell is None or not Path(shell).is_file():
+        pytest.skip("Bash required for the Python runtime harness")
+    script = (ROOT / ".github/scripts/install_pbs.sh").as_posix()
+    url = "https://example.invalid/python.tar.gz"
+    digest = "0" * 64
+    prefix = (tmp_path / "pbs").as_posix()
+    # The stubs stand in for the network, the digest check, and the
+    # archive: `tar` leaves an interpreter that reports how it is called.
+    prelude = r"""
+attempts=0
+curl() {
+    attempts=$((attempts + 1))
+    echo "FETCH:$*"
+    [ "$attempts" -gt "$FAILURES" ]
+}
+sha256sum() {
+    read -r line
+    echo "VERIFY:$line"
+    [ "$DIGEST_OK" = 1 ]
+}
+tar() {
+    echo "UNPACK:$*"
+    mkdir -p "$4/bin"
+    printf '#!/bin/sh\necho "RUN:$*"\n' > "$4/bin/python3"
+    chmod +x "$4/bin/python3"
+}
+rm() { :; }
+sleep() { echo "DELAY:$1"; }
+. "$0"
+"""
+    result = subprocess.run(
+        [shell, "-c", prelude, script, url, digest, prefix],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "FAILURES": str(failures),
+            "DIGEST_OK": str(int(digest_ok)),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    fetched = failures < 5
+    assert (result.returncode == 0) == (fetched and digest_ok), (
+        result.stdout + result.stderr
+    )
+    out = result.stdout.splitlines()
+    calls = [line[6:].split() for line in out if line.startswith("FETCH:")]
+    expected_attempts = min(failures + 1, 5)
+    assert len(calls) == expected_attempts
+    assert result.stdout.count("DELAY:") == expected_attempts - 1
+    # Every attempt names the pinned archive and carries a stall limit,
+    # so a transfer that stalls fails and the retry handles it.
+    for args in calls:
+        assert args[-1] == url
+        assert stalled_seconds("curl", args) is not None, args
+    # The digest check sees the pinned digest and the downloaded archive,
+    # and only a download that succeeded reaches it.
+    archive = "/tmp/pbs-python.tar.gz"
+    assert [line for line in out if line.startswith("VERIFY:")] == (
+        [f"VERIFY:{digest}  {archive}"] if fetched else []
+    )
+    # The script unpacks only a verified archive and runs the interpreter
+    # only from one: once for its version and once for the libpython and
+    # ssl probe.
+    installed = fetched and digest_ok
+    assert [line for line in out if line.startswith("UNPACK:")] == (
+        [f"UNPACK:-xzf {archive} -C {prefix} --strip-components=1"]
+        if installed
+        else []
+    )
+    assert [line for line in out if line.startswith("RUN:")] == (
+        ["RUN:-VV", "RUN:-"] if installed else []
+    )
     if not fetched:
         assert "still failing after 5 attempts" in result.stderr
 
