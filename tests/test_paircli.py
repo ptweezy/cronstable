@@ -33,6 +33,11 @@ from cronstable import (
     qr,
     webclient,
 )
+from tests.test_netutil import (
+    _lenient_getaddrinfo,
+    _socket_layer,
+    _strict_getaddrinfo,
+)
 
 SERVER = "http://cron.example.test:8080"
 LOOPBACK = "http://127.0.0.1:8080"
@@ -421,6 +426,26 @@ def test_a_name_that_utf8_cannot_encode_is_a_clean_error(
             "cronstable pair: the server name 'na\\udcffs' holds a "
             "character that UTF-8 cannot encode\n"
         )
+
+
+def test_json_format_escapes_what_a_terminal_does_not_print(
+    monkeypatch, capsys
+):
+    # a node name with C1 controls (CSI, OSC, ST), a bidi override, DEL,
+    # and a zero-width space, which a terminal acts on or hides
+    hostile = "prod\x9b2J\x9d0;owned\x9c\u202eedon\x7f\u200b"
+    cluster = {"enabled": True, "node_name": hostile}
+    _serve(monkeypatch, _routes(cluster=cluster))
+    assert paircli.dispatch(_args()) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert out.endswith("\n") and out[:-1].isprintable()
+    assert (
+        r'"name":"prod\u009b2J\u009d0;owned\u009c\u202eedon\u007f\u200b"'
+        in out
+    )
+    # and the app reads the name that the daemon sent
+    assert json.loads(out)["name"] == hostile
 
 
 def test_public_url_goes_into_the_code(monkeypatch, capsys):
@@ -980,14 +1005,53 @@ def test_loopback_url_without_a_lan_address_is_an_error(monkeypatch, capsys):
     assert "which a phone cannot reach. Add a LAN" in err
 
 
-def test_loopback_in_another_spelling_gets_the_same_check(monkeypatch, capsys):
+def test_hostname_that_idna_refuses_counts_as_no_lan_address(
+    monkeypatch, capsys
+):
+    def no_route(*args):
+        raise OSError("network is unreachable")
+
+    # no default route, and a hostname of one 64-character label, which
+    # the idna codec refuses with UnicodeError ahead of any lookup
+    _serve(monkeypatch, _routes(base=LOOPBACK))
+    monkeypatch.setattr(netutil.socket, "socket", no_route)
+    monkeypatch.setattr(netutil.socket, "gethostname", lambda: "n" * 64)
+    assert paircli.dispatch(_args(url=LOOPBACK)) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == (
+        "cronstable pair: {} is a loopback address, which a phone cannot "
+        "reach. Add a LAN or VPN address to web.listen, or pass "
+        "--public-url with the address the phone uses.\n".format(LOOPBACK)
+    )
+
+
+@pytest.mark.parametrize(
+    "getaddrinfo, loopback",
+    [
+        (None, None),
+        (_lenient_getaddrinfo, True),
+        (_strict_getaddrinfo, False),
+    ],
+    ids=["host", "lenient", "strict"],
+)
+def test_loopback_in_another_spelling_gets_the_same_check(
+    monkeypatch, capsys, getaddrinfo, loopback
+):
     short = "http://127.1:8080"
     routes = _routes(base=short)
     routes[LAN + "/whoami"] = _guarded(PHONE)
     _serve(monkeypatch, routes)
     monkeypatch.setattr(netutil, "lan_address", lambda: "192.0.2.7")
+    if getaddrinfo is None:
+        loopback = _socket_layer("127.1") == {"127.0.0.1"}
+    else:
+        monkeypatch.setattr(netutil.socket, "getaddrinfo", getaddrinfo)
     assert paircli.dispatch(_args(url=short)) == 0
-    assert json.loads(capsys.readouterr().out)["url"] == LAN
+    # a host whose getaddrinfo looks 127.1 up dials it as a hostname, which
+    # goes into the code as given
+    url = json.loads(capsys.readouterr().out)["url"]
+    assert url == (LAN if loopback else short)
 
 
 def test_unverified_https_session_does_not_vouch_for_the_lan_address(
@@ -1362,6 +1426,22 @@ def test_host_that_no_request_can_name(monkeypatch, capsys, flag):
     bad = "http://cron example.test:8080"
     err = _fails(monkeypatch, capsys, _routes(), **{flag: bad})
     assert "{!r} is not an http:// or https:// URL".format(bad) in err
+
+
+@pytest.mark.parametrize("flag", ["url", "public_url"])
+@pytest.mark.parametrize("empty", ["", " "])
+def test_empty_url_is_no_url(monkeypatch, capsys, flag, empty):
+    # what a script passes for a variable that it left unset
+    daemon = _serve(monkeypatch, _routes())
+    assert paircli.dispatch(_args(**{flag: empty})) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == (
+        "cronstable pair: {!r} is not an http:// or https:// URL\n".format(
+            empty
+        )
+    )
+    assert daemon.requests == []
 
 
 @pytest.mark.parametrize(

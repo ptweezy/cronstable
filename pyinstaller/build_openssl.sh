@@ -61,11 +61,15 @@ url="https://github.com/openssl/openssl/releases/download/openssl-$VERSION/$tarb
 work=$(mktemp -d)
 cd "$work" || exit 1
 
+# The limits make a stalled transfer fail, so the retry covers it. With
+# curl, an archive that keeps 1024 bytes a second or more continues, however
+# long it takes.
 fetch() {
     if command -v curl >/dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 -sSfLo "$tarball" "$url"
+        curl --proto '=https' --tlsv1.2 -sSfLo "$tarball" \
+            --connect-timeout 30 --speed-limit 1024 --speed-time 30 "$url"
     else
-        wget -qO "$tarball" "$url"
+        wget -q -T 60 -O "$tarball" "$url"
     fi
 }
 if [ -f "$(dirname "$0")/../.github/scripts/retry.sh" ]; then

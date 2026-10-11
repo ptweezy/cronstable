@@ -539,6 +539,24 @@ async def test_loader_explains_a_401_under_the_token_modal(tmp_path):
     assert "Building the pairing code" not in text
 
 
+async def test_loader_401_closes_the_palette_opened_over_the_panel(tmp_path):
+    app = _bare_app(tmp_path)
+    _stub_whoami(app, Unauthorized())
+    app.open("pair")
+    # the palette opens again while GET /whoami is in flight
+    await app.handle_key("ctrl+k")
+    assert app.open_overlays == ["pair", "palette"]
+    await app._load_pair(app._pair_seq)
+    assert app.open_overlays == ["pair", "token"] and app.focus == "token"
+    # the modal on screen takes the keys, and none reaches the palette
+    for ch in "wall":
+        await app.handle_key(ch)
+    assert (app.inputs["token"], app.inputs["palette"]) == ("wall", "")
+    # Esc closes the modal, and the panel is back on screen
+    await app.handle_key("esc")
+    assert app.open_overlays == ["pair"]
+
+
 async def test_loader_reports_a_failed_request_in_the_panel(tmp_path):
     app = _bare_app(tmp_path)
     _stub_whoami(app, ApiError(503))

@@ -102,8 +102,14 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 tarball="$work/nfpm.tar.gz"
+# The time limits make a stalled transfer fail, so the retries cover it. curl
+# counts a timeout as retryable. --retry-max-time stops it from starting
+# another attempt of its own once 30 seconds have passed. Each `retry` attempt
+# then ends within 65 seconds, and all five fit inside the 10-minute jobs that
+# run this script.
 retry 5 curl --proto =https --tlsv1.2 -fsSL --retry 5 --retry-connrefused \
     --retry-delay 5 -o "$tarball" \
+    --connect-timeout 10 --max-time 30 --retry-max-time 30 \
     "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
 echo "${NFPM_SHA256}  ${tarball}" | sha256sum -c -
 tar -xzf "$tarball" -C "$work" nfpm

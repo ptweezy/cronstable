@@ -1010,8 +1010,9 @@ mutex (`N = 1`). `N` must be between `1` and `1024`: the acquire probes
 permits sequentially, so an oversized count is refused rather than turned
 into that many store operations per pass. `--wait --timeout S` blocks up to
 `S` seconds for a free permit (`--timeout` defaults to `0`, so `--wait` alone
-makes a single pass and gives up, exactly like omitting it). Without
-`--wait`, a taken lock returns immediately (exit `3`).
+makes a single pass and gives up, exactly like omitting it). A negative `S`
+counts as `0`, and an `S` of `nan` or `inf` is a usage error (exit `2`).
+Without `--wait`, a taken lock returns immediately (exit `3`).
 
 For manual control, `cronstable lock acquire NAME` prints a hold token and
 `cronstable lock release TOKEN` frees it. The acquire reply also carries the

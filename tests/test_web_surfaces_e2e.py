@@ -2,7 +2,8 @@
 
 Coverage includes the wallboard, screensaver, alarms, notifications,
 schedule radar, week calendar, schedule load, peer timeline, cluster card,
-state inspector, run ledger, cron sandbox, and pairing QR code.
+state inspector, run ledger, cron sandbox, pairing QR code, and node
+resources card.
 
 The dashboard uses ``tests/_web_e2e.py`` for jobs, runs, state storage, and
 schedule forecasts. Tests supply controlled ``/cluster`` responses to
@@ -1592,3 +1593,130 @@ def test_version_and_job_set_chips_copy_their_values(browser, tmp_path):
                 "getComputedStyle(document.getElementById('nodeCard'))"
                 ".display !== 'none'"
             )
+
+
+# --------------------------------------------------------------------------
+# node resources card
+# --------------------------------------------------------------------------
+
+_NODE_ENTRY = "Toggle node resources"
+_NODE_CARD_PREF = "localStorage.getItem('cronstable.nodeCard')"
+
+
+def _toggle_node_card(page):
+    """Run the palette's node card entry, which is the only match."""
+    page.keyboard.press("Control+k")
+    page.wait_for_function("document.activeElement.id === 'paletteInput'")
+    page.keyboard.type(_NODE_ENTRY)
+    assert page.evaluate(
+        "[...document.querySelectorAll('#paletteList .item .lbl')]"
+        ".map((l) => l.firstChild.textContent.trim())"
+    ) == [_NODE_ENTRY]
+    page.keyboard.press("Enter")
+
+
+# A header content box of 1,109 CSS pixels or less hides the node meter,
+# which leaves the palette entry as the card's control. ``meter`` says
+# whether the header shows the meter in that window.
+@pytest.mark.parametrize(
+    "width,scale,meter",
+    [
+        (390, 100, False),
+        (1024, 100, False),
+        (1440, 140, False),
+        (1440, 100, True),
+    ],
+)
+def test_palette_toggles_the_node_card_at_any_header_width(
+    browser, tmp_path, width, scale, meter
+):
+    with e2e.Daemon(tmp_path) as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            prefs={"scale": scale},
+            viewport={"width": width, "height": 900},
+        ) as page:
+            page.wait_for_selector("#nodeMeter .m", state="attached")
+            assert page.is_visible("#nodeMeter") is meter
+            assert not page.is_visible("#nodeCard")
+            _toggle_node_card(page)
+            page.wait_for_selector("#nodeCard")
+            page.wait_for_function(
+                "document.getElementById('nodeCardMeta').textContent"
+                ".includes('sampled every')"
+            )
+            assert page.evaluate(_NODE_CARD_PREF) == "true"
+            # A reload restores the open card, with or without its meter.
+            page.reload()
+            page.wait_for_selector("#rows tr[data-job]")
+            page.wait_for_selector("#nodeMeter .m", state="attached")
+            assert page.is_visible("#nodeMeter") is meter
+            assert page.is_visible("#nodeCard")
+            _toggle_node_card(page)
+            page.wait_for_selector("#nodeCard", state="hidden")
+            assert page.evaluate(_NODE_CARD_PREF) == "false"
+
+
+def test_palette_scrolls_the_opened_node_card_into_view(browser, tmp_path):
+    """Opening the card from a scrolled page brings it into the window.
+
+    The card sits at the top of the page, above the list that the reader
+    scrolled down.
+    """
+    jobs = [e2e.job("job-{:02d}".format(n), "true") for n in range(30)]
+    with e2e.Daemon(tmp_path, jobs=jobs) as daemon:
+        with e2e.open_page(
+            browser, daemon.url, viewport={"width": 390, "height": 700}
+        ) as page:
+            page.wait_for_selector("#rows tr[data-job]")
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            # far enough that a card at the top of the page is out of view
+            assert page.evaluate("window.scrollY") > 1000
+            _toggle_node_card(page)
+            page.wait_for_selector("#nodeCard", state="attached")
+            page.wait_for_function(
+                "(() => { const r = document.getElementById('nodeCard')"
+                ".getBoundingClientRect();"
+                " return r.height > 0 && r.bottom > 0"
+                " && r.top < window.innerHeight; })()"
+            )
+
+
+def test_palette_toggles_the_node_card_without_node_readings(
+    browser, tmp_path
+):
+    """The entry stays listed when the daemon can't read the host.
+
+    The header meter stays empty, and the card says that the history is
+    unavailable.
+    """
+
+    def routes(page):
+        page.faults.json(r"/node", {"node_name": "n1", "resources": None})
+        page.faults.json(
+            r"/node/history",
+            {
+                "node_name": "n1",
+                "enabled": False,
+                "interval": None,
+                "points": [],
+            },
+        )
+
+    with e2e.Daemon(tmp_path) as daemon:
+        with e2e.open_page(browser, daemon.url, before_goto=routes) as page:
+            page.wait_for_function(
+                "performance.getEntriesByName(location.origin + '/node')"
+                ".length >= 1"
+            )
+            assert not page.is_visible("#nodeMeter")
+            _toggle_node_card(page)
+            page.wait_for_selector("#nodeCard")
+            page.wait_for_function(
+                "document.getElementById('nodeCardBody').textContent"
+                ".includes('Node history is unavailable')"
+            )
+            _toggle_node_card(page)
+            page.wait_for_selector("#nodeCard", state="hidden")
+            assert page.evaluate(_NODE_CARD_PREF) == "false"

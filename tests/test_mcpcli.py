@@ -132,7 +132,13 @@ def test_build_opener_without_context_is_the_shared_global():
     assert webclient.build_opener(None) is webclient.OPENER
 
 
-def test_build_opener_with_context_is_a_separate_opener():
+def test_build_opener_with_context_is_a_separate_opener(monkeypatch):
+    # a proxy in the environment while the opener is built: urllib registers
+    # a ProxyHandler only when a proxy is configured, so without one the
+    # no-proxy assertion below also passes for an opener that reads its
+    # proxies from the environment.
+    for name in ("http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
     opener = webclient.build_opener(ssl.create_default_context())
     assert opener is not webclient.OPENER
     handlers = [type(h).__name__ for h in opener.handlers]
@@ -686,6 +692,25 @@ def test_bridge_answers_a_url_without_a_scheme_with_a_transport_error(
     assert "the address is not a valid URL" in captured.err
 
 
+def test_bridge_answers_a_timeout_no_socket_takes_with_a_transport_error(
+    monkeypatch, capsys
+):
+    # a timeout that skipped the argument parser: the unpatched opener's
+    # socket raises ValueError for it, so the transport refuses it first
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO('{"jsonrpc": "2.0", "id": 7, "method": "ping"}\n'),
+    )
+    assert mcpcli._run_bridge(_args(timeout=float("nan"))) == 0
+    [frame] = _frames(capsys.readouterr().out)
+    assert frame["id"] == 7
+    assert frame["error"]["code"] == -31000
+    assert frame["error"]["message"].endswith(
+        "the timeout of nan seconds is not greater than 0"
+    )
+
+
 def test_bridge_refuses_a_negotiated_version_no_header_can_carry(
     monkeypatch, capsys
 ):
@@ -1199,6 +1224,30 @@ def test_parser_defaults(monkeypatch):
     assert args.client_cert is None
     assert args.client_key is None
     assert args.insecure is False
+
+
+@pytest.mark.parametrize(
+    "value", ["0", "-0.0", "-1", "nan", "inf", "-inf", "1e999", "soon", ""]
+)
+def test_parser_refuses_a_timeout_that_no_request_can_wait(capsys, value):
+    # a socket refuses a negative deadline and one that is not a number, and
+    # a deadline of 0 leaves it non-blocking, so the parser refuses the flag
+    # before the bridge starts.  The `=` form hands argparse a leading minus
+    # as the value on every Python.
+    with pytest.raises(SystemExit) as caught:
+        _parse_cli(["mcp", "--timeout=" + value])
+    assert caught.value.code == 2  # the usage exit code
+    assert (
+        "argument --timeout: SECONDS must be a finite number greater than "
+        "0, not {!r}".format(value)
+    ) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "value, seconds", [("0.5", 0.5), ("90", 90.0), ("1e300", 1e300)]
+)
+def test_parser_takes_a_finite_timeout_above_0(value, seconds):
+    assert _parse_cli(["mcp", "--timeout", value]).timeout == seconds
 
 
 def test_parser_accepts_the_tls_flags():
