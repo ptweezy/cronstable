@@ -445,9 +445,6 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python }}
-          # TODO: Remove `allow-prereleases` when actions/python-versions
-          # lists 3.15.0. Until then, the 3.15 and 3.15t cells run 3.15.0rc3.
-          allow-prereleases: true
       - run: |-
           pip install tox tox-uv
 
