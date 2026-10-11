@@ -33,6 +33,11 @@ from cronstable import (
     qr,
     webclient,
 )
+from tests.test_netutil import (
+    _lenient_getaddrinfo,
+    _socket_layer,
+    _strict_getaddrinfo,
+)
 
 SERVER = "http://cron.example.test:8080"
 LOOPBACK = "http://127.0.0.1:8080"
@@ -1021,14 +1026,32 @@ def test_hostname_that_idna_refuses_counts_as_no_lan_address(
     )
 
 
-def test_loopback_in_another_spelling_gets_the_same_check(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    "getaddrinfo, loopback",
+    [
+        (None, None),
+        (_lenient_getaddrinfo, True),
+        (_strict_getaddrinfo, False),
+    ],
+    ids=["host", "lenient", "strict"],
+)
+def test_loopback_in_another_spelling_gets_the_same_check(
+    monkeypatch, capsys, getaddrinfo, loopback
+):
     short = "http://127.1:8080"
     routes = _routes(base=short)
     routes[LAN + "/whoami"] = _guarded(PHONE)
     _serve(monkeypatch, routes)
     monkeypatch.setattr(netutil, "lan_address", lambda: "192.0.2.7")
+    if getaddrinfo is None:
+        loopback = _socket_layer("127.1") == {"127.0.0.1"}
+    else:
+        monkeypatch.setattr(netutil.socket, "getaddrinfo", getaddrinfo)
     assert paircli.dispatch(_args(url=short)) == 0
-    assert json.loads(capsys.readouterr().out)["url"] == LAN
+    # a host whose getaddrinfo looks 127.1 up dials it as a hostname, which
+    # goes into the code as given
+    url = json.loads(capsys.readouterr().out)["url"]
+    assert url == (LAN if loopback else short)
 
 
 def test_unverified_https_session_does_not_vouch_for_the_lan_address(

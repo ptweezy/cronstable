@@ -2575,7 +2575,8 @@ def _wildcard_listen_versions(host: str) -> frozenset[int]:
 
     ``*`` and an empty host bind both.  An unspecified address binds its
     own, in any form :func:`cronstable.netutil.ip_literal` reads
-    (``0.0.0.0``, ``0``, ``::``, ``[::0]``).  Any other host binds none.
+    (``0.0.0.0``, ``::``, ``[::0]``, and ``0`` where the host's socket
+    layer reads it).  Any other host binds none.
 
     A wildcard bind holds the port on every interface of its family, which
     makes a same-family literal loopback peer entry unambiguously self (see

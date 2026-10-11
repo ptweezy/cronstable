@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cronstable import config, platform
+from cronstable import config, netutil, platform
 from cronstable.config import (
     DEFAULT_CONFIG,
     ConfigError,
@@ -16,7 +16,11 @@ from cronstable.config import (
     parse_config_string,
 )
 from cronstable.platform import IS_WINDOWS
-from tests.test_netutil import _socket_layer
+from tests.test_netutil import (
+    _lenient_getaddrinfo,
+    _socket_layer,
+    _strict_getaddrinfo,
+)
 
 
 def test_mergedicts():
@@ -1975,19 +1979,71 @@ def test_is_local_listener_forms():
 
 def test_listener_checks_read_a_host_as_the_socket_layer_does():
     # one reader, cronstable.netutil.ip_literal, for every spelling
-    assert config._is_local_listener("http://127.1:8080") is True
     assert config._is_local_listener("http://[::1]:8080") is True
-    assert config._is_local_listener("http://0x7f.0.0.1:8080") is True
-    assert config._loopback_ip_version("127.1") == 4
     assert config._loopback_ip_version("[::1]") == 6
-    assert config._is_wildcard_host("0") is True
     assert config._is_wildcard_host("[::]") is True
+    # a short or hexadecimal form is an address on a host whose socket
+    # layer reads it, and a name on any other
+    short = _socket_layer("127.1") == {"127.0.0.1"}
+    assert config._is_local_listener("http://127.1:8080") is short
+    assert config._loopback_ip_version("127.1") == (4 if short else None)
+    hexadecimal = _socket_layer("0x7f.0.0.1") == {"127.0.0.1"}
+    assert config._is_local_listener("http://0x7f.0.0.1:8080") is hexadecimal
+    assert config._is_wildcard_host("0") is (_socket_layer("0") == {"0.0.0.0"})
     # every address is no local one, and a name is neither
     assert config._is_local_listener("http://0.0.0.0:8080") is False
     assert config._is_local_listener("http://127.0.0.1.example:8080") is False
     assert config._loopback_ip_version("192.168.1.50") is None
     assert config._loopback_ip_version("localhost") is None
     assert config._is_wildcard_host("nas.local") is False
+
+
+_JOB_API_LISTEN = "state:\n  path: /x\n  jobApi:\n    listen: http://{}:9000\n"
+_MCP_LISTEN = "web:\n  listen:\n    - http://{}:8080\nmcp:\n  enabled: true\n"
+
+
+def test_listener_checks_read_a_short_form_where_getaddrinfo_reads_it(
+    monkeypatch,
+):
+    monkeypatch.setattr(netutil.socket, "getaddrinfo", _lenient_getaddrinfo)
+    assert config._is_local_listener("http://127.1:8080") is True
+    assert config._is_local_listener("http://0x7f.0.0.1:8080") is True
+    assert config._loopback_ip_version("127.1") == 4
+    assert config._is_wildcard_host("0") is True
+    assert config._wildcard_listen_versions("0") == {4}
+    assert config._is_self_listed("127.1:7946", "0:7946", "n")
+    parse_config_string(_JOB_API_LISTEN.format("127.1"), "")
+    local_mcp = parse_config_string(_MCP_LISTEN.format("127.1"), "")
+    config._validate_cross_sections(local_mcp)
+
+
+def test_loopback_checks_refuse_a_form_that_getaddrinfo_looks_up(monkeypatch):
+    # a getaddrinfo that reads an address in the dotted quad alone: a bind
+    # on that host resolves 127.1 as a hostname
+    monkeypatch.setattr(netutil.socket, "getaddrinfo", _strict_getaddrinfo)
+    assert netutil.ip_literal("127.1") is None
+    assert config._is_local_listener("http://127.1:8080") is False
+    assert config._is_local_listener("http://0x7f.0.0.1:8080") is False
+    assert config._loopback_ip_version("127.1") is None
+    with pytest.raises(ConfigError, match="'127.1' is not loopback"):
+        parse_config_string(_JOB_API_LISTEN.format("127.1"), "")
+    open_mcp = parse_config_string(_MCP_LISTEN.format("127.1"), "")
+    with pytest.raises(ConfigError, match="without authentication"):
+        config._validate_cross_sections(open_mcp)
+    # a bare 0 is a name there too, so it is not a wildcard bind
+    assert config._is_wildcard_host("0") is False
+    assert config._wildcard_listen_versions("0") == frozenset()
+    assert not config._is_self_listed("127.0.0.1:7946", "0:7946", "n")
+    assert not config._is_self_listed("127.1:7946", "0.0.0.0:7946", "n")
+    # the dotted quad is an address to every C library
+    assert config._is_local_listener("http://127.0.0.1:8080") is True
+    assert config._loopback_ip_version("127.0.0.1") == 4
+    assert config._is_wildcard_host("0.0.0.0") is True
+    assert config._wildcard_listen_versions("0.0.0.0") == {4}
+    assert config._is_self_listed("127.0.0.1:7946", "0.0.0.0:7946", "n")
+    parse_config_string(_JOB_API_LISTEN.format("127.0.0.1"), "")
+    local_mcp = parse_config_string(_MCP_LISTEN.format("127.0.0.1"), "")
+    config._validate_cross_sections(local_mcp)
 
 
 @pytest.mark.parametrize(

@@ -53,18 +53,25 @@
   of its output closes the pipe, as `head` does after its last line.
 - In the terminal dashboard, `Esc` closes the panel or drawer that is on
   top. When a `401` opens the access token prompt while the command palette
-  is open, the palette closes and the prompt takes the keys.
+  is open, the palette closes and the prompt takes the keys. The wallboard
+  draws the prompt and any other open panel or drawer, and the one on top
+  takes the keys, so `cronstable tui --tv` works against a daemon that
+  requires a token. With `--job NAME` and no token, the prompt comes first,
+  and the job's drawer appears when the prompt closes. With
+  `--tv --job NAME`, the drawer opens beside the board. Saving a token
+  restarts a log stream that the daemon refused with a `401`.
 - The Bonjour advert skips a listener bound to `[::]`. That socket accepts
   IPv6 connections only, and the advert's address record is IPv4. On a host
   with no default route and a hostname that isn't a valid DNS name, such as
   one with a 64-character label, the daemon logs a warning and skips the
   advert.
 - Configuration checks read a loopback or wildcard address in every form that
-  the socket layer reads, such as `127.1`, so `state.jobApi.listen:
-  http://127.1:9000` counts as a loopback bind. A form with a leading zero
-  that the host's C library reads as octal in one call and as decimal in
-  another, such as `0177.0.0.1` on macOS, counts as a hostname, so the checks
-  treat it as a non-loopback address.
+  the host's socket layer reads as an address. On a host that reads `127.1`
+  as `127.0.0.1`, `state.jobApi.listen: http://127.1:9000` counts as a
+  loopback bind. A form that the host looks up as a name counts as a
+  hostname, so the checks treat it as a non-loopback address. So does a form
+  with a leading zero that the host's C library reads as octal in one call
+  and as decimal in another, such as `0177.0.0.1` on macOS.
 - The web dashboard's header keeps its buttons in view at any window width.
   As the window narrows, the header hides readouts, least essential first:
   the job-set ID chip, the node meter's bars, the clock, the version and the
@@ -77,6 +84,12 @@
 - The web dashboard's command palette has a "Toggle node resources" entry.
   It opens and closes the node resources card at any window width, including
   when the header hides the node meter.
+- In the web dashboard, when a `401` opens the access token prompt while the
+  command palette is open, the palette closes and the prompt takes the keys.
+  The palette shortcut does nothing while a panel that covers the palette is
+  open, such as the token prompt or the settings panel. The prompt opens on
+  top of every other panel, and `Enter` in its field saves the token without
+  activating the control that held the focus before.
 - In the web dashboard's log panes, line numbers and timestamps have a
   contrast ratio of at least 4.5:1 in all ten themes. Placeholder text in
   every field uses the theme's faint ink.

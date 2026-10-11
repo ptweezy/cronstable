@@ -34,8 +34,12 @@ tarball=/tmp/pbs-python.tar.gz
 # deterministic and retrying it just multiplies the failure. retry.sh is the
 # whole retry story here: manylinux2014 is CentOS 7, whose curl 7.29 rejects
 # --retry-connrefused outright, and a flag it does not know is a hard usage
-# error rather than a download attempt.
-retry 5 curl --proto =https --tlsv1.2 -fsSL -o "$tarball" "$url"
+# error rather than a download attempt. curl 7.29 has the three limits below.
+# They make a stalled transfer fail, so the retry covers it. The connection
+# phase has 30 seconds, and a transfer that stays under 1024 bytes a second for
+# 30 seconds ends. An archive that is slow but still arriving continues.
+retry 5 curl --proto =https --tlsv1.2 -fsSL -o "$tarball" \
+    --connect-timeout 30 --speed-limit 1024 --speed-time 30 "$url"
 echo "$sha  $tarball" | sha256sum -c -
 
 # The archive roots at python/, so strip that component and land bin/, lib/

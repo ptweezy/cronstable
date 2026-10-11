@@ -1991,20 +1991,6 @@
   </div>
 </div>
 
-<!-- token modal -->
-<div class="overlay" id="modalWrap">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalMsg">
-    <h3 id="modalTitle">Access token required</h3>
-    <p id="modalMsg">This cronstable instance requires a bearer token. The dashboard stores the token only in this browser tab.</p>
-    <input id="tokenInput" type="password" placeholder="paste token…" autocomplete="off" />
-    <div class="modal-actions">
-      <button class="btn" id="tokenClear" style="margin-right:auto">Clear</button>
-      <button class="btn" id="tokenCancel">Cancel</button>
-      <button class="btn primary" id="tokenSave">Save</button>
-    </div>
-  </div>
-</div>
-
 <!-- incident timeline overlay -->
 <div class="overlay" id="timelineWrap">
   <div class="tlpanel" role="dialog" aria-label="Incident timeline">
@@ -2047,6 +2033,23 @@
       <button class="iconbtn" id="sbxClose" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
     <div class="sbxbody" id="sbxBody"></div>
+  </div>
+</div>
+
+<!-- token modal. LAST among the .overlay surfaces: the overlays share one
+     z-index, so DOM order is paint order. A 401 can raise this modal while
+     any other panel is open, and the keyboard layer ranks it topmost
+     (activeSurface and the Esc chain), so it paints above every panel. -->
+<div class="overlay" id="modalWrap">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalMsg">
+    <h3 id="modalTitle">Access token required</h3>
+    <p id="modalMsg">This cronstable instance requires a bearer token. The dashboard stores the token only in this browser tab.</p>
+    <input id="tokenInput" type="password" placeholder="paste token…" autocomplete="off" />
+    <div class="modal-actions">
+      <button class="btn" id="tokenClear" style="margin-right:auto">Clear</button>
+      <button class="btn" id="tokenCancel">Cancel</button>
+      <button class="btn primary" id="tokenSave">Save</button>
+    </div>
   </div>
 </div>
 
@@ -9504,6 +9507,11 @@ var qrcode = function() {
     if (cur) cur.scrollIntoView({ block: "nearest" });
   }
   function openPalette() {
+    // The palette opens only as the top surface. The overlays share one
+    // z-index, so an open overlay that follows #paletteWrap in the markup
+    // paints above it. A palette opened beneath one would take focus and
+    // keys from the overlay that covers it.
+    if (document.querySelector("#paletteWrap ~ .overlay.open")) return;
     if (!openOverlay("paletteWrap")) return;
     state.palette.open = true; state.palette.cur = 0;
     $("paletteInput").value = "";
@@ -9844,6 +9852,11 @@ var qrcode = function() {
   function openOverlay(id) {
     const surf = $(id);
     if (surf.classList.contains("open")) return false;
+    // The palette takes keys ahead of every other surface, so opening
+    // another surface closes the palette. A 401 raises the token modal
+    // on its own. A palette left open beneath the modal would run its
+    // current row when Enter saves the token.
+    if (id !== "paletteWrap") closePalette();
     pushFocus();
     surf.classList.add("open");
     return true;
@@ -9920,7 +9933,8 @@ var qrcode = function() {
     // any key wakes the zen screensaver back to the live wallboard grid (without
     // consuming the key — Esc still exits the wallboard, w/a still work below).
     if (state.zen.on) zenWake();
-    // palette navigation has priority
+    // palette navigation has priority: the palette is the top surface
+    // whenever it is open (see openPalette and openOverlay)
     if (state.palette.open) {
       if (e.key === "Escape") { e.preventDefault(); closePalette(); return; }
       else if (e.key === "ArrowDown") { e.preventDefault(); state.palette.cur = Math.min(state.palette.items.length - 1, state.palette.cur + 1); renderPalette(); return; }
@@ -11378,7 +11392,10 @@ var qrcode = function() {
     $("tokenClear").addEventListener("click", () => { sessionStorage.removeItem(TOKEN_KEY); tokenChanged(); });
     $("tokenCancel").addEventListener("click", closeModal);
     $("modalWrap").addEventListener("click", (e) => { if (e.target === $("modalWrap")) closeModal(); });
-    $("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("tokenSave").click(); });
+    // Saving closes the modal, and closing it returns focus to the control
+    // that held it before. The field consumes Enter so that the browser
+    // does not go on to activate that control with the same key press.
+    $("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("tokenSave").click(); } });
 
     // pair a device
     $("openPair").addEventListener("click", () => { closeSettings(); openPair(); });

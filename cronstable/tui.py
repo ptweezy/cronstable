@@ -2453,7 +2453,9 @@ class LogTail:
         return block
 
     async def _run(self) -> None:
-        clear_next = False  # the previous attempt died mid-run
+        # the previous attempt died mid-run, or a 401 ended it and the
+        # buffer still holds the run
+        clear_next = self.error == "unauthorized"
         dedupe_next = False  # the previous attempt saw its run end
         retry = TAIL_RETRY_MS / 1000
         while True:
@@ -3179,13 +3181,17 @@ class App:
 
         The top overlay is the one drawn, the one that takes keys, and the
         one that Esc closes. The palette takes keys ahead of every other
-        overlay, so opening another overlay closes the palette.
+        overlay, so opening another overlay closes the palette. A focused
+        input takes keys ahead of the overlays too, so an input that lives
+        outside ``name`` loses the focus.
         """
         if name != "palette" and self.is_open("palette"):
             self.close("palette")
         if name in self.open_overlays:
             self.open_overlays.remove(name)
         self.open_overlays.append(name)
+        if self.focus and INPUT_HOMES.get(self.focus) != name:
+            self.focus = None
         self.panel_scroll = 0
         self.mark()
 
@@ -3317,6 +3323,12 @@ class App:
         await self._first_load()
         if self._start_job:
             self.open_drawer(self._start_job, "logs")
+            if self.is_open("token"):
+                # a token prompt is waiting (the first poll answered
+                # 401): it keeps the screen and the keys, with the
+                # drawer beneath it
+                self.open("token")
+                self.focus = "token"
 
     async def _first_load(self) -> None:
         with contextlib.suppress(Exception):
@@ -3510,7 +3522,9 @@ class App:
             now = time.monotonic()
             if self.toasts and any(t[2] <= now for t in self.toasts):
                 self.toasts = [t for t in self.toasts if t[2] > now]
-            # zen: engage on an idle, healthy wallboard (web governor)
+            # zen: engage on an idle, healthy wallboard (web governor);
+            # an open overlay keeps the board up, because the board
+            # draws the overlay and zen does not
             if self.wallboard and self.prefs["zen"]:
                 idle = now - self.last_key_mono
                 healthy = not self.any_failing and not any(
@@ -3520,6 +3534,7 @@ class App:
                     idle > float(self.prefs["zen_idle_s"])
                     and healthy
                     and not self.stale()
+                    and not self.open_overlays
                 )
                 if want != self.zen_on:
                     self.zen_on = want
@@ -4203,6 +4218,17 @@ class AppActions(App):
             self.log_tail = None
         self.drawer_job = None
 
+    def _start_unauthorized_streams(self) -> None:
+        """Start each open log stream that a ``401`` ended.
+
+        A stream that gets a ``401`` stops and does not retry. Saving a
+        token calls this method, so the job drawer, the DAG drawer, and
+        the live logs panel request their logs with the saved token.
+        """
+        for tail in (self.log_tail, self.dag_task_tail, *self.tails):
+            if tail is not None and tail.error == "unauthorized":
+                self._track_task(tail.start())
+
     def open_dag(self, name: str) -> None:
         self._close_dag_streams()
         self.dag_name = name
@@ -4789,7 +4815,10 @@ class AppPalette(AppActions):
             self.mark()
 
     def _focus_filter(self) -> None:
-        self.focus = "filter"
+        # the filter belongs to the list, and an overlay over the list
+        # keeps the keys
+        if not self.open_overlays:
+            self.focus = "filter"
 
 
 # ===================================================================
@@ -4799,10 +4828,11 @@ class AppKeys(AppPalette):
     async def handle_key(self, key: str) -> None:
         """One key press.  Structure and guards mirror the web page's
         single keydown handler: palette submode first, then the palette
-        chord (global, even over the wallboard), Esc (closes the top
+        chord (global, except on the wallboard), Esc (closes the top
         overlay), focused-field editing, ``w``/``a`` (list or wallboard,
-        never in overlays), overlay-local keys, and finally the list
-        keys."""
+        never in overlays), overlay-local keys (over the list or the
+        wallboard), and finally the list keys, which the wallboard
+        leaves inert."""
         if key == "ctrl+c":
             self.quit = True
             return
@@ -4813,10 +4843,9 @@ class AppKeys(AppPalette):
             return
         if key in ("ctrl+k", "ctrl+p"):
             if self.wallboard:
-                # the TV board composes no overlays: an invisible
-                # palette would swallow keys and could fire unseen
-                # actions on Enter, so it stays inert like every
-                # other surface here (leave with w or Esc first)
+                # the TV board is a display: the palette and its
+                # actions stay out of reach here, like the list keys
+                # (leave with w or Esc first)
                 return
             self.open("palette")
             self.inputs["palette"] = ""
@@ -4835,12 +4864,13 @@ class AppKeys(AppPalette):
             else:
                 self.ack_alarm()
             return
-        if self.wallboard:
-            return  # everything else is inert on the TV board
         top = self.top_overlay()
         if top is not None:
+            # the overlay on screen, over the list or the TV board
             await self._overlay_key(top, key)
             return
+        if self.wallboard:
+            return  # the list keys are inert on the TV board
         await self._list_key(key)
 
     # ---------------------------------------------------------------
@@ -4912,6 +4942,7 @@ class AppKeys(AppPalette):
             self.focus = None
             self.toast("ok", "⚿ token %s" % ("set" if value else "cleared"))
             self.refresh_now()
+            self._start_unauthorized_streams()
             if self.is_open("pair"):
                 # the code embeds the token: rebuild it, as the page does
                 self._build_pair()
@@ -5569,30 +5600,41 @@ class AppRender(AppKeys):
         paint = Painter(self.theme)
         if self.booting:
             rows = [paint.row(r) for r in self.boot_rows]
-        elif self.wallboard:
-            rows = (
-                self.render_zen(paint, cols, lines)
-                if self.zen_on
-                else self.render_wallboard(paint, cols, lines)
-            )
+        elif self.wallboard and self.zen_on:
+            rows = self.render_zen(paint, cols, lines)
         else:
+            # the top overlay composes over either base screen, the
+            # table or the wallboard
             top = self.top_overlay()
             if top in ("drawer", "dag"):
-                # the compositor clips the table to the left gutter, so
-                # lay it out for cols but cut each row once, there: the
-                # rows used to be walked at cols and walked again a
-                # moment later at the gutter
-                rows = self.render_base(
-                    paint, cols, lines, drawer_widths(cols)[1] - 1
-                )
+                gutter = drawer_widths(cols)[1] - 1
+                if self.wallboard:
+                    # the board lays its tiles out for the gutter, and
+                    # the cut pads every row out to the drawer's border
+                    rows = [
+                        cut_to_width(row, gutter)
+                        for row in self.render_wallboard(paint, gutter, lines)
+                    ]
+                else:
+                    # the compositor clips the table to the left gutter,
+                    # so lay it out for cols but cut each row once,
+                    # there, which walks the rows a single time
+                    rows = self.render_base(paint, cols, lines, gutter)
                 rows = self._compose_drawer(paint, rows, cols, lines, top)
             else:
-                rows = self.render_base(paint, cols, lines)
+                rows = (
+                    self.render_wallboard(paint, cols, lines)
+                    if self.wallboard
+                    else self.render_base(paint, cols, lines)
+                )
                 if top is not None:
                     panel = self.render_overlay(paint, top, cols, lines)
                     fill = self.theme.bg("bg") + DIM_SGR
                     rows = overlay_center(rows, panel, cols, lines, fill)
-            rows = self._compose_toasts(paint, rows, cols, lines)
+            if top is not None or not self.wallboard:
+                # the table and every overlay show toasts; the bare
+                # wallboard does not
+                rows = self._compose_toasts(paint, rows, cols, lines)
         self.term.paint(rows, self.theme.bg("bg"))
 
     # ---------------------------------------------------------------
@@ -7612,12 +7654,13 @@ class AppDrawers(AppOverlays):
         lines: int,
         which: str,
     ) -> list[str]:
-        """Splice a right-hand drawer over the dimmed table, like the
-        web page's aside.
+        """Splice a right-hand drawer over the dimmed base screen, like
+        the web page's aside.
 
-        ``base`` arrives already cut to the left gutter (:meth:`paint`
-        passes :func:`drawer_widths`' gutter to ``render_base``), so the
-        table rows are walked once per frame rather than twice.
+        ``base`` arrives already cut to the left gutter: :meth:`paint`
+        passes :func:`drawer_widths`' gutter to ``render_base`` for the
+        table and lays the wallboard out for the gutter itself, so the
+        rows are walked once per frame.
         """
         drawer_w, left_w = drawer_widths(cols)
         panel = (

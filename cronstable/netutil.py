@@ -23,12 +23,13 @@ def ip_literal(host: str) -> Address | None:
 
     The one reader of a literal host for the daemon and its clients. It
     reads an address with or without a URL's brackets, and the short and
-    hexadecimal IPv4 forms that the socket layer reads, such as ``127.1``
-    and ``0x7f.0.0.1``. It calls no resolver.
+    hexadecimal IPv4 forms that this host's socket layer reads, such as
+    ``127.1`` and ``0x7f.0.0.1``. It looks up no name.
 
     A form that the host's C library reads as two addresses is a name: in
     ``0177.0.0.1``, a leading zero is octal to one call and decimal to
-    another.
+    another. A form that the host's ``getaddrinfo`` looks up is a name
+    too: some C libraries read an address there only in the dotted quad.
     """
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
@@ -48,8 +49,25 @@ def ip_literal(host: str) -> Address | None:
         # a leading zero as decimal there and as octal in inet_aton.
         packed = socket.inet_pton(socket.AF_INET, host)
     except OSError:
-        return address
-    return address if packed == address.packed else None
+        packed = None
+    if packed is not None:
+        return address if packed == address.packed else None
+    try:
+        # A bind or a connect asks getaddrinfo next. Some C libraries
+        # read an address there, and others look the text up as a name.
+        # With AI_NUMERICHOST, the call raises in place of a lookup.
+        infos = socket.getaddrinfo(
+            host,
+            None,
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+            flags=socket.AI_NUMERICHOST,
+        )
+    except (OSError, UnicodeError):
+        # The idna codec refuses a label of more than 63 characters.
+        return None
+    read = {info[4][0] for info in infos}
+    return address if read == {str(address)} else None
 
 
 def netloc(host: str, port: int | str | None = None) -> str:

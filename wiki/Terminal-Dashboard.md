@@ -42,7 +42,7 @@ For fonts missing the status glyphs, use `--ascii`.
 | `--insecure` | Disable TLS certificate verification, which can expose the bearer token to an untrusted server (same as `CRONSTABLE_WEB_INSECURE=1`). |
 | `--theme NAME` | Start on a theme (`standard`, `carolina`, `amber`, `green`, `modern`, each also as `NAME-light`). The choice persists (default: remembered, else `standard`). |
 | `--tv` | Start on the wallboard, like opening the page at `#tv`. |
-| `--job NAME` | Open a job's drawer at startup, like `#job/NAME`. |
+| `--job NAME` | Open a job's drawer at startup, like `#job/NAME`. With `--tv`, the drawer opens beside the wallboard. |
 | `--poll SECONDS` | Refresh interval. `0` pauses (default: remembered, else 3). |
 | `--boot` / `--no-boot` | Force or skip the boot self-test. |
 | `--ascii` | Plain-ASCII status glyphs for limited fonts and terminals. |
@@ -140,7 +140,9 @@ The TUI includes:
   [pairing from the terminal](Terminal-Pairing).
 - The **wallboard** (`w`) with worst-first tiles, the tally foot, a
   `NO SIGNAL` banner when data goes stale, and the zen screensaver on an
-  idle board (nothing failing or running, data fresh).
+  idle board (nothing failing or running, data fresh). A panel, a drawer,
+  or the token prompt that is open over the wallboard takes the keys.
+  `Esc` closes it, and then `Esc` or `w` leaves the wallboard.
 - The **BIOS-style boot self-test**, checking the daemon once
   per 12 hours. Skip it with any key, `--no-boot`, or a settings toggle.
 
@@ -197,7 +199,9 @@ in the palette as "Toggle compact density"). Three rows live only here:
   screensaver. On an idle board (nothing failing or running, data fresh),
   it engages after the keyboard has been idle for the **Zen idle**
   interval: 30, 60, 90, 120, or 300 seconds, default 90. Any key wakes
-  it without acting.
+  it without acting. It stays off while a panel, a drawer, or the token
+  prompt is open over the board. A token prompt that opens during the
+  screensaver ends the screensaver within a second.
 - **Living logo** animates the logo mark. With it off, the mark holds
   still.
 
@@ -230,6 +234,12 @@ file.
 
 When the token prompt opens while the command palette is open, the
 terminal dashboard closes the palette, and the prompt takes the keys.
+
+On the wallboard, the prompt opens over the board, and the board stays
+on screen after you save the token. When you start with `--job` and no
+token, the prompt comes first, and the job's drawer appears when the
+prompt closes. Saving the token loads the job's log in the drawer's
+**Logs** tab.
 
 Mutating keys (`r`, `x`, DAG trigger/backfill/decision) go through the
 same `POST` endpoints. The daemon's cross-site `Origin` gate does not

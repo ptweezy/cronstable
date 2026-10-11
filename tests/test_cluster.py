@@ -270,11 +270,14 @@ def test_is_self_listed_loopback_edge_cases():
     assert _is_self_listed("10.0.0.1:8443", "0.0.0.0:8443", "node-a") is False
 
 
-def test_is_self_listed_reads_a_wildcard_listen_in_any_spelling():
+def test_is_self_listed_reads_a_wildcard_listen_in_any_spelling(monkeypatch):
+    from cronstable import netutil
     from cronstable.config import _is_self_listed, _likely_self_fqdn
+    from tests.test_netutil import _lenient_getaddrinfo
 
     # the wildcard host is read as the socket layer reads it, like the
-    # loopback peer beside it
+    # loopback peer beside it.  This getaddrinfo reads the short forms.
+    monkeypatch.setattr(netutil.socket, "getaddrinfo", _lenient_getaddrinfo)
     assert _is_self_listed("127.1:7946", "0:7946", "node-a") is True
     assert _is_self_listed("[::1]:7946", "[::0]:7946", "node-a") is True
     assert _is_self_listed("node-a:7946", "0:7946", "node-a") is True

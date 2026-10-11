@@ -214,7 +214,7 @@ def _http(
 def _parse_body(body: bytes) -> dict[str, Any]:
     """A response body as a dict, tolerating non-JSON.
 
-    Error bodies are not always JSON.  This daemon's endpoint now wraps
+    Error bodies are not always JSON.  This daemon's endpoint wraps
     every error it serves in the ``{"error": ...}`` envelope, but the CLI
     may be talking to one older than that arm, and a reverse proxy or a
     transport-level failure aiohttp answers itself still renders as

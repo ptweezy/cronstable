@@ -1440,6 +1440,30 @@ async def test_token_modal_on_401(tmp_path):
         await h.stop()
 
 
+async def test_token_modal_on_401_over_the_wallboard(tmp_path):
+    """``cronstable tui --tv`` against a daemon that wants a token."""
+    h = Harness()
+    h.daemon.jobs = [_job("secret-tile", outcome="success")]
+    h.daemon.token = "s3cr3t"
+    try:
+        app = await h.start(tmp_path, start_wallboard=True)  # no token
+        await _wait_for(lambda: app.is_open("token"))
+        # the prompt is drawn over the board
+        await _wait_for(lambda: "access token" in h.term.screen())
+        assert "esc/w exit" in h.term.screen()
+        # the keys reach the prompt, and Enter saves them as the token
+        for ch in "s3cr3t":
+            h.keys.send(ch)
+        h.keys.send("enter")
+        await _wait_for(lambda: app.api.token == "s3cr3t")
+        # the board fills in with its tiles, with no key to return to it
+        await _wait_for(lambda: len(app.jobs) == 1, timeout=8)
+        await _wait_for(lambda: "secret-tile" in h.term.screen())
+        assert app.wallboard and "esc/w exit" in h.term.screen()
+    finally:
+        await h.stop()
+
+
 async def test_theme_cycling_persists(tmp_path):
     h = Harness()
     h.daemon.jobs = [_job("a")]
@@ -1588,9 +1612,9 @@ async def test_manual_refresh_works_while_paused(tmp_path):
 
 
 async def test_wallboard_keeps_the_palette_closed(tmp_path):
-    """Ctrl-K on the TV board must stay inert: the wallboard composes
-    no overlays, so an invisible palette would swallow keys and could
-    fire unseen job actions on Enter."""
+    """Ctrl-K on the TV board must stay inert: the board is a display,
+    so the palette and its job actions stay out of reach until the
+    operator leaves it."""
     h = Harness()
     h.daemon.jobs = [_job("alpha", outcome="success")]
     try:
@@ -1821,7 +1845,7 @@ async def test_week_calendar_overlay(tmp_path):
 # ===================================================================
 #  paint-path performance plumbing: the ANSI memo + scan gating
 # ===================================================================
-def _bare_app(tmp_path) -> TuiApp:
+def _bare_app(tmp_path, **app_kwargs) -> TuiApp:
     """An app instance with no daemon and no run loop, for driving the
     pure render helpers directly."""
     prefs = dict(tui.PREF_DEFAULTS)
@@ -1832,6 +1856,7 @@ def _bare_app(tmp_path) -> TuiApp:
         prefs,
         boot=False,
         prefs_file=str(tmp_path / "prefs.json"),
+        **app_kwargs,
     )
 
 
@@ -4861,6 +4886,299 @@ async def test_action_401_over_the_palette_gives_the_token_prompt_the_keys(
         await app.handle_key("esc")
         assert app.open_overlays == []
         app.inputs["token"] = ""
+
+
+# ===================================================================
+#  The overlay on screen is the one that takes the keys
+# ===================================================================
+def _screen(app) -> str:
+    app.paint()
+    return app.term.screen()
+
+
+def test_open_blurs_an_input_outside_the_overlay(tmp_path):
+    app = _bare_app(tmp_path)
+    app.focus = "filter"
+    app.open("help")  # help covers the list, where the filter lives
+    assert app.focus is None
+    app.open("drawer")
+    app.focus = "logsearch"
+    app.open("drawer")  # raising the input's own overlay keeps the focus
+    assert app.focus == "logsearch"
+    app.open("token")
+    assert app.focus is None
+
+
+async def test_wallboard_draws_the_token_prompt_and_gives_it_the_keys(
+    tmp_path,
+):
+    """``cronstable tui --tv`` against a daemon that wants a token."""
+    app = _bare_app(tmp_path, start_wallboard=True)
+    app.api.get_json = _raise_unauth
+    app.api.get_text = _raise_unauth
+    await app._startup()
+    assert app.open_overlays == ["token"] and app.focus == "token"
+    screen = _screen(app)
+    assert "access token" in screen and "esc/w exit" in screen
+    # the board's own keys type into the prompt that is on screen
+    for key in ("w", "a", "q"):
+        await app.handle_key(key)
+    assert app.inputs["token"] == "waq"
+    assert app.wallboard and not app.quit
+    assert "•••" in _screen(app)
+    # Esc closes the prompt, and the bare board answers to its own
+    # keys again: q is inert there, and w leaves
+    await app.handle_key("esc")
+    assert app.open_overlays == [] and app.wallboard
+    screen = _screen(app)
+    assert "access token" not in screen and "esc/w exit" in screen
+    await app.handle_key("q")
+    assert app.wallboard and not app.quit
+    await app.handle_key("w")
+    assert not app.wallboard
+    # the next 401 opens the prompt again, and Enter saves what it shows
+    app.set_wallboard(True)
+    await app._poll_once()
+    assert "access token" in _screen(app)
+    await app.handle_key("enter")
+    assert app.api.token == "waq"
+    assert app.open_overlays == [] and app.wallboard
+
+
+async def test_overlay_open_at_wallboard_entry_stays_on_screen(tmp_path):
+    app = _bare_app(tmp_path)
+    app.open("help")
+    await app.handle_key("ctrl+k")
+    for ch in "wallboard":
+        await app.handle_key(ch)
+    await app.handle_key("enter")
+    assert app.wallboard and app.open_overlays == ["help"]
+    # help is drawn over the board, and so is the toast
+    app.toast("info", "marker toast")
+    screen = _screen(app)
+    assert "keyboard shortcuts" in screen and "esc/w exit" in screen
+    assert "marker toast" in screen
+    # help takes the keys: j scrolls it, and w does nothing in help
+    await app.handle_key("j")
+    await app.handle_key("w")
+    assert app.panel_scroll == 1 and app.wallboard
+    # Esc closes the overlay on screen, and the next Esc leaves the board
+    await app.handle_key("esc")
+    assert app.open_overlays == [] and app.wallboard
+    screen = _screen(app)
+    assert "keyboard shortcuts" not in screen and "esc/w exit" in screen
+    assert "marker toast" not in screen
+    await app.handle_key("esc")
+    assert not app.wallboard
+
+
+async def test_job_drawer_is_drawn_over_the_wallboard(tmp_path):
+    """``cronstable tui --tv --job NAME``."""
+    app = _bare_app(tmp_path, start_wallboard=True, start_job="watched")
+    _stub_api(app)
+    stub = app.api.get_json
+    names = ("alpha", "bravo", "charlie", "delta")
+
+    async def get_json(path, **k):
+        if path == "/jobs":
+            return [_job(name, outcome="success") for name in names]
+        return await stub(path, **k)
+
+    app.api.get_json = get_json
+    await app._startup()
+    assert app.wallboard and app.open_overlays == ["drawer"]
+    # the drawer sits beside the board, which lays every tile out in the
+    # left gutter
+    screen = _screen(app)
+    assert "/ to search" in screen
+    assert all(name in screen for name in names)
+    assert screen.split("\n")[-1].startswith(" 4 jobs")
+    # w is the drawer's wrap key while the drawer is on screen
+    wrap = app.wrap
+    await app.handle_key("w")
+    assert app.wrap != wrap and app.wallboard
+    # Esc closes the drawer, and w leaves the bare board
+    await app.handle_key("esc")
+    assert app.open_overlays == [] and app.wallboard
+    screen = _screen(app)
+    assert "/ to search" not in screen and "esc/w exit" in screen
+    await app.handle_key("w")
+    assert not app.wallboard
+    await asyncio.sleep(0.05)
+
+
+async def test_zen_yields_to_an_overlay_over_the_wallboard(tmp_path):
+    app = _bare_app(tmp_path, start_wallboard=True)
+    app.api.get_json = _raise_unauth
+    # a fresh, healthy, idle board: the governor engages zen on its tick
+    app.prefs["poll_ms"] = 3_600_000  # keeps the data fresh for the test
+    app.fetched_mono = time.monotonic()
+    app.last_key_mono = time.monotonic() - 3600
+    tick = asyncio.get_running_loop().create_task(app._tick_loop())
+    try:
+        await _wait_for(lambda: app.zen_on, timeout=10)
+        assert "all clear" in _screen(app)
+        # a poll answers 401 while the screensaver is up
+        await app._poll_once()
+        assert app.open_overlays == ["token"]
+        await _wait_for(lambda: not app.zen_on, timeout=10)
+        screen = _screen(app)
+        assert "access token" in screen and "all clear" not in screen
+    finally:
+        tick.cancel()
+        await asyncio.gather(tick, return_exceptions=True)
+
+
+async def test_job_deep_link_opens_beneath_the_token_prompt(tmp_path):
+    """``cronstable tui --job NAME`` against a daemon that wants a token."""
+    app = _bare_app(tmp_path, start_job="deploy")
+    _stub_api(app)
+    app.api.get_json = _raise_unauth
+    app.api.get_text = _raise_unauth
+    await app._startup()
+    # the first poll answered 401 before the drawer opened
+    assert app.open_overlays == ["drawer", "token"] and app.focus == "token"
+    screen = _screen(app)
+    assert "access token" in screen and "/ to search" not in screen
+    # t types into the prompt on screen; in the drawer it is a toggle
+    stamps = app.timestamps
+    await app.handle_key("t")
+    assert (app.inputs["token"], app.timestamps) == ("t", stamps)
+    # Esc closes the prompt, and the drawer beneath it takes the keys
+    await app.handle_key("esc")
+    assert app.open_overlays == ["drawer"] and app.focus is None
+    screen = _screen(app)
+    assert "access token" not in screen and "/ to search" in screen
+    await app.handle_key("t")
+    assert (app.inputs["token"], app.timestamps) == ("t", not stamps)
+    app.close("drawer")
+    await asyncio.sleep(0.05)
+
+
+async def test_saving_the_token_starts_a_log_stream_that_a_401_ended(
+    tmp_path,
+):
+    """``cronstable tui --job NAME`` against a daemon that wants a token."""
+    app = _bare_app(tmp_path, start_job="deploy")
+    _stub_api(app)
+    attempts = []
+
+    async def stream(path):
+        attempts.append(app.api.token)
+        if app.api.token != "s3cr3t":
+            raise tui.Unauthorized()
+        yield "line", {"stream": "stdout", "line": "deployed build 7"}
+        yield "end", {}
+
+    app.api.get_json = _raise_unauth
+    app.api.stream = stream
+    await app._startup()
+    await asyncio.sleep(0.05)
+    tail = app.log_tail
+    assert tail.error == "unauthorized" and attempts == [None]
+    # a token that the daemon refuses gets one attempt
+    for key in ("n", "o", "enter"):
+        await app.handle_key(key)
+    await asyncio.sleep(0.05)
+    assert tail.error == "unauthorized" and attempts == [None, "no"]
+    assert "⚠ unauthorized" in _screen(app)
+    # the next poll opens the prompt again, and a token that the
+    # daemon accepts loads the log in the open drawer
+    await app._poll_once()
+    for key in ("ctrl+u", *"s3cr3t", "enter"):
+        await app.handle_key(key)
+    await asyncio.sleep(0.05)
+    assert app.log_tail is tail and tail.error is None
+    assert attempts == [None, "no", "s3cr3t"]
+    assert app.open_overlays == ["drawer"]
+    screen = _screen(app)
+    assert "deployed build 7" in screen and "⚠ unauthorized" not in screen
+    app.close("drawer")
+    await asyncio.sleep(0.05)
+
+
+async def test_a_stream_started_after_a_401_shows_its_run_once(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tui, "TAIL_RETRY_MS", 20)
+    app = _bare_app(tmp_path)
+    _stub_api(app)
+    app.jobs = [_job("deploy"), _job("build")]
+    app.by_name = {job["name"]: job for job in app.jobs}
+    attempts = []
+
+    async def stream(path):
+        # the daemon replays the run's retained output on every attach
+        attempts.append(path)
+        if app.api.token != "s3cr3t":
+            raise tui.Unauthorized()
+        yield "line", {"stream": "stdout", "line": "deployed build 7"}
+        yield "end", {}
+
+    app.api.stream = stream
+    app.api.token = "s3cr3t"
+    app.open_tail(["deploy", "build"])
+    await _wait_for(lambda: all(tail.ended == "" for tail in app.tails))
+    # the token stops working, so each stream's next attach gets a 401
+    # and the stream stops
+    app.api.token = None
+    await _wait_for(
+        lambda: all(tail.error == "unauthorized" for tail in app.tails)
+    )
+    ended = len(attempts)
+    await asyncio.sleep(0.1)
+    assert len(attempts) == ended
+    app.open("token")
+    for key in (*"s3cr3t", "enter"):
+        await app.handle_key(key)
+    await _wait_for(lambda: all(tail.ended == "" for tail in app.tails))
+    for tail in app.tails:
+        assert tail.error is None
+        texts = [line for _, line, _ in tail.lines]
+        assert texts == ["deployed build 7", "end of run output"]
+    app.close("tail")
+    await asyncio.sleep(0.05)
+
+
+async def test_job_deep_link_takes_the_keys_from_the_list_filter(tmp_path):
+    app = _bare_app(tmp_path, start_job="deploy")
+    _stub_api(app)
+    # the operator focuses the filter while the first load is in flight
+    await app.handle_key("/")
+    assert app.focus == "filter"
+    await app._startup()
+    assert app.open_overlays == ["drawer"] and app.focus is None
+    assert "/ to search" in _screen(app)
+    # t is the drawer's timestamps key, and the filter stays empty
+    stamps = app.timestamps
+    await app.handle_key("t")
+    assert (app.inputs["filter"], app.timestamps) == ("", not stamps)
+    app.close("drawer")
+    await asyncio.sleep(0.05)
+
+
+async def test_palette_focus_filter_leaves_an_overlay_its_keys(tmp_path):
+    app = _bare_app(tmp_path)
+
+    async def focus_filter_from_the_palette():
+        await app.handle_key("ctrl+k")
+        for ch in "focus filter":
+            await app.handle_key(ch)
+        await app.handle_key("enter")
+
+    app.open("help")
+    await focus_filter_from_the_palette()
+    # help covers the list, so it stays on screen and keeps the keys
+    assert app.open_overlays == ["help"] and app.focus is None
+    assert "keyboard shortcuts" in _screen(app)
+    await app.handle_key("j")
+    assert (app.inputs["filter"], app.panel_scroll) == ("", 1)
+    # with the list on screen, the same row focuses its filter
+    await app.handle_key("esc")
+    await focus_filter_from_the_palette()
+    assert app.open_overlays == [] and app.focus == "filter"
+    await app.handle_key("j")
+    assert app.inputs["filter"] == "j"
 
 
 async def test_filter_tab_blurs(tmp_path):

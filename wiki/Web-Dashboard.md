@@ -613,6 +613,19 @@ reduce motion, open settings, set the access token…) and a per-job action for 
 (open its logs, run it, cancel it, copy its command, view its schedule). Type to
 filter, arrow keys to move, `Enter` to run.
 
+The palette opens on top of a job drawer, a DAG drawer, the
+[live logs panel](#live-logs), or the [wallboard](#wallboard--tv-mode), and
+`Esc` closes the palette first. Seven panels cover the palette, so the
+shortcut does nothing while one of them is open: the settings panel, the
+shortcut list, the [Pair a device](#pair-a-device) panel, the
+[token prompt](#authentication), the incident timeline, the job actions
+panel, and the schedule preview. Press `Esc` to close the panel, and then
+open the palette.
+
+The palette closes when another panel or drawer opens: a `401` that opens
+the token prompt closes it, and so does a `#job/<name>` or `#dag/<name>`
+link that opens a drawer.
+
 ## Keyboard shortcuts
 
 [![The keyboard shortcut reference overlay listing every shortcut](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-shortcuts.png)
@@ -747,6 +760,11 @@ subsequent request. You can update or clear the stored token from the header's
 token button at any time. Saving or clearing a token rewrites the calendar
 feed links from the new token and empties the pairing sheet, so no link or
 payload in the tab keeps the previous token.
+
+The token prompt opens on top of any other open panel. When a `401` opens it
+while the [command palette](#command-palette) is open, the dashboard closes
+the palette, and the prompt takes the keys: `Enter` saves the token, and `Esc`
+closes the prompt.
 
 ### Scope-aware chrome
 

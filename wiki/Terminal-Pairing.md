@@ -151,12 +151,13 @@ serves without a token under `web.anonymousScopes`. The command then has no
 address to check. Present a token, or pass `--public-url`.
 
 A loopback address is `localhost`, a name under it, or an address such as
-`127.0.0.1`, `::1`, or `0.0.0.0` in any form that the socket layer reads, such
-as `127.1`. A form with a leading zero that this host's C library reads as
-octal in one call and as decimal in another, such as `0177.0.0.1` on macOS,
-counts as a hostname. Any other hostname goes into the code as given, because
-the phone resolves it. A path in the address goes into the code
-percent-encoded.
+`127.0.0.1`, `::1`, or `0.0.0.0` in any form that this host's socket layer
+reads as an address, for example `127.1` where this host reads it as
+`127.0.0.1`. A form that this host looks up as a name counts as a hostname.
+So does a form with a leading zero that this host's C library reads as octal
+in one call and as decimal in another, such as `0177.0.0.1` on macOS. Any
+other hostname goes into the code as given, because the phone resolves it. A
+path in the address goes into the code percent-encoded.
 
 The command doesn't follow redirects, because its request carries the token.
 When `--url` answers with a redirect, the command reports the redirect's

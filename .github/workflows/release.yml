@@ -931,7 +931,9 @@ jobs:
           # retry.sh itself. The installer goes to a file first, because sh
           # would already be running a truncated download piped into it. No
           # curl retry flags: CentOS 7 curl 7.29 rejects --retry-connrefused.
-          RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+          # It has both time limits, which make a stalled download fail, so
+          # the retry covers it.
+          RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --connect-timeout 30 --max-time 60 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
         run: |
           set -euo pipefail
           docker run --rm --platform ${{ matrix.platform }} \
@@ -1129,13 +1131,15 @@ jobs:
           - {libc: glibc, arch: armv6}
         include:
           # per-libc. These commands are spliced into the single-quoted
-          # sh -euc script, so none may contain a quote character.
+          # sh -euc script, so none may contain a quote character. The time
+          # limits on each rustup download make a stalled attempt fail, so
+          # curl and `retry` both retry it.
           - libc: musl
             image: python:3.14-alpine3.23
             suffix: -musl
             toolchain: 'retry 5 apk add --no-cache build-base libffi-dev zlib-dev'
             nacl_tools: 'retry 3 apk add --no-cache libffi-dev make >/dev/null 2>&1 || true'
-            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache curl && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache curl && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 --connect-timeout 30 --max-time 60 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
             # For pq_src rows: Alpine 3.23 ships Rust 1.91 (cryptography
             # needs 1.83) and OpenSSL 3.5 (ML-KEM needs 3.5) on every arch,
             # so no rustup or OpenSSL build.
@@ -1146,7 +1150,7 @@ jobs:
             suffix: ''
             toolchain: 'retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev'
             nacl_tools: 'retry 3 apt-get -o Acquire::Retries=5 install -y --no-install-recommends libffi-dev make >/dev/null 2>&1 || true'
-            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 --connect-timeout 30 --max-time 60 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
             # trixie ships rustc 1.85 and OpenSSL 3.5. Only riscv64 uses this;
             # the bookworm i686 row overrides it below.
             pq_tools: 'retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends rustc cargo libssl-dev pkg-config'
@@ -1194,7 +1198,7 @@ jobs:
             pq_src: '1'
             pq_openssl: '1'
             pq_tools: 'retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates perl make pkg-config'
-            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --default-host i686-unknown-linux-gnu --profile minimal --no-modify-path'
+            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 --connect-timeout 30 --max-time 60 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --default-host i686-unknown-linux-gnu --profile minimal --no-modify-path'
           - {libc: glibc, arch: riscv64, image: python:3.14-slim-trixie, floor: '2.41', pq: soft, pq_src: '1'}
     runs-on: ${{ matrix.runner }}
     steps:
@@ -1675,7 +1679,7 @@ jobs:
             # namespace that gets rebuilt (sid-slim and forky-slim are stale).
             image: ghcr.io/loong64/python:3.14-slim-trixie
             toolchain: 'retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev curl ca-certificates'
-            rust_setup: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+            rust_setup: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 --connect-timeout 30 --max-time 60 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
             # OpenSSL 3.5 headers for the cryptography source build; Rust
             # comes from rustup.
             pq_tools: 'retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends libssl-dev pkg-config'
@@ -1686,7 +1690,7 @@ jobs:
             # loongarch64/alpine namespace is stale.
             image: ghcr.io/loong64/alpine:3.24.1
             toolchain: 'retry 5 apk add --no-cache build-base libffi-dev zlib-dev python3 python3-dev py3-pip curl'
-            rust_setup: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+            rust_setup: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 --connect-timeout 30 --max-time 60 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
             # Alpine 3.24's OpenSSL 3.5 headers, for the same source build.
             pq_tools: 'retry 5 apk add --no-cache openssl-dev pkgconf'
             floor: ''
@@ -2138,7 +2142,9 @@ jobs:
               export RUSTFLAGS
             fi
             "$runtime" -m venv --without-pip venv
-            retry 5 fetch -o get-pip.py https://bootstrap.pypa.io/get-pip.py
+            # -T states the fetch default: a connection or a read that waits
+            # 120 seconds fails, so the retry covers a stalled download.
+            retry 5 fetch -T 120 -o get-pip.py https://bootstrap.pypa.io/get-pip.py
             venv/bin/python get-pip.py
 
             # install_extra.sh and install_orjson.sh read these.
@@ -2376,7 +2382,10 @@ jobs:
             else
               python3.13 -m venv --system-site-packages --without-pip venv
             fi
-            retry 5 ftp -o get-pip.py https://bootstrap.pypa.io/get-pip.py
+            # -q makes ftp quit when the connection or the transfer stalls for
+            # 60 seconds, so the retry covers it. Without -q, ftp waits on a
+            # stalled transfer with no limit.
+            retry 5 ftp -q 60 -o get-pip.py https://bootstrap.pypa.io/get-pip.py
             venv/bin/python get-pip.py
 
             # install_extra.sh and install_orjson.sh read these.
@@ -2646,8 +2655,11 @@ jobs:
               # soft row (logged below) and never fails the job.
               prepare_crypto_toolchain() {
                 # The arm64 image may lack cargo; if so, fetch rustup-init.
+                # The limits end a stalled download, which then counts as a
+                # failed setup.
                 if ! command -v cargo >/dev/null 2>&1; then
                   curl --proto '=https' --tlsv1.2 -sSfo rustup-init.exe \
+                    --connect-timeout 30 --speed-limit 1024 --speed-time 30 \
                     "https://static.rust-lang.org/rustup/dist/${{ matrix.pq_rust_host }}/rustup-init.exe" || return 1
                   ./rustup-init.exe -y --profile minimal --default-toolchain stable || return 1
                   export PATH="$USERPROFILE/.cargo/bin:$PATH"
@@ -3013,7 +3025,10 @@ jobs:
               python3 -c "import sysconfig; print(\"wheel platform:\", sysconfig.get_platform())"
               python3 -m venv /v
               retry 5 /v/bin/pip install --upgrade pip setuptools wheel
-              retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup-init https://static.rust-lang.org/rustup/dist/arm-unknown-linux-gnueabihf/rustup-init
+              # The limits make a stalled download fail, so the retry covers
+              # it. A download that keeps 1024 bytes a second or more
+              # continues, however long it takes.
+              retry 3 curl --proto =https --tlsv1.2 --connect-timeout 30 --speed-limit 1024 --speed-time 30 -sSfo /tmp/rustup-init https://static.rust-lang.org/rustup/dist/arm-unknown-linux-gnueabihf/rustup-init
               chmod +x /tmp/rustup-init
               env CARGO_HOME=/src/.pq-cache/cargo RUSTUP_HOME=/opt/rustup /tmp/rustup-init -y \
                 --default-host arm-unknown-linux-gnueabihf --default-toolchain stable \
@@ -4291,7 +4306,10 @@ jobs:
             echo "::error::WINGET_TOKEN is not set; the winget manifest would go stale. Add it as a repo secret (a GitHub PAT with public_repo scope)." >&2
             exit 1
           fi
+          # The limits make a stalled download fail, so the curl retries
+          # cover it. Six attempts at the limits fit inside the job timeout.
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o wingetcreate.exe \
+            --connect-timeout 20 --speed-limit 1024 --speed-time 30 \
             https://github.com/microsoft/winget-create/releases/latest/download/wingetcreate.exe
           ./wingetcreate.exe submit winget-manifests \
             --no-open --token "$WINGET_TOKEN" \
