@@ -9,6 +9,9 @@ middleware. Tests check these behaviors:
   stores it in ``sessionStorage``, sends it in the bearer header, and loads
   the dashboard.
 * Invalid or cleared tokens reopen the required token dialog.
+* A 401 that arrives while the command palette is open closes the palette,
+  so the token dialog takes the keys. The palette stays closed while the
+  dialog is open.
 * A ``view`` token hides controls that change state and disables the r, x,
   and p shortcuts.
 * ``control`` and ``approve`` expose only their respective actions.
@@ -45,6 +48,18 @@ def _closed(page, overlay_id):
     page.wait_for_function(
         "(id) => !document.getElementById(id).classList.contains('open')",
         arg=overlay_id,
+    )
+
+
+def _open_overlays(page):
+    return page.evaluate(
+        "[...document.querySelectorAll('.overlay.open')].map((e) => e.id)"
+    )
+
+
+def _wait_active(page, element_id):
+    page.wait_for_function(
+        "(id) => document.activeElement.id === id", arg=element_id
     )
 
 
@@ -268,6 +283,180 @@ def test_token_revoked_by_the_daemon_reopens_the_modal(browser, tmp_path):
             page.wait_for_function(
                 "document.getElementById('conn').textContent === 'live'"
             )
+
+
+# --------------------------------------------------------------------------
+# the token modal and the command palette
+# --------------------------------------------------------------------------
+
+
+def _palette_row(page, label):
+    """Open the palette and make ``label`` its current row."""
+    page.keyboard.press("Control+k")
+    _wait_active(page, "paletteInput")
+    page.keyboard.type(label)
+    page.wait_for_function(
+        "(label) => (document.querySelector('#paletteList .item.cur .lbl')"
+        " || {textContent: ''}).textContent.startsWith(label)",
+        arg=label,
+    )
+
+
+def _modal_after_a_401(page):
+    """Answer the next ``/jobs`` poll with a 401 and wait for the modal."""
+    page.faults.status(r"/jobs", 401, times=1, method="GET")
+    _open(page, "modalWrap")
+    _wait_active(page, "tokenInput")
+
+
+def test_enter_in_a_modal_raised_over_the_palette_only_saves_the_token(
+    browser, tmp_path
+):
+    """A 401 that arrives while the palette is open closes the palette.
+
+    The modal paints above the palette, so the modal takes the keys. Enter
+    in the token field saves the token and leaves the palette's current row
+    alone.
+    """
+    with e2e.Daemon(tmp_path, auth="scoped") as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            token=e2e.CONTROL_TOKEN,
+            prefs={"pollMs": 1000},
+        ) as page:
+            requests = page.faults.record()
+            # The window hears a key after the page's own handler, so the
+            # record shows whether that handler consumed the key.
+            page.evaluate(
+                """() => {
+                  window.__keys = [];
+                  window.addEventListener('keydown', (e) => window.__keys
+                    .push([e.key, e.target.id, e.defaultPrevented]));
+                }"""
+            )
+            _palette_row(page, "Run: alpha-ok")
+            _modal_after_a_401(page)
+            page.keyboard.press("ArrowDown")
+            page.keyboard.press("ArrowUp")
+            # the field offers the current token back; typing replaces it
+            page.evaluate("document.getElementById('tokenInput').select()")
+            page.keyboard.type(e2e.FULL_TOKEN)
+            assert page.input_value("#tokenInput") == e2e.FULL_TOKEN
+            page.keyboard.press("Enter")
+            _closed(page, "modalWrap")
+            assert _stored_token(page) == e2e.FULL_TOKEN
+            # the board reloads with the saved token
+            e2e.wait_until(
+                lambda: [
+                    r
+                    for r in page.faults.sent("GET", "/jobs")
+                    if r["headers"].get("authorization")
+                    == "Bearer " + e2e.FULL_TOKEN
+                ],
+                page=page,
+            )
+            keys = page.evaluate(
+                "window.__keys.filter((k) => k[1] === 'tokenInput' && "
+                "k[0].length > 1)"
+            )
+            assert not [r for r in requests if r["method"] != "GET"]
+            # the page handler leaves the arrow keys alone, and the token
+            # field consumes Enter itself
+            assert keys == [
+                ["ArrowDown", "tokenInput", False],
+                ["ArrowUp", "tokenInput", False],
+                ["Enter", "tokenInput", True],
+            ]
+            assert _open_overlays(page) == []
+        assert daemon.jobs(e2e.FULL_TOKEN)["alpha-ok"]["last_run"] is None
+
+
+def test_enter_in_the_token_field_does_not_press_the_refocused_control(
+    browser, tmp_path
+):
+    """Enter in the token field saves the token and presses nothing else.
+
+    Closing the modal returns focus to the control that held it before the
+    modal opened. The token field consumes Enter, so the browser does not
+    activate that control with the same key press.
+    """
+    with e2e.Daemon(tmp_path, auth="full") as daemon:
+        daemon.run_and_wait("beta-fail", e2e.FULL_TOKEN)
+        before = daemon.jobs(e2e.FULL_TOKEN)["beta-fail"]["last_run"]
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            token=e2e.FULL_TOKEN,
+            prefs={"pollMs": 1000},
+        ) as page:
+            requests = page.faults.record()
+            page.focus("#runFailingBtn")
+            _modal_after_a_401(page)
+            polls = len(page.faults.sent("GET", "/jobs"))
+            page.keyboard.press("Enter")
+            _closed(page, "modalWrap")
+            _wait_active(page, "runFailingBtn")
+            # the board reloads, and any request from the button precedes it
+            e2e.wait_until(
+                lambda: len(page.faults.sent("GET", "/jobs")) > polls,
+                page=page,
+            )
+            assert not [r for r in requests if r["method"] != "GET"]
+            assert _open_overlays(page) == []
+        assert daemon.jobs(e2e.FULL_TOKEN)["beta-fail"]["last_run"] == before
+
+
+def test_escape_closes_a_modal_raised_over_the_palette(browser, tmp_path):
+    with e2e.Daemon(tmp_path, auth="full") as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            token=e2e.FULL_TOKEN,
+            prefs={"pollMs": 1000},
+        ) as page:
+            theme = "document.documentElement.getAttribute('data-theme')"
+            before = page.evaluate(theme)
+            page.focus("#search")
+            _palette_row(page, "Cycle theme")
+            _modal_after_a_401(page)
+            assert page.inner_text("#modalTitle") == "Access token required"
+            page.keyboard.press("Escape")
+            # one Escape closes the modal, and no palette stays open under it
+            assert _open_overlays(page) == []
+            # focus returns to the field that held it before the palette
+            _wait_active(page, "search")
+            # no palette row is left for Enter to run
+            page.keyboard.press("Enter")
+            assert page.evaluate(theme) == before
+
+
+def test_palette_shortcut_leaves_the_keys_with_the_token_modal(
+    browser, tmp_path
+):
+    """The palette stays closed while the token modal is open.
+
+    The modal paints above the palette. A palette opened beneath it would
+    take focus, and typed text would go to the palette's query.
+    """
+    with e2e.Daemon(tmp_path, auth="full") as daemon:
+        with e2e.open_page(browser, daemon.url, wait_rows=False) as page:
+            _open(page, "modalWrap")
+            _wait_active(page, "tokenInput")
+            for chord in ("Control+k", "Meta+k", "Control+p"):
+                page.keyboard.press(chord)
+                assert _open_overlays(page) == ["modalWrap"], chord
+            # the header button is the shortcut's other route
+            _click(page, "#paletteBtn")
+            assert _open_overlays(page) == ["modalWrap"]
+            assert page.evaluate("document.activeElement.id") == "tokenInput"
+            page.keyboard.type(e2e.FULL_TOKEN)
+            assert page.input_value("#tokenInput") == e2e.FULL_TOKEN
+            assert page.input_value("#paletteInput") == ""
+            page.keyboard.press("Enter")
+            page.wait_for_selector("#rows tr[data-job]")
+            _closed(page, "modalWrap")
+            assert _stored_token(page) == e2e.FULL_TOKEN
 
 
 # --------------------------------------------------------------------------

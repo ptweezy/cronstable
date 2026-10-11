@@ -1825,9 +1825,12 @@ components:
     CronstableInstance:
       description: >-
         The daemon's instance ID, which it draws at random when it starts.
-        Every response carries it, including a 401, and `GET /whoami`
-        reports the same value as `instance`, so a client can tell one
-        daemon from another without presenting a token.
+        Every response that this API's application serves carries it,
+        including a 401 and a 404, and `GET /whoami` reports the same value
+        as `instance`, so a client can tell one daemon from another without
+        presenting a token. A request that the HTTP server cannot parse,
+        such as one with a malformed request line, fails before it reaches
+        the application, and its 400 has no such header.
       schema: { type: string }
 
   responses:
@@ -1971,8 +1974,9 @@ components:
           type: string
           description: >-
             An ID that the daemon draws at random when it starts and keeps
-            until it exits. Every response carries the same value in the
-            `Cronstable-Instance` header.
+            until it exits. Every response that this API's application
+            serves carries the same value in the `Cronstable-Instance`
+            header.
         listeners:
           type: array
           items: { type: string }

@@ -269,10 +269,11 @@ no `https://` listen refused, an `https://` listen with no certificate refused.
 Two rules are specific to this endpoint:
 
 * **No wildcard host over `https://`.** `https://0.0.0.0:9000`,
-  `https://[::]:9000`, and every other spelling of the unspecified address are
-  `ConfigError`s. Jobs dial the address they are handed, and no certificate
-  carries a SAN for "every interface", so every job would fail hostname
-  verification. Name the interface explicitly (`https://10.0.0.5:9000`).
+  `https://[::]:9000`, and every other form that the host's socket layer
+  reads as the unspecified address are `ConfigError`s. Jobs dial the
+  address they are handed, and no certificate carries a SAN for "every
+  interface", so every job would fail hostname verification. Name the
+  interface explicitly (`https://10.0.0.5:9000`).
 * **The advertised URL is the configured host**, not the bound one. A job
   receives `CRONSTABLE_STATE_URL=https://10.0.0.5:9000`, the address it can
   actually dial and the one the certificate covers. (The daemon uses the

@@ -214,7 +214,7 @@ def _http(
 def _parse_body(body: bytes) -> dict[str, Any]:
     """A response body as a dict, tolerating non-JSON.
 
-    Error bodies are not always JSON.  This daemon's endpoint now wraps
+    Error bodies are not always JSON.  This daemon's endpoint wraps
     every error it serves in the ``{"error": ...}`` envelope, but the CLI
     may be talking to one older than that arm, and a reverse proxy or a
     transport-level failure aiohttp answers itself still renders as
@@ -251,8 +251,12 @@ def _json(
 
 
 def _ok(status: int, data: dict[str, Any]) -> dict[str, Any]:
-    """Return the body, or raise the endpoint's error for a 4xx/5xx."""
-    if status >= 400:
+    """Return the body of a 2xx reply, or raise the endpoint's error.
+
+    Every other status is a failure. That includes a 3xx that names no
+    redirect target, which the transport returns as a status.
+    """
+    if not 200 <= status < 300:
         raise _CliError(
             data.get("error")
             or "the state endpoint returned HTTP {}".format(status)
@@ -469,7 +473,7 @@ def _cmd_artifact(args: argparse.Namespace) -> int:
         if status == 404:
             print("artifact not found: {}".format(args.name), file=sys.stderr)
             return EXIT_NOT_FOUND
-        if status >= 400:
+        if not 200 <= status < 300:
             _ok(status, _parse_body(body))
         if args.output in (None, "-"):
             sys.stdout.buffer.write(body)
@@ -541,7 +545,7 @@ def _cmd_xcom(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return EXIT_NOT_FOUND
-        if status >= 400:
+        if not 200 <= status < 300:
             _ok(status, _parse_body(body))
         _write_output(args.output, body)
         return 0
@@ -580,6 +584,7 @@ def _lock_acquire(args: argparse.Namespace) -> tuple[bool, str | None]:
     scope = _scope_of(args)
     # a --wait long poll is server-bounded by blockSeconds: the client
     # deadline is that plus margin, so the server (not the socket) ends it.
+    # The transport caps the deadline at the longest wait a socket takes.
     deadline = args.timeout + _DEFAULT_TIMEOUT if args.wait else None
     status, data = _json(
         "POST",

@@ -33,6 +33,11 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only
 # a lone surrogate, which UTF-8 cannot encode.
 _UNSENDABLE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f\ud800-\udfff]")
 
+# The longest timeout, in seconds, that a socket takes on every platform:
+# about 24.9 days. Windows counts a timeout in milliseconds in a C int, and
+# a socket there raises OverflowError for a longer one.
+_LONGEST_TIMEOUT = 2147483.0
+
 
 class ClientError(Exception):
     """A request that got no usable reply from the daemon.
@@ -240,6 +245,10 @@ def send(
     ``--url``. A redirect to that endpoint on another base names the base
     to pass instead.
 
+    ``timeout`` is the number of seconds to wait on the socket. One that
+    is not greater than 0 raises :exc:`ClientError`, and one longer than
+    ``_LONGEST_TIMEOUT`` waits that long.
+
     ``limit`` is the most bytes of the body to read. A caller that reads
     only the headers passes 0.
     """
@@ -275,6 +284,15 @@ def send(
             "cannot send a request to {}: the address is not an http:// or "
             "https:// URL".format(what)
         )
+    if not timeout > 0:
+        # A socket raises ValueError for a negative timeout and for one
+        # that is not a number, and a timeout of 0 makes it non-blocking.
+        # NaN fails the comparison, so this branch refuses it too.
+        raise ClientError(
+            "cannot send a request to {}: the timeout of {:g} seconds is "
+            "not greater than 0".format(what, timeout)
+        )
+    timeout = min(timeout, _LONGEST_TIMEOUT)
     try:
         try:
             with opener.open(req, timeout=timeout) as resp:

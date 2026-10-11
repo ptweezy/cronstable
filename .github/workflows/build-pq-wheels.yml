@@ -78,9 +78,11 @@ jobs:
           # Passed as env so the single-quoted script stays free of quotes.
           # Each string runs in a fresh `sh -c`, so it sources retry.sh
           # itself. manylinux adds the perl modules OpenSSL needs: IPC::Cmd
-          # (Configure), Time::Piece (its Makefile), bigint (s390x asm).
+          # (Configure), Time::Piece (its Makefile), bigint (s390x asm). The
+          # time limits on the rustup download make a stalled attempt fail,
+          # so the retry covers it.
           PQ_TOOLS: ${{ matrix.libc == 'musl' && '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache build-base libffi-dev rust cargo openssl-dev openssl-libs-static pkgconf' || matrix.manylinux && '. /src/.github/scripts/retry.sh && retry 5 yum install -y perl-IPC-Cmd perl-Time-Piece perl-bignum' || '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev rustc cargo libssl-dev zlib1g-dev libzstd-dev pkg-config' }}
-          RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/src/.pq-cache/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+          RUST_SETUP_CMD: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --connect-timeout 30 --max-time 60 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/src/.pq-cache/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
           # The probe below installs the project, and the python images carry
           # no git, so the version comes from here.
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version }}

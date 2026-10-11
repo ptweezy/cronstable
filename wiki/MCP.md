@@ -294,7 +294,9 @@ Flags:
   sent before `initialize` completes (default `2025-11-25`); after
   `initialize` returns, the bridge adopts the server's negotiated version
 - `--timeout` (default `30.0`): per-request deadline, in seconds, for each
-  forwarded frame
+  forwarded frame. It takes a finite number greater than `0`; any other
+  value is a usage error (exit status 2). The bridge waits at most 2,147,483
+  seconds (about 24.9 days) for a reply
 - `--check`: probe the endpoint with `server/discover` (or `initialize`,
   for a daemon that does not answer it), count its tools, print the protocol
   and era, and exit

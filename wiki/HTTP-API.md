@@ -150,10 +150,10 @@ error whose reason says nothing: its `error` is the generic
 an unknown token, so the response cannot be used to tell them apart.
 
 aiohttp answers requests that fail before they reach the application, as
-`text/plain`. A malformed request line, an unparseable method token, and
-request headers past 8190 bytes are each a `400`, and an unrecognized
-`Expect:` header is a `417`. The envelope covers every response from the
-routing layer inward.
+`text/plain`. A malformed request line, an unparseable method token, and a
+request target or header value longer than 8,190 bytes are each a `400`, and
+an unrecognized `Expect:` header is a `417`. The envelope covers every
+response from the routing layer inward.
 
 One listener is outside this contract: the cluster peer transport
 ([clustering and leader election](Clustering-and-Leader-Election)), a separate
@@ -1205,11 +1205,17 @@ daemon. `instance` is an ID that the daemon draws at random when it starts
 and keeps until it exits. `listeners`
 holds the address of each TCP socket that the `web.listen` entries bound, in
 the form of a `web.listen` entry, such as `http://0.0.0.0:8080`. Every
-response from the daemon, including a `401`, carries the instance ID in the
-`Cronstable-Instance` header, so a client can recognize a daemon without
-presenting a token.
-[`cronstable pair`](Terminal-Pairing#the-address-in-the-code) reads both
-fields to check whether another address reaches the same daemon.
+response that the web API serves, including a `401` and a `404`, carries the
+instance ID in the `Cronstable-Instance` header, so a client can recognize a
+daemon without presenting a token. A `400` for a request that fails before
+it reaches the application, such as one with a malformed request line or a
+header value longer than 8,190 bytes, doesn't carry the header. Neither do
+responses from the
+[job-facing state endpoints](#job-facing-state-endpoints-loopback) and the
+cluster peer transport, which are separate listeners.
+[`cronstable pair`](Terminal-Pairing#the-address-in-the-code) reads
+`instance` and `listeners` to check whether another address reaches the same
+daemon.
 
 A companion app uses it to show what it may do. The dashboard uses it to warn
 when its pairing QR would hand a phone a token that passes every route's

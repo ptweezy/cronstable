@@ -6,14 +6,16 @@ Use the dashboard served by ``tests/_web_e2e.py`` to check these behaviors:
   each palette is distinct. Read expected colors from the stylesheet to
   avoid maintaining a second copy.
 * Text meets the configured contrast thresholds in every theme and color
-  vision mode.
+  vision mode. The measurement composites translucent fills and opacity.
 * ``prefers-reduced-motion`` and the app setting stop animations and skip
   the boot screen. The page also responds to operating system changes.
 * UI scale, font, density, and color vision settings apply and persist.
 * Preferences survive reloads. Invalid stored values fall back to defaults.
 * Panels fit the viewport at widths of 390 and 820 pixels.
-* The header keeps its controls inside the window at widths from 340 to
-  1,440 pixels, and at the largest UI scale.
+* The header hides its readouts in order as it narrows and keeps its
+  controls inside the window, at widths from 340 to 1,440 pixels and at
+  larger UI scales. During an outage, a narrow header shows ``no signal``,
+  and it hides the ``live`` label again when the connection returns.
 """
 
 import json
@@ -144,31 +146,58 @@ def test_every_theme_applies_its_tokens_to_the_page(browser, tmp_path):
             )
 
 
-# WCAG relative luminance contrast of rendered text against the first
-# opaque background behind it.
+# Compute the WCAG contrast of rendered text against the color painted
+# behind it. The helper paints the chain from the page canvas down to the
+# element: each background color goes over what is behind it, the text goes
+# over that, and each element's opacity blends its whole subtree with what is
+# behind the element. Background images, filters, and overlapping siblings
+# are outside this model.
 _CONTRAST = """
 (selectors) => {
+  // Chromium serializes a color-mix() result as color(srgb r g b / a),
+  // with channels from 0 to 1.
   const parse = (c) => {
-    const m = c.match(/rgba?\\(([^)]+)\\)/)[1].split(",").map(parseFloat);
-    return { r: m[0], g: m[1], b: m[2], a: m.length > 3 ? m[3] : 1 };
+    let m = c.match(/^rgba?\\(([^)]+)\\)$/), unit = 1;
+    if (!m) { m = c.match(/^color\\(srgb ([^)]+)\\)$/); unit = 255; }
+    const v = m ? m[1].split(/[\\s,\\/]+/).map(parseFloat) : [];
+    if (v.length < 3 || v.some(Number.isNaN))
+      throw new Error("unreadable color: " + c);
+    return { r: v[0] * unit, g: v[1] * unit, b: v[2] * unit,
+      a: v.length > 3 ? v[3] : 1 };
   };
   const lum = (c) => {
     const f = (v) => { v /= 255;
       return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
     return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b);
   };
-  const backdrop = (el) => {
-    for (let e = el; e; e = e.parentElement) {
-      const c = parse(getComputedStyle(e).backgroundColor);
-      if (c.a >= 0.99) return c;
+  // Paint `top` over `under` with coverage `a`.
+  const over = (top, under, a) => ({
+    r: top.r * a + under.r * (1 - a),
+    g: top.g * a + under.g * (1 - a),
+    b: top.b * a + under.b * (1 - a),
+  });
+  // Paint chain[i] and its descendants over `behind`. Return the text ink
+  // and the color behind the text, both as painted.
+  const paint = (chain, i, behind) => {
+    const cs = getComputedStyle(chain[i]);
+    const fill = parse(cs.backgroundColor);
+    let bg = over(fill, behind, fill.a), ink;
+    if (i === chain.length - 1) {
+      const text = parse(cs.color);
+      ink = over(text, bg, text.a);
+    } else {
+      [ink, bg] = paint(chain, i + 1, bg);
     }
-    return { r: 255, g: 255, b: 255, a: 1 };
+    const opacity = parseFloat(cs.opacity);
+    return [over(ink, behind, opacity), over(bg, behind, opacity)];
   };
   const out = {};
   for (const sel of selectors) {
     const el = document.querySelector(sel);
     if (!el) { out[sel] = null; continue; }
-    const ink = parse(getComputedStyle(el).color), bg = backdrop(el);
+    const chain = [];
+    for (let e = el; e; e = e.parentElement) chain.unshift(e);
+    const [ink, bg] = paint(chain, 0, { r: 255, g: 255, b: 255 });
     const a = lum(ink), b = lum(bg);
     out[sel] = (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
   }
@@ -177,8 +206,9 @@ _CONTRAST = """
 """
 
 # Map selectors to the stylesheet's minimum contrast ratios: 7:1 for body
-# text, 4.2:1 for secondary text and controls, and 3:1 for status indicators.
-# Status indicators also use icons and labels so color is not the only cue.
+# text, 4.5:1 for log line numbers and timestamps, 4.2:1 for secondary text
+# and controls, and 3:1 for status indicators. Status indicators also use
+# icons and labels so color is not the only cue.
 _CONTRAST_FLOORS = {
     "#rows .jobname": 7.0,
     "#rows .jobcmd": 4.2,
@@ -193,6 +223,8 @@ _CONTRAST_FLOORS = {
     '#rows tr[data-job="epsilon-quiet"] .st .label': 3.0,
     '#rows tr[data-job="delta-off"] .st .label': 3.0,
     "#term .ln.stderr": 4.2,
+    "#term .ln .gut": 4.5,
+    "#term .ln .ts": 4.5,
     "#dMeta": 4.2,
 }
 
@@ -201,9 +233,11 @@ def test_text_contrast_in_every_theme_and_vision_mode(browser, tmp_path):
     with e2e.Daemon(tmp_path) as daemon:
         daemon.run_and_wait("alpha-ok")
         daemon.run_and_wait("beta-fail")
-        with e2e.open_page(browser, daemon.url) as page:
+        # The timestamp setting adds a timestamp to each log line.
+        with e2e.open_page(browser, daemon.url, prefs={"ts": True}) as page:
             _click(page, '#rows [data-logs="beta-fail"]')
             page.wait_for_selector("#term .ln.stderr")
+            page.wait_for_selector("#term .ln .ts")
             # Measure colors after palette transitions finish.
             page.add_style_tag(content="* { transition: none !important; }")
             failures = []
@@ -229,6 +263,99 @@ def test_text_contrast_in_every_theme_and_vision_mode(browser, tmp_path):
                                 )
                             )
             assert not failures, "\n".join(failures)
+
+
+def _wcag(ink, backdrop):
+    """Return the WCAG contrast ratio of two opaque sRGB colors."""
+
+    def luminance(color):
+        r, g, b = (
+            v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+            for v in (channel / 255 for channel in color)
+        )
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    a, b = luminance(ink), luminance(backdrop)
+    return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+
+
+_BLACK, _WHITE = (0, 0, 0), (255, 255, 255)
+
+# Define nested boxes for the contrast helper. Each case lists one style for
+# each box, outermost first, and the innermost box holds the text. The two
+# colors are the text and the color behind it as the browser paints them.
+_CONTRAST_CASES = [
+    ("opaque", ["background: #fff", "color: #000"], _BLACK, _WHITE),
+    (
+        "own opacity",
+        ["background: #fff", "color: #000; opacity: .6"],
+        (102, 102, 102),
+        _WHITE,
+    ),
+    (
+        "ancestor opacity",
+        ["background: #fff", "opacity: .7", "color: #000"],
+        (76.5, 76.5, 76.5),
+        _WHITE,
+    ),
+    (
+        "translucent ink",
+        ["background: #fff", "color: rgba(0, 0, 0, .5)"],
+        (127.5, 127.5, 127.5),
+        _WHITE,
+    ),
+    (
+        "translucent fill",
+        [
+            "background: #000",
+            "background: rgba(255, 255, 255, .5)",
+            "color: #000",
+        ],
+        _BLACK,
+        (127.5, 127.5, 127.5),
+    ),
+    (
+        "color-mix fill",
+        [
+            "background: #000",
+            "background: color-mix(in srgb, #fff 50%, transparent)",
+            "color: #000",
+        ],
+        _BLACK,
+        (127.5, 127.5, 127.5),
+    ),
+    # Opacity blends the box's own fill and its text with the white behind.
+    (
+        "fill under its own opacity",
+        ["background: #fff", "background: #000; opacity: .5", "color: #fff"],
+        _WHITE,
+        (127.5, 127.5, 127.5),
+    ),
+]
+
+
+def test_contrast_helper_composites_opacity_and_translucent_colors(browser):
+    """Check ``_CONTRAST`` against ratios computed from known colors."""
+    boxes = []
+    for index, (_, styles, _, _) in enumerate(_CONTRAST_CASES):
+        box = '<div id="case{}" style="{}">text</div>'.format(
+            index, styles[-1]
+        )
+        for style in reversed(styles[:-1]):
+            box = '<div style="{}">{}</div>'.format(style, box)
+        boxes.append(box)
+    page = browser.new_page()
+    try:
+        page.set_content("".join(boxes))
+        ratios = page.evaluate(
+            _CONTRAST, ["#case%d" % i for i in range(len(boxes))]
+        )
+    finally:
+        page.close()
+    for index, (name, _, ink, backdrop) in enumerate(_CONTRAST_CASES):
+        assert ratios["#case%d" % index] == pytest.approx(
+            _wcag(ink, backdrop), abs=0.01
+        ), name
 
 
 def test_color_vision_modes_remap_the_status_inks(browser, tmp_path):
@@ -921,21 +1048,89 @@ _HEADER_STRAYS = """
 """
 
 
+# List the readouts that the header hides as it narrows, in hiding order.
+# Each entry pairs a readout with the widest header content box, in CSS
+# pixels, that hides it. The content box is the size the header's container
+# queries test.
+_HEADER_READOUTS = [
+    ("#jobset", 1379),
+    ("#nodeMeter .bar", 1299),
+    ("#clock", 1209),
+    ("#nodeMeter", 1109),
+    ("#ver", 1109),
+    ("#summary .pill.opt", 949),
+    ("#summary", 519),
+    ("#authLabel", 519),
+    ("#connTxt", 339),
+]
+
+# List the parts of the header that stay at every width.
+_HEADER_CONTROLS = [
+    "#brandName",
+    "#conn .dot",
+    "#paletteBtn",
+    "#refreshBtn",
+    "#settingsBtn",
+    "#authBtn",
+    "#authIcon",
+]
+
+# Measure the header's content box and report which elements have a box.
+# A missing element reports null.
+_HEADER_STATE = """
+(selectors) => {
+  const header = document.querySelector('header');
+  const cs = getComputedStyle(header);
+  const shown = {};
+  for (const sel of selectors) {
+    const el = document.querySelector(sel);
+    shown[sel] = el ? el.getClientRects().length > 0 : null;
+  }
+  return {
+    box: header.clientWidth - parseFloat(cs.paddingLeft) -
+      parseFloat(cs.paddingRight),
+    height: header.getBoundingClientRect().height,
+    shown,
+  };
+}
+"""
+
+
+def _header_state(page):
+    return page.evaluate(
+        _HEADER_STATE,
+        [selector for selector, _ in _HEADER_READOUTS] + _HEADER_CONTROLS,
+    )
+
+
+def _assert_header_controls(page, state):
+    for control in _HEADER_CONTROLS:
+        assert state["shown"][control], control
+    assert page.evaluate(_HEADER_STRAYS) == []
+
+
+# Each case names a window width, a UI scale, and how many readouts the
+# header hides, counted from the start of _HEADER_READOUTS. Each case puts
+# the header's content box at least 20 pixels from the nearest breakpoint, so
+# a scrollbar that takes layout width doesn't change the count.
 @pytest.mark.parametrize(
-    "width,scale",
+    "width,scale,hidden",
     [
-        (340, 100),
-        (390, 100),
-        (820, 100),
-        (1024, 100),
-        (1180, 100),
-        (1280, 100),
-        (1440, 100),
-        (1440, 140),
+        (340, 100, 9),
+        (412, 100, 8),
+        (820, 100, 6),
+        (1024, 100, 5),
+        (1180, 100, 3),
+        (1280, 100, 2),
+        (1380, 100, 1),
+        (1440, 100, 0),
+        # A larger UI scale narrows the header like a narrower window does.
+        (430, 125, 9),
+        (1440, 140, 5),
     ],
 )
-def test_header_keeps_its_controls_inside_the_window(
-    browser, tmp_path, width, scale
+def test_header_hides_readouts_in_order_and_keeps_its_controls(
+    browser, tmp_path, width, scale, hidden
 ):
     with e2e.Daemon(tmp_path, jobs=e2e.default_jobs()) as daemon:
         with e2e.open_page(
@@ -944,21 +1139,64 @@ def test_header_keeps_its_controls_inside_the_window(
             prefs={"scale": scale},
             viewport={"width": width, "height": 900},
         ) as page:
-            # Wait for attached, not visible, because the narrow header
-            # hides both elements.
-            page.wait_for_selector("#summary .pill", state="attached")
+            # Wait for every readout to render. Wait for attached, not
+            # visible, because a narrow header hides them.
+            for readout in ("#summary .pill.opt", "#nodeMeter .bar"):
+                page.wait_for_selector(readout, state="attached")
             page.wait_for_function(
-                "document.getElementById('ver').textContent"
+                "document.getElementById('ver').textContent && "
+                "document.getElementById('jobset').textContent"
             )
-            assert page.evaluate(_HEADER_STRAYS) == []
-            for control in (
-                "#paletteBtn",
-                "#refreshBtn",
-                "#settingsBtn",
-                "#authBtn",
-            ):
-                assert page.is_visible(control), control
-            # A narrow header hides readouts and keeps its controls.
-            if width <= 390:
-                assert not page.is_visible("#summary")
-                assert not page.is_visible("#clock")
+            state = _header_state(page)
+            assert None not in state["shown"].values(), state["shown"]
+            expected = [selector for selector, _ in _HEADER_READOUTS[:hidden]]
+            # The window width and the UI scale decide which readouts the
+            # header hides.
+            assert [
+                selector
+                for selector, limit in _HEADER_READOUTS
+                if state["box"] <= limit
+            ] == expected, state["box"]
+            assert [
+                selector
+                for selector, _ in _HEADER_READOUTS
+                if not state["shown"][selector]
+            ] == expected, state["box"]
+            _assert_header_controls(page, state)
+
+
+@pytest.mark.parametrize("width,scale", [(340, 100), (430, 125)])
+def test_narrow_header_hides_the_live_label_again_after_an_outage(
+    browser, tmp_path, width, scale
+):
+    with e2e.Daemon(tmp_path) as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            prefs={"pollMs": 1000, "scale": scale},
+            viewport={"width": width, "height": 900},
+        ) as page:
+
+            def label():
+                return page.evaluate(
+                    "(document.getElementById('connTxt') || {}).textContent"
+                )
+
+            before = _header_state(page)
+            assert label() == "live"
+            assert before["shown"]["#connTxt"] is False
+            page.faults.abort(r"/jobs")
+            page.wait_for_selector("#conn .dot.dead")
+            # The label reads "no signal" at every width during an outage.
+            # The header wraps when the longer label needs the room.
+            down = _header_state(page)
+            assert label() == "no signal"
+            assert down["shown"]["#connTxt"] is True
+            _assert_header_controls(page, down)
+            page.faults.clear(r"/jobs")
+            page.wait_for_selector("#conn .dot.live")
+            after = _header_state(page)
+            assert label() == "live"
+            assert after["shown"]["#connTxt"] is False
+            assert after["height"] == before["height"]
+            _assert_header_controls(page, after)

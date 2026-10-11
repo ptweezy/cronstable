@@ -23,8 +23,9 @@ from cronstable import netutil
 #: no push section, and when ``GET /whoami`` names no ``pairLinkBase``.
 PAIR_LINK_FALLBACK = "https://relay.cronstable.com/pair"
 
-#: The header that carries the daemon's instance ID on every reply, with or
-#: without a token. ``GET /whoami`` reports the same ID as ``instance``.
+#: The header that carries the daemon's instance ID on every reply that the
+#: web API serves, with or without a token. ``GET /whoami`` reports the same
+#: ID as ``instance``.
 INSTANCE_HEADER = "Cronstable-Instance"
 
 #: The scopes a route can require. A token that holds them passes every
@@ -233,10 +234,14 @@ def accepted_token(whoami: Any, token: str | None) -> str | None:
 
 
 def payload(name: str, url: str, token: str | None) -> str:
-    """The pairing JSON, in the form the dashboard writes it.
+    """The pairing JSON: the text that the dashboard writes, with each
+    character that :meth:`str.isprintable` rejects as its JSON escape.
 
-    Raises :exc:`ValueError` for a name or an address that UTF-8 cannot
-    encode, such as a command-line argument with a byte outside UTF-8.
+    The text goes to a terminal and the name comes from the daemon. The
+    escape parses to the same character, so the app reads the same
+    pairing. Raises :exc:`ValueError` for a name or an address that UTF-8
+    cannot encode, such as a command-line argument with a byte outside
+    UTF-8.
     """
     for what, value in (("server name", name), ("address", url)):
         try:
@@ -246,10 +251,16 @@ def payload(name: str, url: str, token: str | None) -> str:
                 "the {} {!a} holds a character that UTF-8 cannot "
                 "encode".format(what, value)
             ) from None
-    return json.dumps(
+    text = json.dumps(
         {"v": 1, "name": name, "url": url, "token": token or ""},
         separators=(",", ":"),
         ensure_ascii=False,
+    )
+    # The call above leaves every character from U+007F up as it is. With
+    # its defaults, json.dumps writes one as its escape inside quotes, and
+    # as a surrogate pair above the BMP.
+    return "".join(
+        ch if ch.isprintable() else json.dumps(ch)[1:-1] for ch in text
     )
 
 
@@ -263,7 +274,8 @@ def hint(token: str | None) -> list[str]:
     """What the terminal clients print beside a code that carries
     ``token``."""
     lines = [
-        "Scan the code with the phone's camera, or tap Scan QR in the app."
+        "Scan the code with the phone's camera, or tap Scan QR code in the "
+        "app."
     ]
     if token:
         lines.append(

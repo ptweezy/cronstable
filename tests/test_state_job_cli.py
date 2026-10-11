@@ -11,10 +11,12 @@ test_state_job_api.py).
 """
 
 import argparse
+import http.server
 import io
 import json
 import ssl
 import sys
+import threading
 import urllib.error
 import urllib.request
 
@@ -340,6 +342,59 @@ def test_lock_run_parses_flags_before_command(job_cli):
     assert acquire["json"]["ttl"] == 42.0
 
 
+@pytest.mark.parametrize("verb", ["acquire", "run"])
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e999", "soon", ""])
+def test_lock_timeout_that_is_not_a_finite_number_is_a_usage_error(
+    job_cli, capsys, verb, value
+):
+    # a socket refuses a deadline that is not a number, so the parser
+    # refuses the flag before the command takes the lock.  The `=` form
+    # hands argparse a leading minus as the value on every Python.
+    http = _FakeHTTP(_LOCK_OK)
+    argv = ["lock", verb, "L", "--wait", "--timeout=" + value]
+    if verb == "run":
+        argv += ["--", sys.executable, "-c", "pass"]
+    assert job_cli(argv, http) == 2  # the usage exit code
+    assert (
+        "argument --timeout: SECONDS must be a finite number, "
+        "not {!r}".format(value)
+    ) in capsys.readouterr().err
+    assert http.calls == []
+
+
+@pytest.mark.parametrize(
+    "value, seconds", [("0", 0.0), ("0.5", 0.5), ("1e300", 1e300)]
+)
+def test_lock_timeout_takes_a_finite_wait_from_0_up(job_cli, value, seconds):
+    http = _FakeHTTP(
+        {"/v1/lock/acquire": (200, {"acquired": True, "token": "h1"})}
+    )
+    argv = ["lock", "acquire", "L", "--wait", "--timeout", value]
+    assert job_cli(argv, http) == 0
+    assert http.calls[0]["json"]["blockSeconds"] == seconds
+    assert http.calls[0]["timeout"] == seconds + jobcli._DEFAULT_TIMEOUT
+
+
+@pytest.mark.parametrize("value", ["-1", "-0.5", "-100", "-0.0"])
+def test_lock_timeout_below_0_is_no_wait(job_cli, value):
+    # the daemon reads a negative blockSeconds as no wait, so the client
+    # sends 0 and keeps its own deadline above the socket's floor
+    http = _FakeHTTP(
+        {"/v1/lock/acquire": (200, {"acquired": True, "token": "h1"})}
+    )
+    argv = ["lock", "acquire", "L", "--wait", "--timeout=" + value]
+    assert job_cli(argv, http) == 0
+    assert http.calls[0]["json"]["blockSeconds"] == 0.0
+    assert http.calls[0]["timeout"] == jobcli._DEFAULT_TIMEOUT
+
+
+def test_lock_run_with_a_timeout_below_0_runs_its_command(job_cli):
+    http = _FakeHTTP(_LOCK_OK)
+    argv = ["lock", "run", "L", "--timeout=-1", "--"]
+    argv += [sys.executable, "-c", "import sys; sys.exit(7)"]
+    assert job_cli(argv, http) == 7  # the wrapped command ran
+
+
 # --------------------------------------------------------------------------
 # artifact + secret
 # --------------------------------------------------------------------------
@@ -660,6 +715,12 @@ def test_opener_without_cacert_is_the_shared_opener(monkeypatch):
 def test_opener_with_cacert_verifies_against_it(monkeypatch, tmp_path):
     ca = _write_ca(tmp_path)
     monkeypatch.setenv(jobcli.ENV_CACERT, ca)
+    # a proxy in the environment while the opener is built: urllib registers
+    # a ProxyHandler only when a proxy is configured, so without one the
+    # no-proxy assertion below also passes for an opener that reads its
+    # proxies from the environment.
+    for name in ("http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
     opener = jobcli._opener()
     assert opener is not jobcli._OPENER
     https = [
@@ -746,10 +807,127 @@ def test_http_sends_the_given_method(monkeypatch):
     assert opener.request.get_method() == "POST"
 
 
+def test_http_timeout_that_no_socket_takes_raises_cli_error(monkeypatch):
+    # the transport refuses the value before it opens a connection
+    with pytest.raises(jobcli._CliError) as ei:
+        _post(monkeypatch, _FakeResponse(200, b"{}"), timeout=float("nan"))
+    assert str(ei.value) == (
+        "cannot send a request to the cronstable state endpoint at "
+        "http://127.0.0.1:1: the timeout of nan seconds is not greater "
+        "than 0"
+    )
+
+
 def test_parse_body_wraps_non_object_json():
     assert jobcli._parse_body(b"[1, 2]") == {"value": [1, 2]}
     assert jobcli._parse_body(b"") == {}
     assert jobcli._parse_body(b"401: Unauthorized") == {}
+
+
+# ---------------------------------------------------------------------------
+# a reply outside 2xx is a failure
+# ---------------------------------------------------------------------------
+
+
+def test_ok_returns_a_2xx_body_and_raises_for_every_other_status():
+    assert jobcli._ok(200, {"value": 1}) == {"value": 1}
+    assert jobcli._ok(204, {}) == {}
+    for status in (199, 300, 302, 304, 400, 503):
+        with pytest.raises(jobcli._CliError, match="HTTP {}".format(status)):
+            jobcli._ok(status, {})
+    # the endpoint's own error text replaces the status
+    with pytest.raises(jobcli._CliError, match="^store down$"):
+        jobcli._ok(302, {"error": "store down"})
+
+
+@pytest.mark.parametrize("status", [302, 304])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["state", "get", "k"],
+        ["state", "set", "k", "v"],
+        ["state", "delete", "k"],
+        ["state", "keys"],
+        ["cursor", "get", "c"],
+        ["cursor", "advance", "c", "5"],
+        ["idempotent", "order-1"],
+        ["idempotent", "order-1", "--release"],
+        ["secret", "get", "s"],
+        ["secret", "list"],
+        ["artifact", "get", "a"],
+        ["artifact", "list"],
+        ["lock", "acquire", "L"],
+        ["lock", "release", "T"],
+        ["xcom", "pull", "--task", "b", "--key", "k"],
+        ["xcom", "list"],
+    ],
+    ids=" ".join,
+)
+def test_3xx_that_names_no_target_is_an_error_for_every_verb(
+    monkeypatch, job_cli, capsysbinary, status, argv
+):
+    # the transport returns a 3xx with no Location header as a status, and
+    # no verb reads it as success: `state set` stored nothing, `idempotent`
+    # claimed nothing (so exit 5 would tell a guard script to skip its
+    # work), and `artifact get` has no artifact to write.  The test drives
+    # the real _http with what the redirect-free opener raises for the reply.
+    _xcom_env(monkeypatch)
+    monkeypatch.delenv(jobcli.ENV_CACERT, raising=False)
+    reply = urllib.error.HTTPError(
+        "http://x", status, "moved", None, io.BytesIO(b"<html>moved</html>")
+    )
+    monkeypatch.setattr(jobcli, "_OPENER", _FakeOpener(reply))
+    assert job_cli(argv) == 1
+    captured = capsysbinary.readouterr()
+    assert captured.out == b""
+    assert (
+        "the state endpoint returned HTTP {}".format(status).encode()
+        in captured.err
+    )
+
+
+def test_3xx_that_names_no_target_from_a_real_server_is_an_error(
+    monkeypatch, job_cli, capsysbinary
+):
+    # A real socket, not the _http seam, so the test exercises urllib's own
+    # handling of the reply.
+    body = b"<html>moved</html>"
+
+    class _Moved(http.server.BaseHTTPRequestHandler):
+        def _answer(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(302)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = _answer
+
+        def log_message(self, *args):
+            pass
+
+    monkeypatch.delenv(jobcli.ENV_CACERT, raising=False)
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Moved)
+    # a short poll, so that shutdown returns at once
+    thread = threading.Thread(
+        target=server.serve_forever, args=(0.01,), daemon=True
+    )
+    thread.start()
+    try:
+        url = "http://127.0.0.1:{}".format(server.server_port)
+        for argv in (
+            ["state", "set", "k", "v"],
+            ["idempotent", "order-1"],
+            ["artifact", "get", "a"],
+        ):
+            assert job_cli(argv, url=url) == 1
+            captured = capsysbinary.readouterr()
+            assert captured.out == b""
+            assert b"the state endpoint returned HTTP 302" in captured.err
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 # ---------------------------------------------------------------------------
