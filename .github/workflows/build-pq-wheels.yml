@@ -45,7 +45,7 @@ jobs:
           ref: ${{ steps.source.outputs.revision }}
           persist-credentials: false
       - name: Download resolved cryptography source
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: release-inputs
           path: release-inputs
@@ -181,7 +181,7 @@ jobs:
           path: .openssl-${{ matrix.arch }}
           key: openssl-pqwheel-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
         continue-on-error: true
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: pq-wheel-${{ matrix.libc }}-${{ matrix.arch }}
           path: wheelhouse/cryptography-*.whl
