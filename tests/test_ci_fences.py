@@ -196,6 +196,59 @@ def test_perf_gate_override_is_resolved_once_and_honoured_everywhere():
     assert "if [ -f perf/perf-summary.md ]" in notes["run"], notes["run"]
 
 
+def _compare_commands(run):
+    """Each ``benchmarks/compare.py`` command of a step, as a word list.
+
+    The script is read as the shell reads it: a comment is dropped and a
+    trailing backslash joins the next line, so a flag that only a comment
+    names is part of no command.
+    """
+    commands, words = [], []
+    for line in run.splitlines():
+        tokens = line.split()
+        for index, token in enumerate(tokens):
+            if token.startswith("#"):
+                del tokens[index:]
+                break
+        continued = tokens[-1:] == ["\\"]
+        words += tokens[:-1] if continued else tokens
+        if not continued:
+            if "benchmarks/compare.py" in words:
+                commands.append(words)
+            words = []
+    return commands
+
+
+def _word_after(words, flag):
+    """The word that follows ``flag`` in a command, or ``None``."""
+    if flag not in words[:-1]:
+        return None
+    return words[words.index(flag) + 1]
+
+
+def test_perf_gate_reads_the_budgets_and_the_expected_gated_list():
+    # compare.py runs neither check unless its flag names the file. The
+    # paths are the checked-in files that tests/test_benchmarks.py vets.
+    perf = _workflow()["jobs"]["perf"]
+    commands = _compare_commands(_named_steps(perf)["Compare and gate"]["run"])
+    assert any("--baseline" in words for words in commands), (
+        "no compare.py call with a baseline: the detector went stale"
+    )
+    for words in commands:
+        command = " ".join(words)
+        budgets = _word_after(words, "--budgets")
+        assert budgets == "benchmarks/budgets.json", (
+            "this call passes when a metric exceeds its checked-in "
+            "ceiling: " + command
+        )
+        if "--baseline" in words:  # nothing is compared without one
+            gated = _word_after(words, "--expected-gated")
+            assert gated == "benchmarks/expected_gated.txt", (
+                "this call passes when a metric on the checked-in list is "
+                "not compared: " + command
+            )
+
+
 def test_every_browser_backed_test_module_is_fenced():
     # The enforcement step is the ONLY thing standing between a
     # browser-backed module and running nowhere: these all self-skip

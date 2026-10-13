@@ -55,8 +55,8 @@ can seal at startup. If you expected post-quantum sealing and did not get
 it, that line says so. To ask a binary directly, run
 `cronstable --sealable-suites`, which prints one suite per line. On a
 platform without a wheel, you can attempt post-quantum sealing by
-building `cryptography` 50.0.1 or newer from source
-(`pip install "cryptography>=50.0.1,<51"`, which needs a Rust toolchain and the
+building `cryptography` 50.0.2 or newer from source
+(`pip install "cryptography>=50.0.2,<51"`, which needs a Rust toolchain and the
 OpenSSL 3.5 headers on that host).
 
 Cryptography 49.0.0 dropped support for Intel macOS and 32-bit Windows

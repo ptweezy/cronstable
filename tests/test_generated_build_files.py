@@ -86,7 +86,7 @@ def test_push_dependencies_resolve_without_vulnerable_legacy_crypto(
     assert ("cryptography" in active) == has_crypto
     if has_crypto:
         spec = active["cryptography"].specifier
-        assert "50.0.1" in spec
+        assert "50.0.2" in spec
         for vulnerable in ("44.0.0", "48.0.0", "48.0.1", "49.0.0"):
             assert vulnerable not in spec
 

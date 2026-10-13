@@ -15,7 +15,8 @@ import json
 import random
 import subprocess
 import sys
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -244,6 +245,11 @@ def _seconds_apart(iso, instant):
     return abs((datetime.fromisoformat(iso) - instant).total_seconds())
 
 
+def _wall_clock_lead():
+    """Seconds the wall clock leads the clock that times a retry's wait."""
+    return time.time() - time.perf_counter()
+
+
 def test_kill_with_retry_pending_rearms_the_same_deadline(daemon):
     script = daemon.script("retry.py", RETRY_JOB)
     daemon.configure(
@@ -281,6 +287,7 @@ def test_kill_with_retry_pending_rearms_the_same_deadline(daemon):
     daemon.kill()
     assert len(daemon.job_pids("retry")) == 1
 
+    lead = _wall_clock_lead()
     daemon.start()
     after = daemon.request("/jobs/retry")["retry"]
     # the ladder resumes where it stood: same attempt, and the deadline is
@@ -308,7 +315,12 @@ def test_kill_with_retry_pending_rearms_the_same_deadline(daemon):
         ("failure", 23),
         ("success", 0),
     ]
-    assert datetime.fromisoformat(runs[1]["started_at"]) >= not_before
+    # the daemon times the wait on a monotonic clock and stamps the launch
+    # from the wall clock, so a wall clock stepped back during the wait
+    # moves the stamp back by the size of the step.
+    stepped_back = max(0.0, lead - _wall_clock_lead())
+    earliest = not_before - timedelta(seconds=stepped_back)
+    assert datetime.fromisoformat(runs[1]["started_at"]) >= earliest
     assert len(daemon.job_pids("retry")) == 2
     daemon.wait(
         "persisting the settled ladder",

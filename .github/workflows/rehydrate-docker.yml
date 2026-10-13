@@ -69,7 +69,7 @@ jobs:
           mkdir -p release-inputs/refresh-tools
           cp ../.github/scripts/refresh_runtime.py ../.github/scripts/scan_gate.py \
             release-inputs/refresh-tools/
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: release-inputs
           path: source/release-inputs/
@@ -97,7 +97,7 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python }}
-      - uses: actions/download-artifact@v8.0.1
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: release-inputs
           path: release-inputs
@@ -188,7 +188,7 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: actions/download-artifact@v8.0.1
+      - uses: actions/download-artifact@v8.0.2
         with:
           pattern: image-${{ matrix.distro }}-linux-*
           path: images
@@ -208,7 +208,7 @@ jobs:
           retry 5 sudo apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update
           retry 5 sudo apt-get -o Acquire::Retries=5 install -y skopeo
           skopeo copy --all --preserve-digests oci-archive:image.tar:release oci:verified:release
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: docker-refresh-${{ matrix.distro }}
           path: |
@@ -249,7 +249,7 @@ jobs:
         env:
           ARTIFACT: docker-refresh-${{ matrix.distro }}
         run: python3 .github/scripts/docker_refresh.py ready
-      - uses: actions/download-artifact@v8.0.1
+      - uses: actions/download-artifact@v8.0.2
         if: steps.ready.outputs.ready == 'true'
         with:
           name: docker-refresh-${{ matrix.distro }}

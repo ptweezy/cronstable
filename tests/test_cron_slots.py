@@ -4,6 +4,7 @@ import copy
 import pytest
 
 import cronstable.cron
+from cronstable.job import JobRetryState
 from cronstable.state import Lease
 from tests._configs import job_yaml
 from tests._cron_helpers import (
@@ -452,6 +453,53 @@ async def test_slotlease_claim_replace_spawns_pursuit(monkeypatch):
     assert spawned and spawned[0][0] == "s"
 
 
+def _slotlease_retry_job(policy):
+    return job_yaml(
+        "s",
+        "echo hi",
+        extra=(
+            "    concurrencyScope: cluster\n"
+            "    concurrencyPolicy: %s\n"
+            "    onFailure:\n      retry:\n        maximumRetries: 2\n"
+            "        initialDelay: 60\n        maximumDelay: 60\n"
+            "        backoffMultiplier: 1\n" % policy
+        ),
+    )
+
+
+@pytest.mark.parametrize("policy", ["Forbid", "Replace"])
+async def test_slotlease_fire_that_a_peer_holds_back_leaves_its_ladder(
+    monkeypatch, slotlease_reaper, policy
+):
+    # A scheduled fire ends the job's retry sequence and installs its own
+    # ladder before the cluster slot rules on it.  A peer holds the slot,
+    # so the fire starts no run and no launch carries its ladder.  Under
+    # Replace the ladder waits for the launch of the pursuit.
+    cron = _slotlease_cluster_cron(
+        _slotlease_retry_job(policy), monkeypatch=monkeypatch
+    )
+    cron.state_backend = _SlotleaseBackend(
+        acquire=None, read=_slotlease_lease()
+    )
+    job = cron.cron_jobs["s"]
+    earlier = JobRetryState(60, 1, 60)
+    cron.retry_state["s"] = earlier
+
+    async def _pursuing(job, observed):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(cron, "_pursue_replace_slot", _pursuing)
+    slotlease_reaper(lambda: cron._slot_pursuits.get("s"))
+    await cron.launch_scheduled_job(job)
+    assert not cron.running_jobs.get("s")
+    ladder = cron.retry_state["s"]
+    assert earlier.cancelled
+    assert ladder is not earlier and ladder.unclaimed
+    pursued = policy == "Replace"
+    assert ("s" in cron._slot_pursuits) is pursued
+    assert cron._unclaimed_ladder("s") is not pursued
+
+
 async def test_slotlease_claim_adopts_own_late_acquire(
     monkeypatch, slotlease_reaper
 ):
@@ -780,6 +828,7 @@ async def test_slotlease_slot_renewer_replace_request_cancels_instance(
     class _FakeRun:
         def __init__(self):
             self.replaced = False
+            self.ended = False
             self.cancelled = False
 
         async def cancel(self):
@@ -809,6 +858,25 @@ async def test_slotlease_slot_renewer_replace_request_cancels_instance(
     assert run.replaced is True and run.cancelled is True
 
 
+async def test_slotlease_replace_request_leaves_an_ended_instance_alone():
+    # An instance that has ended keeps its outcome: the request neither
+    # marks it replaced nor cancels it.
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+
+    class _EndedRun:
+        replaced = False
+        ended = True
+
+        async def cancel(self):
+            raise AssertionError("cancelled an instance that has ended")
+
+    run = _EndedRun()
+    cron.running_jobs["s"] = [run]
+    cron._cancel_replaced_instances("s", "peerZ")
+    assert run.replaced is False
+    assert not cron._replace_cancel_tasks
+
+
 async def test_slotlease_slot_renewer_replace_cancel_runs_in_background(
     monkeypatch, caplog
 ):
@@ -824,6 +892,7 @@ async def test_slotlease_slot_renewer_replace_cancel_runs_in_background(
     class _SlowRun:
         def __init__(self):
             self.replaced = False
+            self.ended = False
             self.cancel_calls = 0
             self.config = cron.cron_jobs["s"]
 

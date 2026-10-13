@@ -453,8 +453,8 @@ _XWING_INFO = b"cronstable-push-xwing"
 #: verbatim; the library's own reason goes to the log instead.
 _XWING_BROKEN = (
     "cryptography is installed but cannot seal X-Wing; the reason is in "
-    "the cronstable log (reinstall cryptography 50.0.1 or newer: "
-    'pip install "cryptography>=50.0.1,<51")'
+    "the cronstable log (reinstall cryptography 50.0.2 or newer: "
+    'pip install "cryptography>=50.0.2,<51")'
 )
 
 
@@ -609,8 +609,8 @@ def validate_public_key(value: Any, suite: str = DEFAULT_SUITE) -> str:
         # :class:`_Suite`.
         raise PushError(
             "suite {} is not sealable by this daemon; pair with suite "
-            "{} instead, or install cryptography 50.0.1 or newer "
-            '(pip install "cryptography>=50.0.1,<51")'.format(
+            "{} instead, or install cryptography 50.0.2 or newer "
+            '(pip install "cryptography>=50.0.2,<51")'.format(
                 spec.name, DEFAULT_SUITE
             )
         )
@@ -713,8 +713,8 @@ def seal_to_device(
     if not spec.sealable:
         raise PushError(
             "cannot seal to suite {}: no implementation in this daemon; "
-            "install cryptography 50.0.1 or newer "
-            '(pip install "cryptography>=50.0.1,<51")'.format(spec.name)
+            "install cryptography 50.0.2 or newer "
+            '(pip install "cryptography>=50.0.2,<51")'.format(spec.name)
         )
     try:
         raw = base64.b64decode(public_key_b64, validate=True)
@@ -1529,14 +1529,14 @@ class PushService:
                 # cryptography, which the log must not call absent.
                 reason = (
                     "the installed cryptography is too old to seal it "
-                    "(X-Wing needs cryptography 50.0.1 or newer: "
-                    'pip install "cryptography>=50.0.1,<51")'
+                    "(X-Wing needs cryptography 50.0.2 or newer: "
+                    'pip install "cryptography>=50.0.2,<51")'
                 )
             else:
                 reason = (
                     "this install has no cryptography; the push extra "
                     "carries it wherever a wheel exists, and pip install "
-                    '"cryptography>=50.0.1,<51" attempts a source build '
+                    '"cryptography>=50.0.2,<51" attempts a source build '
                     "elsewhere"
                 )
             logger.info(
@@ -1646,8 +1646,8 @@ class PushService:
             "push: %d paired device(s) use a suite this node cannot seal, "
             "so alerts raised HERE will not reach them: %s. Install the "
             "matching library on this node (post-quantum xwing needs "
-            "cryptography 50.0.1 or newer: "
-            'pip install "cryptography>=50.0.1,<51"), '
+            "cryptography 50.0.2 or newer: "
+            'pip install "cryptography>=50.0.2,<51"), '
             "or re-pair those devices under a suite every node shares. "
             "Nodes sharing a device registry must carry the same sealing "
             "libraries.",

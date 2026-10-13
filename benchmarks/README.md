@@ -3,9 +3,11 @@
 This directory holds the performance regression harness that CI runs on every
 commit and enforces on every release. It exists to keep cronstable fast and
 small enough for old machines: startup cost, schedule math at 100k-job scale,
-config parsing, DAG planning, durable-state I/O, memory footprint, the terminal
-dashboard's per-frame string work, and the web dashboard's render hot paths are
-all measured, and a release that regresses past a metric's limit does not ship.
+config parsing, job launch and reaping, pool admission, DAG planning and runs,
+durable-state I/O, the HTTP, MCP and gossip response paths, memory footprint,
+the terminal dashboard's frames, and the web dashboard's render and poll paths
+are all measured, and a release that regresses past a metric's limit does not
+ship.
 
 ## The two tools
 
@@ -39,8 +41,18 @@ the full suite. `--only <substring>` selects benchmarks by name or group
 (for example `--only cronexpr`), `--tier inprocess` (or `subprocess`) selects
 one tier, `--warmup N` overrides the warm-up passes, `--no-stabilize` skips
 the CPU pin, `--list` prints the inventory, and `--smoke` is the minimal mode
-the unit tests use. If cronstable is not installed in the interpreter, the
-harness falls back to the source tree it lives in and says so on stderr.
+the unit tests use.
+
+The harness measures the cronstable package that the interpreter imports, and
+each run names that package's directory on stderr. An interpreter with
+cronstable installed measures the installed copy, which is how CI benchmarks
+an older release with the current harness. To measure a checkout from such an
+interpreter, such as a tox environment, set `PYTHONPATH` to the checkout's
+root. A relative path works: the subprocess benchmarks run in a temporary
+directory, and the harness gives them each `PYTHONPATH` entry as an absolute
+path. An empty entry names the current directory, as it does for Python. If
+cronstable is not installed in the interpreter, the harness falls back to the
+source tree it lives in and says so on stderr.
 
 Local numbers are only comparable to other runs on the same machine in the
 same session. The CI comparison is paired for exactly that reason: both
@@ -130,15 +142,25 @@ audits found the relative gate alone could not deliver them:
   across many quick releases compounds under a green gate (seven release
   hops in five days at a legal 15% each is 2.7x). A handful of headline
   metrics carry absolute ceilings; a breach fails the run even when the
-  relative gate passes. Raising a ceiling is a deliberate edit to
-  `budgets.json`, made in the same PR as the change that needs it.
+  relative gate passes. A value that is not finite counts as a breach.
+  Raising a ceiling is a deliberate edit to `budgets.json`, made in the
+  same PR as the change that needs it.
 - **Gate integrity** (`expected_gated.txt`, `compare.py --expected-gated`).
   A metric whose BASELINE side skips is filed as first-release coverage and
   warned about by nothing, so a gate that died because a private seam
   drifted was silently ungated forever. The checked-in list names every
   metric that must actually be compared; a listed metric that was not is an
-  integrity failure. The companion net is `tests/test_benchmarks.py`'s
-  never-skip list, which catches a drifted seam in the ordinary test run.
+  integrity failure. A metric counts as compared when both sides measured a
+  finite value and the baseline value is above zero, because a percentage
+  change is undefined otherwise and no limit can fire. One exception keeps
+  a local paired run usable: under `--quick` and `--smoke` a baseline that
+  reads exactly zero is not an integrity failure, because a reduced workload
+  can finish inside one step of its clock (`webui.log_count_5k` does under
+  `--quick`). The metric is still reported as not compared. The companion
+  net is `tests/test_benchmarks.py`'s never-skip list, which catches a
+  drifted seam in the ordinary test run. The same file checks that every
+  listed id is registered and that every gating benchmark is either listed
+  or named in its exclusion set.
 - **The effective gate column.** The percentage and absolute-floor tests
   are ANDed, so a metric whose value sits near its floor really gates at
   `100*floor/value`, however tight its declared `gate_pct` reads. The floor
@@ -148,17 +170,31 @@ audits found the relative gate alone could not deliver them:
   floor-bound metric, so an undersized workload is visible and fixable
   instead of silently ungated.
 - **Comparability.** The two sides must agree on python version, platform,
-  run mode, and the optional-backend state (orjson, uvloop). A pairing that
-  differs is refused outright (exit 2, never a verdict): a one-sided
+  run mode, and the optional-backend state (orjson, uvloop, isal). A pairing
+  that differs is refused outright (exit 2, never a verdict): a one-sided
   backend would report a backend swap as a large code regression, or mask a
-  real one. The CI perf job installs orjson into BOTH venvs -- production's
-  default backend in the binaries and Docker images -- and deliberately NOT
-  uvloop (see the waivers below).
+  real one. The CI perf job installs orjson and isal into BOTH venvs, the
+  backends the binaries and Docker images ship, and deliberately NOT uvloop
+  (see the waivers below).
 
 `bench.py` also stamps per-benchmark wall clock (fixtures included) into
 every result row and prints its ten slowest benchmarks per run, so the CI
 job's timeout ceiling is triaged from the log rather than by bisecting a
-timed-out release.
+timed-out release. It names each benchmark on stderr before running it, so
+the log of a run that hangs ends on the benchmark that hung. A child process
+that exits nonzero, or that runs for more than six minutes (five and a half
+for a peak-RSS target), fails its repeat, and the reason carries the last
+line the child wrote to stderr. If no repeat produced a value, the benchmark
+is recorded as skipped with that reason. If an earlier repeat did, the
+benchmark keeps those values: its result line ends with
+`PARTIAL (N of M repeats: <reason>)`, and its row stores the reason in
+`partial_reason`, next to `runs` (the repeats that produced a value) and
+`repeats` (the repeats declared). `compare.py` merges the rounds that
+produced a value. For each side of a compared metric that skipped or ran
+short in any round, it prints a `::warning::perf gate:` line that names
+those rounds and their reasons. The warning changes neither the verdict nor
+the exit code. The merged results (`--merged-out`) list the current side's
+short rounds in the row's `short_rounds` field.
 
 ## Waivers: what is deliberately not measured
 
@@ -190,9 +226,13 @@ missed:
   scheduling-gap gauge, `info` for its first release, then armed) covers
   the one stall class that has actually shipped, five separate times.
 - **Leadership backends and operator CLIs** (`state_admin`, `jobcli`,
-  `mcpcli`, `discovery`, `tlsutil`). Run by hand once, or one-shot startup
-  paths; their pure per-call functions are microsecond-scale. Tests, not
-  metrics.
+  `mcpcli`, `paircli`, `pairlink`, `pairprobe`, `webclient`, `discovery`,
+  `tlsutil`). Their pure per-call functions are microsecond-scale, and the
+  rest of each call is a network round trip or a store operation that
+  `state.*` measures. Tests, not metrics. The exception is process start,
+  which a script pays on every call: `startup.jobcli_state_get` and
+  `startup.mcp_bridge` time the cold start of the job-side CLI and of the
+  MCP bridge.
 - **The report/notify delivery pipeline.** A reporter metric would be ~95%
   jinja2/stdlib/socket and would break the no-network rule; the one owned
   risk (a multi-MB capture rendered into a report body) is a bounds
@@ -201,11 +241,8 @@ missed:
   machine's process table, so a timing gate can only measure the runner.
   The invariant that matters -- one table snapshot per sample batch,
   however many runs are monitored -- is a count, gated by
-  `tests/test_perf_invariants.py`.
-- **Per-line SSE live-tail fan-out.** `job.stream_capture_40k` deliberately
-  disables the passthrough mirror and excludes the `on_line` live-tail leg,
-  so per-line x per-client delivery on the shared loop stays untimed (a
-  zero-subscriber LiveLogBuffer variant could close this later).
+  `tests/test_perf_invariants.py`. The parse of a stored resource series
+  takes synthetic input, and `resources.usage_from_dict_500` times it.
 
 The rule those waivers keep applying: **a COUNT or ORDERING invariant gets
 a test, never a metric.** Five benchmark candidates from the 2026-07 audits
@@ -231,27 +268,65 @@ snapshot. Redraws build visible rows and stop styling task labels at the right
 edge of the viewport. Run-state snapshots use a task lookup so redraws can
 read the states of visible tasks directly.
 
-The **web UI** (`webui.*`) is browser JavaScript, so it is timed inside a
-headless Chromium via Playwright. The page exposes a `window.__perf` hook ONLY
-under the `?perf=1` query string (it is entirely inert otherwise — no global is
-defined), giving the harness seed helpers and the real render functions;
-`bench.py` seeds synthetic jobs / fleet / log data and times `renderRows`,
-`renderFleet` and `updateLogCount` with the page's own `performance.now()`
-(batched, because Chromium clamps that clock to ~100us). The whole `webui`
-group **skips cleanly** when Playwright or its Chromium build is absent, when
-the page predates the `?perf=1` hook (an older release), and in `--smoke`
-(the unit test must not launch a browser). The CI `perf` job installs
-Playwright + Chromium into the current-side venv (best-effort) so `webui.*`
-runs there; to run them locally:
+`tui.table_paint_5k` paints full frames of the jobs table over 5,000 jobs,
+steady and while the selection scrolls, and `tui.frame_bytes_5k` gates the
+bytes that one full repaint writes to the terminal. `tui.poll_absorb_5k`
+times what the dashboard does with one decoded `/jobs` payload: the by-name
+index, the health fold, the sort, and the verdict. The JSON decode, and the
+release of the payload that a poll replaces, run off the clock.
+`tui.view_sort_5k` and `tui.palette_type_5k` time the filter and sort pass
+and the command palette's ranking, which run on each keystroke.
+`tui.fleet_paint_15x400`, `tui.week_rows_500`, and
+`tui.wallboard_paint_5k` cover the overlays, `tui.tail_ingest_30k` covers
+the live log tail, and `tui.mark_idle_300` covers the header mark's idle
+animation.
+
+The web UI (`webui.*`) is browser JavaScript, so it is timed inside a
+headless Chromium through Playwright. The page exposes a `window.__perf` hook
+only under the `?perf=1` query string, and defines no global otherwise. The
+hook gives the harness seed helpers and the real render functions. `bench.py`
+seeds synthetic jobs, fleet, and log data, and times each operation with the
+page's own `performance.now()`, in batches, because Chromium clamps that
+clock to about 100 microseconds.
+
+The group follows what the page does on each trigger:
+
+- First load: `webui.boot_rows_500` times navigation to the first laid-out
+  jobs table.
+- Each poll: `webui.rows_diff_500` (the keyed row diff),
+  `webui.wallboard_poll_500`, `webui.dag_tasks_2k`, `webui.timeline_500`, and
+  `webui.swim_400x49`. `webui.render_rows_500`, `webui.rows_layout_200`, and
+  `webui.render_fleet_15x400` time the full rebuilds.
+- Each second: `webui.tick_500`.
+- Each frame: `webui.dirty_frame_rows_500` reads the main-thread time of a
+  repainted frame through a CDP session, and `webui.logo_recovery` steps the
+  logo's simulation.
+- Each keystroke: `webui.filter_keys_500`, `webui.select_move_500`,
+  `webui.sort_500`, and `webui.palette_keys_500`.
+- Logs: `webui.render_term_5k`, `webui.tail_term_2k`, `webui.append_line_5k`,
+  and `webui.log_count_5k`.
+- Schedule walks and run analysis: `webui.week_walk_500x20`,
+  `webui.radar_walk_500x150`, and `webui.ledger_analyze_500x600`.
+
+The whole `webui` group skips cleanly when Playwright or a browser is absent,
+and in `--smoke`, because the unit test must not launch a browser. A
+benchmark that needs a hook the measured page lacks skips on that side. The
+CI `perf` job installs Playwright and Chromium for both sides so `webui.*`
+runs there. To run the group locally:
 
 ```sh
 pip install playwright && playwright install chromium
 python benchmarks/bench.py --quick --only webui
 ```
 
-Because an older release's page carries no `?perf=1` hook, the `webui` metrics
-compare new-against-new (a forward-looking gate and a recorded number), not an
-old-vs-new delta; the `tui.*` and backend metrics do diff across releases.
+To use an installed browser in place of Playwright's Chromium build, set
+`CRONSTABLE_TEST_BROWSER_CHANNEL` to its channel name, for example `msedge`.
+The browser tests read the same variable.
+
+A benchmark that drives the page's own controls, or a hook that the baseline
+release's page carries, compares across releases like the `tui.*` and backend
+metrics. A benchmark that needs a new hook compares from the first release
+whose page has it.
 
 ## Adding a benchmark
 
@@ -288,6 +363,12 @@ Ground rules:
 - Scale the workload with `_n(base)` so `--quick` and `--smoke` stay cheap.
 - Import cronstable inside the function and raise `Skip` when an API is
   missing, so the harness still runs against older releases.
+- A benchmark that empties a memo by its private name also counts the work
+  the memo hides (see `_count_calls`) and raises when a timed call skipped
+  it. A renamed memo then fails the benchmark, where a clear that reached
+  nothing would read as a large improvement.
+  `tests/test_benchmarks.py` lists those memo names and checks that the
+  package still has each one.
 - Keep workloads deterministic: fixed datetimes, fixed inputs, no network.
 - Memory metrics use `unit="MB"` and `compare="median"`.
 - A benchmark that measures a child process (cold start, import, peak RSS)

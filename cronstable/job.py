@@ -265,10 +265,17 @@ LIVE_LOG_SUBSCRIBER_QUEUE_LIMIT = 8192
 
 # How long a forcibly-terminated run waits for stdout/stderr EOF before its
 # readers are cancelled and the captured output kept (see
-# RunningJob._read_job_streams). Only reached when a descendant escaped the
+# RunningJob._read_job_streams, and RunningJob._bound_exit_wait for a wait()
+# that the open pipe holds). Only reached when a descendant escaped the
 # process-group kill. A fixed bound rather than killTimeout, which is
 # legitimately 0 for jobs that would then lose output already produced.
 KILLED_STREAM_DRAIN_TIMEOUT = 30.0
+
+# How often a cancelled run's Process.returncode is read while its exit is
+# awaited, and how soon RunningJob._bound_exit_wait looks for the exit that
+# follows a forced kill. A descendant that holds a pipe can keep
+# Process.wait() from resolving after the process has exited.
+EXIT_POLL_INTERVAL = 0.25
 
 # Overall bound on one mail report's SMTP conversation. aiosmtplib only
 # bounds each operation (60s default), and the report runs inside the job's
@@ -818,13 +825,19 @@ class StreamReader:
         a bound (see RunningJob._read_job_streams). On expiry the read
         loop is cancelled and the output captured so far is returned;
         nothing already collected is lost.
+
+        A caller that is canceled here leaves the read loop running and
+        can join again. A read loop that something else canceled counts
+        as drained.
         """
-        if timeout is None:
-            await self._reader
-        else:
-            try:
-                await asyncio.wait_for(self._reader, timeout)
-            except asyncio.TimeoutError:
+        reader = self._reader
+        if not reader.done():
+            # asyncio.wait hands the read loop neither the caller's
+            # cancellation nor the expiry of the bound.
+            done, _ = await asyncio.wait({reader}, timeout=timeout)
+            if not done:
+                reader.cancel()
+                await asyncio.wait({reader})
                 logger.warning(
                     "job %s: %s did not reach end-of-file within %.1f seconds "
                     "of the job being killed -- a descendant that outlived it "
@@ -834,6 +847,9 @@ class StreamReader:
                     self.stream_name,
                     timeout,
                 )
+        if not reader.cancelled():
+            # raises a failure of the read loop
+            reader.result()
         if self.save_bottom:
             middle = (
                 [
@@ -2150,6 +2166,19 @@ def _redacted_check_output(text: str | None) -> str | None:
     return "\n".join(redact_lines(text.split("\n")))[:VERIFY_OUTPUT_LIMIT]
 
 
+def _reads_output_pipe(transport: Any) -> bool:
+    """Whether a subprocess transport still has an output pipe open.
+
+    Asks the pipe transports, because uvloop reports the process transport
+    as closing from the moment the process exits.
+    """
+    for fd in (1, 2):
+        pipe = transport.get_pipe_transport(fd)
+        if pipe is not None and not pipe.is_closing():
+            return True
+    return False
+
+
 class JobRetryState:
     def __init__(
         self, initial_delay: float, multiplier: float, max_delay: float
@@ -2174,6 +2203,10 @@ class JobRetryState:
         # Durable pool generation: a settled ladder cannot be revived by
         # an already queued attempt, including after a daemon restart.
         self.pool_retry: dict[str, str] | None = None
+        # True from when the scheduled fire that installed this ladder is
+        # dropped until a launch takes the ladder up (see
+        # Cron._unclaimed_ladder).
+        self.unclaimed = False
 
     def next_delay(self) -> float:
         delay = self.delay
@@ -2238,6 +2271,10 @@ class RunningJob:
         # wall-clock instant this run started, for the web UI's run history;
         # set in start() so even a failed launch carries a timestamp.
         self.started_at: datetime | None = None
+        # wall-clock instant this run ended (see stopped). wait() can
+        # return up to a minute later, when the output drain of a killed
+        # run ends.
+        self.ended_at: datetime | None = None
         # live, broadcastable view of this run's captured output (web UI tail)
         self.output = output if output is not None else JobOutputStream()
         self._output_prefix = output_prefix
@@ -2265,6 +2302,10 @@ class RunningJob:
         self.start_failed = False
         # guards against _on_stop running twice (cancel() racing wait())
         self._stopped = False
+        # set once a cancel has terminated the verification check: the run
+        # has ended. wait() collects the check before _on_stop, so the stop
+        # metrics carry the check's outcome.
+        self._verifier_cancelled = False
         # set by cancel(): this run was forcibly terminated. Read by
         # _read_job_streams, which then bounds its wait for pipe EOF
         # instead of trusting a killed process tree to close its output.
@@ -2319,6 +2360,8 @@ class RunningJob:
         if self._stopped:
             return
         self._stopped = True
+        if self.ended_at is None:
+            self.ended_at = datetime.now(timezone.utc)
         # Finalize resource accounting before statsd reports it. _on_stop
         # is the single idempotent choke point every completion path
         # funnels through, so usage is captured exactly once. Guarded so a
@@ -2625,6 +2668,8 @@ class RunningJob:
                     )
                 else:
                     raise asyncio.TimeoutError
+                if await self._output_open_at_deadline():
+                    raise asyncio.TimeoutError
             except asyncio.TimeoutError:
                 logger.info(
                     "Job %s exceeded its executionTimeout of "
@@ -2652,6 +2697,31 @@ class RunningJob:
         finally:
             self.output.close()
             await self._on_stop()
+
+    async def _output_open_at_deadline(self) -> bool:
+        """Whether a captured pipe is still open at the execution deadline.
+
+        The job's own process has exited. A descendant that holds a
+        captured pipe keeps the run going, so ``executionTimeout`` bounds
+        the drain as it bounds the process.
+        """
+        assert self.execution_deadline is not None
+        reading = {
+            reader._reader
+            for reader in (self._stderr_reader, self._stdout_reader)
+            if reader is not None and not reader._reader.done()
+        }
+        if not reading:
+            return False
+        remaining = self.execution_deadline - time.perf_counter()
+        # A spent deadline still yields once, so the loop takes in an
+        # end-of-file that has arrived.
+        _, reading = await asyncio.wait(reading, timeout=max(0.0, remaining))
+        if not reading:
+            return False
+        # A reader can be a few loop turns behind a pipe that has closed.
+        transport = getattr(self.proc, "_transport", None)
+        return transport is None or _reads_output_pipe(transport)
 
     async def _verify_result(self) -> None:
         spec = self.config.verify
@@ -2692,14 +2762,18 @@ class RunningJob:
                     logger.warning("Could not publish verification status")
             if self._terminated:
                 await check.cancel()
+                self._end_at_check_cancel()
             await check.wait()
 
         try:
-            await asyncio.wait_for(verify(), spec["timeout"])
-        except asyncio.TimeoutError:
-            check.retcode = -100
-            await check.cancel()
-            await check._read_job_streams()
+            try:
+                await asyncio.wait_for(verify(), spec["timeout"])
+            except asyncio.TimeoutError:
+                check.retcode = -100
+                await check.cancel()
+                if self._terminated:
+                    self._end_at_check_cancel()
+                await check._read_job_streams()
         except BaseException:
             await check.cancel()
             await check._read_job_streams()
@@ -2764,7 +2838,17 @@ class RunningJob:
         # lose no captured output.
         transport = getattr(self.proc, "_transport", None)
         if transport is not None:
-            transport.close()
+            try:
+                transport.close()
+            except OSError:
+                # close() sends a kill to a process that is still running.
+                # asyncio up to Python 3.12 and uvloop raise one that the
+                # operating system refuses, and uvloop raises it with the
+                # pipes still open.
+                for fd in (1, 2):
+                    pipe = transport.get_pipe_transport(fd)
+                    if pipe is not None:
+                        pipe.close()
             if platform.IS_WINDOWS:
                 self._unlink_drained_pipes(transport)
 
@@ -2787,6 +2871,25 @@ class RunningJob:
                 pipe.get_protocol(), "disconnected", False
             ):
                 pipe.set_protocol(None)
+
+    @property
+    def stopped(self) -> bool:
+        """Whether this run has ended.
+
+        True once :meth:`wait` has collected the process and its output, or
+        :meth:`cancel` has terminated it. A run whose process never started
+        stays False.
+        """
+        return self._stopped or self._verifier_cancelled
+
+    @property
+    def ended(self) -> bool:
+        """Whether this run has no process left to signal.
+
+        True once the run has :attr:`stopped`, and for a run whose process
+        never started.
+        """
+        return self.stopped or self.start_failed
 
     @property
     def failed(self) -> bool:
@@ -2830,6 +2933,12 @@ class RunningJob:
             return "command wrote to stderr (configured to count as a failure)"
         return None
 
+    def _end_at_check_cancel(self) -> None:
+        """End this run: its canceled verification check has no process."""
+        self._verifier_cancelled = True
+        if self.ended_at is None:
+            self.ended_at = datetime.now(timezone.utc)
+
     async def cancel(self) -> None:
         """Terminate this run and everything it spawned.
 
@@ -2844,10 +2953,21 @@ class RunningJob:
         try/except, so a raise here would take down the whole scheduler.
         The reaper still completes such a run through ``wait()``'s
         ``start_failed`` path, so nothing is left stranded.
+
+        A run that has ended is a NO-OP too. Its process is reaped, so its
+        group id can belong to an unrelated process.
         """
+        if self._stopped:
+            return
         if self._verifier is not None:
             self._terminated = True
-            await self._verifier.cancel()
+            check = self._verifier
+            await check.cancel()
+            # A check that has yet to spawn is canceled by
+            # _verify_result: once it has a process and on_verifying
+            # has returned, or when verify.timeout expires.
+            if check.ended:
+                self._end_at_check_cancel()
             return
         if self.proc is None:
             logger.info(
@@ -2869,15 +2989,9 @@ class RunningJob:
         # first, as the fallback below does, would orphan every descendant
         # for good). The fallback to the direct child remains for a
         # group/tree that could not be signalled at all.
-        if not await platform.kill_process_group(self.proc.pid, force=False):
-            if self.proc.returncode is None:
-                try:
-                    self.proc.terminate()
-                except ProcessLookupError:
-                    pass
-        try:
-            await asyncio.wait_for(self.proc.wait(), self.config.killTimeout)
-        except asyncio.TimeoutError:
+        if not await self._kill_group(force=False):
+            self._signal_child(force=False)
+        if not await self._exited_within(self.config.killTimeout):
             logger.warning(
                 "Job %s did not gracefully terminate after "
                 "%.1f seconds, killing it...",
@@ -2888,17 +3002,131 @@ class RunningJob:
         # exiting says nothing about the descendants sharing its group, and
         # those are what hold the pipes open. A group that is already empty
         # reports back as "not signalled" and this is a no-op.
-        if not await platform.kill_process_group(self.proc.pid, force=True):
-            # On Python <=3.11 wait_for can spuriously time out even
-            # though proc.wait() completed, leaving the returncode already
-            # set; kill() would then raise ProcessLookupError, so re-check
-            # and guard it like terminate().
-            if self.proc.returncode is None:
-                try:
-                    self.proc.kill()
-                except ProcessLookupError:
-                    pass
+        if not await self._kill_group(force=True):
+            self._signal_child(force=True)
+        if self.retcode != -100:
+            # A run that wait() timed out drains under wait()'s own bound.
+            exited = self.proc.returncode is not None
+            asyncio.get_running_loop().call_later(
+                # a forced kill shows as an exit a moment after the signal
+                KILLED_STREAM_DRAIN_TIMEOUT if exited else EXIT_POLL_INTERVAL,
+                self._bound_exit_wait,
+                weakref.ref(self),
+                exited,
+            )
         await self._on_stop()
+
+    async def _kill_group(self, *, force: bool) -> bool:
+        """Signal this run's process group; return whether it was signaled.
+
+        Once the leader is reaped, a process that exists under its pid is
+        an unrelated one. This run's group is then empty, and no signal is
+        sent (see :func:`cronstable.platform.pid_reused`).
+        """
+        proc = self.proc
+        assert proc is not None
+        if proc.returncode is not None and platform.pid_reused(proc.pid):
+            return False
+        return await platform.kill_process_group(proc.pid, force=force)
+
+    def _signal_child(self, *, force: bool) -> None:
+        """Signal the direct child of a group that could not be signaled.
+
+        A signal that the operating system refuses is logged and the
+        cancel goes on. The process then runs until it exits by itself.
+        """
+        proc = self.proc
+        assert proc is not None
+        if proc.returncode is not None:
+            return
+        try:
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+        except ProcessLookupError:
+            # The process can exit while the group is signaled, and a
+            # signal to a process that asyncio has collected raises
+            # ProcessLookupError.
+            pass
+        except OSError as ex:
+            # EPERM: another user owns the process, as with a command
+            # that sudo runs
+            logger.warning(
+                "Job %s: could not signal its process (pid %s): %s",
+                self.config.name,
+                proc.pid,
+                ex,
+            )
+
+    async def _exited_within(self, timeout: float) -> bool:
+        """Whether the process exits within ``timeout`` seconds.
+
+        Reads ``Process.returncode`` beside ``Process.wait()``: on an
+        asyncio whose ``Process.wait()`` resolves only once every pipe has
+        closed, a descendant that holds a pipe hides the exit from it.
+        """
+        proc = self.proc
+        assert proc is not None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        exit_wait = asyncio.ensure_future(proc.wait())
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                # A spent timeout still yields once. kill() on a process
+                # whose exit the loop has yet to see collects the exit
+                # status, and asyncio then reports 255.
+                await asyncio.wait(
+                    {exit_wait},
+                    timeout=max(0.0, min(remaining, EXIT_POLL_INTERVAL)),
+                )
+                if proc.returncode is not None or exit_wait.done():
+                    return True
+                if remaining <= 0:
+                    return False
+        finally:
+            exit_wait.cancel()
+
+    @staticmethod
+    def _bound_exit_wait(ref: "weakref.ref[RunningJob]", exited: bool) -> None:
+        """Close the output pipes of a killed run whose process is gone.
+
+        A descendant that holds a pipe keeps :meth:`wait` from recording
+        the run. A drain that began before the kill has no bound, and an
+        asyncio whose ``Process.wait()`` resolves only once every pipe has
+        closed keeps :meth:`wait` from its drain.
+
+        ``exited`` is whether the process had exited at the previous look.
+        The pipes close only then, so a process that outlives the kill
+        keeps them for a whole bound after it exits.
+        """
+        job = ref()
+        if job is None:
+            return
+        proc = job.proc
+        transport = getattr(proc, "_transport", None)
+        if proc is None or transport is None:
+            return
+        if not _reads_output_pipe(transport):
+            return
+        if not exited:
+            asyncio.get_running_loop().call_later(
+                KILLED_STREAM_DRAIN_TIMEOUT,
+                RunningJob._bound_exit_wait,
+                ref,
+                proc.returncode is not None,
+            )
+            return
+        logger.warning(
+            "job %s: %soutput did not reach end-of-file within %.1f seconds "
+            "of the job being killed (a descendant that outlived it still "
+            "holds a pipe open); keeping the output captured so far",
+            job.config.name,
+            job._output_prefix,
+            KILLED_STREAM_DRAIN_TIMEOUT,
+        )
+        transport.close()
 
     # The three completion hooks probe report_config_enabled first (the
     # guard the DAG-task reaper also uses, see Cron._maybe_report_dag_task)

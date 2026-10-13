@@ -82,8 +82,8 @@ All metrics are prefixed `cronstable_`. Per-job metrics carry the job name in a 
 | `cronstable_start_time_seconds` | gauge | Unix time this cronstable process started. |
 | `cronstable_job_set_info{job_set_id}` | gauge (info) | The [job-set fingerprint](Clustering-and-Leader-Election#the-job-set-id-foundation) of the currently loaded configuration; always `1`. Compare across a fleet to spot configuration drift. |
 | `cronstable_jobs{state}` | gauge | Number of configured jobs, `state="enabled"` / `"disabled"`. |
-| `cronstable_config_last_reload_successful` | gauge | `1` if the most recent configuration parse succeeded, `0` if the configuration on disk is currently broken (the daemon keeps running the previous good one). Absent until the first parse. |
-| `cronstable_config_last_reload_success_timestamp_seconds` | gauge | Unix time of the last successful configuration parse. |
+| `cronstable_config_last_reload_successful` | gauge | `1` after the daemon installs a configuration, at startup or on a reload. `0` after a failed parse (the daemon keeps running the previous good configuration), after a reload that read no configuration from a source that cannot be read twice (no bytes, or only the bytes past an earlier read), and after a source changed while the configuration is a pipe or a FIFO that the once-a-minute check does not read again (see [configuration hot reload](Architecture-and-Internals#configuration-hot-reload)). It returns to `1` at the next reload that installs a configuration. Absent until the first parse. |
+| `cronstable_config_last_reload_success_timestamp_seconds` | gauge | Unix time at which the daemon last installed a configuration, at startup or on a reload. |
 
 ### Per job
 
@@ -94,11 +94,11 @@ All metrics are prefixed `cronstable_`. Per-job metrics carry the job name in a 
 | `cronstable_job_retries_total{job_name}` | counter | Retry attempts actually launched (`onFailure.retry`). Deferred or abandoned retries are not counted. |
 | `cronstable_job_permanent_failures_total{job_name}` | counter | Failures with no retry remaining: exactly when [`onPermanentFailure`](Failure-Detection-and-Retries) reporting fires. |
 | `cronstable_job_start_failures_total{job_name}` | counter | Runs whose command could not be launched at all, also recorded as failures with the conventional exit code `127`. |
-| `cronstable_job_last_success_timestamp_seconds{job_name}` | gauge | Unix time of the last successful finish. Absent until the first success. |
-| `cronstable_job_last_failure_timestamp_seconds{job_name}` | gauge | Unix time of the last failed finish. Absent until the first failure. |
+| `cronstable_job_last_success_timestamp_seconds{job_name}` | gauge | Unix time at which the daemon last recorded a successful run of the job. Absent until the first success. |
+| `cronstable_job_last_failure_timestamp_seconds{job_name}` | gauge | Unix time at which the daemon last recorded a failed run of the job. Absent until the first failure. |
 | `cronstable_job_info{job_name, schedule, cluster_policy}` | gauge (info) | Static configuration facts; always `1`. |
 | `cronstable_job_enabled{job_name}` | gauge | `1` if the job is enabled in the loaded configuration. |
-| `cronstable_job_running{job_name}` | gauge | Number of currently running instances (can exceed `1` under `concurrencyPolicy: Allow`). |
+| `cronstable_job_running{job_name}` | gauge | Number of instances that the daemon has not yet recorded: the running ones, and each one that has [ended](Concurrency-and-Timeouts#concurrency-policy) and awaits its record. It can exceed `1` under `concurrencyPolicy: Allow`. A `Forbid` job can read `2`, because a `Forbid` fire can start beside an instance that has ended. |
 | `cronstable_job_next_run_timestamp_seconds{job_name}` | gauge | Unix time of the next scheduled run. Absent for disabled jobs and `@reboot` schedules. |
 | `cronstable_job_last_run_timestamp_seconds{job_name}` | gauge | Unix time the most recent run finished. |
 | `cronstable_job_last_run_duration_seconds{job_name}` | gauge | Duration of the most recent finished run. |
@@ -119,6 +119,16 @@ model and every other surface the numbers reach. Like the run counters,
 `cronstable_job_cpu_seconds_total` and `cronstable_job_peak_rss_bytes` are made
 restart-durable by a `state:` store (see
 [semantics and guarantees](#semantics-and-guarantees)).
+
+`cronstable_job_duration_seconds` and the `cronstable_job_last_run_*` gauges
+read the run record, whose `finished_at` is the instant the run ended (see
+[`GET /jobs/{name}/runs`](HTTP-API#get-jobsnameruns)).
+`cronstable_job_last_success_timestamp_seconds` and
+`cronstable_job_last_failure_timestamp_seconds` hold the time at which the
+daemon recorded the run. The two instants are apart for a run that the
+daemon killed while a surviving process holds its output open: the daemon
+records that run when the output closes or the
+[bound on it](Concurrency-and-Timeouts#cancellation-and-killtimeout) ends.
 
 ### State backend
 

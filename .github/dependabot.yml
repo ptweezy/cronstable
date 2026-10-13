@@ -1,7 +1,8 @@
-# Weekly VERSION updates for the exact pins, grouped into one PR per
-# ecosystem. SECURITY updates are enabled in the repo settings (Code security:
-# "Dependabot alerts" and "Dependabot security updates") and reuse the
-# ecosystems below, so keep this list in step with what the pipeline uses.
+# Daily VERSION updates for the exact pins, grouped into one PR per ecosystem.
+# The `daily` interval runs Monday through Friday. SECURITY updates are enabled
+# in the repo settings (Code security: "Dependabot alerts" and "Dependabot
+# security updates") and reuse the ecosystems below, so keep this list in step
+# with what the pipeline uses.
 version: 2
 updates:
   # Actions are exact-pinned (actions/checkout@v7.0.0) so Dependabot sees the
@@ -11,7 +12,7 @@ updates:
       - "/" # scans .github/workflows/ and root action.yml only
       - "/.github/actions/*"
     schedule:
-      interval: weekly
+      interval: daily
     open-pull-requests-limit: 10
     groups:
       github-actions:
@@ -28,7 +29,7 @@ updates:
       - "requirements/dev-freethreaded.txt"
       - "pyinstaller/requirements/**"
     schedule:
-      interval: weekly
+      interval: daily
     open-pull-requests-limit: 10
     groups:
       python:
@@ -44,7 +45,7 @@ updates:
       - "/docker"
       - "/pyinstaller"
     schedule:
-      interval: weekly
+      interval: daily
     open-pull-requests-limit: 10
     groups:
       docker:
@@ -54,7 +55,7 @@ updates:
   - package-ecosystem: nix
     directory: "/"
     schedule:
-      interval: weekly
+      interval: daily
     open-pull-requests-limit: 10
     groups:
       nix:

@@ -91,7 +91,7 @@ jobs:
           print("|---|---|---|---|---|")
           print("| {killed} | {survived} | {timeout} | {no_tests} | {total} |".format(**stats))
           EOF
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: mutation-${{ matrix.module }}
           path: mutation-${{ matrix.module }}.txt

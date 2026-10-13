@@ -1,4 +1,4 @@
-# cronstable™ wiki
+# the cronstable™ wiki
 
 cronstable is an asyncio-based job scheduler for Linux, macOS, and Windows. Define jobs in YAML or load [classic Vixie crontabs](Classic-Crontabs). It supports failure notifications, retries with exponential backoff, statsd and Prometheus metrics, and an optional HTTP control API with a [web dashboard](Web-Dashboard) to monitor and control jobs.
 

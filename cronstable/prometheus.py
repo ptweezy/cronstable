@@ -1138,7 +1138,8 @@ class PrometheusMetrics:
             reload_ok = MetricFamily(
                 "cronstable_config_last_reload_successful",
                 "gauge",
-                "Whether the last configuration parse succeeded.",
+                "Whether the last configuration load installed a "
+                "configuration.",
             )
             reload_ok.add({}, 1 if self._last_reload_ok else 0)
             families.append(reload_ok)
@@ -1146,7 +1147,8 @@ class PrometheusMetrics:
             reload_time = MetricFamily(
                 "cronstable_config_last_reload_success_timestamp_seconds",
                 "gauge",
-                "Unix time of the last successful configuration parse.",
+                "Unix time at which the daemon last installed a "
+                "configuration.",
             )
             reload_time.add({}, self._last_reload_success_time)
             families.append(reload_time)
@@ -1307,7 +1309,8 @@ class PrometheusMetrics:
         running = MetricFamily(
             "cronstable_job_running",
             "gauge",
-            "Number of currently running instances of the job.",
+            "Number of instances of the job that are running or await their "
+            "record.",
         )
         next_run = MetricFamily(
             "cronstable_job_next_run_timestamp_seconds",

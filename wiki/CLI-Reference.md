@@ -364,8 +364,10 @@ Rewrites records written under *older known* record-scheme versions to the
 current one, and reports how many records were converted, already current,
 unknown, unreadable, or failed. `v1` is the only scheme so far, so today this
 reports and converts nothing; it becomes useful only after a future scheme
-bump. Records with unknown versions are left in place for the daemon's usual
-quarantine-on-read handling. `--dry-run` counts without rewriting.
+bump. Records with unknown versions are left in place. The daemon leaves
+such a record in place too: a read warns and skips it, and a
+[strict](Durable-State#the-store-model) read fails on it. `--dry-run` counts
+without rewriting.
 
 ### `state` exit codes
 
@@ -675,11 +677,13 @@ When started normally (no `--version`, no `--validate-config`, no
 
 The scheduler checks the configuration files about once a minute and reparses
 them when a file's modification time or size changes, so edits take effect
-without a restart. On POSIX, `SIGHUP` forces an immediate reparse (on Windows,
+without a restart. The next check picks up an edit that lands while a reload
+is parsing. On POSIX, `SIGHUP` forces an immediate reparse (on Windows,
 `cronstable service reload`). A configuration that
 becomes invalid after a successful start is logged and ignored, and the
-previously loaded jobs keep running. See
-[architecture and internals](Architecture-and-Internals).
+previously loaded jobs keep running. When `-c` names a pipe or a FIFO, the
+once-a-minute check does not read it again, and only a reload request
+does. See [architecture and internals](Architecture-and-Internals).
 
 ### Signal handling and graceful shutdown
 

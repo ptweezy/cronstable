@@ -443,6 +443,287 @@ def test_key_decoder_modified_and_split_sequences():
     assert dec.feed("é".encode("utf-8")[1:]) == ["é"]
 
 
+def _pasted(keys):
+    """Which of ``keys`` the decoder marked as pasted text."""
+    return [isinstance(key, tui._Pasted) for key in keys]
+
+
+def test_key_decoder_delivers_a_bracketed_paste_as_text():
+    """The text between the paste markers comes out as pasted characters
+    with its line breaks dropped. The keys around the paste stay keys."""
+    dec = KeyDecoder()
+    paste = tui.PASTE_START + "db-\r\nprod\texport é\n" + tui.PASTE_END
+    keys = dec.feed(b"/" + paste.encode("utf-8") + b"\rj")
+    assert keys == ["/", *"db-prodexport é", "enter", "j"]
+    assert _pasted(keys) == [False] + [True] * 15 + [False, False]
+    # a second paste, and an end marker with no paste open
+    again = tui.PASTE_START + "x" + tui.PASTE_END + tui.PASTE_END + "y"
+    keys = dec.feed(again.encode("utf-8"))
+    assert keys == ["x", "y"] and _pasted(keys) == [True, False]
+
+
+def test_key_decoder_paste_markers_split_across_reads():
+    """The markers and the text may arrive in any number of reads, and
+    the quiet-gap flush between two of them ends no paste. The flush
+    keeps the head of a start marker from its third character on. An Esc
+    typed right before a paste is its own key."""
+    data = (tui.PASTE_START + "a\rb" + tui.PASTE_END + "c\r").encode("utf-8")
+    for cut in range(len(data) + 1):
+        dec = KeyDecoder()
+        keys = dec.feed(data[:cut])
+        if cut > 2:
+            keys += dec.flush_escape()
+        keys += dec.feed(data[cut:])
+        assert keys == ["a", "b", "c", "enter"], cut
+        assert _pasted(keys) == [True, True, False, False], cut
+    dec = KeyDecoder()
+    keys = [key for byte in data for key in dec.feed(bytes([byte]))]
+    assert keys == ["a", "b", "c", "enter"]
+    assert _pasted(keys) == [True, True, False, False]
+    for cut in (1, 2, len(data)):
+        dec = KeyDecoder()
+        keys = dec.feed(b"\x1b" + data[:cut]) + dec.feed(data[cut:])
+        assert keys == ["esc", "a", "b", "c", "enter"], cut
+        assert _pasted(keys) == [False, True, True, False, False], cut
+    # the flush ends the head of any other sequence
+    dec = KeyDecoder()
+    assert dec.feed(b"\x1b[") == [] and dec.flush_escape() == []
+    assert dec.feed(b"\x1b[5") == [] and dec.flush_escape() == []
+    assert dec.feed(b"~j") == ["~", "j"]
+    # a head that the flush kept takes no other key
+    for head in (b"\x1b[2", b"\x1b[20", b"\x1b[200"):
+        dec = KeyDecoder()
+        assert dec.feed(head) == [] and dec.flush_escape() == []
+        assert dec.feed(b"q\x1b[A") == ["q", "up"]
+
+
+def test_key_decoder_keeps_an_escape_inside_a_paste_out_of_the_keys():
+    """An Esc in pasted text that starts no end marker is dropped like
+    any control character, and the characters behind it are text."""
+    dec = KeyDecoder()
+    paste = "a\x1bb\x1b[2x\x1b[A\x03\x7f\x1b" + tui.PASTE_START + "z\x1b"
+    keys = dec.feed((tui.PASTE_START + paste + tui.PASTE_END + "q").encode())
+    assert keys == [*"ab[2x[A[200~z", "q"]
+    assert _pasted(keys) == [True] * 13 + [False]
+
+
+def test_key_decoder_ctrl_c_after_a_quiet_gap_ends_a_paste():
+    """A paste that lost its end marker takes every later key as text.
+    A Ctrl+C byte that follows a quiet gap ends it and comes out as
+    ``ctrl+c``. The same byte inside a burst is pasted text and is
+    dropped."""
+    dec = KeyDecoder()
+    start = tui.PASTE_START.encode()
+    assert dec.feed(start + b"ab\x03c") == [*"abc"] and dec._pasting
+    # with no end marker, q, Esc and Enter are text
+    assert dec.flush_escape() == []
+    keys = dec.feed(b"q\x1b\r")
+    assert keys == ["q"] and _pasted(keys) == [True] and dec._pasting
+    # a character after the gap puts the byte back inside a burst
+    assert dec.flush_escape() == []
+    assert dec.feed(b"x\x03") == ["x"] and dec._pasting
+    assert dec.flush_escape() == []
+    keys = dec.feed(b"\x03j")
+    assert keys == ["ctrl+c", "j"] and _pasted(keys) == [False, False]
+    assert not dec._pasting
+    # half an end marker that waits is dropped with the paste
+    assert dec.feed(start + b"z\x1b[20") == ["z"] and dec._pasting
+    assert dec.flush_escape() == []
+    assert dec.feed(b"\x031~") == ["ctrl+c", "1", "~"]
+    # outside a paste the flush marks nothing
+    assert dec.flush_escape() == []
+    assert dec.feed(start + b"\x03") == [] and dec._pasting
+
+
+def test_key_decoder_reads_an_escape_prefixed_key_as_the_plain_key():
+    """A terminal that sends Alt as an ``Esc`` prefix puts it in front of
+    the key's own sequence, and the key decodes as it does without the
+    prefix."""
+    cases = [("[" + tail, name) for tail, name in tui._CSI_KEYS.items()]
+    cases += [("O" + tail, name) for tail, name in tui._SS3_KEYS.items()]
+    # a modifier parameter, then keys that the tables do not hold
+    cases += [("[1;5A", "up"), ("[5;3~", "pgup"), ("[2;5~", "insert")]
+    cases += [("[20~", None), ("[1;3P", None), ("OP", None)]
+    for tail, name in cases:
+        want = [name] if name else []
+        data = ("\x1b\x1b" + tail).encode()
+        dec = KeyDecoder()
+        assert dec.feed(data) == want, tail
+        assert dec.flush_escape() == [], tail
+        assert KeyDecoder().feed(data[1:]) == want, tail
+    # the keys around a prefixed key stay keys
+    dec = KeyDecoder()
+    assert dec.feed(b"j\x1b\x1b[B\x1b\x1bOA\x1b\x1b[6~k") == [
+        "j", "down", "up", "pgdn", "k"
+    ]
+
+
+def test_key_decoder_double_escape_waits_for_the_byte_behind_it():
+    """Two ``Esc`` bytes in a row wait for the byte behind them. The
+    quiet-gap flush makes both keys, and a byte that starts no CSI or SS3
+    sequence makes the first one a key."""
+    dec = KeyDecoder()
+    assert dec.feed(b"\x1b\x1b") == []
+    assert dec.flush_escape() == ["esc", "esc"]
+    assert dec.flush_escape() == []
+    # the flush parts the pair from a tail that arrives late
+    assert dec.feed(b"\x1b") == [] and dec.feed(b"\x1b") == []
+    assert dec.flush_escape() == ["esc", "esc"]
+    assert dec.feed(b"[B") == ["[", "B"]
+    # a third Esc is one press ahead of the pair
+    assert dec.feed(b"\x1b\x1b\x1b") == ["esc"]
+    assert dec.feed(b"[B") == ["down"]
+    assert dec.feed(b"\x1b\x1b\x1b") == ["esc"]
+    assert dec.flush_escape() == ["esc", "esc"]
+    # Esc, then Alt and a character
+    assert dec.feed(b"\x1b\x1bx") == ["esc"]
+    assert dec.feed(b"\x1b\x1b\r") == ["esc"]
+    assert dec.feed(b"\x1b\x1b]0;title\x07") == ["esc"]
+    # the flush ends the head of a sequence behind the first Esc
+    for head in (b"\x1b\x1b[", b"\x1b\x1bO", b"\x1b\x1b[5", b"\x1b\x1b[1;"):
+        assert dec.feed(head) == [], head
+        assert dec.flush_escape() == ["esc"], head
+        assert dec.flush_escape() == [], head
+    assert dec.feed(b"j") == ["j"]
+
+
+def test_key_decoder_takes_a_paste_behind_an_escape():
+    """An ``Esc`` in front of a start marker is the Esc key, and the
+    paste is text. The flush takes that Esc and keeps the head of the
+    marker from its third character on."""
+    data = (tui.PASTE_START + "a\rb" + tui.PASTE_END + "j").encode()
+    for lead in (1, 2, 3):
+        dec = KeyDecoder()
+        keys = dec.feed(b"\x1b" * lead + data)
+        assert keys == ["esc"] * lead + ["a", "b", "j"], lead
+        assert _pasted(keys) == [False] * lead + [True, True, False], lead
+        assert dec.flush_escape() == [], lead
+    for cut in (3, 4, 5):
+        dec = KeyDecoder()
+        assert dec.feed(b"\x1b" + data[:cut]) == [], cut
+        assert dec.flush_escape() == ["esc"], cut
+        assert dec.flush_escape() == [], cut
+        keys = dec.feed(data[cut:])
+        assert keys == ["a", "b", "j"], cut
+        assert _pasted(keys) == [True, True, False], cut
+    # a kept head takes no other key, and the Esc ahead of it came out
+    dec = KeyDecoder()
+    assert dec.feed(b"\x1b\x1b[20") == []
+    assert dec.flush_escape() == ["esc"]
+    assert dec.feed(b"q\x1b\x1b[A") == ["q", "up"]
+
+
+def _decode_reads(reads):
+    """The keys of ``reads`` fed in turn with one quiet-gap flush at the
+    end, each with its pasted mark."""
+    dec = KeyDecoder()
+    keys = [key for read in reads for key in dec.feed(read)]
+    keys += dec.flush_escape()
+    return list(zip(keys, _pasted(keys), strict=True))
+
+
+def test_key_decoder_chunking_changes_no_key():
+    """A stream decodes to the same keys whole, cut in two at any byte,
+    and one byte at a time, when no quiet-gap flush falls between the
+    reads."""
+    text = [tui._Pasted(ch) for ch in "ab é"]
+    paste = tui.PASTE_START + "a\rb é\n" + tui.PASTE_END
+    streams = {
+        "j\x1b[A\x1bOB\x1b[5~\x1b[1;5C\x1b[Zé\U0001f600\r\t\x7f\x03": [
+            "j", "up", "down", "pgup", "right", "shift+tab", "é",
+            "\U0001f600", "enter", "tab", "backspace", "ctrl+c",
+        ],
+        "\x1b\x1b[A": ["up"],
+        "\x1b\x1b[B\x1b\x1bOD\x1b\x1b[5~\x1b\x1b[3~q": [
+            "down", "left", "pgup", "delete", "q",
+        ],
+        "\x1b\x1b[1;3H\x1b\x1b[20~\x1b\x1bOP\x1b\x1b[Zk": [
+            "home", "shift+tab", "k",
+        ],
+        "\x1b\x1b": ["esc", "esc"],
+        "\x1b\x1b\x1b": ["esc", "esc", "esc"],
+        "\x1b\x1b\x1b[F\x1b": ["esc", "end", "esc"],
+        "\x1bx\x1b\x1by\x1b\x1b\rz\x1b": ["esc", "esc", "z", "esc"],
+        "\x1b]0;t\x07k\x1b\x1b]0;t\x1b\\\x1b\x1bOH": ["k", "esc", "home"],
+        "\x1b[99~\x1b[2~\x1b\x1b[": ["insert", "esc"],
+        "/" + paste + "\x1b\x1b[B": ["/", *text, "down"],
+        "\x1b" + paste + "\x1b" + paste + "j": [
+            "esc", *text, "esc", *text, "j",
+        ],
+        "\x1b\x1b" + paste + "\x1b\x1b": ["esc", "esc", *text, "esc", "esc"],
+        "x" + tui.PASTE_START + "a\x1b\x1b[A\x1b[20": [
+            "x", *map(tui._Pasted, "a[A"),
+        ],
+    }
+    for stream, want in streams.items():
+        data = stream.encode("utf-8")
+        whole = _decode_reads([data])
+        marks = _pasted(want)
+        assert whole == list(zip(want, marks, strict=True)), stream
+        for cut in range(1, len(data)):
+            reads = [data[:cut], data[cut:]]
+            assert _decode_reads(reads) == whole, (stream, cut)
+        reads = [data[at : at + 1] for at in range(len(data))]
+        assert _decode_reads(reads) == whole, stream
+
+
+def test_windows_key_events_decode_to_key_names():
+    """One console key event names one key: the character it types, or
+    the key's own name when it types none."""
+    from cronstable.tui import _win_key
+
+    shift, ctrl, alt, enhanced = 0x10, 0x08, 0x02, 0x100
+
+    def down(vk=0, ch="", state=0):
+        return _win_key(True, vk, ord(ch) if ch else 0, state)
+
+    # characters, U+00E0 and U+0000 among them, whatever key typed them
+    assert down(0x41, "a") == "a" and down(0, "一") == "一"
+    assert down(0, "\xe0") == "\xe0" and down(0x41, "\xe0", shift) == "\xe0"
+    assert down(0x32, "", ctrl) is None  # Ctrl+2 types U+0000: no key
+    assert down(0x51, "@", ctrl | 0x01) == "@"  # AltGr types a character
+    # control characters
+    assert down(0x0D, "\r") == "enter" and down(0x1B, "\x1b") == "esc"
+    assert down(0x08, "\x08") == "backspace" and down(0x09, "\t") == "tab"
+    assert down(0x43, "\x03", ctrl) == "ctrl+c"
+    assert down(0x4B, "\x0b", ctrl) == "ctrl+k"
+    assert down(0x09, "\t", shift) == "shift+tab"
+    assert down(0x09, "", shift) == "shift+tab"
+    # keys that type nothing: the navigation cluster, either keypad
+    names = {
+        0x21: "pgup",
+        0x22: "pgdn",
+        0x23: "end",
+        0x24: "home",
+        0x25: "left",
+        0x26: "up",
+        0x27: "right",
+        0x28: "down",
+        0x2D: "insert",
+        0x2E: "delete",
+    }
+    for vk, name in names.items():
+        assert down(vk, "", enhanced) == name
+        assert down(vk) == name and down(vk, "", shift | enhanced) == name
+        assert down(vk, "", alt | enhanced) is None
+        arrow = name in ("left", "up", "right", "down")
+        assert down(vk, "", ctrl | enhanced) == (name if arrow else None)
+    # function keys, modifiers on their own, and every key release
+    for vk in (0x70, 0x7B, 0x10, 0x11, 0x12, 0x14, 0x5B, 0x60):
+        assert down(vk) is None
+    assert _win_key(False, 0x41, ord("a"), 0) is None
+    assert _win_key(False, 0x26, 0, enhanced) is None
+    # Alt+numpad entry: the digits are no keys, and the character
+    # arrives as Alt is released
+    assert down(0x12, "", alt) is None and down(0x61, "", alt) is None
+    assert _win_key(False, 0x12, ord("€"), 0) == "€"
+    assert _win_key(False, 0x12, 0, 0) is None
+    # a control character entered that way is the key it names
+    assert _win_key(False, 0x12, 0x7F, 0) == "backspace"
+    assert _win_key(False, 0x12, 0x0D, 0) == "enter"
+    assert _win_key(False, 0x12, 0x1B, 0) == "esc"
+
+
 def test_ansi_measurement_and_cutting():
     theme = Theme("carolina", light=False)
     styled = theme.fg("ok") + "hello" + "\x1b[0m" + " world"
@@ -2480,6 +2761,15 @@ async def test_api_builds_a_connector_only_for_a_tls_context(monkeypatch):
     assert seen[-1]["connector"].kwargs == {"ssl": ctx}
 
 
+def _stub_key_readers(monkeypatch):
+    """Keep ``dispatch`` off the terminal that runs the tests: the real
+    readers take its keys, and the Windows one sets its input mode."""
+    for name in ("PosixKeyReader", "WindowsKeyReader"):
+        monkeypatch.setattr(
+            tui, name, lambda *a, **k: object(), raising=False
+        )
+
+
 def test_dispatch_takes_the_token_and_tls_from_the_shared_client(monkeypatch):
     """The session's credential comes from cronstable.webclient, which
     resolves it for the MCP bridge and cronstable pair too, so the three
@@ -2505,7 +2795,7 @@ def test_dispatch_takes_the_token_and_tls_from_the_shared_client(monkeypatch):
 
     monkeypatch.setattr(tui, "TuiApp", FakeApp)
     monkeypatch.setattr(tui, "Term", lambda *a, **k: object())
-    monkeypatch.setattr(tui, "PosixKeyReader", lambda *a, **k: object())
+    _stub_key_readers(monkeypatch)
     context = object()
     asked = []
 
@@ -2860,6 +3150,120 @@ def test_term_exit_headless_screen_and_clipboard(monkeypatch):
     assert ht.copied == ["hello"]
 
 
+@pytest.mark.parametrize("encoding", ["utf-8", "ascii", "cp1252"])
+def test_term_paints_what_its_stream_cannot_encode(encoding):
+    """A frame may hold a character that the stream's encoding lacks, or
+    half a surrogate pair. The frame is painted with "?" in its place."""
+    import io
+
+    raw = io.BytesIO()
+    out = io.TextIOWrapper(raw, encoding=encoding, errors="strict")
+    term = tui.Term(stream=out)
+    term.paint(["half \ud83d pair", "glyph ● end", "plain"], "")
+    painted = raw.getvalue()
+    assert b"half ? pair" in painted and b"plain" in painted
+    glyph = "●".encode("utf-8") if encoding == "utf-8" else b"?"
+    assert b"glyph " + glyph + b" end" in painted
+
+
+def _posix_term(monkeypatch, out):
+    """A real ``Term`` over ``out`` whose raw-mode calls reach no tty.
+    Returns it with the list that collects restored tty modes."""
+
+    class Tty:
+        def fileno(self):
+            return 0
+
+    restored = []
+    monkeypatch.setattr("sys.stdin", Tty())
+    monkeypatch.setattr(tui.termios, "tcgetattr", lambda fd: ["cooked"])
+    monkeypatch.setattr(tui.tty, "setraw", lambda fd, when: None)
+    monkeypatch.setattr(
+        tui.termios,
+        "tcsetattr",
+        lambda fd, when, mode: restored.append(mode),
+    )
+    return tui.Term(stream=out), restored
+
+
+def test_term_brackets_pastes_on_posix_only(monkeypatch):
+    """A POSIX terminal marks pastes while the dashboard holds it. The
+    Windows console gets no such request."""
+    import io
+
+    out = io.StringIO()
+    if sys.platform == "win32":
+        monkeypatch.setattr(tui, "enable_console_vt", lambda: None)
+        term = tui.Term(stream=out)
+    else:
+        term, _ = _posix_term(monkeypatch, out)
+    term.enter()
+    entered = out.getvalue()
+    term.exit()
+    left = out.getvalue()[len(entered) :]
+    if sys.platform == "win32":
+        assert "2004" not in entered + left
+    else:
+        assert entered.count(tui.PASTE_ON) == 1
+        assert tui.PASTE_OFF not in entered
+        assert left.count(tui.PASTE_OFF) == 1 and tui.PASTE_ON not in left
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a POSIX terminal mode")
+@pytest.mark.parametrize("shutdown", ["quit", "cancel", "crash"])
+async def test_every_way_out_of_the_dashboard_ends_bracketed_paste(
+    tmp_path, monkeypatch, shutdown
+):
+    """The terminal marks pastes from the moment the dashboard takes it,
+    and each way out of ``run`` switches that off with the raw mode."""
+    import io
+
+    out = io.StringIO()
+    term, restored = _posix_term(monkeypatch, out)
+    app = TuiApp(
+        Api("http://127.0.0.1:1", None),
+        term,
+        ScriptedKeys(),
+        dict(tui.PREF_DEFAULTS),
+        boot=False,
+        prefs_file=str(tmp_path / "prefs.json"),
+    )
+
+    async def idle():
+        await asyncio.Event().wait()
+
+    async def fail_on_key(key):
+        raise RuntimeError("input failed")
+
+    monkeypatch.setattr(app, "_startup", idle)
+    monkeypatch.setattr(app, "_poll_loop", idle)
+    run = asyncio.create_task(app.run())
+    try:
+        await asyncio.sleep(0)
+        assert out.getvalue().count(tui.PASTE_ON) == 1
+        assert tui.PASTE_OFF not in out.getvalue() and not restored
+        if shutdown == "quit":
+            app.keys.send("ctrl+c")
+            await asyncio.wait_for(run, 5)
+        elif shutdown == "cancel":
+            run.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(run, 5)
+        else:
+            monkeypatch.setattr(app, "handle_key", fail_on_key)
+            app.keys.send("x")
+            with pytest.raises(RuntimeError, match="input failed"):
+                await asyncio.wait_for(run, 5)
+        text = out.getvalue()
+        assert text.count(tui.PASTE_OFF) == 1
+        assert text.rindex(tui.PASTE_OFF) > text.rindex(tui.PASTE_ON)
+        assert restored == [["cooked"]]
+    finally:
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
 def test_add_tui_command_registers_all_flags():
     import argparse
 
@@ -2907,7 +3311,7 @@ def test_dispatch_runs_amain(monkeypatch):
 
     monkeypatch.setattr(tui, "TuiApp", FakeApp)
     monkeypatch.setattr(tui, "Term", lambda *a, **k: object())
-    monkeypatch.setattr(tui, "PosixKeyReader", lambda *a, **k: object())
+    _stub_key_readers(monkeypatch)
 
     class Args(_TlsArgs):
         url = tui.DEFAULT_URL
@@ -2936,6 +3340,57 @@ def test_dispatch_runs_amain(monkeypatch):
 
     assert tui.dispatch(ArgsNoBoot()) == 0
     assert seen["kwargs"]["boot"] is False
+
+
+@pytest.mark.parametrize("failing", [None, "build", "run"])
+def test_dispatch_closes_the_key_reader_on_every_way_out(monkeypatch, failing):
+    """The Windows reader holds the console in raw input mode until it is
+    closed. ``dispatch`` closes the reader when the dashboard returns,
+    when the app fails to build, and when it fails while it runs."""
+
+    class Tty:
+        def isatty(self):
+            return True
+
+        def fileno(self):
+            return 0
+
+    monkeypatch.setattr("sys.stdin", Tty())
+    monkeypatch.setattr("sys.stdout", Tty())
+    closed = []
+
+    class Reader:
+        def __init__(self, *a, **k):
+            pass
+
+        def close(self):
+            closed.append(self)
+
+    class FakeApp:
+        def __init__(self, *a, **k):
+            if failing == "build":
+                raise RuntimeError("build failed")
+
+        async def run(self):
+            if failing == "run":
+                raise RuntimeError("run failed")
+
+    for name in ("PosixKeyReader", "WindowsKeyReader"):
+        monkeypatch.setattr(tui, name, Reader, raising=False)
+    monkeypatch.setattr(tui, "TuiApp", FakeApp)
+    monkeypatch.setattr(tui, "Term", lambda *a, **k: object())
+
+    class Args(_TlsArgs):
+        url = tui.DEFAULT_URL
+        token = None
+        token_env = _cliargs.WEB_ENV_TOKEN
+
+    if failing is None:
+        assert tui.dispatch(Args()) == 0
+    else:
+        with pytest.raises(RuntimeError, match=failing + " failed"):
+            tui.dispatch(Args())
+    assert len(closed) == 1
 
 
 # ===================================================================
@@ -3404,6 +3859,33 @@ def test_render_heat_bucket_edges(tmp_path):
     assert "activity heatmap" in _txt(app.render_heat(paint, 110, 30))
 
 
+#: the punchcard's one request: the first HEAT_MAX_JOBS jobs by name
+_HEAT_PATH = "/activity?jobs=%d&sort=name" % tui.HEAT_MAX_JOBS
+
+
+async def test_load_heat_asks_for_the_rows_the_card_draws(tmp_path):
+    """The request names the card's own cap and order, so the daemon
+    sends the 80 jobs ``render_heat`` draws and no others."""
+    assert _HEAT_PATH == "/activity?jobs=80&sort=name"
+    app = _bare_app(tmp_path)
+    names = ["j%03d" % i for i in range(tui.HEAT_MAX_JOBS)]
+    row = {"outcome": "success", "finished_at": _iso_ago(60)}
+    calls = []
+
+    class FakeApi:
+        async def get_json(self, path):
+            calls.append(path)
+            return {"jobs": {name: [row] for name in names}}
+
+    app.api = FakeApi()
+    app._heat_busy = True
+    await app._load_heat()
+    assert calls == ["/activity?jobs=80&sort=name"]
+    assert sorted(app.heat_data) == names
+    shown = _txt(app.render_heat(_paint(app), 110, 200))
+    assert all(name in shown for name in names)
+
+
 async def test_load_heat_overlaps_bounded_and_prunes_dead_names(tmp_path):
     # The heat load used to await its per-job /runs fetches strictly one at
     # a time INSIDE the poll loop, freezing every poll surface for the sum
@@ -3417,7 +3899,7 @@ async def test_load_heat_overlaps_bounded_and_prunes_dead_names(tmp_path):
 
     class FakeApi:
         async def get_json(self, path):
-            if path == "/activity":
+            if path == _HEAT_PATH:
                 # an old daemon: the batch probe 404s (uncounted), and
                 # the per-job fan-out below is the path under test
                 raise tui.ApiError(404)
@@ -3452,13 +3934,13 @@ async def test_load_heat_prefers_the_batched_endpoint(tmp_path):
     class FakeApi:
         async def get_json(self, path):
             calls.append(path)
-            assert path == "/activity", "unexpected fan-out to %s" % path
+            assert path == _HEAT_PATH, "unexpected fan-out to %s" % path
             return {"jobs": {"j00": [row], "j01": []}}
 
     app.api = FakeApi()
     app._heat_busy = True  # exactly as _fanout sets it before spawning
     await app._load_heat()
-    assert calls == ["/activity"]
+    assert calls == [_HEAT_PATH]
     assert "gone" not in app.heat_data
     assert app.heat_data["j00"] == [row]
     assert app.heat_data["j01"] == []
@@ -3476,26 +3958,56 @@ async def test_load_heat_falls_back_per_job_on_404(tmp_path):
     class FakeApi:
         async def get_json(self, path):
             calls.append(path)
-            if path == "/activity":
+            if path == _HEAT_PATH:
                 raise tui.ApiError(404)
             return {"runs": [{"outcome": "success"}]}
 
     app.api = FakeApi()
     app._heat_busy = True
     await app._load_heat()
-    assert calls[0] == "/activity"
+    assert calls[0] == _HEAT_PATH
     assert len(calls) == 13  # the probe plus one /runs per job
     assert app.heat_data["j00"] == [{"outcome": "success"}]
     assert app._heat_busy is False
 
 
+async def test_load_heat_fanout_holds_the_first_jobs_by_name(tmp_path):
+    """Against a daemon without /activity the card holds the first
+    HEAT_MAX_JOBS jobs by name, whichever jobs held those rows before."""
+    app = _bare_app(tmp_path)
+    cap = tui.HEAT_MAX_JOBS
+
+    class FakeApi:
+        async def get_json(self, path):
+            if path == _HEAT_PATH:
+                raise tui.ApiError(404)
+            return {"runs": [{"outcome": "success"}]}
+
+    app.api = FakeApi()
+
+    async def load(names):
+        app.jobs = [{"name": name} for name in names]
+        app.by_name = {job["name"]: job for job in app.jobs}
+        app._heat_busy = True
+        await app._load_heat()
+
+    names = ["j%03d" % i for i in range(cap + 20)]
+    await load(names)
+    assert sorted(app.heat_data) == names[:cap]
+    # a reload adds five jobs that sort first: five rows leave the card
+    names = ["a%03d" % i for i in range(5)] + names
+    await load(names)
+    assert sorted(app.heat_data) == names[:cap]
+    shown = _txt(app.render_heat(_paint(app), 110, 200))
+    assert "a004" in shown and names[cap - 1] in shown
+    assert names[cap] not in shown
+
+
 async def test_load_heat_batched_caps_like_the_fanout(tmp_path):
-    # /activity is capped in RUNS per job but not in JOBS, so a
-    # fleet-scale daemon hands the batched path a row list for every
-    # configured job. The card draws HEAT_MAX_JOBS of them, so retaining
-    # the rest is memory the user can never reach, and it left the two
-    # heat paths disagreeing: the fan-out has always capped. Both now
-    # take the same first-N-by-name slice.
+    # The fake daemon ignores the jobs parameter, as a daemon that
+    # predates it does, and answers with a row list for every configured
+    # job. The card draws HEAT_MAX_JOBS of them, so the batched path keeps
+    # the first HEAT_MAX_JOBS by name, the slice the fan-out path fetches.
     app = _bare_app(tmp_path)
     total = tui.HEAT_MAX_JOBS + 25
     app.jobs = [{"name": "j%03d" % i} for i in range(total)]
@@ -3504,7 +4016,7 @@ async def test_load_heat_batched_caps_like_the_fanout(tmp_path):
 
     class FakeApi:
         async def get_json(self, path):
-            assert path == "/activity"
+            assert path == _HEAT_PATH
             return {"jobs": {j["name"]: [row] for j in app.jobs}}
 
     app.api = FakeApi()
@@ -3536,7 +4048,7 @@ async def test_load_heat_transient_batch_failure_keeps_stale_data(tmp_path):
     app.api = FakeApi()
     app._heat_busy = True
     await app._load_heat()
-    assert calls == ["/activity"]  # no per-job fan-out
+    assert calls == [_HEAT_PATH]  # no per-job fan-out
     assert app.heat_data["j00"] == stale
     assert app._heat_busy is False
 
@@ -5021,6 +5533,56 @@ async def test_posix_key_reader_via_pipe():
         # a lone Esc resolves through the quiet-gap flush
         os.write(w, b"\x1b")
         assert await asyncio.wait_for(reader.get(), 2) == "esc"
+        # keys that one read delivers together wait in the queue
+        os.write(w, b"jk")
+        assert await asyncio.wait_for(reader.get(), 2) == "j"
+        assert reader.get_nowait() == "k"
+        assert reader.get_nowait() is None
+    finally:
+        reader.close()
+        os.close(w)
+        os.close(r)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX key reader")
+async def test_posix_key_reader_takes_ctrl_c_out_of_an_unended_paste():
+    """The reader's quiet-gap flush marks the gap in a paste that lost
+    its end marker, so a Ctrl+C typed after it arrives as ``ctrl+c``."""
+    import os
+
+    r, w = os.pipe()
+    reader = tui.PosixKeyReader(asyncio.get_running_loop(), r)
+    try:
+        os.write(w, tui.PASTE_START.encode() + b"ab\x03")
+        assert await asyncio.wait_for(reader.get(), 2) == "a"
+        assert await asyncio.wait_for(reader.get(), 2) == "b"
+        await _wait_for(lambda: reader._decoder._quiet)
+        assert reader.get_nowait() is None
+        os.write(w, b"\x03")
+        assert await asyncio.wait_for(reader.get(), 2) == "ctrl+c"
+    finally:
+        reader.close()
+        os.close(w)
+        os.close(r)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX key reader")
+async def test_posix_key_reader_resolves_a_double_escape_on_the_flush():
+    """Two ``Esc`` bytes that one read delivers come out together on the
+    quiet-gap flush, and an Esc-prefixed arrow comes out as the arrow."""
+    import os
+
+    r, w = os.pipe()
+    reader = tui.PosixKeyReader(asyncio.get_running_loop(), r)
+    try:
+        os.write(w, b"\x1b\x1b")
+        assert await asyncio.wait_for(reader.get(), 2) == "esc"
+        assert reader.get_nowait() == "esc"
+        assert reader.get_nowait() is None
+        os.write(w, b"\x1b\x1b[Bj")
+        assert await asyncio.wait_for(reader.get(), 2) == "down"
+        assert reader.get_nowait() == "j"
+        assert reader.get_nowait() is None
     finally:
         reader.close()
         os.close(w)
@@ -6200,3 +6762,979 @@ async def test_refused_job_params_keep_the_row_for_a_correction(tmp_path):
     await app.run_job_from_input("x=1")
     assert app.focus is None
     await asyncio.sleep(0.05)
+
+
+# ===================================================================
+#  Queued filter keystrokes share one view rebuild
+# ===================================================================
+def _filter_fleet(nameless=False):
+    """Jobs whose names and commands overlap, so typed filters narrow,
+    widen and empty the view. Two jobs share a name, and ``nameless``
+    adds one that has none: the selection follows a job by name, and
+    both cases bend that rule."""
+    jobs = [
+        _job("north-beacon", outcome="success", command="bin/one"),
+        _job(
+            "south-beacon",
+            outcome="failure",
+            exit_code=2,
+            command="bin/one --hot",
+            finished_ago=5,
+            duration=9,
+        ),
+        _job(
+            "pulse-check",
+            running=True,
+            scheduled_in=None,
+            command="bin/none",
+        ),
+        _job(
+            "etl-1",
+            outcome="success",
+            command="echo one",
+            finished_ago=600,
+            duration=3,
+            scheduled_in=5,
+        ),
+        _job("etl-10", enabled=False, command="echo bone"),
+        _job("Etl-11", outcome="cancelled", command="echo no"),
+        _job("beacon", outcome="success", command="bin/eon", duration=0.5),
+        _job("bone", outcome="success", command="bin/one b"),
+        _job("bone", outcome="failure", command="echo eb", scheduled_in=None),
+        _job("one-b", outcome="success", command="hub", scheduled_in=900),
+        _job("hub", command="one"),
+        _job("u-boot", outcome="unknown", command="-1"),
+    ]
+    if nameless:
+        job = _job("x", command="bone 1")
+        del job["name"]
+        jobs.append(job)
+    return jobs
+
+
+def _filter_rig(tmp_path, jobs):
+    """A bare app over ``jobs`` whose view-reading actions record the
+    job they acted on and reach no daemon."""
+    app = _bare_app(tmp_path)
+    app.jobs = jobs
+    app.by_name = {job.get("name", ""): job for job in jobs}
+    app.recompute_view()
+    acted = []
+
+    async def run_job(name):
+        acted.append(("run", name))
+
+    app.open_drawer = lambda name, tab="logs": acted.append(("open", name))
+    app.copy_command = lambda job: acted.append(("copy", job.get("name")))
+    app.run_job = run_job
+    return app, acted
+
+
+def _view_state(app):
+    return (
+        [id(job) for job in app.view],
+        app.sel,
+        app.filter_text,
+        app.inputs["filter"],
+        app.focus,
+        app.sort_key,
+        app.sort_dir,
+        app.status_filter,
+    )
+
+
+class _InputLoop:
+    """The real input loop over a scripted queue, one burst at a time."""
+
+    def __init__(self, app):
+        self.app = app
+        self.task = None
+
+    async def __aenter__(self):
+        loop = asyncio.get_running_loop()
+        self.task = loop.create_task(self.app._input_loop())
+        await asyncio.sleep(0)
+        return self
+
+    async def burst(self, *keys):
+        """Queue ``keys`` together and return once the loop handled them
+        all and is waiting for the next key. The loop takes a queued run
+        without yielding, so one turn of the event loop drains it."""
+        self.app.keys.send(*keys)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert self.app.keys.queue.empty(), keys
+        assert not self.task.done(), self.task
+
+    async def __aexit__(self, *exc):
+        self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+
+
+def _count_rebuilds(app):
+    """Count ``recompute_view`` calls on ``app`` from here on."""
+    calls = []
+    real = app.recompute_view
+
+    def counted():
+        calls.append(app.filter_text)
+        real()
+
+    app.recompute_view = counted
+    return calls
+
+
+async def test_queued_filter_keys_share_one_view_rebuild(tmp_path):
+    """A paste lands in the key queue whole. Its characters rebuild the
+    view once, and the result is the view that one rebuild per character
+    leaves."""
+    jobs = _filter_fleet()
+    app, _ = _filter_rig(tmp_path, jobs)
+    ref, _ = _filter_rig(tmp_path, jobs)
+    text = "bin/one --hot and then some more that matches nothing"
+    for key in ["/", *text]:
+        await ref.handle_key(key)
+    calls = _count_rebuilds(app)
+    async with _InputLoop(app) as loop:
+        await loop.burst("/", *text)
+    assert calls == [text]
+    assert _view_state(app) == _view_state(ref)
+    assert app.view == [] and app.sel == 0
+    # keys that arrive one at a time rebuild one at a time
+    async with _InputLoop(app) as loop:
+        for _ in text:
+            await loop.burst("backspace")
+    assert len(calls) == 1 + len(text)
+    assert len(app.view) == len(jobs)
+
+
+def _typed(text):
+    """Windows console key events for ``text``: a press and a release
+    for each UTF-16 code unit, as ``(down, vk, unit, state)``."""
+    data = text.encode("utf-16-le", "surrogatepass")
+    events = []
+    for at in range(0, len(data), 2):
+        unit = int.from_bytes(data[at : at + 2], "little")
+        events += [(True, 0, unit, 0), (False, 0, unit, 0)]
+    return events
+
+
+class _FakeConsole:
+    """The console as the Windows reader thread sees it. Each ``send``
+    is the key events that wait in the console together."""
+
+    def __init__(self):
+        import queue
+
+        self._waiting = queue.Queue()
+        self.closed = False
+
+    def send(self, events):
+        self._waiting.put(list(events))
+
+    def read(self):
+        return self._waiting.get()
+
+    def stop(self):
+        self._waiting.put(None)
+
+    def close(self):
+        self.closed = True
+
+
+def _windows_reader(monkeypatch):
+    """The real reader over a fake console, and that console."""
+    console = _FakeConsole()
+    monkeypatch.setattr(tui, "_WinConsole", lambda: console)
+    return tui.WindowsKeyReader(asyncio.get_running_loop()), console
+
+
+async def _next_keys(reader, count):
+    return [await asyncio.wait_for(reader.get(), 5) for _ in range(count)]
+
+
+windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="the Windows console key reader"
+)
+
+
+@windows_only
+async def test_windows_reader_queues_waiting_keys_in_one_callback(
+    monkeypatch,
+):
+    """A paste waits in the console as a run of keys. The reader posts
+    the run to the loop in one callback, so the input loop's drain finds
+    all of it."""
+    loop = asyncio.get_running_loop()
+    posted = []
+    real_post = loop.call_soon_threadsafe
+
+    def recording_post(callback, *args):
+        posted.append(callback)
+        return real_post(callback, *args)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", recording_post)
+    reader, console = _windows_reader(monkeypatch)
+    try:
+        console.send(_typed("ab\x7fc\r"))
+        keys = [await reader.get()]
+        while (key := reader.get_nowait()) is not None:
+            keys.append(key)
+    finally:
+        reader.close()
+        reader._thread.join(30)
+    assert keys == ["a", "b", "backspace", "c", "enter"]
+    assert posted.count(reader._enqueue) == 1
+    # close ends the thread, which hands the console back
+    assert not reader._thread.is_alive() and console.closed
+
+
+@windows_only
+async def test_windows_reader_takes_u00e0_as_a_character(monkeypatch):
+    """A typed U+00E0 is a character. It reaches the queue with the keys
+    around it, and the key pressed after it is its own key."""
+    reader, console = _windows_reader(monkeypatch)
+    try:
+        console.send(_typed("vo\xe0"))
+        keys = await _next_keys(reader, 3)
+        assert reader.get_nowait() is None
+        # an arrow key, a function key (which names no key), then Enter
+        arrow = [(True, 0x26, 0, 0x100), (False, 0x26, 0, 0x100)]
+        f1 = [(True, 0x70, 0, 0), (False, 0x70, 0, 0)]
+        console.send(arrow + f1 + _typed("\r\xe0x"))
+        keys += await _next_keys(reader, 4)
+        assert reader.get_nowait() is None
+    finally:
+        reader.close()
+        reader._thread.join(30)
+    assert keys == ["v", "o", "\xe0", "up", "enter", "\xe0", "x"]
+
+
+@windows_only
+async def test_windows_reader_joins_surrogate_pairs(monkeypatch):
+    """The console delivers a character outside the BMP as two UTF-16
+    halves. They reach the queue as one character, and a half without
+    its pair is dropped, so every queued key can be painted."""
+    emoji, high, low = "\U0001f600", "\ud83d", "\ude00"
+    reader, console = _windows_reader(monkeypatch)
+    try:
+        console.send(_typed("a" + emoji + "b"))
+        # a pair whose halves arrive in two waits
+        console.send(_typed("c" + high))
+        console.send(_typed(low + "d"))
+        # halves without a pair
+        console.send(_typed(high + "e" + low + "f" + high))
+        console.send(_typed("g"))
+        keys = await _next_keys(reader, 9)
+        assert reader.get_nowait() is None
+    finally:
+        reader.close()
+        reader._thread.join(30)
+    assert keys == ["a", emoji, "b", "c", emoji, "d", "e", "f", "g"]
+    "".join(keys).encode("utf-8")
+
+
+@windows_only
+async def test_windows_reader_drops_the_rest_of_one_batch(monkeypatch):
+    """``drop_batch`` discards the keys that waited in the console with
+    the key last taken, and no key of a later wait."""
+    reader, console = _windows_reader(monkeypatch)
+    try:
+        console.send(_typed("ab\rcd"))
+        console.send(_typed("e"))
+        assert await _next_keys(reader, 3) == ["a", "b", "enter"]
+        # the later wait is queued when the drop runs
+        await _wait_for(lambda: reader._queue.qsize() == 1)
+        reader.drop_batch()
+        assert await _next_keys(reader, 1) == ["e"]
+        assert reader.get_nowait() is None
+        reader.drop_batch()  # nothing left to drop
+        console.send(_typed("f"))
+        assert await _next_keys(reader, 1) == ["f"]
+    finally:
+        reader.close()
+        reader._thread.join(30)
+
+
+@windows_only
+async def test_windows_reader_without_a_console_delivers_no_key(monkeypatch):
+    """Where no console opens, the reader thread ends at once, no key
+    arrives, and ``close`` has nothing to stop."""
+
+    def no_console():
+        raise OSError("no console")
+
+    monkeypatch.setattr(tui, "_WinConsole", no_console)
+    reader = tui.WindowsKeyReader(asyncio.get_running_loop())
+    reader._thread.join(30)
+    assert not reader._thread.is_alive()
+    assert reader.get_nowait() is None
+    reader.close()
+
+
+#: Runs in a process that owns a console. It writes key event records
+#: into that console's input buffer, reads them through the real reader,
+#: and prints what it saw as JSON. argv[1] is the directory that holds
+#: the package under test.
+_CONSOLE_CHILD = r"""
+import asyncio, ctypes, json, sys
+from ctypes import wintypes
+
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+dword = wintypes.DWORD
+
+
+class Key(ctypes.Structure):
+    _fields_ = [
+        ("bKeyDown", wintypes.BOOL),
+        ("wRepeatCount", wintypes.WORD),
+        ("wVirtualKeyCode", wintypes.WORD),
+        ("wVirtualScanCode", wintypes.WORD),
+        ("UnicodeChar", wintypes.WORD),
+        ("dwControlKeyState", dword),
+    ]
+
+
+class Record(ctypes.Structure):
+    _fields_ = [("EventType", wintypes.WORD), ("Key", Key)]
+
+
+handle, count = wintypes.HANDLE, ctypes.POINTER(dword)
+k32.CreateFileW.restype = handle
+k32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR, dword, dword, ctypes.c_void_p, dword, dword, handle
+]
+k32.GetConsoleMode.argtypes = [handle, count]
+k32.GetNumberOfConsoleInputEvents.argtypes = [handle, count]
+k32.WriteConsoleInputW.argtypes = [
+    handle, ctypes.POINTER(Record), dword, count
+]
+conin = k32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+
+
+def ask(function):
+    value = dword()
+    return value.value if function(conin, ctypes.byref(value)) else None
+
+
+if ask(k32.GetConsoleMode) is None:
+    print(json.dumps({"console": False}))
+    sys.exit(0)
+sys.path.insert(0, sys.argv[1])
+from cronstable import tui
+
+
+def press(vk=0, unit=0, state=0):
+    records = []
+    for down in (1, 0):
+        record = Record(EventType=1)
+        record.Key.bKeyDown, record.Key.wRepeatCount = down, 1
+        record.Key.wVirtualKeyCode, record.Key.UnicodeChar = vk, unit
+        record.Key.dwControlKeyState = state
+        records.append(record)
+    return records
+
+
+typed = (
+    press(0x41, ord("a"))
+    + press(0, 0xE0)
+    + press(0x26, 0, 0x100)  # the up arrow
+    + press(0, 0xD83D)  # U+1F600 as its two halves
+    + press(0, 0xDE00)
+    + press(0x51, ord("@"), 0x09)  # AltGr+Q: left Ctrl and right Alt
+    + [Record(EventType=0x10)]  # a focus event, which is no key
+    + press(0x0D, 0x0D)
+)
+
+
+async def main():
+    loop = asyncio.get_running_loop()
+    seen = {"console": True, "modes": [ask(k32.GetConsoleMode)]}
+    seen.update(alive=[], left=[])
+
+    def opened():
+        reader = tui.WindowsKeyReader(loop)
+        seen["modes"].append(ask(k32.GetConsoleMode))
+        return reader
+
+    def close(reader):
+        reader.close()
+        reader._thread.join(10)
+        seen["alive"].append(reader._thread.is_alive())
+        seen["modes"].append(ask(k32.GetConsoleMode))
+        seen["left"].append(ask(k32.GetNumberOfConsoleInputEvents))
+
+    close(opened())  # a reader that is closed before a key arrives
+    reader = opened()
+    records, written = (Record * len(typed))(*typed), dword()
+    k32.WriteConsoleInputW(conin, records, len(typed), ctypes.byref(written))
+    seen["written"], keys = written.value == len(typed), []
+    try:
+        for _ in range(6):
+            keys.append(await asyncio.wait_for(reader.get(), 10))
+    except asyncio.TimeoutError:
+        pass
+    while (key := reader.get_nowait()) is not None:
+        keys.append(key)
+    seen["keys"] = keys
+    close(reader)
+    return seen
+
+
+print(json.dumps(asyncio.run(main())))
+"""
+
+#: The exit status of a process that Windows could not attach to a
+#: console or a desktop (STATUS_DLL_INIT_FAILED).
+_NO_CONSOLE_EXIT = 0xC0000142
+
+
+@windows_only
+def test_windows_reader_reads_key_events_from_a_real_console():
+    """The reader over a real console. A child process owns a hidden
+    console and types into it, so the console that runs the tests is never
+    read or changed. The reader names each key, holds the console in raw
+    input mode while it is open, and on close ends its thread, restores
+    the mode and leaves no record behind."""
+    import os
+    import subprocess
+
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = 0  # SW_HIDE
+    root = os.path.dirname(os.path.dirname(os.path.abspath(tui.__file__)))
+    try:
+        child = subprocess.run(
+            [sys.executable, "-c", _CONSOLE_CHILD, root],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+            startupinfo=startup,
+            timeout=50,
+        )
+    except OSError as err:
+        pytest.skip("no hidden console: %s" % err)
+    if child.returncode == _NO_CONSOLE_EXIT and not child.stdout:
+        pytest.skip("no hidden console: the child could not start in one")
+    assert child.returncode == 0, child.stderr.decode(errors="replace")
+    seen = json.loads(child.stdout)
+    if not seen["console"]:
+        pytest.skip("no hidden console: the child has no console")
+    assert seen["written"]
+    assert seen["keys"] == ["a", "\xe0", "up", "\U0001f600", "@", "enter"]
+    before, *modes = seen["modes"]
+    # raw while a reader is open, and as it was once the reader closed
+    assert before != 0 and modes == [0, before, 0, before]
+    assert seen["alive"] == [False, False]
+    assert seen["left"] == [0, 0]
+
+
+def _hotkey_rig(tmp_path, keys=None):
+    """A bare app over two ``db-`` jobs and one other, whose job actions
+    record what they were asked to do and reach no daemon."""
+    app = _bare_app(tmp_path)
+    if keys is not None:
+        app.keys = keys
+    app.jobs = [
+        _job("db-backup", command="pg_dump prod"),
+        _job("db-restore", command="pg_restore prod", running=True),
+        _job("mail-digest", command="digest"),
+    ]
+    app.by_name = {job["name"]: job for job in app.jobs}
+    app.recompute_view()
+    acted = []
+
+    def record(what):
+        async def action(name):
+            acted.append((what, name))
+
+        return action
+
+    for what in ("run", "cancel", "pause", "resume"):
+        setattr(app, what + "_job", record(what))
+    app.open_drawer = lambda name, tab="logs": acted.append(("open", name))
+    app.copy_command = lambda job: acted.append(("copy", job.get("name")))
+    return app, acted
+
+
+@windows_only
+async def test_windows_paste_with_a_line_break_fires_no_hotkey(
+    tmp_path, monkeypatch
+):
+    """The console marks no paste, so a pasted line break is an Enter.
+    The keys that waited in the console behind an Enter typed into the
+    filter are the rest of the paste and are dropped. A key that arrives
+    later acts."""
+    reader, console = _windows_reader(monkeypatch)
+    app, acted = _hotkey_rig(tmp_path, reader)
+    try:
+        console.send(_typed("/"))
+        console.send(_typed("db-\rprod export\r"))
+        console.send(_typed("p"))
+        # the later key is queued when the paste is cut
+        await _wait_for(lambda: reader._queue.qsize() == 3)
+        async with _InputLoop(app):
+            await _wait_for(lambda: acted)
+        assert acted == [("pause", "db-backup")]
+        assert app.filter_text == "db-" and app.focus is None
+    finally:
+        reader.close()
+        reader._thread.join(30)
+
+
+class _BatchKeys(ScriptedKeys):
+    """A key source whose queued keys arrived together, as one batch of
+    the Windows console reader does."""
+
+    def drop_batch(self):
+        while self.get_nowait() is not None:
+            pass
+
+
+async def test_enter_in_a_text_field_drops_the_keys_that_arrived_with_it(
+    tmp_path,
+):
+    """A key source that marks no paste delivers a pasted line break, tab
+    or escape as Enter, Tab or Esc. When such a key takes the focus out of
+    a text field, the keys that arrived with it are the rest of a paste
+    and act on nothing. Keys that arrive on their own act. So do the keys
+    behind an Enter typed with no field focused. The keys behind a Tab
+    that leaves the palette focused are typed into it."""
+    app, acted = _hotkey_rig(tmp_path, _BatchKeys())
+    async with _InputLoop(app) as loop:
+        await loop.burst("/", *"db-", "enter", *"prod export", "enter")
+        assert acted == []
+        assert app.filter_text == "db-" and app.focus is None
+        assert [job["name"] for job in app.view] == ["db-backup", "db-restore"]
+        # Tab and Esc leave the filter as Enter does
+        for leave in ("tab", "esc"):
+            await loop.burst("/", "ctrl+u", *"db-", leave, *"prod export")
+            assert acted == [], leave
+            assert app.filter_text == "db-" and app.focus is None, leave
+        # Tab in the palette keeps the focus, so the keys behind it are
+        # typed into the palette
+        await loop.burst("ctrl+k", *"zz", "tab", *"rp")
+        assert app.inputs["palette"] == "zzrp" and app.focus == "palette"
+        await loop.burst("esc", *"rp")
+        assert acted == [] and not app.is_open("palette")
+        # typed keys: each arrives on its own
+        for key in ["/", "backspace", "enter", "j", "x"]:
+            await loop.burst(key)
+        assert acted == [("cancel", "db-restore")]
+        assert app.filter_text == "db"
+        # Enter on the list opens a drawer, and the keys behind it act
+        del acted[:]
+        await loop.burst("enter", "k", "p")
+        assert acted == [("open", "db-restore"), ("pause", "db-backup")]
+        # the palette follows the filter's rule
+        del acted[:]
+        await loop.burst("ctrl+k", *"Logs: mail-digest", "enter", "r", "p")
+        assert acted == [("open", "mail-digest")]
+        assert not app.is_open("palette") and app.focus is None
+
+
+def _paste_keys(text):
+    """The keys that a terminal in bracketed paste mode delivers for a
+    paste of ``text``."""
+    marked = tui.PASTE_START + text + tui.PASTE_END
+    return KeyDecoder().feed(marked.encode("utf-8"))
+
+
+async def test_pasted_text_edits_the_focused_field_and_fires_no_hotkey(
+    tmp_path,
+):
+    """A marked paste is text. The focused field takes it without its
+    line breaks and keeps the focus. With no field focused the paste does
+    nothing, whatever it spells."""
+    app, acted = _hotkey_rig(tmp_path)
+    calls = _count_rebuilds(app)
+    async with _InputLoop(app) as loop:
+        await loop.burst("/", *_paste_keys("db-\rprod export\r"))
+        assert app.filter_text == "db-prod export" and app.focus == "filter"
+        assert acted == [] and calls == ["db-prod export"]
+        await loop.burst("ctrl+u", *"db-", "enter")
+        before = _view_state(app)
+        # typed, these toggle the wallboard, acknowledge, pause, cancel,
+        # run, copy, quit, focus the filter, open the help and move down
+        await loop.burst(*_paste_keys("wapxrcq/?\rj"))
+        assert acted == [] and _view_state(app) == before
+        assert not (app.wallboard or app.quit or app.open_overlays)
+        await loop.burst("p")
+        assert acted == [("pause", "db-backup")]
+
+
+async def test_pasted_text_reaches_an_overlay_that_is_a_text_input(tmp_path):
+    """The sandbox and the palette take every key as typing, so a paste
+    lands in them. An overlay with hotkeys takes none of it."""
+    app, acted = _hotkey_rig(tmp_path)
+    app.open("sandbox")
+    assert app.focus is None
+    for key in _paste_keys("*/5 * * * *\n"):
+        await app.handle_key(key)
+    assert app.inputs["sandbox"] == "*/5 * * * *"
+    app.close("sandbox")
+    await app.handle_key("ctrl+k")
+    for key in _paste_keys("db-\rbackup"):
+        await app.handle_key(key)
+    assert app.inputs["palette"] == "db-backup" and app.is_open("palette")
+    await app.handle_key("esc")
+    app.open("help")
+    for key in _paste_keys("jj?"):
+        await app.handle_key(key)
+    assert app.is_open("help") and app.panel_scroll == 0
+    assert acted == []
+
+
+async def test_escape_prefixed_arrow_leaves_the_overlay_open(tmp_path):
+    """Alt and an arrow, sent with an ``Esc`` prefix, act as the arrow in
+    the overlay on top. The overlay stays open, and the list beneath
+    keeps its row."""
+    app, acted = _hotkey_rig(tmp_path)
+    for stream in (b"\x1b\x1b[B", b"\x1b\x1bOB", b"\x1b[1;3B"):
+        app.open("help")
+        for key in KeyDecoder().feed(stream):
+            await app.handle_key(key)
+        assert app.is_open("help") and app.panel_scroll == 1, stream
+        assert app.sel == 0 and acted == [], stream
+        app.close("help")
+
+
+async def test_queued_filter_keys_track_the_selection_edit_by_edit(tmp_path):
+    """The selection follows its job through every intermediate filter
+    and keeps its row number when the job drops out, so the row a burst
+    ends on depends on every edit in it."""
+    jobs = [
+        _job("a"),
+        _job("b"),
+        _job("c", command="zz1"),
+        _job("d", command="zz"),
+        _job("e", command="zz1"),
+        _job("f", command="zz1"),
+    ]
+    app, _ = _filter_rig(tmp_path, jobs)
+    app.sel = 3
+    assert app.selected_job()["name"] == "d"
+    calls = _count_rebuilds(app)
+    async with _InputLoop(app) as loop:
+        await loop.burst("/", "z", "z", "1")
+    # "zz" keeps d as row 1 of c d e f; "zz1" drops it, so row 1 of
+    # c e f is selected. One rebuild from the unfiltered view would
+    # clamp row 3 to f.
+    assert [job["name"] for job in app.view] == ["c", "e", "f"]
+    assert app.selected_job()["name"] == "e"
+    assert calls == ["zz1"]
+    # widening edits keep the job by name without a view between them
+    async with _InputLoop(app) as loop:
+        await loop.burst("backspace", "backspace", "backspace")
+    assert app.selected_job()["name"] == "e" and app.sel == 4
+    assert calls == ["zz1", ""]
+
+
+async def test_queued_filter_keys_over_a_selected_row_without_a_name(
+    tmp_path,
+):
+    """A selected row without a name keeps its row number through every
+    edit, so each edit of a burst builds its view."""
+    nameless = _job("placeholder", command="xy", scheduled_in=30)
+    del nameless["name"]
+    jobs = [
+        _job("p1", command="q", scheduled_in=10),
+        _job("p2", command="q", scheduled_in=20),
+        nameless,
+        _job("a", command="x", scheduled_in=40),
+        _job("b", command="xy", scheduled_in=50),
+        _job("c", command="xy", scheduled_in=60),
+    ]
+    app, acted = _filter_rig(tmp_path, jobs)
+    ref, ref_acted = _filter_rig(tmp_path, jobs)
+    for each in (app, ref):
+        each.sort_key = "next"
+        each.recompute_view()
+        each.sel = 2
+        assert each.selected_job() is nameless
+    keys = ["/", "x", "y", "enter", "r"]
+    for key in keys:
+        await ref.handle_key(key)
+    async with _InputLoop(app) as loop:
+        await loop.burst(*keys)
+    # "x" leaves the nameless row, a, b, c with row 2 on b, and "xy"
+    # follows b by name. One rebuild for "xy" leaves row 2 on c.
+    assert _view_state(app) == _view_state(ref)
+    assert acted == ref_acted == [("run", "b")]
+
+
+async def test_keys_after_queued_filter_edits_act_on_the_filtered_view(
+    tmp_path,
+):
+    """Every key that is no filter edit sees the view its preceding
+    edits produce, in the same queue pass."""
+    jobs = _filter_fleet(nameless=True)
+    app, acted = _filter_rig(tmp_path, jobs)
+    ref, ref_acted = _filter_rig(tmp_path, jobs)
+    keys = [
+        *"/bon",  # filter to the four bone jobs
+        "enter",  # blur: the list keys act again
+        "j",
+        "enter",  # open the second filtered row
+        "r",
+        "c",
+        "end",
+        "c",
+        "s",  # sort by status
+        "c",
+        *"/e",  # narrow again, mid-burst
+        "esc",
+        "home",
+        "enter",
+        "/",
+        "ctrl+u",
+        "tab",
+        "f",  # status segment: ok
+        "k",
+        "enter",
+    ]
+    for key in keys:
+        await ref.handle_key(key)
+    calls = _count_rebuilds(app)
+    async with _InputLoop(app) as loop:
+        await loop.burst(*keys)
+    assert acted == ref_acted
+    assert acted == [
+        ("open", "bone"),
+        ("run", "bone"),
+        ("copy", "bone"),
+        ("copy", "etl-10"),
+        ("copy", "etl-10"),
+        ("open", "bone"),
+        ("open", "beacon"),
+    ]
+    assert _view_state(app) == _view_state(ref)
+    # one rebuild per run of edits, one per sort or segment key
+    assert calls == ["bon", "bon", "bone", "", ""]
+
+
+async def test_queued_keys_leave_the_view_that_single_keys_leave(tmp_path):
+    """Random key sequences, queued in random bursts through the input
+    loop, against the same keys handled one at a time."""
+    import random
+
+    typed = list("beno1- uhZ")
+    edits = ["backspace", "backspace", "ctrl+u"]
+    other = [
+        *["/"] * 5,
+        "enter",
+        "esc",
+        "tab",
+        "j",
+        "k",
+        "pgdn",
+        "pgup",
+        "home",
+        "end",
+        "s",
+        "S",
+        "f",
+        "c",
+        "r",
+    ]
+    pool = typed * 4 + edits * 3 + other
+    # Enter and r read the selected job's name, which the nameless job
+    # lacks, so the fleet that has it runs without those two keys
+    fleets = {
+        False: (_filter_fleet(), pool),
+        True: (
+            _filter_fleet(nameless=True),
+            [key for key in pool if key not in ("enter", "r")],
+        ),
+    }
+    for seed in range(200):
+        rng = random.Random(seed)
+        jobs, keyset = fleets[seed % 2 == 1]
+        app, acted = _filter_rig(tmp_path, jobs)
+        ref, ref_acted = _filter_rig(tmp_path, jobs)
+        app.sel = ref.sel = rng.randrange(len(jobs))
+        keys = [rng.choice(keyset) for _ in range(70)]
+        done = 0
+        async with _InputLoop(app) as loop:
+            while done < len(keys):
+                chunk = keys[done : done + rng.randint(1, 14)]
+                done += len(chunk)
+                for key in chunk:
+                    await ref.handle_key(key)
+                await loop.burst(*chunk)
+                where = (seed, keys[:done])
+                assert _view_state(app) == _view_state(ref), where
+                assert acted == ref_acted, where
+                assert app._filter_typed == [], where
+
+
+async def test_queued_filter_keys_over_a_view_built_elsewhere(tmp_path):
+    """A view that no rebuild produced is no shortcut for the next one:
+    the queued edits still land where single keys land."""
+    jobs = _filter_fleet(nameless=True)
+    runs = ["/o", "/on", "/one", [*"/one", "backspace", *"e b"]]
+    for swap in ("view", "jobs", "sort"):
+        for keys in runs:
+            app, _ = _filter_rig(tmp_path, jobs)
+            ref, _ = _filter_rig(tmp_path, jobs)
+            for each in (app, ref):
+                if swap == "view":
+                    each.view = [jobs[7], jobs[2], jobs[0]]
+                    each.sel = 1
+                elif swap == "jobs":
+                    each.jobs = jobs[3:]
+                else:
+                    each.sort_key = "duration"
+            for key in keys:
+                await ref.handle_key(key)
+            async with _InputLoop(app) as loop:
+                await loop.burst(*keys)
+            assert _view_state(app) == _view_state(ref), (swap, keys)
+
+
+async def test_filter_edit_routing_matches_the_key_dispatch(tmp_path):
+    """``_edits_filter`` claims exactly the keys that the dispatch order
+    behind it turns into the same filter edit, whatever else is open or
+    focused. The reference app takes every key through that order, so a
+    key that an earlier arm owns (the palette, its chord, Esc, a commit)
+    cannot become a filter edit unnoticed."""
+    keys = [
+        "x",
+        " ",
+        "/",
+        "backspace",
+        "ctrl+u",
+        "enter",
+        "esc",
+        "tab",
+        "up",
+        "ctrl+k",
+        "ctrl+c",
+        "w",
+    ]
+    setups = {
+        "list": lambda app: None,
+        "filter": lambda app: setattr(app, "focus", "filter"),
+        "booting": lambda app: (
+            setattr(app, "focus", "filter"),
+            setattr(app, "booting", True),
+        ),
+        "palette": lambda app: (
+            app.open("palette"),
+            setattr(app, "focus", "palette"),
+        ),
+        "token": lambda app: (
+            app.open("token"),
+            setattr(app, "focus", "token"),
+        ),
+        "palette over filter": lambda app: (
+            setattr(app, "focus", "filter"),
+            app.open("palette"),
+        ),
+    }
+
+    def reached(app):
+        return (
+            _view_state(app),
+            dict(app.inputs),
+            list(app.open_overlays),
+            app.quit,
+            app.wallboard,
+        )
+
+    for label, setup in setups.items():
+        for key in keys:
+            jobs = _filter_fleet()
+            app, _ = _filter_rig(tmp_path, jobs)
+            ref, _ = _filter_rig(tmp_path, jobs)
+            ref._edits_filter = lambda key: False
+            for each in (app, ref):
+                setup(each)
+                each.inputs["filter"] = "seed"
+            claimed = app._edits_filter(key)
+            await app.handle_key(key)
+            await ref.handle_key(key)
+            assert reached(app) == reached(ref), (label, key)
+            assert claimed == (ref.inputs["filter"] != "seed"), (label, key)
+
+
+async def test_key_source_without_a_queue_peek_rebuilds_per_key(tmp_path):
+    """A key source that offers only ``get`` still drives the loop: each
+    key is its own pass."""
+
+    class OnlyGet:
+        def __init__(self):
+            self.queue = asyncio.Queue()
+
+        def send(self, *keys):
+            for key in keys:
+                self.queue.put_nowait(key)
+
+        async def get(self):
+            return await self.queue.get()
+
+    app, _ = _filter_rig(tmp_path, _filter_fleet(nameless=True))
+    app.keys = OnlyGet()
+    calls = _count_rebuilds(app)
+    async with _InputLoop(app) as loop:
+        await loop.burst(*"/bon")
+    assert calls == ["b", "bo", "bon"]
+    assert [job.get("name") for job in app.view] == [
+        None,
+        "bone",
+        "bone",
+        "etl-10",
+    ]
+
+
+def test_scripted_keys_hand_out_queued_keys_without_waiting():
+    keys = ScriptedKeys()
+    assert keys.get_nowait() is None
+    keys.send("a", "b")
+    assert [keys.get_nowait(), keys.get_nowait()] == ["a", "b"]
+    assert keys.get_nowait() is None
+
+
+def test_filter_admits_is_the_view_text_filter():
+    """The per-job test the narrowing shortcut applies is the one
+    ``compute_view`` applies to the whole list."""
+    jobs = _filter_fleet(nameless=True)
+    for text in ("", "  ", "bon", "BONE", " one ", "bin/one b", "zz", "-1"):
+        needle = text.strip().lower()
+        admitted = [job for job in jobs if tui._filter_admits(job, needle)]
+        viewed = compute_view(jobs, text, "all", "name", 1)
+        assert sorted(map(id, admitted)) == sorted(map(id, viewed)), text
+
+
+async def test_paint_and_poll_follow_a_filter_burst(tmp_path):
+    """The frame and the poll after a burst both read the filtered
+    view: the frame shows it, and the poll keeps its selection."""
+    h = Harness()
+    h.daemon.jobs = [
+        _job("north-beacon"),
+        _job("south-beacon"),
+        _job("pulse-check"),
+    ]
+    try:
+        app = await h.start(tmp_path)
+        await _wait_for(lambda: len(app.jobs) == 3)
+        polled = app.jobs
+        h.keys.send("j", "j", "/", *"beacon", "enter")
+        await _wait_for(lambda: app.focus is None and app.filter_text)
+        assert [j["name"] for j in app.view] == [
+            "north-beacon",
+            "south-beacon",
+        ]
+        # south-beacon was row 2 of three and is row 1 of two
+        assert app.selected_job()["name"] == "south-beacon"
+        await h.settle()
+        screen = h.term.screen()
+        assert "south-beacon" in screen and "pulse-check" not in screen
+        await _wait_for(lambda: app.jobs is not polled)
+        assert [j["name"] for j in app.view] == [
+            "north-beacon",
+            "south-beacon",
+        ]
+        assert app.selected_job()["name"] == "south-beacon"
+    finally:
+        await h.stop()

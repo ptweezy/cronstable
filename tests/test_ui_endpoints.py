@@ -2142,3 +2142,584 @@ async def test_web_activity_projection_runs_off_loop_past_the_gate(
     assert resp.status == 200
     assert idents and idents[-1] != threading.get_ident()  # executor thread
     assert json.loads(resp.body) == cron.activity_payload()
+
+
+# configuration order differs from name order, so the two `jobs` selections
+# pick different jobs
+_ACTIVITY_ORDER_NAMES = ("zeta", "alpha", "mid", "beta")
+_ACTIVITY_ORDER_YAML = "jobs:\n" + "".join(
+    "  - name: %s\n    command: echo hi\n    schedule: '*/5 * * * *'\n" % name
+    for name in _ACTIVITY_ORDER_NAMES
+)
+
+
+async def test_web_activity_jobs_caps_the_job_set():
+    # `jobs` keeps the first N jobs in configuration order, the order
+    # GET /jobs lists them; `sort=name` keeps the first N by name.
+    import gzip
+
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    for name in _ACTIVITY_ORDER_NAMES:
+        for i in range(10):
+            cron.run_history[name].append(_heat_run("success", 60 * i + 60))
+    full = cron.activity_payload()["jobs"]
+    assert list(full) == list(_ACTIVITY_ORDER_NAMES)
+    capped = await cron._web_get_activity(Req({"jobs": "2"}))
+    assert capped.status == 200
+    jobs = json.loads(capped.body)["jobs"]
+    assert list(jobs) == ["zeta", "alpha"]
+    assert jobs == {name: full[name] for name in ("zeta", "alpha")}
+    by_name = await cron._web_get_activity(Req({"jobs": "2", "sort": "name"}))
+    assert list(json.loads(by_name.body)["jobs"]) == ["alpha", "beta"]
+    # composes with `limit` (rows per job)
+    both = await cron._web_get_activity(Req({"jobs": "1", "limit": "3"}))
+    assert json.loads(both.body)["jobs"] == {"zeta": full["zeta"][-3:]}
+    # a capped response tags, varies, 304s and gzips like the default one
+    assert capped.headers["Vary"] == "Accept-Encoding"
+    etag = capped.headers["ETag"]
+    assert etag != by_name.headers["ETag"]
+    revalidated = await cron._web_get_activity(
+        Req({"jobs": "2"}, headers={"If-None-Match": etag})
+    )
+    assert revalidated.status == 304
+    zipped = await cron._web_get_activity(
+        Req({"jobs": "2"}, headers={"Accept-Encoding": "gzip"})
+    )
+    assert zipped.headers["Content-Encoding"] == "gzip"
+    assert gzip.decompress(zipped.body) == capped.body
+
+
+async def test_web_activity_jobs_clamps_and_tolerates_garbage():
+    # the _web_int_query contract: under the minimum clamps to one job,
+    # and an unparseable value falls back to every job
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    cron.run_history["zeta"].append(_heat_run("success", 60))
+    default = await cron._web_get_activity(Req())
+    for raw in ("0", "-3"):
+        resp = await cron._web_get_activity(Req({"jobs": raw}))
+        assert list(json.loads(resp.body)["jobs"]) == ["zeta"]
+    for query in ({"jobs": "many"}, {"jobs": ""}, {"sort": ""}):
+        resp = await cron._web_get_activity(Req(query))
+        assert resp.status == 200
+        assert resp.body == default.body
+
+
+async def test_web_activity_uncapped_requests_share_the_default_product(
+    monkeypatch,
+):
+    # Without `jobs`, and with a `jobs` value that covers every job, the
+    # response is the default one byte for byte, from the shared memo: a
+    # fleet smaller than a dashboard's cap costs one build per window
+    # however many viewers send ?jobs=80.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    cron.run_history["mid"].append(_heat_run("failure", 60))
+    builds = []
+    real_payload = cron.activity_payload
+
+    def counting_payload(*args, **kwargs):
+        builds.append(1)
+        return real_payload(*args, **kwargs)
+
+    monkeypatch.setattr(cron, "activity_payload", counting_payload)
+    default = await cron._web_get_activity(Req())
+    for query in (
+        {"jobs": "4"},
+        {"jobs": "80"},
+        {"sort": "name"},
+        {"jobs": "80", "sort": "name"},
+    ):
+        resp = await cron._web_get_activity(Req(query))
+        assert resp.body == default.body
+        assert resp.headers["ETag"] == default.headers["ETag"]
+    assert len(builds) == 1
+    # a cap that bites has a product of its own and leaves this one alone
+    stored = cron._activity_response_memo.cached
+    capped = await cron._web_get_activity(Req({"jobs": "3"}))
+    assert len(json.loads(capped.body)["jobs"]) == 3
+    assert len(builds) == 2
+    assert cron._activity_response_memo.cached is stored
+
+
+async def _activity_follower_across_a_reload(monkeypatch, query):
+    """Answer ``query`` as a follower of a default build that a reload
+    voids; return the cron, the response and the builds' arguments.
+
+    The reload grows the job set from ``a`` and ``b`` to six jobs.
+    """
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    cron = _cron(_ACTIVITY_YAML)
+    reloaded = _cron(_ACTIVITY_ORDER_YAML).cron_jobs
+    release = asyncio.Event()
+    builds = []
+    real_build = cron._build_activity_product
+
+    async def held_build(*args, **kwargs):
+        builds.append(args)
+        if len(builds) == 1:
+            await release.wait()
+        return await real_build(*args, **kwargs)
+
+    monkeypatch.setattr(cron, "_build_activity_product", held_build)
+    leader = asyncio.ensure_future(cron._web_get_activity(Req()))
+    await asyncio.sleep(0)
+    follower = asyncio.ensure_future(cron._web_get_activity(Req(query)))
+    await asyncio.sleep(0)
+    assert len(builds) == 1  # the follower waits on the leader's build
+    cron.cron_jobs.update(reloaded)
+    cron._bust_response_memos()
+    release.set()
+    await leader
+    return cron, await follower, builds
+
+
+@pytest.mark.parametrize("query", [{}, {"jobs": "80"}])
+async def test_web_activity_build_after_a_reload_carries_every_job(
+    monkeypatch, query
+):
+    # A request that joins a build in flight builds the default product
+    # itself when a reload voids the build it joined.  That build carries
+    # every job of the new job set, and so does the product it stores.
+    cron, resp, builds = await _activity_follower_across_a_reload(
+        monkeypatch, query
+    )
+    assert len(builds) == 2
+    every = {"a", "b", *_ACTIVITY_ORDER_NAMES}
+    assert set(json.loads(resp.body)["jobs"]) == every
+    again = await cron._web_get_activity(Req())
+    assert len(builds) == 2  # served from the product the follower stored
+    assert again.body == resp.body
+
+
+async def test_web_activity_cap_holds_when_a_reload_outgrows_it(monkeypatch):
+    # `jobs=2` covers a fleet of two, so the request waits on the default
+    # product.  The reload leaves six jobs, and the response still carries
+    # two.  The default product that the request built on the way holds
+    # every job, for the viewers that send no cap.
+    cron, resp, builds = await _activity_follower_across_a_reload(
+        monkeypatch, {"jobs": "2"}
+    )
+    assert list(json.loads(resp.body)["jobs"]) == ["a", "b"]
+    assert [names for _limit, names in builds[1:]] == [None, ["a", "b"]]
+    every = {"a", "b", *_ACTIVITY_ORDER_NAMES}
+    default = await cron._web_get_activity(Req())
+    assert set(json.loads(default.body)["jobs"]) == every
+    again = await cron._web_get_activity(Req({"jobs": "2"}))
+    assert again.body == resp.body
+    assert len(builds) == 3  # both served from the products already built
+
+
+async def test_web_activity_cap_holds_over_a_product_another_request_built(
+    monkeypatch,
+):
+    # Two requests wait on a default build that a reload voids.  The
+    # uncapped one builds the default product from the six jobs the reload
+    # left.  The `jobs=2` request reads that product from the memo, and
+    # its response still carries two jobs.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    cron = _cron(_ACTIVITY_YAML)
+    reloaded = _cron(_ACTIVITY_ORDER_YAML).cron_jobs
+    release = asyncio.Event()
+    builds = []
+    real_build = cron._build_activity_product
+
+    async def held_build(*args, **kwargs):
+        builds.append(args)
+        if len(builds) == 1:
+            await release.wait()
+        return await real_build(*args, **kwargs)
+
+    monkeypatch.setattr(cron, "_build_activity_product", held_build)
+    requests = [
+        asyncio.ensure_future(cron._web_get_activity(Req(query)))
+        for query in ({}, {}, {"jobs": "2"})
+    ]
+    await asyncio.sleep(0)
+    assert len(builds) == 1  # the other two wait on the first one's build
+    cron.cron_jobs.update(reloaded)
+    cron._bust_response_memos()
+    release.set()
+    _leader, uncapped, capped = await asyncio.gather(*requests)
+    every = {"a", "b", *_ACTIVITY_ORDER_NAMES}
+    assert set(json.loads(uncapped.body)["jobs"]) == every
+    assert list(json.loads(capped.body)["jobs"]) == ["a", "b"]
+    assert [names for _limit, names in builds[1:]] == [None, ["a", "b"]]
+
+
+def _activity_fleet_yaml(count):
+    # a fleet past _JOBS_SERIALIZE_OFFLOAD_MIN builds its default product
+    # on the executor
+    return "jobs:\n" + "".join(
+        "  - name: f%03d\n    command: echo hi\n    schedule: '*/5 * * * *'\n"
+        % i
+        for i in range(count)
+    )
+
+
+async def test_web_activity_cap_holds_across_a_reload_pair(monkeypatch):
+    # `jobs=250` covers a fleet of 240, so the request waits on the default
+    # product.  A reload to 260 jobs voids that build and the request
+    # builds the default product itself; a reload back to 240 lands before
+    # that build returns.  The response carries the 240 configured jobs.
+    import cronstable.cron
+    from cronstable.config import parse_config_string
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    small, large = _activity_fleet_yaml(240), _activity_fleet_yaml(260)
+    cron = _cron(small)
+    built = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    builds = []
+    real_build = cron._build_activity_product
+
+    async def held_build(limit, names):
+        index = len(builds)
+        builds.append(len(cron.cron_jobs) if names is None else len(names))
+        product = await real_build(limit, names)
+        if index < 2:
+            built[index].set()
+            await release[index].wait()
+        return product
+
+    monkeypatch.setattr(cron, "_build_activity_product", held_build)
+    leader = asyncio.ensure_future(cron._web_get_activity(Req()))
+    await asyncio.sleep(0)
+    request = Req({"jobs": "250"})
+    capped = asyncio.ensure_future(cron._web_get_activity(request))
+    await asyncio.sleep(0)
+    assert builds == [240]  # the capped request waits on the leader's build
+    cron._apply_reload(parse_config_string(large, ""))
+    release[0].set()
+    await built[1].wait()
+    cron._apply_reload(parse_config_string(small, ""))
+    release[1].set()
+    resp = await capped
+    await leader
+    assert list(json.loads(resp.body)["jobs"]) == list(cron.cron_jobs)
+    assert builds == [240, 260, 240]
+    again = await cron._web_get_activity(request)
+    assert again.body == resp.body
+    assert len(builds) == 3  # served from the product the request stored
+
+
+async def test_web_activity_covered_request_keeps_a_build_a_reload_overtook(
+    monkeypatch,
+):
+    # `jobs=80` covers the job set before the reload and after it, so the
+    # product that the request built from the earlier set is its response.
+    import cronstable.cron
+    from cronstable.config import parse_config_string
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    cron = _cron(_ACTIVITY_YAML)
+    built, release = asyncio.Event(), asyncio.Event()
+    builds = []
+    real_build = cron._build_activity_product
+
+    async def held_build(limit, names):
+        builds.append(names)
+        product = await real_build(limit, names)
+        if len(builds) == 1:
+            built.set()
+            await release.wait()
+        return product
+
+    monkeypatch.setattr(cron, "_build_activity_product", held_build)
+    request = Req({"jobs": "80"})
+    capped = asyncio.ensure_future(cron._web_get_activity(request))
+    await built.wait()
+    cron._apply_reload(parse_config_string(_ACTIVITY_ORDER_YAML, ""))
+    release.set()
+    resp = await capped
+    assert list(json.loads(resp.body)["jobs"]) == ["a", "b"]
+    assert builds == [None]
+    # a reload voids the build, so the next request builds again
+    again = await cron._web_get_activity(request)
+    assert list(json.loads(again.body)["jobs"]) == list(_ACTIVITY_ORDER_NAMES)
+    assert builds == [None, None]
+
+
+async def test_web_activity_capped_requests_share_a_product_per_pair(
+    monkeypatch,
+):
+    # Each dashboard polls one (jobs, sort) pair, so every viewer of a
+    # pair gets one build per window, and the name-order selection runs
+    # in that build alone.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    cron.run_history["mid"].append(_heat_run("failure", 60))
+    builds = []
+    real_names = cron._activity_job_names
+
+    def counting_names(jobs, sort=None):
+        builds.append((jobs, sort))
+        return real_names(jobs, sort)
+
+    monkeypatch.setattr(cron, "_activity_job_names", counting_names)
+    web = {"jobs": "2"}
+    tui = {"jobs": "2", "sort": "name"}
+    first = await cron._web_get_activity(Req(web))
+    for _ in range(3):
+        again = await cron._web_get_activity(Req(web))
+        assert again.body == first.body
+        assert again.headers["ETag"] == first.headers["ETag"]
+    by_name = await cron._web_get_activity(Req(tui))
+    await cron._web_get_activity(Req(tui))
+    assert list(json.loads(by_name.body)["jobs"]) == ["alpha", "beta"]
+    assert builds == [(2, None), (2, "name")]
+    # a local change renders on the next poll of either pair
+    cron.run_history["zeta"].append(_heat_run("success", 30))
+    cron._bust_response_memos()
+    fresh = await cron._web_get_activity(Req(web))
+    assert fresh.headers["ETag"] != first.headers["ETag"]
+    await cron._web_get_activity(Req(tui))
+    assert builds[2:] == [(2, None), (2, "name")]
+    # a narrower `limit` is built for its caller, whatever the cap
+    for _ in range(2):
+        await cron._web_get_activity(Req({"jobs": "2", "limit": "1"}))
+    assert builds[4:] == [(2, None), (2, None)]
+
+
+async def test_web_activity_capped_products_are_bounded(monkeypatch):
+    # The least recently used pair makes room, and is built again when it
+    # is next asked for.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_CAPPED_MEMOS", 2)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    builds = []
+    real_names = cron._activity_job_names
+
+    def counting_names(jobs, sort=None):
+        builds.append((jobs, sort))
+        return real_names(jobs, sort)
+
+    monkeypatch.setattr(cron, "_activity_job_names", counting_names)
+
+    async def get(jobs):
+        await cron._web_get_activity(Req({"jobs": str(jobs)}))
+
+    await get(1)
+    await get(2)
+    await get(1)  # shared, which makes it the most recently used
+    await get(3)  # takes the slot of jobs=2
+    assert list(cron._activity_capped_memos) == [(1, None), (3, None)]
+    await get(1)
+    await get(2)
+    assert builds == [(1, None), (2, None), (3, None), (2, None)]
+
+
+async def test_web_activity_large_cap_is_built_per_request(monkeypatch):
+    # A product grows with its cap, so a cap above the bound holds no
+    # shared response and takes no slot from the pairs that the dashboards
+    # poll.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_CAPPED_MEMO_MAX_JOBS", 1)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    builds = []
+    real_names = cron._activity_job_names
+
+    def counting_names(jobs, sort=None):
+        builds.append((jobs, sort))
+        return real_names(jobs, sort)
+
+    monkeypatch.setattr(cron, "_activity_job_names", counting_names)
+    for _ in range(2):
+        small = await cron._web_get_activity(Req({"jobs": "1"}))
+        large = await cron._web_get_activity(Req({"jobs": "3"}))
+    assert len(json.loads(small.body)["jobs"]) == 1
+    assert len(json.loads(large.body)["jobs"]) == 3
+    assert builds == [(1, None), (3, None), (3, None)]
+    assert list(cron._activity_capped_memos) == [(1, None)]
+    assert not cron._activity_capped_waiting
+    # a large cap tags and revalidates like any other response
+    revalidated = await cron._web_get_activity(
+        Req({"jobs": "3"}, headers={"If-None-Match": large.headers["ETag"]})
+    )
+    assert revalidated.status == 304
+    assert builds[3:] == [(3, None)]
+
+
+async def test_web_activity_pair_in_flight_keeps_its_slot(monkeypatch):
+    # A pair that a request waits on keeps its slot when another pair
+    # needs one, so a second request for it joins the build.  The pairs go
+    # back to the bound after the requests end.
+    import asyncio
+
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_CAPPED_MEMOS", 1)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    gate = asyncio.Event()
+    builds = []
+    real_build = cron._build_activity_product
+
+    async def gated_build(limit, names):
+        builds.append(len(names))
+        await gate.wait()
+        return await real_build(limit, names)
+
+    monkeypatch.setattr(cron, "_build_activity_product", gated_build)
+
+    async def start(jobs):
+        request = Req({"jobs": str(jobs)})
+        task = asyncio.ensure_future(cron._web_get_activity(request))
+        await asyncio.sleep(0)
+        return task
+
+    first = await start(1)
+    other = await start(2)
+    again = await start(1)
+    assert builds == [1, 2]
+    assert list(cron._activity_capped_memos) == [(2, None), (1, None)]
+    gate.set()
+    one, _two, joined = await asyncio.gather(first, other, again)
+    assert joined.body == one.body
+    # the pair that was asked for last has the one slot
+    assert list(cron._activity_capped_memos) == [(1, None)]
+    assert not cron._activity_capped_waiting
+    await cron._web_get_activity(Req({"jobs": "3"}))
+    assert list(cron._activity_capped_memos) == [(3, None)]
+
+
+async def test_web_activity_waiters_keep_the_pair_of_a_cancelled_build(
+    monkeypatch,
+):
+    # The request that builds a pair's product is cancelled, as when its
+    # client hangs up, while another pair holds the one slot.  The request
+    # that waited on that build keeps the pair and builds the product, and
+    # a later request for the pair joins that build.
+    import asyncio
+
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_CAPPED_MEMOS", 1)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    gate = asyncio.Event()
+    builds = []
+    real_build = cron._build_activity_product
+
+    async def gated_build(limit, names):
+        builds.append(len(names))
+        await gate.wait()
+        return await real_build(limit, names)
+
+    monkeypatch.setattr(cron, "_build_activity_product", gated_build)
+
+    async def start(jobs):
+        request = Req({"jobs": str(jobs)})
+        task = asyncio.ensure_future(cron._web_get_activity(request))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return task
+
+    leader = await start(1)
+    other = await start(2)
+    waiter = await start(1)
+    assert builds == [1, 2]
+    leader.cancel()
+    await asyncio.gather(leader, return_exceptions=True)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert leader.cancelled()
+    assert builds == [1, 2, 1]
+    late = await start(1)
+    assert builds == [1, 2, 1]
+    gate.set()
+    built, joined, _other = await asyncio.gather(waiter, late, other)
+    assert joined.body == built.body
+    assert builds == [1, 2, 1]
+    assert not cron._activity_capped_waiting
+    assert len(cron._activity_capped_memos) == 1
+
+
+async def test_web_activity_pairs_in_flight_go_back_to_the_bound(monkeypatch):
+    # More pairs in flight than there are slots: each keeps its slot while
+    # a request waits on it, and the pairs asked for last hold the slots.
+    # The requests that those products serve leave the pairs as they are.
+    import asyncio
+
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_CAPPED_MEMOS", 2)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    gate = asyncio.Event()
+    real_build = cron._build_activity_product
+
+    async def gated_build(limit, names):
+        await gate.wait()
+        return await real_build(limit, names)
+
+    monkeypatch.setattr(cron, "_build_activity_product", gated_build)
+    queries = [
+        {"jobs": "1"},
+        {"jobs": "1", "sort": "name"},
+        {"jobs": "2"},
+        {"jobs": "2", "sort": "name"},
+    ]
+    tasks = []
+    for query in queries:
+        tasks.append(asyncio.ensure_future(cron._web_get_activity(Req(query))))
+        await asyncio.sleep(0)
+    assert len(cron._activity_capped_memos) == 4
+    gate.set()
+    await asyncio.gather(*tasks)
+    held = [(2, None), (2, "name")]
+    assert list(cron._activity_capped_memos) == held
+    for query in queries[2:]:
+        await cron._web_get_activity(Req(query))
+    assert list(cron._activity_capped_memos) == held
+
+
+async def test_web_activity_unknown_sort_is_a_400():
+    # the one enumerated parameter is refused like /schedule/suggest's
+    # `period`: a 400 carrying the error envelope, with or without `jobs`
+    cron = _cron(_ACTIVITY_YAML)
+    for query in ({"sort": "recent"}, {"sort": "NAME", "jobs": "1"}):
+        resp = await cron._web_get_activity(Req(query))
+        assert resp.status == 400
+        assert json.loads(resp.body) == {
+            "error": "sort must be 'name', got {!r}".format(query["sort"])
+        }
+
+
+async def test_web_activity_offload_follows_the_selected_job_count(
+    monkeypatch,
+):
+    # the executor hop is decided by how many jobs the response carries,
+    # so a capped build of a large fleet stays inline
+    import threading
+
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_JOBS_SERIALIZE_OFFLOAD_MIN", 3)
+    cron = _cron(_ACTIVITY_ORDER_YAML)
+    cron.run_history["zeta"].append(_heat_run("failure", 60))
+    seen = []
+    real_jobs = cronstable.cron._activity_jobs
+
+    def recording_jobs(histories, limit):
+        seen.append((len(histories), threading.get_ident()))
+        return real_jobs(histories, limit)
+
+    monkeypatch.setattr(cronstable.cron, "_activity_jobs", recording_jobs)
+    loop_thread = threading.get_ident()
+    await cron._web_get_activity(Req({"jobs": "3"}))
+    await cron._web_get_activity(Req({"jobs": "2"}))
+    assert [count for count, _ in seen] == [3, 2]
+    assert seen[0][1] != loop_thread  # at the gate: a worker thread
+    assert seen[1][1] == loop_thread  # under it: inline

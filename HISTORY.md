@@ -1,5 +1,186 @@
 # History
 
+## 1.2.66
+
+- The FreeBSD binary builds link OpenSSL 3.5 from FreeBSD's `openssl`
+  package.
+
+## 1.2.65
+
+- A run that has ended keeps its outcome until the daemon records it. A
+  `concurrencyPolicy: Replace` launch leaves that run as it is, a `Forbid`
+  launch starts its job, and a pooled run that finishes while the pool
+  scheduler renews its lease keeps its result. `POST /jobs/{name}/cancel`
+  and the MCP `cron_cancel_job` tool ask the runs that have not ended to
+  stop. When every run has ended, the request returns `409` and the tool
+  reports an error.
+- When the daemon cancels a run, it waits up to `killTimeout` for the job's
+  own process and stops waiting when that process exits. On every platform
+  except Windows, the forced kill of the rest of the process group follows
+  within about 0.25 seconds. A workload that needs all of `killTimeout` to
+  shut down must be the job's own process: an argv list, or `exec` as the
+  last step of a shell command.
+- The daemon records a canceled or timed-out run within a time limit when a
+  process that the run started holds its output open. A canceled run has
+  30 seconds. A run that its `executionTimeout` ended, or a verification
+  check that reached `verify.timeout`, has 30 seconds for each stream. The
+  daemon then logs a warning, keeps the output captured so far, and records
+  the run.
+- `executionTimeout` bounds a run until its captured output closes. When the
+  job's own process exits inside the deadline and a process that it started
+  still holds a captured stream open at the deadline, the daemon times the
+  run out and records exit code `-100`.
+- When the operating system refuses the daemon's signal to a job's process,
+  such as `EPERM` for a command that `sudo` runs, the daemon logs a warning
+  and completes the cancel sequence. The process keeps running until it
+  exits by itself.
+- A recorded run's `finished_at` is the instant the run ended, and `ranAt`
+  and the archived output carry the same instant. A canceled or timed-out
+  run that is recorded after a later run of the same job leaves the later
+  run as the job's last run. `onlyIfLastSucceeded`, `maxTimeSinceSuccess`,
+  and missed-run catch-up go by the instant each run ended.
+- When two runs of a job overlap, the success of the earlier run leaves the
+  retries of the later scheduled run in place until that run has scheduled
+  a retry. Once a retry is pending or its attempt is running, a success of
+  any run of the job ends the retry sequence. A run canceled through
+  `POST /jobs/{name}/cancel` or `cron_cancel_job` follows the same rule.
+- When `concurrencyPolicy: Forbid` drops a scheduled fire of a job that has
+  no `pool`, the job's retry sequence stays as it is. A scheduled fire of a
+  pooled job ends the job's retry sequence before it queues its own entry.
+- When the store write that records a pooled entry's completion fails, the
+  pool scheduler writes it again on its next pass and on each lease
+  heartbeat, every five seconds.
+- `GET /pools`, `POST /pools/{name}/queue/{key}/cancel`, and
+  `POST /jobs/{name}/start` for a pooled job answer `503` with
+  `pool state is unavailable` whenever pool state cannot be read or
+  written. `GET /jobs` then answers `200`, and the `pool` object of each
+  pooled job carries `queueUnavailable: true`. The MCP `cron_list_pools`,
+  `cron_cancel_queued`, and `cron_run_job` tools report the `503` as a tool
+  error with the same text. The daemon logs a warning and drops a scheduled
+  fire of a pooled job that finds pool state unavailable.
+- Once a run is recorded and its reports are sent, the daemon frees the
+  run's process handles and the copy of its output that reports read.
+- A workflow whose configuration lists a task before its upstreams settles a
+  failure in one scheduler pass.
+- The workflow retention pass lists a workflow's runs once and deletes them
+  in batches of up to 32, each run under its lease. It keeps a run that a
+  recovery in preparation or an open recovery batch references. Under
+  `state.maxOpsPerSecond` of about 2 or lower, or on a slow store, a busy
+  workflow can hold more than `retainRuns` finished runs, and a scheduled
+  workflow run can start late.
+- A date-range recovery takes the lease of each source run before it writes
+  its batch. While retention or another recovery holds the lease of a
+  source run, the request answers `409` with
+  `source run is busy; retry shortly`. When a source run is gone or its key
+  holds another run, the message is
+  `recovery preview is stale; preview again`.
+- `POST /dags/{name}/recover`, `POST /dags/{name}/runs/{run_key}/recover`,
+  and `POST /dags/{name}/backfill` answer `503` whenever the state store
+  cannot answer: on a store I/O error or a timeout, on a document that
+  cannot be read, and while the configured store has not started. The
+  message is `recovery state is unavailable` or
+  `backfill state is unavailable`. After a fault during a backfill, the
+  same request creates the rest of the runs. The MCP
+  `cron_preview_recovery`, `cron_recover_dag`, and `cron_backfill_dag`
+  tools report these answers as tool errors.
+- Publishing an artifact or an XCom value costs the same at any number of
+  names in the scope. Workflow recovery's limit of 10,000 artifacts counts
+  names.
+- Nodes that share a state store need synchronized clocks, and they should
+  move to this release together. Until they do, a node on the previous
+  release can answer not found for an artifact or an XCom value while a
+  node on this release republishes it.
+- Planning a workflow rerun from a task follows each dependency once.
+- A configuration directory of more than 1,024 files reloads by reparsing
+  only the files that changed. An include tree of that size reparses each
+  changed file, each file that includes it, and the entry file.
+- A configuration file, an included file, or an `env_file` that changes
+  while the daemon loads the configuration is parsed again. So is a
+  configuration directory when a file joins or leaves it during the parse.
+- A source that cannot be read twice (a pipe, a FIFO, a terminal,
+  `/dev/stdin`, or `/dev/fd/N`) is read again only when the file that names
+  it is parsed again. Jobs keep the environment read from a piped
+  `env_file` across a reload request and across an edit to another file.
+- When the configuration named by `-c` is a pipe, a FIFO, or a terminal,
+  only a reload request (`SIGHUP` or `cronstable service reload`) reads it
+  again. When another source changes, the once-a-minute check logs a
+  warning and keeps the loaded configuration. A reload that reads zero
+  bytes from such a configuration does the same. In both cases,
+  `cronstable_config_last_reload_successful` reads 0.
+- A file that two files of one include tree both include is loaded under
+  each of them and is no cycle. Only a file that holds `defaults` alone can
+  be shared: a shared file that defines a job, a pool, or a `web` or
+  `logging` section fails the load. A file that includes itself, directly
+  or through other files, fails with `include cycle detected at <path>`.
+- A configuration file, a file of a configuration directory, or an included
+  file that is not valid UTF-8 is a configuration error. The message is
+  `Could not load config file '<path>':` followed by the decoding error.
+  Windows PowerShell 5.1 writes little-endian UTF-16 when it redirects
+  output to a file, which is the usual cause.
+- The file that `cluster.etcd.password.fromFile` names is a configuration
+  source, as an `env_file` is: the once-a-minute check parses the
+  configuration again when the file changes. Change the password on the
+  etcd server before you replace the file.
+- Configuration parse time grows in proportion to the number of keys in a
+  mapping. A `pools` or `web.headers` block with 2,000 entries loads in
+  under a second.
+- The jobs and workflow tasks of one configuration file share one read of an
+  `env_file` that they name or inherit from `defaults`.
+- `cronstable --validate-config` and `cronstable --job-set-id` exit without
+  loading psutil. They load asyncio only for a configuration that has a
+  `push` section or enables `web.bonjour`.
+- `GET /activity` takes two optional query parameters that cap the jobs in
+  the response. `jobs=N` returns at most `N` jobs: the first `N` in
+  configuration order, or the first `N` by name with `sort=name`. Each
+  dashboard draws at most 80 heatmap rows and sends that cap.
+- The daemon compresses the dashboard page with zlib at level 9 for the
+  first browser that accepts gzip and serves the stored result after that.
+  Such a browser downloads about 180 KB. The page answers
+  `304 Not Modified` to an `If-None-Match` header that carries its `ETag`
+  in weak form or in a list.
+- The MCP `cron_list_jobs` tool builds full job rows only for the page that
+  it returns, so the cost of a call follows the page size.
+- Some terminals send `Alt` with a navigation key as an `Esc` ahead of the
+  key's own sequence. On every platform except Windows, the terminal
+  dashboard reads that as the plain key, and the panel or drawer that is on
+  top stays open.
+- Except on Windows, the terminal dashboard asks the terminal to mark each
+  paste (bracketed paste), and marked text is text only. The text field
+  with the focus takes it without its line breaks and other control
+  characters, and no pasted character acts as a shortcut. The Windows
+  console marks no paste, so a pasted line break, tab, or escape arrives
+  as `Enter`, `Tab`, or `Esc`.
+- On Windows, the terminal dashboard reads key events from the console. A
+  character outside the Basic Multilingual Plane, such as an emoji, arrives
+  as one character, and a character composed with `Alt` and the numeric
+  keypad is delivered. `Shift-Tab` steps the tabs of the job drawer and the
+  state inspector backward. The dashboard restores the console's input mode
+  when it exits, including after an error.
+- In the web dashboard, a job's countdown and its **Next at** time stay tied
+  to the `/jobs` response that delivered them. When the daemon answers a
+  poll with `304 Not Modified`, the dashboard keeps the jobs it holds, and
+  their countdowns run on. After the computer sleeps or its clock is set,
+  the next poll takes a full response and restarts the countdowns from it.
+  The **Next at** label names its day from the browser's local date.
+
+## 1.2.64
+
+- Push, development, the minimum dependency tests, and the binary builds
+  require `cryptography` 50.0.2 or newer. The daemon's messages about
+  X-Wing sealing give that version and the command
+  `pip install "cryptography>=50.0.2,<51"`: the startup line that says why
+  post-quantum sealing is off, the pairing and sealing refusals, and the
+  warning about paired devices that a node can't seal to.
+- cronstable requires `aiohttp` 3.14.4 or newer.
+- The glibc Linux binaries for `amd64`, `amd64v3`, `arm64`, `ppc64le`,
+  `s390x`, and `armv7` bundle CPython 3.14.8, from python-build-standalone
+  release 20261009. The `amd64v3` runtime that `docker/python_runtime.py`
+  installs for the other `amd64v3` binaries and for the `amd64v3` Docker
+  images is CPython 3.14.8 too, and the local PyInstaller image builds on
+  it.
+- The Linux builds that compile their own OpenSSL for a `cryptography`
+  source build use OpenSSL 3.5.9.
+
 ## 1.2.63
 
 - `cronstable pair` prints the iOS app's pairing QR code in the terminal, for

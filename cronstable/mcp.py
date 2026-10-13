@@ -32,7 +32,6 @@ legacy path, where ``initialize`` negotiates ``2025-11-25`` or an earlier
 revision.
 """
 
-import asyncio
 import base64
 import binascii
 import json as _stdlib_json
@@ -54,6 +53,8 @@ from aiohttp import web
 from cronstable import _json
 from cronstable import version as _version
 from cronstable.cron import (
+    _BACKFILL_UNAVAILABLE,
+    _RECOVERY_UNAVAILABLE,
     PAUSE_BY_MAX,
     WEB_ANON_REQUEST_KEY,
     WEB_TOKEN_REQUEST_KEY,
@@ -1290,23 +1291,28 @@ class MCPHandler:
         return _result({"status": page, "page": meta}, summary)
 
     async def _t_list_jobs(self, args: dict[str, Any]) -> dict[str, Any]:
-        rows = self._cron.jobs_payload()
+        cron = self._cron
+        jobs = cron.cron_jobs
+        running = cron._row_instances
+        # The filters read what a row reports as `name`, `enabled` and
+        # `running`, from the sources that the row builder reads, so
+        # selection walks names and the full rows are built for the
+        # returned page.
+        names = list(jobs)
         flt = args.get("filter")
         if isinstance(flt, str) and flt:
             low = flt.lower()
-            rows = [r for r in rows if low in r["name"].lower()]
+            names = [n for n in names if low in n.lower()]
         state = args.get("state")
         if state == "running":
-            rows = [r for r in rows if r.get("running")]
+            names = [n for n in names if running(n)]
         elif state == "disabled":
-            rows = [r for r in rows if not r.get("enabled")]
+            names = [n for n in names if not jobs[n].enabled]
         elif state == "scheduled":
-            rows = [
-                r for r in rows if r.get("enabled") and not r.get("running")
-            ]
-        page, meta = self._page(rows, args.get("offset"), args.get("limit"))
+            names = [n for n in names if jobs[n].enabled and not running(n)]
+        page, meta = self._page(names, args.get("offset"), args.get("limit"))
         return _result(
-            {"jobs": page, "page": meta},
+            {"jobs": cron.jobs_payload_for(page), "page": meta},
             "{} matching job(s); {} returned".format(
                 meta["total"], meta["returned"]
             ),
@@ -1735,28 +1741,26 @@ class MCPHandler:
         return _result({"resumed": name}, "resumed job {!r}".format(name))
 
     async def _t_list_pools(self, args):
-        from cronstable.pools import PoolError
+        from cronstable.pools import POOL_UNAVAILABLE, PoolError
 
         try:
             pools = await self._cron._pools.snapshot()
-        except PoolError as ex:
-            return _tool_error(str(ex))
-        except (OSError, asyncio.TimeoutError):
+        except (PoolError, *POOL_UNAVAILABLE):
             return _tool_error("pool state is unavailable")
         return _result({"pools": pools}, "resource pools")
 
     async def _t_cancel_queued(self, args):
-        from cronstable.pools import PoolError
+        from cronstable.pools import POOL_UNAVAILABLE, PoolError
 
         _require_confirm(args, "cancelling queued work")
         try:
             entry = await self._cron._pools.cancel(
                 _req_str(args, "pool"), _req_str(args, "id")
             )
+        except POOL_UNAVAILABLE:
+            return _tool_error("pool state is unavailable")
         except PoolError as ex:
             return _tool_error(str(ex))
-        except (OSError, asyncio.TimeoutError):
-            return _tool_error("pool state is unavailable")
         return _result(
             {"id": entry["id"], "state": entry["state"]},
             "queued work cancelled",
@@ -1824,10 +1828,10 @@ class MCPHandler:
                 )
         except ParamError as ex:
             return _tool_error(_param_error_text(ex))
+        except _RECOVERY_UNAVAILABLE:
+            return _tool_error("recovery state is unavailable")
         except RecoveryError as ex:
             return _tool_error(str(ex))
-        except (OSError, asyncio.TimeoutError):
-            return _tool_error("recovery state is unavailable")
         return _result(
             data, "recovery started" if execute else "recovery preview"
         )
@@ -1907,6 +1911,8 @@ class MCPHandler:
             )
         except ParamError as ex:
             return _tool_error(_param_error_text(ex))
+        except _BACKFILL_UNAVAILABLE:
+            return _tool_error("backfill state is unavailable")
         if not result.get("ok"):
             return _tool_error(str(result.get("reason")))
         return _result(

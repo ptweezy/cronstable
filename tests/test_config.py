@@ -2,6 +2,7 @@ import ipaddress
 import logging
 import os
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -668,6 +669,942 @@ def test_parse_config_dir_cache_validates_content_not_mtime(tmp_path):
     assert str(second.jobs[0].schedule) == "0 5 * * *"  # not the stale 0 3
 
 
+def _write_one_job_files(directory, count, prefix="job", hour=3):
+    directory.mkdir(exist_ok=True)
+    for i in range(count):
+        name = "{}-{:03d}".format(prefix, i)
+        (directory / (name + ".yaml")).write_text(
+            "jobs:\n"
+            "  - name: {}\n"
+            "    command: echo x\n"
+            '    schedule: "0 {} * * *"\n'.format(name, hour)
+        )
+
+
+def _small_dir_file_cache(monkeypatch, floor=4):
+    """An empty per-file cache with a floor small enough to cross cheaply."""
+    from collections import OrderedDict
+
+    cache = OrderedDict()
+    monkeypatch.setattr(config, "_DIR_FILE_CACHE", cache)
+    monkeypatch.setattr(config, "_DIR_FILE_CACHE_MAX", floor)
+    monkeypatch.setattr(config, "_DIR_FILE_CACHE_KEPT", frozenset())
+    return cache
+
+
+def _record_file_parses(monkeypatch):
+    parsed = []
+    real = config.parse_config_file
+
+    def recording(path, *args, **kwargs):
+        parsed.append(os.path.basename(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(config, "parse_config_file", recording)
+    return parsed
+
+
+def test_warm_dir_pass_reparses_nothing_past_the_cache_floor(
+    tmp_path, monkeypatch
+):
+    # The per-file cache holds every file of the configuration being
+    # loaded, however many there are. _DIR_FILE_CACHE_MAX bounds the
+    # entries that configuration does not use.
+    cache = _small_dir_file_cache(monkeypatch)
+    _write_one_job_files(tmp_path, 7)
+    first = config.parse_config_with_sources(str(tmp_path))[0]
+    assert len(first.jobs) == 7
+    assert len(cache) == 7
+
+    parsed = _record_file_parses(monkeypatch)
+    second = config.parse_config_with_sources(str(tmp_path))[0]
+    assert parsed == []
+    assert [j.name for j in second.jobs] == [j.name for j in first.jobs]
+
+    # an edit reparses the edited file and no other
+    _write_one_job_files(tmp_path, 1, prefix="job", hour=5)
+    third = config.parse_config_with_sources(str(tmp_path))[0]
+    assert parsed == ["job-000.yaml"]
+    assert str(third.jobs[0].schedule) == "0 5 * * *"
+    assert len(cache) == 7
+
+
+def test_warm_include_tree_reparses_only_the_entry_past_the_cache_floor(
+    tmp_path, monkeypatch
+):
+    # An include tree goes through the same cache. The entry file is the
+    # one member parsed on every load.
+    _small_dir_file_cache(monkeypatch)
+    _write_one_job_files(tmp_path / "parts", 7)
+    entry = tmp_path / "entry.yaml"
+    entry.write_text(
+        "include:\n"
+        + "".join("  - parts/job-{:03d}.yaml\n".format(i) for i in range(7))
+    )
+    first = config.parse_config_with_sources(str(entry))[0]
+    assert len(first.jobs) == 7
+
+    parsed = _record_file_parses(monkeypatch)
+    second = config.parse_config_with_sources(str(entry))[0]
+    assert parsed == ["entry.yaml"]
+    assert len(second.jobs) == 7
+
+
+def test_warm_nested_include_tree_keeps_the_files_a_cached_parent_includes(
+    tmp_path, monkeypatch
+):
+    # A cached file is served without a visit to the files it includes, so
+    # those stay cached with it: editing a parent later reparses the parent
+    # and none of its unchanged children.
+    cache = _small_dir_file_cache(monkeypatch, floor=2)
+    _write_one_job_files(tmp_path / "leaves", 3)
+    for i in range(3):
+        (tmp_path / "mid-{}.yaml".format(i)).write_text(
+            "include:\n  - leaves/job-{:03d}.yaml\n".format(i)
+        )
+    entry = tmp_path / "entry.yaml"
+    entry.write_text(
+        "include:\n" + "".join("  - mid-{}.yaml\n".format(i) for i in range(3))
+    )
+    assert len(config.parse_config(str(entry)).jobs) == 3
+    assert len(cache) == 6
+
+    parsed = _record_file_parses(monkeypatch)
+    config.parse_config(str(entry))
+    assert parsed == ["entry.yaml"]
+    assert len(cache) == 6
+
+    del parsed[:]
+    (tmp_path / "mid-1.yaml").write_text(
+        "include:\n  - leaves/job-001.yaml\n# edited\n"
+    )
+    assert len(config.parse_config(str(entry)).jobs) == 3
+    assert parsed == ["entry.yaml", "mid-1.yaml"]
+
+
+def test_dir_file_cache_stays_bounded_as_the_config_shrinks_or_moves(
+    tmp_path, monkeypatch
+):
+    cache = _small_dir_file_cache(monkeypatch)
+
+    def cached_names():
+        return sorted(os.path.basename(path) for path in cache)
+
+    big = tmp_path / "big"
+    _write_one_job_files(big, 9)
+    config.parse_config(str(big))
+    assert len(cache) == 9
+
+    # the directory shrinks: its two files stay, and the entries of the
+    # deleted ones fall back under the floor
+    for i in range(2, 9):
+        (big / "job-{:03d}.yaml".format(i)).unlink()
+    config.parse_config(str(big))
+    assert len(cache) == 4
+    assert {"job-000.yaml", "job-001.yaml"} <= set(cached_names())
+
+    # a different configuration: its files are cached, the total stays
+    # at the floor
+    other = tmp_path / "other"
+    _write_one_job_files(other, 3, prefix="other")
+    config.parse_config(str(other))
+    assert len(cache) == 4
+    assert {"other-000.yaml", "other-001.yaml", "other-002.yaml"} <= set(
+        cached_names()
+    )
+
+    # a configuration larger than the floor is cached whole, alone
+    wide = tmp_path / "wide"
+    _write_one_job_files(wide, 6, prefix="wide")
+    config.parse_config(str(wide))
+    assert cached_names() == ["wide-{:03d}.yaml".format(i) for i in range(6)]
+
+
+def test_failed_load_keeps_the_unbroken_files_cached(tmp_path, monkeypatch):
+    cache = _small_dir_file_cache(monkeypatch)
+    _write_one_job_files(tmp_path, 6)
+    config.parse_config(str(tmp_path))
+
+    broken = tmp_path / "job-002.yaml"
+    good = broken.read_text()
+    broken.write_text("jobs:\n  - name: job-002\n    bogus: 1\n")
+    parsed = _record_file_parses(monkeypatch)
+    with pytest.raises(ConfigError):
+        config.parse_config(str(tmp_path))
+    assert parsed == ["job-002.yaml"]
+    # a load that raises evicts no file of the last load that returned
+    assert len(cache) == 6
+
+    # the repair is new content, so it is the one file parsed
+    del parsed[:]
+    broken.write_text(good.replace('"0 3', '"0 5'))
+    conf = config.parse_config(str(tmp_path))
+    assert parsed == ["job-002.yaml"]
+    assert len(conf.jobs) == 6
+    assert len(cache) == 6
+
+
+def test_failed_include_load_keeps_the_files_it_did_not_reach(
+    tmp_path, monkeypatch
+):
+    # An include tree stops at its first broken file, so the load that
+    # raises has used only the files before it.  The rest stay cached.
+    cache = _small_dir_file_cache(monkeypatch)
+    _write_one_job_files(tmp_path / "parts", 12)
+    entry = tmp_path / "entry.yaml"
+    entry.write_text(
+        "include:\n"
+        + "".join("  - parts/job-{:03d}.yaml\n".format(i) for i in range(12))
+    )
+    assert len(config.parse_config(str(entry)).jobs) == 12
+    assert len(cache) == 12
+
+    broken = tmp_path / "parts" / "job-002.yaml"
+    good = broken.read_text()
+    broken.write_text("jobs:\n  - name: job-002\n    bogus: 1\n")
+    with pytest.raises(ConfigError):
+        config.parse_config(str(entry))
+    assert len(cache) == 12
+
+    # the repair is new content: it and the entry are the files parsed
+    broken.write_text(good.replace('"0 3', '"0 5'))
+    parsed = _record_file_parses(monkeypatch)
+    assert len(config.parse_config(str(entry)).jobs) == 12
+    assert parsed == ["entry.yaml", "job-002.yaml"]
+
+    # A load that raises still trims.  It keeps its own files and those of
+    # the last load that returned, so the files of an earlier load that
+    # raised are the ones to go.
+    for prefix in ("one", "two"):
+        other = tmp_path / prefix
+        _write_one_job_files(other, 3, prefix=prefix)
+        (other / (prefix + "-001.yaml")).write_text("jobs:\n  - bogus: 1\n")
+        with pytest.raises(ConfigError):
+            config.parse_config(str(other))
+    assert sorted(os.path.basename(path) for path in cache) == [
+        "job-{:03d}.yaml".format(i) for i in range(12)
+    ] + ["two-000.yaml", "two-002.yaml"]
+
+
+# A cache entry is signed with the bytes its parse read.  Each test below
+# edits a source after the parse read it and before the entry is stored,
+# then checks that the next load parses the edit.
+
+
+def _job_text(name, command, extra=""):
+    return (
+        "{}jobs:\n"
+        "  - name: {}\n"
+        "    command: {}\n"
+        '    schedule: "0 3 * * *"\n'.format(extra, name, command)
+    )
+
+
+def _commands(conf):
+    return {job.name: job.command for job in conf.jobs}
+
+
+def _who(conf):
+    return {
+        job.name: {e["key"]: e["value"] for e in job.environment}["WHO"]
+        for job in conf.jobs
+    }
+
+
+def _edit_when_reading(monkeypatch, basename, edit):
+    """Run ``edit`` when parse_config_file is asked for ``basename``."""
+    real = config.parse_config_file
+
+    def editing(path, *args, **kwargs):
+        if os.path.basename(path) == basename:
+            edit()
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(config, "parse_config_file", editing)
+    return real
+
+
+def test_dir_file_edited_after_its_read_is_parsed_by_the_next_load(
+    tmp_path, monkeypatch
+):
+    _small_dir_file_cache(monkeypatch)
+    target = tmp_path / "a.yaml"
+    target.write_text(_job_text("a", "echo old"))
+    real = config.parse_config_string
+
+    def edit_then_parse(data, path, *args, **kwargs):
+        target.write_text(_job_text("a", "echo new"))
+        return real(data, path, *args, **kwargs)
+
+    monkeypatch.setattr(config, "parse_config_string", edit_then_parse)
+    assert _commands(config.parse_config(str(tmp_path))) == {"a": "echo old"}
+
+    monkeypatch.setattr(config, "parse_config_string", real)
+    assert _commands(config.parse_config(str(tmp_path))) == {"a": "echo new"}
+
+
+def test_included_file_edited_while_a_sibling_parses_is_seen_by_the_next_load(
+    tmp_path, monkeypatch
+):
+    # The file that includes both is stored after the edit, and its
+    # signature still holds the bytes the first leaf was parsed from.
+    _small_dir_file_cache(monkeypatch)
+    first = tmp_path / "leaf-1.yaml"
+    first.write_text(_job_text("one", "echo old"))
+    (tmp_path / "leaf-2.yaml").write_text(_job_text("two", "echo x"))
+    (tmp_path / "mid.yaml").write_text(
+        "include:\n  - leaf-1.yaml\n  - leaf-2.yaml\n"
+    )
+    entry = tmp_path / "entry.yaml"
+    entry.write_text("include:\n  - mid.yaml\n")
+
+    real = _edit_when_reading(
+        monkeypatch,
+        "leaf-2.yaml",
+        lambda: first.write_text(_job_text("one", "echo new")),
+    )
+    loaded = config.parse_config(str(entry))
+    assert _commands(loaded) == {"one": "echo old", "two": "echo x"}
+
+    monkeypatch.setattr(config, "parse_config_file", real)
+    parsed = _record_file_parses(monkeypatch)
+    loaded = config.parse_config(str(entry))
+    assert _commands(loaded) == {"one": "echo new", "two": "echo x"}
+    assert parsed == ["entry.yaml", "mid.yaml", "leaf-1.yaml"]
+
+    # the repaired tree is cached whole again
+    del parsed[:]
+    config.parse_config(str(entry))
+    assert parsed == ["entry.yaml"]
+
+
+def test_cached_file_edited_while_a_sibling_parses_is_seen_by_the_next_load(
+    tmp_path, monkeypatch
+):
+    # A file served from the cache is signed with the bytes that validated
+    # it, in the signature of the file that includes it.
+    _small_dir_file_cache(monkeypatch)
+    first = tmp_path / "leaf-1.yaml"
+    first.write_text(_job_text("one", "echo old"))
+    second = tmp_path / "leaf-2.yaml"
+    second.write_text(_job_text("two", "echo x"))
+    (tmp_path / "mid.yaml").write_text(
+        "include:\n  - leaf-1.yaml\n  - leaf-2.yaml\n"
+    )
+    entry = tmp_path / "entry.yaml"
+    entry.write_text("include:\n  - mid.yaml\n")
+    config.parse_config(str(entry))
+
+    # leaf-2 changed, so mid.yaml is parsed again and leaf-1 is a cache hit
+    second.write_text(_job_text("two", "echo y"))
+    real = _edit_when_reading(
+        monkeypatch,
+        "leaf-2.yaml",
+        lambda: first.write_text(_job_text("one", "echo new")),
+    )
+    loaded = config.parse_config(str(entry))
+    assert _commands(loaded) == {"one": "echo old", "two": "echo y"}
+
+    monkeypatch.setattr(config, "parse_config_file", real)
+    loaded = config.parse_config(str(entry))
+    assert _commands(loaded) == {"one": "echo new", "two": "echo y"}
+
+
+def test_env_file_edited_after_its_read_is_parsed_by_the_next_load(
+    tmp_path, monkeypatch
+):
+    _small_dir_file_cache(monkeypatch)
+    env = tmp_path / "shared.env"
+    env.write_text("WHO=old\n")
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    (confdir / "a.yaml").write_text(
+        _job_text("a", "echo x", "defaults:\n  env_file: {}\n".format(env))
+    )
+    real = config.parse_environment_file
+
+    def read_then_edit(path):
+        environ = real(path)
+        env.write_text("WHO=new\n")
+        return environ
+
+    monkeypatch.setattr(config, "parse_environment_file", read_then_edit)
+    assert _who(config.parse_config(str(confdir))) == {"a": "old"}
+
+    monkeypatch.setattr(config, "parse_environment_file", real)
+    assert _who(config.parse_config(str(confdir))) == {"a": "new"}
+
+
+def test_env_file_read_in_two_states_by_one_tree_is_parsed_again(
+    tmp_path, monkeypatch
+):
+    # Two documents under one including file read the same env_file, one
+    # before an edit and one after.  The including file's signature matches
+    # neither state, so the next load parses it again.
+    _small_dir_file_cache(monkeypatch)
+    env = tmp_path / "shared.env"
+    env.write_text("WHO=old\n")
+    defaults = "defaults:\n  env_file: {}\n".format(env)
+    (tmp_path / "leaf-a.yaml").write_text(_job_text("a", "echo x", defaults))
+    (tmp_path / "leaf-b.yaml").write_text(_job_text("b", "echo x", defaults))
+    (tmp_path / "mid.yaml").write_text(
+        "include:\n  - leaf-a.yaml\n  - leaf-b.yaml\n"
+    )
+    entry = tmp_path / "entry.yaml"
+    entry.write_text("include:\n  - mid.yaml\n")
+
+    real = _edit_when_reading(
+        monkeypatch, "leaf-b.yaml", lambda: env.write_text("WHO=new\n")
+    )
+    assert _who(config.parse_config(str(entry))) == {"a": "old", "b": "new"}
+
+    monkeypatch.setattr(config, "parse_config_file", real)
+    parsed = _record_file_parses(monkeypatch)
+    assert _who(config.parse_config(str(entry))) == {"a": "new", "b": "new"}
+    assert parsed == ["entry.yaml", "mid.yaml", "leaf-a.yaml"]
+
+    del parsed[:]
+    config.parse_config(str(entry))
+    assert parsed == ["entry.yaml"]
+
+
+def test_env_file_put_back_after_two_states_is_parsed_again(
+    tmp_path, monkeypatch
+):
+    # The env_file is back in its first state at the next load.  The
+    # including file's signature holds the conflict marker, which matches
+    # no state of the env_file.
+    _small_dir_file_cache(monkeypatch)
+    env = tmp_path / "shared.env"
+    env.write_text("WHO=old\n")
+    defaults = "defaults:\n  env_file: {}\n".format(env)
+    (tmp_path / "leaf-a.yaml").write_text(_job_text("a", "echo x", defaults))
+    (tmp_path / "leaf-b.yaml").write_text(_job_text("b", "echo x", defaults))
+    (tmp_path / "mid.yaml").write_text(
+        "include:\n  - leaf-a.yaml\n  - leaf-b.yaml\n"
+    )
+    entry = tmp_path / "entry.yaml"
+    entry.write_text("include:\n  - mid.yaml\n")
+
+    real = _edit_when_reading(
+        monkeypatch, "leaf-b.yaml", lambda: env.write_text("WHO=new\n")
+    )
+    assert _who(config.parse_config(str(entry))) == {"a": "old", "b": "new"}
+
+    monkeypatch.setattr(config, "parse_config_file", real)
+    env.write_text("WHO=old\n")
+    assert _who(config.parse_config(str(entry))) == {"a": "old", "b": "old"}
+
+
+_ETCD_PASSWORD_FILE = (
+    "cluster:\n"
+    "  backend: etcd\n"
+    "  nodeName: node-a\n"
+    "  etcd:\n"
+    "    endpoints:\n"
+    "      - https://127.0.0.1:2379\n"
+    "    password:\n"
+    "      fromFile: {}\n"
+)
+
+
+def _etcd_password(conf):
+    return conf.cluster_config["etcd"]["resolved_password"]
+
+
+@pytest.mark.parametrize("shape", ["file", "directory", "include"])
+def test_secret_file_rewritten_in_place_is_read_by_the_next_load(
+    tmp_path, monkeypatch, shape
+):
+    # The parse resolves cluster.etcd.password.fromFile, so the secret file
+    # is a source of the file that holds the section.
+    _small_dir_file_cache(monkeypatch)
+    secret = tmp_path / "etcd.pw"
+    secret.write_text("old-password\n")
+    cluster = _ETCD_PASSWORD_FILE.format(secret)
+    if shape == "file":
+        arg = tmp_path / "c.yaml"
+        arg.write_text(cluster + _job_text("a", "echo x"))
+    elif shape == "directory":
+        arg = tmp_path / "conf"
+        arg.mkdir()
+        (arg / "cluster.yaml").write_text(cluster)
+        (arg / "jobs.yaml").write_text(_job_text("a", "echo x"))
+    else:
+        (tmp_path / "cluster.yaml").write_text(cluster)
+        arg = tmp_path / "entry.yaml"
+        arg.write_text(
+            _job_text("a", "echo x", "include:\n  - cluster.yaml\n")
+        )
+
+    loaded, sources = config.parse_config_with_sources(str(arg))
+    assert _etcd_password(loaded) == "old-password"
+    assert str(secret) in sources
+
+    secret.write_text("new-password\n")
+    loaded, sources = config.parse_config_with_sources(str(arg))
+    assert _etcd_password(loaded) == "new-password"
+    assert config.parsed_sources_unchanged(sources)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+def test_secret_read_from_a_fifo_is_not_a_source(tmp_path, monkeypatch):
+    # A FIFO that is written once has no writer for a second open, so a
+    # load that validated the cached file against it would block.
+    _small_dir_file_cache(monkeypatch)
+    fifo = tmp_path / "etcd.pw"
+    os.mkfifo(str(fifo))
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    (confdir / "cluster.yaml").write_text(_ETCD_PASSWORD_FILE.format(fifo))
+    writer = threading.Thread(
+        target=lambda: fifo.write_text("piped\n"), daemon=True
+    )
+    writer.start()
+    loaded, sources = config.parse_config_with_sources(str(confdir))
+    writer.join(5)
+    assert _etcd_password(loaded) == "piped"
+    assert sources == {str(confdir / "cluster.yaml")}
+
+
+@pytest.fixture
+def piped():
+    """Serve text once, from the ``/dev/fd/N`` path of a pipe's read end."""
+    read_ends = []
+
+    def serve(text):
+        read_end, write_end = os.pipe()
+        read_ends.append(read_end)
+        try:
+            os.write(write_end, text.encode())
+        finally:
+            os.close(write_end)
+        path = "/dev/fd/{}".format(read_end)
+        # FreeBSD without fdescfs has nodes for 0, 1 and 2 alone.
+        if not os.path.exists(path):
+            pytest.skip("needs /dev/fd/N for an open descriptor")
+        return path
+
+    yield serve
+    for read_end in read_ends:
+        os.close(read_end)
+
+
+@pytest.mark.parametrize("shape", ["directory", "include"])
+def test_cached_file_keeps_the_env_file_it_read_from_a_pipe(
+    tmp_path, monkeypatch, piped, shape
+):
+    # A pipe gives its bytes once, so the cached file is checked against
+    # its other sources alone.
+    _small_dir_file_cache(monkeypatch)
+    job = _job_text("a", "echo x") + "    env_file: {}\n".format(
+        piped("WHO=s3cret\n")
+    )
+    if shape == "directory":
+        arg = tmp_path / "conf"
+        arg.mkdir()
+        (arg / "a.yaml").write_text(job)
+        other = arg / "b.yaml"
+        other.write_text("defaults:\n  utc: false\n")
+        every_load = []
+    else:
+        (tmp_path / "a.yaml").write_text(job)
+        (tmp_path / "mid.yaml").write_text("include:\n  - a.yaml\n")
+        arg = other = tmp_path / "entry.yaml"
+        arg.write_text("include:\n  - mid.yaml\n")
+        every_load = ["entry.yaml"]
+    assert _who(config.parse_config_with_sources(str(arg))[0]) == {
+        "a": "s3cret"
+    }
+
+    # a reload request with nothing edited, then an edit to another file
+    parsed = _record_file_parses(monkeypatch)
+    assert _who(config.parse_config_with_sources(str(arg))[0]) == {
+        "a": "s3cret"
+    }
+    assert parsed == every_load
+    del parsed[:]
+    other.write_text(other.read_text() + "# edited\n")
+    assert _who(config.parse_config_with_sources(str(arg))[0]) == {
+        "a": "s3cret"
+    }
+    assert parsed == [other.name]
+
+
+def test_cached_include_keeps_the_jobs_it_read_from_a_pipe(
+    tmp_path, monkeypatch, piped
+):
+    _small_dir_file_cache(monkeypatch)
+    entry = tmp_path / "entry.yaml"
+    entry.write_text(
+        "include:\n  - {}\n".format(piped(_job_text("piped", "echo x")))
+    )
+    for _ in ("first load", "reload"):
+        loaded = config.parse_config_with_sources(str(entry))[0]
+        assert _commands(loaded) == {"piped": "echo x"}
+
+
+def test_cached_file_is_checked_without_opening_a_source_read_once(
+    tmp_path, monkeypatch
+):
+    # The stand-in gives every platform an env_file that reads as a pipe
+    # does.  A second read of it would find other bytes.
+    _small_dir_file_cache(monkeypatch)
+    env = tmp_path / "once.env"
+    env.write_text("WHO=first\n")
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    (confdir / "a.yaml").write_text(
+        _job_text("a", "echo x", "defaults:\n  env_file: {}\n".format(env))
+    )
+    real_rereadable = config._rereadable
+    monkeypatch.setattr(
+        config,
+        "_rereadable",
+        lambda path: path != str(env) and real_rereadable(path),
+    )
+    loaded, sources = config.parse_config_with_sources(str(confdir))
+    assert _who(loaded) == {"a": "first"}
+    assert str(env) in sources
+
+    env.write_text("WHO=second\n")
+    opened = []
+
+    def recording_open(file, *args, **kwargs):
+        opened.append(os.path.basename(file))
+        return open(file, *args, **kwargs)
+
+    monkeypatch.setattr(config, "open", recording_open, raising=False)
+    loaded, sources = config.parse_config_with_sources(str(confdir))
+    assert _who(loaded) == {"a": "first"}
+    assert opened == ["a.yaml"]
+    assert str(env) in sources
+    assert config.parsed_sources_unchanged(sources)
+
+    # the file that names it is parsed again, and reads it again
+    (confdir / "a.yaml").write_text(
+        _job_text("a", "echo y", "defaults:\n  env_file: {}\n".format(env))
+    )
+    assert _who(config.parse_config(str(confdir))) == {"a": "second"}
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+def test_cached_file_is_checked_without_opening_its_fifo_env_file(
+    tmp_path, monkeypatch
+):
+    # A FIFO that is written once has no writer for a second open, and
+    # that open blocks.
+    _small_dir_file_cache(monkeypatch)
+    fifo = tmp_path / "secrets.env"
+    os.mkfifo(str(fifo))
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    (confdir / "a.yaml").write_text(
+        _job_text("a", "echo x", "defaults:\n  env_file: {}\n".format(fifo))
+    )
+    writer = threading.Thread(
+        target=lambda: fifo.write_text("WHO=fifo\n"), daemon=True
+    )
+    writer.start()
+    assert _who(config.parse_config(str(confdir))) == {"a": "fifo"}
+    writer.join(5)
+
+    loaded = []
+    load = threading.Thread(
+        target=lambda: loaded.append(config.parse_config(str(confdir))),
+        daemon=True,
+    )
+    load.start()
+    load.join(10)
+    stuck = load.is_alive()
+    if stuck:
+        # release the open that waits for a writer
+        os.close(os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK))
+        load.join(5)
+    assert not stuck
+    assert _who(loaded[0]) == {"a": "fifo"}
+
+    # a regular file in the FIFO's place can be read again, and the next
+    # load reads it
+    fifo.unlink()
+    fifo.write_text("WHO=file\n")
+    assert _who(config.parse_config(str(confdir))) == {"a": "file"}
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+def test_cached_file_is_parsed_again_when_its_env_file_becomes_a_fifo(
+    tmp_path, monkeypatch
+):
+    # The FIFO is written once.  A check that opened it would take those
+    # bytes, and the parse would wait for a second writer.
+    _small_dir_file_cache(monkeypatch)
+    env = tmp_path / "secrets.env"
+    env.write_text("WHO=file\n")
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    (confdir / "a.yaml").write_text(
+        _job_text("a", "echo x", "defaults:\n  env_file: {}\n".format(env))
+    )
+    assert _who(config.parse_config(str(confdir))) == {"a": "file"}
+
+    env.unlink()
+    os.mkfifo(str(env))
+    writer = threading.Thread(
+        target=lambda: env.write_text("WHO=fifo\n"), daemon=True
+    )
+    writer.start()
+    loaded = []
+    load = threading.Thread(
+        target=lambda: loaded.append(config.parse_config(str(confdir))),
+        daemon=True,
+    )
+    load.start()
+    load.join(10)
+    stuck = load.is_alive()
+    if stuck:
+        # release the open that waits for a writer
+        os.close(os.open(str(env), os.O_WRONLY | os.O_NONBLOCK))
+        load.join(5)
+    writer.join(5)
+    assert not stuck
+    assert _who(loaded[0]) == {"a": "fifo"}
+
+
+def test_cached_file_check_opens_no_source_that_turned_one_shot(
+    tmp_path, monkeypatch
+):
+    # The stand-in gives every platform an env_file that reads as a FIFO
+    # does once the parse has read it as a regular file.  The check opens
+    # nothing, and the parse that follows reads each file once.
+    _small_dir_file_cache(monkeypatch)
+    monkeypatch.setattr(config, "_FIFOS", True)
+    env = tmp_path / "secrets.env"
+    env.write_text("WHO=file\n")
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    (confdir / "a.yaml").write_text(
+        _job_text("a", "echo x", "defaults:\n  env_file: {}\n".format(env))
+    )
+    assert _who(config.parse_config(str(confdir))) == {"a": "file"}
+
+    env.write_text("WHO=fifo\n")
+    real_rereadable = config._rereadable
+    monkeypatch.setattr(
+        config,
+        "_rereadable",
+        lambda path: path != str(env) and real_rereadable(path),
+    )
+    opened = []
+
+    def recording_open(file, *args, **kwargs):
+        opened.append(os.path.basename(file))
+        return open(file, *args, **kwargs)
+
+    monkeypatch.setattr(config, "open", recording_open, raising=False)
+    assert _who(config.parse_config(str(confdir))) == {"a": "fifo"}
+    assert opened == ["a.yaml", "secrets.env"]
+
+
+def test_parsed_sources_unchanged_compares_disk_with_the_bytes_parsed(
+    tmp_path, monkeypatch
+):
+    _small_dir_file_cache(monkeypatch)
+    env = tmp_path / "vars.env"
+    env.write_text("WHO=old\n")
+    part = tmp_path / "part.yaml"
+    part.write_text(_job_text("part", "echo x"))
+    entry = tmp_path / "entry.yaml"
+    entry_text = _job_text(
+        "entry",
+        "echo x",
+        "include:\n  - part.yaml\ndefaults:\n  env_file: {}\n".format(env),
+    )
+    entry.write_text(entry_text)
+
+    _, sources = config.parse_config_with_sources(str(entry))
+    assert sources == {str(entry), str(part), str(env)}
+    assert config.parsed_sources_unchanged(sources)
+    # only the set the load returned is vouched for
+    assert not config.parsed_sources_unchanged(frozenset(set(sources)))
+
+    for path, text in (
+        (entry, entry_text),
+        (part, _job_text("part", "echo x")),
+        (env, "WHO=old\n"),
+    ):
+        path.write_text(text + "# edited\n")
+        assert not config.parsed_sources_unchanged(sources), path.name
+        path.write_text(text)
+        assert config.parsed_sources_unchanged(sources), path.name
+    env.unlink()
+    assert not config.parsed_sources_unchanged(sources)
+
+
+@pytest.mark.parametrize("edited", ["entry.yaml", "part.yaml", "vars.env"])
+def test_parsed_sources_unchanged_is_false_after_an_edit_during_the_load(
+    tmp_path, monkeypatch, edited
+):
+    _small_dir_file_cache(monkeypatch)
+    env = tmp_path / "vars.env"
+    env.write_text("WHO=old\n")
+    (tmp_path / "part.yaml").write_text(_job_text("part", "echo x"))
+    entry = tmp_path / "entry.yaml"
+    entry.write_text(
+        _job_text(
+            "entry",
+            "echo x",
+            "include:\n  - part.yaml\ndefaults:\n  env_file: {}\n".format(env),
+        )
+    )
+    real = config.parse_environment_file
+
+    def read_then_edit(path):
+        # the entry's jobs are built last, after every other read
+        environ = real(path)
+        with open(str(tmp_path / edited), "a") as handle:
+            handle.write("# edited\n")
+        return environ
+
+    monkeypatch.setattr(config, "parse_environment_file", read_then_edit)
+    _, sources = config.parse_config_with_sources(str(entry))
+    assert not config.parsed_sources_unchanged(sources)
+
+    monkeypatch.setattr(config, "parse_environment_file", real)
+    _, sources = config.parse_config_with_sources(str(entry))
+    assert config.parsed_sources_unchanged(sources)
+
+
+def test_parsed_sources_unchanged_compares_the_directory_listing(
+    tmp_path, monkeypatch
+):
+    # A file that joins the directory is no source of the load, so the
+    # entries that the load listed are compared as well.
+    _small_dir_file_cache(monkeypatch)
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    (confdir / "a.yaml").write_text(_job_text("a", "echo x"))
+    _, sources = config.parse_config_with_sources(str(confdir))
+    assert config.parsed_listing_unchanged(sources)
+    assert config.parsed_sources_unchanged(sources)
+    # only the set the load returned is vouched for
+    assert not config.parsed_listing_unchanged(frozenset(set(sources)))
+
+    # entries that the loader skips
+    (confdir / "README").write_text("notes\n")
+    (confdir / "_off.yaml").write_text(_job_text("off", "echo x"))
+    assert config.parsed_listing_unchanged(sources)
+    assert config.parsed_sources_unchanged(sources)
+
+    for name in ("b.yaml", "B.YML", "extra.crontab"):
+        (confdir / name).write_text("")
+        assert not config.parsed_listing_unchanged(sources), name
+        assert not config.parsed_sources_unchanged(sources), name
+        (confdir / name).unlink()
+        assert config.parsed_sources_unchanged(sources), name
+
+    (confdir / "a.yaml").rename(confdir / "c.yaml")
+    assert not config.parsed_listing_unchanged(sources)
+
+
+def test_parsed_listing_unchanged_is_true_for_a_file_source(
+    tmp_path, monkeypatch
+):
+    _small_dir_file_cache(monkeypatch)
+    entry = tmp_path / "entry.yaml"
+    entry.write_text(_job_text("entry", "echo x"))
+    _, sources = config.parse_config_with_sources(str(entry))
+    (tmp_path / "other.yaml").write_text(_job_text("other", "echo x"))
+    assert config.parsed_listing_unchanged(sources)
+    assert config.parsed_sources_unchanged(sources)
+
+
+def test_parsed_sources_unchanged_is_false_after_a_file_joins_during_the_load(
+    tmp_path, monkeypatch
+):
+    # The file joins after the directory is listed, so the load leaves it
+    # out.
+    _small_dir_file_cache(monkeypatch)
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    (confdir / "a.yaml").write_text(_job_text("a", "echo x"))
+    real = _edit_when_reading(
+        monkeypatch,
+        "a.yaml",
+        lambda: (confdir / "b.yaml").write_text(_job_text("b", "echo x")),
+    )
+    loaded, sources = config.parse_config_with_sources(str(confdir))
+    assert [job.name for job in loaded.jobs] == ["a"]
+    assert not config.parsed_sources_unchanged(sources)
+
+    monkeypatch.setattr(config, "parse_config_file", real)
+    loaded, sources = config.parse_config_with_sources(str(confdir))
+    assert [job.name for job in loaded.jobs] == ["a", "b"]
+    assert config.parsed_sources_unchanged(sources)
+
+
+def test_parsed_listing_unchanged_is_false_when_the_directory_is_gone(
+    tmp_path, monkeypatch
+):
+    _small_dir_file_cache(monkeypatch)
+    confdir = tmp_path / "conf"
+    confdir.mkdir()
+    _, sources = config.parse_config_with_sources(str(confdir))
+    assert config.parsed_listing_unchanged(sources)
+    confdir.rmdir()
+    assert not config.parsed_listing_unchanged(sources)
+
+
+def test_config_file_bytes_are_decoded_with_universal_newlines(tmp_path):
+    # CRLF and a lone CR each end a line, as in a file opened in text mode.
+    (tmp_path / "a.yaml").write_bytes(
+        b"jobs:\r\n  - name: j\r\n    command: |\r\n      echo a\r\n"
+        b'      echo b\r\n    schedule: "0 3 * * *"\r\n'
+    )
+    (tmp_path / "b.crontab").write_bytes(
+        b"*/5 * * * * echo one\r0 3 * * * echo two\r"
+    )
+    for _ in ("cold", "warm"):
+        conf = config.parse_config(str(tmp_path))
+        assert sorted(job.command for job in conf.jobs) == [
+            "echo a\necho b\n",
+            "echo one",
+            "echo two",
+        ]
+
+
+def test_environ_file_that_is_not_utf8_is_a_config_error(tmp_path):
+    env = tmp_path / "latin1.env"
+    env.write_bytes(b"GREETING=h\xe9llo\n")
+    with pytest.raises(ConfigError, match="Could not load env_file"):
+        config.parse_environment_file(str(env))
+
+
+@pytest.mark.parametrize("shape", ["file", "directory", "include"])
+@pytest.mark.parametrize("encoding", ["utf-16", "latin-1"])
+def test_config_file_that_is_not_utf8_is_a_config_error(
+    tmp_path, monkeypatch, shape, encoding
+):
+    # UTF-16 is what a redirect in Windows PowerShell 5.1 writes.
+    _small_dir_file_cache(monkeypatch)
+    if shape == "file":
+        bad = arg = tmp_path / "c.yaml"
+    elif shape == "directory":
+        arg = tmp_path / "conf"
+        arg.mkdir()
+        bad = arg / "jobs.yaml"
+    else:
+        bad = tmp_path / "part.yaml"
+        arg = tmp_path / "entry.yaml"
+        arg.write_text("include:\n  - part.yaml\n")
+    text = _job_text("a", "echo x") + "# caf\xe9\n"
+    bad.write_bytes(text.encode(encoding))
+    with pytest.raises(ConfigError) as refused:
+        config.parse_config_with_sources(str(arg))
+    message = str(refused.value)
+    assert "Could not load config file {!r}".format(str(bad)) in message
+    assert "'utf-8' codec can't decode" in message
+
+
 @pytest.mark.parametrize(
     "snippet, message",
     [
@@ -802,6 +1739,84 @@ def test_include_cycle_detected(tmp_path):
     assert "cycle" in str(exc.value)
 
 
+def _who_defaults(who):
+    return (
+        "defaults:\n  environment:\n    - key: WHO\n"
+        "      value: {}\n".format(who)
+    )
+
+
+def _write_diamond(tmp_path):
+    """main.yaml includes two team files, and each includes common.yaml."""
+    (tmp_path / "common.yaml").write_text(_who_defaults("common"))
+    for team in ("a", "b"):
+        (tmp_path / "team_{}.yaml".format(team)).write_text(
+            _job_text(team, "echo x", "include:\n  - common.yaml\n")
+        )
+    entry = tmp_path / "main.yaml"
+    entry.write_text("include:\n  - team_a.yaml\n  - team_b.yaml\n")
+    return entry
+
+
+def test_file_included_through_two_branches_is_no_cycle(
+    tmp_path, monkeypatch
+):
+    # Each team file takes the defaults of common.yaml.  The first load
+    # parses common.yaml for team_a.yaml and serves team_b.yaml the cached
+    # parse.
+    cache = _small_dir_file_cache(monkeypatch, floor=2)
+    entry = _write_diamond(tmp_path)
+    parsed = _record_file_parses(monkeypatch)
+    expected = {"a": "common", "b": "common"}
+    assert _who(config.parse_config(str(entry))) == expected
+    assert parsed == [
+        "main.yaml",
+        "team_a.yaml",
+        "common.yaml",
+        "team_b.yaml",
+    ]
+
+    del parsed[:]
+    assert _who(config.parse_config(str(entry))) == expected
+    assert parsed == ["main.yaml"]
+
+    # an edit to common.yaml reaches both team files
+    (tmp_path / "common.yaml").write_text(_who_defaults("edited"))
+    assert _who(config.parse_config(str(entry))) == {
+        "a": "edited",
+        "b": "edited",
+    }
+
+    # team_b.yaml keeps common.yaml cached when team_a.yaml drops it
+    (tmp_path / "team_a.yaml").write_text(
+        _job_text("a", "echo x", _who_defaults("own"))
+    )
+    assert _who(config.parse_config(str(entry))) == {
+        "a": "own",
+        "b": "edited",
+    }
+    assert len(cache) == 3
+
+
+@pytest.mark.parametrize("cached", [True, False], ids=["cached", "cold"])
+def test_include_cycle_below_a_shared_file_is_detected(
+    tmp_path, monkeypatch, cached
+):
+    # common.yaml includes a file that is being parsed.  The cached parses
+    # date from a load that had no cycle.
+    cache = _small_dir_file_cache(monkeypatch)
+    entry = _write_diamond(tmp_path)
+    config.parse_config(str(entry))
+    (tmp_path / "common.yaml").write_text("include:\n  - team_a.yaml\n")
+    if not cached:
+        cache.clear()
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config(str(entry))
+    assert str(exc.value) == "include cycle detected at {}".format(
+        tmp_path / "team_a.yaml"
+    )
+
+
 def test_environ_file_utf8(tmp_path):
     # env files are decoded as UTF-8 regardless of the system locale.
     env = tmp_path / "vars.env"
@@ -818,6 +1833,72 @@ jobs:
     )
     environment = {e["key"]: e["value"] for e in conf.jobs[0].environment}
     assert environment["GREETING"] == "héllo"
+
+
+def test_env_file_is_read_once_per_document_dag_tasks_included(
+    tmp_path, monkeypatch
+):
+    # A DAG task builds its launch template through JobConfig, as a job
+    # does, so the jobs and tasks of one document share one read of an
+    # env_file they name or inherit from `defaults:`.
+    env = tmp_path / "vars.env"
+    env.write_text("SHARED=file\nLEVEL=file\n", encoding="utf-8")
+    reads = []
+    real = config.parse_environment_file
+
+    def counting(path):
+        reads.append(path)
+        return real(path)
+
+    monkeypatch.setattr(config, "parse_environment_file", counting)
+    conf = config.parse_config_string(
+        f"""
+defaults:
+  env_file: {env}
+jobs:
+  - name: job-a
+    command: foo
+    schedule: "* * * * *"
+dags:
+  - name: etl
+    tasks:
+      - id: extract
+        command: foo
+        environment:
+          - key: LEVEL
+            value: task
+      - id: transform
+        command: foo
+        env_file: {env}
+        dependsOn:
+          - extract
+      - id: load
+        command: foo
+        dependsOn:
+          - transform
+""",
+        "",
+    )
+    assert len(reads) == 1, reads
+
+    def environment(job):
+        return {e["key"]: e["value"] for e in job.environment}
+
+    templates = conf.dags[0].task_templates
+    assert environment(conf.jobs[0]) == {"SHARED": "file", "LEVEL": "file"}
+    # one task's own variable overrides the file for that task alone
+    assert environment(templates["extract"]) == {
+        "SHARED": "file",
+        "LEVEL": "task",
+    }
+    assert environment(templates["transform"]) == {
+        "SHARED": "file",
+        "LEVEL": "file",
+    }
+    assert environment(templates["load"]) == {
+        "SHARED": "file",
+        "LEVEL": "file",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1159,6 +2240,61 @@ def test_monitor_resources_defaults_off():
     # the sampling knobs still normalize so consumers never branch on shape
     assert job.monitorResourcesInterval == config.SAMPLE_INTERVAL
     assert job.monitorResourcesHistory == config.MONITOR_HISTORY_DEFAULT
+
+
+def test_the_resource_monitor_takes_its_sampling_defaults_from_config():
+    # config defines the two defaults, so building a job does not import
+    # cronstable.resources, and the monitor's own defaults are those values.
+    import inspect
+
+    from cronstable import resources
+
+    params = inspect.signature(resources.ResourceMonitor).parameters
+    assert params["interval"].default is config.SAMPLE_INTERVAL
+    assert params["history"].default is config.MONITOR_HISTORY_DEFAULT
+
+
+def test_validating_a_config_loads_no_asyncio(tmp_path):
+    # --validate-config and --job-set-id parse and exit. asyncio is the
+    # largest import the daemon makes and neither of them runs a loop.
+    import subprocess
+    import textwrap
+
+    path = tmp_path / "one.yaml"
+    path.write_text(
+        "jobs:\n"
+        "  - name: a\n"
+        "    command: echo a\n"
+        '    schedule: "0 * * * *"\n'
+        "    monitorResources: true\n"
+    )
+    code = textwrap.dedent(
+        """
+        import sys
+
+        sys.argv = ["cronstable", "-c", sys.argv[1], sys.argv[2]]
+        import cronstable.__main__ as main
+
+        try:
+            main.main_loop()
+        except SystemExit as stop:
+            print("EXIT", stop.code)
+        print(sorted(
+            m for m in sys.modules
+            if m in ("asyncio", "aiohttp", "psutil", "cronstable.resources")
+        ))
+        """
+    )
+    for flag in ("--validate-config", "--job-set-id"):
+        done = subprocess.run(
+            [sys.executable, "-c", code, str(path), flag],
+            capture_output=True,
+            text=True,
+        )
+        assert done.returncode == 0, done.stderr
+        lines = done.stdout.strip().splitlines()
+        assert lines[-2] == "EXIT 0", done.stdout + done.stderr
+        assert lines[-1] == "[]", flag
 
 
 def test_monitor_resources_bool_form():

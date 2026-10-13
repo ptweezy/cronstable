@@ -445,15 +445,10 @@ async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
     # offloads the parse. This test is about WHERE the reparse runs (a worker
     # thread), not about the skip cache's change detection -- which
     # test_run_reloads_changed_config already covers via a real on-disk edit.
-    # Driving the reparse this way keeps the test off filesystem timing
-    # entirely: relying on real size/mtime changes to trigger successive
-    # reparses races the parse->record window (reload_config re-stats the file
-    # when recording the parse result, so a second rapid rewrite lands inside
-    # that window and is absorbed into the record -- the next reparse never
-    # fires). That race is benign in production (reloads are ~60s apart) but is
-    # deterministic under this test's 10ms ticks on Windows / Python <= 3.12,
-    # whose coarse ~15.6ms asyncio timer lands every rewrite inside the window
-    # -- which hung this test in CI.
+    # Driving the reparse this way keeps the test off filesystem timing.
+    # reload_config reparses when the file's size or mtime differs from the
+    # fingerprint that it took before its previous parse, and two rewrites of
+    # the same size inside one mtime step share a fingerprint.
     _sig_counter = itertools.count()
     monkeypatch.setattr(
         cron, "_config_signature", lambda files: next(_sig_counter)
@@ -1785,6 +1780,7 @@ async def test_sla_late_after_excused_while_an_instance_runs(monkeypatch):
 
     class _FakeRun:
         started_at = DT(2020, 1, 1, 12, 0, 0, tzinfo=UTC)
+        ended = False
 
     # the 12:10 slot fires while the 12:00 instance still runs: _launch_plan
     # records it as due, and the Forbid drop in maybe_launch_job pops it
@@ -1822,6 +1818,7 @@ async def test_sla_late_after_forbid_drop_survives_the_run_ending(monkeypatch):
 
     class _FakeRun:
         started_at = DT(2020, 1, 1, 12, 0, 0, tzinfo=UTC)
+        ended = False
 
     # the 12:00 run is still going; the 12:10 slot fires and is Forbid-dropped
     cron.running_jobs["s"] = [_FakeRun()]

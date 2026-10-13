@@ -39,7 +39,7 @@ and the modules behind individual features.
 | `cronstable/cluster.py` | The `gossip` backend: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop) is one concrete `LeadershipBackend`, plus the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. No dependency on `cron.py`. See [clustering and leader election](Clustering-and-Leader-Election). |
 | `cronstable/statsd.py` | `StatsdJobMetricWriter` and the UDP `StatsdClientProtocol` that emits best-effort statsd metrics. |
 | `cronstable/prometheus.py` | `PrometheusMetrics` accumulators plus the hand-rolled text/OpenMetrics exposition renderer behind `GET /metrics`. |
-| `cronstable/state.py` | The opt-in durable state store: the `StateBackend` ABC and the single `FilesystemStateBackend` concrete, serving both a local directory and an Amazon S3 Files / EFS (NFSv4) mount. The mount, not the code, decides the reach (`detect_topology` probes it). Immutable schema-versioned JSON records written with temp file + atomic rename (unknown/corrupt records are quarantined on read, never fatal), derived-maximum cursors, advisory-`flock` TTL leases with a monotonic fence, and the `make_state_backend` factory. `start_stop_state` constructs the backend only when a `state:` section is configured. Stdlib-only, so the stateless install pays nothing. |
+| `cronstable/state.py` | The opt-in durable state store: the `StateBackend` ABC and the single `FilesystemStateBackend` concrete, serving both a local directory and an Amazon S3 Files / EFS (NFSv4) mount. The mount, not the code, decides the reach (`detect_topology` probes it). Immutable schema-versioned JSON records written with temp file + atomic rename (a corrupt record is quarantined on read and a record of an unknown schema version is skipped in place, never fatal), derived-maximum cursors, advisory-`flock` TTL leases with a monotonic fence, and the `make_state_backend` factory. `start_stop_state` constructs the backend only when a `state:` section is configured. Stdlib-only, so the stateless install pays nothing. |
 | `cronstable/state_admin.py` | Offline administration of the durable store behind the `cronstable state ...` subcommands: `backup`/`restore`, `migrate` (between paths/mounts), manual `gc`, `check` (writability probe + inventory), and `migrate-schema`. Works straight from the `state` config section with no running daemon, and stays safe against a live one. Imported lazily by `__main__.py` only when a `state` subcommand is used. |
 | `cronstable/jobapi.py` / `cronstable/jobstate.py` | The loopback HTTP API jobs use to reach durable state, and the job state operations it serves over the storage backend. |
 | `cronstable/dag.py` / `cronstable/dagrun.py` | DAG orchestration: the pure state machine, and the runtime driver that makes it durable. |
@@ -315,16 +315,161 @@ The run loop reloads through `reload_config`, which reparses off the loop only
 when the config files' stat signature changed; `update_config` is the
 synchronous twin used at construction. When `config_arg` is `None` (the
 unit-test path) both return an empty `CronstableConfig`. Otherwise they call
-`parse_config_with_sources`, which runs `parse_config(config_arg)` and records
-the files the parse read for the next signature check. `parse_config`
-dispatches on whether the argument is a directory (`_parse_config_dir`) or a
-single file (`parse_config_file`). On success the reload overwrites
-`self.cron_jobs` with a fresh `OrderedDict` keyed by job name and returns the
-full `CronstableConfig` (jobs, web config, job defaults, logging config).
+`parse_config_with_sources`, which runs `parse_config(config_arg)` and reports
+the files the parse read. `parse_config` dispatches on whether the argument
+is a directory (`_parse_config_dir`) or a single file (`parse_config_file`).
+On success the reload overwrites `self.cron_jobs` with a fresh `OrderedDict`
+keyed by job name and returns the full `CronstableConfig` (jobs, web config,
+job defaults, logging config).
+
+The stat signature holds each source file's path, modification time in
+nanoseconds, and size, plus a configuration directory's own modification
+time. For a source that is not a regular file, such as a pipe or a FIFO, it
+holds the path alone, because reading such a source moves its modification
+time. `reload_config` takes it before the parse starts and again when the
+parse returns, and records the first value only when the two are equal. An
+edit that lands while a parse runs, including one between the signature and
+the read of the file, is therefore parsed again at the next check. This
+holds for a single configuration file as well as for a directory or an
+include tree. When an edit and its reversal both land between the two
+signatures and restore the file's size and modification time, the daemon
+keeps what the parse read until the file changes again or a reload is
+requested. After a reload that reads a different set of source files (a
+configuration file, an include, or an `env_file` added or removed), the
+daemon records no signature and parses once more at the next check.
+`update_config` parses once at startup, then reads every source that is a
+regular file again and compares it with the bytes that it parsed. When a
+file changed in between, the first scheduling pass parses the configuration
+again. A source that cannot be read twice (a pipe, a FIFO, a terminal,
+`/dev/stdin`, or `/dev/fd/N`) is read once at startup and left out of that
+comparison. A later load reads such a source again only when it parses the
+file that names it (see the per-file parse cache later in this section). A
+drained pipe then gives no bytes, and the read of a FIFO waits until a
+writer opens it.
+
+When the configuration that `-c` names is itself a pipe, a FIFO, or a
+terminal (by its own path, or as `/dev/stdin` or `/dev/fd/N`), the
+once-a-minute check never reads it again, so the check does not wait on a
+FIFO that has no writer. When the size or modification time of another
+source changes (an included file, an `env_file`, or the
+`cluster.etcd.password.fromFile` file), the daemon logs at `WARNING`
+`A configuration source changed. <config path> is not a regular file, so
+only a reload request reads it again; keeping the loaded configuration`. It
+keeps the loaded jobs and the cluster, web, and state sections, and
+`cronstable_config_last_reload_successful` reads `0`. The daemon logs once
+for each change. For a FIFO, the next reload request reads the configuration
+and the changed source again. A drained pipe gives that request no bytes, as
+described later in this section. At startup, when a regular source file
+differs from the bytes that the daemon parsed, the first scheduling pass
+logs the same warning and does not parse again.
+
+A reload request (`SIGHUP`, `cronstable service reload`) reads a pipe or
+FIFO configuration once for each request, and requests that arrive before
+one pass share one read. For a FIFO the read waits until a writer opens it,
+and scheduling waits with it, so write the configuration to the FIFO and
+request a reload. A request that arrives while that read runs gets a read
+of its own. After a reload that installs a configuration from a FIFO, the
+daemon reads each regular source file a second time and compares it with
+the bytes that it parsed, as at startup. It does not parse again at the
+next check, including when the reload read a different set of files. When a
+regular source file differs from the bytes that the reload parsed, the next
+check logs the `A configuration source changed` warning. A reload of a FIFO
+configuration that fails to parse logs the error,
+`cronstable_config_last_reload_successful` reads `0`, and the next check
+does not try it again. The next reload request reads the FIFO again.
+
+When a reload reads zero bytes from a configuration that cannot be read
+twice (a drained pipe, a standard input at end-of-file, a FIFO whose writer
+wrote nothing), the daemon installs nothing. It logs at `WARNING`
+`Reload read no configuration from <config path>, which gives its bytes
+once; keeping the loaded configuration`, keeps the loaded jobs and the
+cluster, web, and state sections, and
+`cronstable_config_last_reload_successful` reads `0`. Each request and each
+change is answered once. Restart the daemon to load another configuration
+from a pipe or standard input. An empty regular file named by its own path
+is a valid empty configuration. An empty regular file reached through
+`/dev/stdin` or `/dev/fd/N` is refused with the same warning, and so is a
+reload request with `-c /dev/null`.
+
+With `-c /dev/stdin` or `-c /dev/fd/N` where the descriptor is a regular
+file, the once-a-minute check reads the configuration again when the file's
+size or modification time changes. On Linux that read returns the file from
+its start, and the edit is applied. Where the open shares the descriptor's
+offset (macOS, BSD), the read starts where the first read ended, so it
+returns nothing or only the bytes that were appended. The daemon installs
+neither: it logs the `Reload read no configuration` warning and keeps the
+loaded configuration. When the appended bytes do not parse, that reload
+first fails with the parse error, and the next check logs the warning.
+
+For a configuration directory, `update_config` and `reload_config` also
+list the directory again when the parse returns. They compare the names
+that the loader takes (YAML by extension or a crontab by name, without the
+names that start with `_` or `.`) with the names that the parse listed.
+When a file that the loader takes joined or left the directory in between,
+the daemon records no signature, and the next check parses again. A file
+that joins the directory while a parse runs is therefore loaded at the next
+check, including when the directory's modification time did not move.
+
+The files of a configuration directory and the targets of `include` go
+through a per-file parse cache. Each entry is signed with a digest of the
+bytes that its parse read: the file's own bytes, those of every file it
+includes, and those of every `env_file` that its jobs and workflow tasks
+read. A load reuses an entry only while each of those files on disk still
+hashes to the signature, so a file that is replaced after the daemon read it
+is parsed again by the next load that reaches the parser. When one load reads
+a file in two different states, the entry of the file that includes it gets
+a signature that matches no content, and the next load parses that entry
+again. An edit to one file of an include tree reparses that file, each file
+that includes it, and the entry file, which is parsed on every load. The
+cache has room for every file of the loaded configuration, and for at least
+1,024 files.
+
+The signature covers the sources that can be read again. A source that
+cannot be read twice (a pipe, a FIFO, a terminal, `/dev/stdin`, or
+`/dev/fd/N`) is left out of it, and a load never opens such a source to
+check an entry. The entry of the file that names the source stays in use
+while its other sources are unchanged, so jobs keep the environment read
+from a piped `env_file` across a reload request and across an edit to
+another file. An edit to the file that names a piped `env_file`, or to
+another of that file's sources, parses the file again and reads the
+`env_file` again. The entry file is parsed on every load, so every load
+reads a piped `env_file` that the entry file names. An included file that is
+read from a pipe has an entry of its own, which keeps the file's jobs across
+a reload request and across an edit to another file, the file that includes
+it among them. When a FIFO named by its own path is replaced by a regular
+file or deleted, the file that names it is parsed again at the next load. A
+`/dev/stdin` or `/dev/fd/N` path counts as read-once whatever it names:
+closing the descriptor does not make the file that names it parse again,
+and an edit to a regular file reached through such a path is not read until
+the file that names the path is parsed again.
+
+When a regular file that an entry read (the file itself, an included file,
+an `env_file`, or the `cluster.etcd.password.fromFile` file) is replaced by
+a FIFO, the next load does not open the FIFO to check the entry. It parses
+the file that names it again, and that parse is the one read of the FIFO,
+so a FIFO that is written once is enough. On Linux, macOS, and BSD, the
+check of an entry takes one `os.stat` of each of its sources before it
+opens them.
+
+The file that `cluster.etcd.password.fromFile` names is a source file like
+an `env_file`. It is part of the stat signature and the startup comparison,
+and of the cache signature of the file that holds the `cluster` section and
+of each file that includes it. The once-a-minute check therefore parses
+again when the password file's size or modification time changes, unless
+the configuration is a pipe, a FIFO, or a terminal (see earlier in this
+section). A reload request reads a password that was rewritten in place.
+The check that reads a new password restarts the cluster connection once.
+Change the password on the etcd server before you replace the file: when
+the file changes first, the restarted connection fails to authenticate
+until the server has the new password. The other `fromFile` secrets are
+read outside the parse and are not source files.
 
 Because housekeeping checks for a reload at most once per wall-clock minute,
 and immediately on `SIGHUP`, configuration edits take effect within a minute
-without a restart. Schedule parsing, include
+without a restart. `SIGHUP` clears the recorded signature, so the next pass
+parses whatever the files' stats say. A request that arrives while a parse is
+running gets a parse of its own on the next pass, and a request that arrives
+before the parse starts is served by that parse. Schedule parsing, include
 merging, and defaults application all happen inside `parse_config*`. See
 [includes, defaults, and multi-file config](Includes-and-Defaults).
 
@@ -596,12 +741,17 @@ waits have no polling timeout. Registration work is proportional to new
 instances, and each completion callback takes constant time.
 
 The reaper handles completed jobs in batches. It removes each job from
-`wait_tasks`, reads `task.result()`, and passes the job to
-`_handle_finished_job`. An unexpected wait exception is logged as bug (2). A
-handler exception is logged as bug (6), and processing continues with the rest
-of the batch. If that instance remains in `running_jobs`, it is queued for
-another completion attempt. Each batch flushes buffered DAG completions in a
-`finally` block, including when cancellation interrupts the batch.
+`wait_tasks`, checks `task.cancelled()`, reads `task.result()` when the task
+was not canceled, and passes the job to `_handle_finished_job`. A wait task
+that ended canceled is logged at `ERROR` with the line
+`The wait on job <name> was canceled; please report this as a bug (9)`.
+Its job still goes to `_handle_finished_job`, so the instance leaves
+`running_jobs`, and the reaper continues with the batch. An unexpected wait
+exception is logged as bug (2). A handler exception is logged as bug (6),
+and processing continues with the rest of the batch. If that instance
+remains in `running_jobs`, it is queued for another completion attempt. Each
+batch flushes buffered DAG completions in a `finally` block, including when
+cancellation interrupts the batch.
 
 `CancelledError` is re-raised. Other unexpected exceptions in the outer loop
 are logged as bug (3), followed by a one-second sleep.
@@ -701,7 +851,10 @@ calls `await running_job.start()`, and registers the instance with
    "command not found"), reads streams, and returns, so a failed launch is a
    normal job failure, not a reaper bug. With no deadline it awaits
    `proc.wait()` and then `_on_stop()`. With a deadline it awaits
-   `asyncio.wait_for(proc.wait(), timeout)`; on `TimeoutError` it logs the
+   `asyncio.wait_for(proc.wait(), timeout)` and, once the process has
+   exited, waits until the deadline for the captured streams to close
+   (`_output_open_at_deadline`). When the deadline passes with the process
+   still running or a captured stream still open, it logs the
    `executionTimeout`, sets `retcode = -100`, and calls `cancel()`. Finally it
    reads the stream buffers.
 
@@ -713,7 +866,10 @@ calls `await running_job.start()`, and registers the instance with
    forcibly stops the group with `kill_process_group(pid, force=True)`,
    unconditionally even when the child exited in time, because descendants
    sharing its group are what hold the job's stdout/stderr pipes open (fallback:
-   `proc.kill()` on the direct child).
+   `proc.kill()` on the direct child). When the operating system refuses a
+   fallback signal (for example `EPERM` for a process that another user
+   owns), `cancel()` logs `Job <name>: could not signal its process (pid
+   <pid>): <error>` at `WARNING` and completes the sequence.
 
    On POSIX both group signals are `os.killpg` (SIGTERM, then SIGKILL). On
    Windows the graceful call delivers `CTRL_BREAK_EVENT` to the job's process
@@ -722,6 +878,13 @@ calls `await running_job.start()`, and registers the instance with
    tree stop immediately, while the root is still alive to anchor the walk. The
    forced call shells out to `taskkill /F /T`, which walks the live process tree
    (the `taskkill` run is bounded at 10s).
+
+   On POSIX, once asyncio has reaped the direct child, `cancel()` checks
+   before each group signal whether a process exists under the child's pid
+   (`platform.pid_reused`, a signal 0 probe). POSIX keeps a pid out of use
+   while a process group with that id has a member, so a process that exists
+   there is an unrelated one and the job's own group is empty. In that case
+   `cancel()` sends the group no signal. Windows makes no such check.
 
    A run whose spawn failed (`proc is None`) makes `cancel()` a logged no-op
    rather than an error, because callers (the `Replace` branch, the cluster
@@ -732,7 +895,11 @@ calls `await running_job.start()`, and registers the instance with
    `cancel()` calls `_on_stop()`, which is idempotent (guarded by
    `self._stopped`) because `cancel()` and `wait()` can both reach it for one
    run (for example, under `Replace`); it emits the statsd `job_stopped` metric
-   once. Full user-facing semantics:
+   once. A cancel that arrives while the run's verification check runs goes
+   to the check, and `cancel()` returns without calling `_on_stop()`.
+   `wait()` calls it once it has collected the check, so the stop metrics
+   are sent then and the success gauge carries the check's outcome. Full
+   user-facing semantics:
    [cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout).
 
 5. **Failure classification.** `fail_reason` is a property evaluated against
@@ -789,12 +956,24 @@ backoff capped at `maximumDelay`).
 
 Flow:
 
-- **Arming.** `launch_scheduled_job` first `cancel_job_retries(name)` (asserting
-  the name is then absent from `retry_state`), and if `maximumRetries` is
-  truthy creates a `JobRetryState(initialDelay, backoffMultiplier,
-  maximumDelay)` and stores it under the job name before `maybe_launch_job`. The
-  `RunningJob` is given this state through the `retry_state` constructor
-  argument.
+- **Arming.** A scheduled fire ends the job's retry sequence and stores a
+  fresh state through `_begin_retry_sequence`. That method calls
+  `cancel_job_retries(name)` until no retry state is left for the job and, if
+  `maximumRetries` is truthy, creates a `JobRetryState(initialDelay,
+  backoffMultiplier, maximumDelay)` and stores it under the job name. For a
+  job with no pool, `launch_scheduled_job` calls `maybe_launch_job`, and the
+  launch calls `_begin_retry_sequence` under the per-job launch lock
+  (`_launch_job_locked`), after the `Forbid` check and before a `Replace`
+  launch cancels the running instances. For a pooled job,
+  `launch_scheduled_job` calls `_begin_retry_sequence` before it queues the
+  fire. A scheduled fire of a job with no pool that arrives while another
+  launch of the same job holds the launch lock, such as a retry attempt that
+  is starting its process, waits for the lock and leaves the retry state
+  alone until it holds the lock. The concurrency policy then rules on the
+  fire with that launch's run in place: `Forbid` drops the fire and the
+  retry sequence stays, and `Allow` and `Replace` end the sequence and give
+  the fire's run a fresh one. The `RunningJob` is given the state through
+  the `retry_state` constructor argument.
 - **On failure** (`handle_job_failure`, only when not shutting down): the job's
   output is logged, `report_failure()` runs, then the retry state is examined.
   If there is no state or it is `cancelled`, `report_permanent_failure()` runs
@@ -811,7 +990,10 @@ Flow:
   If the job has disappeared from the (possibly reloaded) config, it pops the
   stale retry state and returns; otherwise it calls `maybe_launch_job(job)`.
 - **On success** (`handle_job_success`): `cancel_job_retries(name)` clears any
-  pending retry, then `report_success()` runs.
+  pending retry, then `report_success()` runs. A retry state that another
+  run's launch installed and that has scheduled no retry stays in place.
+  The record of an operator-canceled run applies the same test
+  (`_ends_retry_sequence`) before it settles the retries as `cancelled`.
 - **`cancel_job_retries(name)`** pops the state (no-op if absent), sets
   `cancelled = True`, and awaits or cancels the pending `task`. It takes a
   `settle` reason (default `"superseded"`) for the durable retry state described

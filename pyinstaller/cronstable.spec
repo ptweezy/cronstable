@@ -123,11 +123,12 @@ except ImportError:
 # Modules that are never reachable at runtime but that the analysis (or a
 # dependency's optional `try: import ...` probe) could otherwise rake into the
 # bundle. cronstable is a headless daemon with an ANSI TUI (raw termios/tty on
-# POSIX, msvcrt on Windows) and an HTML/JSON web UI, so no GUI toolkit is ever
-# imported; the TUI reads raw keypresses itself and never uses readline; durable
-# state is JSON (orjson / stdlib json), never sqlite. Excluding a module that was
-# never going to be collected is a harmless no-op, so this list is insurance
-# against dead weight sneaking in. Verified against the tree and the runtime deps
+# POSIX, console key events through ctypes on Windows) and an HTML/JSON web UI,
+# so no GUI toolkit is ever imported; the TUI reads raw keypresses itself and
+# never uses readline; durable state is JSON (orjson / stdlib json), never
+# sqlite. Excluding a module that was never going to be collected is a harmless
+# no-op, so this list is insurance against dead weight sneaking in. Verified
+# against the tree and the runtime deps
 # (aiohttp / jinja2 / strictyaml / sentry-sdk / aiosmtplib / psutil / tzdata);
 # the per-arch `--version` smoke test is the build-time backstop.
 excludes = [

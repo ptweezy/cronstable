@@ -18,8 +18,9 @@ Status classification, sorting, failure correlation, command matching,
 and schedule descriptions follow the web dashboard's behavior.
 
 On POSIX, keyboard input uses ``termios`` and ``loop.add_reader``. On
-Windows, it uses an ``msvcrt`` reader thread because the Proactor event
-loop cannot watch stdin. ``SetConsoleMode`` enables ANSI output on Windows.
+Windows, a reader thread takes key events from the console because the
+Proactor event loop cannot watch stdin. ``SetConsoleMode`` enables ANSI
+output on Windows.
 
 The module contains utilities, the terminal engine, the API client, views,
 the application, and CLI handling, in that order.
@@ -49,9 +50,10 @@ import textwrap
 import threading
 import time
 import unicodedata
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterator
 from typing import (
     Any,
+    NamedTuple,
     cast,
 )
 
@@ -73,9 +75,8 @@ from cronstable.croninfo import (
 )
 from cronstable.platform import IS_WINDOWS, enable_console_vt
 
-if sys.platform == "win32":  # pragma: no cover (windows)
-    import msvcrt
-else:  # pragma: no cover (posix) - termios/tty live nowhere else
+if sys.platform != "win32":  # pragma: no cover (posix)  # pragma: no branch
+    # termios and tty live nowhere else
     import fcntl  # noqa: F401  (re-exported guard parity; unused directly)
     import signal
     import termios
@@ -647,6 +648,15 @@ def fuzzy(query: str, label: str) -> int:
     return 1 if qi == len(q) else 0
 
 
+def _filter_admits(job: dict[str, Any], needle: str) -> bool:
+    """Whether ``job`` passes the text filter: its name or its command
+    contains ``needle``, the filter text stripped and lowercased."""
+    return not needle or (
+        needle in job.get("name", "").lower()
+        or needle in job.get("command", "").lower()
+    )
+
+
 def compute_view(
     jobs: list[dict[str, Any]],
     filter_text: str,
@@ -663,10 +673,8 @@ def compute_view(
     needle = filter_text.strip().lower()
     view = []
     for job in jobs:
-        if needle and (
-            needle not in job.get("name", "").lower()
-            and needle not in job.get("command", "").lower()
-        ):
+        # the needle test spares an unfiltered list one call per job
+        if needle and not _filter_admits(job, needle):
             continue
         key = health(job)[0]
         if status_filter != "all" and segment_of(key) != status_filter:
@@ -704,6 +712,29 @@ def compute_view(
 
     view.sort(key=sort_value, reverse=sort_dir < 0)
     return view
+
+
+class _ViewBuilt(NamedTuple):
+    """The inputs that a view was built from, and the view."""
+
+    jobs: list[dict[str, Any]]
+    status_filter: str
+    sort_key: str
+    sort_dir: int
+    filter_text: str
+    view: list[dict[str, Any]]
+
+
+def _edit_text(text: str, key: str) -> str | None:
+    """``text`` after ``key`` edits it, or ``None`` when ``key`` is no
+    editing key."""
+    if key == "backspace":
+        return text[:-1]
+    if key == "ctrl+u":
+        return ""
+    if len(key) == 1 and key >= " ":
+        return text + key
+    return None
 
 
 # ===================================================================
@@ -1773,6 +1804,11 @@ CURSOR_SHOW = "\x1b[?25h"
 CLEAR = "\x1b[2J"
 SYNC_ON = "\x1b[?2026h"  # "synchronized output"; ignored where unknown
 SYNC_OFF = "\x1b[?2026l"
+PASTE_ON = "\x1b[?2004h"  # "bracketed paste"; ignored where unknown
+PASTE_OFF = "\x1b[?2004l"
+#: The sequences a terminal in bracketed paste mode puts around a paste.
+PASTE_START = "\x1b[200~"
+PASTE_END = "\x1b[201~"
 
 #: CSI/SS3 escape tails -> key names (POSIX byte-stream decoding).
 _CSI_KEYS = {
@@ -1799,25 +1835,20 @@ _SS3_KEYS = {
     "F": "end",
 }
 
-#: msvcrt scan codes (after a '\x00'/'\xe0' prefix) -> key names.
+#: Windows virtual-key codes -> key names, for keys that type no character.
 _WIN_KEYS = {
-    "H": "up",
-    "P": "down",
-    "K": "left",
-    "M": "right",
-    "I": "pgup",
-    "Q": "pgdn",
-    "G": "home",
-    "O": "end",
-    "S": "delete",
-    "R": "insert",
-    "\x0f": "shift+tab",
-    # ctrl-arrow variants collapse onto the plain arrows
-    "\x8d": "up",
-    "\x91": "down",
-    "s": "left",
-    "t": "right",
+    0x21: "pgup",
+    0x22: "pgdn",
+    0x23: "end",
+    0x24: "home",
+    0x25: "left",
+    0x26: "up",
+    0x27: "right",
+    0x28: "down",
+    0x2D: "insert",
+    0x2E: "delete",
 }
+_WIN_ARROWS = ("left", "up", "right", "down")
 
 
 def _decode_control(ch: str) -> str:
@@ -1835,6 +1866,38 @@ def _decode_control(ch: str) -> str:
     return ch
 
 
+def _win_key(down: bool, vk: int, unit: int, state: int) -> str | None:
+    """The key that one Windows console key event names, or ``None``.
+
+    ``unit`` is the UTF-16 code unit that the key types, or 0. A character
+    comes back as that one unit, so half of a surrogate pair comes back
+    alone.
+    """
+    if not down:
+        # Alt+numpad entry delivers its character as Alt is released
+        if vk != 0x12 or not unit:
+            return None
+    elif vk == 0x09 and state & 0x10:  # Tab with Shift held
+        return "shift+tab"
+    if unit:
+        ch = chr(unit)
+        return _decode_control(ch) if ch < " " or ch == "\x7f" else ch
+    if state & 0x03:  # Alt held: the digits of an Alt+numpad entry
+        return None
+    name = _WIN_KEYS.get(vk)
+    # with Ctrl held, only the arrows keep their meaning
+    if state & 0x0C and name not in _WIN_ARROWS:
+        return None
+    return name
+
+
+class _Pasted(str):
+    """One character of pasted text. It equals the typed character, and
+    only a text field takes it."""
+
+    __slots__ = ()
+
+
 class KeyDecoder:
     """Incremental bytes -> key-name decoder for the POSIX byte stream.
 
@@ -1842,18 +1905,53 @@ class KeyDecoder:
     press is only distinguishable from the head of a sequence by time;
     ``flush_escape()`` is called by the reader after a short quiet gap to
     resolve a pending lone escape.
+
+    Some terminals send Alt as an ``Esc`` ahead of the key's own sequence.
+    A CSI or SS3 key with that prefix decodes as the key without it.
+
+    The text between ``PASTE_START`` and ``PASTE_END`` is a paste. Its
+    printable characters come out as :class:`_Pasted`, and its line breaks
+    and other control characters are dropped. A paste whose end marker is
+    lost takes every later key as text, so a Ctrl+C byte that follows a
+    quiet gap ends the paste and comes out as ``ctrl+c``.
     """
 
     def __init__(self) -> None:
         self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
         self._pending = ""  # a partially-received escape sequence
+        self._pasting = False
+        self._quiet = False  # the paste paused for a quiet gap
+        self._held = False  # a flush kept the head of a start marker
 
     def feed(self, data: bytes) -> list[str]:
         keys: list[str] = []
         for ch in self._utf8.decode(data):
+            if self._pasting:
+                self._paste(ch, keys)
+                continue
+            if self._held:
+                # a head that a flush kept takes a parameter byte or
+                # the closing tilde, and no other key
+                self._held = False
+                if ch not in "0123456789;~":
+                    self._pending = ""
             if self._pending:
                 self._pending += ch
-                done, name = self._try_escape(self._pending)
+                seq = self._pending
+                if seq.startswith("\x1b\x1b"):
+                    # An Esc ahead of a CSI or SS3 sequence is the Alt
+                    # prefix. Ahead of a paste marker or any other byte
+                    # it is a key press.
+                    seq = seq[1:]
+                    if seq == PASTE_START or seq[1:2] not in ("", "[", "O"):
+                        keys.append("esc")
+                        self._pending = seq
+                    if seq in ("\x1b", "\x1b\x1b"):
+                        continue  # the pair waits for the byte behind it
+                if seq == PASTE_START:
+                    self._pending, self._pasting = "", True
+                    continue
+                done, name = self._try_escape(seq)
                 if done:
                     self._pending = ""
                     if name:
@@ -1868,12 +1966,50 @@ class KeyDecoder:
                 keys.append(ch)
         return keys
 
+    def _paste(self, ch: str, keys: list[str]) -> None:
+        """Take one character of a paste: text, or part of ``PASTE_END``."""
+        quiet, self._quiet = self._quiet, False
+        if quiet and ch == "\x03":
+            # A paste arrives in a burst, so this byte was typed.
+            self._pending, self._pasting = "", False
+            keys.append("ctrl+c")
+        elif self._pending or ch == "\x1b":
+            seq = self._pending + ch
+            self._pending = ""
+            if seq == PASTE_END:
+                self._pasting = False
+            elif PASTE_END.startswith(seq):
+                self._pending = seq
+            else:
+                # an Esc that starts no end marker is dropped, and the
+                # characters behind it are pasted text
+                for late in seq[1:]:
+                    self._paste(late, keys)
+        elif ch >= " " and ch != "\x7f":
+            keys.append(_Pasted(ch))
+
     def flush_escape(self) -> list[str]:
-        """Resolve a lone ``Esc`` (or abandon a malformed sequence)."""
-        if not self._pending:
+        """Resolve a lone ``Esc`` (or abandon a malformed sequence) after
+        a quiet gap. An ``Esc`` ahead of another is a key press. A paste
+        notes the gap and keeps what may be the head of its end marker,
+        and the head of a start marker stays pending."""
+        if self._pasting:
+            self._quiet = True
             return []
-        pending, self._pending = self._pending, ""
-        return ["esc"] if pending == "\x1b" else []
+        pending = self._pending
+        keys: list[str] = []
+        if pending.startswith("\x1b\x1b"):
+            keys.append("esc")
+            pending = pending[1:]
+        # "\x1b[" alone may be Alt+[, so the marker's head starts at "\x1b[2"
+        if len(pending) > 2 and PASTE_START.startswith(pending):
+            self._pending = pending
+            self._held = True
+            return keys
+        self._pending = ""
+        if pending == "\x1b":
+            keys.append("esc")
+        return keys
 
     @staticmethod
     def _try_escape(seq: str) -> tuple[bool, str | None]:
@@ -1904,6 +2040,14 @@ class KeyDecoder:
             return (len(seq) > 256, None)
         # Alt+char and anything else: swallow the pair
         return (True, None)
+
+
+def _queued_key(queue: "asyncio.Queue[str]") -> str | None:
+    """The next key in ``queue`` when one is waiting, else ``None``."""
+    try:
+        return queue.get_nowait()
+    except asyncio.QueueEmpty:
+        return None
 
 
 class PosixKeyReader:
@@ -1937,6 +2081,9 @@ class PosixKeyReader:
     async def get(self) -> str:
         return await self._queue.get()
 
+    def get_nowait(self) -> str | None:
+        return _queued_key(self._queue)
+
     def close(self) -> None:
         with contextlib.suppress(Exception):
             self._loop.remove_reader(self._fd)
@@ -1946,51 +2093,228 @@ class PosixKeyReader:
 
 if sys.platform == "win32":  # pragma: no cover (windows)
 
-    class WindowsKeyReader:
-        """msvcrt reader thread -> key-name queue (Proactor-safe).
+    class _WinConsole:  # pragma: no cover - needs a real console
+        """The console's input buffer, read as key event records.
 
-        The Proactor loop cannot watch stdin, so a daemon thread blocks
-        in ``getwch()`` and marshals decoded keys onto the loop.
+        A record tells a typed U+00E0 from the prefix of an extended key,
+        which ``msvcrt.getwch()`` cannot.
+        """
+
+        def __init__(self) -> None:
+            import ctypes
+            from ctypes import wintypes
+
+            class Record(ctypes.Structure):
+                # INPUT_RECORD with its union spelled as a key event
+                _fields_ = [
+                    ("EventType", wintypes.WORD),
+                    ("bKeyDown", wintypes.BOOL),
+                    ("wRepeatCount", wintypes.WORD),
+                    ("wVirtualKeyCode", wintypes.WORD),
+                    ("wVirtualScanCode", wintypes.WORD),
+                    ("UnicodeChar", wintypes.WORD),
+                    ("dwControlKeyState", wintypes.DWORD),
+                ]
+
+            handle, dword = wintypes.HANDLE, wintypes.DWORD
+            flag, text = wintypes.BOOL, wintypes.LPCWSTR
+            address, count = wintypes.LPVOID, ctypes.POINTER(dword)
+            handles, records = ctypes.POINTER(handle), ctypes.POINTER(Record)
+            # A wrapper of its own, because ctypes.windll shares its
+            # prototypes with every caller. Each entry is the result type,
+            # then the arguments: an undeclared handle is cut to an int.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            for function, (restype, *argtypes) in {
+                "CreateFileW": (handle, text, dword, dword, address)
+                + (dword, dword, handle),
+                "CreateEventW": (handle, address, flag, flag, text),
+                "SetEvent": (flag, handle),
+                "CloseHandle": (flag, handle),
+                "GetConsoleMode": (flag, handle, count),
+                "SetConsoleMode": (flag, handle, dword),
+                "WaitForMultipleObjects": (dword, dword, handles, flag, dword),
+                "GetNumberOfConsoleInputEvents": (flag, handle, count),
+                "ReadConsoleInputW": (flag, handle, records, dword, count),
+            }.items():
+                prototype = getattr(kernel32, function)
+                prototype.restype, prototype.argtypes = restype, argtypes
+            self._kernel32 = kernel32
+            self._lock = threading.Lock()
+            self._closed = False
+            # GENERIC_READ | GENERIC_WRITE, shared, OPEN_EXISTING
+            conin = kernel32.CreateFileW(
+                "CONIN$", 0xC0000000, 0x3, None, 3, 0, None
+            )
+            if conin in (None, handle(-1).value):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._mode = dword()
+            if not kernel32.GetConsoleMode(conin, ctypes.byref(self._mode)):
+                kernel32.CloseHandle(conin)
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._conin = conin
+            self._wake = kernel32.CreateEventW(None, True, False, None)
+            self._waits = (handle * 2)(self._wake, conin)
+            self._records = (Record * 512)()
+            self._count = dword()
+            self._counted = ctypes.byref(self._count)
+            # No line input, echo, Ctrl+C signal or escape sequences: the
+            # mode msvcrt.getwch() reads in.
+            kernel32.SetConsoleMode(conin, 0)
+
+        def read(self) -> list[tuple[bool, int, int, int]] | None:
+            """Wait for input, then take every key event that waits in the
+            console as ``(down, vk, unit, state)``. ``None`` once
+            :meth:`stop` ran or the console is gone."""
+            kernel32, conin = self._kernel32, self._conin
+            count, counted, records = self._count, self._counted, self._records
+            # index 0 is the stop event, index 1 the console
+            if (
+                kernel32.WaitForMultipleObjects(
+                    2, self._waits, False, 0xFFFFFFFF
+                )
+                != 1
+            ):
+                return None
+            events = []
+            want = len(records)
+            while True:
+                if not kernel32.ReadConsoleInputW(
+                    conin, records, want, counted
+                ):
+                    return None
+                for idx in range(count.value):
+                    record = records[idx]
+                    if record.EventType == 1:  # KEY_EVENT
+                        events.append(
+                            (
+                                bool(record.bKeyDown),
+                                record.wVirtualKeyCode,
+                                record.UnicodeChar,
+                                record.dwControlKeyState,
+                            )
+                        )
+                # A call hands the GIL to a busy loop thread, and keys
+                # typed meanwhile join the batch: only a full buffer is
+                # worth a second call.
+                if count.value < len(records):
+                    return events
+                if not kernel32.GetNumberOfConsoleInputEvents(conin, counted):
+                    return None
+                want = min(count.value, len(records))
+                if not want:
+                    return events
+
+        def stop(self) -> None:
+            """Make :meth:`read` return ``None``, from any thread."""
+            with self._lock:
+                if not self._closed:
+                    self._kernel32.SetEvent(self._wake)
+
+        def close(self) -> None:
+            """Restore the console's input mode and release the handles."""
+            kernel32 = self._kernel32
+            with self._lock:
+                self._closed = True
+                kernel32.SetConsoleMode(self._conin, self._mode.value)
+                kernel32.CloseHandle(self._conin)
+                kernel32.CloseHandle(self._wake)
+
+    class WindowsKeyReader:
+        """Console reader thread -> key-name queue (Proactor-safe).
+
+        The Proactor loop cannot watch stdin, so a daemon thread waits on
+        the console and marshals decoded keys onto the loop.  Keys that
+        wait in the console together, as a paste does, reach the queue in
+        one loop callback and form one batch.
         """
 
         def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
             self._loop = loop
-            self._queue: "asyncio.Queue[str]" = asyncio.Queue()
-            self._stop = False
+            self._queue: "asyncio.Queue[list[str]]" = asyncio.Queue()
+            self._batch: Iterator[str] = iter(())
+            self._high = ""  # a high surrogate that waits for its pair
+            self._console: Any = None
+            with contextlib.suppress(Exception):  # no console: no keys
+                self._console = _WinConsole()
             self._thread = threading.Thread(
-                target=self._pump, name="tui-keys", daemon=True
+                target=self._pump,
+                args=(self._console,),
+                name="tui-keys",
+                daemon=True,
             )
             self._thread.start()
 
-        def _pump(self) -> None:
-            while not self._stop:
-                try:
-                    ch = msvcrt.getwch()
-                except Exception:  # noqa: BLE001 - no console: stop reading
-                    return
-                if ch in ("\x00", "\xe0"):
-                    code = msvcrt.getwch()
-                    name = _WIN_KEYS.get(code)
-                    if name is None:
-                        continue
-                elif ch == "\x1b":
-                    name = "esc"
-                elif ch < " " or ch == "\x7f":
-                    name = _decode_control(ch)
-                else:
-                    name = ch
-                try:
-                    self._loop.call_soon_threadsafe(
-                        self._queue.put_nowait, name
-                    )
-                except RuntimeError:  # loop already closed mid-exit
-                    return
+        def _pump(self, console: Any) -> None:
+            if console is None:
+                return
+            with contextlib.suppress(Exception):  # no console: stop reading
+                while (events := console.read()) is not None:
+                    keys = [
+                        key
+                        for event in events
+                        if (key := self._key(*event)) is not None
+                    ]
+                    if keys and not self._post(keys):
+                        break
+            with contextlib.suppress(Exception):
+                console.close()
+
+        def _key(
+            self, down: bool, vk: int, unit: int, state: int
+        ) -> str | None:
+            """The key for one key event. The two halves of a surrogate
+            pair make one key, and a half without its pair makes none."""
+            key = _win_key(down, vk, unit, state)
+            if key is None:
+                return None
+            high, self._high = self._high, ""
+            if "\ud800" <= key <= "\udbff":
+                self._high = key
+                return None
+            if "\udc00" <= key <= "\udfff":
+                if not high:
+                    return None
+                return chr(
+                    0x10000
+                    + ((ord(high) - 0xD800) << 10)
+                    + (ord(key) - 0xDC00)
+                )
+            return key
+
+        def _post(self, keys: list[str]) -> bool:
+            """Hand ``keys`` to the loop; ``False`` once the loop is closed."""
+            try:
+                self._loop.call_soon_threadsafe(self._enqueue, keys)
+            except RuntimeError:  # loop already closed mid-exit
+                return False
+            return True
+
+        def _enqueue(self, keys: list[str]) -> None:
+            self._queue.put_nowait(keys)
 
         async def get(self) -> str:
-            return await self._queue.get()
+            key = self.get_nowait()
+            while key is None:
+                self._batch = iter(await self._queue.get())
+                key = next(self._batch, None)
+            return key
+
+        def get_nowait(self) -> str | None:
+            key = next(self._batch, None)
+            if key is None and not self._queue.empty():
+                self._batch = iter(self._queue.get_nowait())
+                key = next(self._batch, None)
+            return key
+
+        def drop_batch(self) -> None:
+            """Discard the keys that arrived with the key last taken."""
+            self._batch = iter(())
 
         def close(self) -> None:
-            self._stop = True
+            if self._console is not None:
+                self._console.stop()
+                # the thread restores the console's input mode as it ends
+                self._thread.join(1)
 
 
 class Term:
@@ -2007,6 +2331,11 @@ class Term:
         self._last_rows: list[str] = []
         self._last_size = (0, 0)
 
+    #: A POSIX terminal marks each paste while the dashboard holds it. The
+    #: Windows console delivers no paste markers to a reader of key events.
+    _PASTE_ON = "" if IS_WINDOWS else PASTE_ON
+    _PASTE_OFF = "" if IS_WINDOWS else PASTE_OFF
+
     # ---- lifecycle ---------------------------------------------------
     def enter(self) -> None:
         if sys.platform == "win32":  # pragma: no cover (windows)
@@ -2015,11 +2344,11 @@ class Term:
             fd = sys.stdin.fileno()
             self._saved = termios.tcgetattr(fd)
             tty.setraw(fd, termios.TCSADRAIN)
-        self._write(ALT_SCREEN_ON + CURSOR_HIDE + CLEAR)
+        self._write(ALT_SCREEN_ON + CURSOR_HIDE + CLEAR + self._PASTE_ON)
         self.flush()
 
     def exit(self) -> None:
-        self._write(RESET + ALT_SCREEN_OFF + CURSOR_SHOW)
+        self._write(self._PASTE_OFF + RESET + ALT_SCREEN_OFF + CURSOR_SHOW)
         self.flush()
         if sys.platform != "win32" and self._saved is not None:
             termios.tcsetattr(
@@ -2074,7 +2403,15 @@ class Term:
         self.flush()
 
     def _write(self, data: str) -> None:
-        self._out.write(data)
+        try:
+            self._out.write(data)
+        except UnicodeEncodeError:
+            # the stream's encoding lacks a character, or the text holds
+            # half a surrogate pair: "?" stands in
+            encoding = getattr(self._out, "encoding", None) or "utf-8"
+            self._out.write(
+                data.encode(encoding, "replace").decode(encoding, "replace")
+            )
 
     def flush(self) -> None:
         with contextlib.suppress(Exception):
@@ -2133,6 +2470,9 @@ class ScriptedKeys:
 
     async def get(self) -> str:
         return await self.queue.get()
+
+    def get_nowait(self) -> str | None:
+        return _queued_key(self.queue)
 
     def close(self) -> None:
         pass
@@ -2997,6 +3337,14 @@ class App:
         self.status_filter = "all"
         self.sort_key = "name"
         self.sort_dir = 1
+        # filter edits the input loop holds for one view rebuild (see
+        # _input_loop): the editing keys in order, and the filter text
+        # before the first of them
+        self._filter_hold = False
+        self._filter_typed: list[str] = []
+        self._filter_base = ""
+        # what self.view was built from, by the last recompute_view
+        self._view_built: _ViewBuilt | None = None
 
         # ---- surfaces ----
         self.open_overlays: list[str] = []  # stack, last = topmost
@@ -3284,23 +3632,105 @@ class App:
         # the aggregates fold rides along: every path that swaps or
         # reshapes the job data ends in a recompute_view
         self._refresh_job_aggregates()
-        keep = None
-        current = self.selected_job()
-        if current is not None:
-            keep = current.get("name")
-        self.view = compute_view(
-            self.jobs,
-            self.filter_text,
-            self.status_filter,
-            self.sort_key,
-            self.sort_dir,
+        typed, self._filter_typed = self._filter_typed, []
+        if typed:
+            self.view, self.sel = self._retype_filter(typed)
+        else:
+            self.view, self.sel = self._filter_step(
+                self.view, None, self.sel, self.filter_text
+            )
+        self._view_built = _ViewBuilt(
+            jobs=self.jobs,
+            status_filter=self.status_filter,
+            sort_key=self.sort_key,
+            sort_dir=self.sort_dir,
+            filter_text=self.filter_text,
+            view=self.view,
         )
+
+    def _filter_step(
+        self,
+        view: list[dict[str, Any]],
+        needle: str | None,
+        sel: int,
+        text: str,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """The view for filter ``text`` and the row selected in it, given
+        the ``view`` and the row ``sel`` before the change.
+
+        The selection follows its job by name and keeps its row number
+        when the job leaves the view. ``needle`` is the lowercased filter
+        text whose matches ``view`` holds under the current jobs, sort
+        and status segment, or ``None``. A text that contains ``needle``
+        filters ``view`` and skips the sort.
+        """
+        current = view[min(sel, len(view) - 1)] if view else None
+        keep = current.get("name") if current is not None else None
+        want = text.strip().lower()
+        if needle is not None and needle in want:
+            view = [job for job in view if _filter_admits(job, want)]
+        else:
+            view = compute_view(
+                self.jobs,
+                text,
+                self.status_filter,
+                self.sort_key,
+                self.sort_dir,
+            )
         if keep is not None:
-            for idx, job in enumerate(self.view):
+            for idx, job in enumerate(view):
                 if job.get("name") == keep:
-                    self.sel = idx
+                    sel = idx
                     break
-        self.sel = max(0, min(self.sel, max(0, len(self.view) - 1)))
+        return view, max(0, min(sel, max(0, len(view) - 1)))
+
+    def _retype_filter(
+        self, typed: list[str]
+    ) -> tuple[list[dict[str, Any]], int]:
+        """The view and the selected row after the editing keys ``typed``
+        that the input loop held, as one rebuild per key leaves them.
+
+        The selected row depends on every intermediate filter (see
+        :meth:`_filter_step`), so the edits are taken in order. An edit
+        whose filter still admits the selected job builds no view until a
+        later edit drops the job or the run ends.
+        """
+        built = self._view_built
+        view, sel = self.view, self.sel
+        needle = None
+        if (
+            built is not None
+            and built.jobs is self.jobs
+            and built.status_filter == self.status_filter
+            and built.sort_key == self.sort_key
+            and built.sort_dir == self.sort_dir
+            and built.view is view
+        ):
+            needle = built.filter_text.strip().lower()
+        text = self._filter_base
+        owed: str | None = None
+        for key in typed:
+            text = _edit_text(text, key) or ""
+            if needle is not None and view:
+                job = view[min(sel, len(view) - 1)]
+                if job.get("name") is not None and _filter_admits(
+                    job, text.strip().lower()
+                ):
+                    owed = text
+                    continue
+            if owed is not None:
+                view, sel = self._filter_step(view, needle, sel, owed)
+                needle, owed = owed.strip().lower(), None
+            view, sel = self._filter_step(view, needle, sel, text)
+            needle = text.strip().lower()
+        if owed is not None:
+            view, sel = self._filter_step(view, needle, sel, owed)
+        return view, sel
+
+    def _settle_view(self) -> None:
+        """Rebuild the view for the filter edits the input loop holds."""
+        if self._filter_typed:
+            self.recompute_view()
 
     def stale(self) -> bool:
         """Wallboard NO-SIGNAL rule: data older than max(15s, 2 polls)."""
@@ -3672,14 +4102,49 @@ class App:
 
     async def _input_loop(self) -> None:
         while not self.quit:
-            key = await self.keys.get()
-            self.last_key_mono = time.monotonic()
-            if self.zen_on:  # any key wakes zen without acting
-                self.zen_on = False
-                self.mark()
-                continue
-            await self.handle_key(key)
-            self.mark()
+            key: str | None = await self.keys.get()
+            # Keys that are queued together, as a paste is, are handled
+            # in one pass. The filter edits among them share one view
+            # rebuild: handle_key runs it before any other key acts, and
+            # the pass ends with it, so every other key, the next frame
+            # and the next poll read the view for the text typed so far.
+            self._filter_hold = True
+            try:
+                while key is not None and not self.quit:
+                    self.last_key_mono = time.monotonic()
+                    if self.zen_on:  # any key wakes zen without acting
+                        self.zen_on = False
+                    else:
+                        held = self.focus
+                        await self.handle_key(key)
+                        if held is not None and self.focus != held:
+                            self._drop_paste_tail()
+                    self.mark()
+                    take = getattr(self.keys, "get_nowait", None)
+                    key = take() if take is not None else None
+            finally:
+                self._filter_hold = False
+            self._settle_view()
+
+    def _drop_paste_tail(self) -> None:
+        """Discard the keys that reached the key source together with a
+        key that took the focus out of a text field. A source that marks
+        no paste, as the Windows console, delivers a pasted line break,
+        tab or escape as that key, and the keys behind it are the rest of
+        the paste."""
+        drop = getattr(self.keys, "drop_batch", None)
+        if drop is not None:
+            drop()
+
+    def _edits_filter(self, key: str) -> bool:
+        """Whether ``key`` edits the filter box. :meth:`handle_key` routes
+        on this test, so it is the one definition of a filter edit."""
+        return (
+            self.focus == "filter"
+            and not self.booting
+            and not self.is_open("palette")
+            and _edit_text("", key) is not None
+        )
 
     async def _paint_loop(self) -> None:
         while not self.quit:
@@ -3721,7 +4186,11 @@ class App:
         # launches a 40-request burst; the stale card just survives until
         # the next window.
         try:
-            data = await self.api.get_json("/activity")
+            # jobs and sort ask for the rows render_heat draws: the
+            # first HEAT_MAX_JOBS by name
+            data = await self.api.get_json(
+                "/activity?jobs=%d&sort=name" % HEAT_MAX_JOBS
+            )
         except ApiError as exc:
             return exc.status != 404
         except Exception:  # noqa: BLE001 - transient; keep the stale card
@@ -3731,11 +4200,11 @@ class App:
             # wholesale replacement, so the fan-out path's prune of
             # removed names is implicit here and _heat_parsed's orphan
             # sweep covers the shrinkage. Capped like the fan-out and the
-            # web card: /activity is uncapped in JOBS, so a fleet-scale
-            # daemon would otherwise hand every refresh a row list per
-            # job, all but HEAT_MAX_JOBS of them never drawn. Selected in
-            # the order render_heat draws, so the retained set is the set
-            # the user can actually reach.
+            # web card: a daemon that predates the jobs parameter ignores
+            # it and answers with a row list for every job, all but
+            # HEAT_MAX_JOBS of them never drawn. Selected in the order
+            # render_heat draws, so the retained set is the set the user
+            # can actually reach.
             names = sorted(str(name) for name in jobs)[:HEAT_MAX_JOBS]
             self.heat_data = {
                 name: (jobs[name] if isinstance(jobs.get(name), list) else [])
@@ -3766,11 +4235,13 @@ class App:
         # the web page's cap, and the same selection the batched path
         # makes, so the two agree on WHICH jobs the card retains
         ordered = sorted(self.jobs, key=lambda j: str(j.get("name", "")))
-        await asyncio.gather(*(fetch(j) for j in ordered[:HEAT_MAX_JOBS]))
-        # a job removed (or renamed) by a reload never refreshes its
-        # entry again; without this prune a long session with name
-        # churn accretes one dead run-list payload per old name.
-        for stale in [k for k in self.heat_data if k not in self.by_name]:
+        chosen = ordered[:HEAT_MAX_JOBS]
+        await asyncio.gather(*(fetch(j) for j in chosen))
+        # Only the names selected above stay: a job that left the
+        # configuration or the first HEAT_MAX_JOBS never refreshes its
+        # entry.
+        keep = {job.get("name", "") for job in chosen}
+        for stale in [k for k in self.heat_data if k not in keep]:
             del self.heat_data[stale]
 
     def _pressure_entries(self) -> list[ScheduleEntry]:
@@ -5106,13 +5577,18 @@ class AppPalette(AppActions):
 # ===================================================================
 class AppKeys(AppPalette):
     async def handle_key(self, key: str) -> None:
-        """One key press.  Structure and guards mirror the web page's
-        single keydown handler: palette submode first, then the palette
-        chord (global, except on the wallboard), Esc (closes the top
-        overlay), focused-field editing, ``w``/``a`` (list or wallboard,
-        never in overlays), overlay-local keys (over the list or the
-        wallboard), and finally the list keys, which the wallboard
-        leaves inert."""
+        """One key press.  A filter edit goes to the filter box, and
+        every other key acts on the view for the text typed so far.
+        Structure and guards for those keys mirror the web page's single
+        keydown handler: palette submode first, then the palette chord
+        (global, except on the wallboard), Esc (closes the top overlay),
+        focused-field editing, ``w``/``a`` (list or wallboard, never in
+        overlays), overlay-local keys (over the list or the wallboard),
+        and finally the list keys, which the wallboard leaves inert."""
+        if self._edits_filter(key):
+            self._edit_input("filter", key)
+            return
+        self._settle_view()
         if key == "ctrl+c":
             self.quit = True
             return
@@ -5138,6 +5614,12 @@ class AppKeys(AppPalette):
         if self.focus is not None:
             await self._input_key(self.focus, key)
             return
+        if isinstance(key, _Pasted):
+            # pasted text is no hotkey: past this point only an overlay
+            # that is itself a text input takes it
+            top = self.top_overlay()
+            if top is None or INPUT_HOMES.get(top) != top:
+                return
         if key in ("w", "a") and not self.open_overlays:
             if key == "w":
                 self.set_wallboard(not self.wallboard)
@@ -5265,19 +5747,20 @@ class AppKeys(AppPalette):
         return None
 
     def _edit_input(self, name: str, key: str) -> None:
-        buf = self.inputs[name]
-        if key == "backspace":
-            buf = buf[:-1]
-        elif key == "ctrl+u":
-            buf = ""
-        elif len(key) == 1 and key >= " ":
-            buf += key
-        else:
+        before = self.inputs[name]
+        buf = _edit_text(before, key)
+        if buf is None:
             return
         self.inputs[name] = buf
         if name == "filter":
             self.filter_text = buf
-            self.recompute_view()
+            if self._filter_hold:
+                # the input loop rebuilds the view for the whole run
+                if not self._filter_typed:
+                    self._filter_base = before
+                self._filter_typed.append(key)
+            else:
+                self.recompute_view()
         if name == "logsearch":
             self._log_search_recompute(reset=True)
         self.mark()
@@ -9296,19 +9779,26 @@ def dispatch(args: Any) -> int:
             keys = WindowsKeyReader(loop)
         else:  # pragma: no cover (posix) - PosixKeyReader
             keys = PosixKeyReader(loop, sys.stdin.fileno())
-        app = TuiApp(
-            Api(str(args.url), token, ssl_context),
-            Term(),
-            keys,
-            prefs,
-            start_wallboard=bool(getattr(args, "tv", False)),
-            start_job=getattr(args, "job", None),
-            boot=boot,
-        )
         try:
-            await app.run()
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            pass
+            app = TuiApp(
+                Api(str(args.url), token, ssl_context),
+                Term(),
+                keys,
+                prefs,
+                start_wallboard=bool(getattr(args, "tv", False)),
+                start_job=getattr(args, "job", None),
+                boot=boot,
+            )
+            try:
+                await app.run()
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                pass
+        finally:
+            # The Windows reader holds the console in raw input mode until
+            # it closes, and App.run closes it only when its own cleanup
+            # gets that far.
+            with contextlib.suppress(Exception):
+                keys.close()
         return 0
 
     try:

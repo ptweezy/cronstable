@@ -74,6 +74,28 @@ let
           license = pkgs.lib.licenses.mit;
         };
       };
+
+  # aiohttp 3.14.4 depends on this release.
+  yarl =
+    let
+      version = "1.25.1";
+    in
+    if pkgs.lib.versionAtLeast pkgs.python3Packages.yarl.version version then
+      pkgs.python3Packages.yarl
+    else
+      pkgs.python3Packages.yarl.overridePythonAttrs (old: {
+        inherit version;
+        src = pkgs.fetchFromGitHub {
+          owner = "aio-libs";
+          repo = "yarl";
+          tag = "v${version}";
+          hash = "sha256-cQsVglP3OqaQW95OYPlbWCFTs5p6L5wOzx7QCIqqJ9U=";
+        };
+        doCheck = false;
+        meta = old.meta // {
+          changelog = "https://github.com/aio-libs/yarl/blob/v${version}/CHANGES.rst";
+        };
+      });
 in
 pkgs.python3Packages
 // {
@@ -108,6 +130,37 @@ pkgs.python3Packages
         doCheck = false;
         meta = old.meta // {
           changelog = "https://github.com/pypa/setuptools-scm/blob/setuptools-scm-v${version}/setuptools-scm/CHANGELOG.md";
+        };
+      });
+  # aiohttp propagates yarl, so the override builds on the yarl above.
+  aiohttp =
+    let
+      version = "3.14.4";
+    in
+    if pkgs.lib.versionAtLeast pkgs.python3Packages.aiohttp.version version then
+      pkgs.python3Packages.aiohttp
+    else
+      (pkgs.python3Packages.aiohttp.override { inherit yarl; }).overridePythonAttrs (old: {
+        inherit version;
+        src = pkgs.fetchFromGitHub {
+          owner = "aio-libs";
+          repo = "aiohttp";
+          tag = "v${version}";
+          hash = "sha256-ArlEDpuUQJ6Ueup7tL9H1Nd3/TgajMaHtg4pJiSGOy8=";
+        };
+        # The nixpkgs postPatch edits pytest settings in setup.cfg, which
+        # this release keeps in pytest.ini. Keep its build steps only.
+        postPatch = ''
+          rm -r vendor
+          patchShebangs tools
+          touch .git  # tools/gen.py uses .git to find the project root
+
+          substituteInPlace Makefile \
+            --replace-fail "cythonize: .install-cython" "cythonize:"
+        '';
+        doCheck = false;
+        meta = old.meta // {
+          changelog = "https://docs.aiohttp.org/en/v${version}/changes.html";
         };
       });
   sentry-sdk =

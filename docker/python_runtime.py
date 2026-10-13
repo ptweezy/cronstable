@@ -5,8 +5,8 @@ python-build-standalone; other systems compile the same CPython release. The
 prefix's python-path file is written only after the runtime passes its probes.
 Baseline mode records the calling interpreter and downloads nothing.
 
-Pins: https://github.com/astral-sh/python-build-standalone/releases/tag/20260814
-      https://www.python.org/downloads/release/python-3147/
+Pins: https://github.com/astral-sh/python-build-standalone/releases/tag/20261009
+      https://www.python.org/downloads/release/python-3148/
 """
 
 import argparse
@@ -27,17 +27,19 @@ import urllib.request
 from pathlib import Path
 
 # TODO: Move the release binaries and Docker images to CPython 3.15 when
-# Docker Hub publishes final `python:3.15-*` images, isal publishes cp315
-# wheels, and orjson publishes cp315 wheels that keep the binaries' glibc
-# 2.17 floor. The other interpreter pins are in docker/images.toml,
-# pyinstaller/Dockerfile, and the binaries jobs in
+# Docker Hub publishes final `python:3.15-*` images and isal publishes cp315
+# wheels. The orjson cp315 glibc wheels require glibc 2.39 or later, so on
+# 3.15 the binaries built on an older glibc compile orjson from source
+# through RUST_SETUP (pyinstaller/install_orjson.sh). The glibc armv7 row
+# sets no RUST_SETUP and uses stdlib json. The other interpreter pins are in
+# docker/images.toml, pyinstaller/Dockerfile, and the binaries jobs in
 # .github/workflows/release.yml.
-VERSION = "3.14.7"
-SOURCE_SHA = "3b48dac8fb59f62eaa67ac83c1eb12bda1b7a08406dd286e252c11a66be27f81"
-PBS_RELEASE = "20260814"
+VERSION = "3.14.8"
+SOURCE_SHA = "c2215904f02b175596dc49351585104f4bc20341e1c47378b26a2c274360ce73"
+PBS_RELEASE = "20261009"
 PBS_SHA = {
-    "gnu": "8fc4a6bd7422364d815844616de31bfb5c38743815810fd9a8a4bc278684f6fc",
-    "musl": "12656d3adb74e2dfbbc7f411707cad30e6fd89e19ffd3a6579dd0770f054bd42",
+    "gnu": "37f748ae662fb29f7716242ea214ac7cd64cbea545eab4eb2de16ab0b1447e68",
+    "musl": "18b8ed1e8e737b432ca783d40c8a9be49bb71aa3827004ed935cdc95705464c9",
 }
 MARCH = "-march=x86-64-v3"
 

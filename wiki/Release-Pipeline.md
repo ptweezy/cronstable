@@ -263,7 +263,7 @@ Installing the package under `SETUPTOOLS_SCM_PRETEND_VERSION` before running PyI
 
 ### Building a binary locally
 
-`pyinstaller/Dockerfile` builds a glibc binary reproducibly on `ubuntu:26.04`. It installs build deps, uses `pyenv` to install CPython `3.14.7` (the release the CI lanes freeze) with `--enable-shared`, creates a venv, installs PyInstaller from `pyinstaller/build-requirements.txt` and the package with **uv** (copied in with `COPY --from=ghcr.io/astral-sh/uv`), runs the entry script (`python pyinstaller/cronstable --version`), runs `pyinstaller pyinstaller/cronstable.spec`, and smoke-tests `dist/cronstable --version`. This amd64-only local build makes the image-copy pattern arch-safe here, unlike the multi-arch release `Dockerfile`.
+`pyinstaller/Dockerfile` builds a glibc binary reproducibly on `ubuntu:26.04`. It installs build deps, uses `pyenv` to install CPython `3.14.8` (the release the CI lanes freeze) with `--enable-shared`, creates a venv, installs PyInstaller from `pyinstaller/build-requirements.txt` and the package with **uv** (copied in with `COPY --from=ghcr.io/astral-sh/uv`), runs the entry script (`python pyinstaller/cronstable --version`), runs `pyinstaller pyinstaller/cronstable.spec`, and smoke-tests `dist/cronstable --version`. This amd64-only local build makes the image-copy pattern arch-safe here, unlike the multi-arch release `Dockerfile`.
 
 `pyinstaller/Makefile` wraps that: `make` (target `all`) builds the image, copies `dist/cronstable` out of the container, and runs `dist/cronstable --version`.
 

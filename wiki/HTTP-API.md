@@ -34,9 +34,40 @@ preview's `planToken`. With [scoped tokens](#scoped-tokens-webauthtokens),
 execution also needs the `params` scope when a source run stores
 [run parameter](Orchestration-and-DAGs#run-parameters) values other than the
 declared defaults. See [workflow recovery](Workflow-Recovery) for request
-fields and conflict handling. A pooled job's start endpoint returns `202`
-with its queue ID; see [resource pools](Resource-Pools). Completed run history
-includes [verification results](Result-Verification) when configured.
+fields and conflict handling. Both recovery endpoints answer `503` with
+`recovery state is unavailable` when the state store cannot answer: the
+configured store has not started, a store operation fails or times out, or a
+record or document cannot be read. A fault in the lease file of a source run
+is the exception: an execution answers `409` with
+`source run is busy; retry shortly` until the fault clears. A daemon whose
+configuration has no `state` section has no workflow and no store to wait
+for. On such a daemon
+the single-run endpoint answers `409` with `workflow run not found`, and the
+date-range endpoint answers `409` with `workflow not found`.
+
+A pooled job's start endpoint returns `202` with its queue ID; see
+[resource pools](Resource-Pools). `GET /pools`, the queue cancel endpoint,
+and the start endpoint of a pooled job answer `503` with
+`pool state is unavailable` when pool state cannot be read or written: the
+configured store has not started, a store operation fails with an I/O error
+or takes longer than 5 seconds, or a pool document cannot be read (a damaged
+body or an unknown schema version). A refusal by a pool that answers is a
+`409` with the pool's own message:
+
+- The start endpoint refuses with `pool queue is full`,
+  `pool is draining before a capacity change`, or
+  `pool state requires reliable exclusive locks`. A disabled job is a `409`
+  as well.
+- The queue cancel endpoint refuses with `queue entry not found` or
+  `only waiting entries can be cancelled`. On a daemon whose configuration
+  has no `state` section, it answers `409` with `unknown pool '<name>'`.
+
+`GET /pools` on a daemon with no pools answers `200` with `[]`. `GET /jobs`
+and `GET /jobs/{name}` answer `200` while pool state is unavailable and flag
+each pooled job (see the `pool` field under [`GET /jobs`](#get-jobs)).
+
+Completed run history includes
+[verification results](Result-Verification) when configured.
 
 ### Listener configuration
 
@@ -567,7 +598,9 @@ changes.
 
 Launches the named job immediately, regardless of its schedule. `{name}` is the
 job's `name`. Success answers `{"started": "<name>"}` (the `cron_run_job`
-[MCP tool](MCP)'s ack shape).
+[MCP tool](MCP)'s ack shape). For a job in a
+[resource pool](Resource-Pools), [Enabling the API](#enabling-the-api) gives
+the `202`, `409`, and `503` answers.
 
 The `409` for a disabled job is deliberate: a disabled job behaves as if it is
 not there, so the API refuses to launch it manually rather than overriding the
@@ -626,16 +659,39 @@ The daemon cancels instances concurrently, so a job with several running
 instances costs at most one `killTimeout`, not one per instance. A job with no
 running instance is a `409`; success answers
 `{"cancelled": "<name>", "instances": <count>}` (the `cron_cancel_job`
-[MCP tool](MCP)'s ack shape).
+[MCP tool](MCP)'s ack shape). `instances` is the number of instances that the
+daemon asked to stop. An instance that has ended is not running: the daemon
+has collected its exit status and captured output and has finished any
+verification, has finished canceling it, or could not start its command
+(see [concurrency policy](Concurrency-and-Timeouts#concurrency-policy)). The
+request neither signals nor counts such an instance, and the run keeps the
+outcome that it ended with. An instance whose command exits by itself before
+the daemon has collected it is counted, and its run is recorded as
+`cancelled` with the command's own exit code.
+
+A request that arrives while an instance's
+[verification check](Result-Verification) runs terminates the check. The
+instance has ended when the daemon has finished canceling the check, even
+while a process that the check started holds the check's output open. A
+second request then answers `409` with `job '<name>' is not running`. When
+the first request arrives before the check has a process, the instance keeps
+running until the daemon has terminated the check, right after the check
+starts.
 
 A run cancelled this way is recorded in the job's history with the outcome
 `cancelled`. Cancellation is a deliberate operator action, not a job failure,
 so it is **not** reported (`onFailure` does not fire) and does **not** trigger
-retries. It also ends the job's
-[retry sequence](Failure-Detection-and-Retries#retry-lifecycle), with one
-exception: the run of a manual start that supplied
+retries. Recording the canceled run ends the job's retry sequence by the
+rule that a success follows: a scheduled run that started beside the
+canceled run keeps its retries until it has scheduled one (see
+[retry lifecycle](Failure-Detection-and-Retries#retry-lifecycle)). The run of
+a manual start that supplied
 [run parameter](Commands-and-Environment#params) values is outside the
-sequence, so its cancellation leaves a pending retry in place.
+sequence, so its cancellation leaves a pending retry in place. When a
+process that the job or its verification check started holds captured output
+open after the cancel, the daemon records the run within the bound that
+[cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout)
+describes.
 
 ### `POST /jobs/{name}/pause`
 
@@ -700,7 +756,7 @@ the endpoint the [web dashboard](Web-Dashboard) polls.
 | `priority` | Present only when the job sets a non-default [scheduling priority](Commands-and-Environment#priority): one of `idle`, `below-normal`, `above-normal`, `high`. A job at the default level (`normal`, the one level never applied) carries no key. |
 | `clusterPolicy`, `clusterOwner` | Present only when leader election is configured: the job's [cluster policy](Clustering-and-Leader-Election#per-job-policy), and, under `distribution: spread` for leader-gated jobs, the node that owns the job (`null` when there is no quorum). |
 | `verification` | Present only when the job configures [result verification](Result-Verification): `{configured, running}`, where `running` says whether verification of a running instance is in progress. |
-| `pool` | Present only when the job belongs to a [resource pool](Resource-Pools): `{name, slots, priority}`, plus `queued` (the job's waiting entries, in queue order), or `queueUnavailable: true` when the pool state cannot be read. |
+| `pool` | Present only when the job belongs to a [resource pool](Resource-Pools): `{name, slots, priority}`, plus `queued` (the job's waiting entries, in queue order). When pool state cannot be read or written (the cases where `GET /pools` answers `503`; see [Enabling the API](#enabling-the-api)), the response is still a `200`, and the `pool` object of each pooled job carries `queueUnavailable: true` and no `queued` list. |
 
 ```shell
 $ http get http://127.0.0.1:8080/jobs
@@ -758,7 +814,12 @@ the whole retained window regardless of `limit`.
 always finish order. The array is never re-ordered at read time: after a
 restart the ring is rebuilt in finish order and then grows in completion
 order, so on a shared mount a peer's interleaved append can put an older run
-later, and a crash-reconciled row stands where its interrupted run began. The
+later, and a crash-reconciled row stands where its interrupted run began. A
+canceled or timed-out run whose captured output a surviving process holds
+open is recorded when that output closes or its
+[drain bound](Concurrency-and-Timeouts#cancellation-and-killtimeout) ends,
+so a run of the same job that started after it ended can stand before it.
+The newer run stays the job's `last_run` in `GET /jobs`. The
 `stats` block's `last_*` fields do fold by finish time.
 
 Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
@@ -775,6 +836,17 @@ is `null` unless the job opted into
 [`monitorResources`](Resource-Monitoring), in which case it is
 `{cpu_user_seconds, cpu_system_seconds, cpu_total_seconds, max_rss_bytes,
 samples}` for that run.
+
+For a run that the daemon records as `success`, `failure`, or `cancelled`,
+`finished_at` is the instant the run ended: when the daemon had collected
+its exit status and captured output and finished any verification, or when
+the daemon finished canceling the run (an operator cancel, an
+`executionTimeout`, or a cancel during verification). It is never later than
+the instant the daemon recorded the run, which is also the `finished_at` of
+a run whose command could not start. `duration` is `finished_at` minus
+`started_at`, so it excludes the time the daemon then waits for captured
+output that a surviving process holds open (see
+[cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout)).
 
 Besides `success`, `failure`, and `cancelled`, `outcome` can be `unknown`: a
 crash-reconciled run, recorded when the daemon exited or lost the
@@ -810,6 +882,26 @@ per-job fan-out, and one built response is shared across every viewer polling
 it (with `ETag` / `If-None-Match` and gzip, like `GET /jobs`). An optional
 `?limit=` query caps the runs per job (newest kept, clamped to the retained
 window; the default serves the whole window).
+
+The response carries every job by default, so its size grows with the fleet.
+Two optional query parameters cap the job set for a client that draws a
+bounded number of rows:
+
+| Parameter | Meaning |
+| --- | --- |
+| `jobs=N` | Return at most `N` jobs. `N` is an integer of at least 1; a lower value counts as 1, and a value that is not an integer returns every job. |
+| `sort=name` | Select the `N` jobs in ascending job-name order (code point order). Without `sort`, the selection is the first `N` jobs in configuration order, the order [`GET /jobs`](#get-jobs) lists them. Any other `sort` value returns `400 Bad Request`. |
+
+`sort` selects jobs for a `jobs` cap and has no effect without one. A capped
+response carries its own `ETag` and supports `If-None-Match` and gzip.
+Viewers that send the same `jobs` and `sort` values share one built response,
+and a `jobs` value that covers every job returns the shared default response.
+The daemon builds the response for each request that sets `limit` below the
+retained window. It holds a shared response for up to eight pairs with `jobs`
+at most 256. When more pairs are in use, the least recently requested one
+gives up its place and is built again on its next request. For a larger cap
+that leaves jobs out, the daemon builds the response for each request. For
+example, `GET /activity?jobs=80&sort=name` returns the first 80 jobs by name.
 
 ### `GET /jobs/{name}/resources`
 
@@ -1132,8 +1224,34 @@ values, and `existingRunKeys` names it. A non-empty `params` object needs the
 that is unknown or has no schedule, on an unknown body field, and on refused
 parameters, which add
 `paramErrors` as the trigger route does. `403` when the body has a non-empty
-`params` object and the token lacks `params`. A backfill that cannot be
-durably recorded (the state backend is unavailable) is a `500`.
+`params` object and the token lacks `params`.
+
+The route answers `503` with `backfill state is unavailable` when the state
+store cannot answer:
+
+- The configured store has not started. The answer is the same for a valid
+  range, a bad range, a workflow absent from the configuration, and a
+  workflow with no schedule, because the request is not validated without a
+  store. The request writes nothing.
+- A store operation of the backfill fails with an I/O error, takes longer
+  than 10 seconds, or meets a run document that it cannot read, or the state
+  store stops during the request, as on a reload of the `state` section.
+  The runs written before the fault stay, a write that timed out can still
+  land, and the same request then answers `200` and counts those runs in
+  `existing`. A run
+  document in the range that is damaged on disk gives this `503` on every
+  request until the document is repaired or removed. For an I/O error, a
+  timeout, or an unreadable run document, the daemon logs one warning for
+  each request from logger `cronstable.dagrun`: `dag <workflow>: backfill is
+  unavailable at the run for <instant>: <cause>`. `<instant>` is the
+  scheduled instant of the run at which the request stopped, with the UTC
+  offset of `from` (`+00:00` when `from` has none). `<cause>` is the
+  parser's or the operating system's text,
+  `unknown-schema-or-not-a-document` for an unknown schema version, or
+  `TimeoutError` for a timeout.
+
+On a daemon whose configuration has no `state` section, the route answers
+`400` with `scheduled workflow not found`.
 
 #### `POST /dags/{name}/runs/{run_key}/tasks/{taskkey}/decision`
 
@@ -1397,7 +1515,9 @@ Serves the single-page [web dashboard](Web-Dashboard). Set `ui: false` in the
 `web` section to disable the page and expose only the REST endpoints. The page
 is served with secure default headers (a strict Content-Security-Policy,
 anti-clickjacking, and nosniff) with any operator `web.headers` merged on top,
-so a deliberately-set operator header wins.
+so a deliberately-set operator header wins. The page carries an `ETag`, and a
+request whose `If-None-Match` header matches it gets `304 Not Modified`. A
+client that accepts gzip receives the page compressed.
 
 When `web.authToken` is enabled, the page itself loads without a token (it
 holds no data). It prompts for the token in the browser and authenticates

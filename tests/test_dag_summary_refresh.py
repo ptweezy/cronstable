@@ -139,14 +139,14 @@ async def test_new_generation_refresh_keeps_older_reads_out_of_caches(
         body["state"] = dag.SUCCESS
         return body, None
 
-    await scheduler._mutate("xc", "r1", finish)
+    finished, _ = await scheduler._mutate("xc", "r1", finish)
     entered = asyncio.Event()
     release = asyncio.Event()
     read_op = "list_documents" if bulk else "read_document"
     real_read = getattr(backend, read_op)
 
-    async def gated_read(*args):
-        body = await real_read(*args)
+    async def gated_read(*args, **kwargs):
+        body = await real_read(*args, **kwargs)
         if not entered.is_set():
             entered.set()
             await release.wait()
@@ -156,7 +156,9 @@ async def test_new_generation_refresh_keeps_older_reads_out_of_caches(
     older = asyncio.create_task(scheduler._run_summaries(backend, "xc"))
     try:
         await asyncio.wait_for(entered.wait(), 5)
-        await scheduler._delete_run(backend, "xc", "r1", None)
+        await scheduler._delete_run_batch(
+            backend, "xc", [("r1", None, finished["createdAt"])]
+        )
         await _mint_run(cron, "r1")
         fresh = await asyncio.wait_for(
             scheduler._run_summaries(backend, "xc"), 5

@@ -75,7 +75,7 @@ DEFAULT_SHELL = "" if IS_WINDOWS else "/bin/sh"
 
 # --- Default config location (the ``-c`` default) -------------------------
 #: File names a configuration directory can be loaded from, kept in step
-#: with the filter in :func:`cronstable.config._parse_config_dir` (YAML by
+#: with the filter in :func:`cronstable.config._config_dir_entries` (YAML by
 #: extension, classic crontabs by the markers in
 #: :func:`cronstable.crontabs.is_crontab_path`).  Duplicated rather than
 #: imported because this module resolves the default at import time and has
@@ -454,17 +454,21 @@ async def kill_process_group(pid: int, *, force: bool) -> bool:
     rather than the pid is what reaches an orphaned descendant, and it keeps
     working after the leader itself has exited.
 
-    Nothing here can address an unrelated group on either platform, but
-    they rule that out by different means.  POSIX does it through the group
-    itself: one lives as long as any member does, and the kernel will not
-    recycle a pid still in use as a pgid.  Windows reserves nothing once
-    the root exits, and what rules out a recycled id there is asyncio
-    holding the child's process handle open until it reaps the child, since
-    Windows frees a pid for reuse only after the last handle to it closes.
-    The caller's contract is therefore narrower than POSIX makes it look:
-    signal through the ``Process`` object that owns the handle, as
-    :meth:`cronstable.job.RunningJob.cancel` does, never through a bare pid
-    remembered across a reap.
+    Nothing here can address an unrelated group while the job's own group
+    has a member or its root is unreaped, and the platforms rule that out
+    by different means.  POSIX does it through the group itself: one lives
+    as long as any member does, and the kernel will not recycle a pid still
+    in use as a pgid.  Windows reserves nothing once the root exits, and
+    what rules out a recycled id there is asyncio holding the child's
+    process handle open until it reaps the child, since Windows frees a pid
+    for reuse only after the last handle to it closes.  A POSIX group that
+    is empty and whose leader is reaped reserves nothing either: the pid can
+    name an unrelated process, and this call then signals the group that
+    process leads.  The caller's contract is therefore narrower than POSIX
+    makes it look: signal through the ``Process`` object that owns the
+    handle, and ask :func:`pid_reused` first once that process is reaped,
+    as :meth:`cronstable.job.RunningJob.cancel` does, never through a bare
+    pid remembered across a reap.
 
     The Windows sequence mirrors the POSIX one.  The graceful call delivers
     ``CTRL_BREAK_EVENT`` to the job's process group; that event is trappable
@@ -516,6 +520,30 @@ async def kill_process_group(pid: int, *, force: bool) -> bool:
             )
             return False
         return True
+
+
+def pid_reused(pid: int) -> bool:
+    """Whether the pid of a reaped group leader names another process.
+
+    A caller asks before it hands such a pid to :func:`kill_process_group`.
+    POSIX keeps a pid out of use while a process group with that ID has a
+    member, so a process that exists under it is unrelated and the leader's
+    own group is empty.  One reuse goes unseen: a new owner of the pid that
+    has exited and left members in a group of its own.
+
+    Always ``False`` on Windows, where asyncio's open handle to the child
+    keeps its pid out of use and signal 0 is ``CTRL_C_EVENT``.
+    """
+    if IS_WINDOWS:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # EPERM: the process exists and another user owns it
+        pass
+    return True
 
 
 async def _windows_graceful_break(

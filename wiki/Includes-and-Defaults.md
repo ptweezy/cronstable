@@ -267,12 +267,21 @@ results are merged into the including file as follows:
 - **Pools** from included files are merged with this file's pools. A pool name
   defined in both raises `ConfigError("duplicate pool '<name>'")`.
 
+A file that two files of one include tree both include is loaded under each
+of them. Each includer takes the shared file's `defaults`. Everything else
+arrives once for each includer, so only a file that holds `defaults` alone
+can be shared. A shared file that defines a job fails the load with
+`duplicate job name(s): <name>; the scheduler tracks jobs by name, so all
+but the last definition of a name would silently never run. Rename the
+duplicates.` A shared `pools` block fails with `duplicate pool '<name>'`,
+and a shared `web`, `logging`, `cluster`, `state`, `mcp`, `notify`, or
+`push` section fails with `multiple <kind> configs`.
+
 The intended use is to put common definitions (reporting defaults, `shell`, and
 `environment`) in a fragment named so directory mode skips it, for example with
 a leading underscore, and `include` it from each real config file. For example:
 
-`_inc.yaml` (skipped by directory mode; provides shared `defaults`, `web`, and
-`logging`):
+`_inc.yaml` (skipped by directory mode; provides shared `defaults`):
 
 ```yaml
 defaults:
@@ -304,19 +313,23 @@ also defined jobs, those jobs would carry `_inc.yaml`'s own defaults and would
 
 ### Include cycle detection
 
-`parse_config_file` tracks visited files by absolute path in a `_seen` set that
-is threaded through the recursive include parse. A file that includes itself,
-directly or transitively, raises a clear
+`parse_config_file` receives in `_seen` the absolute paths of the files whose
+parse is in progress, from the top-level file down to the file that includes
+this one, and raises when its own path is in that set. A file that includes
+itself, directly or through other files, therefore raises a clear
 `ConfigError("include cycle detected at <path>")` instead of recursing until a
-`RecursionError`.
+`RecursionError`. `<path>` is the include path as joined to the including
+file's directory.
 
-The `_seen` set is scoped to a single top-level `parse_config_file` call and
-starts empty, so two independent files that both include a common fragment are
-**not** flagged as a cycle: diamond includes are allowed; only true
-cycles are rejected.
+Each file passes its includes a copy of the set with its own path added, so a
+file under one include is never in the set that another include receives. A
+file that two files of one include tree both include is therefore **not**
+flagged as a cycle. Loading a `main.yaml` that includes `team_a.yaml` and
+`team_b.yaml`, each of which includes `common.yaml`, succeeds. See
+[the `include` directive](#the-include-directive) for what a file that is
+included twice contributes.
 
-In directory mode, `_seen` is *not* shared across the directory's files: each
-file in the directory is parsed with its own fresh cycle-detection state.
+In directory mode, each file of the directory starts with an empty set.
 
 ## Related pages
 

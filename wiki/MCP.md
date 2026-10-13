@@ -96,6 +96,17 @@ the text to the model still see the data. `cron_get_status`,
 does not accept returns an error result that names the argument and lists the
 accepted ones, so the model can correct the call.
 
+`cron_get_status` and `cron_list_jobs` return one page per call. `limit` sets
+the page size, up to [`mcp.maxRows`](Configuration-Reference#mcp), and
+`offset` sets where the page starts. Without `limit`, a page holds
+`mcp.maxRows` rows. The result's `page` object reports `offset`, `limit`,
+`total`, `returned`, and `nextOffset`, which is `null` on the last page.
+`cron_list_jobs` also takes `filter`, a case-insensitive substring of the job
+name, and `state`: `running`, `disabled`, or `scheduled` (enabled and not
+running). The tool applies both before it pages, so `total` counts the
+matching jobs, and it builds full job rows for the returned page. On a large
+job set, a small `limit` or a `filter` keeps the result small.
+
 Mutating tools require an explicit `confirm: true` argument and re-check the
 same authorization as the REST API. The tools that launch configured commands
 (`cron_run_job`, `cron_trigger_dag`, `cron_backfill_dag`, and
@@ -153,9 +164,32 @@ and recovery execution require `confirm: true` and a writable MCP setup.
 Recovery also requires `allow_config_change: true` when the preview reports
 a configuration change. With scoped web tokens, `cron_recover_dag` also needs
 the `params` scope when a plan's `params` differ from the declared defaults,
-as on the REST routes. `cron_preview_recovery` needs `control` alone. See
-[resource pools](Resource-Pools) and [workflow recovery](Workflow-Recovery)
-for behavior and limits.
+as on the REST routes. `cron_preview_recovery` needs `control` alone.
+A recovery that the REST routes answer with `409` or
+`503`, such as `source run is busy; retry shortly` or
+`recovery state is unavailable`, comes back as a tool error with the same
+message. `cron_backfill_dag` returns the tool error
+`backfill state is unavailable` when a call that executes (`dry_run: false`
+and `confirm: true`) cannot reach the state store: the configured store has
+not started, a store operation fails or times out, or a run document cannot
+be read. For a store operation that fails or times out and for a run
+document that cannot be read, the daemon logs the warning that
+[`POST /dags/{name}/backfill`](HTTP-API#post-dagsnamebackfill) describes.
+The dry run, the refusal that asks for `confirm=true`, and
+`dag not found: '<name>'` need no store. A workflow absent from the
+configuration therefore gets `dag not found` from the tool where the REST
+route answers `503` while the store has not started.
+`cron_list_pools`, `cron_cancel_queued`, and `cron_run_job` for a
+pooled job return the tool error `pool state is unavailable` when pool state
+cannot be read or written. A refusal by a pool that answers comes back as a
+tool error with the refusal's message, such as `queue entry not found` or
+`pool queue is full`. On a daemon whose configuration has no `state`
+section, the recovery tools return `workflow run not found` for a run and
+`workflow not found` for a date range, `cron_backfill_dag` returns
+`dag not found: '<name>'`, and `cron_cancel_queued` returns
+`unknown pool '<name>'`. The [HTTP API](HTTP-API#enabling-the-api) lists the
+cases behind each answer. See [resource pools](Resource-Pools) and
+[workflow recovery](Workflow-Recovery) for behavior and limits.
 
 The three schedule-authoring tools make an agent a competent schedule
 **author**, not only a reader, with the daemon's own engine as the authority:

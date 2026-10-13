@@ -59,7 +59,7 @@ def test_binary_crypto_policy_accepts_the_security_floor():
             assert row["pq"] == ("soft" if source_only else "hard")
             assert bool(row.get("pq_src")) == source_only
             spec = Requirement(floor.strip() + row.get("pqcap", ""))
-            assert "50.0.1" in spec.specifier, (name, row)
+            assert "50.0.2" in spec.specifier, (name, row)
             assert "48.0.1" not in spec.specifier, (name, row)
             if name == "binaries-windows" and source_only:
                 arch = "x86" if row["arch"] == "i686" else "arm64"
@@ -561,21 +561,17 @@ sleep() { echo "DELAY:$1"; }
 
 
 @pytest.mark.parametrize(
-    "has_openssl35,version,ok",
+    "version,ok",
     [
-        (True, "OpenSSL 3.5.8 (stub)", True),
-        (False, "OpenSSL 3.5.9 (stub)", True),
-        (False, "OpenSSL 4.0.1 (stub)", True),
-        (False, "OpenSSL 3.0.22 (stub)", False),
+        ("OpenSSL 3.5.9 (stub)", True),
+        ("OpenSSL 4.0.1 (stub)", True),
+        ("OpenSSL 3.0.22 (stub)", False),
     ],
 )
-def test_freebsd_installs_the_openssl_35_port_under_either_name(
-    has_openssl35, version, ok
-):
-    # FreeBSD moved security/openssl35 to security/openssl, and each
-    # repository follows on its own schedule. A fixed name fails the
-    # install in one repository or installs OpenSSL 3.0 in another, where
-    # the soft cryptography build would drop ML-KEM without failing.
+def test_freebsd_installs_the_openssl_port_at_35_or_later(version, ok):
+    # The step installs the security/openssl port and fails when that port
+    # is older than OpenSSL 3.5. Against an older OpenSSL, the soft
+    # cryptography build drops ML-KEM and still passes.
     shell = shutil.which("bash")
     if os.name == "nt":
         shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
@@ -587,17 +583,13 @@ def test_freebsd_installs_the_openssl_35_port_under_either_name(
         for s in job["steps"]
         if s.get("uses", "").startswith("vmactions/freebsd-vm@")
     )
-    # As on FreeBSD, `pkg install` fails for a package the repository
-    # lacks. Any other subcommand fails too: `pkg rquery` exits without
-    # output on a VM that has no catalogue yet, so the step cannot use it.
+    # Only `pkg install` succeeds: `pkg rquery` exits without output on a
+    # VM that has no catalogue yet, so the step cannot use it.
     prelude = """
 pkg() {
     [ "$1" = install ] || return 1
     shift
     echo "INSTALL:$*"
-    case " $* " in
-        *" openssl35 "*) [ "$HAS_OPENSSL35" = 1 ] ;;
-    esac
 }
 openssl() { echo "$OPENSSL_VERSION"; }
 """
@@ -611,11 +603,7 @@ openssl() { echo "$OPENSSL_VERSION"; }
         result = subprocess.run(
             [shell, "-c", prelude + prepare],
             cwd=ROOT,
-            env={
-                **os.environ,
-                "HAS_OPENSSL35": str(int(has_openssl35)),
-                "OPENSSL_VERSION": version,
-            },
+            env={**os.environ, "OPENSSL_VERSION": version},
             capture_output=True,
             text=True,
             timeout=30,
@@ -628,8 +616,7 @@ openssl() { echo "$OPENSSL_VERSION"; }
         ]
         assert installs == [
             f"INSTALL:-y {row['pkgs']}",
-            "INSTALL:-y openssl35",
-            *([] if has_openssl35 else ["INSTALL:-y openssl"]),
+            "INSTALL:-y openssl",
         ]
         if not ok:
             assert "must be 3.5 or later" in result.stderr
