@@ -15,6 +15,7 @@
   its drawer after you save an access token.
 - A `web.headers` entry replaces the dashboard page's default header of the
   same name in any letter case.
+- cronstable requires `aiohttp` 3.14.5 or newer.
 
 ## 1.2.66
 

@@ -1065,6 +1065,7 @@ jobs:
           path: acceptance-results/
           if-no-files-found: warn
           retention-days: 7
+        continue-on-error: true
       # The container writes these as root with mode 0600, which the
       # runner-user tar in the cache save cannot read.
       - name: Make the pip cache readable by the cache save
@@ -1359,6 +1360,7 @@ jobs:
           path: acceptance-results/
           if-no-files-found: warn
           retention-days: 7
+        continue-on-error: true
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
@@ -1993,6 +1995,7 @@ jobs:
           path: acceptance-results/
           if-no-files-found: warn
           retention-days: 7
+        continue-on-error: true
       - name: Rename binary
         run: |-
           mv dist/cronstable "dist/cronstable-${{ matrix.asset }}"
@@ -2932,6 +2935,7 @@ jobs:
           path: acceptance-results/
           if-no-files-found: warn
           retention-days: 7
+        continue-on-error: true
 
   # cryptography wheels, built once per (libc, arch) for image platforms
   # without PyPI wheels (one QEMU compile takes an hour or more). Docker jobs

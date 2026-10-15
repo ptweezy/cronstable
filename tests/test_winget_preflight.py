@@ -81,13 +81,28 @@ function Invoke-FakeScan {
         $global:LASTEXITCODE = 2
     }
 }
+function Invoke-WrongScanner {
+    throw 'picked the wrong Defender platform folder'
+}
 function Get-ChildItem {
     param($Path, [switch]$Recurse, [switch]$File, $Filter)
     if ($Path -like '/mock*') {
-        return [pscustomobject]@{
-            FullName = 'Invoke-FakeScan'
-            Directory = @{ Name = '4.18.26070.3006-0' }
-        }
+        # Only the newest version folder has a working scanner. It sits
+        # mid-list, so picking either end fails.
+        return @(
+            [pscustomobject]@{
+                FullName = 'Invoke-WrongScanner'
+                Directory = @{ Name = 'CurrentVersion' }
+            },
+            [pscustomobject]@{
+                FullName = 'Invoke-FakeScan'
+                Directory = @{ Name = '4.18.26070.3006-0' }
+            },
+            [pscustomobject]@{
+                FullName = 'Invoke-WrongScanner'
+                Directory = @{ Name = '4.18.26060.3008-0' }
+            }
+        )
     }
     Microsoft.PowerShell.Management\Get-ChildItem @PSBoundParameters
 }

@@ -75,7 +75,7 @@ let
         };
       };
 
-  # aiohttp 3.14.4 depends on this release.
+  # aiohttp 3.14.5 depends on this release.
   yarl =
     let
       version = "1.25.1";
@@ -135,7 +135,7 @@ pkgs.python3Packages
   # aiohttp propagates yarl, so the override builds on the yarl above.
   aiohttp =
     let
-      version = "3.14.4";
+      version = "3.14.5";
     in
     if pkgs.lib.versionAtLeast pkgs.python3Packages.aiohttp.version version then
       pkgs.python3Packages.aiohttp
@@ -146,7 +146,7 @@ pkgs.python3Packages
           owner = "aio-libs";
           repo = "aiohttp";
           tag = "v${version}";
-          hash = "sha256-ArlEDpuUQJ6Ueup7tL9H1Nd3/TgajMaHtg4pJiSGOy8=";
+          hash = "sha256-gSxqab8AYJ6PsMP1PYWUxQ8TJ9KtEehoekLD8ziBt+g=";
         };
         # The nixpkgs postPatch edits pytest settings in setup.cfg, which
         # this release keeps in pytest.ini. Keep its build steps only.
