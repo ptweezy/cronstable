@@ -31,7 +31,11 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
-from cronstable.config import MONITOR_HISTORY_DEFAULT, SAMPLE_INTERVAL
+from cronstable.config import (
+    MONITOR_HISTORY_DEFAULT,
+    SAMPLE_INTERVAL,
+    resolve_web_toggle,
+)
 
 try:
     import psutil
@@ -1153,15 +1157,10 @@ def resolve_node_history_config(
 
     Returns ``None`` when disabled, else ``{"interval", "points"}``.  Enabled
     by default whenever the web API is on; ``nodeHistory: false`` /
-    ``nodeHistory: true`` are shorthands for the map form (mirroring how
-    ``web.metrics`` resolves in cronstable.prometheus).
+    ``nodeHistory: true`` are shorthands for the map form.
     """
-    raw = web_config.get("nodeHistory")
-    if raw is False:
-        return None
-    if raw is None or raw is True:
-        raw = {}
-    if not raw.get("enabled", True):
+    raw = resolve_web_toggle(web_config, "nodeHistory")
+    if raw is None:
         return None
     return {
         "interval": float(raw.get("interval", NODE_HISTORY_INTERVAL)),

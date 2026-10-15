@@ -1512,10 +1512,12 @@ Embed a badge with Markdown that links it to the job in the dashboard:
 A job's badge shows a verdict such as `passing`, `failing`, `overdue`, or
 `paused`, and the fleet badge at `/badge.svg` counts the jobs in the most
 urgent state, such as `2 failing`. The command palettes of the web and
-terminal dashboards copy this Markdown for any job. On a daemon that
-requires a token, set `web.badges.public: true` so that GitHub and other
-pages can fetch the badges; every other route still requires the token. For
-every verdict, the query parameters, and caching, see
+terminal dashboards copy this Markdown. A daemon that requires a token
+serves the badges only with it, and GitHub's image proxy can't send one. A
+browser also refuses to load a badge from the daemon into a page from
+another origin. Set `web.badges.public: true` to lift both limits; it
+exempts only the two badge routes from the token. For every verdict, the
+query parameters, and caching, see
 [status badges](https://github.com/ptweezy/cronstable/wiki/Status-Badges) in
 the wiki.
 

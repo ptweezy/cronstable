@@ -200,18 +200,26 @@ configs` / `multiple logging configs`.)
 ### An embedded status badge shows a broken image
 
 **Symptom.** A [status badge](Status-Badges) in a README, a wiki page, or a
-home dashboard shows a broken image, and `curl` on the image URL returns
-`401`.
+home dashboard shows a broken image.
 
-**Cause.** `web.authToken` or `web.authTokens` is configured, and the badge
-routes require the bearer token like every other data route. Image fetchers,
-such as GitHub's image proxy and the browsers that render a wiki page, can't
-send one.
+**Cause.** With `web.authToken` or `web.authTokens` configured, the badge
+routes require the bearer token like every other data route, and image
+fetchers, such as GitHub's image proxy and the browsers that render a wiki
+page, can't send one. Unless the badges are public, a badge also carries
+`Cross-Origin-Resource-Policy: same-origin` and `frame-ancestors 'self'`,
+so a browser refuses to load it from the daemon into a page from another
+origin, as an image or in a frame.
 
-**Fix.** Set `web.badges.public: true` to exempt the two badge routes from
-the token; every other route stays gated. A `404` instead means that no job
-has the name in the URL, or that `web.badges: false` turned the routes off. A
-badge in a GitHub README also needs an address that the internet can reach.
+**Fix.** Run `curl` on the image URL, with the token if the daemon has one.
+A `404` means that no job has the name in the URL, or that
+`web.badges: false` (or `web.badges.enabled: false`) turned the routes off,
+and `public` has no effect until they are back on. A `200` means that the
+badge itself works. A page that loads the badge straight from the daemon,
+such as a wiki page or a home dashboard, needs `web.badges.public: true`,
+which exempts only the two badge routes from the token and lets pages on
+other origins load them. A badge in a GitHub README needs an address that
+the internet can reach, and it needs `public` only on a daemon that requires
+a token.
 See [making badges public](Status-Badges#make-badges-public).
 
 ## Scheduling

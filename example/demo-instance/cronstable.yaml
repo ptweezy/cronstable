@@ -74,6 +74,9 @@ web:
   metrics:
     enabled: true
     public: true
+  # Status badges load on any site, which is what the gateway serves.
+  badges:
+    public: true
   # Node CPU/memory ring behind the dashboard header meter and the app's node
   # tab: 5s resolution, two hours of window.
   nodeHistory:

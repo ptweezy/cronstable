@@ -45,7 +45,9 @@ local samples. Real notifications need a separate configured server.
 
 The daemon grants anonymous `view` access and gives the public compatibility
 token, `cronstable-public-demo-view`, that same scope. Direct anonymous or
-view-token mutations at port 8080 return 403.
+view-token mutations at port 8080 return 403. Status badges are public
+(`web.badges.public: true`), so pages on any site can embed them through
+the gateway.
 
 The gateway accepts anonymous visitors and that one public token. It forwards
 reads with the view token and selected mutations with the private

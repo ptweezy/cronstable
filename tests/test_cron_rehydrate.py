@@ -1,5 +1,7 @@
 import asyncio
 import datetime
+import os
+import threading
 
 import pytest
 
@@ -7,6 +9,7 @@ import cronstable.cron
 from cronstable.cron import JobRunInfo
 from cronstable.fingerprint import job_digest
 from cronstable.job import JobOutputStream, JobRetryState
+from cronstable.state import BULK_CALL_SLOTS, FilesystemStateBackend
 from tests._configs import _DEP_JOB, _ONE_JOB, job_yaml
 from tests._cron_helpers import (
     UTC,
@@ -568,6 +571,527 @@ async def test_rehydrate_rehydrate_from_state_warms_history(tmp_path):
     assert cron._last_completed_at["j"].isoformat() == (
         "2026-07-01T09:05:00+00:00"
     )
+
+
+async def test_rehydrate_reads_past_a_window_of_pause_skips(tmp_path):
+    # a pause across the restart can leave only "skipped" rows in the
+    # warmed window; the status badge still needs the last real run
+    cron = await _rehydrate_state_cron(tmp_path)
+    _serve_badges(cron)
+    cron._state_rehydrated = False
+    stream = cron._run_stream("j")
+    await cron.state_backend.append_record(
+        stream,
+        {
+            "outcome": "failure",
+            "exit_code": 1,
+            "finished_at": "2026-07-01T09:00:00+00:00",
+            "ranAt": "2026-07-01T09:00:00+00:00",
+        },
+    )
+    for minute in range(cronstable.cron.RUN_HISTORY_LIMIT):
+        await cron.state_backend.append_record(
+            stream,
+            {
+                "outcome": "skipped",
+                "skip_reason": "paused",
+                "finished_at": "2026-07-01T10:{:02d}:00+00:00".format(minute),
+            },
+        )
+    await cron._rehydrate_from_state()
+    assert all(r.outcome == "skipped" for r in cron.run_history["j"])
+    # the deeper read runs after the boot steps
+    assert cron._last_run_outcome("j") is None
+    await cron._last_run_scan_task
+    assert cron._last_run_outcome("j") == "failure"
+
+
+_TWO_JOBS = _ONE_JOB + (
+    "  - name: k\n    command: 'true'\n    schedule: '* * * * *'\n"
+)
+
+
+async def _seed_failure_then_skips(cron, name, skips):
+    """A failed run, then ``skips`` pause skips a minute apart after it."""
+    stream = cron._run_stream(name)
+    start = datetime.datetime(1999, 12, 31, 9, 0, tzinfo=UTC)
+    at = start.isoformat()
+    await cron.state_backend.append_record(
+        stream,
+        {
+            "outcome": "failure",
+            "exit_code": 1,
+            "finished_at": at,
+            "ranAt": at,
+        },
+    )
+    for minute in range(1, skips + 1):
+        at = (start + datetime.timedelta(minutes=minute)).isoformat()
+        await cron.state_backend.append_record(
+            stream,
+            {"outcome": "skipped", "skip_reason": "paused", "finished_at": at},
+        )
+
+
+def _badge(cron, name):
+    now = cronstable.cron.get_now(UTC)
+    return cron._badge_verdict(name, cron.cron_jobs[name], now)
+
+
+def _serve_badges(cron):
+    """Stand in for a web app that serves badges, which the deeper reads
+    wait for (see test_rehydrate_last_run_reads_wait_for_the_badges)."""
+    cron._serves_badges = lambda: True
+
+
+@pytest.mark.parametrize(
+    "webs, scans",
+    [
+        ([], False),
+        ([{"badges": False}], False),
+        ([{}], True),
+        ([{"badges": False}, {}], True),
+    ],
+    ids=["no-web-app", "badges-off", "badges-on", "badges-on-by-reload"],
+)
+async def test_rehydrate_last_run_reads_wait_for_the_badges(
+    tmp_path, webs, scans
+):
+    # the badges are the only reader of a job's last real run
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron._state_rehydrated = False
+    await _seed_failure_then_skips(
+        cron, "j", cronstable.cron.RUN_HISTORY_LIMIT
+    )
+    await cron._rehydrate_from_state()
+    assert cron._last_run_scan_task is None
+    try:
+        for web in webs:
+            await cron.start_stop_web_app(
+                dict(web, listen=["http://127.0.0.1:0"])
+            )
+        if scans:
+            await cron._last_run_scan_task
+            assert _badge(cron, "j") == "failing"
+        else:
+            assert cron._last_run_scan_task is None
+            assert cron._last_run_scan_owed == ["j"]
+    finally:
+        await cron.start_stop_web_app(None)
+
+
+async def test_rehydrate_deeper_read_timeout_spares_the_other_jobs(
+    tmp_path, caplog
+):
+    # j's deeper read waits for every boot read, so its timeout cannot
+    # cost k (read after j in config order) its history
+    cron = await _rehydrate_state_cron(tmp_path, _TWO_JOBS)
+    _serve_badges(cron)
+    cron._state_rehydrated = False
+    await _seed_failure_then_skips(
+        cron, "j", cronstable.cron.RUN_HISTORY_LIMIT
+    )
+    await _seed_failure_then_skips(cron, "k", 0)
+    read = cron.state_backend.list_records
+    reads = []
+
+    async def _list(stream, **kw):
+        deeper = "max_matches" in kw
+        reads.append((stream, deeper))
+        if stream == cron._run_stream("j") and deeper:
+            raise asyncio.TimeoutError
+        return await read(stream, **kw)
+
+    cron.state_backend.list_records = _list
+    await cron._rehydrate_from_state()
+    assert reads and not any(deeper for _, deeper in reads)
+    assert [r.outcome for r in cron.run_history["k"]] == ["failure"]
+    await cron._last_run_scan_task
+    assert reads[-1] == (cron._run_stream("j"), True)
+    assert _badge(cron, "j") == "pending"
+    assert "cannot widen the last-run scan for j" in caplog.text
+    assert "skipping the rest of the last-run scans" in caplog.text
+    assert "skipping the rest of the warm-up" not in caplog.text
+    assert cron.last_run["k"].outcome == "failure"
+    assert _badge(cron, "k") == "failing"
+
+
+_THREE_JOBS = _TWO_JOBS + (
+    "  - name: m\n    command: 'true'\n    schedule: '* * * * *'\n"
+)
+
+
+async def test_rehydrate_one_deeper_read_timeout_ends_the_others(
+    tmp_path, monkeypatch, caplog
+):
+    # the deeper reads run one at a time and end at the first timeout, so
+    # a hung store strands one worker thread however many jobs are paused
+    cron = await _rehydrate_state_cron(tmp_path, _THREE_JOBS)
+    _serve_badges(cron)
+    cron._state_rehydrated = False
+    names = ("j", "k", "m")
+    for name in names:
+        await _seed_failure_then_skips(
+            cron, name, cronstable.cron.RUN_HISTORY_LIMIT
+        )
+    read = cron.state_backend.list_records
+    deeper = []
+
+    async def _list(stream, **kw):
+        if "max_matches" in kw:
+            deeper.append(stream)
+            await asyncio.Event().wait()
+        return await read(stream, **kw)
+
+    cron.state_backend.list_records = _list
+    await cron._rehydrate_from_state()
+    assert not deeper
+    for name in names:
+        history = cron.run_history[name]
+        assert len(history) == cronstable.cron.RUN_HISTORY_LIMIT
+        assert all(r.outcome == "skipped" for r in history)
+    # only the hung deeper read gets the short timeout: the pass first
+    # runs at the await below
+    monkeypatch.setattr(cronstable.cron, "STATE_OP_TIMEOUT", 0.5)
+    await cron._last_run_scan_task
+    assert len(deeper) == 1
+    for name in names:
+        assert _badge(cron, name) == "pending"
+    assert caplog.text.count("skipping the rest of the last-run scans") == 1
+    assert "skipping the rest of the warm-up" not in caplog.text
+
+
+async def test_rehydrate_short_window_needs_no_deeper_read(tmp_path):
+    # a first read shorter than the window holds the whole stream, so
+    # pause skips alone mean the job never ran
+    cron = await _rehydrate_state_cron(tmp_path)
+    _serve_badges(cron)
+    cron._state_rehydrated = False
+    stream = cron._run_stream("j")
+    skips = cronstable.cron.RUN_HISTORY_LIMIT - 1
+    for minute in range(skips):
+        await cron.state_backend.append_record(
+            stream,
+            {
+                "outcome": "skipped",
+                "skip_reason": "paused",
+                "finished_at": "1999-12-31T10:{:02d}:00+00:00".format(minute),
+            },
+        )
+    reads = []
+    read = cron.state_backend.list_records
+
+    async def _list(name, **kw):
+        if name == stream:
+            reads.append(kw)
+        return await read(name, **kw)
+
+    cron.state_backend.list_records = _list
+    await cron._rehydrate_from_state()
+    assert len(cron.run_history["j"]) == skips
+    assert _badge(cron, "j") == "pending"
+    assert reads and not any("max_matches" in kw for kw in reads)
+    assert cron._last_run_scan_task is None
+
+
+@pytest.mark.parametrize(
+    "skips, verdict",
+    [(61, "failing"), (120, "pending")],
+    ids=["past-the-bounded-window", "past-the-cap"],
+)
+async def test_rehydrate_unbounded_retention_reads_past_a_long_pause(
+    tmp_path, monkeypatch, skips, verdict
+):
+    # unbounded retention keeps the failure however many skips follow it,
+    # and the deeper read looks LAST_RUN_SCAN_LIMIT records back for it
+    monkeypatch.setattr(cronstable.cron, "SLA_SUCCESS_SCAN_LIMIT", 60)
+    monkeypatch.setattr(cronstable.cron, "LAST_RUN_SCAN_LIMIT", 120)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
+    _serve_badges(cron)
+    await start_state(
+        cron,
+        _state_cfg(
+            "state:\n  path: {}\n  maxRunsPerJob: 0\n".format(tmp_path)
+        ),
+    )
+    cron._state_rehydrated = False
+    await _seed_failure_then_skips(cron, "j", skips)
+    await cron._rehydrate_from_state()
+    await cron._last_run_scan_task
+    assert all(r.outcome == "skipped" for r in cron.run_history["j"])
+    assert _badge(cron, "j") == verdict
+
+
+@pytest.mark.parametrize(
+    "max_runs, limit", [(0, 120), (30, 60), (90, 90), (5000, 120)]
+)
+async def test_rehydrate_deeper_read_depth_has_a_fixed_cap(
+    tmp_path, monkeypatch, max_runs, limit
+):
+    # an abandoned read keeps its worker thread until it ends, so the
+    # depth never exceeds LAST_RUN_SCAN_LIMIT, whatever maxRunsPerJob is
+    monkeypatch.setattr(cronstable.cron, "SLA_SUCCESS_SCAN_LIMIT", 60)
+    monkeypatch.setattr(cronstable.cron, "LAST_RUN_SCAN_LIMIT", 120)
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron._state_max_runs = max_runs
+    read = cron.state_backend.list_records
+    limits = []
+
+    async def _list(stream, **kw):
+        limits.append(kw["limit"])
+        return await read(stream, **kw)
+
+    cron.state_backend.list_records = _list
+    assert await cron._warm_last_real_run_beyond_history("j")
+    assert limits == [limit]
+
+
+async def test_rehydrate_reads_the_ledger_under_skips_of_a_store_outage(
+    tmp_path, monkeypatch
+):
+    # the store is down at boot and the job is paused meanwhile, so its
+    # history holds only that pause's skips when the store comes up
+    prev = await _rehydrate_state_cron(tmp_path)
+    await _seed_failure_then_skips(prev, "j", 0)
+    await stop_cron_state(prev)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
+    _serve_badges(cron)
+    make = cronstable.cron.make_state_backend
+
+    def _down(*args, **kwargs):
+        raise OSError("mount not ready")
+
+    monkeypatch.setattr(cronstable.cron, "make_state_backend", _down)
+    await start_state(cron, _rehydrate_cfg(tmp_path))
+    assert cron.state_backend is None
+    await cron.pause_job_by_name("j", duration=3600)
+    await cron.launch_scheduled_job(cron.cron_jobs["j"])
+    monkeypatch.setattr(cronstable.cron, "make_state_backend", make)
+    await start_state(cron, _rehydrate_cfg(tmp_path))
+    assert cron.state_backend is not None
+    await cron._last_run_scan_task
+    assert [r.outcome for r in cron.run_history["j"]] == ["skipped"]
+    assert _badge(cron, "j") == "paused"
+    await cron.resume_job_by_name("j")
+    assert _badge(cron, "j") == "failing"
+
+
+async def test_rehydrate_reads_the_ledger_under_a_skip_landing_mid_read(
+    tmp_path,
+):
+    # a pause skip recorded while the first read is out keeps the live
+    # history, and the badge still finds the ledger's last real run
+    cron = await _rehydrate_state_cron(tmp_path)
+    _serve_badges(cron)
+    cron._state_rehydrated = False
+    await _seed_failure_then_skips(cron, "j", 0)
+    skip = JobRunInfo(
+        outcome="skipped",
+        exit_code=None,
+        started_at=None,
+        finished_at=datetime.datetime(1999, 12, 31, 11, 0, tzinfo=UTC),
+        fail_reason=None,
+        output=JobOutputStream(),
+        skip_reason="paused",
+    )
+    pending = [skip]
+    read = cron.state_backend.list_records
+
+    async def _list(stream, **kw):
+        recs = await read(stream, **kw)
+        if stream == cron._run_stream("j") and pending:
+            cron._install_run_info("j", pending.pop())
+        return recs
+
+    cron.state_backend.list_records = _list
+    await cron._rehydrate_from_state()
+    await cron._last_run_scan_task
+    assert [r.outcome for r in cron.run_history["j"]] == ["skipped"]
+    assert _badge(cron, "j") == "failing"
+
+
+# --- rehydrate: deeper last-run reads on a slow store -----------------------
+#
+# A timed-out read keeps its store worker thread, and that thread's bulk slot,
+# until the read ends. With a paused job per bulk slot, deeper reads made
+# during the boot could hold every slot its other reads need.
+
+_SCAN_PAUSED = tuple("p%02d" % i for i in range(BULK_CALL_SLOTS))
+_SCAN_NORMAL = ("n0", "n1", "n2", "n3")
+_SCAN_JOBS = "jobs:\n" + "".join(
+    "  - name: %s\n    command: 'true'\n    schedule: '* * * * *'\n" % name
+    for name in _SCAN_PAUSED + _SCAN_NORMAL
+)
+
+# what each boot step logs when its store reads time out
+_BOOT_TIMEOUTS = (
+    "rehydration timed out reading",
+    "in-flight reconciliation timed out",
+    "cannot rehydrate the metric counters",
+    "cannot refresh pause state",
+    "retry re-arm timed out",
+)
+
+
+async def _long_pause_boot(tmp_path, skips):
+    """A store whose paused jobs hold a failure, ``skips`` pause skips and
+    an active pause, and whose other jobs ran once; and a Cron that serves
+    badges to boot it.
+
+    All but one skip per job are copies of an appended record file, since
+    an append pays an fsync.
+    """
+    seed = await _rehydrate_state_cron(tmp_path, _SCAN_JOBS)
+    for name in _SCAN_NORMAL:
+        await _seed_failure_then_skips(seed, name, 0)
+    for name in _SCAN_PAUSED:
+        await _seed_failure_then_skips(seed, name, 1)
+        stream_dir = seed.state_backend._stream_dir(seed._run_stream(name))
+        newest = max(n for n in os.listdir(stream_dir) if n.endswith(".json"))
+        with open(os.path.join(stream_dir, newest), "rb") as fobj:
+            raw = fobj.read()
+        # later sequence numbers under the same head sort after the skip
+        head, seq = newest[: -len(".json")].rsplit("-", 1)
+        for i in range(1, skips):
+            copy = "{}-{:012d}.json".format(head, int(seq) + i)
+            with open(os.path.join(stream_dir, copy), "wb") as fobj:
+                fobj.write(raw)
+        await seed.pause_job_by_name(name, duration=3600)
+    await asyncio.gather(*list(seed._pending_state_writes))
+    await stop_cron_state(seed)
+    cron = cronstable.cron.Cron(None, config_yaml=_SCAN_JOBS)
+    _serve_badges(cron)
+    return cron
+
+
+async def test_rehydrate_slow_last_run_reads_spare_the_boot(
+    tmp_path, monkeypatch, caplog
+):
+    # a deeper read hangs on its store thread, as on a wedged mount, while
+    # the boot reads answer at once
+    window = cronstable.cron.RUN_HISTORY_LIMIT
+    cron = await _long_pause_boot(tmp_path, window + 5)
+    scan = cron._scan_last_real_runs
+
+    async def _scan(names):
+        # the boot reads keep the default timeout, which a loaded host
+        # can need
+        monkeypatch.setattr(cronstable.cron, "STATE_OP_TIMEOUT", 0.5)
+        await scan(names)
+
+    monkeypatch.setattr(cron, "_scan_last_real_runs", _scan)
+    list_sync = FilesystemStateBackend._list_sync
+    released = threading.Event()
+
+    def _hung_list(
+        self,
+        stream,
+        limit,
+        newest_first,
+        strict=False,
+        predicate=None,
+        max_matches=None,
+    ):
+        if max_matches is not None:
+            released.wait()
+        return list_sync(
+            self, stream, limit, newest_first, strict, predicate, max_matches
+        )
+
+    monkeypatch.setattr(FilesystemStateBackend, "_list_sync", _hung_list)
+    list_records = FilesystemStateBackend.list_records
+    reads = []
+
+    async def _list(self, stream, **kw):
+        reads.append("deeper" if "max_matches" in kw else "boot")
+        return await list_records(self, stream, **kw)
+
+    monkeypatch.setattr(FilesystemStateBackend, "list_records", _list)
+    try:
+        await start_state(cron, _rehydrate_cfg(tmp_path))
+        backend = cron.state_backend
+        assert cron._last_run_scan_task is not None
+        await cron._last_run_scan_task
+        # one deeper read, after every boot read, and its thread holds the
+        # only busy slot
+        assert reads.count("deeper") == 1
+        assert reads[-1] == "deeper"
+        assert backend._inflight_bulk == 1
+        skipped = "skipping the rest of the last-run scans"
+        assert caplog.text.count(skipped) == 1
+        for message in _BOOT_TIMEOUTS:
+            assert message not in caplog.text
+        for name in _SCAN_NORMAL:
+            assert [r.outcome for r in cron.run_history[name]] == ["failure"]
+        for name in _SCAN_PAUSED:
+            assert len(cron.run_history[name]) == window
+            assert name in cron._paused
+            assert cron._last_run_outcome(name) is None
+    finally:
+        released.set()
+    # the abandoned read ends once the store answers
+    for _ in range(600):
+        if backend._inflight_bulk == 0:
+            break
+        await asyncio.sleep(0.05)
+    assert backend._inflight_bulk == 0
+
+
+async def test_rehydrate_last_run_reads_fill_in_after_the_boot(tmp_path):
+    cron = await _long_pause_boot(
+        tmp_path, cronstable.cron.RUN_HISTORY_LIMIT + 5
+    )
+    await start_state(cron, _rehydrate_cfg(tmp_path))
+    await cron._last_run_scan_task
+    for name in _SCAN_PAUSED:
+        assert name in cron._paused
+        assert all(r.outcome == "skipped" for r in cron.run_history[name])
+        assert cron._last_run_outcome(name) == "failure"
+    for name in _SCAN_NORMAL:
+        assert cron._last_run_outcome(name) == "failure"
+
+
+@pytest.mark.parametrize(
+    "end", ["store swap", "store removal", "shutdown", "rehydrate"]
+)
+async def test_rehydrate_last_run_reads_end_with_their_store(tmp_path, end):
+    # one pass at a time, and only against the store that it reads
+    cron = await _rehydrate_state_cron(tmp_path / "old")
+    _serve_badges(cron)
+    cron._state_rehydrated = False
+    await _seed_failure_then_skips(
+        cron, "j", cronstable.cron.RUN_HISTORY_LIMIT
+    )
+    read = cron.state_backend.list_records
+    started = asyncio.Event()
+
+    async def _list(stream, **kw):
+        if "max_matches" in kw:
+            started.set()
+            await asyncio.Event().wait()
+        return await read(stream, **kw)
+
+    cron.state_backend.list_records = _list
+    await cron._rehydrate_from_state()
+    task = cron._last_run_scan_task
+    await started.wait()
+    if end == "store swap":
+        await start_state(cron, _rehydrate_cfg(tmp_path / "new"))
+    elif end == "store removal":
+        await cron.start_stop_state(None)
+    elif end == "shutdown":
+        cron._cancel_coordination_tasks()
+    else:
+        cron._state_rehydrated = False
+        await cron._rehydrate_from_state()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # the next warm-up owes j a read of its store's ledger
+    if end in ("store removal", "shutdown"):
+        assert cron._last_run_scan_task is None
+        assert cron._last_run_scan_owed == []
+    else:
+        assert cron._last_run_scan_task not in (None, task)
 
 
 # --- rehydrate: order tolerance on a shared mount ---------------------------

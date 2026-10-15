@@ -4643,6 +4643,38 @@ def _build_push_config(raw: dict) -> dict[str, Any]:
     }
 
 
+def resolve_web_toggle(
+    web_config: Mapping[str, Any], key: str
+) -> Mapping[str, Any] | None:
+    """The map form of the on-by-default ``web.<key>`` option, or ``None``.
+
+    ``false`` or ``enabled: false`` turns the option off. An absent option
+    and ``true`` give an empty map, so every setting takes its default.
+    """
+    raw: Mapping[str, Any] | bool | None = web_config.get(key)
+    if raw is False:
+        return None
+    if raw is None or raw is True:
+        return {}
+    if not raw.get("enabled", True):
+        return None
+    return raw
+
+
+def resolve_badges_config(
+    web_config: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Resolve the raw ``web.badges`` option into effective settings.
+
+    Returns ``None`` when the badge routes are off, else a dict with
+    ``public`` (serve the badges without a bearer token).
+    """
+    raw = resolve_web_toggle(web_config, "badges")
+    if raw is None:
+        return None
+    return {"public": bool(raw.get("public", False))}
+
+
 def resolve_bonjour_config(
     web_config: WebConfig | None,
 ) -> dict[str, Any] | None:

@@ -199,6 +199,20 @@ def test_saving_a_token_loads_the_board(browser, tmp_path, how):
             assert _stored_token(page) == e2e.FULL_TOKEN
 
 
+def test_a_deep_link_opens_once_the_token_is_saved(browser, tmp_path):
+    # a status badge links to #job/<name>; a reader without a token lands
+    # on the token modal, and the job opens once the token is saved
+    with e2e.Daemon(tmp_path, auth="full") as daemon:
+        url = daemon.url.rstrip("/") + "/#job/alpha-ok"
+        with e2e.open_page(browser, url, wait_rows=False) as page:
+            _open(page, "modalWrap")
+            page.fill("#tokenInput", e2e.FULL_TOKEN)
+            page.click("#tokenSave")
+            page.wait_for_selector('#drawer[aria-hidden="false"]')
+            assert page.inner_text("#dName") == "alpha-ok"
+            assert page.evaluate("location.hash") == "#job/alpha-ok"
+
+
 def test_wrong_token_returns_to_the_required_modal(browser, tmp_path):
     with e2e.Daemon(tmp_path, auth="full") as daemon:
         with e2e.open_page(browser, daemon.url, wait_rows=False) as page:
@@ -222,6 +236,33 @@ def test_wrong_token_returns_to_the_required_modal(browser, tmp_path):
             page.press("#tokenInput", "Enter")
             page.wait_for_selector("#rows tr[data-job]")
             _closed(page, "modalWrap")
+
+
+def test_a_token_saved_during_a_whoami_read_gets_its_scopes(browser, tmp_path):
+    # the save joins the read already out, which carries the old token,
+    # so the page reads /whoami again for the new one
+    with e2e.Daemon(tmp_path, auth="scoped") as daemon:
+        with e2e.open_page(browser, daemon.url, token=e2e.VIEW_TOKEN) as page:
+            assert _row_buttons(page, "alpha-ok") == ["data-logs"]
+            parked = page.faults.hang(r"/whoami")
+            _click(page, "#authBtn")
+            _open(page, "modalWrap")
+            page.click("#tokenSave")
+            e2e.wait_until(lambda: len(parked) == 1, page)
+            _click(page, "#authBtn")
+            _open(page, "modalWrap")
+            page.fill("#tokenInput", e2e.FULL_TOKEN)
+            page.click("#tokenSave")
+            page.faults.clear(r"/whoami")
+            parked[0].fallback()
+            page.wait_for_function(
+                "document.querySelector('#rows [data-run=\"alpha-ok\"]')"
+            )
+            assert _row_buttons(page, "alpha-ok") == [
+                "data-run",
+                "data-pause",
+                "data-logs",
+            ]
 
 
 def test_clearing_the_token_returns_to_the_required_modal(browser, tmp_path):

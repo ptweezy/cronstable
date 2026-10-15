@@ -107,7 +107,7 @@ section. `listen` is required; the rest are optional (strictyaml `Opt(...)`).
 | `tls` | map (`cert`/`key`/`clientCa`) | (none) | Certificate and key served by every `https://` listen address, plus an optional CA that makes those listeners require a client certificate (mutual TLS). `cert` and `key` are required together. The config loader validates the block and the `https://` addresses against each other at load. See [listener TLS](Listener-TLS). |
 | `ui` | bool | `true` | Serve the [web dashboard](Web-Dashboard) page at `/` (see [`GET /`](#get--the-dashboard-page)). `ui: false` exposes only the REST endpoints. |
 | `metrics` | bool or map | `true` | Serve the Prometheus exposition at `/metrics`. The map form tunes buckets or exempts the endpoint from `authToken` (see [`GET /metrics`](#get-metrics)). |
-| `badges` | bool or map | `true` | Serve the SVG status badges at `/badge.svg` and `/jobs/{name}/badge.svg`. The map form can exempt the two badge routes from `authToken` (see [`GET /badge.svg`](#get-badgesvg-and-get-jobsnamebadgesvg) and [status badges](Status-Badges)). |
+| `badges` | bool or map | `true` | Serve the SVG status badges at `/badge.svg` and `/jobs/{name}/badge.svg`. The map form's `public: true` exempts the two badge routes from `authToken` and lets pages on other origins load the badges (see [`GET /badge.svg`](#get-badgesvg-and-get-jobsnamebadgesvg) and [status badges](Status-Badges)). |
 | `nodeHistory` | bool or map | `true` | Background node CPU/memory sampling that feeds [`GET /node/history`](#get-nodehistory). The map form tunes cadence and window size (see [`web.nodeHistory`](Configuration-Reference#web)). |
 | `bonjour` | bool or map | `false` | Advertise the API over mDNS; see [LAN discovery](LAN-Discovery). |
 
@@ -411,15 +411,22 @@ job name is a `404`. The fleet badge shows `cronstable` and counts the jobs
 in the most urgent state, such as `2 failing`.
 
 The optional `label` query parameter replaces the left-hand text (1 to 64
-printable characters), and `style` picks `flat` (the default) or
-`flat-square`. Any other value of either is a `400`. Each response carries an
+characters, with no control characters or line breaks), and `style` picks
+`flat` (the default) or `flat-square`. An empty `style` takes the default,
+and any other value of either is a `400`. Each badge image carries an
 `ETag` and `Cache-Control: no-cache`, and a request whose `If-None-Match`
-matches gets `304 Not Modified`.
+matches gets `304 Not Modified`. The image and the `304` both carry
+`Cross-Origin-Resource-Policy: same-origin`, `X-Frame-Options: SAMEORIGIN`,
+and a `Content-Security-Policy` with `frame-ancestors 'self'`, so a browser
+refuses to load a badge into a page from another origin, as an image or in
+a frame.
 
 The `web.badges` option turns the routes off (`badges: false`) or, with
-`badges.public: true`, exempts them from the bearer token so that an image
-proxy can fetch them. For the verdict table, the fleet count, and embedding,
-see [status badges](Status-Badges).
+`badges.public: true`, exempts them from the bearer token and sends
+`Cross-Origin-Resource-Policy: cross-origin` with no frame limits, so that
+an image proxy can fetch them without a token and pages on any origin can
+load them. For the verdict table, the fleet count, embedding, and the exact
+headers, see [status badges](Status-Badges).
 
 ```shell
 curl http://localhost:8080/jobs/nightly-backup/badge.svg
@@ -1170,6 +1177,19 @@ cluster peer transport, which are separate listeners.
 `instance` and `listeners` to check whether another address reaches the same
 daemon.
 
+`badges` is `null` while the daemon serves no
+[status badges](Status-Badges) (`web.badges: false`). Otherwise it's an
+object with two fields. `public` is the `web.badges.public` setting, which
+lets an image proxy fetch the badges without a token and lets pages from
+other origins load them (see
+[make badges public](Status-Badges#make-badges-public)). While it's
+`false`, the dashboards add "embeds need web.badges.public" to the copy
+confirmation. `dashboard` is `false` under `web.ui: false`, where the copied
+Markdown has no dashboard page to link to. The dashboards list their
+copy-badge commands only when `badges` is an object, and they read
+`/whoami` again about once a minute, so the commands follow a configuration
+reload.
+
 A companion app uses it to show what it may do. The dashboard uses it to warn
 when its pairing QR would hand a phone the all-scopes token (see
 [push notifications](Push-Notifications)). Requires the `view` scope.
@@ -1348,9 +1368,12 @@ Serves the single-page [web dashboard](Web-Dashboard). Set `ui: false` in the
 `web` section to disable the page and expose only the REST endpoints. The page
 is served with secure default headers (a strict Content-Security-Policy,
 anti-clickjacking, and nosniff) with any operator `web.headers` merged on top,
-so a deliberately-set operator header wins. The page carries an `ETag`, and a
-request whose `If-None-Match` header matches it gets `304 Not Modified`. A
-client that accepts gzip receives the page compressed.
+so an operator header replaces the default of the same name in any letter
+case. An operator header can't set the page's `Content-Type`,
+`Content-Encoding`, `ETag`, `Cache-Control`, or `Vary`; the page sets those
+itself. A request whose `If-None-Match` header
+matches the page's `ETag` gets `304 Not Modified`. A client that accepts
+gzip receives the page compressed.
 
 When `web.authToken` is enabled, the page itself loads without a token (it
 holds no data). It prompts for the token in the browser and authenticates
@@ -1395,7 +1418,13 @@ responses, which are raised without the configured headers. One key is exempt
 everywhere: a `Content-Type` in this map (in any spelling) is ignored, because
 every endpoint owns its own content type. The SSE log routes also fix
 `Cache-Control` and `X-Accel-Buffering`, so the map cannot override those two
-on a live stream. Example:
+on a live stream. `/jobs`, `/fleet`, `/dags`, and `/activity` set their own
+`ETag` and `Vary`, and `/cluster` and `/metrics` set their own `Vary`; an
+entry can't replace those. On the dashboard page, an entry for
+`Content-Encoding`, `ETag`, `Cache-Control`, or `Vary`, in any letter case,
+has no effect, and on the status badges an entry for `ETag` or
+`Cache-Control` has none.
+Example:
 
 ```yaml
 web:
@@ -1461,7 +1490,8 @@ grants named scopes (`view` only) to callers presenting no credential,
 which is how a public read-only board is served. A wrong token is still
 `401`, and everything outside the grant is `403` (see
 [public read-only access](#public-read-only-access-webanonymousscopes)).
-Without any of them, every route stays gated.
+Without any of them, every route but the dashboard page at `/` requires the
+token.
 
 One built-in carve-out: paths ending in `.ics` (the
 [calendar feeds](Calendar-Export)) also accept the same token as a `token`
@@ -1702,7 +1732,11 @@ The rule, per request:
 `GET`/`HEAD`/`OPTIONS` are never gated (no read here mutates, and the
 browser's same-origin policy already hides their responses cross-site), and
 `/mcp` is exempt because it enforces its own `mcp.allowedOrigins` list with
-CORS preflight support (see [MCP](MCP)).
+CORS preflight support (see [MCP](MCP)). A page on another origin could
+load a status badge as an image or in a frame and read the verdict from its
+size, so unless `web.badges.public` is true, the badges carry
+`Cross-Origin-Resource-Policy: same-origin` and `frame-ancestors 'self'`
+(see [security headers](Status-Badges#security-headers)).
 
 Two overrides for deliberate cross-origin deployments: a specific
 origin in a `web.headers` `Access-Control-Allow-Origin` header is treated as

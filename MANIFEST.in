@@ -29,6 +29,11 @@ prune docs
 include docs/openapi.yaml
 include docs/demo/index.html
 include docs/demo/_backend.html
+include docs/img/badge-failing.svg
+include docs/img/badge-flat-square.svg
+include docs/img/badge-fleet.svg
+include docs/img/badge-overdue.svg
+include docs/img/badge-passing.svg
 include docs/logo-engine.js
 include docs/logo-lab.html
 include docs/palette.css

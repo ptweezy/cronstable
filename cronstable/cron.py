@@ -43,6 +43,7 @@ if TYPE_CHECKING:  # the loopback job-state API is imported lazily at runtime
     import aiohttp
     from aiohttp import web
 
+    from cronstable._webkeys import WebAppSettings
     from cronstable.jobapi import JobStateAPI
 
 import cronstable.version
@@ -66,7 +67,6 @@ from cronstable.badge import (
     job_verdict,
     label_error,
     render_badge,
-    resolve_badges_config,
 )
 from cronstable.config import (
     WEB_TOKEN_SCOPES,
@@ -87,6 +87,7 @@ from cronstable.config import (
     parsed_entry_drained,
     parsed_listing_unchanged,
     parsed_sources_unchanged,
+    resolve_badges_config,
     resolve_bonjour_config,
     validate_pools,
 )
@@ -358,9 +359,19 @@ SLA_CHECK_RUNTIME = "maxRuntime"
 # The only check names ever keyed into _sla_state; latch bookkeeping walks
 # these three, keeping a widespread breach O(jobs).
 SLA_CHECKS = (SLA_CHECK_STALE, SLA_CHECK_LATE, SLA_CHECK_RUNTIME)
+# The sla config key behind each check; a check is configured while its key
+# is not null.
+SLA_CHECK_KEYS = {
+    SLA_CHECK_STALE: "maxTimeSinceSuccessSeconds",
+    SLA_CHECK_LATE: "lateAfterSeconds",
+    SLA_CHECK_RUNTIME: "maxRuntimeSeconds",
+}
 # Boot ledger re-read depth when the warm window holds no success at all
 # (maxTimeSinceSuccess jobs only).
 SLA_SUCCESS_SCAN_LIMIT = 1000
+# Cap on the ledger re-read for a job's last real run after a boot, and its
+# depth under unbounded retention (maxRunsPerJob <= 0).
+LAST_RUN_SCAN_LIMIT = 10000
 # Pause windows kept per job for the staleness credit; overflow drops the
 # oldest, understating the credit rather than overstating it.
 SLA_PAUSE_SPANS_MAX = 64
@@ -379,10 +390,6 @@ TREND_SCAN_LIMIT = 5000
 JOB_TRENDS_CACHE_TTL = 5.0
 # Served without bearer auth: only the UI page, which carries no secrets.
 WEB_PUBLIC_PATHS = frozenset({"/"})
-# The status badge routes, by canonical path. web.badges.public serves them
-# without bearer auth, so a README or wiki can embed them: each badge shows
-# one name and one verdict, and every other route keeps the token gate.
-WEB_BADGE_PATHS = frozenset({"/badge.svg", "/jobs/{name}/badge.svg"})
 
 # Methods the cross-site Origin gate waves through (reads mutate nothing);
 # OPTIONS passes so the /mcp CORS preflight keeps answering.
@@ -513,6 +520,13 @@ WEB_ROUTES: "tuple[tuple[str, str, str, str | None], ...]" = (
     ("GET", "/jobs/{name}/badge.svg", "_web_job_badge", "badges"),
 )
 
+# The status badge routes, by canonical path. web.badges.public serves them
+# without bearer auth, so a README or wiki can embed them: each badge shows
+# one name and one verdict, and every other route keeps the token gate.
+WEB_BADGE_ROUTES = frozenset(
+    path for _method, path, _handler, gate in WEB_ROUTES if gate == "badges"
+)
+
 
 def _effective_web_scopes(scopes: Iterable[str]) -> "frozenset[str]":
     """Expand declared token scopes: ``control`` and ``approve`` imply
@@ -524,15 +538,9 @@ def _effective_web_scopes(scopes: Iterable[str]) -> "frozenset[str]":
 
 
 def _web_public_paths(
-    ui_enabled: bool,
-    metrics_config: dict[str, Any] | None,
-    badges_config: dict[str, Any] | None,
+    ui_enabled: bool, metrics_config: dict[str, Any] | None
 ) -> "frozenset[str]":
-    """The paths and routes an authenticated web app serves without a token.
-
-    Entries are literal paths or canonical route paths; the auth middleware
-    matches both.
-    """
+    """The literal paths an authenticated web app serves without a token."""
     # the UI page is served unauthenticated (it holds no data); the
     # browser then sends the token on every data request.
     public = set(WEB_PUBLIC_PATHS) if ui_enabled else set()
@@ -540,11 +548,18 @@ def _web_public_paths(
         # deliberate operator opt-out for scrapers that cannot send a
         # bearer token; everything else stays gated.
         public.add("/metrics")
+    return frozenset(public)
+
+
+def _web_public_routes(
+    badges_config: dict[str, Any] | None,
+) -> "frozenset[str]":
+    """The routes, by canonical path, served without a token."""
     if badges_config is not None and badges_config["public"]:
         # the operator's opt-in for embedding: image fetchers (GitHub's
-        # camo, a wiki) cannot send a bearer token either.
-        public.update(WEB_BADGE_PATHS)
-    return frozenset(public)
+        # camo, a wiki) cannot send a bearer token.
+        return WEB_BADGE_ROUTES
+    return frozenset()
 
 
 def _route_canonical(request) -> str | None:
@@ -886,13 +901,27 @@ WEB_SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
 }
 
-# The same defense in depth for the SVG status badges, which a browser
-# opens as documents of this origin when someone follows a badge's image
-# URL. A badge holds no script, style sheet, or link, so its policy refuses
-# everything. Operators override these through web.headers as well.
+# The same defense in depth for the SVG status badges. A browser opens a
+# badge as a document of this origin when someone follows its image URL.
+# A badge holds no script, style sheet, or link, so its policy refuses
+# everything. A page on another origin could load a badge as an image, or
+# frame it in an <object> or <embed>, and read the verdict from its size:
+# CORP refuses the image and frame-ancestors the frame. X-Frame-Options
+# refuses the frame when an operator's CSP leaves out frame-ancestors, as
+# on the page. web.headers overrides these too.
 WEB_BADGE_SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'self'",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Cross-Origin-Resource-Policy": "same-origin",
+}
+
+# web.badges.public badges load and frame on any origin (see
+# _badge_response).
+WEB_PUBLIC_BADGE_SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'none'",
     "X-Content-Type-Options": "nosniff",
+    "Cross-Origin-Resource-Policy": "cross-origin",
 }
 
 
@@ -1557,6 +1586,10 @@ _METRICS_RESPONSE_TTL = 1.0
 #: How long one built /fleet product is shared; the payload is peer gossip
 #: already up to a poll interval old, so a further second is invisible.
 _FLEET_RESPONSE_TTL = 1.0
+
+#: How long one fleet badge verdict is shared across requests. Local
+#: changes bust it; the TTL bounds how long an SLA latch can lag.
+_FLEET_BADGE_TTL = 1.0
 
 #: Per-node entry count from which the /fleet serialize/hash/gzip run on
 #: the executor; the merge stays on the loop (live gossip state).
@@ -2304,6 +2337,10 @@ class Cron:
         self._activity_response_memo: _ResponseMemo[
             tuple[str, bytes, bytes | None]
         ] = _ResponseMemo()
+        # the fleet badge's (message, color), a pass over every job
+        self._fleet_badge_memo: _ResponseMemo[tuple[str, str]] = (
+            _ResponseMemo()
+        )
         # /activity under a `jobs` cap: (jobs, sort) -> memo, least
         # recently used first, and how many requests wait on each pair's
         # product (see _activity_capped_memo).
@@ -2347,6 +2384,10 @@ class Cron:
         # long pause floods with synthetic "skipped" rows, so the gate
         # cannot rely on it alone. Must exist before update_config().
         self._last_real_outcome: dict[str, tuple[datetime.datetime, str]] = {}
+        # name -> (finish key, outcome) of the newest run other than a
+        # pause's "skipped" row, for the status badges: a long pause fills
+        # run_history with skipped rows. Must exist before update_config().
+        self._last_real_run: dict[str, tuple[datetime.datetime, str]] = {}
         # name -> (monotonic deadline, payload): trends cache; busted per
         # job by _record_run so it never outlives a locally finished run.
         self._trends_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -2612,6 +2653,11 @@ class Cron:
         # the in-flight housekeeping refresh of the paused/ streams, if any
         # (single-flight; a slow store must not stack refresh passes).
         self._pause_refresh_task: asyncio.Task | None = None
+        # the post-boot pass of badge-only last-run scans, if any (see
+        # _scan_last_real_runs), and the jobs owed one until a web app
+        # serves badges (see _start_last_run_scan).
+        self._last_run_scan_task: asyncio.Task | None = None
+        self._last_run_scan_owed: list[str] = []
         # same ordering guard for the inflight/ stream: a near-instant
         # run's close could sort BEFORE its open, which the next restart
         # would reconcile as a spurious interrupted run.
@@ -2895,7 +2941,8 @@ class Cron:
 
     def _cancel_coordination_tasks(self) -> None:
         """Cancel the launch-adjacent background work: Replace pursuits, the
-        DAG catch-up sleepers, the retry claim scan and the pause refresh.
+        DAG catch-up sleepers, the retry claim scan and the pause refresh;
+        and the boot's last-run scans, which feed only the badges.
 
         All are scoped to the current state backend; the pause refresh is
         cancelled rather than awaited because it mutates the pause gate map,
@@ -2917,6 +2964,10 @@ class Cron:
         if self._pause_refresh_task is not None:
             self._pause_refresh_task.cancel()
             self._pause_refresh_task = None
+        if self._last_run_scan_task is not None:
+            self._last_run_scan_task.cancel()
+            self._last_run_scan_task = None
+        self._last_run_scan_owed = []
 
     async def _sleep_until_wake(self, sleep_interval: float) -> None:
         """Park the run loop until the interval elapses or a wake arrives.
@@ -3325,6 +3376,7 @@ class Cron:
             },
         )
         self._last_real_outcome = _kept(self._last_real_outcome, keep)
+        self._last_real_run = _kept(self._last_real_run, keep)
         self._last_completed_at = _kept(self._last_completed_at, keep)
         # SLA trackers survive a job edit (history did not change); only
         # removed jobs are pruned. A check dropped from a surviving job's
@@ -3552,10 +3604,10 @@ class Cron:
         """Serve ``memo``'s product, building (or joining a build) on a miss.
 
         The ONE memoized-response scaffold (/jobs, /metrics, /fleet,
-        /activity). Single-flight: followers await the leader's future,
-        shielded so a hung-up client cannot cancel the shared build; a
-        failed build resolves the future to None (never set_exception) and
-        the failure propagates only to the builder.
+        /activity, /badge.svg). Single-flight: followers await the
+        leader's future, shielded so a hung-up client cannot cancel the
+        shared build; a failed build resolves the future to None (never
+        set_exception) and the failure propagates only to the builder.
 
         The generation guard closes the bust races: the leader reads
         _memo_gen BEFORE build() and re-checks before storing; a joiner
@@ -3916,7 +3968,8 @@ class Cron:
         to (the app picks its pairing suite from that list). Every shape
         also carries ``instance``, and every shape but the anonymous one
         carries ``listeners``. A terminal pairing client reads both to
-        check whether another address reaches this daemon.
+        check whether another address reaches this daemon. ``badges``
+        tells the dashboards whether to offer the copy-badge commands.
         """
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         # The anonymous grant that serves this request, when no token does.
@@ -3945,6 +3998,7 @@ class Cron:
         payload["pairLinkBase"] = self._web_pair_link_base()
         payload["sealableSuites"] = await push.sealable_suites_async()
         payload["instance"] = self._web_instance
+        payload["badges"] = self._web_badges_payload(request)
         if anon is None:
             # The bind addresses describe the host's network, so an
             # anonymous caller does not get them.
@@ -3953,6 +4007,37 @@ class Cron:
                 for scheme, sockname in self._web_tcp_bound
             ]
         return _json_response(payload, headers=self._web_headers())
+
+    def _web_badges_payload(
+        self, request: web.Request
+    ) -> dict[str, bool] | None:
+        """/whoami's ``badges``, or ``None`` while the badge routes are off.
+
+        ``public`` is web.badges.public: the badge routes skip the token,
+        and pages on other origins can load them (see _badge_response).
+        ``dashboard`` is whether the daemon serves the page that badge
+        Markdown links to.
+        """
+        settings = self._web_app_settings(request)
+        if settings.badges is None:
+            return None
+        return {"public": settings.badges["public"], "dashboard": settings.ui}
+
+    def _web_app_settings(self, request: web.Request) -> WebAppSettings:
+        """The settings of the web app that serves ``request``.
+
+        A reload hands new connections to the new app before it latches
+        web_config, so these come off the app: the badge headers and
+        /whoami then match the routes and auth gate serving the request.
+        A stand-in request, or an app built elsewhere, reads web_config.
+        """
+        from cronstable._webkeys import WEB_APP_SETTINGS, WebAppSettings
+
+        app = getattr(request, "app", None)
+        settings = None if app is None else app.get(WEB_APP_SETTINGS)
+        if settings is None:
+            settings = WebAppSettings.resolve(self.web_config or {})
+        return settings
 
     async def _web_stamp_instance(
         self, request: web.Request, response: web.StreamResponse
@@ -4826,18 +4911,31 @@ class Cron:
         """The word a job's status badge shows (see badge.job_verdict).
 
         Reads the state behind the dashboard's status column and OVERDUE
-        chip, so the badge and the dashboard agree, except that a run in
-        progress leaves the badge on the job's last verdict.
+        chip, except that a run in progress, or a slot a pause held back,
+        leaves the badge on the last run's result.
         """
-        last = self.last_run.get(name)
         return job_verdict(
             enabled=job.enabled,
             paused=self._pause_active(name, now) is not None,
-            outcome=last.outcome if last is not None else None,
+            outcome=self._last_run_outcome(name),
+            # a latch counts only while its check is configured, as in
+            # the payload's sla.state
             overdue=job.has_sla
-            and any((name, check) in self._sla_state for check in SLA_CHECKS),
+            and any(
+                (name, check) in self._sla_state
+                for check, key in SLA_CHECK_KEYS.items()
+                if job.sla.get(key) is not None
+            ),
             running=bool(self._row_instances(name)),
         )
+
+    def _last_run_outcome(self, name: str) -> str | None:
+        """The outcome of ``name``'s last run, or ``None`` if it never ran.
+
+        Passes over the synthetic rows of slots a pause held back.
+        """
+        real = self._last_real_run.get(name)
+        return None if real is None else real[1]
 
     def _badge_response(
         self, request: web.Request, label: str, message: str, color: str
@@ -4869,10 +4967,19 @@ class Cron:
                 headers=self._web_headers(),
             )
         body = render_badge(label, message, color, style).encode("utf-8")
-        # the image's own Content-Type wins, in any spelling: see
-        # _strip_content_type
-        headers = _strip_content_type(
-            self._security_headers(WEB_BADGE_SECURITY_HEADERS)
+        badges = self._web_app_settings(request).badges
+        defaults = (
+            WEB_PUBLIC_BADGE_SECURITY_HEADERS
+            if badges is not None and badges["public"]
+            else WEB_BADGE_SECURITY_HEADERS
+        )
+        # the image's own Content-Type, validator, and cache policy win, in
+        # any spelling: see _strip_headers
+        headers = _strip_headers(
+            self._security_headers(defaults),
+            "content-type",
+            "etag",
+            "cache-control",
         )
         etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
         headers["ETag"] = etag
@@ -4903,13 +5010,20 @@ class Cron:
 
     async def _web_fleet_badge(self, request: web.Request) -> web.Response:
         """The fleet's status badge (``GET /badge.svg``)."""
+        message, color = await self._shared_response_product(
+            self._fleet_badge_memo,
+            _FLEET_BADGE_TTL,
+            self._build_fleet_badge_verdict,
+        )
+        return self._badge_response(request, "cronstable", message, color)
+
+    async def _build_fleet_badge_verdict(self) -> tuple[str, str]:
         # one instant for the whole pass, as jobs_payload reads it
         now = get_now(datetime.timezone.utc)
-        message, color = fleet_message(
+        return fleet_message(
             self._badge_verdict(name, job, now)
             for name, job in self.cron_jobs.items()
         )
-        return self._badge_response(request, "cronstable", message, color)
 
     async def start_job_by_name(self, name: str) -> str | None:
         """Launch a job now (`POST /jobs/{name}/start`, MCP `cron_run_job`).
@@ -5823,22 +5937,31 @@ class Cron:
     ) -> dict[str, str]:
         """Security headers for a document this origin serves.
 
-        Secure ``defaults`` (unless a caller passes its own, the dashboard
-        HTML page's CSP, anti-clickjacking, and nosniff) with any operator
-        ``web.headers`` merged on top, so an operator who deliberately sets
-        one of these (e.g. a relaxed CSP or framing policy) still wins.
+        ``defaults`` (the dashboard page's CSP, anti-clickjacking, and
+        nosniff headers, unless a caller passes its own) with the operator's
+        ``web.headers`` merged on top. An operator header replaces the
+        default of the same name in any spelling, so a deliberately relaxed
+        CSP or framing policy wins.
         """
-        headers = dict(defaults)
         custom = self._web_headers()
-        if custom:
-            headers.update(custom)
+        if not custom:
+            return dict(defaults)
+        headers = _strip_headers(defaults, *(key.lower() for key in custom))
+        headers.update(custom)
         return headers
 
     async def _web_index(self, request: web.Request) -> web.Response:
         raw, etag = _index_document()
-        # the page's own Content-Type wins, in any spelling: see
-        # _strip_content_type
-        headers = _strip_content_type(self._security_headers())
+        # the page's own content type, encoding, validator, and cache
+        # headers win, in any spelling: see _strip_headers
+        headers = _strip_headers(
+            self._security_headers(),
+            "content-type",
+            "content-encoding",
+            "etag",
+            "cache-control",
+            "vary",
+        )
         # a validator a cache or proxy can revalidate against; stable for the
         # life of the process, since the document is package data.
         headers["ETag"] = etag
@@ -6316,6 +6439,7 @@ class Cron:
         for memo in self._metrics_response_memo.values():
             memo.cached = None
         self._fleet_response_memo.cached = None
+        self._fleet_badge_memo.cached = None
         self._activity_response_memo.cached = None
         for capped in self._activity_capped_memos.values():
             capped.cached = None
@@ -7707,9 +7831,14 @@ class Cron:
         # `web_config is not None` is implied by start_wanted; it is repeated
         # so the narrowing survives for the whole start branch below.
         if start_wanted and not tls_failed and web_config is not None:
-            ui_enabled = web_config.get("ui", True)
+            from cronstable._webkeys import WEB_APP_SETTINGS, WebAppSettings
+
+            # one answer for the routes, the auth gate, and the handlers
+            # (see _web_app_settings)
+            settings = WebAppSettings.resolve(web_config)
+            ui_enabled = settings.ui
             metrics_config = resolve_metrics_config(web_config)
-            badges_config = resolve_badges_config(web_config)
+            badges_config = settings.badges
             # Envelope first, so it is outermost and wraps the errors the
             # origin/auth middlewares below raise as well as the router's
             # own 404/405 (see _error_envelope_middleware, which carries its
@@ -7773,14 +7902,14 @@ class Cron:
                 middlewares.append(
                     self._make_auth_middleware(
                         token_table,
-                        _web_public_paths(
-                            ui_enabled, metrics_config, badges_config
-                        ),
+                        _web_public_paths(ui_enabled, metrics_config),
                         anonymous_scopes=anonymous_scopes,
+                        public_routes=_web_public_routes(badges_config),
                     )
                 )
             _gzip.use_for_aiohttp()
             app = web.Application(middlewares=middlewares)
+            app[WEB_APP_SETTINGS] = settings
             # The on_shutdown hook ends this generation's tails at its
             # teardown (see _web_on_shutdown for why cleanup would
             # otherwise stall), and on_cleanup forgets the generation.
@@ -7908,6 +8037,7 @@ class Cron:
         # one even for an ephemeral `:0` listen. Converge is cheap (a
         # signature compare) and never raises.
         await self._bonjour.start_stop(self._bonjour_advert(web_config))
+        self._start_last_run_scan()
 
     def _record_bound_listeners(self, scheme: str, bound_before: int) -> None:
         """File the sockets one just-started site added to the runner.
@@ -8386,6 +8516,11 @@ class Cron:
             if self._pause_refresh_task is not None:
                 self._pause_refresh_task.cancel()
                 self._pause_refresh_task = None
+            # the boot's last-run scans read the old store too
+            if self._last_run_scan_task is not None:
+                self._last_run_scan_task.cancel()
+                self._last_run_scan_task = None
+            self._last_run_scan_owed = []
             await backend.stop()
             self.state_backend = None
             # the loopback job-state API belongs to this backend generation
@@ -9132,9 +9267,12 @@ class Cron:
         tokens,
         public_paths: "frozenset[str]" = frozenset(),
         anonymous_scopes: "frozenset[str]" = frozenset(),
+        public_routes: "frozenset[str]" = frozenset(),
     ):
         # A bare string is a single all-scopes token (callers/tests rely
-        # on this).
+        # on this). public_paths holds literal paths ("/"); public_routes
+        # holds canonical route paths ("/jobs/{name}/badge.svg"), each
+        # covering every path its route matches.
         if isinstance(tokens, str):
             tokens = [
                 _WebToken(tokens.encode("utf-8"), _WEB_ALL_SCOPES, "authToken")
@@ -9143,13 +9281,9 @@ class Cron:
 
         @web.middleware
         async def auth_middleware(request, handler):
-            # A public entry names a literal path ("/") or a route by its
-            # canonical path ("/jobs/{name}/badge.svg"), which covers every
-            # job the route serves.
-            if public_paths and (
-                request.path in public_paths
-                or _route_canonical(request) in public_paths
-            ):
+            if public_paths and request.path in public_paths:
+                return await handler(request)
+            if public_routes and _route_canonical(request) in public_routes:
                 return await handler(request)
             # CORS preflights pass without a token: the Fetch standard
             # strips credentials from them, and a preflight response
@@ -12946,15 +13080,19 @@ class Cron:
         ``run_history`` is appended to unconditionally: it is a bounded
         display ring, and dropping or re-sorting rows here would hide the
         interrupted run the reconcile exists to surface.
+
+        ``_last_real_run`` takes the same fold over every row except a
+        pause's ``skipped`` one.
         """
         self.run_history[name].append(info)
+        key = _run_finish_key(info)
         prev = self.last_run.get(name)
-        if (
-            prev is None
-            or promote
-            or _run_finish_key(info) >= _run_finish_key(prev)
-        ):
+        if prev is None or promote or key >= _run_finish_key(prev):
             self.last_run[name] = info
+        if info.outcome != "skipped":
+            real = self._last_real_run.get(name)
+            if real is None or promote or key >= real[0]:
+                self._last_real_run[name] = (key, info.outcome)
         self._bust_response_memos()
 
     @staticmethod
@@ -13328,6 +13466,100 @@ class Cron:
         if seen:
             self._sla_last_success.setdefault(name, min(seen))
 
+    async def _warm_last_real_run_beyond_history(self, name: str) -> bool:
+        """Find the last real run when pause skips fill the warmed window.
+
+        A job paused across a restart can warm only ``skipped`` records,
+        which would leave its badge on ``pending``. Re-read deeper once,
+        stopping at the first real runs. setdefault, so a live run recorded
+        mid-await wins. A store error or timeout leaves the badge on
+        ``pending``. Returns False when the read timed out.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return True
+        # a timed-out scan keeps reading on the store's worker thread, so
+        # the depth has a fixed cap whatever the retention
+        limit = (
+            LAST_RUN_SCAN_LIMIT
+            if self._state_max_runs <= 0
+            else min(
+                max(SLA_SUCCESS_SCAN_LIMIT, self._state_max_runs),
+                LAST_RUN_SCAN_LIMIT,
+            )
+        )
+        try:
+            recs = await asyncio.wait_for(
+                backend.list_records(
+                    self._run_stream(name),
+                    limit=limit,
+                    newest_first=True,
+                    predicate=lambda rec: rec.get("outcome") != "skipped",
+                    # a few, since appends can land out of finish order
+                    max_matches=RUN_HISTORY_LIMIT,
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except Exception as ex:  # noqa: BLE001 - the badge reads pending
+            logger.warning(
+                "state: cannot widen the last-run scan for %s: %s",
+                name,
+                str(ex) or type(ex).__name__,
+            )
+            return not isinstance(ex, (asyncio.TimeoutError, TimeoutError))
+        reals = [
+            info
+            for info in (_job_run_info_from_dict(r) for r in recs)
+            if info is not None and info.outcome != "skipped"
+        ]
+        # a reload during the read can drop the job
+        if reals and name in self.cron_jobs:
+            newest = max(reals, key=_run_finish_key)
+            self._last_real_run.setdefault(
+                name, (_run_finish_key(newest), newest.outcome)
+            )
+        return True
+
+    def _start_last_run_scan(self) -> None:
+        """Start the owed last-run scans once a web app serves badges.
+
+        The badges are the scans' only reader. start_stop_web_app calls
+        this on every pass, so badges turned on by a reload start them.
+        """
+        if not self._last_run_scan_owed or not self._serves_badges():
+            return
+        names, self._last_run_scan_owed = self._last_run_scan_owed, []
+        if self._last_run_scan_task is not None:
+            self._last_run_scan_task.cancel()
+        self._last_run_scan_task = self._track_state_write(
+            self._scan_last_real_runs(names)
+        )
+
+    def _serves_badges(self) -> bool:
+        """Whether the running web app serves the badge routes."""
+        return (
+            self.web_runner is not None
+            and self.web_config is not None
+            and resolve_badges_config(self.web_config) is not None
+        )
+
+    async def _scan_last_real_runs(self, names: list[str]) -> None:
+        """Run the deeper last-run scans that the boot warm-up deferred.
+
+        One scan at a time, ending at the first timeout: a timed-out scan
+        holds its store worker thread and bulk slot until the read
+        finishes, so this pass holds at most one slot.
+        """
+        for name in names:
+            if name in self._last_real_run or name not in self.cron_jobs:
+                continue
+            if not await self._warm_last_real_run_beyond_history(name):
+                logger.warning(
+                    "state: skipping the rest of the last-run scans "
+                    "(store slow?)"
+                )
+                return
+
     async def _seed_stale_reference(
         self, name: str, history: Iterable[JobRunInfo]
     ) -> None:
@@ -13364,19 +13596,32 @@ class Cron:
         status surfaces are correct from the first scrape. Bypasses
         _record_run deliberately: rehydration must not re-emit counters
         or re-persist what it just read. Poison records are skipped,
-        never fatal. Reads via the bounded boot-scan pool.
+        never fatal. Reads via the bounded boot-scan pool. A job whose
+        warmed rows are all pause skips gets its last real run from one
+        background pass after the boot steps, while a web app serves
+        badges (_start_last_run_scan).
         """
         backend = self.state_backend
         if backend is None or self._state_rehydrated:
             return
         self._state_rehydrated = True
+        # jobs owed a deeper last-run scan; it runs after the boot steps,
+        # since timed-out scans hold bulk slots the boot reads need
+        deeper: list[str] = []
 
-        async def _warm_one(name: str, _job: JobConfig) -> str | None:
+        async def _keep_live_history(name: str) -> None:
             # existing in-memory history stays the source of truth, but
             # the staleness reference is still seeded from it (a job that
-            # only FAILED during a state outage must not re-baseline).
+            # only FAILED during a state outage must not re-baseline), and
+            # when it holds only pause skips (a job paused while the store
+            # was down) the badge's last run comes from the ledger.
+            await self._seed_stale_reference(name, self.run_history[name])
+            if name not in self._last_real_run:
+                deeper.append(name)
+
+        async def _warm_one(name: str, _job: JobConfig) -> str | None:
             if self.run_history.get(name):
-                await self._seed_stale_reference(name, self.run_history[name])
+                await _keep_live_history(name)
                 return None
             try:
                 recs = await asyncio.wait_for(
@@ -13400,7 +13645,7 @@ class Cron:
                 # a run finished while we awaited the read: the live run
                 # is fresher; appending old records would regress
                 # last_run and scramble history order.
-                await self._seed_stale_reference(name, self.run_history[name])
+                await _keep_live_history(name)
                 return None
             # oldest-first: the stable sort below then keeps stream order
             # as the equal-instant tiebreak, matching a live node's
@@ -13429,6 +13674,12 @@ class Cron:
             # maxTimeSinceSuccess must page from the REAL last success,
             # not re-baseline on process start.
             await self._seed_stale_reference(name, history)
+            # a short first read already holds the whole stream
+            if (
+                len(recs) >= RUN_HISTORY_LIMIT
+                and name not in self._last_real_run
+            ):
+                deeper.append(name)
             # and the onlyIfLastSucceeded memo: a pause across the
             # restart can fill the warmed ring with "skipped" rows. By
             # finished_at, not position (unserialized writes): the
@@ -13487,6 +13738,8 @@ class Cron:
         # analogue of _reconcile_inflight); resumed from that state,
         # never from memory.
         await self._dag.reconcile_on_boot()
+        self._last_run_scan_owed = deeper
+        self._start_last_run_scan()
 
     async def _rehydrate_counters(self) -> None:
         """Seed the Prometheus accumulators from the newest durable snapshot.

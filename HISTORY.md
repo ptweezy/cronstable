@@ -2,20 +2,19 @@
 
 ## 1.2.67
 
-- The HTTP API serves SVG status badges for a README, a wiki page, or a home
-  dashboard. `GET /jobs/{name}/badge.svg` shows a job's name and its verdict,
-  such as `passing`, `failing`, `overdue`, or `paused`. `GET /badge.svg`
-  counts the jobs in the most urgent state, such as `2 failing`. The `label`
-  query parameter replaces the left-hand text, and `style` picks `flat` or
-  `flat-square`.
-- The `web.badges` option controls the badge routes, which are on by default.
-  `web.badges.public: true` serves both routes without the bearer token, so
-  that a page that embeds a badge can load the image, and every other route
-  still requires the token. `web.badges: false` turns the routes off.
-- The command palettes of the web and terminal dashboards have a
-  "Copy badge Markdown" entry for each job and a "Copy fleet badge Markdown"
-  entry. Each one copies Markdown that embeds the badge and links it to the
-  dashboard.
+- The daemon serves status badges for READMEs, wikis, and home dashboards.
+  `GET /jobs/{name}/badge.svg` shows a job's verdict, such as `passing` or
+  `failing`, and `GET /badge.svg` counts the jobs in the most urgent state,
+  such as `2 failing`.
+- Badges are on by default. A page on another site can load them straight
+  from the daemon only with `web.badges.public: true`, which also serves
+  them without the access token. `web.badges: false` turns them off.
+- The web and terminal dashboards can copy a badge's Markdown from the
+  command palette.
+- A dashboard link to a job or a DAG, such as `/#job/nightly-backup`, opens
+  its drawer after you save an access token.
+- A `web.headers` entry replaces the dashboard page's default header of the
+  same name in any letter case.
 
 ## 1.2.66
 

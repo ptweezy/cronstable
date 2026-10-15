@@ -57,7 +57,7 @@ from typing import (
 )
 
 from cronstable import _cliargs
-from cronstable.badge import badge_markdown
+from cronstable.badge import badge_addressable, badge_markdown
 from cronstable.cronexpr import LOCAL_ZONE, CronTab
 from cronstable.croninfo import (
     Finding,
@@ -3267,6 +3267,15 @@ class App:
         self.fetched_mono = 0.0  # monotonic stamp of the last good /jobs
         self.version = ""
         self.job_set_id = ""
+        # /whoami's badges: None until a daemon that serves them says so.
+        # Read on the first good poll after start, a token change, a failed
+        # poll, or a minute since the last read (polls keep succeeding
+        # across a reload that changes web.badges), and on each poll until
+        # a read succeeds.
+        self.badges: dict[str, Any] | None = None
+        self._badges_due = True
+        self._badges_read = 0.0  # monotonic stamp of the last /whoami read
+        self._badges_busy = False  # a /whoami read in flight
         self.cluster: dict[str, Any] | None = None
         self.fleet: dict[str, Any] | None = None
         self.dags: list[dict[str, Any]] = []
@@ -3443,6 +3452,7 @@ class App:
                 str,
                 list[dict[str, Any]],
                 list[dict[str, Any]],
+                bool,
                 bool,
                 list[_PaletteRow],
             ]
@@ -3770,6 +3780,43 @@ class App:
         with contextlib.suppress(Exception):
             await self._load_dags()
 
+    async def _load_badges(self) -> bool:
+        """Read whether the daemon serves status badges (``/whoami``).
+
+        A daemon with ``web.badges: false``, or one older than the badges,
+        sends no ``badges`` object, and the palette hides its copy-badge
+        rows. Returns whether the read succeeded; a failed one keeps the
+        last answer.
+        """
+        try:
+            whoami = await self.api.get_json("/whoami")
+        except ApiError as exc:
+            if exc.status >= 500:
+                return False
+            # a daemon or proxy that does not serve /whoami serves no badges
+            self.badges = None
+            return True
+        except Exception:  # noqa: BLE001 - the next poll reads it again
+            return False
+        badges = whoami.get("badges") if isinstance(whoami, dict) else None
+        self.badges = badges if isinstance(badges, dict) else None
+        return True
+
+    async def _read_badges(self) -> None:
+        """Run :meth:`_load_badges` as the one read in flight.
+
+        ``_poll_once`` spawns it beside the fan-out. A failed read marks
+        the badges due again. Success leaves ``_badges_due`` as it is, so
+        a token change or failed poll during the read still gets a fresh
+        read.
+        """
+        try:
+            if not await self._load_badges():
+                self._badges_due = True
+            self.mark()
+        finally:
+            self._badges_busy = False
+
     # ---------------------------------------------------------------
     #  background loops
     # ---------------------------------------------------------------
@@ -3842,6 +3889,7 @@ class App:
             self.connected = False
             self.conn_error = "unauthorized"
             self._mark_signal(False)
+            self._badges_due = True
             if not self.is_open("token"):
                 self.open("token")
                 self.focus = "token"
@@ -3851,6 +3899,8 @@ class App:
             self.connected = False
             self.conn_error = str(exc) or exc.__class__.__name__
             self._mark_signal(False)
+            # the daemon may come back with another web.badges setting
+            self._badges_due = True
             self.mark()
             return
         first = self.fetched_mono == 0.0
@@ -3862,6 +3912,15 @@ class App:
         self.fetched_mono = time.monotonic()
         self._fleet_sound(first)
         self.recompute_view()
+        if not self._badges_busy and (
+            self._badges_due or time.monotonic() - self._badges_read > 60
+        ):
+            # spawned, never awaited: a stalled /whoami must not hold up
+            # the fan-out and the verdict below
+            self._badges_busy = True
+            self._badges_due = False
+            self._badges_read = time.monotonic()
+            self._spawn(self._read_badges())
         # verdict rides the cluster alert; /cluster is refreshed in the
         # same fan-out the web page does on every successful poll
         await self._fanout()
@@ -5005,10 +5064,16 @@ class AppPalette(AppActions):
             ("▮", "Toggle startup checks", self._toggle_boot),
             ("❏", "Copy version", lambda: self._copy_chip(self.version)),
             ("❏", "Copy job-set ID", lambda: self._copy_chip(self.job_set_id)),
-            (
-                "❏",
-                "Copy fleet badge Markdown",
-                lambda: self._copy_badge_markdown(None),
+            *(
+                [
+                    (
+                        "❏",
+                        "Copy fleet badge Markdown",
+                        lambda: self._copy_badge_markdown(None),
+                    )
+                ]
+                if self.badges is not None
+                else []
             ),
             ("⚙", "Open settings", lambda: self.open("settings")),
             ("?", "Keyboard shortcuts", lambda: self.open("help")),
@@ -5086,13 +5151,14 @@ class AppPalette(AppActions):
                     functools.partial(self._copy_job_command, name),
                 )
             )
-            out.append(
-                (
-                    "❏",
-                    "Copy badge Markdown: %s" % name,
-                    functools.partial(self._copy_badge_markdown, name),
+            if self.badges is not None and badge_addressable(name):
+                out.append(
+                    (
+                        "❏",
+                        "Copy badge Markdown: %s" % name,
+                        functools.partial(self._copy_badge_markdown, name),
+                    )
                 )
-            )
             out.append(
                 (
                     "◴",
@@ -5134,13 +5200,15 @@ class AppPalette(AppActions):
 
         One build serves the key handler and every frame the palette is
         open: the rows are a pure function of the query, the two payload
-        lists (swapped wholesale per poll) and the glyph set, and each
-        action reads app state when invoked, not when built.  The slot
-        pins both lists, so a recycled id cannot validate a stale entry.
+        lists (swapped wholesale per poll), the glyph set, and whether the
+        daemon serves badges, and each action reads app state when
+        invoked, not when built.  The slot pins both lists, so a recycled
+        id cannot validate a stale entry.
         """
         query = self.inputs["palette"].strip()
         jobs, dags = self.jobs, self.dags
         ascii_mode = bool(self.prefs["ascii"])
+        badges = self.badges is not None
         cached = self._palette_memo
         if (
             cached is not None
@@ -5148,8 +5216,9 @@ class AppPalette(AppActions):
             and cached[1] is jobs
             and cached[2] is dags
             and cached[3] == ascii_mode
+            and cached[4] == badges
         ):
-            return cached[4]
+            return cached[5]
         scored: list[tuple[int, tuple[str, str, Callable[[], Any]]]] = []
         for icon, label, action in self.palette_commands():
             score = fuzzy(query, label)
@@ -5163,7 +5232,7 @@ class AppPalette(AppActions):
                 60, scored, key=lambda pair: pair[0]
             )
         ]
-        self._palette_memo = (query, jobs, dags, ascii_mode, matches)
+        self._palette_memo = (query, jobs, dags, ascii_mode, badges, matches)
         return matches
 
     # small palette helpers -------------------------------------------
@@ -5239,8 +5308,27 @@ class AppPalette(AppActions):
 
         ``name`` picks one job's badge, and ``None`` the fleet's.
         """
-        copy_to_clipboard(self.term, badge_markdown(self.api.url, name))
-        self.toast("ok", "❏ copied badge Markdown")
+        from cronstable import pairlink
+
+        badges = self.badges or {}
+        try:
+            # the Markdown goes into a README, so it must not carry the
+            # credentials in --url
+            base = pairlink.base_url(self.api.url)
+        except ValueError:
+            self.toast("fail", "copy badge Markdown: --url is not http(s)")
+            return
+        link = bool(badges.get("dashboard", True))
+        copy_to_clipboard(self.term, badge_markdown(base, name, link=link))
+        # a page elsewhere shows only public badges, so name the setting;
+        # at most 40 cells, the toast width on an 80-column terminal
+        public = bool(badges.get("public"))
+        self.toast(
+            "ok",
+            "❏ copied badge Markdown"
+            if public
+            else "❏ copied; embeds need web.badges.public",
+        )
 
     def _open_token(self) -> None:
         self.open("token")
@@ -5444,6 +5532,8 @@ class AppKeys(AppPalette):
             self.close("token")
             self.focus = None
             self.toast("ok", "⚿ token %s" % ("set" if value else "cleared"))
+            # a token-gated /whoami answers only now
+            self._badges_due = True
             self.refresh_now()
             self._start_unauthorized_streams()
             if self.is_open("pair"):

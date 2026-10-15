@@ -8069,6 +8069,14 @@ var qrcode = function() {
   //  data loading + notifications
   // ===================================================================
   let refreshing = false;
+  // Set by a token change: the first good /jobs after it opens the hash's
+  // deep link, which a 401 at boot left unopened (a badge's #job/<name>).
+  let hashPending = false;
+  // Polls keep succeeding across a daemon reload that changes the scopes,
+  // web.badges or web.ui, so a good poll re-reads /whoami once this long
+  // has passed since the last read, and after a lost connection.
+  const WHOAMI_REFRESH_MS = 60000;
+  let whoamiAt = 0;   // performance.now() when loadWhoami last read
   // One in-flight request per secondary poll endpoint. Every secondary
   // loader is fired without awaiting, so a daemon slower than the poll
   // interval accumulated one more overlapping request per cycle against
@@ -8123,6 +8131,7 @@ var qrcode = function() {
       }
       const jobs = state.jobs;
       state.respondedAt = performance.now();
+      const recovered = state.connected === false;
       setConnected(true);
       const first = !state.seenFirst;
       maybeNotify(jobs);
@@ -8144,7 +8153,15 @@ var qrcode = function() {
       loadDags();
       loadState();
       loadPools();
+      if (recovered || performance.now() - whoamiAt >= WHOAMI_REFRESH_MS) loadWhoami();
       if (state.drawerJob) { renderDrawerMeta(); maybeReattachDrawerStream(); }
+      if (hashPending) {
+        // an open drawer or the wallboard already owns the hash; any other
+        // overlay holds the link until the first poll after it closes
+        const drawerUp = state.drawerJob || (state.dagDrawer && state.dagDrawer.dag);
+        if (drawerUp || state.wallboard) hashPending = false;
+        else if (!activeSurface()) { hashPending = false; openFromHash(); }
+      }
     } catch (e) {
       if (e.message !== "unauthorized") { setConnected(false); console.warn("loadJobs failed:", e); }
     } finally {
@@ -9468,6 +9485,7 @@ var qrcode = function() {
     // verb that can only answer 403 is a worse experience than not
     // listing it.
     const ctl = canControl();
+    const badges = badgesServed();
     return [
       { ic: "↻", lbl: "Refresh now", hint: "g", run: loadJobs },
       ...(ctl ? [{ ic: "▶", lbl: "Run all failing jobs", run: runAllFailing }] : []),
@@ -9504,7 +9522,7 @@ var qrcode = function() {
       // mouse-only spans -- the palette keeps both reachable by keyboard
       { ic: "❏", lbl: "Copy version", run: () => { const v = $("ver").textContent; if (v) copyText(v, "version"); } },
       { ic: "❏", lbl: "Copy job-set ID", run: () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job-set ID"); } },
-      { ic: "❏", lbl: "Copy fleet badge Markdown", run: () => copyText(badgeMarkdown(null), "badge Markdown") },
+      ...(badges ? [{ ic: "❏", lbl: "Copy fleet badge Markdown", run: () => copyBadgeMarkdown(null) }] : []),
       { ic: "⚙", lbl: "Open settings", run: openSettings },
       { ic: "?", lbl: "Keyboard shortcuts", hint: "?", run: openHelp },
       { ic: "⚿", lbl: "Set access token", run: () => openModal() },
@@ -9516,20 +9534,47 @@ var qrcode = function() {
   }
   // Markdown that embeds a status badge (wiki: Status Badges) and links it
   // to this dashboard: one job's badge, which opens that job's drawer, or
-  // the fleet's when name is null. The terminal dashboard builds the same
-  // text (badge.badge_markdown). enc() also encodes the !'()* that
-  // encodeURIComponent leaves, so a ")" in a name cannot end the link.
+  // the fleet's when name is null. A daemon that serves no dashboard
+  // (/whoami's badges.dashboard) gets the bare image. The terminal
+  // dashboard builds the same text (badge.badge_markdown). enc() also
+  // encodes the !'()* that encodeURIComponent leaves, so a ")" in a name
+  // cannot end the link. The alt text turns each of Python's
+  // str.splitlines boundaries into a space (CRLF counts as one; \p{Zl}
+  // and \p{Zp} are U+2028 and U+2029), then escapes the characters that
+  // Markdown reads as syntax there (badge._ALT_SYNTAX). An underscore
+  // between two letters or digits opens no emphasis, so it stays bare.
   function badgeMarkdown(name) {
     const enc = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
     const base = location.origin;
-    const alt = (name == null ? "cronstable" : name).replace(/[\\[\]]/g, "\\$&");
+    const word = (c) => /[A-Za-z0-9]/.test(c);
+    const alt = (name == null ? "cronstable" : name)
+      .replace(/\r\n|[\n\v\f\r\x1c-\x1e\x85\p{Zl}\p{Zp}]/gu, " ")
+      .replace(/[\\[\]`*_|<&~^]/g, (c, i, s) => (c === "_" && word(s.charAt(i - 1)) && word(s.charAt(i + 1)) ? c : "\\" + c));
     const image = name == null ? "/badge.svg" : "/jobs/" + enc(name) + "/badge.svg";
     const link = name == null ? "/" : "/#job/" + enc(name);
-    return "[![" + alt + "](" + base + image + ")](" + base + link + ")";
+    const embed = "![" + alt + "](" + base + image + ")";
+    const badges = state.auth && state.auth.badges;
+    if (badges && badges.dashboard === false) return embed;
+    return "[" + embed + "](" + base + link + ")";
+  }
+  // /whoami's badges is null, or absent on an older daemon, while the
+  // daemon serves no badges, so the copy commands would link a 404.
+  function badgesServed() { return !!(state.auth && state.auth.badges); }
+  // No URL reaches the badge of a job named "", "." or ".." (a browser
+  // resolves those segments), or one holding "{" or "}", which the
+  // route's {name} never matches (badge.badge_addressable).
+  function badgeAddressable(name) {
+    return name !== "" && name !== "." && name !== ".." && !/[{}]/.test(name);
+  }
+  function copyBadgeMarkdown(name) {
+    // a page elsewhere shows only public badges, so name the setting
+    const pub = !!(state.auth && state.auth.badges && state.auth.badges.public);
+    copyText(badgeMarkdown(name), pub ? "badge Markdown" : "badge Markdown; embeds need web.badges.public");
   }
   function jobCommands() {
     const out = [];
     const ctl = canControl();   // same scope rule as the row buttons
+    const badges = badgesServed();
     for (const j of state.jobs) {
       out.push({ ic: GLYPH[health(j).key], lbl: "Logs: " + j.name, sub: "open", run: () => openDrawer(j.name, "logs") });
       if (ctl && j.enabled && !j.running) out.push({ ic: "▶", lbl: "Run: " + j.name, run: () => runJob(j.name) });
@@ -9537,7 +9582,7 @@ var qrcode = function() {
       if (ctl && j.paused) out.push({ ic: "▶", lbl: "Resume: " + j.name, run: () => resumeJob(j.name) });
       else if (ctl) out.push({ ic: "⏸", lbl: "Pause: " + j.name, run: () => pauseJob(j.name) });
       out.push({ ic: "❏", lbl: "Copy command: " + j.name, run: () => copyText(j.command, "command") });
-      out.push({ ic: "❏", lbl: "Copy badge Markdown: " + j.name, run: () => copyText(badgeMarkdown(j.name), "badge Markdown") });
+      if (badges && badgeAddressable(j.name)) out.push({ ic: "❏", lbl: "Copy badge Markdown: " + j.name, run: () => copyBadgeMarkdown(j.name) });
       out.push({ ic: "◴", lbl: "Schedule: " + j.name, run: () => openDrawer(j.name, "schedule") });
       out.push({ ic: "≋", lbl: "Tail: " + j.name, sub: "live logs", run: () => openTail([j.name]) });
     }
@@ -9820,6 +9865,7 @@ var qrcode = function() {
     pairSeq++;
     $("pairPayload").textContent = "";
     $("pairQr").textContent = "";
+    hashPending = true;
     updateAuthBtn(); closeModal(); loadWhoami(); loadJobs();
   }
 
@@ -11526,13 +11572,27 @@ var qrcode = function() {
   // Which scopes this browser holds: an anonymous public-view grant, a
   // scoped token, or everything. Resolves before the first jobs render so
   // the first paint already shows the right affordances; re-runs whenever
-  // the stored token changes.
+  // the stored token changes, and loadJobs re-runs it (WHOAMI_REFRESH_MS).
+  // Only a change to the fields the chrome reads repaints, since
+  // applyScopeChrome's DAG card rebuild drops the focus from a button in
+  // the card. Nodes behind one load balancer each send their own
+  // instance and listeners.
+  const scopeKey = (a) => JSON.stringify(a && [a.authenticated, a.allScopes, a.scopes]);
   function loadWhoami() {
     return singleFlight("whoami", async () => {
-      try {
-        const r = await apiFetch("/whoami");
-        if (r.ok) state.auth = await r.json();
-      } catch (_) { /* a 401 already opened the token modal; keep prior scopes */ }
+      whoamiAt = performance.now();
+      const prior = scopeKey(state.auth);
+      // a token saved during the read joins this flight, so read until the
+      // answer is the stored token's
+      let sent;
+      do {
+        sent = token();
+        try {
+          const r = await apiFetch("/whoami");
+          if (r.ok) state.auth = await r.json();
+        } catch (_) { /* a 401 already opened the token modal; keep prior scopes */ }
+      } while (sent !== token());
+      if (scopeKey(state.auth) === prior) return;
       updateAuthBtn();
       applyScopeChrome();
     });

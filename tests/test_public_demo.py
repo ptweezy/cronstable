@@ -15,6 +15,7 @@ from cronstable.config import (
     ConfigError,
     parse_config_file,
     parse_config_string,
+    resolve_badges_config,
 )
 from cronstable.cron import WEB_ROUTES, Cron, _error_envelope_middleware
 from tests._configs import DISABLED_JOB
@@ -91,6 +92,15 @@ async def demo_http():
             return web.Response(
                 status=302, headers={"Location": "http://untrusted.example"}
             )
+        if request.path.endswith("/badge.svg"):
+            return web.Response(
+                text="<svg/>",
+                content_type="image/svg+xml",
+                headers={
+                    "Content-Security-Policy": "default-src 'none'",
+                    "Cross-Origin-Resource-Policy": "cross-origin",
+                },
+            )
         if request.path == "/summary":
             if request.headers.get("If-None-Match") == '"summary"':
                 return web.Response(status=304, headers={"ETag": '"summary"'})
@@ -130,6 +140,23 @@ async def demo_http():
         async with TestClient(TestServer(gateway.application())) as client:
             yield client, gateway, now, state, seen, daemon
         state["stream_release"].set()
+
+
+@pytest.mark.parametrize("path", ["/badge.svg", "/jobs/sample/badge.svg"])
+async def test_badges_the_dashboard_offers_are_served(demo_http, path):
+    # the daemon's /whoami tells the dashboard it serves badges, so the
+    # Markdown its palette copies must load through the gateway
+    client, gateway, now, state, seen, daemon = demo_http
+    whoami = await (await client.get("/whoami")).json()
+    assert whoami["badges"] is not None
+    response = await client.get(path)
+    assert response.status == 200
+    assert response.content_type == "image/svg+xml"
+    assert response.headers["Content-Security-Policy"] == "default-src 'none'"
+    # a page that requires CORP on what it embeds loads the public badge
+    assert response.headers["Cross-Origin-Resource-Policy"] == "cross-origin"
+    assert seen[-1][1] == path
+    assert seen[-1][2]["Authorization"] == "Bearer public"
 
 
 async def test_dashboard_can_poll_resource_pools(demo_http):
@@ -528,6 +555,13 @@ def test_example_monitors_resources_by_default():
     assert all(
         t.job_template.monitorResources for d in config.dags for t in d.tasks
     )
+
+
+def test_example_badges_are_public():
+    # Public badges load on any site, through the gateway too; /whoami
+    # must say so, or the copy toast asks for web.badges.public.
+    config = parse_config_file(str(DEMO / "cronstable.yaml"))
+    assert resolve_badges_config(config.web_config) == {"public": True}
 
 
 def test_policy_edit_invalidates_gateway(tmp_path):

@@ -66,8 +66,9 @@ depend on `config`, `leadership`, and `backends._common`;
 `backends.filesystem` also depends on `state` and `platform`, because it
 embeds a private `FilesystemStateBackend` as its lease store. `config.py` has no dependency on `cron.py` or `job.py`.
 
-`prometheus.py` imports only `cronstable.version` and `cronstable.cronexpr` at
-module scope, `cron.py` imports it, and its renderer late-imports
+`prometheus.py` imports `cronstable.version`, `cronstable.config`, and
+`cronstable.cronexpr` at module scope, `cron.py` imports it, and its renderer
+late-imports
 `cronstable.cron` helpers at scrape time to break the cycle.
 `platform.py` is a leaf module with no cronstable dependencies, imported by
 `__main__`, `config`, `cron`, and `job` wherever per-OS behavior is needed.

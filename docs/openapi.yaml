@@ -1027,8 +1027,10 @@ paths:
         The message counts the jobs whose own badges show the most urgent of
         `failing`, `overdue`, and `passing`, in that order. It reads
         `no status` when no job shows one of the three, and `no jobs` when
-        none is configured. Registered unless `web.badges: false`, and exempt
-        from the bearer token when `web.badges.public: true`. Supports
+        none is configured. The count reads the jobs as the serving node
+        sees them, not the cluster-wide `/fleet` view. Registered unless
+        `web.badges: false`. With `web.badges.public: true`, exempt from
+        the bearer token and loadable by pages on any origin. Supports
         `ETag` / `If-None-Match` (304).
       security:
         - bearerAuth: []
@@ -1042,12 +1044,27 @@ paths:
           description: The badge image.
           headers:
             ETag: { $ref: "#/components/headers/ETag" }
+            Content-Security-Policy:
+              $ref: "#/components/headers/BadgeContentSecurityPolicy"
+            X-Frame-Options:
+              $ref: "#/components/headers/BadgeFrameOptions"
+            Cross-Origin-Resource-Policy:
+              $ref: "#/components/headers/BadgeResourcePolicy"
           content:
             image/svg+xml:
               schema: { type: string }
-        "304": { description: Not modified (matching `If-None-Match`). }
+        "304":
+          description: Not modified (matching `If-None-Match`).
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Content-Security-Policy:
+              $ref: "#/components/headers/BadgeContentSecurityPolicy"
+            X-Frame-Options:
+              $ref: "#/components/headers/BadgeFrameOptions"
+            Cross-Origin-Resource-Policy:
+              $ref: "#/components/headers/BadgeResourcePolicy"
         "400":
-          description: A blank, overlong, or unprintable `label`, or an unknown `style`.
+          description: A blank or overlong `label`, one with a control character or line break, or an unknown `style`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1061,11 +1078,15 @@ paths:
       description: >-
         An SVG badge that shows the job's name beside its verdict: `passing`,
         `failing`, `overdue` (an SLA check is in breach), `paused`,
-        `disabled`, `cancelled`, `skipped`, `unknown`, `running` (the job's
-        first run is in progress), or `pending` (the job has no run yet). A
-        later run in progress leaves the last verdict in place. Registered
-        unless `web.badges: false`, and exempt from the bearer token when
-        `web.badges.public: true`. Supports `ETag` / `If-None-Match` (304).
+        `disabled`, `cancelled`, `unknown`, `running` (a run is in progress
+        and the daemon has no earlier run of the job on record), or
+        `pending` (the daemon has no record of a run of the job). When a
+        run is on record, a run in progress or a slot that a pause held
+        back leaves the last run's verdict in place. The verdict reads the
+        runs that the serving node has on record. Registered unless
+        `web.badges: false`. With `web.badges.public: true`, exempt from
+        the bearer token and loadable by pages on any origin. Supports
+        `ETag` / `If-None-Match` (304).
       security:
         - bearerAuth: []
         - {}
@@ -1079,12 +1100,27 @@ paths:
           description: The badge image.
           headers:
             ETag: { $ref: "#/components/headers/ETag" }
+            Content-Security-Policy:
+              $ref: "#/components/headers/BadgeContentSecurityPolicy"
+            X-Frame-Options:
+              $ref: "#/components/headers/BadgeFrameOptions"
+            Cross-Origin-Resource-Policy:
+              $ref: "#/components/headers/BadgeResourcePolicy"
           content:
             image/svg+xml:
               schema: { type: string }
-        "304": { description: Not modified (matching `If-None-Match`). }
+        "304":
+          description: Not modified (matching `If-None-Match`).
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Content-Security-Policy:
+              $ref: "#/components/headers/BadgeContentSecurityPolicy"
+            X-Frame-Options:
+              $ref: "#/components/headers/BadgeFrameOptions"
+            Cross-Origin-Resource-Policy:
+              $ref: "#/components/headers/BadgeResourcePolicy"
         "400":
-          description: A blank, overlong, or unprintable `label`, or an unknown `style`.
+          description: A blank or overlong `label`, one with a control character or line break, or an unknown `style`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1196,7 +1232,8 @@ paths:
         suites this daemon can seal push alerts under. Every shape also
         carries `instance`, which identifies the daemon. `listeners`, the
         daemon's bound TCP listeners, is in every shape except the
-        `web.anonymousScopes` one.
+        `web.anonymousScopes` one. `badges` says whether the daemon serves
+        the status badges, and whether they're public.
       responses:
         "200":
           description: The matched token's identity.
@@ -1811,8 +1848,8 @@ components:
       required: false
       description: >-
         Text that replaces the badge's left half, which otherwise shows the
-        job's name, or `cronstable` on the fleet badge. 1 to 64 printable
-        characters.
+        job's name, or `cronstable` on the fleet badge. 1 to 64 characters,
+        with no control characters or line breaks.
       schema: { type: string, minLength: 1, maxLength: 64 }
     BadgeStyle:
       name: style
@@ -1820,7 +1857,8 @@ components:
       required: false
       description: >-
         `flat`, with rounded corners and a soft gradient, or `flat-square`,
-        with square corners and no gradient.
+        with square corners and no gradient. An empty value takes the
+        default.
       schema: { type: string, enum: [flat, flat-square], default: flat }
     DeviceId:
       name: id
@@ -1832,6 +1870,28 @@ components:
   headers:
     ETag:
       description: A content hash for conditional `If-None-Match` requests.
+      schema: { type: string }
+    BadgeContentSecurityPolicy:
+      description: >-
+        `default-src 'none'; frame-ancestors 'self'`, so a browser refuses
+        to frame the badge in a page from another origin, or
+        `default-src 'none'` with `web.badges.public: true`. A `web.headers`
+        entry of the same name replaces it.
+      schema: { type: string }
+    BadgeFrameOptions:
+      description: >-
+        `SAMEORIGIN`, which refuses a frame in a page from another origin
+        when a `web.headers` `Content-Security-Policy` leaves out
+        `frame-ancestors`. Not sent with `web.badges.public: true`. A
+        `web.headers` entry of the same name replaces it, or adds it to a
+        public badge.
+      schema: { type: string }
+    BadgeResourcePolicy:
+      description: >-
+        `same-origin`, so a browser refuses to load the badge as an image
+        into a page from another origin, or `cross-origin` with
+        `web.badges.public: true`. A `web.headers` entry of the same name
+        replaces it.
       schema: { type: string }
     CronstableInstance:
       description: >-
@@ -1996,6 +2056,21 @@ components:
             `http://0.0.0.0:8080`. The list has no entry for a unix socket.
             The reply to a credential-less request served through
             `web.anonymousScopes` omits the field.
+        badges:
+          type: object
+          nullable: true
+          description: >-
+            `null` while the daemon serves no status badges
+            (`web.badges: false`). `public` is the `web.badges.public`
+            setting, which lets an image proxy fetch the badges without a
+            token and lets pages from other origins load them. `dashboard`
+            is false under `web.ui: false`, where copied badge Markdown has
+            no dashboard page to link to. The dashboards list their
+            copy-badge commands only when the object is present.
+          properties:
+            public: { type: boolean }
+            dashboard: { type: boolean }
+          required: [public, dashboard]
       required: [authenticated, scopes, allScopes, pairLinkBase]
 
     PushDevice:

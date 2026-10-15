@@ -298,7 +298,11 @@ is **rehydrated** from the ledger once: the [web dashboard](Web-Dashboard)'s
 history drawer, sparklines, and `GET /jobs/{name}/runs` show runs from before
 the restart, immediately, instead of starting blank. Rehydration is read-only
 and bounded (with a slow store the daemon skips it with a warning; history
-then fills in as jobs run, exactly as with no rehydration).
+then fills in as jobs run, exactly as with no rehydration). When a job's
+newest records are all slots that a pause skipped, the daemon finds the last
+run for the job's [status badge](Status-Badges#what-a-jobs-badge-says) with
+a deeper read in the background after rehydration. It makes these reads one
+job at a time and stops at the first one that times out.
 
 A job's *latest* run is the one with the newest finish time, not the last
 record in the stream. A run's finish time is the instant the run

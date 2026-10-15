@@ -37,6 +37,7 @@ from typing import (
 )
 
 import cronstable.version
+from cronstable.config import resolve_web_toggle
 from cronstable.cronexpr import CronTab
 
 if TYPE_CHECKING:  # pragma: no cover -- import cycle guard, types only
@@ -423,12 +424,8 @@ def resolve_metrics_config(
     default whenever the web API itself is on; ``metrics: false`` /
     ``metrics: true`` are shorthands for the map form.
     """
-    raw = web_config.get("metrics")
-    if raw is False:
-        return None
-    if raw is None or raw is True:
-        raw = {}
-    if not raw.get("enabled", True):
+    raw = resolve_web_toggle(web_config, "metrics")
+    if raw is None:
         return None
     buckets = raw.get("durationBuckets")
     return {

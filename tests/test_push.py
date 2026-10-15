@@ -2968,6 +2968,8 @@ async def test_whoami_with_and_without_token():
         # no web app runs here, so no listener is bound
         "instance": cron._web_instance,
         "listeners": [],
+        # served, but a request without a token cannot fetch them
+        "badges": {"public": False, "dashboard": True},
     }
     body = json.loads((await cron._web_whoami(_Req())).body)
     assert body["authenticated"] is False
@@ -2996,6 +2998,8 @@ async def test_whoami_reports_an_anonymous_grant():
         "sealableSuites": _sealable_now(),
         # and no listeners: the grant leaves the bind addresses out
         "instance": cron._web_instance,
+        # the grant serves the badges; other origins need web.badges.public
+        "badges": {"public": False, "dashboard": True},
     }
 
 

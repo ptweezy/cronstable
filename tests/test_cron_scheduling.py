@@ -853,15 +853,16 @@ def test_reload_prunes_finished_run_maps(tmp_path, monkeypatch):
             fail_reason=None,
             output=JobOutputStream(),
         )
-        cron.last_run[name] = info
-        cron.run_history[name].append(info)
+        cron._install_run_info(name, info)
 
     cfg.write_text(_RELOAD_AFTER)
     cron.update_config()
     assert "drop" not in cron.last_run  # removed job's data pruned
     assert "drop" not in cron.run_history
+    assert "drop" not in cron._last_real_run
     assert "keep" in cron.last_run  # surviving job's data kept
     assert len(cron.run_history["keep"]) == 1
+    assert "keep" in cron._last_real_run
 
 
 def _count_crontab_calls(monkeypatch):

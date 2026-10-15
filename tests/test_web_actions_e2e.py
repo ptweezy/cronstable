@@ -492,11 +492,24 @@ def test_palette_copies_the_badge_markdown_the_terminal_builds(
     browser, tmp_path
 ):
     # the page's badgeMarkdown and badge.badge_markdown (the terminal
-    # dashboard's) must agree byte for byte, the percent-encoding of a
-    # name with "/" and ")" included
+    # dashboard's) must agree byte for byte: the percent-encoding of a
+    # name with "/" and ")", the escaped Markdown syntax, and the line
+    # breaks that become spaces
     from cronstable.badge import badge_markdown
 
-    jobs = [e2e.job("team/backup (prod)"), e2e.job("alpha-ok")]
+    odd = "odd [name]\\x"
+    syntax = "syntax`x|y*z_w<v&u~t^_"
+    broken = (
+        "two\r\nlines\N{LINE SEPARATOR}# here\n"
+        "\x85and\N{PARAGRAPH SEPARATOR}more"
+    )
+    jobs = [
+        e2e.job("team/backup (prod)"),
+        e2e.job(odd),
+        e2e.job(syntax),
+        e2e.job(broken),
+        e2e.job("alpha-ok"),
+    ]
     with e2e.Daemon(tmp_path, jobs=jobs) as daemon:
         with e2e.open_page(
             browser,
@@ -509,6 +522,18 @@ def test_palette_copies_the_badge_markdown_the_terminal_builds(
                     "badge markdown: team",
                     "Copy badge Markdown: team/backup (prod)",
                     "team/backup (prod)",
+                ),
+                ("badge markdown: odd", "Copy badge Markdown: " + odd, odd),
+                (
+                    "badge markdown: syntax",
+                    "Copy badge Markdown: " + syntax,
+                    syntax,
+                ),
+                (
+                    "badge markdown: two",
+                    # the HTML parser reads the label's CRLF as LF
+                    "Copy badge Markdown: " + broken.replace("\r\n", "\n"),
+                    broken,
                 ),
                 (
                     "fleet badge",
@@ -524,13 +549,235 @@ def test_palette_copies_the_badge_markdown_the_terminal_builds(
                     arg=label,
                 )
                 page.keyboard.press("Enter")
-                e2e.wait_toast(page, "copied badge Markdown")
-                page.wait_for_function(
-                    "async () => (await navigator.clipboard.readText()) !== ''"
+                # no token here, but a page on another origin still shows
+                # only public badges
+                e2e.wait_toast(
+                    page,
+                    "copied badge Markdown; embeds need web.badges.public",
                 )
-                assert page.evaluate(
-                    "navigator.clipboard.readText()"
-                ) == badge_markdown(origin, name)
+                # wait_for_function takes a Promise as truthy at once, so
+                # poll the async readText from Python
+                copied = e2e.wait_until(
+                    lambda: page.evaluate("navigator.clipboard.readText()"),
+                    page,
+                )
+                assert copied == badge_markdown(origin, name)
+
+
+def test_palette_badge_markdown_without_a_dashboard(browser, tmp_path):
+    # a daemon reloaded to web.ui: false serves no page for the badge to
+    # link to, so the page copies the bare image, as the terminal does
+    from cronstable.badge import badge_markdown
+
+    def no_dashboard(page):
+        page.faults.rewrite(
+            r"/whoami",
+            lambda body: dict(
+                body, badges={"public": True, "dashboard": False}
+            ),
+        )
+
+    with e2e.Daemon(tmp_path, jobs=[e2e.job("alpha-ok")]) as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            before_goto=no_dashboard,
+            permissions=["clipboard-read", "clipboard-write"],
+        ) as page:
+            origin = page.evaluate("location.origin")
+            page.evaluate("navigator.clipboard.writeText('')")
+            _palette(page, "badge markdown: alpha")
+            page.wait_for_function(
+                "() => document.querySelector("
+                "'#paletteList .item.cur .lbl').textContent"
+                " === 'Copy badge Markdown: alpha-ok'"
+            )
+            page.keyboard.press("Enter")
+            e2e.wait_toast(page, "copied badge Markdown")
+            copied = e2e.wait_until(
+                lambda: page.evaluate("navigator.clipboard.readText()"),
+                page,
+            )
+            assert copied == badge_markdown(origin, "alpha-ok", link=False)
+
+
+def test_palette_badge_commands_follow_the_daemon(browser, tmp_path):
+    # web.badges: false drops the copy commands; a badge that isn't
+    # public gets a toast that names web.badges.public
+    jobs = [e2e.job("alpha-ok")]
+    for sub in ("off", "gated"):
+        (tmp_path / sub).mkdir()
+    with e2e.Daemon(
+        tmp_path / "off", jobs=jobs, web={"badges": False}
+    ) as daemon:
+        with e2e.open_page(browser, daemon.url) as page:
+            _palette(page, "Copy")
+            labels = page.evaluate(
+                "[...document.querySelectorAll('#paletteList .lbl')]"
+                ".map((l) => l.textContent)"
+            )
+            assert "Copy command: alpha-ok" in labels
+            assert not [lbl for lbl in labels if "badge" in lbl]
+    with e2e.Daemon(tmp_path / "gated", auth="full", jobs=jobs) as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            token=e2e.FULL_TOKEN,
+            permissions=["clipboard-read", "clipboard-write"],
+        ) as page:
+            _palette(page, "fleet badge")
+            page.wait_for_function(
+                "() => document.querySelector("
+                "'#paletteList .item.cur .lbl').textContent"
+                " === 'Copy fleet badge Markdown'"
+            )
+            page.keyboard.press("Enter")
+            e2e.wait_toast(
+                page, "copied badge Markdown; embeds need web.badges.public"
+            )
+
+
+def _badge_rows(page):
+    """The palette's badge rows, with the palette closed again after."""
+    _palette(page, "badge markdown")
+    labels = page.evaluate(
+        "[...document.querySelectorAll('#paletteList .lbl')]"
+        ".map((l) => l.textContent)"
+    )
+    page.keyboard.press("Escape")
+    page.wait_for_function(
+        "!document.getElementById('paletteWrap').classList.contains('open')"
+    )
+    return sorted(lbl for lbl in labels if "badge" in lbl)
+
+
+_BADGE_ROWS = ["Copy badge Markdown: alpha-ok", "Copy fleet badge Markdown"]
+
+
+def test_palette_badge_commands_follow_a_reload(browser, tmp_path):
+    # polls keep succeeding across a reload that changes web.badges, so
+    # the page reads /whoami again on the first poll a minute after the
+    # last read
+    answer = {"badges": None}
+    with e2e.Daemon(tmp_path, jobs=[e2e.job("alpha-ok")]) as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            before_goto=lambda page: page.clock.install(),
+            permissions=["clipboard-read", "clipboard-write"],
+        ) as page:
+            page.faults.record()
+            assert _badge_rows(page) == _BADGE_ROWS
+            page.faults.rewrite(r"/whoami", lambda body: dict(body, **answer))
+
+            def polls(ms):
+                # one 3 s poll interval at a time, each poll landing
+                # before the next is due
+                for _ in range(ms // 3000):
+                    page.clock.fast_forward(3000)
+                    page.wait_for_function(
+                        "!document.getElementById('refreshBtn').classList"
+                        ".contains('spin')"
+                    )
+
+            def reads():
+                return len(page.faults.sent("GET", "/whoami"))
+
+            polls(30000)
+            assert reads() == 0
+            assert _badge_rows(page) == _BADGE_ROWS
+            polls(33000)
+            e2e.wait_until(lambda: reads() == 1, page)
+            e2e.wait_until(lambda: _badge_rows(page) == [], page)
+            # badges back on, but not public
+            answer["badges"] = {"public": False, "dashboard": True}
+            polls(63000)
+            e2e.wait_until(lambda: reads() == 2, page)
+            e2e.wait_until(lambda: _badge_rows(page) == _BADGE_ROWS, page)
+            _palette(page, "fleet badge")
+            page.wait_for_function(
+                "() => document.querySelector("
+                "'#paletteList .item.cur .lbl').textContent"
+                " === 'Copy fleet badge Markdown'"
+            )
+            page.keyboard.press("Enter")
+            e2e.wait_toast(
+                page, "copied badge Markdown; embeds need web.badges.public"
+            )
+
+
+def test_a_whoami_refresh_keeps_the_focus_in_the_dag_card(browser, tmp_path):
+    # only a change to the scopes repaints the chrome, and each node
+    # behind a load balancer answers with its own instance and listeners
+    reads = []
+
+    def per_node(body):
+        reads.append(body)
+        return dict(body, instance="node-%d" % len(reads), listeners=[])
+
+    with e2e.Daemon(
+        tmp_path,
+        jobs=[e2e.job("alpha-ok")],
+        dags=[e2e.diamond_dag("diamond")],
+    ) as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            before_goto=lambda page: page.clock.install(),
+        ) as page:
+            page.faults.rewrite(r"/whoami", per_node)
+            button = '#dagRows [data-dagopen="diamond"]'
+            page.wait_for_selector(button)
+            page.focus(button)
+            # 63 s of 3 s polls: one /whoami refresh, then two more polls
+            for _ in range(21):
+                page.clock.fast_forward(3000)
+                page.wait_for_function(
+                    "!document.getElementById('refreshBtn').classList"
+                    ".contains('spin')"
+                )
+            e2e.wait_until(lambda: len(reads) == 1, page)
+            for _ in range(2):
+                page.clock.fast_forward(3000)
+                page.wait_for_function(
+                    "!document.getElementById('refreshBtn').classList"
+                    ".contains('spin')"
+                )
+            assert page.evaluate(
+                "(sel) => document.activeElement"
+                " === document.querySelector(sel)",
+                button,
+            )
+
+
+def test_palette_badge_commands_follow_a_lost_connection(browser, tmp_path):
+    # a daemon restart can bring back another web.badges setting, so the
+    # first good poll after a failed one reads /whoami again
+    with e2e.Daemon(tmp_path, jobs=[e2e.job("alpha-ok")]) as daemon:
+        with e2e.open_page(
+            browser, daemon.url, prefs={"pollMs": 1000}
+        ) as page:
+            page.faults.record()
+            assert _badge_rows(page) == _BADGE_ROWS
+            page.faults.rewrite(
+                r"/whoami", lambda body: dict(body, badges=None)
+            )
+            page.faults.abort(r"/jobs", times=1)
+            e2e.wait_until(lambda: page.faults.sent("GET", "/whoami"), page)
+            assert len(page.faults.sent("GET", "/jobs")) >= 2
+            e2e.wait_until(lambda: _badge_rows(page) == [], page)
+
+
+def test_palette_leaves_out_badges_no_url_reaches(browser, tmp_path):
+    # a browser resolves "." and "..", and the route matches no brace
+    names = ["ok", "..", ".", "{x}", "..."]
+    with e2e.Daemon(tmp_path, jobs=[e2e.job(n) for n in names]) as daemon:
+        with e2e.open_page(browser, daemon.url) as page:
+            assert _badge_rows(page) == [
+                "Copy badge Markdown: ...",
+                "Copy badge Markdown: ok",
+                "Copy fleet badge Markdown",
+            ]
 
 
 # --------------------------------------------------------------------------

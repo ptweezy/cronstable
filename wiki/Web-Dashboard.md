@@ -27,8 +27,10 @@ The HTML document is returned with defense-in-depth security headers, including
 a strict `Content-Security-Policy` (`default-src 'self'`, `connect-src 'self'`,
 `frame-ancestors 'none'`, anti-clickjacking `X-Frame-Options: DENY`, and
 `X-Content-Type-Options: nosniff`). The daemon merges any header you set under
-`web.headers` on top of these defaults, so you can relax or extend them
-deliberately (`Content-Type` excepted: the page is always `text/html`).
+`web.headers` on top of these defaults, in any letter case, so you can relax
+or extend them deliberately. A `web.headers` entry can't set the page's
+`Content-Type`, `Content-Encoding`, `ETag`, `Cache-Control`, or `Vary`; the
+page sets those itself.
 
 To expose only the REST API and **not** the dashboard, set `ui: false`:
 
@@ -616,7 +618,11 @@ filter, arrow keys to move, `Enter` to run.
 
 **Copy badge Markdown** (per job) and **Copy fleet badge Markdown** copy
 Markdown that embeds a [status badge](Status-Badges) and links it back to
-this dashboard, ready to paste into a README or a wiki page.
+this dashboard, ready to paste into a README or a wiki page. The palette
+lists them while the daemon serves badges, and it follows a configuration
+reload within about a minute (see [scope-aware chrome](#scope-aware-chrome)).
+It leaves out the per-job command for a job whose badge no URL reaches, such
+as one named `..` (see [embed a badge](Status-Badges#embed-a-badge)).
 
 The palette opens on top of a job drawer, a DAG drawer, the
 [live logs panel](#live-logs), or the [wallboard](#wallboard--tv-mode), and
@@ -771,12 +777,20 @@ while the [command palette](#command-palette) is open, the dashboard closes
 the palette, and the prompt takes the keys: `Enter` saves the token, and `Esc`
 closes the prompt.
 
+A `#job/<name>` or `#dag/<name>` link, such as the one on a
+[status badge](Status-Badges#embed-a-badge), opens the token prompt first,
+and the link's drawer opens after you save the token.
+
 ### Scope-aware chrome
 
 On load the dashboard asks [`GET /whoami`](HTTP-API#get-whoami) what it is
 allowed to do, and draws only the controls that scope covers. With every scope,
 or against a daemon with no authentication configured, it draws the full
-interface.
+interface. It asks again on the first good poll after a lost connection and
+on the first good poll a minute or more after the last read, and redraws
+only when the scopes changed. A daemon reload or restart that changes
+the token's scopes or the [badge settings](Status-Badges#configuration)
+therefore reaches an open page within about a minute, without a page reload.
 
 Without `control`, the dashboard omits the Run, Stop, Pause, and Resume
 buttons, the DAG Trigger and Backfill buttons, "run failing", and the mitigate

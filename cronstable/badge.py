@@ -6,44 +6,47 @@ colored message on the right, such as ``passing`` or ``failing``.  The
 daemon serves it as ``GET /jobs/{name}/badge.svg`` (one job) and
 ``GET /badge.svg`` (the fleet); the "Status Badges" wiki page is the user
 documentation.  :func:`job_verdict` and :func:`fleet_message` decide what a
-badge says, and :func:`resolve_badges_config` reads the ``web.badges``
-option.
+badge says.
 
 Rendering choices, all deliberate:
 
 - No font travels with the image, so text widths come from a table of
-  DejaVu Sans advance widths at 11px, which sit within a fraction of a
-  pixel of Verdana's for these characters.  Each text run also carries
-  ``textLength``, so a viewer that draws another font still fits the text
-  to its box.
+  DejaVu Sans advance widths at 11px.  Verdana, the first font the image
+  names, draws most of these characters within a pixel of the table, and
+  a few, such as ``_``, ``/``, and ``J``, up to 2px wider.  Each text run
+  also carries ``textLength``, so a viewer that draws another font still
+  fits the text to its box.
 - Every string is XML-escaped, and characters that XML forbids become
-  U+FFFD.  :func:`label_error` also limits a caller's label override to
-  printable characters.  The daemon serves these images from the
-  dashboard's own origin, so markup in a label must never reach the SVG.
+  U+FFFD.  :func:`label_error` also keeps control characters and line
+  breaks out of a caller's label override.  The daemon serves these images
+  from the dashboard's own origin, so markup in a label must never reach
+  the SVG.
 - The image carries ``role="img"``, an ``aria-label``, and a ``<title>``
   that read "label: message", so screen readers and hover tooltips name
   the verdict.
+- Element ids carry a hash of the badge's content, so badges inlined into
+  one HTML page never resolve each other's gradient or clip path.
 """
 
+import hashlib
 import html
 import math
 import re
 import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Mapping
-from typing import Any
 from urllib.parse import quote
 
 __all__ = [
     "BADGE_STYLES",
     "LABEL_MAX",
     "VERDICT_COLORS",
+    "badge_addressable",
     "badge_markdown",
     "fleet_message",
     "job_verdict",
     "label_error",
     "render_badge",
-    "resolve_badges_config",
     "text_width",
 ]
 
@@ -70,7 +73,6 @@ VERDICT_COLORS: Mapping[str, str] = {
     "paused": _GRAY,
     "disabled": _GRAY,
     "cancelled": _GRAY,
-    "skipped": _GRAY,
     "unknown": _GRAY,
     "pending": _GRAY,
 }
@@ -131,25 +133,49 @@ _PADDING = 5
 
 _FONT = "Verdana,Geneva,DejaVu Sans,sans-serif"
 
+#: Unicode categories a label override must not contain: control
+#: characters, line and paragraph separators, and lone surrogates.
+_LABEL_FORBIDDEN = frozenset({"Cc", "Zl", "Zp", "Cs"})
 
-def resolve_badges_config(
-    web_config: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """Resolve the raw ``web.badges`` option into effective settings.
+#: Unicode categories that take no space of their own: nonspacing and
+#: enclosing marks, and format characters such as a zero-width space.
+_ZERO_WIDTH_CATEGORIES = frozenset({"Mn", "Me", "Cf"})
 
-    Returns ``None`` when the badge routes are off, else a dict with
-    ``public`` (serve the badges without a bearer token).  Badges are on
-    whenever the web API is on unless the option turns them off;
-    ``badges: false`` and ``badges: true`` are shorthands for the map form.
-    """
-    raw = web_config.get("badges")
-    if raw is False:
-        return None
-    if raw is None or raw is True:
-        raw = {}
-    if not raw.get("enabled", True):
-        return None
-    return {"public": bool(raw.get("public", False))}
+#: Format characters that draw a visible glyph, such as the Arabic number
+#: signs.
+_VISIBLE_FORMAT = frozenset(
+    chr(code)
+    for code in (
+        *range(0x0600, 0x0606),
+        0x06DD,
+        0x070F,
+        0x0890,
+        0x0891,
+        0x08E2,
+        0x110BD,
+        0x110CD,
+        *range(0xFFF9, 0xFFFC),
+    )
+)
+
+#: Emoji skin tone modifiers, which merge into the emoji before them.
+_SKIN_TONES = range(0x1F3FB, 0x1F400)
+
+_ZWJ = "\N{ZERO WIDTH JOINER}"
+_VS16 = "\N{VARIATION SELECTOR-16}"
+
+#: The line boundaries of :meth:`str.splitlines`, CRLF first so that it
+#: counts as one.  The page's ``badgeMarkdown`` matches the same set.
+_LINE_BREAK = re.compile(
+    r"\r\n|[\n\v\f\r\x1c-\x1e\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]"
+)
+
+#: The characters in a badge's alt text that Markdown could read as
+#: syntax: they could end the alt text, open a code span or emphasis,
+#: split a table cell, or start HTML, an entity, or a GitHub footnote.  An
+#: underscore between two letters or digits opens no emphasis, so it stays
+#: bare.  The page's ``badgeMarkdown`` matches the same set.
+_ALT_SYNTAX = re.compile(r"[\\\[\]`*|<&~^]|(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])")
 
 
 def job_verdict(
@@ -162,10 +188,11 @@ def job_verdict(
 ) -> str:
     """The word a job's badge shows, most urgent state first.
 
-    ``outcome`` is the outcome of the job's last recorded run, or ``None``
-    when the job has none yet, and ``overdue`` is whether an SLA check is
-    in breach.  A run in progress leaves a verdict in place, so the badge
-    of a job that runs every minute keeps showing its last result.
+    ``outcome`` is the outcome of the job's last run, or ``None`` when the
+    job has never run.  A slot that a pause held back ran nothing, so it
+    is not a run.  ``overdue`` is whether an SLA check is in breach.  A run
+    in progress leaves a verdict in place, so the badge of a job that runs
+    every minute keeps showing its last result.
     """
     if not enabled:
         return "disabled"
@@ -179,8 +206,8 @@ def job_verdict(
         return "passing"
     if outcome is None:
         return "running" if running else "pending"
-    if outcome in ("cancelled", "skipped"):
-        return outcome
+    if outcome == "cancelled":
+        return "cancelled"
     return "unknown"
 
 
@@ -204,54 +231,104 @@ def fleet_message(verdicts: Iterable[str]) -> tuple[str, str]:
 
 
 def label_error(label: str) -> str | None:
-    """Why ``label`` cannot head a badge, or ``None`` when it can."""
-    if not label.strip():
+    """Why ``label`` cannot head a badge, or ``None`` when it can.
+
+    A label of only spaces and zero-width characters, such as a zero-width
+    space or a combining mark, counts as blank.
+    """
+    if all(char.isspace() or _zero_width(char) for char in label):
         return "label must not be blank"
     if len(label) > LABEL_MAX:
         return "label must be at most {} characters".format(LABEL_MAX)
-    if not label.isprintable():
-        return "label must contain only printable characters"
+    if any(unicodedata.category(char) in _LABEL_FORBIDDEN for char in label):
+        return "label must not contain control characters or line breaks"
     return None
 
 
-def badge_markdown(base_url: str, name: str | None = None) -> str:
+def badge_addressable(name: str) -> bool:
+    """Whether a URL can reach the badge of the job called ``name``.
+
+    A browser resolves the path segments ``.`` and ``..`` before it sends
+    the request, an empty segment matches no route, and the route's
+    ``{name}`` segment matches no ``{`` or ``}``.
+    """
+    return name not in ("", ".", "..") and "{" not in name and "}" not in name
+
+
+def badge_markdown(
+    base_url: str, name: str | None = None, link: bool = True
+) -> str:
     """Markdown that embeds a status badge and links it to the dashboard.
 
     ``base_url`` is the daemon's web address, such as
     ``https://cron.example.com``.  ``name`` picks one job's badge, which
     links to that job's drawer, and ``None`` picks the fleet badge, which
-    links to the dashboard.  The web dashboard's ``badgeMarkdown`` builds
-    the same text.
+    links to the dashboard.  ``link=False`` leaves the link out, for a
+    daemon that serves no dashboard.  The web dashboard's ``badgeMarkdown``
+    builds the same text.
     """
-    base = base_url.rstrip("/")
+    # an unbalanced "(" or ")" in a path prefix would end the link early
+    base = base_url.rstrip("/").replace("(", "%28").replace(")", "%29")
     if name is None:
-        alt, image, link = "cronstable", "/badge.svg", "/"
+        alt, image, target = "cronstable", "/badge.svg", "/"
     else:
         # safe="" also encodes "/", and the "(" and ")" that would end a
         # Markdown link early
         quoted = quote(name, safe="")
         alt = name
         image = "/jobs/{}/badge.svg".format(quoted)
-        link = "/#job/{}".format(quoted)
-    # a bracket in a job name would end the alt text early, and a
-    # backslash would escape the character after it
-    alt = re.sub(r"([\\\[\]])", r"\\\1", alt)
-    return "[![{}]({}{})]({}{})".format(alt, base, image, base, link)
+        target = "/#job/{}".format(quoted)
+    # a line break in a job name could end the paragraph
+    alt = _LINE_BREAK.sub(" ", alt)
+    alt = _ALT_SYNTAX.sub(r"\\\g<0>", alt)
+    embed = "![{}]({}{})".format(alt, base, image)
+    if not link:
+        return embed
+    return "[{}]({}{})".format(embed, base, target)
+
+
+def _zero_width(char: str) -> bool:
+    """Whether ``char`` takes no space of its own."""
+    if char in _VISIBLE_FORMAT:
+        return False
+    return (
+        unicodedata.category(char) in _ZERO_WIDTH_CATEGORIES
+        or unicodedata.combining(char) != 0
+    )
 
 
 def text_width(text: str) -> float:
-    """The estimated rendered width of ``text``, in pixels at size 11."""
+    """The estimated rendered width of ``text``, in pixels at size 11.
+
+    Zero-width characters add nothing.  Neither does a skin tone after an
+    emoji, or an emoji that a zero-width joiner merges into the one before
+    it.  An emoji presentation selector widens a text-style emoji to a full
+    em.
+    """
     total = 0.0
+    prev, prev_width = "", 0.0
     for char in text:
         width = _WIDTHS.get(char)
         if width is None:
-            if unicodedata.combining(char):
+            emoji_before = bool(prev) and unicodedata.category(prev) == "So"
+            if _zero_width(char):
+                width = 0.0
+                if (
+                    char == _VS16
+                    and emoji_before
+                    and prev_width == _FALLBACK_WIDTH
+                ):
+                    width = _WIDE_WIDTH - _FALLBACK_WIDTH
+            elif emoji_before and ord(char) in _SKIN_TONES:
+                width = 0.0
+            elif prev == _ZWJ and unicodedata.category(char) == "So":
                 width = 0.0
             elif unicodedata.east_asian_width(char) in ("W", "F"):
                 width = _WIDE_WIDTH
             else:
                 width = _FALLBACK_WIDTH
         total += width
+        prev, prev_width = char, width
     return total
 
 
@@ -281,7 +358,10 @@ def render_badge(
         raise ValueError("unknown badge style {!r}".format(style))
     label = "".join(_xml_char(char) for char in label)
     message = "".join(_xml_char(char) for char in message)
-    # Text sits at font size 110 under scale(.1), so every coordinate below
+    uid = hashlib.sha256(
+        "\0".join((label, message, color, style)).encode("utf-8")
+    ).hexdigest()[:12]
+    # Text sits at font size 110 under scale(.1), so every later coordinate
     # is in tenths of a pixel: the shields.io idiom for sub-pixel centering
     # in integer attributes.
     label_text = math.ceil(text_width(label))
@@ -298,13 +378,13 @@ def render_badge(
     ]
     if flat:
         parts.append(
-            '<linearGradient id="s" x2="0" y2="100%">'
+            '<linearGradient id="s-{uid}" x2="0" y2="100%">'
             '<stop offset="0" stop-color="#bbb" stop-opacity=".1"/>'
             '<stop offset="1" stop-opacity=".1"/>'
             "</linearGradient>"
-            '<clipPath id="r"><rect width="{}" height="20" rx="3" '
-            'fill="#fff"/></clipPath>'
-            '<g clip-path="url(#r)">'.format(width)
+            '<clipPath id="r-{uid}"><rect width="{width}" height="20" '
+            'rx="3" fill="#fff"/></clipPath>'
+            '<g clip-path="url(#r-{uid})">'.format(uid=uid, width=width)
         )
     else:
         parts.append('<g shape-rendering="crispEdges">')
@@ -320,7 +400,9 @@ def render_badge(
     )
     if flat:
         parts.append(
-            '<rect width="{}" height="20" fill="url(#s)"/>'.format(width)
+            '<rect width="{}" height="20" fill="url(#s-{})"/>'.format(
+                width, uid
+            )
         )
     parts.append(
         '</g><g fill="#fff" text-anchor="middle" font-family="{}" '
